@@ -93,6 +93,12 @@ OPTIONAL_META_KEYS: frozenset[str] = frozenset(
         # PR-D: BTC + SOL 4h benchmark strip (factual numeric only).
         "market_benchmarks",
         "market_benchmarks_is_visual_context_only",
+        # DASH-07 / SIG-09: trailing-7d per-trade paper PnL + hostile cue.
+        "trailing_7d_paper_pnl",
+        "trailing_7d_paper_pnl_is_visual_context_only",
+        # SIG-08: detection-earliness truth surface.
+        "earliness_vs_trending",
+        "earliness_vs_trending_is_visual_context_only",
     }
 )
 # PR-D: strict-pinned allowed keys inside `meta.market_benchmarks`.
@@ -100,6 +106,29 @@ OPTIONAL_META_KEYS: frozenset[str] = frozenset(
 # (including cohort-average smuggle attempts like focus_rows_avg_24h_pct)
 # fails critical.
 ALLOWED_BENCHMARK_KEYS: frozenset[str] = frozenset({"btc_4h_pct", "sol_4h_pct"})
+# DASH-07 / SIG-09: strict-pinned sub-keys inside `meta.trailing_7d_paper_pnl`.
+ALLOWED_TRAILING_PNL_KEYS: frozenset[str] = frozenset(
+    {
+        "closed_trades",
+        "per_trade_usd",
+        "total_pnl_usd",
+        "display_threshold_usd",
+        "n_gate",
+        "hostile",
+        "window_days",
+    }
+)
+# SIG-08: strict-pinned sub-keys inside `meta.earliness_vs_trending`.
+ALLOWED_EARLINESS_KEYS: frozenset[str] = frozenset(
+    {
+        "median_lead_time_min",
+        "count_ok",
+        "count_no_reference",
+        "count_total",
+        "no_reference_pct",
+        "window_days",
+    }
+)
 
 ALLOWED_SOURCE_CORPUS = {"paper", "tracker"}
 ALLOWED_WINDOW_STATES = {"open", "closing", "late", "closed", "unknown"}
@@ -452,9 +481,7 @@ def _check_row(row, idx: int, result: Result) -> None:
     if not isinstance(row, dict):
         result.critical(f"{path} must be object")
         return
-    _check_exact_keys(
-        row, EXPECTED_ROW_KEYS, path, result, optional=OPTIONAL_ROW_KEYS
-    )
+    _check_exact_keys(row, EXPECTED_ROW_KEYS, path, result, optional=OPTIONAL_ROW_KEYS)
     _check_price_path_points(row, path, result)
 
     for field in ("row_key", "token_id", "source_corpus", "trade_inbox_group"):
@@ -548,8 +575,7 @@ def _check_price_path_points(row: dict, path: str, result: Result) -> None:
         ts, price = pair
         if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
             result.critical(
-                f"{path}.price_path_points[{i}][0] must be positive int; "
-                f"got {ts!r}"
+                f"{path}.price_path_points[{i}][0] must be positive int; " f"got {ts!r}"
             )
         if (
             not isinstance(price, (int, float))
@@ -665,6 +691,152 @@ def _check_market_benchmarks(payload: dict, result: Result) -> None:
         )
 
 
+def _check_trailing_7d_paper_pnl(payload: dict, result: Result) -> None:
+    """DASH-07 / SIG-09: validate optional `meta.trailing_7d_paper_pnl` + flag.
+
+    Same absence-iff-empty + strict-True identity discipline as the benchmark
+    strip. Sub-keys strictly pinned to `ALLOWED_TRAILING_PNL_KEYS`; the block
+    is present only when >= 1 closed trade contributed, and `hostile` (the
+    display-only red cue) must be False below the n-gate.
+    """
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return
+    present = "trailing_7d_paper_pnl" in meta
+    flag_present = "trailing_7d_paper_pnl_is_visual_context_only" in meta
+    flag_value = meta.get("trailing_7d_paper_pnl_is_visual_context_only")
+
+    if not present:
+        if flag_present:
+            result.critical(
+                "meta.trailing_7d_paper_pnl_is_visual_context_only must be "
+                "absent when trailing_7d_paper_pnl is absent (omit rather "
+                "than set False)"
+            )
+        return
+
+    block = meta.get("trailing_7d_paper_pnl")
+    if not isinstance(block, dict):
+        result.critical(
+            f"meta.trailing_7d_paper_pnl must be object; got " f"{type(block).__name__}"
+        )
+        return
+    keys = set(block.keys())
+    missing = ALLOWED_TRAILING_PNL_KEYS - keys
+    unknown = keys - ALLOWED_TRAILING_PNL_KEYS
+    if missing:
+        result.critical(f"meta.trailing_7d_paper_pnl: missing keys {sorted(missing)!r}")
+    if unknown:
+        result.critical(f"meta.trailing_7d_paper_pnl: unknown keys {sorted(unknown)!r}")
+    for field in ("closed_trades", "n_gate", "window_days"):
+        value = block.get(field)
+        if not _is_int(value) or value < 0:
+            result.critical(f"meta.trailing_7d_paper_pnl.{field} must be int >= 0")
+    for field in ("per_trade_usd", "total_pnl_usd", "display_threshold_usd"):
+        value = block.get(field)
+        if not _is_number(value) or not (-1e308 < float(value) < 1e308):
+            result.critical(f"meta.trailing_7d_paper_pnl.{field} must be finite number")
+    if not isinstance(block.get("hostile"), bool):
+        result.critical("meta.trailing_7d_paper_pnl.hostile must be bool")
+    if _is_int(block.get("closed_trades")) and block["closed_trades"] < 1:
+        result.critical(
+            "meta.trailing_7d_paper_pnl.closed_trades must be >= 1 when the "
+            "block is present"
+        )
+    if (
+        block.get("hostile") is True
+        and _is_int(block.get("closed_trades"))
+        and _is_int(block.get("n_gate"))
+        and block["closed_trades"] < block["n_gate"]
+    ):
+        result.critical("meta.trailing_7d_paper_pnl.hostile must be False below n_gate")
+    if not flag_present:
+        result.critical(
+            "meta.trailing_7d_paper_pnl_is_visual_context_only must be present "
+            "when trailing_7d_paper_pnl is present"
+        )
+    elif flag_value is not True:
+        result.critical(
+            "meta.trailing_7d_paper_pnl_is_visual_context_only must be exactly "
+            f"True (identity check); got {flag_value!r}"
+        )
+
+
+def _check_earliness_vs_trending(payload: dict, result: Result) -> None:
+    """SIG-08: validate optional `meta.earliness_vs_trending` + paired flag.
+
+    Sub-keys strictly pinned to `ALLOWED_EARLINESS_KEYS`. `median_lead_time_min`
+    may be null (no `ok` references) but must be non-null when count_ok > 0.
+    The block is present only when >= 1 trade opened in the window.
+    """
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        return
+    present = "earliness_vs_trending" in meta
+    flag_present = "earliness_vs_trending_is_visual_context_only" in meta
+    flag_value = meta.get("earliness_vs_trending_is_visual_context_only")
+
+    if not present:
+        if flag_present:
+            result.critical(
+                "meta.earliness_vs_trending_is_visual_context_only must be "
+                "absent when earliness_vs_trending is absent (omit rather "
+                "than set False)"
+            )
+        return
+
+    block = meta.get("earliness_vs_trending")
+    if not isinstance(block, dict):
+        result.critical(
+            f"meta.earliness_vs_trending must be object; got " f"{type(block).__name__}"
+        )
+        return
+    keys = set(block.keys())
+    missing = ALLOWED_EARLINESS_KEYS - keys
+    unknown = keys - ALLOWED_EARLINESS_KEYS
+    if missing:
+        result.critical(f"meta.earliness_vs_trending: missing keys {sorted(missing)!r}")
+    if unknown:
+        result.critical(f"meta.earliness_vs_trending: unknown keys {sorted(unknown)!r}")
+    for field in ("count_ok", "count_no_reference", "count_total", "window_days"):
+        value = block.get(field)
+        if not _is_int(value) or value < 0:
+            result.critical(f"meta.earliness_vs_trending.{field} must be int >= 0")
+    median = block.get("median_lead_time_min")
+    if median is not None and (
+        not _is_number(median) or not (-1e308 < float(median) < 1e308)
+    ):
+        result.critical(
+            "meta.earliness_vs_trending.median_lead_time_min must be finite "
+            "number or null"
+        )
+    pct = block.get("no_reference_pct")
+    if not _is_number(pct) or not (0 <= float(pct) <= 100):
+        result.critical(
+            "meta.earliness_vs_trending.no_reference_pct must be number in " "[0, 100]"
+        )
+    if _is_int(block.get("count_total")) and block["count_total"] < 1:
+        result.critical(
+            "meta.earliness_vs_trending.count_total must be >= 1 when the "
+            "block is present"
+        )
+    if median is None and _is_int(block.get("count_ok")) and block["count_ok"] > 0:
+        result.critical(
+            "meta.earliness_vs_trending.median_lead_time_min must be non-null "
+            "when count_ok > 0"
+        )
+    if not flag_present:
+        result.critical(
+            "meta.earliness_vs_trending_is_visual_context_only must be present "
+            "when earliness_vs_trending is present"
+        )
+    elif flag_value is not True:
+        result.critical(
+            "meta.earliness_vs_trending_is_visual_context_only must be exactly "
+            f"True (identity check); got {flag_value!r}"
+        )
+
+
 def validate_payload(payload, *, requested_window: int = 36) -> Result:
     result = Result()
     if not isinstance(payload, dict):
@@ -688,6 +860,8 @@ def validate_payload(payload, *, requested_window: int = 36) -> Result:
         result.critical("duplicate row_key rows are not allowed")
     _check_sparkline_meta_flag(payload, rows, result)
     _check_market_benchmarks(payload, result)
+    _check_trailing_7d_paper_pnl(payload, result)
+    _check_earliness_vs_trending(payload, result)
     meta = payload.get("meta")
     if isinstance(meta, dict):
         if meta.get("rows_returned") != len(rows):

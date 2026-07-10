@@ -234,6 +234,12 @@ def test_todays_focus_tab_is_wired_with_local_storage_only_state():
     heading_end = panel.find("</div>", heading_start)
     assert heading_start != -1 and heading_end != -1
     assert "BtcSolBenchmarkStrip" in panel[heading_start:heading_end]
+    # DASH-07 / SIG-09 + SIG-08 — regime + earliness strip imported and
+    # rendered as a sibling of the benchmark chips inside the heading.
+    assert "import RegimeStrip from './RegimeStrip'" in panel
+    assert "trailingPnl={meta.trailing_7d_paper_pnl}" in panel
+    assert "earliness={meta.earliness_vs_trending}" in panel
+    assert "RegimeStrip" in panel[heading_start:heading_end]
     assert panel.index("todays-focus-list") < panel.index("todays-focus-usage")
     assert "save_for_review" in panel
     assert "dismiss" in panel
@@ -299,6 +305,17 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
             f"Forbidden conditional selector {forbidden!r} would branch "
             "benchmark color by sign; ban via plan anti-scope §5."
         )
+    # DASH-07 / SIG-09 + SIG-08 — regime + earliness strip classes present.
+    # The hostile modifier is an intentional value-conditioned red cue, so
+    # (unlike the benchmark chips) a second color declaration is expected.
+    assert ".todays-focus-regime-group" in css
+    assert ".todays-focus-regime" in css
+    assert ".todays-focus-regime-hostile" in css
+    hostile_rule = re.search(
+        r"\.todays-focus-regime-hostile\s*\{([^}]*)\}", css, re.S
+    )
+    assert hostile_rule
+    assert "color" in hostile_rule.group(1)
     assert "min-width: 0" in css
     assert "width: 100%" in css
     assert "min-height: calc(100vh - 170px)" in css
@@ -347,6 +364,22 @@ def test_todays_focus_benchmark_strip_has_no_regime_or_advice_vocabulary():
     assert 'aria-label="BTC and SOL 4-hour deltas"' in strip
 
 
+def test_regime_strip_copy_is_factual_and_svg_free():
+    """DASH-07 / SIG-09 + SIG-08: lock the RegimeStrip copy fragments and keep
+    the component numeric-only (no SVG smuggling)."""
+    strip = (
+        ROOT / "dashboard" / "frontend" / "components" / "RegimeStrip.jsx"
+    ).read_text(encoding="utf-8")
+    # Load-bearing copy fragments — a refactor dropping these breaks the test.
+    for fragment in ("7d/trade:", "vs CG trending", "no reference", "n="):
+        assert fragment in strip, f"RegimeStrip.jsx missing copy fragment {fragment!r}"
+    # late/early direction words rendered from the median sign.
+    assert "'late'" in strip and "'early'" in strip
+    # SVG anti-scope inherited from the Sparkline / benchmark pattern.
+    for tag in ("<text", "<tspan", "<title", "<desc", "<circle", "<rect", "<path"):
+        assert tag not in strip, f"RegimeStrip.jsx contains banned SVG tag {tag!r}"
+
+
 def test_todays_focus_sparkline_component_has_no_banned_svg_substrings():
     """PR-C strict structural guard: Sparkline.jsx source MUST contain only
     `<polyline>` geometry. Banned tags (text/title/circle/rect/etc.) would
@@ -390,6 +423,9 @@ def test_todays_focus_frontend_copy_stays_factual():
         ROOT / "dashboard" / "frontend" / "components" / "Sparkline.jsx",
         # PR-D — extend factual-copy scan to cover the BTC + SOL benchmark strip.
         ROOT / "dashboard" / "frontend" / "components" / "BtcSolBenchmarkStrip.jsx",
+        # DASH-07 / SIG-09 + SIG-08 — extend factual-copy scan to cover the
+        # regime + earliness strip.
+        ROOT / "dashboard" / "frontend" / "components" / "RegimeStrip.jsx",
         # BL-NEW-DASHBOARD-WHAT-CHANGED — extend factual-copy scan to cover the
         # new What Changed panel + its storage + facts chokepoint.
         ROOT / "dashboard" / "frontend" / "whatChangedStorage.js",
@@ -452,6 +488,12 @@ def test_committed_dashboard_dist_references_existing_signal_trust_bundle():
     assert "todays-focus-benchmark" in bundle_text
     assert "BTC 4h" in bundle_text
     assert "SOL 4h" in bundle_text
+    # DASH-07 / SIG-09 + SIG-08 — regime + earliness strip className + literal
+    # copy shipped to dist.
+    assert "todays-focus-regime" in bundle_text
+    assert "7d/trade" in bundle_text
+    assert "vs CG trending" in bundle_text
+    assert "no reference" in bundle_text
 
 
 def test_what_changed_files_exist():

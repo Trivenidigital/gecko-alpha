@@ -645,7 +645,17 @@ def create_app(db_path: str | None = None) -> FastAPI:
         firewall provides stricter structural validation than Pydantic.
         See feedback_response_model_vs_prod_data_shape memory.
         """
-        return await db.get_todays_focus(_db_path, window_hours=window_hours)
+        # DASH-07 / SIG-09: server-side, env-tunable hostile-cue threshold for
+        # the trailing-7d per-trade PnL strip. Fall back to the db-layer
+        # default when Settings failed to initialise (misconfigured .env).
+        hostile_threshold = None
+        if _DASHBOARD_SETTINGS is not None:
+            hostile_threshold = _DASHBOARD_SETTINGS.REGIME_HOSTILE_PER_TRADE_USD
+        return await db.get_todays_focus(
+            _db_path,
+            window_hours=window_hours,
+            hostile_per_trade_threshold_usd=hostile_threshold,
+        )
 
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():

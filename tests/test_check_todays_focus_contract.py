@@ -232,9 +232,7 @@ def test_sparkline_meta_flag_false_is_critical():
     payload = _payload([row], sparkline_is_visual_price_history_only=False)
     result = _MOD.validate_payload(payload)
     assert not result.is_clean
-    assert any(
-        "must be exactly" in c and "True" in c for c in result.criticals
-    )
+    assert any("must be exactly" in c and "True" in c for c in result.criticals)
 
 
 def test_sparkline_meta_flag_truthy_one_is_critical():
@@ -315,6 +313,7 @@ def test_sparkline_unavailable_suffixed_string_is_banned():
 
 
 # PR-D: market_benchmarks contract firewall tests.
+
 
 def test_valid_market_benchmarks_with_flag_passes():
     payload = _payload(
@@ -452,3 +451,202 @@ def test_market_benchmarks_zero_delta_passes():
     )
     result = _MOD.validate_payload(payload)
     assert result.is_clean, result.criticals
+
+
+# DASH-07 / SIG-09: trailing-7d per-trade PnL contract firewall tests.
+
+
+def _trailing_block(**overrides):
+    block = {
+        "closed_trades": 6,
+        "per_trade_usd": -32.5,
+        "total_pnl_usd": -195.0,
+        "display_threshold_usd": -10.0,
+        "n_gate": 5,
+        "hostile": True,
+        "window_days": 7,
+    }
+    block.update(overrides)
+    return block
+
+
+def test_trailing_pnl_valid_with_flag_passes():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_trailing_pnl_both_absent_passes():
+    result = _MOD.validate_payload(_payload([_row()]))
+    assert result.is_clean, result.criticals
+
+
+def test_trailing_pnl_without_flag_is_critical():
+    payload = _payload([_row()], trailing_7d_paper_pnl=_trailing_block())
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_flag_without_block_is_critical():
+    payload = _payload([_row()], trailing_7d_paper_pnl_is_visual_context_only=True)
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_flag_truthy_one_is_critical():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(),
+        trailing_7d_paper_pnl_is_visual_context_only=1,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_unknown_subkey_is_critical():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(recommend_size=1.0),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_string_value_is_critical():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(per_trade_usd="-32.5"),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_hostile_non_bool_is_critical():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(hostile=1),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_hostile_below_gate_is_critical():
+    """hostile MUST be False below n_gate (display-only cue is gated)."""
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(closed_trades=3, hostile=True),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_trailing_pnl_zero_closed_trades_is_critical():
+    payload = _payload(
+        [_row()],
+        trailing_7d_paper_pnl=_trailing_block(closed_trades=0, hostile=False),
+        trailing_7d_paper_pnl_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+# SIG-08: earliness-vs-trending contract firewall tests.
+
+
+def _earliness_block(**overrides):
+    block = {
+        "median_lead_time_min": 21938.0,
+        "count_ok": 65,
+        "count_no_reference": 99,
+        "count_total": 164,
+        "no_reference_pct": 60.4,
+        "window_days": 30,
+    }
+    block.update(overrides)
+    return block
+
+
+def test_earliness_valid_with_flag_passes():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_earliness_null_median_when_no_ok_passes():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(
+            median_lead_time_min=None,
+            count_ok=0,
+            count_no_reference=5,
+            count_total=5,
+            no_reference_pct=100.0,
+        ),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert result.is_clean, result.criticals
+
+
+def test_earliness_without_flag_is_critical():
+    payload = _payload([_row()], earliness_vs_trending=_earliness_block())
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_earliness_unknown_subkey_is_critical():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(source_rank=1),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_earliness_null_median_with_positive_count_ok_is_critical():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(median_lead_time_min=None),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_earliness_no_reference_pct_out_of_range_is_critical():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(no_reference_pct=150.0),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean
+
+
+def test_earliness_zero_count_total_is_critical():
+    payload = _payload(
+        [_row()],
+        earliness_vs_trending=_earliness_block(
+            count_total=0,
+            count_ok=0,
+            count_no_reference=0,
+            median_lead_time_min=None,
+            no_reference_pct=0.0,
+        ),
+        earliness_vs_trending_is_visual_context_only=True,
+    )
+    result = _MOD.validate_payload(payload)
+    assert not result.is_clean

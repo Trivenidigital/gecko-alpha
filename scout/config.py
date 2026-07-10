@@ -267,6 +267,15 @@ class Settings(BaseSettings):
     # 1-3 DexScreener calls). Initial 995-row backlog drains in ~5h.
     LIQUIDITY_BACKFILL_BATCH_MAX: int = Field(default=50, ge=1, le=1000)
 
+    # DASH-07 / SIG-09 (display-only regime strip, 2026-07-10): trailing-7d
+    # per-trade paper PnL hostile-cue threshold. When the trailing-7d
+    # SUM(pnl_usd)/COUNT over closed paper_trades falls BELOW this value, the
+    # Today's Focus regime strip renders the figure with a hostile (red) tint.
+    # DISPLAY-ONLY — gates no trading behaviour; the throttle half of SIG-09 is
+    # evidence-gated and out of scope. Env-tunable server-side. Default
+    # -10.0 USD/trade.
+    REGIME_HOSTILE_PER_TRADE_USD: float = -10.0
+
     # MiroFish
     MIROFISH_URL: str = "http://localhost:5001"
     # ge=1 — zero would trigger instant timeout on every call; le=600

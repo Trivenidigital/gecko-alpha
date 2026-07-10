@@ -386,12 +386,11 @@ async def test_todays_focus_empty_state_is_factual(client):
 # data even though dashboard/db.py populated it correctly. These tests
 # catch the model-vs-data drift at the endpoint layer.
 
+
 async def test_todays_focus_sparkline_field_survives_response_model(client):
     c, db = client
     await _insert_open_trade(db._conn, token_id="paper-sparkline")
-    await _insert_volume_history_points(
-        db._conn, coin_id="paper-sparkline", n=24
-    )
+    await _insert_volume_history_points(db._conn, coin_id="paper-sparkline", n=24)
 
     resp = await c.get("/api/todays_focus?window_hours=36")
     assert resp.status_code == 200, resp.text
@@ -410,9 +409,7 @@ async def test_todays_focus_sparkline_field_survives_response_model(client):
         assert isinstance(pair, list) and len(pair) == 2
         assert isinstance(pair[0], int) and pair[0] > 0
         assert isinstance(pair[1], (int, float)) and pair[1] > 0
-    assert (
-        payload["meta"].get("sparkline_is_visual_price_history_only") is True
-    )
+    assert payload["meta"].get("sparkline_is_visual_price_history_only") is True
 
 
 async def test_todays_focus_sparkline_omitted_below_density_floor(client):
@@ -576,3 +573,98 @@ async def test_todays_focus_benchmarks_only_btc_when_solana_missing(client):
     assert "btc_4h_pct" in meta["market_benchmarks"]
     assert "sol_4h_pct" not in meta["market_benchmarks"]
     assert meta.get("market_benchmarks_is_visual_context_only") is True
+
+
+# DASH-07 / SIG-09 + SIG-08: endpoint-level wiring. Verifies the api.py ->
+# db.py threshold plumbing and the meta wire-shape survive the ASGI path.
+# (DB-layer coverage that runs on Windows lives in
+# test_todays_focus_regime_strip.py — the httpx path here needs Linux CI.)
+
+
+async def _insert_closed_trade(conn, *, token_id, pnl_usd, closed_days_ago=1.0):
+    now = datetime.now(timezone.utc)
+    opened = (now - timedelta(days=closed_days_ago, hours=6)).isoformat()
+    closed = (now - timedelta(days=closed_days_ago)).isoformat()
+    await conn.execute(
+        """INSERT INTO paper_trades
+           (token_id, symbol, name, chain, signal_type, signal_data,
+            entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price,
+            status, pnl_usd, opened_at, closed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            token_id,
+            token_id.upper()[:8],
+            token_id.title(),
+            "coingecko",
+            "volume_spike",
+            json.dumps({}),
+            100.0,
+            300.0,
+            3.0,
+            20.0,
+            10.0,
+            120.0,
+            90.0,
+            "closed_sl",
+            pnl_usd,
+            opened,
+            closed,
+        ),
+    )
+    await conn.commit()
+
+
+async def test_todays_focus_trailing_pnl_present_and_hostile_via_settings(client):
+    c, db = client
+    # 6 closed trades (>= n_gate) each -500 → per-trade well below any sane
+    # server threshold → hostile True regardless of the .env value.
+    for i in range(6):
+        await _insert_closed_trade(db._conn, token_id=f"closed-{i}", pnl_usd=-500.0)
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    block = payload["meta"]["trailing_7d_paper_pnl"]
+    assert block["closed_trades"] == 6
+    assert block["per_trade_usd"] == -500.0
+    assert block["n_gate"] == 5
+    assert block["window_days"] == 7
+    assert block["hostile"] is True
+    # Threshold is sourced server-side from Settings (env-tunable); assert it
+    # traversed as a finite number rather than pinning an env-dependent value.
+    assert isinstance(block["display_threshold_usd"], (int, float))
+    assert not isinstance(block["display_threshold_usd"], bool)
+    assert payload["meta"]["trailing_7d_paper_pnl_is_visual_context_only"] is True
+
+
+async def test_todays_focus_earliness_present_with_leadtime(client):
+    c, db = client
+    now = datetime.now(timezone.utc)
+    # One open trade with an 'ok' lead-time and one 'no_reference'.
+    await _insert_open_trade(db._conn, token_id="lead-ok")
+    await _insert_open_trade(db._conn, token_id="lead-nr")
+    await db._conn.execute(
+        "UPDATE paper_trades SET lead_time_vs_trending_min = ?, "
+        "lead_time_vs_trending_status = ? WHERE token_id = ?",
+        (600.0, "ok", "lead-ok"),
+    )
+    await db._conn.execute(
+        "UPDATE paper_trades SET lead_time_vs_trending_min = NULL, "
+        "lead_time_vs_trending_status = ? WHERE token_id = ?",
+        ("no_reference", "lead-nr"),
+    )
+    await db._conn.commit()
+
+    resp = await c.get("/api/todays_focus?window_hours=36")
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    _assert_todays_focus_contract(payload)
+    block = payload["meta"]["earliness_vs_trending"]
+    assert block["median_lead_time_min"] == 600.0  # positive → late
+    assert block["count_ok"] == 1
+    assert block["count_no_reference"] == 1
+    assert block["count_total"] == 2
+    assert block["no_reference_pct"] == 50.0
+    assert block["window_days"] == 30
+    assert payload["meta"]["earliness_vs_trending_is_visual_context_only"] is True
