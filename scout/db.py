@@ -82,7 +82,7 @@ class Database:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def initialize(self) -> None:
+    async def initialize(self, *, retire_dead_tables: bool = False) -> None:
         """Open connection and create tables."""
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
@@ -201,6 +201,12 @@ class Database:
         # (ddl-retire) and 20260712 (#400-renumber) are claimed in-flight, so this
         # takes the next free literal.
         await self._migrate_moved_already_postmortems_v1()
+
+        # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
+        # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
+        # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
+        # LAST so every additive migration above has already settled.
+        await self._migrate_retire_dead_tables_v1(enabled=retire_dead_tables)
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
@@ -1923,25 +1929,6 @@ class Database:
                 ON social_signals(coin_id, detected_at);
             CREATE INDEX IF NOT EXISTS idx_social_signals_symbol
                 ON social_signals(symbol);
-
-            CREATE TABLE IF NOT EXISTS social_baselines (
-                coin_id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                avg_social_volume_24h REAL NOT NULL,
-                avg_galaxy_score REAL NOT NULL,
-                last_galaxy_score REAL,
-                interactions_ring TEXT NOT NULL DEFAULT '[]',
-                sample_count INTEGER NOT NULL,
-                last_poll_at TEXT,
-                last_updated TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS social_credit_ledger (
-                utc_date TEXT PRIMARY KEY,
-                credits_used INTEGER NOT NULL,
-                last_updated TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS velocity_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 coin_id TEXT NOT NULL,
@@ -6060,6 +6047,133 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "ledger_enrollment_evictions_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+
+    async def _migrate_retire_dead_tables_v1(self, *, enabled: bool = False) -> None:
+        """NAR-06 + INF-07: retire dead tables. schema_version 20260711.
+
+        NAR-06 named three LunarCrush tables; ``social_signals`` is EXCLUDED
+        (see below), so the DROP set is four tables.
+
+        Drops (verified zero live readers, list in the PR body):
+          * ``social_baselines`` / ``social_credit_ledger`` — retired LunarCrush
+            integration, 0 rows ever, only readers/writers were the deleted
+            LunarCrush code.
+          * ``gainers_comparisons_bak_20260602051857`` — one-off backup artifact
+            (scripts/backfill_gainers_comparisons.py mints new timestamped
+            backups; it never reads this dated instance).
+          * ``paper_trades_junk_backfill`` — one-off backfill artifact, zero refs.
+
+        ``social_signals`` is deliberately NOT in the set: scout/trending/
+        tracker.py reads it (the trending-comparison "social 4th tier"), a live
+        consumer independent of the retired LunarCrush loop. Dropping it would
+        break that path with "no such table".
+
+        OPT-IN DESTRUCTIVE / fail-closed. Unlike every other migration here the
+        DDL is IRREVERSIBLE — SQLite cannot roll a committed ``DROP TABLE`` back;
+        recovery is restore-from-backup only. So the drops run ONLY when the
+        operator sets ``RETIRE_DEAD_TABLES_ENABLED=true`` at a deploy (plumbed
+        via ``initialize(retire_dead_tables=...)``). The flag IS the
+        recorded-approval hook: no flag, no drop, and — critically — nothing is
+        stamped in ``paper_migrations`` / ``schema_version`` until the drops
+        actually execute, so a later flag-on deploy still performs them.
+
+        Idempotent: once recorded, re-runs skip regardless of the flag.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "retire_dead_tables_v1"
+        schema_version = 20260711
+
+        # Module-local constants, never user input — safe to interpolate.
+        dead_tables = (
+            "social_baselines",
+            "social_credit_ledger",
+            "gainers_comparisons_bak_20260602051857",
+            "paper_trades_junk_backfill",
+        )
+
+        # Idempotence: if already applied, skip regardless of the flag — the
+        # drops already happened on the deploy that recorded the migration.
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("retire_dead_tables_v1_migration_skip_already_applied")
+                return
+
+        # Fail-closed gate: irreversible drops never fire (and nothing is
+        # recorded) until the operator flips the flag at a deploy.
+        if not enabled:
+            _log.info("retire_dead_tables_v1_migration_skip_disabled")
+            return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for retire_dead_tables_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            for table in dead_tables:
+                await conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+            # Record ONLY after the drops actually executed (fail-closed).
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "retire_dead_tables_v1_migration_complete",
+                dropped=list(dead_tables),
+            )
+        except BaseException as e:
+            _log.exception(
+                "retire_dead_tables_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
