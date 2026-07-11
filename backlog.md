@@ -1,5 +1,119 @@
 # gecko-alpha — Backlog
 
+## Reconciliation 2026-07-10 (drift audit vs shipped work + new Fable backlog)
+
+**Forward tracker:** `tasks/backlog_fable_analysis_2026_07_10.md` (68 items across 7
+lanes: MIN / ALR / LIVE / DASH / SIG / INF / NAR). This legacy `backlog.md` and
+`tasks/todo.md` are being wound down in its favor — treat items below per the
+reconciled status; the Fable backlog is authoritative for anything marked
+SUPERSEDED. Audit performed 2026-07-10 against prod master `bb31c18f` + git log +
+the new backlog. Status lines elsewhere in this file are NOT retroactively
+rewritten (no restructure); this section is the authoritative reconciliation index.
+
+### CLOSED-TODAY (shipped/deployed 2026-07-10)
+- **Live-readiness audit Phase 1** (`## Superseded/Closed: 2026-06-22 live-readiness
+  audit`; open PR checkbox) → filed by **#376** (`8ebc6c0a`).
+- **BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS — Phase 1c (cron scheduling)** → wired
+  by **#382** (`eae7ccfa`, inert pending `LIQUIDITY_ENRICHMENT_ENABLED`). *Phase 2
+  (downstream consumer) remains STILL-OPEN-VALID — see below.*
+- **BL-NEW-MINARA-SOLANA-NATIVE-ID** (line ~1361) → dead-feature watchdog gate landed
+  **#436** (`e400e79b`); the native-id fix was already in master (`minara_alert.py`).
+  Recorded in the Fable backlog as **MIN-04** (CODE-SHIPPED-INERT).
+- *Standing concerns closed by tonight's SIG lane (no discrete legacy row):*
+  negative-EV lanes still opening (`narrative_prediction`/`tg_social`) → **#437**
+  (SIG-03 dispatch quarantine); vestigial conviction gate → **#440** (SIG-01 retire).
+
+### CLOSED-EARLIER-BUT-UNMARKED (pre-existing drift — shipped before today, status stale)
+- **P0 SQLite durable maintenance (Part B)** (`tasks/todo.md` PLAN-READY) → **#368**
+  (`1d82b0f1`), deployed.
+- **Dashboard entry snapshot drawer** (`tasks/todo.md` IN-PROGRESS) → **#341**
+  (`f138c95c`); already SHIPPED in the `## Follow-ups filed 2026-05-20` section.
+- **Today's Focus Block Cause + Research Links** (`tasks/todo.md` "IN PROGRESS") →
+  **#304** (`31f11a4`), merged+deployed (body already states this).
+- **Today's Focus V0 / UX Pass / Residual Closure** (`tasks/todo.md` PLANNING/PR-READY)
+  → Today's Focus surface shipped+deployed via **#297** (`87f56207`) and follow-ups.
+- **Codex/Hermes systemd auto-remediation** (`tasks/todo.md` IN-PROGRESS) → **#236**
+  (`7e0292a4`), CI-green, deployed to all 3 VPSes (body already states this).
+- **BL-NEW-HERMES-NARRATIVE-CRON-RUNTIME-TIMEOUT-FIX** (PARTIAL-SHIPPED) → the runtime
+  fix shipped as the `-APPLY` follow-up (concurrency=3, 79s vs 234s).
+- **BL-NEW-HERMES-NARRATIVE-DEFERRED-RESOLUTION-SWEEP** (status header still BLOCKED) →
+  UNBLOCKED 2026-06-30; `resolve_ca` + backfill implemented **#390** (`d76fb7fb`).
+- **BL-NEW-SOURCE-CALL-IDENTITY-RESOLUTION (CA side)** → canonical `contract_coin_map`
+  resolver shipped **#383–#390**. *(Symbol side → SUPERSEDED by NAR-05.)*
+- **BL-NEW-ONE-WORKTREE-PER-SESSION** (Fable-review #4) → codified as the
+  "Worktree-first, one worktree per session" standing rule in project `CLAUDE.md`.
+- **Revival-verdict + held-position watchdog (SCHEDULING-PENDING-OPERATOR)** → scheduled
+  **#399** (`f5a891d9`, 2026-07-06).
+- **BL-NEW-LEDGER-GATE-TIGHTENING** (Fable-review #5) → price-source invariant shipped
+  **#408** (`b23ef0a2`; `price_source` stamped at open, `db.py:5753`,
+  `models.py:50 _require_registered_price_source`). **VERIFY (§9c):** confirm the
+  invariant *blocks* labeling-lane (`price_cache_row`) opens for `dex:` tokens, not
+  only stamps provenance — the item's ask was a blocking gate.
+
+### SUPERSEDED (by the new Fable backlog — cite new ID)
+- Kraken order-placement (PROPOSED/OPERATOR-GATED, line ~120) → **LIVE-11**.
+- M1.5C Minara execution phases (gated on BL-055, line ~1050) → **MIN-06**.
+- BL-NEW-NARRATIVE-SYMBOL-RESOLVER (cashtag→coin_id, line ~452) → **NAR-05**.
+- BL-NEW-MIGRATION-VERSION-SCHEME (Fable-review #2) → **INF-05** + **LIVE-09**.
+- BL-NEW-PR400-MIGRATION-RENUMBER (Fable-review #3) → **LIVE-09**.
+- BL-NEW-SOURCE-CALL-FORWARD-ONLY-COVERAGE (Path 3, line ~352) → **NAR-04**
+  (snapshot-writer activation).
+- BL-NEW-NO-PEAK-RISK-HANDLING / peak-giveback (lines ~513, todo peak-giveback audit)
+  → **SIG-04** (exit optimization) + momentum-death dry-run **#434**.
+- Signal-trust / live-decision-cockpit roadmap (PARTIALLY-SHIPPED/FOLDED, lines
+  ~2401–2450, ~2805–2883) → **DASH-08 / DASH-11** and the DASH lane generally.
+- X-influencer C5 accrual (forward-only, none deployed) → **NAR-03** (formal KILL).
+- Live-trading 4 S1 blockers (M1 audit 2026-07-06) → **LIVE-01 / LIVE-03 / LIVE-04 /
+  LIVE-05** (LIVE-01 shadow-kill unlatch shipped tonight **#439**).
+
+### STILL-OPEN-VALID (not covered by the new backlog — candidates to add to it)
+1. **BL-NEW-LEDGER-EVICTION-DB-MARKER** (REQUIRED 2026-07-02, Fable-review #6) — durable
+   DB eviction marker; only the interim journal-export cron shipped (**#415**). Operator
+   deadline ≈ 3 weeks of deploy-#2 (journald rotation makes backfill lossy). **HIGH.**
+2. **BL-DATETIME-NORMALIZATION** (PROPOSED 2026-07-04, Fable-review #7) — the *code* fix
+   (normalize datetime string-compares / `julianday()` + CI guard); **#427** filed only
+   the lesson + backlog slice. Latent off-by-one across every `datetime('now'` vs stored
+   ISO compare in the tree. **HIGH.**
+3. **BL-NEW-NARRATIVE-RESOLVER-ERROR-RATE-ALARM** (PROPOSED 2026-06-30) — wire
+   `resolver_error_count` into `narrative_resolution_alarms`. **Confirmed still dormant**
+   (`main.py:1723` calls it without the arg). **MED.**
+4. **BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO** (PROPOSED, Path 2 paid) — operator
+   vendor decision (CG Pro ~$129/mo) for historical source-call price coverage. **MED.**
+5. **BL-NEW-CG-DEMO-API-KEY** (RUNBOOK-READY) — operator registers a CG demo key; runbook
+   complete, execution is operator-only. **MED.**
+6. **BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE** (PROPOSED) — `.gitattributes` CRLF +
+   one-time `git update-index --chmod` normalize; **#419** fixed the exec-bit half, the
+   CRLF/`dist/index.html` half still recurs each deploy. **LOW-MED.**
+7. **BL-NEW-CANDIDATE-ALERT-AT-MOST-ONCE** (PROPOSED 2026-07-02) — operator accepted the
+   at-least-once trade-off at #401; port claim-then-demote only if strict semantics
+   wanted. **LOW.**
+8. **BL-NEW-GT-CHAIN-MAP-EXTENSION** (PROPOSED) — add bsc/monad/hyperevm to the GT chain
+   mapper. **LOW.**
+9. **BL-NEW-HERMES-CRON-SUBPROCESS-LIFECYCLE-AUDIT** (AUDITED-DEFERRED) — keep deferred;
+   revisit only if sustained >120s cycles recur. **LOW.**
+10. **Helius / Moralis enable-path** (two conditional PROPOSED rows, lines ~1558/1579) —
+    fire only if operator sets the API key; `SIG-02` covers the *phantom-signal cleanup*
+    side but not the enable path. **LOW.**
+11. **BL-NEW-SQLITE-WAL-PROFILE** + **BL-NEW-CG-RATE-LIMITER-BURST-PROFILE** tuning
+    follow-ups (PROPOSED, evidence-gated 4-week windows now ELAPSED) — the measurement
+    windows closed; the follow-up evaluation is due. **LOW.**
+12. **Long-tail hardening PROPOSED items** (~12: settings-immutability audit follow-up,
+    systemd-drift/config-audit reviewer follow-ups, C2-score/C2-volume SLO docs,
+    revival-verdict reviewer follow-ups) — none in the new 68; low-priority hygiene,
+    file individually only when the work resumes.
+
+### STALE-KILL (no longer coherent — do not implement from the old diagnosis)
+- **X-alerts-schema follow-up** (STALE-PENDING-DRIFT-CHECK, line ~2468) — `/api/x_alerts`
+  healthy after #213/#215 (~0.18s); old slow-path diagnosis is void.
+- **Source-call GT lookback-cap probe + historical-pool-selection probe** (REFUTED /
+  NEGATIVE, lines ~328/332) — closed-with-result; historical GT backfill PARKED.
+- **Early Detection Roadmap phases** (STALE / DO NOT START, line ~1960) + **LunarCrush**
+  paths — dropped (cost + free-layer saturation).
+- **stack=1 bleed** (SHELVED) and **RESEARCH-GATED** rows — keep dormant until their own
+  triggers fire.
+
+---
+
 ## Close-Development Park List 2026-05-22
 
 Operator close-development block 2026-05-22 explicitly parks the following items. **All entries listed below are PARKED — NOT FORGOTTEN.** They remain individually tracked in their existing locations; this section is the consolidated index so future sessions don't accidentally re-scope them.
@@ -2931,16 +3045,16 @@ ssh srilu-vps "(crontab -l | grep -v '/opt/polymarket-ml-signal/') | crontab -"
 
 ## 2026-07-02 — Fable-review follow-ups (PROPOSED)
 
-1. **BL-NEW-CANDIDATE-ALERT-AT-MOST-ONCE** — PROPOSED 2026-07-02. Candidate alert path is at-least-once by design after #401 (record-after-confirmed-delivery; a crash between Telegram 200 and `log_alert` re-sends on restart). If strict at-most-once is wanted, port the claim-then-demote pattern from `scout/trading/tg_alert_dispatch.py:414-448` to the candidate path. Small slice; operator accepted the current trade-off at #401 merge (see `tasks/gecko-alpha-fable-review_2026_07.md` Phase 1).
+1. **BL-NEW-CANDIDATE-ALERT-AT-MOST-ONCE** — PROPOSED 2026-07-02. → **[RECON 2026-07-10: STILL-OPEN-VALID · LOW — operator-accepted trade-off at #401]** Candidate alert path is at-least-once by design after #401 (record-after-confirmed-delivery; a crash between Telegram 200 and `log_alert` re-sends on restart). If strict at-most-once is wanted, port the claim-then-demote pattern from `scout/trading/tg_alert_dispatch.py:414-448` to the candidate path. Small slice; operator accepted the current trade-off at #401 merge (see `tasks/gecko-alpha-fable-review_2026_07.md` Phase 1).
 
-2. **BL-NEW-MIGRATION-VERSION-SCHEME** — PROPOSED 2026-07-02. Date-based `schema_version` integers collide: two migrations on master both chose dates as versions and PR #400 reused `20260702` (already taken by `source_call_price_snapshot_runs_v1`, db.py:5266). Evaluate monotonic sequence numbers (MAX(version)+1 at authoring time) or `date+2-digit-suffix` convention + a CI check asserting uniqueness of `schema_version = N` literals in scout/db.py. The CI uniqueness check is the load-bearing part whichever scheme wins.
+2. **BL-NEW-MIGRATION-VERSION-SCHEME** — PROPOSED 2026-07-02. → **[RECON 2026-07-10: SUPERSEDED by Fable backlog INF-05 + LIVE-09]** Date-based `schema_version` integers collide: two migrations on master both chose dates as versions and PR #400 reused `20260702` (already taken by `source_call_price_snapshot_runs_v1`, db.py:5266). Evaluate monotonic sequence numbers (MAX(version)+1 at authoring time) or `date+2-digit-suffix` convention + a CI check asserting uniqueness of `schema_version = N` literals in scout/db.py. The CI uniqueness check is the load-bearing part whichever scheme wins.
 
-3. **BL-NEW-PR400-MIGRATION-RENUMBER** — PROPOSED 2026-07-02, BLOCKS #400. `_migrate_live_trades_venue_column` in PR #400 uses `schema_version = 20260702` (collides with merged C2 migration) and lacks the description-collision guard other migrations carry — on upgrade it would silently misattribute or fail. Renumber (20260704+ or per BL-NEW-MIGRATION-VERSION-SCHEME) and add the guard before #400 merges.
+3. **BL-NEW-PR400-MIGRATION-RENUMBER** — PROPOSED 2026-07-02, BLOCKS #400. → **[RECON 2026-07-10: SUPERSEDED by Fable backlog LIVE-09]** `_migrate_live_trades_venue_column` in PR #400 uses `schema_version = 20260702` (collides with merged C2 migration) and lacks the description-collision guard other migrations carry — on upgrade it would silently misattribute or fail. Renumber (20260704+ or per BL-NEW-MIGRATION-VERSION-SCHEME) and add the guard before #400 merges.
 
-4. **BL-NEW-ONE-WORKTREE-PER-SESSION** — PROPOSED 2026-07-02. The shared checkout's HEAD moved mid-session to a PR #400 review line (2dbc777a) while another session had uncommitted files there — the documented parallel-session divergence failure mode (memory: feedback_parallel_session_branch_coordination). Establish: every session (human or agent) claims its own `git worktree` before any git state change; the root checkout stays on master, read-only. Enforce via session-start convention in CLAUDE.md before Phase 6 implementation slices.
+4. **BL-NEW-ONE-WORKTREE-PER-SESSION** — PROPOSED 2026-07-02. → **[RECON 2026-07-10: CLOSED-EARLIER — codified as the "Worktree-first, one worktree per session" standing rule in project CLAUDE.md]** The shared checkout's HEAD moved mid-session to a PR #400 review line (2dbc777a) while another session had uncommitted files there — the documented parallel-session divergence failure mode (memory: feedback_parallel_session_branch_coordination). Establish: every session (human or agent) claims its own `git worktree` before any git state change; the root checkout stays on master, read-only. Enforce via session-start convention in CLAUDE.md before Phase 6 implementation slices.
 
-5. **BL-NEW-LEDGER-GATE-TIGHTENING** — PROPOSED 2026-07-02, operator-named (condition (a) on PR #406 approval). The ledger enrollment poller writes price_cache rows for `dex:` tokens (labeling lane), which can satisfy the paper-open gate's "price_cache row exists" branch during a token's 7d enrollment — measurement affecting trading. Tighten the open gate: require `price_source='cg_lane'` OR a price_cache row fresher than X minutes at open (Settings), so labeling-lane rows cannot admit trades. **Hard precondition recorded on the funnel-reopening experiment: no tg_social or dex-producing signal re-enable until this slice is merged AND deployed.**
+5. **BL-NEW-LEDGER-GATE-TIGHTENING** — PROPOSED 2026-07-02, operator-named (condition (a) on PR #406 approval). → **[RECON 2026-07-10: LIKELY CLOSED-EARLIER by #408 price-source invariant — VERIFY (§9c) it BLOCKS labeling-lane (`price_cache_row`) opens for `dex:` tokens, not only stamps provenance]** The ledger enrollment poller writes price_cache rows for `dex:` tokens (labeling lane), which can satisfy the paper-open gate's "price_cache row exists" branch during a token's 7d enrollment — measurement affecting trading. Tighten the open gate: require `price_source='cg_lane'` OR a price_cache row fresher than X minutes at open (Settings), so labeling-lane rows cannot admit trades. **Hard precondition recorded on the funnel-reopening experiment: no tg_social or dex-producing signal re-enable until this slice is merged AND deployed.**
 
-6. **BL-NEW-LEDGER-EVICTION-DB-MARKER** — REQUIRED 2026-07-02 (operator ruling on #406 censoring residual; evict-oldest cap policy ACCEPTED conditional on this). Promote the ledger's eviction record from journal-only (`ledger_enrollment_evicted` log) to a durable DB marker (eviction table or ledger-row flag) so evicted-truncated vs liquidity-death separates via DB state alone. **Deadline: before any analysis beyond the N=30 reopening experiment consumes ledger data, AND within ~3 weeks of deploy-#2** — srilu journald runs size-based rotation (3.9G, no explicit retention config; observed window ≈24 days — an UPPER ESTIMATE measured at pre-deploy write rates: deploy-#2's own journal volume, poller cycle stats + eviction records, accelerates rotation exactly when the data starts existing), so journal backfill becomes lossy after first rotation of the relevant entries; treat ~3 weeks as a ceiling, not a budget. Non-random-censoring note: cap-pressure eviction rises exactly when candidate flow is hottest; missed-winner return estimates must be reported alongside the window's truncation rate.
+6. **BL-NEW-LEDGER-EVICTION-DB-MARKER** — REQUIRED 2026-07-02 (operator ruling on #406 censoring residual; evict-oldest cap policy ACCEPTED conditional on this). → **[RECON 2026-07-10: STILL-OPEN-VALID · HIGH — only the interim journal-export cron shipped (#415); durable DB marker still pending; operator deadline ≈ 3wk of deploy-#2]** Promote the ledger's eviction record from journal-only (`ledger_enrollment_evicted` log) to a durable DB marker (eviction table or ledger-row flag) so evicted-truncated vs liquidity-death separates via DB state alone. **Deadline: before any analysis beyond the N=30 reopening experiment consumes ledger data, AND within ~3 weeks of deploy-#2** — srilu journald runs size-based rotation (3.9G, no explicit retention config; observed window ≈24 days — an UPPER ESTIMATE measured at pre-deploy write rates: deploy-#2's own journal volume, poller cycle stats + eviction records, accelerates rotation exactly when the data starts existing), so journal backfill becomes lossy after first rotation of the relevant entries; treat ~3 weeks as a ceiling, not a budget. Non-random-censoring note: cap-pressure eviction rises exactly when candidate flow is hottest; missed-winner return estimates must be reported alongside the window's truncation rate.
 
-7. **BL-DATETIME-NORMALIZATION** — PROPOSED 2026-07-04 (off-by-one #4, report appendix Q). SQLite string comparisons between a stored ISO datetime column (`T` separator + `+00:00` tz) and `datetime('now',...)` output (space separator, no tz) are wrong at the day boundary: `'T'`(0x54) > `' '`(0x20) at char 10 keeps a row in-window for the whole boundary day (behaves as `DATE() >=` by accident). Confirmed live in `combo_refresh.refresh_all` (`opened_at >= datetime('now','-30 days')`) — #424's suppressed-widened selection moots it for suppressed combos ONLY; every other such comparison inherits the latent bug. **Scope (grep the tree):** every `datetime('now'` compared against a stored ISO/opened_at/closed_at/*_at column. Fix = normalize both sides at write time OR compare on `julianday()`/epoch. Add a CI/lint guard (cousin to the exec-bit guard) asserting no raw string-compare of mismatched datetime formats. Report: `tasks/gecko-alpha-fable-review_2026_07.md` appendix Q + tasks/lessons.md.
+7. **BL-DATETIME-NORMALIZATION** — PROPOSED 2026-07-04 (off-by-one #4, report appendix Q). → **[RECON 2026-07-10: STILL-OPEN-VALID · HIGH — #427 filed docs/lesson + backlog slice only; the code fix (normalize both sides / `julianday()`) + CI guard is unshipped]** SQLite string comparisons between a stored ISO datetime column (`T` separator + `+00:00` tz) and `datetime('now',...)` output (space separator, no tz) are wrong at the day boundary: `'T'`(0x54) > `' '`(0x20) at char 10 keeps a row in-window for the whole boundary day (behaves as `DATE() >=` by accident). Confirmed live in `combo_refresh.refresh_all` (`opened_at >= datetime('now','-30 days')`) — #424's suppressed-widened selection moots it for suppressed combos ONLY; every other such comparison inherits the latent bug. **Scope (grep the tree):** every `datetime('now'` compared against a stored ISO/opened_at/closed_at/*_at column. Fix = normalize both sides at write time OR compare on `julianday()`/epoch. Add a CI/lint guard (cousin to the exec-bit guard) asserting no raw string-compare of mismatched datetime formats. Report: `tasks/gecko-alpha-fable-review_2026_07.md` appendix Q + tasks/lessons.md.
