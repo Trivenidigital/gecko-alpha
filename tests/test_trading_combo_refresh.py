@@ -797,6 +797,11 @@ async def test_permanent_suppression_alert_rearms_after_leaving_state(
     s = settings_factory()
     stub = _StubSender()
     monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", stub)
+    # Run 2 re-suppresses on the fresh losing trade (a §12b reversal) — stub the
+    # reversal sender so it doesn't reach the real aiohttp send path.
+    monkeypatch.setattr(
+        combo_refresh, "_send_suppression_reversal_alert", _StubSender()
+    )
     await _seed_suppressed_combo(db, "gainers_early", remaining=0)
 
     await combo_refresh.refresh_all(db, s)
@@ -959,3 +964,227 @@ async def test_chain_completed_frozen_lock_regression(
     assert stub.calls == 1
     assert "chain_completed" in summary["permanent_suppression"]
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# SIG-07 residual — §12b operator alerts at the combo-suppression WRITE sites
+# that reverse operator-favorable (active/unsuppressed) state. Two transitions:
+#   * newly_suppressed             — an unsuppressed combo becomes suppressed=1
+#   * parole_exhausted_resuppressed — a paroled combo fails its retest on real
+#                                     trades and re-latches with a fresh parole
+# Both silently darkened gainers_early (combo-suppressed 2026-06-12, unnoticed
+# 7.5 weeks). #424 covers only the aged-out permanent state; these cover the
+# transition itself.
+# ---------------------------------------------------------------------------
+
+
+async def test_newly_suppressed_combo_fires_reversal_alert(
+    tmp_path, settings_factory, monkeypatch
+):
+    """An active (unsuppressed) combo that crosses the suppression rule fires a
+    §12b reversal alert naming the combo, the trigger stats, and the revival
+    command, with dispatched + delivered trace logs."""
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    perm_stub = _StubSender()
+    rev_stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", perm_stub)
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev_stub)
+
+    now = datetime.now(timezone.utc)
+    # Fresh combo: 5 wins + 15 losses = 20 trades → 25% WR (< 30% threshold).
+    for _ in range(5):
+        await _insert_trade(db, "gainers_early", 10, 5.0, now - timedelta(days=2))
+    for _ in range(15):
+        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+
+    with structlog.testing.capture_logs() as log_events:
+        summary = await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row["suppressed"] == 1
+
+    # Exactly one reversal alert, with combo + stats + revival command.
+    assert rev_stub.calls == 1
+    msg = rev_stub.messages[0]
+    assert "gainers_early" in msg
+    assert "revive_signal_with_baseline" in msg
+    assert "25.0%" in msg
+    assert "n=20" in msg
+
+    # Surfaced in the summary for main.py logging.
+    reversals = summary["suppression_reversals"]
+    assert any(
+        r["combo_key"] == "gainers_early" and r["transition"] == "newly_suppressed"
+        for r in reversals
+    )
+
+    # §12b dispatched + delivered trace pair.
+    events = {e["event"] for e in log_events}
+    assert "suppression_reversal_alert_dispatched" in events
+    assert "suppression_reversal_alert_delivered" in events
+
+    # Not permanent-suppression — it just traded inside the window.
+    assert perm_stub.calls == 0
+    await db.close()
+
+
+async def test_newly_suppressed_reversal_not_realerted_second_run(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The reversal alert fires once on the transition and is naturally deduped:
+    a subsequent refresh sees the combo already suppressed (no transition)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    rev_stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev_stub)
+
+    now = datetime.now(timezone.utc)
+    for _ in range(5):
+        await _insert_trade(db, "gainers_early", 10, 5.0, now - timedelta(days=2))
+    for _ in range(15):
+        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+
+    await combo_refresh.refresh_all(db, s)
+    assert rev_stub.calls == 1
+
+    summary2 = await combo_refresh.refresh_all(db, s)
+    assert rev_stub.calls == 1, "must NOT re-alert while state is unchanged"
+    assert summary2["suppression_reversals"] == []
+    await db.close()
+
+
+async def test_parole_exhausted_resuppression_fires_reversal_alert(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A suppressed combo whose parole is exhausted, retested on real trades and
+    failed, re-latches with a fresh parole window — a §12b 'failed parole retest'
+    reversal alert must fire."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    perm_stub = _StubSender()
+    rev_stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", perm_stub)
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev_stub)
+
+    now = datetime.now(timezone.utc)
+    original_parole = (now - timedelta(days=6)).isoformat()  # window already open
+    await _seed_suppressed_combo(
+        db, "gainers_early", remaining=0, parole_at=original_parole
+    )
+    # Real, in-window retest trades that fail (0% WR) — NOT a zero-trade combo.
+    for _ in range(20):
+        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+
+    summary = await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row["suppressed"] == 1
+    # Re-armed with a fresh parole window (the transition marker).
+    assert row["parole_trades_remaining"] == s.FEEDBACK_PAROLE_RETEST_TRADES
+    assert row["parole_at"] != original_parole
+
+    assert rev_stub.calls == 1
+    msg = rev_stub.messages[0]
+    assert "gainers_early" in msg
+    assert "parole" in msg.lower()
+    assert "revive_signal_with_baseline" in msg
+    assert any(
+        r["transition"] == "parole_exhausted_resuppressed"
+        for r in summary["suppression_reversals"]
+    )
+    # It traded inside the window → not a permanent-suppression event.
+    assert perm_stub.calls == 0
+    await db.close()
+
+
+async def test_reversal_alert_failure_does_not_break_refresh(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A reversal-alert delivery failure never breaks refresh, and the combo is
+    NOT counted as alerted (so a future run can re-attempt if still in state)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+
+    async def _boom(settings, message):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", _boom)
+
+    now = datetime.now(timezone.utc)
+    for _ in range(5):
+        await _insert_trade(db, "gainers_early", 10, 5.0, now - timedelta(days=2))
+    for _ in range(15):
+        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+
+    summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+    assert summary["failed"] == 0
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row["suppressed"] == 1
+    assert summary["suppression_reversals"] == []
+    await db.close()
+
+
+async def test_healthy_combo_no_reversal_alert(tmp_path, settings_factory, monkeypatch):
+    """A profitable combo that never suppresses produces no reversal alert."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    rev_stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev_stub)
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    now = datetime.now(timezone.utc)
+    for pnl in [10, 20, 30]:
+        await _insert_trade(db, "healthy", pnl, 5.0, now - timedelta(days=1))
+
+    summary = await combo_refresh.refresh_all(db, s)
+    assert rev_stub.calls == 0
+    assert summary["suppression_reversals"] == []
+    await db.close()
+
+
+async def test_preserve_suppressed_combo_no_reversal_alert(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A zero-trade suppressed combo (preserve branch) is NOT a reversal — it is
+    the permanent-suppression path (#424). Only the perm alert fires."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    perm_stub = _StubSender()
+    rev_stub = _StubSender()
+    monkeypatch.setattr(combo_refresh, "_send_permanent_suppression_alert", perm_stub)
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev_stub)
+
+    await _seed_suppressed_combo(db, "gainers_early", remaining=0)
+
+    summary = await combo_refresh.refresh_all(db, s)
+    assert rev_stub.calls == 0
+    assert perm_stub.calls == 1
+    assert summary["suppression_reversals"] == []
+    await db.close()
+
+
+def test_reversal_alert_sender_uses_plain_text_and_source():
+    """§12b: the reversal sender must pass parse_mode=None (underscore-laden
+    combo/signal names + revive_signal_with_baseline would mangle under
+    MarkdownV1) and tag a source= for callsite traceability."""
+    import inspect
+
+    src = inspect.getsource(combo_refresh._send_suppression_reversal_alert)
+    assert "parse_mode=None" in src
+    assert "source=" in src
