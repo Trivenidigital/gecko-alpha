@@ -729,6 +729,19 @@ class Settings(BaseSettings):
         "-tokenized-",
     ]
 
+    # ALR-03 engine universe-exclusion: the ALERT_* filter above suppresses
+    # only the operator SEND — the paper ENGINE still OPENS trades on these
+    # out-of-universe ids (tokenized equities / ETFs), contaminating
+    # paper_trades and every downstream PnL surface. When enabled,
+    # engine.open_trade blocks the OPEN for any token_id matching the SAME
+    # EXCLUDE_ID_PATTERNS above (one universe definition, shared via
+    # scout.token_ids.match_universe_exclude) with decision reason
+    # 'universe_excluded'. Fail-closed (default OFF) so the two layers roll out
+    # independently and a missing / garbled .env value can never silently start
+    # dropping opens. Detection / tracker surfaces are unaffected — only the
+    # paper-trade OPEN is blocked.
+    ENGINE_UNIVERSE_FILTER_ENABLED: bool = False
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the

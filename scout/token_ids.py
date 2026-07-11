@@ -40,3 +40,29 @@ def is_cg_coin_id(token_id: str | None) -> bool:
     if token_id != token_id.lower():
         return False
     return all(c.isalnum() or c in "-_" for c in token_id)
+
+
+def match_universe_exclude(patterns: list[str], token_id: str) -> str | None:
+    """Return the first exclude-pattern that is a case-insensitive substring of
+    *token_id*, else ``None`` (first-match-wins in list order).
+
+    ALR-03 single source of truth for "is this token_id out of universe": the
+    send-layer alert filter (``scout/trading/tg_alert_dispatch._check_universe``),
+    the paper-engine open gate (``scout/trading/engine.open_trade``), and the
+    ``scripts/universe_contamination_report.py`` backfill count all call this
+    against the SAME ``ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS`` list, so there is
+    exactly one universe definition. The per-layer ENABLED flags stay separate
+    — this helper does the substring matching only, never the gating.
+
+    Out-of-universe ids are tokenized equities / ETFs (e.g.
+    ``spy-bstocks-tokenized-stock``); the default pattern ``-tokenized-`` covers
+    every observed prod offender. Matching is a RAW case-insensitive substring,
+    so callers keep patterns specific (see the config field caution).
+    """
+    if not token_id:
+        return None
+    lowered = token_id.lower()
+    for pattern in patterns:
+        if pattern.lower() in lowered:
+            return pattern
+    return None

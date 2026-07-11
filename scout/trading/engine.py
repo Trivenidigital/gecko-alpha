@@ -16,7 +16,7 @@ from scout.trading.params import (
     get_params,
 )
 from scout.trading.decision_events import emit_trade_decision
-from scout.token_ids import is_cg_coin_id
+from scout.token_ids import is_cg_coin_id, match_universe_exclude
 from scout.outcome_ledger import (
     GatedOutSampler,
     liquidity_from_signal_data,
@@ -289,6 +289,38 @@ class TradingEngine:
                         signal_type=signal_type,
                         error=str(exc),
                     )
+
+        # ---------------------------------------------------------------
+        # ALR-03 engine universe-exclusion — keep out-of-universe CoinGecko ids
+        # (tokenized equities / ETFs, e.g. `spy-bstocks-tokenized-stock`) OUT of
+        # paper_trades and every downstream PnL surface. The send-layer filter
+        # (scout/trading/tg_alert_dispatch._check_universe) suppresses only the
+        # operator alert; without THIS gate the ENGINE still OPENS the trade,
+        # contaminating the corpus. Reuses the SAME pattern list as the send
+        # filter (ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS) via the shared
+        # match_universe_exclude helper — ONE universe definition — but is gated
+        # on its OWN fail-closed flag (ENGINE_UNIVERSE_FILTER_ENABLED) so the two
+        # layers roll out independently. Runs BEFORE the quarantine gate (both
+        # are pre-DB, allocation-cheap blocks); a token that is both
+        # universe-excluded and quarantined is recorded 'universe_excluded'.
+        # Detection / tracker surfaces are unaffected — only the OPEN is blocked.
+        # ---------------------------------------------------------------
+        if getattr(self.settings, "ENGINE_UNIVERSE_FILTER_ENABLED", False):
+            universe_pattern = match_universe_exclude(
+                self.settings.ALERT_UNIVERSE_EXCLUDE_ID_PATTERNS, token_id
+            )
+            if universe_pattern is not None:
+                log.info(
+                    "trade_skipped_universe_excluded",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    signal_combo=signal_combo,
+                    pattern=universe_pattern,
+                )
+                await _emit_decision(
+                    "blocked", "universe_excluded", pattern=universe_pattern
+                )
+                return None
 
         # ---------------------------------------------------------------
         # SIG-03 dispatch-quarantine — SINGLE SOURCE OF TRUTH for paper-trade
