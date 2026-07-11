@@ -339,7 +339,21 @@ one-by-one (@alohcooks 72d, NAR-07). Per the operator amendment, ONE script
 monitors ALL FOUR:
 
 - **Check 1 — `tg_alert_log`**: latest `outcome='sent'` row must be newer than
-  `ALERT_SENT_SLO_HOURS` (default 48).
+  `ALERT_SENT_SLO_HOURS` (default 48). **ALR-08 dispatch-activity qualifier:** a
+  stale/empty channel is paged only when the pipeline demonstrably OPENED trades
+  in the same window — `trade_decision_events` rows with `decision='opened'` >
+  `ALERT_DISPATCH_ACTIVITY_THRESHOLD` (cron env, default 0; a cheap `COUNT`).
+  Under universe filter + 24h dedup + quarantine everything is BLOCKED, so zero
+  sends across 48h with zero opens is *legitimate* (nothing was dispatched, so
+  nothing should have alerted), not a dead channel: it is logged
+  `alert_channel_watchdog_alert_channel_quiet_legitimate` and **exits 0, never
+  pages**. `blocked` rows (the skips) are the normal quiet-state and are NOT
+  counted — only `opened` rows are, so the qualifier does not false-positive on
+  exactly the all-blocked scenario it exists to distinguish. Raise the threshold
+  to tolerate the 24h-dedup tail (opens whose alert was legitimately deduped). A
+  MISSING `tg_alert_log` table remains a hard breach (structural, not a quiet
+  market); a missing `trade_decision_events` table counts 0 opens (fail safe
+  toward silence, not a false page).
 - **Check 2 — `paper_daily_summary`**: `MAX(date)` must be within
   `DIGEST_SUMMARY_SLO_DAYS` (default 2; yesterday's row lands ~02:00 UTC daily).
 - **Check 3 — `narrative_alerts_inbound`** (NAR-02): `MAX(received_at)` must be
@@ -351,8 +365,11 @@ monitors ALL FOUR:
   `TG_CHANNEL_STALE_DAYS` (default 14) is flagged in ONE aggregated line listing
   each stale `@handle` and its age in days.
 
-For the freshness checks (1-3) a missing OR empty table is itself a breach
-(silence is never ambiguous). Check 4 is a SET-SCAN, not a freshness gate: an
+For freshness checks 2-3 (and a MISSING `tg_alert_log`) a missing OR empty
+table is itself a breach (silence is never ambiguous). Check 1's stale/empty
+case is additionally gated by the ALR-08 dispatch-activity qualifier above
+(empty-but-no-opens is quiet-legitimate, not a breach). Check 4 is a SET-SCAN,
+not a freshness gate: an
 absent/empty `tg_social_health` (or all channels fresh) is NOT a breach —
 tg_social is a default-off feature and paging on its absence would only train
 the operator to ignore the watchdog. On any breach the script sends ONE
@@ -409,7 +426,7 @@ sed -i '/alert-channel-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.
 
 | Code | Meaning |
 |---|---|
-| 0 | All checks fresh, OR watchdog disabled (no-op) |
+| 0 | All checks fresh; watchdog disabled (no-op); OR the alert channel is quiet-legitimate (0 sent + 0 dispatch activity — logged `alert_channel_watchdog_alert_channel_quiet_legitimate`, never paged; ALR-08) |
 | 5 | One or more breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
 | 1 | DB missing / runtime error / alert-dispatch failure (send raised) |
 | 64 | Unknown argument (wrapper) |

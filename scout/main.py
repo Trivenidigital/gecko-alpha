@@ -1479,6 +1479,41 @@ async def check_outcomes(
     return recorded
 
 
+async def _run_narrative_resolution_watchdog(db, settings, logger) -> list[str]:
+    """REC-02: composition-aware narrative-resolution watchdog.
+
+    Sources a REAL, windowed ``resolver_error`` count from the durable
+    ``narrative_resolver_errors`` table and feeds it into
+    ``narrative_resolution_alarms``. The previous call site passed no count, so
+    the ``resolver_error`` alarm branch was fed a hardcoded 0 and could never
+    fire — a permanently-silent §12a surface. Read-only observability; returns
+    the alarm list (also logged) so the wiring is unit-testable.
+    """
+    from scout.api.narrative_resolver import narrative_resolution_alarms
+
+    n_stats = await db.narrative_resolution_stats()
+    logger.info("narrative_resolution_metrics", **n_stats)
+
+    window_hours = getattr(settings, "NARRATIVE_RESOLVER_ERROR_WINDOW_HOURS", 24)
+    threshold = getattr(settings, "NARRATIVE_RESOLVER_ERROR_ALARM_THRESHOLD", 5)
+    since = (datetime.now(timezone.utc) - timedelta(hours=window_hours)).isoformat()
+    resolver_error_count = await db.count_narrative_resolver_errors(since)
+
+    n_alarms = narrative_resolution_alarms(
+        n_stats,
+        resolver_error_count=resolver_error_count,
+        resolver_error_threshold=threshold,
+    )
+    if n_alarms:
+        logger.warning(
+            "narrative_resolution_alarm",
+            alarms=n_alarms,
+            resolver_error_count=resolver_error_count,
+            resolver_error_window_hours=window_hours,
+        )
+    return n_alarms
+
+
 async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     """Hourly maintenance: outcome check + table prunes.
 
@@ -1716,13 +1751,7 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     # silent mystery. Read-only; does not change scorer/gate/trading behavior.
     if getattr(settings, "NARRATIVE_ENABLED", False):
         try:
-            from scout.api.narrative_resolver import narrative_resolution_alarms
-
-            n_stats = await db.narrative_resolution_stats()
-            logger.info("narrative_resolution_metrics", **n_stats)
-            n_alarms = narrative_resolution_alarms(n_stats)
-            if n_alarms:
-                logger.warning("narrative_resolution_alarm", alarms=n_alarms)
+            await _run_narrative_resolution_watchdog(db, settings, logger)
         except Exception:
             logger.exception("narrative_resolution_metrics_failed")
 

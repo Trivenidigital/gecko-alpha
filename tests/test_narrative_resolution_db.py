@@ -2,12 +2,15 @@
 split metrics, and watchdog logic. Makes 'fresh inbound but zero resolved'
 legible (composition vs failure)."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from scout.db import Database
 from scout.api.narrative_resolver import (
     insert_narrative_alert,
     narrative_resolution_alarms,
+    record_resolver_error,
 )
 
 SOL = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump"
@@ -143,3 +146,64 @@ def test_watchdog_alarms_on_unclassified_and_resolver_errors():
     )
     assert any("unclassified" in x.lower() for x in a)
     assert any("resolver_error" in x.lower() or "resolver error" in x.lower() for x in a)
+
+
+# --- REC-02: durable resolver-error count wired into the alarm branch -------
+# The /api/coin/lookup endpoint (dashboard process) records one row per
+# resolver_error; the pipeline watchdog counts recent rows and feeds the count
+# into narrative_resolution_alarms. Previously main.py passed no count, so the
+# resolver_error branch was fed a hardcoded 0 and could never fire (§12a).
+
+
+async def test_record_resolver_error_creates_table_and_row(db):
+    await record_resolver_error(db._db_path)
+    cur = await db._conn.execute("SELECT COUNT(*) FROM narrative_resolver_errors")
+    assert (await cur.fetchone())[0] == 1
+
+
+async def test_count_resolver_errors_windowed(db):
+    # Three fresh errors via the real recorder + one OLD error inserted directly.
+    for _ in range(3):
+        await record_resolver_error(db._db_path)
+    old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    await db._conn.execute(
+        "INSERT INTO narrative_resolver_errors (occurred_at) VALUES (?)", (old,)
+    )
+    await db._conn.commit()
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    # Only the 3 fresh errors fall inside the 24h window; the 48h-old one does not.
+    assert await db.count_narrative_resolver_errors(since) == 3
+    # A future cutoff sees nothing.
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    assert await db.count_narrative_resolver_errors(future) == 0
+
+
+async def test_count_resolver_errors_missing_table_returns_zero(db):
+    # Older schema / table never created: degrade to 0, never raise.
+    await db._conn.execute("DROP TABLE IF EXISTS narrative_resolver_errors")
+    await db._conn.commit()
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    assert await db.count_narrative_resolver_errors(since) == 0
+
+
+async def test_staged_resolver_error_count_trips_alarm_end_to_end(db):
+    # Stage >= threshold resolver errors, count them over the window, and confirm
+    # the real count trips the resolver_error alarm branch (record -> count ->
+    # alarm), which the hardcoded-0 call site never could.
+    for _ in range(5):
+        await record_resolver_error(db._db_path)
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    count = await db.count_narrative_resolver_errors(since)
+    assert count == 5
+    stats = {"total": 100, "cashtag_only": 100, "ca_bearing": 0, "ca_resolved": 0,
+             "ca_unresolved": 0, "unclassified": 0, "ca_resolve_rate": None}
+    alarms = narrative_resolution_alarms(
+        stats, resolver_error_count=count, resolver_error_threshold=5
+    )
+    assert any("resolver_error" in x.lower() for x in alarms)
+    # Below threshold: no alarm (composition-only stats stay silent).
+    quiet = narrative_resolution_alarms(
+        stats, resolver_error_count=2, resolver_error_threshold=5
+    )
+    assert quiet == []

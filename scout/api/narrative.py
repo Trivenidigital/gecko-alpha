@@ -47,7 +47,11 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, model_validator
 
-from scout.api.narrative_resolver import insert_narrative_alert, resolve_ca
+from scout.api.narrative_resolver import (
+    insert_narrative_alert,
+    record_resolver_error,
+    resolve_ca,
+)
 from scout.config import Settings
 
 _log = structlog.get_logger()
@@ -353,6 +357,11 @@ def create_router(
             return CoinLookupOut(found=False, ca=ca, chain=chain, reason="not_found")
         if result.get("_resolver_error"):
             # V2-PR-review C-SFC2 fold: distinguish unknown-CA from resolver-broken.
+            # REC-02: persist a durable marker so the pipeline watchdog can count a
+            # real resolver_error rate (its alarm branch was fed a hardcoded 0).
+            # record_resolver_error is best-effort/self-swallowing — it never
+            # affects this response.
+            await record_resolver_error(db_path)
             return CoinLookupOut(
                 found=False, ca=ca, chain=chain, reason="resolver_error"
             )
