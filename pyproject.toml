@@ -43,6 +43,11 @@ packages = ["scout", "dashboard"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# LIVE-05: default per-test wall-clock cap (pytest-timeout). A hung poll/await
+# (e.g. an unseeded operator-approval poll defaulting to a 300s deadline) now
+# fails loudly instead of stalling CI. Slow-but-legitimate tests can raise this
+# per-test via @pytest.mark.timeout(N).
+timeout = 60
 
 [dependency-groups]
 dev = [

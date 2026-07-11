@@ -68,6 +68,35 @@ def _settings(**overrides):
     return Settings(**base)
 
 
+async def _seed_open_live_trade(db, *, size_usd, paper_trade_id=901):
+    """Seed one OPEN live_trades row (binance) so the live branch of the
+    cross_venue_exposure view sums it.
+
+    The FK paper_trades row uses chain='coingecko', which the view's minara
+    paper_trades branch filters out — isolating the binance live_trades
+    contribution to the exposure sum.
+    """
+    assert db._conn is not None
+    now = datetime.now(timezone.utc).isoformat()
+    await db._conn.execute(
+        "INSERT OR IGNORE INTO paper_trades "
+        "(id, token_id, symbol, name, chain, signal_type, signal_data, "
+        " entry_price, amount_usd, quantity, tp_price, sl_price, status, opened_at) "
+        "VALUES (?, 'tok', 'TOK', 'Tok', 'coingecko', 'first_signal', '{}', "
+        " 1.0, 100.0, 100.0, 1.2, 0.9, 'open', ?)",
+        (paper_trade_id, now),
+    )
+    await db._conn.execute(
+        "INSERT INTO live_trades "
+        "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, "
+        " size_usd, status, created_at) "
+        "VALUES (?, 'coin', 'TOK', 'binance', 'TUSDT', 'first_signal', "
+        " ?, 'open', ?)",
+        (paper_trade_id, str(size_usd), now),
+    )
+    await db._conn.commit()
+
+
 async def _make_gates(
     db,
     *,
@@ -369,6 +398,40 @@ async def test_gate_exposure_cap_count(tmp_path):
     assert result.passed is False
     assert result.reject_reason == "exposure_cap"
     assert "count=" in result.detail
+    assert venue is not None
+    await db.close()
+
+
+async def test_gate7_exposure_through_live_migrated_view_flag_true(tmp_path):
+    """LIVE-03 structural guard (S1-1 class): with LIVE_TRADING_ENABLED=True,
+    Gate 7 reads the REAL migrated ``cross_venue_exposure`` view
+    (``open_exposure_usd``/``open_count`` columns) instead of shadow_trades.
+
+    The 2026-07-06 live audit found this branch had NO coverage — every other
+    Gate 7 test defaults the flag → shadow branch. A view/reader column-name
+    drift (the audited failure: view recreated as total_usd/count while the
+    reader still selects open_exposure_usd/open_count) would raise
+    OperationalError right here, turning a silent live no-op into a loud test
+    failure. Seeds one $500 open live_trades row (== cap); a $50 request →
+    $550 > cap → exposure_cap, proving the SUM aggregation over the view ran.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_open_live_trade(db, size_usd=Decimal("500"))
+    settings = _settings(
+        LIVE_TRADING_ENABLED=True,
+        LIVE_MAX_EXPOSURE_USD=Decimal("500"),
+        LIVE_MAX_OPEN_POSITIONS=10,  # force the SUM branch, not the COUNT branch
+    )
+    gates = await _make_gates(db, settings=settings)
+    result, venue = await gates.evaluate(
+        signal_type="first_signal",
+        symbol="TEST",
+        size_usd=Decimal("50"),
+    )
+    assert result.passed is False
+    assert result.reject_reason == "exposure_cap"
+    assert "sum=" in result.detail  # SUM-over-view branch fired (not COUNT)
     assert venue is not None
     await db.close()
 
