@@ -554,3 +554,151 @@ async def test_tg_alert_task_cancelled_does_not_log_or_raise():
         _log_tg_alert_task_exception(task)  # must not raise CancelledError
 
     assert not [e for e in logs if e["event"] == "paper_open_alert_task_failed"]
+
+
+# ---------------------------------------------------------------------------
+# SIG-10: trust-weighted paper sizing (paper-only, flag-gated, fail-closed)
+#
+# Resolver-level mapping/registry coverage lives in test_trust_sizing.py; these
+# tests assert the engine wiring — scaling of amount_usd, the 0.0 skip + its
+# decision row, and signal_data recording. Tier resolution is monkeypatched to
+# a deterministic (tier, multiplier) except the one real-registry test, so the
+# assertions do not couple to the committed registry's contents.
+# ---------------------------------------------------------------------------
+
+
+def _trust_engine(db, tmp_path, *, enabled=True, **overrides):
+    s = Settings(
+        TELEGRAM_BOT_TOKEN="test",
+        TELEGRAM_CHAT_ID="test",
+        ANTHROPIC_API_KEY="test",
+        DB_PATH=tmp_path / "test.db",
+        TRADING_ENABLED=True,
+        TRADING_MODE="paper",
+        PAPER_TRADE_AMOUNT_USD=1000.0,
+        PAPER_MAX_EXPOSURE_USD=100000.0,
+        PAPER_TP_PCT=20.0,
+        PAPER_SL_PCT=10.0,
+        PAPER_SLIPPAGE_BPS=50,
+        PAPER_MAX_DURATION_HOURS=48,
+        PAPER_MAX_OPEN_TRADES=1000,
+        PAPER_STARTUP_WARMUP_SECONDS=0,
+        PAPER_TRUST_SIZING_ENABLED=enabled,
+        **overrides,
+    )
+    return TradingEngine(mode="paper", db=db, settings=s)
+
+
+async def _amount_and_signal_data(db, trade_id):
+    cursor = await db._conn.execute(
+        "SELECT amount_usd, signal_data FROM paper_trades WHERE id = ?",
+        (trade_id,),
+    )
+    row = await cursor.fetchone()
+    return row[0], json.loads(row[1] or "{}")
+
+
+async def test_trust_sizing_off_pins_flat_amount(db, tmp_path):
+    """Flag OFF (default): flat PAPER_TRADE_AMOUNT_USD, no trust keys stamped."""
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=60)
+    engine = _trust_engine(db, tmp_path, enabled=False)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        signal_combo="volume_spike",
+    )
+    amount, signal_data = await _amount_and_signal_data(db, trade_id)
+    assert amount == pytest.approx(1000.0)
+    assert "trust_tier" not in signal_data
+    assert "trust_size_multiplier" not in signal_data
+
+
+async def test_trust_sizing_scales_amount_by_tier(db, tmp_path, monkeypatch):
+    """Flag ON: notional scales by the tier multiplier; signal_data records it."""
+    import scout.trading.engine as engine_mod
+
+    monkeypatch.setattr(
+        engine_mod,
+        "resolve_paper_trust_size",
+        lambda signal_type, settings, **kw: ("experimental", 0.5),
+    )
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=60)
+    engine = _trust_engine(db, tmp_path)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        signal_combo="volume_spike",
+    )
+    amount, signal_data = await _amount_and_signal_data(db, trade_id)
+    assert amount == pytest.approx(500.0)  # 1000 * 0.5
+    assert signal_data["trust_tier"] == "experimental"
+    assert signal_data["trust_size_multiplier"] == 0.5
+
+
+async def test_trust_sizing_real_registry_records_signal_data(db, tmp_path):
+    """End-to-end via the committed registry: volume_spike -> trusted (1.0x).
+
+    Amount is unchanged but the tier + multiplier are still recorded so
+    would_be_live re-analysis can decompose by sizing policy.
+    """
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=60)
+    engine = _trust_engine(db, tmp_path)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        signal_combo="volume_spike",
+    )
+    amount, signal_data = await _amount_and_signal_data(db, trade_id)
+    assert amount == pytest.approx(1000.0)
+    assert signal_data["trust_tier"] == "trusted"
+    assert signal_data["trust_size_multiplier"] == 1.0
+
+
+async def test_trust_sizing_zero_skips_open_with_decision_row(
+    db, tmp_path, monkeypatch
+):
+    """A 0.0 (non_tradable) multiplier skips the open and records the reason."""
+    import scout.trading.engine as engine_mod
+
+    monkeypatch.setattr(
+        engine_mod,
+        "resolve_paper_trust_size",
+        lambda signal_type, settings, **kw: ("non_tradable", 0.0),
+    )
+    await _seed_price_cache(db, "bitcoin", 50000.0, age_seconds=60)
+    engine = _trust_engine(db, tmp_path)
+    trade_id = await engine.open_trade(
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={"spike_ratio": 12.3},
+        signal_combo="volume_spike",
+    )
+    assert trade_id is None
+    # No paper trade row opened.
+    cursor = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE token_id = ?", ("bitcoin",)
+    )
+    assert (await cursor.fetchone())[0] == 0
+    # A blocked decision row records the trust_sized_zero reason.
+    cursor = await db._conn.execute(
+        """SELECT decision, reason FROM trade_decision_events
+           WHERE token_id = ? ORDER BY id DESC LIMIT 1""",
+        ("bitcoin",),
+    )
+    row = await cursor.fetchone()
+    assert row == ("blocked", "trust_sized_zero")

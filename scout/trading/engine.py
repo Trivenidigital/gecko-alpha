@@ -23,6 +23,7 @@ from scout.outcome_ledger import (
     record_emission as _ledger_record_emission,
 )
 from scout.price_sources import resolve_price_source
+from scout.trading.trust_sizing import resolve_paper_trust_size
 
 log = structlog.get_logger()
 
@@ -379,6 +380,51 @@ class TradingEngine:
             )
             return None
 
+        # 0b'. SIG-10 trust-weighted paper sizing (paper-only, flag-gated,
+        # fail-closed). Resolve the signal's trust tier from the signal-trust
+        # registry and scale the notional by the operator-configured per-tier
+        # multiplier (applied at step 3 below). A 0.0 multiplier (non_tradable
+        # tier) skips the open entirely — recorded as decision reason
+        # 'trust_sized_zero'.
+        #
+        # Placed after the signal_disabled gate (so a disabled lane still
+        # reports 'signal_disabled') but before the price/duplicate/exposure
+        # DB reads, mirroring the quarantine gate: a zero-sized lane pays no DB
+        # cost. UNKNOWN tier (signal_type absent from the registry) -> the
+        # experimental multiplier, logged inside resolve_paper_trust_size.
+        #
+        # NB: SIG-03 dispatch quarantine (above) supersedes this for
+        # narrative_prediction / tg_social — trust tiers only affect the lanes
+        # that survive quarantine. Flag defaults OFF: trust_multiplier stays
+        # 1.0 and signal_data is untouched (flat sizing pinned).
+        trust_multiplier = 1.0
+        if self.mode == "paper" and getattr(
+            self.settings, "PAPER_TRUST_SIZING_ENABLED", False
+        ):
+            trust_tier, trust_multiplier = resolve_paper_trust_size(
+                signal_type, self.settings
+            )
+            if trust_multiplier <= 0.0:
+                log.info(
+                    "trade_skipped_trust_sized_zero",
+                    token_id=token_id,
+                    signal_type=signal_type,
+                    trust_tier=trust_tier,
+                    trust_multiplier=trust_multiplier,
+                )
+                await _emit_decision(
+                    "blocked",
+                    "trust_sized_zero",
+                    trust_tier=trust_tier,
+                    trust_multiplier=trust_multiplier,
+                )
+                return None
+            # Record the tier + multiplier on signal_data (no schema change) so
+            # would_be_live re-analysis can decompose PnL by the sizing policy
+            # in effect at open time.
+            signal_data["trust_tier"] = trust_tier
+            signal_data["trust_size_multiplier"] = trust_multiplier
+
         # 0c. GA-01 unpriceable-token gate (fail closed). A trade is only
         # admissible if its token_id can be RE-priced after open: either a
         # CG-shaped coin id (served by the CG markets/trending writers and
@@ -517,7 +563,11 @@ class TradingEngine:
                 return None
 
         # 3. Check max exposure
-        trade_amount = amount_usd or self.settings.PAPER_TRADE_AMOUNT_USD
+        # trust_multiplier is 1.0 unless SIG-10 trust-weighted sizing is on
+        # (resolved at step 0b' above); a 0.0 multiplier already returned.
+        trade_amount = (
+            amount_usd or self.settings.PAPER_TRADE_AMOUNT_USD
+        ) * trust_multiplier
         cursor = await conn.execute(
             "SELECT COALESCE(SUM(amount_usd), 0) FROM paper_trades WHERE status = 'open'"
         )
