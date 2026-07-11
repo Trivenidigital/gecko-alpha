@@ -979,6 +979,26 @@ class Settings(BaseSettings):
     PAPER_MOMENTUM_DEATH_ENABLED: bool = False
     PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT: float = 5.0
     PAPER_MOMENTUM_DEATH_DRY_RUN: bool = True
+    # SIG-04 absolute time-death exit — dry-run-only, sub-leg-1 flat-at-24h lane.
+    # W3 analysis-gates verdict (tasks/findings_w3_analysis_gates_2026_07_11.md
+    # §SIG-04, clean cohort n=323): trades still FLAT (<=FLAT_PCT) at the 24h
+    # checkpoint whose running peak never reached ladder leg 1 are dead capital —
+    # exiting them at 24h nets +$1,842 (bootstrap 95% CI [+$1,339,+$2,379],
+    # all-positive) vs a false-trigger cost of only 18 winners/-$438. DISTINCT
+    # band from momentum_death / peak_fade: those gate on a *sustained fade from a
+    # recorded peak*; this gates on *absolute flatness at 24h for a peak that
+    # never reached leg 1* (leg_1_filled_at IS NULL AND max(cp_1h,cp_6h,cp_24h) <
+    # PAPER_LADDER_LEG_1_PCT AND checkpoint_24h_pct <= FLAT_PCT AND
+    # elapsed >= CHECKPOINT_H). Ships DRY_RUN first: the backtest running-peak is
+    # checkpoint-proxied, so the dry-run must observe the LIVE peak before the
+    # flip. Soak gate: n>=15 would-fire events + 0 live runners clipped, then a
+    # separate PAPER_TIME_DEATH_DRY_RUN=False flip PR. Attribution caveat: 78% of
+    # whole-book benefit overlaps SIG-05/#434 stop-avoidance — the distinct
+    # mandate is the sub-3%-peak cohort only. Fail-closed: ENABLED default off.
+    PAPER_TIME_DEATH_ENABLED: bool = False
+    PAPER_TIME_DEATH_DRY_RUN: bool = True
+    PAPER_TIME_DEATH_FLAT_PCT: float = 0.0
+    PAPER_TIME_DEATH_CHECKPOINT_H: int = 24
     # BL-NEW-HPF high-peak fade — single-pass tighter exit on confirmed runners.
     # Fires when peak_pct >= MIN_PEAK_PCT AND current price has retraced
     # >= RETRACE_PCT from peak. Tighter than moonshot trail (30%) because
@@ -1315,6 +1335,30 @@ class Settings(BaseSettings):
         # (peak_pct < PEAK_FADE_MIN_PEAK_PCT) lives in the evaluator, not here.
         if v <= 0:
             raise ValueError(f"PAPER_MOMENTUM_DEATH_MIN_PEAK_PCT must be > 0; got={v}")
+        return v
+
+    @field_validator("PAPER_TIME_DEATH_CHECKPOINT_H")
+    @classmethod
+    def _validate_time_death_checkpoint_h(cls, v: int) -> int:
+        # Positive number of hours only — a zero/negative checkpoint is
+        # meaningless (the lane measures "still flat this many hours in").
+        if v <= 0:
+            raise ValueError(f"PAPER_TIME_DEATH_CHECKPOINT_H must be > 0; got={v}")
+        return v
+
+    @field_validator("PAPER_TIME_DEATH_FLAT_PCT")
+    @classmethod
+    def _validate_time_death_flat_pct(cls, v: float) -> float:
+        # Sane percentage-change band. The backtested operating point is
+        # FLAT<=0 and the soak may sweep it toward 0..3, so this is
+        # intentionally NOT hard-coupled to any other threshold — it only
+        # rejects absurd values (a pct change cannot sit below -100%, and a
+        # "flat" ceiling at/above +100% is not flatness). The sub-leg-1 guard
+        # (max(cp) < PAPER_LADDER_LEG_1_PCT) lives in the evaluator, not here.
+        if not (-100.0 < v < 100.0):
+            raise ValueError(
+                f"PAPER_TIME_DEATH_FLAT_PCT must be in (-100, 100); got={v}"
+            )
         return v
 
     @field_validator("MIROFISH_URL")
