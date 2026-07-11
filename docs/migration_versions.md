@@ -63,6 +63,7 @@ number to appear in the table below.
 | 20260704 | signal_outcome_ledger_v1 | #406 | |
 | 20260705 | price_provenance_v1 | #408 | |
 | 20260710 | ledger_enrollment_evictions_v1 | #448 |
+| 20260713 | moved_already_postmortems_v1 | #459 |
 
 ## Notes / gaps
 
