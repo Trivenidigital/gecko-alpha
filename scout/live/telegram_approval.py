@@ -109,6 +109,83 @@ async def has_active_override(
     return (await cur.fetchone()) is not None
 
 
+async def _send_approval_alert(
+    *,
+    session: Any,
+    settings: Any,
+    paper_trade: Any,
+    venue: str | None,
+    gate: str | None,
+    timeout_sec: float,
+) -> None:
+    """Best-effort Telegram notification that a live trade needs approval.
+
+    LIVE-07 (S2-1 fix): before this, ``request_operator_approval`` only
+    logged + polled, so every early live trade blocked ``timeout_sec`` then
+    rejected with the operator never told there was anything to approve.
+
+    §12b: emits ``live_approval_alert_dispatched`` / ``_delivered`` structured
+    logs around the send so the fire is traceable regardless of delivery
+    outcome (the alerter logs only on failure). ``parse_mode=None`` because
+    the body carries underscore-bearing signal/gate names (``gainers_early``,
+    ``new_venue_gate``) that MarkdownV1 would mangle without erroring.
+
+    The send is best-effort: a delivery failure is logged but does NOT block
+    the override poll (the trade fails closed on timeout, never on the alert).
+    Skips silently (with a log) when no aiohttp session / settings are
+    injected — the call sites that cannot supply them keep the prior
+    log-and-poll behaviour rather than crashing.
+    """
+    pt_id = getattr(paper_trade, "id", None)
+    if session is None or settings is None:
+        log.info(
+            "live_approval_alert_skipped",
+            paper_trade_id=pt_id,
+            venue=venue,
+            gate=gate,
+            reason="no_session_or_settings",
+        )
+        return
+    from scout import alerter  # local import (Windows OpenSSL)
+
+    minutes = max(int(timeout_sec // 60), 1)
+    body = (
+        f"Live trade #{pt_id} needs approval "
+        f"(venue={venue}, gate={gate}). "
+        f"Set /auto-approve venue={venue} within {minutes} min or it "
+        f"will be rejected."
+    )
+    try:
+        log.info(
+            "live_approval_alert_dispatched",
+            paper_trade_id=pt_id,
+            venue=venue,
+            gate=gate,
+        )
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            parse_mode=None,
+            source="live_approval",
+        )
+        log.info(
+            "live_approval_alert_delivered",
+            paper_trade_id=pt_id,
+            venue=venue,
+            gate=gate,
+        )
+    except Exception as exc:
+        log.exception(
+            "live_approval_alert_failed",
+            paper_trade_id=pt_id,
+            venue=venue,
+            gate=gate,
+            err=str(exc),
+            err_type=type(exc).__name__,
+        )
+
+
 async def request_operator_approval(
     db: Database,
     *,
@@ -116,6 +193,8 @@ async def request_operator_approval(
     candidate: Any,
     gate: str | None,
     timeout_sec: float = APPROVAL_TIMEOUT_DEFAULT_SEC,
+    session: Any = None,
+    settings: Any = None,
 ) -> bool:
     """Engine-side approval entrypoint. Posts a Telegram alert and polls
     `live_operator_overrides` for an `auto_approve` row matching the
@@ -125,10 +204,13 @@ async def request_operator_approval(
       True  — operator approved (auto_approve override set within window)
       False — denied or timeout
 
-    M1 scaffold: actual Telegram POST is delegated to the alerter
-    module (which got wired with bot credentials 2026-05-06). This
-    function handles only the polling + decision side, so the engine
-    can integrate without depending on bot-side command parsing.
+    `session` (aiohttp.ClientSession) + `settings` are used to deliver the
+    operator-facing Telegram alert; when either is omitted the function
+    degrades to the prior log-and-poll behaviour (see
+    :func:`_send_approval_alert`). The bot-side command parsing that turns an
+    operator reply into an override row wires up to the telethon listener
+    (BL-064) in M1.5; for M1 the operator writes rows via SQL / the
+    dashboard, and the engine consults them here.
     """
     log.info(
         "operator_approval_requested",
@@ -137,9 +219,18 @@ async def request_operator_approval(
         gate=gate,
         timeout_sec=timeout_sec,
     )
+    venue = getattr(candidate, "venue", None)
+    # LIVE-07: actually notify the operator that a trade is waiting.
+    await _send_approval_alert(
+        session=session,
+        settings=settings,
+        paper_trade=paper_trade,
+        venue=venue,
+        gate=gate,
+        timeout_sec=timeout_sec,
+    )
     poll_interval = 2.0
     deadline = asyncio.get_event_loop().time() + timeout_sec
-    venue = getattr(candidate, "venue", None)
     while asyncio.get_event_loop().time() < deadline:
         if await has_active_override(db, override_type="auto_approve", venue=venue):
             log.info(
