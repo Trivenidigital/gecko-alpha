@@ -417,17 +417,31 @@ def test_contract_dispatcher_today_count_uses_start_of_day_semantics():
     """T9b — pins F2 mitigation. Dashboard MUST use identical date math
     as the dispatcher's gate. If dispatcher refactors to '-24 hours' or
     similar, dashboard cap badge would diverge from gate decision near
-    midnight UTC. Source-grep belt-and-suspenders for the runtime path."""
+    midnight UTC. Source-grep belt-and-suspenders for the runtime path.
+
+    Post-INF-04 both surfaces bind today's UTC-midnight bound via the shared
+    ``scout.timeutil.sql_utc_cutoff(start_of_day=True)`` helper (replacing the
+    old ``datetime('now', 'start of day')`` SQL literal). Pinning the shared
+    call on BOTH sides is a stronger coupling guarantee than the previous
+    one-sided literal grep — they cannot silently diverge."""
     import inspect
+
+    from dashboard.db import get_tg_social_per_channel_cashtag_today
     from scout.social.telegram.dispatcher import _channel_cashtag_trades_today_count
 
-    src = inspect.getsource(_channel_cashtag_trades_today_count)
-    assert "'start of day'" in src or '"start of day"' in src, (
+    token = "sql_utc_cutoff(start_of_day=True)"
+    dispatcher_src = inspect.getsource(_channel_cashtag_trades_today_count)
+    dashboard_src = inspect.getsource(get_tg_social_per_channel_cashtag_today)
+    assert token in dispatcher_src, (
         "BL-065 dispatcher's _channel_cashtag_trades_today_count no longer "
-        "uses 'start of day' SQL literal — dashboard's "
+        f"binds {token} — dashboard's "
         "dashboard/db.py:get_tg_social_per_channel_cashtag_today MUST be "
         "updated to match the new date-math semantics, otherwise the "
         "cap badge will diverge from the dispatcher's actual gate decision."
+    )
+    assert token in dashboard_src, (
+        "dashboard get_tg_social_per_channel_cashtag_today no longer binds "
+        f"{token} — it has diverged from the dispatcher's cap gate."
     )
 
 

@@ -30,6 +30,7 @@ from scout.social.telegram.models import (
     AdmissionDecision,
     ResolvedToken,
 )
+from scout.timeutil import sql_utc_cutoff
 from scout.trading.engine import TradingEngine
 
 log = structlog.get_logger()
@@ -287,9 +288,9 @@ async def _channel_cashtag_trades_today_count(db: Database, channel_handle: str)
          WHERE signal_type = 'tg_social'
            AND json_extract(signal_data, '$.channel_handle') = ?
            AND json_extract(signal_data, '$.resolution') = 'cashtag'
-           AND opened_at >= datetime('now', 'start of day')
+           AND opened_at >= ?
         """,
-        (channel_handle,),
+        (channel_handle, sql_utc_cutoff(start_of_day=True)),
     )
     row = await cur.fetchone()
     return int(row[0]) if row else 0

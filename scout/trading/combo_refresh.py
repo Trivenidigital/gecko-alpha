@@ -9,6 +9,7 @@ import aiosqlite
 import structlog
 
 from scout.db import Database
+from scout.timeutil import sql_utc_cutoff
 from scout.trading.paper import CLOSED_COUNTABLE_STATUSES
 
 log = structlog.get_logger()
@@ -260,17 +261,21 @@ async def refresh_all(db: Database, settings) -> dict:
     combos newly alerted this run as entering permanent-suppression state.
     """
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
-    # SQLite accepts the datetime() modifier as a bound parameter, so the
-    # window stays Settings-driven with no hardcoded 30 in the query.
-    window_modifier = f"-{window_days} days"
+    # INF-04: opened_at is stored as Python .isoformat() ('T'-separated,
+    # +00:00). Bind an ISO-8601 cutoff in the SAME format and compare
+    # like-for-like so the window is a true N-day rolling bound, not the
+    # 'T'>' ' day-boundary artifact of comparing against datetime('now', ...).
+    # Still Settings-driven (no literal window in the SQL) and index-usable
+    # (opened_at is not function-wrapped).
+    window_cutoff = sql_utc_cutoff(days=window_days)
     cur = await db._conn.execute(
         "SELECT DISTINCT signal_combo AS combo FROM paper_trades "
         "WHERE signal_combo IS NOT NULL "
-        "  AND opened_at >= datetime('now', ?) "
+        "  AND opened_at >= ? "
         "UNION "
         "SELECT combo_key AS combo FROM combo_performance "
         "WHERE window = '30d' AND suppressed = 1",
-        (window_modifier,),
+        (window_cutoff,),
     )
     rows = await cur.fetchall()
     combos = [r[0] for r in rows if r[0]]
@@ -296,7 +301,7 @@ async def refresh_all(db: Database, settings) -> dict:
             combo_key=key,
         )
 
-    permanent = await _process_permanent_suppression(db, settings, window_modifier)
+    permanent = await _process_permanent_suppression(db, settings, window_cutoff)
 
     log.info(
         "combo_refresh_summary",
@@ -314,7 +319,7 @@ async def refresh_all(db: Database, settings) -> dict:
 
 
 async def _process_permanent_suppression(
-    db: Database, settings, window_modifier: str
+    db: Database, settings, window_cutoff: str
 ) -> list[str]:
     """Detect combos entering permanent-suppression state and fire the §12b
     operator alert once per entry.
@@ -347,8 +352,8 @@ async def _process_permanent_suppression(
         "  AND (suppressed = 0 OR EXISTS ("
         "        SELECT 1 FROM paper_trades pt "
         "        WHERE pt.signal_combo = combo_performance.combo_key "
-        "          AND pt.opened_at >= datetime('now', ?)))",
-        (window_modifier,),
+        "          AND pt.opened_at >= ?))",
+        (window_cutoff,),
     )
 
     # Pending = suppressed, no recent trade, not yet alerted for this entry.
@@ -360,8 +365,8 @@ async def _process_permanent_suppression(
         "  AND NOT EXISTS ("
         "        SELECT 1 FROM paper_trades pt "
         "        WHERE pt.signal_combo = cp.combo_key "
-        "          AND pt.opened_at >= datetime('now', ?))",
-        (window_modifier,),
+        "          AND pt.opened_at >= ?)",
+        (window_cutoff,),
     )
     pending = [r[0] for r in await cur.fetchall()]
     await conn.commit()
