@@ -52,6 +52,63 @@ function parseDeepLink(hash) {
   return null
 }
 
+// DASH-04 tab consolidation. The 14 legacy `activeTab` strings are grouped into
+// four top-level lanes. NAV_GROUPS is the single source of truth for group
+// membership — the nav-map guard test asserts it covers every `activeTab ===`
+// render branch exactly once. Nothing else changes: each tab still renders
+// through the same string-switch below, so existing deep-links and the
+// `#/trade/{id}` route (which resolves to the `trading` tab in Performance)
+// keep working unchanged. Default landing = Act / Today's Focus.
+const NAV_GROUPS = [
+  {
+    id: 'act',
+    label: 'Act',
+    tabs: [
+      { id: 'todays_focus', label: "Today's Focus" },
+      { id: 'trade_inbox', label: 'Trade Inbox' },
+      { id: 'now_tradable', label: 'Now Tradable' },
+      { id: 'conviction', label: 'Conviction' },
+    ],
+  },
+  {
+    id: 'watch',
+    label: 'Watch',
+    tabs: [
+      { id: 'prospective', label: 'Prospective Watchlist' },
+      { id: 'what_changed', label: 'What Changed' },
+      { id: 'signals', label: 'Signals' },
+    ],
+  },
+  {
+    id: 'performance',
+    label: 'Performance',
+    tabs: [
+      { id: 'trading', label: 'Trading' },
+      { id: 'signal_trust', label: 'Signal Trust' },
+      { id: 'briefing', label: 'Briefing' },
+    ],
+  },
+  {
+    id: 'system',
+    label: 'System',
+    tabs: [
+      { id: 'pipeline', label: 'Pipeline' },
+      { id: 'health', label: 'Health' },
+      { id: 'tg', label: 'TG Alerts' },
+      { id: 'x', label: 'X Alerts' },
+    ],
+  },
+]
+
+const DEFAULT_TAB = 'todays_focus'
+
+// Which group owns a given legacy tab id. Falls back to the first group so an
+// unknown/stale activeTab still renders a valid nav (never a blank group row).
+function groupIdForTab(tabId) {
+  const group = NAV_GROUPS.find((g) => g.tabs.some((t) => t.id === tabId))
+  return group ? group.id : NAV_GROUPS[0].id
+}
+
 export default function App() {
   const [status, setStatus] = useState(DEFAULT_STATUS)
   const [candidates, setCandidates] = useState([])
@@ -59,7 +116,7 @@ export default function App() {
   const [signals, setSignals] = useState([])
   const [alerts, setAlerts] = useState([])
   const [activeTab, setActiveTab] = useState(
-    () => parseDeepLink(window.location.hash)?.tab || 'signals'
+    () => parseDeepLink(window.location.hash)?.tab || DEFAULT_TAB
   )
   const [deepLinkTradeId, setDeepLinkTradeId] = useState(
     () => parseDeepLink(window.location.hash)?.tradeId ?? null
@@ -153,6 +210,12 @@ export default function App() {
     }
   }, [fetchAll, connectWs])
 
+  // DASH-04: derive the active lane from the active tab so deep-links and the
+  // #/trade/{id} route light up the correct group row automatically.
+  const activeGroupId = groupIdForTab(activeTab)
+  const activeGroup =
+    NAV_GROUPS.find((g) => g.id === activeGroupId) || NAV_GROUPS[0]
+
   return (
     <div className="dashboard">
       <div className="header">
@@ -164,91 +227,30 @@ export default function App() {
         </div>
       </div>
 
+      <nav className="nav-groups" aria-label="Dashboard sections">
+        {NAV_GROUPS.map((group) => (
+          <button
+            key={group.id}
+            className={`nav-group-btn ${activeGroupId === group.id ? 'active' : ''}`}
+            onClick={() => {
+              if (activeGroupId !== group.id) setActiveTab(group.tabs[0].id)
+            }}
+          >
+            {group.label}
+          </button>
+        ))}
+      </nav>
+
       <div className="tab-bar">
-        <button
-          className={`tab-btn ${activeTab === 'signals' ? 'active' : ''}`}
-          onClick={() => setActiveTab('signals')}
-        >
-          Signals
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'trading' ? 'active' : ''}`}
-          onClick={() => setActiveTab('trading')}
-        >
-          Trading
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'todays_focus' ? 'active' : ''}`}
-          onClick={() => setActiveTab('todays_focus')}
-        >
-          Today&apos;s Focus
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'what_changed' ? 'active' : ''}`}
-          onClick={() => setActiveTab('what_changed')}
-        >
-          What Changed
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'trade_inbox' ? 'active' : ''}`}
-          onClick={() => setActiveTab('trade_inbox')}
-        >
-          Trade Inbox
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'now_tradable' ? 'active' : ''}`}
-          onClick={() => setActiveTab('now_tradable')}
-        >
-          Now Tradable
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'conviction' ? 'active' : ''}`}
-          onClick={() => setActiveTab('conviction')}
-        >
-          Conviction
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'prospective' ? 'active' : ''}`}
-          onClick={() => setActiveTab('prospective')}
-        >
-          Prospective Watchlist
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'signal_trust' ? 'active' : ''}`}
-          onClick={() => setActiveTab('signal_trust')}
-        >
-          Signal Trust
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'pipeline' ? 'active' : ''}`}
-          onClick={() => setActiveTab('pipeline')}
-        >
-          Pipeline
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'briefing' ? 'active' : ''}`}
-          onClick={() => setActiveTab('briefing')}
-        >
-          Briefing
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'health' ? 'active' : ''}`}
-          onClick={() => setActiveTab('health')}
-        >
-          Health
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'tg' ? 'active' : ''}`}
-          onClick={() => setActiveTab('tg')}
-        >
-          TG Alerts
-        </button>
-        <button
-          className={`tab-btn ${activeTab === 'x' ? 'active' : ''}`}
-          onClick={() => setActiveTab('x')}
-        >
-          X Alerts
-        </button>
+        {activeGroup.tabs.map((tab) => (
+          <button
+            key={tab.id}
+            className={`tab-btn ${activeTab === tab.id ? 'active' : ''}`}
+            onClick={() => setActiveTab(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {activeTab === 'signals' && <SignalsTab />}
