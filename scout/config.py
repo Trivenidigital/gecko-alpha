@@ -632,36 +632,14 @@ class Settings(BaseSettings):
         ]
     )
 
-    # -------- LunarCrush Social-Velocity Alerter --------
-    # Research-only social-velocity signals (Telegram plain-text, no paper
-    # trade dispatch). Double kill-switch: either LUNARCRUSH_ENABLED=false or
-    # empty LUNARCRUSH_API_KEY disables the loop entirely.
-    LUNARCRUSH_ENABLED: bool = False
-    LUNARCRUSH_API_KEY: str = ""
-    LUNARCRUSH_BASE_URL: str = "https://lunarcrush.com/api4/public"
-    LUNARCRUSH_POLL_INTERVAL: int = 300  # 5 min (default / normal)
-    LUNARCRUSH_POLL_INTERVAL_SOFT: int = 600  # 10 min (used after 80% credits)
-    LUNARCRUSH_RATE_LIMIT_PER_MIN: int = 9  # under hard 10/min
-    LUNARCRUSH_DAILY_CREDIT_BUDGET: int = 2000  # free tier cap
-    LUNARCRUSH_CREDIT_SOFT_PCT: float = Field(
-        default=0.80, ge=0.0, le=1.0, description="downshift threshold (0..1)"
-    )
-    LUNARCRUSH_CREDIT_HARD_PCT: float = Field(
-        default=0.95, ge=0.0, le=1.0, description="stop threshold (0..1)"
-    )
-    LUNARCRUSH_SOCIAL_SPIKE_RATIO: float = 2.0
-    LUNARCRUSH_GALAXY_JUMP: float = 10.0
-    LUNARCRUSH_INTERACTIONS_ACCEL: float = 3.0
-    # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
-    LUNARCRUSH_DEDUP_HOURS: int = 4
-    LUNARCRUSH_TOP_N: int = 10
-    LUNARCRUSH_BASELINE_MIN_HOURS: int = 24  # warmup wall-clock, interval-aware
-    LUNARCRUSH_BASELINE_MIN_SAMPLES: int = 288  # EWMA alpha denominator
-    LUNARCRUSH_CHECKPOINT_EVERY_N_POLLS: int = 12  # 60 min
-    LUNARCRUSH_RETENTION_DAYS: int = 30
-    # After N consecutive uncaught-crash-then-restart cycles, leave the
-    # social tier down rather than thrash against a broken environment.
-    LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS: int = 5
+    # -------- Dead-table retirement (NAR-06 + INF-07) --------
+    # Opt-in-destructive kill switch for the retire_dead_tables_v1 migration
+    # (scout/db.py). The migration's DROP TABLE statements are IRREVERSIBLE, so
+    # they fire ONLY when this flag is true at a deploy — the flag is the
+    # recorded-approval hook. Default-off (fail-closed): the migration is a
+    # no-op that records nothing until the operator flips it. See db.py
+    # _migrate_retire_dead_tables_v1 for the fail-closed rationale.
+    RETIRE_DEAD_TABLES_ENABLED: bool = False
 
     # -------- CryptoPanic News Feed (BL-053) --------
     # Research-only news tagging for candidate tokens. Free CryptoPanic v1 tier

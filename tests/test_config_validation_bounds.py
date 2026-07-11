@@ -108,18 +108,6 @@ class TestChainBounds:
             Settings()
 
 
-class TestLunarcrushBounds:
-    def test_credit_soft_above_one_rejected(self, _min_env, monkeypatch):
-        monkeypatch.setenv("LUNARCRUSH_CREDIT_SOFT_PCT", "1.2")
-        with pytest.raises(ValidationError, match="LUNARCRUSH_CREDIT_SOFT_PCT"):
-            Settings()
-
-    def test_credit_hard_above_one_rejected(self, _min_env, monkeypatch):
-        monkeypatch.setenv("LUNARCRUSH_CREDIT_HARD_PCT", "1.5")
-        with pytest.raises(ValidationError, match="LUNARCRUSH_CREDIT_HARD_PCT"):
-            Settings()
-
-
 class TestHygieneRetentionBounds:
     """INF-02 / INF-06: retention fields for the two newly-pruned tables."""
 

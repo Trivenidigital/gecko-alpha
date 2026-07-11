@@ -40,17 +40,15 @@ def test_pipeline_config_resolved_includes_top_level_flags():
         "secondwave_enabled=",
         "briefing_enabled=",
         "tg_social_enabled=",
-        "lunarcrush_enabled=",
         "cryptopanic_enabled=",
         "live_trading_enabled=",
         "ingest_watchdog_enabled=",
         "counter_enabled=",
     ]
     missing = [kw for kw in expected_kwargs if kw not in src]
-    assert not missing, (
-        "pipeline_config_resolved missing expected kwargs: "
-        + ", ".join(missing)
-    )
+    assert (
+        not missing
+    ), "pipeline_config_resolved missing expected kwargs: " + ", ".join(missing)
 
 
 def test_pipeline_config_resolved_does_not_log_secrets():
@@ -92,10 +90,9 @@ def test_pipeline_config_resolved_does_not_log_secrets():
                 if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     for needle in forbidden_substrings:
                         if needle in sub.value.upper():
-                            offenders.append(
-                                f"literal {sub.value!r} in {kw.arg!r}"
-                            )
-    assert not offenders, (
-        "pipeline_config_resolved kwargs reference secret-shaped names: "
-        + ", ".join(offenders)
+                            offenders.append(f"literal {sub.value!r} in {kw.arg!r}")
+    assert (
+        not offenders
+    ), "pipeline_config_resolved kwargs reference secret-shaped names: " + ", ".join(
+        offenders
     )

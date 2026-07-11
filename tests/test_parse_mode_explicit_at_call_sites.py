@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 SCOUT_DIR = Path(__file__).resolve().parent.parent / "scout"
 
 
@@ -87,7 +86,6 @@ def test_no_bare_parse_mode_markdown_in_scout_excl_known_intentional():
     KNOWN_MARKDOWN_SITES = {
         # Intentional Markdown bodies with _escape_md coverage:
         ("scout/velocity/detector.py", "format_velocity_alert"),
-        ("scout/social/lunarcrush/alerter.py", "format_social_alert"),
         # The alerter default itself + docstring references:
         ("scout/alerter.py", None),
     }
@@ -115,6 +113,5 @@ def test_no_bare_parse_mode_markdown_in_scout_excl_known_intentional():
         "new parse_mode='Markdown' call sites detected outside the "
         "known-intentional allowlist. CLAUDE.md §12b requires every such "
         "call to have _escape_md coverage on user-data fields plus a "
-        "corresponding test. Sites:\n"
-        + "\n".join(f"  - {r}:{ln}" for r, ln in extra)
+        "corresponding test. Sites:\n" + "\n".join(f"  - {r}:{ln}" for r, ln in extra)
     )

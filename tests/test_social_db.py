@@ -1,10 +1,14 @@
-"""Tests for LunarCrush social-integration DB schema.
+"""Tests for the ``social_signals`` DB schema.
 
-Validates that ``Database.initialize()`` creates the new tables
-(``social_signals``, ``social_baselines``, ``social_credit_ledger``)
-with the expected columns and constraints, and adds the additive
-``detected_by_social`` / ``social_detected_at`` / ``social_lead_minutes``
-columns to ``trending_comparisons``.
+``social_signals`` is RETAINED after NAR-06 (which retired the rest of the
+LunarCrush integration) because scout/trending/tracker.py still reads it as
+the trending-comparison "social 4th tier". Validates that
+``Database.initialize()`` creates ``social_signals`` with the expected
+columns + UNIQUE constraint, and the additive ``detected_by_social`` /
+``social_detected_at`` / ``social_lead_minutes`` columns on
+``trending_comparisons``. The retired ``social_baselines`` /
+``social_credit_ledger`` tables are covered by
+``test_retire_dead_tables_migration.py``.
 """
 
 from __future__ import annotations
@@ -71,28 +75,6 @@ async def test_social_signals_unique_coin_detected_at(db):
         "SELECT COUNT(*) FROM social_signals WHERE coin_id = 'foo'"
     )
     assert (await cursor.fetchone())[0] == 1
-
-
-@pytest.mark.asyncio
-async def test_social_baselines_table_created(db):
-    cols = await _columns(db, "social_baselines")
-    assert "coin_id" in cols
-    assert "symbol" in cols
-    assert "avg_social_volume_24h" in cols
-    assert "avg_galaxy_score" in cols
-    assert "last_galaxy_score" in cols
-    assert "interactions_ring" in cols
-    assert "sample_count" in cols
-    assert "last_poll_at" in cols
-    assert "last_updated" in cols
-
-
-@pytest.mark.asyncio
-async def test_social_credit_ledger_table_created(db):
-    cols = await _columns(db, "social_credit_ledger")
-    assert "utc_date" in cols
-    assert "credits_used" in cols
-    assert "last_updated" in cols
 
 
 @pytest.mark.asyncio

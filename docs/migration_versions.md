@@ -64,6 +64,7 @@ number to appear in the table below.
 | 20260705 | price_provenance_v1 | #408 | |
 | 20260710 | ledger_enrollment_evictions_v1 | #448 |
 | 20260713 | moved_already_postmortems_v1 | #459 |
+| 20260711 | retire_dead_tables_v1 | #461 |
 
 ## Notes / gaps
 

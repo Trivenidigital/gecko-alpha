@@ -337,7 +337,6 @@ def _find_urllib_telegram_dispatches(tree: ast.AST) -> list[_UrllibTelegramDispa
 #      scout/trading/suppression.py:186
 #      scout/live/loops.py:251
 #      scout/main.py:166 (combo_refresh failure)
-#      scout/social/lunarcrush/alerter.py:144 (body uses _escape_md)
 #  - send_telegram_message dispatch sites (HIGH POTENTIAL per audit,
 #    deferred pending 7-day production log review):
 #      scout/main.py:351 (briefing chunked summary)
@@ -364,7 +363,6 @@ _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
     ("scout/trading/suppression.py", 186),
     ("scout/live/loops.py", 251),
     ("scout/main.py", 166),
-    ("scout/social/lunarcrush/alerter.py", 144),
     ("scout/main.py", 351),
     ("scout/main.py", 434),
     ("scout/main.py", 1537),
