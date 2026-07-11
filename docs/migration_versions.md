@@ -62,6 +62,7 @@ number to appear in the table below.
 | 20260703 | ingest_watchdog_state_v1 | #402 | |
 | 20260704 | signal_outcome_ledger_v1 | #406 | |
 | 20260705 | price_provenance_v1 | #408 | |
+| 20260710 | ledger_enrollment_evictions_v1 | #448 |
 
 ## Notes / gaps
 
