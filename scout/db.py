@@ -166,6 +166,10 @@ class Database:
         await self._migrate_dex_instrumentation_v1()
         # Narrative resolution observability: resolution_status column + backfill.
         await self._migrate_narrative_resolution_status_v1()
+        # REC-02: durable narrative CA-resolver error counter so the pipeline
+        # watchdog can feed a REAL count into narrative_resolution_alarms'
+        # resolver_error branch (previously fed a hardcoded 0 — silent §12a).
+        await self._migrate_narrative_resolver_errors_v1()
         # C2 (#392): forward-only price snapshots for CA-keyed source calls.
         # Additive table; the snapshot-writer cron populates it. No source_calls
         # columns are added. The (separate) C3 pricing hookup reads it.
@@ -703,6 +707,85 @@ class Database:
             "cashtag_only_rate": (cashtag / total) if total else None,
             "ca_resolve_rate": (resolved / ca_bearing) if ca_bearing else None,
         }
+
+    async def _migrate_narrative_resolver_errors_v1(self) -> None:
+        """REC-02: durable narrative CA-resolver error counter (§12a).
+
+        The ``/api/coin/lookup`` endpoint (dashboard process) records one row
+        here per ``resolver_error``; the pipeline's narrative watchdog counts
+        recent rows to feed ``narrative_resolution_alarms``' ``resolver_error``
+        branch, which the ``main.py`` call site previously starved with a
+        hardcoded 0. Name-keyed via ``paper_migrations`` (no numeric
+        ``schema_version``, so immune to the INF-05 dup class). Additive +
+        idempotent; observe-only. The table grows only on genuine DB-side
+        resolver failures (rare), so it needs no dedicated prune.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "narrative_resolver_errors_v1"
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            if await cur.fetchone():
+                await conn.execute("COMMIT")
+                return
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS narrative_resolver_errors ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_narrative_resolver_errors_occurred_at "
+                "ON narrative_resolver_errors(occurred_at)"
+            )
+            await conn.execute(
+                "INSERT INTO paper_migrations(name, cutover_ts) VALUES (?, ?)",
+                (migration_name, datetime.now(timezone.utc).isoformat()),
+            )
+            await conn.execute("COMMIT")
+            _db_log.info(
+                "table_migrated",
+                table="narrative_resolver_errors",
+                migration=migration_name,
+            )
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _db_log.exception(
+                    "narrative_resolver_errors_migration_rollback_failed",
+                    err=str(rb_err),
+                )
+            raise
+
+    async def count_narrative_resolver_errors(self, since_iso: str) -> int:
+        """Count narrative CA-resolver errors recorded since ``since_iso`` (REC-02).
+
+        Feeds the ``resolver_error`` branch of ``narrative_resolution_alarms``
+        with a REAL, windowed count (was hardcoded 0 at the call site). Returns 0
+        if the table is absent (older schema) so the watchdog degrades to silence
+        rather than crashing the hourly-maintenance loop.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        try:
+            cur = await self._conn.execute(
+                "SELECT COUNT(*) FROM narrative_resolver_errors "
+                "WHERE occurred_at > ?",
+                (since_iso,),
+            )
+            row = await cur.fetchone()
+        except aiosqlite.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row and row[0] is not None else 0
 
     async def _migrate_predictions_coin_predicted_id_idx_v1(self) -> None:
         """Index latest-prediction lookups used by Trade Inbox context."""

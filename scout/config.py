@@ -340,6 +340,13 @@ class Settings(BaseSettings):
     NARRATIVE_WEEKLY_LEARN_DAY: int = 6
     NARRATIVE_ENABLED: bool = False
     NARRATIVE_SNAPSHOT_RETENTION_DAYS: int = 7
+    # REC-02: window + threshold for the narrative CA-resolver error-rate alarm.
+    # The pipeline watchdog counts narrative_resolver_errors rows within this
+    # window and pages when the count exceeds the threshold. Cross-process: the
+    # /api/coin/lookup endpoint (dashboard) records errors; the pipeline reads
+    # the count. Wiring fix for the branch previously fed a hardcoded 0 (§12a).
+    NARRATIVE_RESOLVER_ERROR_WINDOW_HOURS: int = Field(default=24, ge=1)
+    NARRATIVE_RESOLVER_ERROR_ALARM_THRESHOLD: int = Field(default=5, ge=1)
     NARRATIVE_SCORING_MODEL: str = "claude-haiku-4-5"
     NARRATIVE_LEARN_MODEL: str = "claude-sonnet-4-6"
 

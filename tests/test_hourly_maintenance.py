@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from scout.api.narrative_resolver import record_resolver_error
 from scout.config import Settings
-from scout.main import _run_hourly_maintenance
+from scout.db import Database
+from scout.main import _run_hourly_maintenance, _run_narrative_resolution_watchdog
 
 
 def _make_settings(tmp_path) -> Settings:
@@ -501,3 +503,49 @@ async def test_run_hourly_maintenance_exception_path_logs_structured(tmp_path):
         call.args[0] for call in logger.exception.call_args_list if call.args
     ]
     assert "score_history_prune_failed" in exception_events
+
+
+# --- REC-02: narrative-resolution watchdog wiring (real resolver_error count) ---
+
+
+async def test_narrative_watchdog_staged_errors_trip_alarm(tmp_path):
+    """REC-02: staged resolver errors in the durable table trip the
+    resolver_error alarm branch through _run_narrative_resolution_watchdog — the
+    branch the old hardcoded-0 call site could never fire."""
+    db = Database(tmp_path / "narr.db")
+    await db.initialize()
+    try:
+        for _ in range(6):  # >= default threshold 5
+            await record_resolver_error(db._db_path)
+        settings = _make_settings(tmp_path)  # default window 24h / threshold 5
+        logger = MagicMock()
+
+        alarms = await _run_narrative_resolution_watchdog(db, settings, logger)
+
+        assert any("resolver_error" in a.lower() for a in alarms)
+        warning_events = [
+            (c.args[0], c.kwargs) for c in logger.warning.call_args_list if c.args
+        ]
+        alarm_calls = [
+            kw for evt, kw in warning_events if evt == "narrative_resolution_alarm"
+        ]
+        assert len(alarm_calls) == 1
+        assert alarm_calls[0]["resolver_error_count"] == 6
+    finally:
+        await db.close()
+
+
+async def test_narrative_watchdog_no_errors_no_resolver_alarm(tmp_path):
+    """No resolver errors recorded -> resolver_error branch stays silent (only
+    composition-driven alarms, if any, would appear)."""
+    db = Database(tmp_path / "narr.db")
+    await db.initialize()
+    try:
+        settings = _make_settings(tmp_path)
+        logger = MagicMock()
+
+        alarms = await _run_narrative_resolution_watchdog(db, settings, logger)
+
+        assert not any("resolver_error" in a.lower() for a in alarms)
+    finally:
+        await db.close()

@@ -13,6 +13,7 @@ retry. This module ONLY resolves by CA.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
@@ -71,6 +72,38 @@ def narrative_resolution_alarms(
     if resolver_error_count >= resolver_error_threshold:
         alarms.append(f"resolver_error spike: {resolver_error_count}")
     return alarms
+
+
+async def record_resolver_error(db_path: str) -> None:
+    """Record one narrative CA-resolver error occurrence (REC-02, §12a).
+
+    The ``/api/coin/lookup`` endpoint calls this whenever ``resolve_ca`` returns
+    the ``_resolver_error`` sentinel, so the pipeline's narrative watchdog can
+    count a REAL, windowed error rate. Previously ``main.py`` passed no count to
+    ``narrative_resolution_alarms``, so its ``resolver_error`` branch was fed a
+    hardcoded 0 and could never fire — a silent-forever alarm.
+
+    Cross-process: the endpoint runs in the dashboard process, the watchdog in
+    the pipeline process; they share only the DB file, so the count must be
+    DB-backed. Best-effort — recording an observability row must NEVER break the
+    lookup response, so every error is swallowed + logged. ``CREATE TABLE IF NOT
+    EXISTS`` is defensive: the dashboard may open the DB before the pipeline's
+    migration has run.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS narrative_resolver_errors ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL)"
+            )
+            await db.execute(
+                "INSERT INTO narrative_resolver_errors (occurred_at) VALUES (?)",
+                (now,),
+            )
+            await db.commit()
+    except Exception as e:  # never break the lookup on an observability write
+        _log.warning("narrative_resolver_error_record_failed", err=str(e))
 
 
 async def resolve_ca(db_path: str, *, ca: str, chain: str) -> dict[str, Any] | None:
