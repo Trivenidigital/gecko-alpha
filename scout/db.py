@@ -196,6 +196,12 @@ class Database:
         # rotation). New table only — additive, idempotent.
         await self._migrate_ledger_enrollment_evictions_v1()
 
+        # DASH-05 moved-already/too-late postmortem substrate: one bare-additive
+        # table (#424-style). schema_version 20260713 — 20260710 (#448), 20260711
+        # (ddl-retire) and 20260712 (#400-renumber) are claimed in-flight, so this
+        # takes the next free literal.
+        await self._migrate_moved_already_postmortems_v1()
+
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
         await self.initialize()
@@ -983,6 +989,113 @@ class Database:
                 "trade_decision_events_v1 schema_version description mismatch - "
                 f"found {found!r}"
             )
+
+    async def _migrate_moved_already_postmortems_v1(self) -> None:
+        """DASH-05 forward-recording postmortem substrate, schema_version 20260713.
+
+        One bare-additive table (#424-style). Records — the FIRST time a token
+        crosses into the dashboard's moved-already/"late" state — the T-minus
+        evidence still AVAILABLE at that moment (gainers_snapshots is 7-day
+        retention, so this is forward-only; there is no backfill path for past
+        monsters). Observe-only: nothing here feeds the scorer/gate/trader.
+
+        ``token_id`` is UNIQUE so the recorder's ``INSERT OR IGNORE`` dedups per
+        token. See scout/postmortem/moved_already.py and DASH-05 in
+        tasks/backlog_fable_analysis_2026_07_10.md.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS moved_already_postmortems (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id      TEXT NOT NULL UNIQUE,
+                    detected_at   TEXT NOT NULL,
+                    run_pct       REAL,
+                    evidence      TEXT NOT NULL,
+                    dropping_gate TEXT
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_moved_already_detected "
+                "ON moved_already_postmortems(detected_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260713, now_iso, "moved_already_postmortems_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed", migration="moved_already_postmortems_v1"
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="moved_already_postmortems_v1",
+                )
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED", migration="moved_already_postmortems_v1"
+            )
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260713,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "moved_already_postmortems_v1 schema_version row missing after migration"
+            )
+
+    async def get_recorded_moved_already_token_ids(self) -> set[str]:
+        """Return the token_ids that already have a moved-already postmortem row."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute("SELECT token_id FROM moved_already_postmortems")
+        return {r[0] for r in await cur.fetchall()}
+
+    async def insert_moved_already_postmortem(
+        self,
+        *,
+        token_id: str,
+        detected_at: str,
+        run_pct: float | None,
+        evidence: dict,
+        dropping_gate: str | None,
+    ) -> bool:
+        """Insert one postmortem row; dedup per token via UNIQUE(token_id).
+
+        Returns True when a new row was written, False when the token already
+        had a postmortem (the ``INSERT OR IGNORE`` no-op'd).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            "INSERT OR IGNORE INTO moved_already_postmortems "
+            "(token_id, detected_at, run_pct, evidence, dropping_gate) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (token_id, detected_at, run_pct, json.dumps(evidence), dropping_gate),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # BL-076: shared metadata resolver

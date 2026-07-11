@@ -53,6 +53,7 @@ from scout.outcome_ledger import (
 )
 from scout.conviction.prospective import build_prospective_watchlist
 from scout.conviction.watchlist_watchdog import check_watchlist_freshness
+from scout.postmortem.moved_already import record_moved_already_postmortems
 from scout.instrumentation.capture import capture_entry_mcap, capture_txns
 from scout.observability.sqlite_maintenance import run_sqlite_maintenance
 from scout.news.cryptopanic import (
@@ -1754,6 +1755,16 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             await _run_narrative_resolution_watchdog(db, settings, logger)
         except Exception:
             logger.exception("narrative_resolution_metrics_failed")
+
+    # DASH-05: forward-record a postmortem for each NEW token that has crossed
+    # into the dashboard's moved-already/too-late state, serialising the T-minus
+    # evidence (7-day gainers_snapshots window) still available now. Observe-only,
+    # flag-gated OFF; guarded so a failure can't break the maintenance cycle.
+    if getattr(settings, "MOVED_ALREADY_POSTMORTEM_ENABLED", False):
+        try:
+            await record_moved_already_postmortems(db, settings)
+        except Exception:
+            logger.exception("moved_already_postmortem_failed")
 
 
 async def _maybe_announce_tg_alerts(db, session, settings) -> None:

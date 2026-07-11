@@ -554,6 +554,24 @@ class Settings(BaseSettings):
     # harmless duplication when the flag is on.
     VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=7, ge=7)
 
+    # DASH-05 moved-already / too-late postmortem recorder. FORWARD-recording
+    # only: gainers_snapshots has a 7-day retention so pre-run T-minus evidence
+    # for past monsters (ANSEM +3,354% at TOO_LATE/score 0) is already gone —
+    # backfill is impossible. Flag-gated OFF: when False the recorder never runs
+    # and the pipeline is byte-identical (no scorer/gate/trade/alert change). The
+    # detection predicate MIRRORS the dashboard's _trade_window_state "late" state
+    # (dashboard/db.py): an OPEN paper trade whose pct-from-entry exceeds
+    # MOVED_ALREADY_RUN_PCT_THRESHOLD. Dedup is per token via a UNIQUE(token_id)
+    # on moved_already_postmortems — each token captures one postmortem the first
+    # time it crosses into the moved-already state. See DASH-05 in
+    # tasks/backlog_fable_analysis_2026_07_10.md.
+    MOVED_ALREADY_POSTMORTEM_ENABLED: bool = False
+    # 25.0 mirrors dashboard/db.py _trade_window_state's "late" boundary (pct > 25).
+    MOVED_ALREADY_RUN_PCT_THRESHOLD: float = Field(default=25.0, gt=0)
+    # T-minus evidence window (days) for the gainers_snapshots capture. Bounded at
+    # 7 because gainers_snapshots is 7-day retention — nothing older exists.
+    MOVED_ALREADY_EVIDENCE_WINDOW_DAYS: int = Field(default=7, ge=1, le=7)
+
     # BL-NEW-TG-BURST-PROFILE: per-call instrumentation for TG dispatch
     # frequency. Default True for the 4-week measurement window; toggle
     # False via .env to disable if instrumentation overhead surfaces.
