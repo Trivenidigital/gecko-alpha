@@ -774,6 +774,33 @@ class Settings(BaseSettings):
     # paper-trade OPEN is blocked.
     ENGINE_UNIVERSE_FILTER_ENABLED: bool = False
 
+    # ALR-02 detection-time alert lane. Fires an "early candidate detected"
+    # Telegram alert on the SCORING pass — BEFORE the paper engine's dispatch
+    # gate (which rejects ~99.99%) decides. Reframes the operator alert from
+    # "the robot acted" to "an early candidate is here", serving the core
+    # product promise (beat CG Highlights by minutes). Default OFF (a new noise
+    # surface; observe-first). See tasks/design_detection_time_alert_lane.md.
+    #
+    # Trigger: a CG-sourced candidate first seen within DETECTION_ALERT_MAX_AGE_MIN
+    # that is NOT yet on CG trending (no trending snapshot, or a trending
+    # crossover later than the detection instant — see
+    # engine._compute_lead_time_vs_trending; negative lead_time = early).
+    # Reuses the operator universe filter (ALERT_UNIVERSE_*) and the 24h
+    # per-token dedup window (TG_ALERT_DEDUP_WINDOW_HOURS). Audit rows land in
+    # tg_alert_log with signal_type='detection_lane',
+    # detail='detection_lane[:reason]' — no schema/CHECK change.
+    DETECTION_ALERT_LANE_ENABLED: bool = False
+    # Daily send cap (calendar day, UTC) — the hard noise budget. Counts
+    # tg_alert_log rows with outcome='sent' detail='detection_lane' since UTC
+    # midnight; overflow is audited outcome='blocked_cooldown'
+    # detail='detection_lane:rate_limit'. 0 = a soft off-switch (no sends).
+    DETECTION_ALERT_MAX_PER_DAY: int = Field(default=5, ge=0)
+    # Freshness ceiling: only candidates whose authoritative
+    # candidates.first_seen_at is within this many minutes are eligible, so the
+    # lane surfaces genuinely-new detections rather than stale not-yet-trending
+    # coins re-scored every cycle. Operationalizes "first_seen" in the trigger.
+    DETECTION_ALERT_MAX_AGE_MIN: int = Field(default=180, ge=0)
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the

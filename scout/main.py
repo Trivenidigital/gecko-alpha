@@ -83,6 +83,7 @@ from scout.trading.signals import (
     trade_trending,
     trade_volume_spikes,
 )
+from scout.trading.detection_alert import notify_early_detections
 from scout.briefing.collector import collect_briefing_data
 from scout.briefing.synthesizer import split_message, synthesize_briefing
 from scout import alerter
@@ -120,9 +121,27 @@ _social_restart_tasks: set[asyncio.Task] = set()
 # completes — without a stored reference, the task can be GC'd mid-flight
 # and never reach the callback.
 _counter_followup_tasks: set[asyncio.Task] = set()
+# ALR-02 detection-time alert lane fire-and-forget tasks. Same GC-protection
+# rationale as the sets above — hold a strong ref so a spawned task can't be
+# collected before its done-callback runs.
+_detection_alert_tasks: set[asyncio.Task] = set()
 # Shared counter for consecutive social-loop restarts; resets on any success
 # signal. Used by the done-callback to enforce LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS.
 _social_consecutive_restarts = [0]
+
+
+def _log_detection_alert_task_exception(task: asyncio.Task) -> None:
+    """Surface ALR-02 detection-lane fire-and-forget task failures.
+
+    ``notify_early_detections`` never raises by contract, but the exception is
+    still retrieved (else asyncio warns) and logged as a defensive net.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("detection_alert_task_failed", error=str(exc), exc_info=exc)
+
 
 # Consecutive combo_refresh failure counter; incremented on failure, reset to 0 on success.
 # Used to trigger streak-alert when >= 3 consecutive failures occur.
@@ -1228,6 +1247,23 @@ async def run_cycle(
                 max_mcap=settings.PAPER_MAX_MCAP,
                 settings=settings,
             )
+
+    # ALR-02 detection-time alert lane (default OFF). Fires an "early candidate
+    # detected" Telegram alert BEFORE the paper dispatch gate decides, surfacing
+    # earliness the gate would otherwise reject (~99.99%). Fire-and-forget so a
+    # slow/failed send never blocks the cycle; the lane's own universe / dedup /
+    # rate-limit guards live inside notify_early_detections (which never raises).
+    # candidates.first_seen_at is already upserted above, so the lane reads the
+    # authoritative detection time. See tasks/design_detection_time_alert_lane.md.
+    if settings.DETECTION_ALERT_LANE_ENABLED and all_scored_tokens:
+        _detection_task = asyncio.create_task(
+            notify_early_detections(
+                db, settings, session, candidates=list(all_scored_tokens)
+            )
+        )
+        _detection_alert_tasks.add(_detection_task)
+        _detection_task.add_done_callback(_detection_alert_tasks.discard)
+        _detection_task.add_done_callback(_log_detection_alert_task_exception)
 
     # I1 (observe-only, gated): retroactively map CG-native coin_ids -> their
     # platform contracts. Best-effort, budget-capped; never blocks the gate.
