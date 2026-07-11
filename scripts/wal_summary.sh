@@ -15,6 +15,12 @@ set -euo pipefail
 HOURS="${1:-168}"
 SINCE="${HOURS} hours ago"
 ARCHIVE_DIR="/var/log/gecko-alpha/wal-archive"
+# Bloat threshold: env-tunable, mirrors scout/config.py SQLITE_WAL_BLOAT_BYTES.
+# Week-1 calibration (2026-07-11, REC-05a) raised the default to 60MB. Used as
+# the per-probe fallback when a probe event lacks threshold_bytes, and as the
+# suggester's floor. Set SQLITE_WAL_BLOAT_BYTES in the environment to match a
+# .env override.
+BLOAT_BYTES="${SQLITE_WAL_BLOAT_BYTES:-60000000}"
 
 echo "=== SQLite WAL probe summary, last ${HOURS}h ==="
 echo "NOTE: shm_size_bytes is informational (NOT bloat); wal_size_bytes drives the trigger."
@@ -105,7 +111,7 @@ if [[ "$PROBES" -gt 0 ]]; then
     echo "--- Consecutive-bloat-run aggregator (D6 strict criterion) ---"
     printf "%s\n" "$COMBINED" \
         | grep '"event": "sqlite_wal_probe"' \
-        | jq -r '"\(.timestamp) \(.wal_size_bytes) \(.threshold_bytes // 50000000)"' 2>/dev/null \
+        | jq -r --argjson thr "$BLOAT_BYTES" '"\(.timestamp) \(.wal_size_bytes) \(.threshold_bytes // $thr)"' 2>/dev/null \
         | sort \
         | awk '
             { ts=$1; wal=$2; thresh=$3;
@@ -178,7 +184,7 @@ BASELINE_LINE=$(printf "%s\n" "$COMBINED" \
     | grep '"event": "sqlite_wal_probe"' \
     | jq -r '"\(.timestamp) \(.wal_size_bytes)"' 2>/dev/null \
     | sort \
-    | awk '
+    | awk -v floor="$BLOAT_BYTES" '
         function ts_to_epoch(ts,   cmd, out) {
           cmd = "date -d \"" ts "\" +%s 2>/dev/null"
           cmd | getline out
@@ -218,11 +224,11 @@ BASELINE_LINE=$(printf "%s\n" "$COMBINED" \
           p95 = samples[p95_idx];
           # round 1.5×p95 up to nearest 5MB
           suggested = int((p95 * 1.5) / 5000000 + 1) * 5000000;
-          if (suggested < 50000000) suggested = 50000000;  # floor at default
+          if (suggested < floor) suggested = floor;  # floor at current threshold
           printf "n=%d clean samples (dropped %d restart-bracket)\n", n, restart_count;
           printf "  p50 wal_size_bytes: %d (%.1f MB)\n", p50, p50/1048576.0;
           printf "  p95 wal_size_bytes: %d (%.1f MB)\n", p95, p95/1048576.0;
-          printf "  suggested SQLITE_WAL_BLOAT_BYTES (~1.5×p95 rounded to 5MB, floor 50MB):\n";
+          printf "  suggested SQLITE_WAL_BLOAT_BYTES (~1.5×p95 rounded to 5MB, floor %.0fMB):\n", floor/1048576.0;
           printf "    SQLITE_WAL_BLOAT_BYTES=%d  # %.1f MB\n", suggested, suggested/1048576.0;
           if (restart_count > 1 && n < 100) {
             printf "  WARN: %d process restarts in window; if any during Week 1, re-run after 168 clean probes (data-bound per CLAUDE.md §11)\n", restart_count;

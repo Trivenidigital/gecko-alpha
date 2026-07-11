@@ -563,12 +563,23 @@ class Settings(BaseSettings):
     TG_PACING_MAX_WAIT_SECONDS: float = Field(default=10.0, gt=0)
 
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4: hourly WAL state probe.
-    # Default True for 4-week measurement; threshold default 50MB is a
-    # starting point — operator runs scripts/wal_summary.sh 168 after
-    # Week 1 and sets SQLITE_WAL_BLOAT_BYTES to ~1.5x observed p95 in
-    # .env. See tasks/plan_sqlite_wal_profile.md § Week-1 baseline.
+    # Default True for 4-week measurement.
+    #
+    # Week-1 calibration performed 2026-07-11 (REC-05a, deferred at deploy).
+    # Method (design_sqlite_wal_profile.md §D5 / wal_summary.sh baseline
+    # section): SQLITE_WAL_BLOAT_BYTES = ceil(1.5 × p95_wal / 5MB) × 5MB,
+    # floored at the 50MB default. Post-P0-vacuum steady state (per
+    # tasks/findings_w3_analysis_gates_2026_07_11.md §REC-05): WAL ~14.1MB
+    # median, spikes into the tens-of-MB, 0 bloat events >50MB in the last
+    # 7d. Taking p95 ≈ 40MB from the spike ceiling:
+    #   1.5 × 40MB = 60MB → round up to 5MB = 60MB → ≥50MB floor → 60MB.
+    # This sits above the observed spike ceiling (so recurring tens-of-MB
+    # spikes stop producing spurious WARNINGs) and below the 100MB
+    # checkpoint threshold (so genuine runaway still warns pre-truncation).
+    # Still env-tunable: override SQLITE_WAL_BLOAT_BYTES in .env once longer
+    # forward telemetry refines p95. wal_summary.sh reads the same env var.
     SQLITE_WAL_PROFILE_ENABLED: bool = True
-    SQLITE_WAL_BLOAT_BYTES: int = 50_000_000
+    SQLITE_WAL_BLOAT_BYTES: int = 60_000_000
 
     # BL-NEW-SQLITE-DURABLE-MAINTENANCE (P0 Part B): active WAL/freelist
     # remediation + stale-reader watchdog in _run_hourly_maintenance.

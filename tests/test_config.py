@@ -745,14 +745,17 @@ def test_sqlite_wal_profile_enabled_default_true():
     assert s.SQLITE_WAL_PROFILE_ENABLED is True
 
 
-def test_sqlite_wal_bloat_bytes_default_50mb():
+def test_sqlite_wal_bloat_bytes_default_60mb():
+    # Week-1 calibration (2026-07-11, REC-05a) raised the default from the
+    # uncalibrated 50MB starting point to 60MB (~1.5×p95 of the post-vacuum
+    # steady state, rounded to 5MB, floored at 50MB). See scout/config.py.
     s = Settings(
         _env_file=None,
         TELEGRAM_BOT_TOKEN="t",
         TELEGRAM_CHAT_ID="c",
         ANTHROPIC_API_KEY="k",
     )
-    assert s.SQLITE_WAL_BLOAT_BYTES == 50_000_000
+    assert s.SQLITE_WAL_BLOAT_BYTES == 60_000_000
 
 
 def test_sqlite_wal_bloat_bytes_env_override():
