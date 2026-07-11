@@ -98,6 +98,7 @@ from scout.live.binance_adapter import BinanceSpotAdapter
 from scout.live.config import LiveConfig
 from scout.live.engine import LiveEngine
 from scout.live.kill_switch import KillSwitch
+from scout.live.live_evaluator import live_evaluator_loop
 from scout.live.loops import (
     live_metrics_rollup_loop,
     override_staleness_loop,
@@ -105,6 +106,7 @@ from scout.live.loops import (
 )
 from scout.live.reconciliation import (
     emit_live_startup_status,
+    reconcile_open_live_trades,
     reconcile_open_shadow_trades,
 )
 from scout.live.resolver import OverrideStore, VenueResolver
@@ -2264,6 +2266,19 @@ async def main(argv: list[str] | None = None) -> int:
             ks=live_kill_switch,
             settings=settings,
         )
+        # LIVE-02: boot reconcile open live_trades against the venue by
+        # client_order_id (recover filled-venue/open-local orphans, terminalize
+        # partial/missing). Only in live mode — live_trades has no opens under
+        # shadow. §12b orphan alerts route through the plain-text kill hook.
+        if live_config.mode == "live":
+            await reconcile_open_live_trades(
+                db=db,
+                adapter=live_adapter,
+                config=live_config,
+                ks=live_kill_switch,
+                settings=settings,
+                alert_hook=_kill_switch_alert,
+            )
         await emit_live_startup_status(
             db=db,
             adapter=live_adapter,
@@ -2630,6 +2645,28 @@ async def main(argv: list[str] | None = None) -> int:
                         )
                     )
                 )
+                # LIVE-02: the live close/exit loop — the ONLY path that sells a
+                # live position. Spawned only in live mode AND when
+                # LIVE_CLOSER_ENABLED (the engine __init__ fail-closed guard
+                # crashes if routing is on while this flag is off, so reaching
+                # here with routing on guarantees the flag is True). Runs a
+                # periodic reconcile then a close pass each tick; §12b orphan /
+                # exit-review alerts route through the plain-text kill hook.
+                if live_config.mode == "live" and getattr(
+                    settings, "LIVE_CLOSER_ENABLED", True
+                ):
+                    tasks.append(
+                        asyncio.create_task(
+                            live_evaluator_loop(
+                                db=db,
+                                adapter=live_adapter,
+                                config=live_config,
+                                ks=live_kill_switch,
+                                settings=settings,
+                                alert_hook=_kill_switch_alert,
+                            )
+                        )
+                    )
                 tasks.append(
                     asyncio.create_task(
                         override_staleness_loop(

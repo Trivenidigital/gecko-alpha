@@ -9,6 +9,7 @@ from scout.live.idempotency import (
     CLIENT_ORDER_ID_BINANCE_MAX_LEN,
     lookup_existing_order_id,
     make_client_order_id,
+    make_exit_client_order_id,
     record_pending_order,
 )
 
@@ -16,6 +17,18 @@ from scout.live.idempotency import (
 def test_client_order_id_format():
     cid = make_client_order_id(1, "abcd1234-ef56-7890-abcd-ef0123456789")
     assert cid == "gecko-1-abcd1234"
+
+
+def test_exit_client_order_id_format_deterministic_and_distinct():
+    """LIVE-02: exit cid is deterministic per live_trade row, ≤28 chars, and
+    distinct from any entry cid (so entry/exit orders never collide)."""
+    assert make_exit_client_order_id(7) == "gecko-x-7"
+    assert make_exit_client_order_id(7) == make_exit_client_order_id(7)
+    assert len(make_exit_client_order_id(10**12)) <= CLIENT_ORDER_ID_BINANCE_MAX_LEN
+    # distinct namespace from entry ("gecko-{id}-{uuid8}")
+    assert make_exit_client_order_id(42) != make_client_order_id(
+        42, "abcd1234-ef56-7890-abcd-ef0123456789"
+    )
 
 
 def test_client_order_id_fits_binance_limit():

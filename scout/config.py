@@ -1126,6 +1126,16 @@ class Settings(BaseSettings):
     # per design §2.2).
     LIVE_USE_ROUTING_LAYER: bool = False
 
+    # LIVE-02 interim fail-closed guard. The live close/exit loop
+    # (live_evaluator_loop) is the only thing that ever sells a live position;
+    # a routing engine that can buy while the closer is off is the buy-only
+    # orphan-money state the reconciler exists to prevent. Default True (closer
+    # runs). scout/main.py spawns the loop only when this is True; LiveEngine
+    # __init__ CRASHES if LIVE_MODE=live AND LIVE_USE_ROUTING_LAYER=True AND
+    # this is False (fail-closed — refuse to boot buy-only). Set False only for
+    # a deliberate maintenance window with routing also off.
+    LIVE_CLOSER_ENABLED: bool = True
+
     # Credentials (live mode only; never in .env.example — see spec §4.4)
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None

@@ -202,6 +202,12 @@ class BinanceSpotAdapter(ExchangeAdapter):
                             if code == -1121:
                                 # Unknown symbol — sentinel preserved
                                 return {"__code": -1121}
+                            if code == -2013:
+                                # LIVE-02: "Order does not exist" — sentinel
+                                # preserved (like -1121) so the reconciler's
+                                # fetch_order_by_client_id maps it to None
+                                # (local row = 'missing') instead of a raise.
+                                return {"__code": -2013}
                             if signed and code in (-2014, -2015, -1021):
                                 # Auth-class — never retry (R1-I1)
                                 raise BinanceAuthError(
@@ -790,6 +796,153 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 (slippage_bps, client_order_id),
             )
             await self._db._conn.commit()
+
+    # ------------------------------------------------------------------
+    # LIVE-02 exit / reconcile surface.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _map_order_status(binance_status: str) -> str:
+        """Map a Binance order status to the OrderConfirmation vocabulary."""
+        return {
+            "FILLED": "filled",
+            "PARTIALLY_FILLED": "partial",
+            "CANCELED": "rejected",
+            "EXPIRED": "rejected",
+            "REJECTED": "rejected",
+        }.get(binance_status, "pending")
+
+    def _confirmation_from_body(
+        self, body: dict[str, Any], *, client_order_id: str
+    ) -> OrderConfirmation:
+        """Build an OrderConfirmation from a Binance order response body."""
+        status = self._map_order_status(body.get("status", ""))
+        fill_price = (
+            self._extract_avg_fill_price(body)
+            if status in ("filled", "partial")
+            else None
+        )
+        executed = body.get("executedQty")
+        try:
+            filled_qty = float(executed) if executed not in (None, "") else None
+        except (TypeError, ValueError):
+            filled_qty = None
+        order_id_raw = body.get("orderId")
+        return OrderConfirmation(
+            venue=self.venue_name,
+            venue_order_id=(
+                str(order_id_raw) if order_id_raw not in (None, "") else None
+            ),
+            client_order_id=client_order_id,
+            status=status,
+            filled_qty=filled_qty,
+            fill_price=fill_price,
+            raw_response=body,
+        )
+
+    async def place_exit_order(
+        self,
+        *,
+        pair: str,
+        base_qty: Decimal,
+        client_order_id: str,
+        timeout_sec: float,
+    ) -> OrderConfirmation:
+        """Submit a MARKET SELL of ``base_qty`` base units and resolve to a
+        terminal ``OrderConfirmation`` (LIVE-02 close mechanics).
+
+        - Idempotent via the deterministic exit ``client_order_id``: a
+          crash-retry re-POSTs the same cid; Binance ``-2010`` recovers the
+          existing order via ``origClientOrderId`` GET (no double-sell).
+        - MARKET orders reply FULL, so the POST body is usually already terminal
+          (FILLED) — no poll needed; otherwise poll GET until terminal or
+          timeout (adaptive backoff, mirroring ``await_fill_confirmation``).
+        - Does NOT write a ``live_trades`` row — the live evaluator owns the
+          ledger UPDATE (unlike the buy path's ``record_pending_order``).
+        - Gated by ``LIVE_USE_REAL_SIGNED_REQUESTS`` (R2-I4 emergency-revert).
+        """
+        if not getattr(self._settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False):
+            raise NotImplementedError(
+                "LIVE_USE_REAL_SIGNED_REQUESTS=False — emergency-revert posture"
+            )
+        try:
+            body = await self._signed_post(
+                "/api/v3/order",
+                params={
+                    "symbol": pair,
+                    "side": "SELL",
+                    "type": "MARKET",
+                    "quantity": str(base_qty),
+                    "newClientOrderId": client_order_id,
+                },
+            )
+        except BinanceDuplicateOrderError:
+            # Prior retry's POST already reached Binance — recover its state.
+            log.info(
+                "place_exit_recovered_from_duplicate", client_order_id=client_order_id
+            )
+            body = await self._signed_get(
+                "/api/v3/order",
+                params={"symbol": pair, "origClientOrderId": client_order_id},
+            )
+
+        conf = self._confirmation_from_body(body, client_order_id=client_order_id)
+        if conf.status in ("filled", "partial", "rejected"):
+            return conf
+
+        # Not terminal in the POST reply — poll GET to a terminal state.
+        backoff_schedule = [0.2, 0.5, 1.0, 2.0]
+        deadline = asyncio.get_event_loop().time() + timeout_sec
+        attempt = 0
+        last_body: dict[str, Any] = body
+        while asyncio.get_event_loop().time() < deadline:
+            body = await self._signed_get(
+                "/api/v3/order",
+                params={"symbol": pair, "origClientOrderId": client_order_id},
+            )
+            last_body = body
+            conf = self._confirmation_from_body(body, client_order_id=client_order_id)
+            if conf.status in ("filled", "partial", "rejected"):
+                return conf
+            await asyncio.sleep(
+                backoff_schedule[min(attempt, len(backoff_schedule) - 1)]
+            )
+            attempt += 1
+
+        return OrderConfirmation(
+            venue=self.venue_name,
+            venue_order_id=(
+                str(last_body.get("orderId"))
+                if last_body.get("orderId") not in (None, "")
+                else None
+            ),
+            client_order_id=client_order_id,
+            status="timeout",
+            filled_qty=None,
+            fill_price=None,
+            raw_response=last_body or None,
+        )
+
+    async def fetch_order_by_client_id(
+        self, *, pair: str, client_order_id: str
+    ) -> OrderConfirmation | None:
+        """Return the venue order for ``client_order_id`` (LIVE-02 reconciler).
+
+        Signed GET ``/api/v3/order?origClientOrderId``. Returns ``None`` on
+        Binance ``-2013`` ("Order does not exist") so the reconciler classifies
+        the open-local row as ``missing`` (the buy never produced a position).
+        Gated by ``LIVE_USE_REAL_SIGNED_REQUESTS``.
+        """
+        if not getattr(self._settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False):
+            raise NotImplementedError(
+                "LIVE_USE_REAL_SIGNED_REQUESTS=False — emergency-revert posture"
+            )
+        body = await self._signed_get(
+            "/api/v3/order",
+            params={"symbol": pair, "origClientOrderId": client_order_id},
+        )
+        if body.get("__code") == -2013:
+            return None
+        return self._confirmation_from_body(body, client_order_id=client_order_id)
 
     async def fetch_account_balance(self, asset: str = "USDT") -> float:
         """Return free balance in `asset` via signed GET /api/v3/account.

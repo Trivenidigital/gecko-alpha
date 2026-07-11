@@ -109,6 +109,21 @@ class LiveEngine:
                     "routing=None. Check scout/main.py construction "
                     "passes routing=live_routing kwarg to LiveEngine."
                 )
+            # LIVE-02 fail-closed guard: a routing engine dispatches live BUYS
+            # (_dispatch_live). The ONLY thing that ever sells a live position is
+            # live_evaluator_loop, gated on LIVE_CLOSER_ENABLED. Booting into
+            # "can buy, cannot sell" orphans real money — refuse it. Default
+            # True; set False only for a maintenance window with routing also
+            # off. (main.py spawns the closer loop iff this flag is True.)
+            flag_closer = getattr(settings, "LIVE_CLOSER_ENABLED", True)
+            if flag_routing and not flag_closer:
+                raise RuntimeError(
+                    "Misconfig: LIVE_USE_ROUTING_LAYER=True but "
+                    "LIVE_CLOSER_ENABLED=False. The live close/exit loop is "
+                    "the only path that sells a live position; booting buy-only "
+                    "orphans real money. Set LIVE_CLOSER_ENABLED=True or "
+                    "LIVE_USE_ROUTING_LAYER=False before boot."
+                )
 
     def is_eligible(self, signal_type: str) -> bool:
         """Cheap pre-check for chokepoint (spec §2.3). No I/O."""
@@ -473,9 +488,56 @@ class LiveEngine:
         )
 
         if confirmation.status == "filled":
+            # LIVE-02: persist the REAL entry fill so the live evaluator can
+            # size the sell (entry_fill_qty base units) and compute realized PnL
+            # (entry_fill_price). Keyed by the same cid the adapter wrote the
+            # 'open' row under. Under txn_lock per the shared-connection rule.
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
+                    "WHERE client_order_id=?",
+                    (
+                        (
+                            str(confirmation.fill_price)
+                            if confirmation.fill_price is not None
+                            else None
+                        ),
+                        (
+                            str(confirmation.filled_qty)
+                            if confirmation.filled_qty is not None
+                            else None
+                        ),
+                        cid,
+                    ),
+                )
+                await self._db._conn.commit()
             await increment_consecutive(
                 self._db,
                 paper_trade.signal_type,
                 top.venue,
                 paper_trade_id=paper_trade.id,
+            )
+        else:
+            # LIVE-08 (audit S2-3): a non-'filled' terminal buy
+            # (partial/rejected/timeout) must NOT leave a permanent 'open' row —
+            # once Gate 7 is live those sum monotonically into exposure_cap and
+            # lock the subsystem out. Terminalize to needs_manual_review so the
+            # row stops counting as open and the operator (or the boot
+            # reconciler) resolves it. No auto-retry: a partial risks reselling
+            # more than is held, and a rejected buy has no position to manage.
+            assert self._db._conn is not None
+            async with self._db._txn_lock:
+                await self._db._conn.execute(
+                    "UPDATE live_trades SET status='needs_manual_review' "
+                    "WHERE client_order_id=? AND status='open'",
+                    (cid,),
+                )
+                await self._db._conn.commit()
+            await inc(self._db, f"live_dispatch_terminal_{confirmation.status}")
+            log.warning(
+                "live_dispatch_terminal_needs_review",
+                paper_trade_id=paper_trade.id,
+                venue_order_id=venue_order_id,
+                status=confirmation.status,
             )

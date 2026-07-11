@@ -20,6 +20,7 @@ field of the WARN log, not in the status column.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -35,6 +36,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from scout.live.config import LiveConfig
 
 log = structlog.get_logger(__name__)
+
+AlertHook = Callable[[str], Awaitable[None]]
 
 
 async def _close_crossed_row(
@@ -219,4 +222,207 @@ async def emit_live_startup_status(
         active_kill_event_id=active_id,
         shadow_trades_open=shadow_open,
         binance_reachable=binance_reachable,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LIVE-02 live reconciler — open live_trades matched to the venue by cid.
+# ---------------------------------------------------------------------------
+
+
+async def _emit_orphan_alert(
+    alert_hook: AlertHook | None, message: str, *, event: str, **fields
+) -> None:
+    """§12b plain-text operator alert for an automated live-orphan resolution.
+
+    Wrapped in the dispatched/delivered/failed log triplet; NEVER raises (the DB
+    change has already committed). Hookless (tests / paper) = log-only.
+    """
+    if alert_hook is None:
+        return
+    log.info("live_orphan_alert_dispatched", alert_event=event, **fields)
+    try:
+        await alert_hook(message)
+        log.info("live_orphan_alert_delivered", alert_event=event, **fields)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.exception(
+            "live_orphan_alert_failed",
+            alert_event=event,
+            err=str(exc),
+            err_type=type(exc).__name__,
+            **fields,
+        )
+
+
+async def _flag_live_review(db: Database, trade_id: int) -> None:
+    """Terminalize an open live row to ``needs_manual_review`` (fail-closed)."""
+    assert db._conn is not None
+    assert db._txn_lock is not None
+    async with db._txn_lock:
+        await db._conn.execute(
+            "UPDATE live_trades SET status='needs_manual_review' "
+            "WHERE id=? AND status='open'",
+            (trade_id,),
+        )
+        await db._conn.commit()
+
+
+async def _persist_recovered_fill(db: Database, trade_id: int, conf) -> None:
+    """Persist a venue-confirmed entry fill onto an open-local row; keep open."""
+    assert db._conn is not None
+    assert db._txn_lock is not None
+    async with db._txn_lock:
+        await db._conn.execute(
+            "UPDATE live_trades SET entry_fill_price=?, entry_fill_qty=? "
+            "WHERE id=? AND status='open'",
+            (
+                str(conf.fill_price) if conf.fill_price is not None else None,
+                str(conf.filled_qty) if conf.filled_qty is not None else None,
+                trade_id,
+            ),
+        )
+        await db._conn.commit()
+
+
+async def reconcile_open_live_trades(
+    *,
+    db: Database,
+    adapter: "ExchangeAdapter",
+    config: "LiveConfig",
+    ks: KillSwitch,
+    settings: "Settings",
+    alert_hook: AlertHook | None = None,
+) -> None:
+    """Boot + periodic recovery pass over open ``live_trades`` (LIVE-02).
+
+    For each open row, query the venue by the entry ``client_order_id`` and
+    classify (see ``tasks/design_live_exit_reconcile.md`` §2.7):
+
+    * FILLED + local entry fill NULL → **filled-venue/open-local** orphan
+      (crash after POST, before persist): persist the fill from the venue, keep
+      ``open`` (the evaluator manages the exit). §12b alert.
+    * FILLED + local entry fill set → healthy open awaiting exit; resumed.
+    * PARTIALLY_FILLED → **partial**: ``needs_manual_review`` + §12b alert.
+    * CANCELED/EXPIRED/REJECTED or order-not-found → **missing** (no position):
+      ``needs_manual_review`` + §12b alert.
+    * cid NULL → malformed: ``needs_manual_review`` + §12b alert.
+    * adapter error / non-terminal → leave ``open``, log row_err, continue.
+
+    ALWAYS emits ``live_boot_live_reconciliation_done`` before returning
+    (including ``rows_inspected=0``) — absence of log != success. Never throws.
+    """
+    assert db._conn is not None
+    restart_at = datetime.now(timezone.utc)
+
+    cur = await db._conn.execute(
+        "SELECT MIN(created_at) FROM live_trades WHERE status='open'"
+    )
+    earliest_row = await cur.fetchone()
+    earliest = earliest_row[0] if earliest_row is not None else None
+    log.info(
+        "live_boot_live_reconciliation_drift_window",
+        restart_at=restart_at.isoformat(),
+        earliest_open_created_at=earliest,
+    )
+
+    cur = await db._conn.execute(
+        "SELECT id, pair, client_order_id, entry_fill_price, entry_fill_qty, "
+        " created_at "
+        "FROM live_trades WHERE status='open'"
+    )
+    rows = await cur.fetchall()
+
+    rows_inspected = 0
+    rows_recovered = 0
+    rows_terminalized = 0
+    rows_resumed = 0
+
+    for trade_id, pair, cid, entry_price_s, entry_qty_s, _created in rows:
+        rows_inspected += 1
+
+        if cid is None:
+            await _flag_live_review(db, trade_id)
+            rows_terminalized += 1
+            log.warning("live_orphan_no_cid", live_trade_id=trade_id)
+            await _emit_orphan_alert(
+                alert_hook,
+                f"live orphan (no client_order_id): trade #{trade_id} flagged for review",
+                event="live_orphan_no_cid",
+                live_trade_id=trade_id,
+            )
+            continue
+
+        try:
+            conf = await adapter.fetch_order_by_client_id(
+                pair=pair, client_order_id=cid
+            )
+        except Exception as exc:
+            log.error(
+                "live_boot_live_reconciliation_row_err",
+                live_trade_id=trade_id,
+                error=str(exc),
+            )
+            rows_resumed += 1
+            continue
+
+        if conf is None or conf.status == "rejected":
+            # Missing / canceled / expired / rejected → the buy never produced a
+            # position. Terminalize so it stops counting as open exposure.
+            await _flag_live_review(db, trade_id)
+            rows_terminalized += 1
+            log.warning(
+                "live_orphan_no_fill",
+                live_trade_id=trade_id,
+                venue_status=(conf.status if conf is not None else None),
+            )
+            await _emit_orphan_alert(
+                alert_hook,
+                f"live orphan (no fill): trade #{trade_id} venue order missing/rejected",
+                event="live_orphan_no_fill",
+                live_trade_id=trade_id,
+            )
+            continue
+
+        if conf.status == "partial":
+            await _flag_live_review(db, trade_id)
+            rows_terminalized += 1
+            log.warning("live_orphan_partial", live_trade_id=trade_id)
+            await _emit_orphan_alert(
+                alert_hook,
+                f"live orphan (partial fill): trade #{trade_id} flagged for review",
+                event="live_orphan_partial",
+                live_trade_id=trade_id,
+            )
+            continue
+
+        if conf.status == "filled":
+            if entry_price_s is None or entry_qty_s is None:
+                # Filled-venue / open-local: recover the fill, keep open.
+                await _persist_recovered_fill(db, trade_id, conf)
+                rows_recovered += 1
+                log.warning(
+                    "live_orphan_recovered_fill",
+                    live_trade_id=trade_id,
+                    fill_price=conf.fill_price,
+                    filled_qty=conf.filled_qty,
+                )
+                await _emit_orphan_alert(
+                    alert_hook,
+                    f"live orphan recovered: trade #{trade_id} fill persisted from venue",
+                    event="live_orphan_recovered_fill",
+                    live_trade_id=trade_id,
+                )
+            else:
+                rows_resumed += 1  # healthy open awaiting exit
+            continue
+
+        # pending / unknown — leave open, retried next pass.
+        rows_resumed += 1
+
+    log.info(
+        "live_boot_live_reconciliation_done",
+        rows_inspected=rows_inspected,
+        rows_recovered=rows_recovered,
+        rows_terminalized=rows_terminalized,
+        rows_resumed=rows_resumed,
     )
