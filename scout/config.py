@@ -670,6 +670,20 @@ class Settings(BaseSettings):
     PAPER_TP_SELL_PCT: float = 70.0  # sell 70% at TP, keep 30% as long_hold
     PAPER_SLIPPAGE_BPS: int = 50  # 0.5% slippage simulation
 
+    # SIG-10: trust-weighted paper-trade sizing (paper-only, fail-closed).
+    # When enabled, open_trade scales PAPER_TRADE_AMOUNT_USD by the opening
+    # signal's trust tier (resolved from the signal-trust registry maturity
+    # state at open time; see scout/trading/trust_sizing.py). Default OFF —
+    # flat sizing is the pinned legacy behavior until the operator opts in.
+    # A 0.0 multiplier (non_tradable) skips the open entirely. This is a
+    # would_be_live sizing-policy knob; it does NOT relax the registry's
+    # not_for_sizing gate for live/production paths (SIG-03 dispatch
+    # quarantine still supersedes for narrative_prediction/tg_social).
+    PAPER_TRUST_SIZING_ENABLED: bool = False
+    # tier=multiplier CSV (same shape as LIVE_SIGNAL_SIZES). Keys are trust
+    # tiers, not signal types: trusted / experimental / non_tradable.
+    PAPER_TRUST_SIZE_MULTIPLIERS: str = "trusted=1.0,experimental=0.5,non_tradable=0.0"
+
     # BL-NEW-LIVE-ELIGIBLE: writes would_be_live=1 on paper trades that
     # match the tier rules from tasks/findings_live_eligibility_*.md AND
     # fit under the live-eligible concurrent-slot cap. Pure observability;
@@ -1232,6 +1246,37 @@ class Settings(BaseSettings):
             if not sep or not k or not v.strip():
                 raise ValueError(f"LIVE_SIGNAL_SIZES malformed entry: {pair!r}")
             out[k] = Decimal(v.strip())
+        return out
+
+    @computed_field
+    @property
+    def paper_trust_size_multipliers_map(self) -> dict[str, float]:
+        """Parse PAPER_TRUST_SIZE_MULTIPLIERS CSV of tier=multiplier pairs.
+
+        Keys are trust tiers (trusted / experimental / non_tradable), values
+        are non-negative size multipliers applied to PAPER_TRADE_AMOUNT_USD
+        (SIG-10). Mirrors live_signal_sizes_map parsing; raises ValueError on
+        any malformed entry (missing '=' , empty key/value, or negative float).
+        """
+        if not self.PAPER_TRUST_SIZE_MULTIPLIERS:
+            return {}
+        out: dict[str, float] = {}
+        for pair in self.PAPER_TRUST_SIZE_MULTIPLIERS.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            k, sep, v = pair.partition("=")
+            k = k.strip().lower()
+            if not sep or not k or not v.strip():
+                raise ValueError(
+                    f"PAPER_TRUST_SIZE_MULTIPLIERS malformed entry: {pair!r}"
+                )
+            mult = float(v.strip())
+            if mult < 0:
+                raise ValueError(
+                    f"PAPER_TRUST_SIZE_MULTIPLIERS multiplier must be >= 0: {pair!r}"
+                )
+            out[k] = mult
         return out
 
     @field_validator(
