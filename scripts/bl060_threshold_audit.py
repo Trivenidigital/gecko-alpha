@@ -18,6 +18,8 @@ from collections import Counter
 
 import aiosqlite
 
+from scout.timeutil import sql_utc_cutoff
+
 WINDOW_DAYS = 7
 THRESHOLDS = [10, 20, 25, 30, 35, 40, 45, 50, 60]
 
@@ -32,9 +34,9 @@ async def run(db_path: str) -> int:
               opened_at
             FROM paper_trades
             WHERE signal_type = 'first_signal'
-              AND opened_at >= datetime('now', ?)
+              AND opened_at >= ?
             """,
-            (f"-{WINDOW_DAYS} days",),
+            (sql_utc_cutoff(days=WINDOW_DAYS),),
         )
         rows = await cur.fetchall()
 

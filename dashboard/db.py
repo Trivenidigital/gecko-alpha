@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 import aiosqlite
 import structlog
 
+from scout.timeutil import sql_utc_cutoff
+
 KNOWN_SIGNALS = [
     "vol_liq_ratio",
     "market_cap_range",
@@ -452,9 +454,9 @@ async def get_narrative_category_history(
                       volume_24h, market_regime, snapshot_at
                FROM category_snapshots
                WHERE category_id = ?
-                 AND snapshot_at >= datetime('now', ?)
+                 AND snapshot_at >= ?
                ORDER BY snapshot_at ASC""",
-            (category_id, f"-{hours} hours"),
+            (category_id, sql_utc_cutoff(hours=hours)),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -580,10 +582,10 @@ async def get_chains_top_movers(db_path: str, limit: int = 5) -> list[dict]:
                       se.event_data, se.created_at
                FROM signal_events se
                LEFT JOIN candidates c ON se.token_id = c.contract_address
-               WHERE se.created_at >= datetime('now', '-24 hours')
+               WHERE se.created_at >= ?
                ORDER BY COALESCE(c.quant_score, 0) DESC
                LIMIT ?""",
-            (limit * 3,),  # fetch extra to dedup
+            (sql_utc_cutoff(hours=24), limit * 3),  # fetch extra to dedup
         )
         rows = [dict(r) for r in await cursor.fetchall()]
 
@@ -613,8 +615,8 @@ async def get_chains_stats(db_path: str) -> dict:
     """Aggregate chain stats."""
     async with _ro_db(db_path) as conn:
         cursor = await conn.execute(
-            "SELECT COUNT(*) FROM signal_events "
-            "WHERE created_at >= datetime('now', '-24 hours')"
+            "SELECT COUNT(*) FROM signal_events WHERE created_at >= ?",
+            (sql_utc_cutoff(hours=24),),
         )
         events_24h = (await cursor.fetchone())[0]
 
@@ -1045,8 +1047,9 @@ async def get_available_categories(db_path: str) -> list[dict]:
         cursor = await conn.execute(
             """SELECT DISTINCT category_id, name
                FROM category_snapshots
-               WHERE snapshot_at > datetime('now', '-1 day')
+               WHERE snapshot_at > ?
                ORDER BY name""",
+            (sql_utc_cutoff(days=1),),
         )
         rows = await cursor.fetchall()
         return [{"category_id": row[0], "name": row[1]} for row in rows]
@@ -4496,13 +4499,15 @@ async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int
     """BL-066' per-channel cashtag dispatches since UTC midnight.
 
     Mirrors the **calendar-day** semantics of the dispatcher's gate at
-    `scout/social/telegram/dispatcher.py:_channel_cashtag_trades_today_count`
-    (which uses `opened_at >= datetime('now', 'start of day')`). If we
-    used a rolling 24h window instead, the dashboard would lie about cap
-    utilization — at 06:00 UTC, a channel that hit cap=5 yesterday at
-    23:00 would read `5/5 (warn)` here but `0/5` to the dispatcher, and
-    the next dispatch would actually go through. **The two surfaces MUST
-    use identical date math.**
+    `scout/social/telegram/dispatcher.py:_channel_cashtag_trades_today_count`.
+    Both bind the same today's-UTC-midnight lower bound via
+    `scout.timeutil.sql_utc_cutoff(start_of_day=True)` (INF-04) — a shared
+    helper so the two surfaces cannot drift apart. If we used a rolling 24h
+    window instead, the dashboard would lie about cap utilization — at
+    06:00 UTC, a channel that hit cap=5 yesterday at 23:00 would read
+    `5/5 (warn)` here but `0/5` to the dispatcher, and the next dispatch
+    would actually go through. **The two surfaces MUST use identical date
+    math.**
 
     Returns dict keyed by channel_handle; channels with zero dispatches
     are omitted (frontend defaults missing keys to 0).
@@ -4514,8 +4519,9 @@ async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int
                FROM paper_trades
                WHERE signal_type = 'tg_social'
                  AND json_extract(signal_data, '$.resolution') = 'cashtag'
-                 AND opened_at >= datetime('now', 'start of day')
-               GROUP BY ch"""
+                 AND opened_at >= ?
+               GROUP BY ch""",
+            (sql_utc_cutoff(start_of_day=True),),
         )
         rows = await cur.fetchall()
         # PR-review SHOULD-FIX (a707628 SF1 + ae6d0a #2): count rows where
