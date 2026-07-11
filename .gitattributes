@@ -10,3 +10,17 @@ systemd/* text eol=lf
 # keep it LF so builds do not inject a CR that re-dirties the committed dist and
 # blocks `git pull` on the LF-only deploy host (srilu).
 dashboard/frontend/index.html text eol=lf
+
+# REC-04 deploy-hygiene: pin LF for ALL shell scripts (broadens scripts/*.sh
+# above to also cover cron/deploy.sh etc.), Python sources, and crontab files.
+# The LF-only deploy host (srilu) breaks bash/cron on CRLF and re-dirties the
+# tree on checkout when line endings drift.
+*.sh text eol=lf
+*.py text eol=lf
+*.crontab text eol=lf
+
+# Content-hashed vite bundles are build artifacts: treat as binary (-text) so no
+# eol normalization can alter the bytes the filename hash commits to. Overrides
+# the `dist/** text eol=lf` rule above for assets/ only — dist/index.html stays
+# LF text.
+dashboard/frontend/dist/assets/** -text
