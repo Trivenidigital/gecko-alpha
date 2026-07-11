@@ -42,6 +42,7 @@ not yet a runtime field.
 | Kind | `source=` | Trigger | Channel | parse_mode | Severity | §12b |
 |------|-----------|---------|---------|-----------|----------|------|
 | Combo suppression reversal (§12b) | `combo_refresh_suppression_reversal` | Nightly refresh newly-suppresses or parole-exhausts a combo | trading | None | warning | Y |
+| Early-detection candidate alert | `detection_alert` | Fresh CG candidate, early vs CG trending (lane flag-gated) | trading | None | info | Y |
 | Alert-channel-death watchdog (script) | `alert_channel_watchdog` | No trading-chat alert delivered within the watchdog window | trading | None | warning | Y |
 | Signal auto-suspension | `auto_suspend` | Tier-1b combined gate (hard_loss / drawdown) suspends a signal — **reverses operator-enabled state** | trading | None | warning | Y |
 | Operator briefing | `briefing` | Periodic briefing synthesis | trading | None | info | N |
