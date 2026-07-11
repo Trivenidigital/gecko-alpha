@@ -2,7 +2,11 @@
 # Alert-channel + digest + narrative + tg-channel freshness watchdog cron entry
 # (CLAUDE.md §12a). Runs scripts/alert_channel_watchdog.py, which monitors FOUR
 # surfaces in ONE script per the operator amendment, and alerts on any breach:
-#   1. tg_alert_log            — 'sent'-row freshness (ALERT_SENT_SLO_HOURS)
+#   1. tg_alert_log            — 'sent'-row freshness (ALERT_SENT_SLO_HOURS),
+#                                qualified by dispatch activity (ALR-08): a
+#                                stale/empty channel pages only when the pipeline
+#                                opened > ALERT_DISPATCH_ACTIVITY_THRESHOLD trades
+#                                in the window (else quiet-is-legitimate: exit 0).
 #   2. paper_daily_summary     — daily-digest write-rate (DIGEST_SUMMARY_SLO_DAYS)
 #   3. narrative_alerts_inbound — X/narrative inbound freshness (NARRATIVE_INBOUND_SLO_HOURS)
 #   4. tg_social_health        — per-channel staleness scan (TG_CHANNEL_STALE_DAYS)
@@ -37,7 +41,8 @@
 # intentionally kept OUT of .env to avoid touching the Settings surface.
 #
 # Exit codes:
-#   0  — ok (both fresh, or disabled no-op)
+#   0  — ok (all fresh, disabled no-op, OR alert channel quiet-legitimate:
+#          0 sent + 0 dispatch activity — logged, never paged; ALR-08)
 #   5  — one or more freshness breaches (page dispatched and/or cooldown-suppressed)
 #   1  — DB missing / runtime / alert-dispatch error
 #  64  — unknown argument
@@ -63,6 +68,9 @@ SENT_SLO_HOURS="${ALERT_SENT_SLO_HOURS:-48}"
 DIGEST_SLO_DAYS="${DIGEST_SUMMARY_SLO_DAYS:-2}"
 NARRATIVE_INBOUND_SLO_HOURS="${NARRATIVE_INBOUND_SLO_HOURS:-72}"
 TG_CHANNEL_STALE_DAYS="${TG_CHANNEL_STALE_DAYS:-14}"
+# ALR-08 dispatch-activity qualifier for check 1 (default 0: any open with 0
+# sent pages; raise to tolerate the 24h-dedup tail). From the cron env, not .env.
+DISPATCH_ACTIVITY_THRESHOLD="${ALERT_DISPATCH_ACTIVITY_THRESHOLD:-0}"
 COOLDOWN_HOURS="${ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS:-24}"
 STATE_DIR="${ALERT_CHANNEL_WATCHDOG_STATE_DIR:-/var/lib/gecko-alpha/alert-channel-watchdog}"
 
@@ -88,4 +96,5 @@ exec "${PYTHON}" "${SCRIPT_DIR}/alert_channel_watchdog.py" \
     --sent-slo-hours "${SENT_SLO_HOURS}" --digest-slo-days "${DIGEST_SLO_DAYS}" \
     --narrative-inbound-slo-hours "${NARRATIVE_INBOUND_SLO_HOURS}" \
     --tg-channel-stale-days "${TG_CHANNEL_STALE_DAYS}" \
+    --dispatch-activity-threshold "${DISPATCH_ACTIVITY_THRESHOLD}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"

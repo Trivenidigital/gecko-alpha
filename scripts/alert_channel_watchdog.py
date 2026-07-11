@@ -6,7 +6,14 @@ Monitors FOUR pipeline surfaces in ONE script (operator amendment):
   1. ``tg_alert_log`` — the latest ``outcome='sent'`` row must be newer than
      ``ALERT_SENT_SLO_HOURS`` (default 48). The Telegram alert channel went
      silent 2026-06-25 -> 07-08 (14 days, zero ``sent`` rows) and nobody
-     noticed because no watchdog read this table.
+     noticed because no watchdog read this table. ALR-08 qualifier: a
+     stale/empty channel is only a REAL breach (page) when the pipeline
+     demonstrably OPENED trades in the same window (``trade_decision_events``
+     rows with ``decision='opened'`` > ``--dispatch-activity-threshold``, cheap
+     COUNT). Under universe filter + 24h dedup + quarantine everything is
+     BLOCKED, so zero sends across 48h with zero opens is LEGITIMATE, not a dead
+     channel — that case is logged (``status='quiet_ok'``) not paged, so
+     recurring false pages never train the operator to ignore the watchdog.
   2. ``paper_daily_summary`` — ``MAX(date)`` must be within
      ``DIGEST_SUMMARY_SLO_DAYS`` (default 2; yesterday's row should land by
      ~02:00 UTC daily). The daily digest stopped writing after 2026-06-26.
@@ -31,8 +38,11 @@ every breached check that is not inside its send cooldown (``parse_mode=None``
 logs around the send. The send passes ``raise_on_failure=True`` so a rejected
 page raises (logged ``_alert_failed`` + exit 1) instead of the alerter's
 default swallow-and-return — otherwise this watchdog's own page could die
-silently. For the freshness checks (1-3) a missing OR empty table is itself a
-breach with a distinct message (silence is never ambiguous). Read-only on the DB.
+silently. For freshness checks 2-3 (and a MISSING tg_alert_log) a missing OR
+empty table is itself a breach with a distinct message (silence is never
+ambiguous); check 1's stale/empty case is additionally gated by the ALR-08
+dispatch-activity qualifier above (empty-but-no-opens is quiet-legitimate, not a
+breach). Read-only on the DB.
 
 Per-table SEND cooldown (``ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS``, default 24;
 state files under ``--state-dir``): at most one page per breached table per
@@ -54,7 +64,9 @@ known-broken-being-fixed writer. The cooldown bounds the blast radius to one
 page/table/window, but the ordering is still the correct sequence.
 
 Exit codes:
-  0 — ok (all checks fresh, or disabled no-op)
+  0 — ok (all checks fresh, disabled no-op, OR alert channel quiet-legitimate:
+      0 sent but 0 dispatch activity — logged ``_alert_channel_quiet_legitimate``,
+      never paged)
   5 — one or more breaches (page dispatched and/or cooldown-suppressed,
       or dry-run preview)
   1 — DB missing, runtime error, or alert-dispatch failure
@@ -107,10 +119,46 @@ def _parse_ts(raw: str) -> datetime:
     return dt
 
 
+async def _count_dispatch_opens(conn: aiosqlite.Connection, since_iso: str) -> int:
+    """Count trade opens (``decision='opened'``) since ``since_iso`` (ALR-08).
+
+    An ``opened`` row in ``trade_decision_events`` is a paper-trade dispatch that
+    SHOULD have produced a ``tg_alert_log`` ``'sent'`` row. ``blocked`` rows
+    (universe-filtered / deduped / quarantined skips) are the NORMAL state during
+    a legitimate quiet stretch and must NOT count — a plain all-rows count would
+    false-positive on exactly the all-blocked scenario the qualifier exists to
+    distinguish. A missing ``trade_decision_events`` table returns 0 (we cannot
+    prove activity, so we fail safe toward silence, not toward a false page)."""
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM trade_decision_events "
+            "WHERE decision = 'opened' AND created_at > ?",
+            (since_iso,),
+        )
+        row = await cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 async def _check_alert_sent_rate(
-    conn: aiosqlite.Connection, slo_hours: int, now: datetime
+    conn: aiosqlite.Connection,
+    slo_hours: int,
+    now: datetime,
+    dispatch_threshold: int,
 ) -> dict:
-    """Latest tg_alert_log row with outcome='sent' must be within the SLO."""
+    """Latest tg_alert_log row with outcome='sent' must be within the SLO.
+
+    ALR-08 dispatch-activity qualifier: a stale/empty alert channel is only a
+    REAL breach (page) when the pipeline demonstrably OPENED trades in the same
+    window yet none was sent — that points at a broken send path. When no trade
+    opened (the normal state under universe filter + 24h dedup + quarantine),
+    48 quiet hours are LEGITIMATE: ``status='quiet_ok'`` (logged, not paged, exit
+    0), so recurring false pages never train the operator to ignore the watchdog.
+    A missing tg_alert_log table stays a hard breach (structural, not a quiet
+    market)."""
     table = "tg_alert_log"
     try:
         cur = await conn.execute(
@@ -126,27 +174,46 @@ async def _check_alert_sent_rate(
                 "last_seen": None,
                 "age_hours": None,
                 "slo_hours": slo_hours,
+                "dispatch_opens_count": None,
+                "dispatch_activity_threshold": dispatch_threshold,
+                "dispatch_window_hours": slo_hours,
             }
         raise
     last_seen = row[0] if row else None
-    if last_seen is None:
-        return {
-            "table": table,
-            "status": "breach",
-            "reason": "no_sent_rows",
-            "last_seen": None,
-            "age_hours": None,
-            "slo_hours": slo_hours,
-        }
-    age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
-    breached = age_hours > slo_hours
+    if last_seen is not None:
+        age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
+        if age_hours <= slo_hours:
+            return {
+                "table": table,
+                "status": "ok",
+                "reason": "fresh",
+                "last_seen": last_seen,
+                "age_hours": round(age_hours, 2),
+                "slo_hours": slo_hours,
+                "dispatch_opens_count": None,
+                "dispatch_activity_threshold": dispatch_threshold,
+                "dispatch_window_hours": slo_hours,
+            }
+        reason = "stale"
+    else:
+        age_hours = None
+        reason = "no_sent_rows"
+
+    # 0 'sent' within the window. Qualify: page only if the pipeline opened
+    # trades (dispatch activity) in the SAME window — otherwise quiet-is-legit.
+    since = (now - timedelta(hours=slo_hours)).isoformat()
+    opens = await _count_dispatch_opens(conn, since)
+    real_death = opens > dispatch_threshold
     return {
         "table": table,
-        "status": "breach" if breached else "ok",
-        "reason": "stale" if breached else "fresh",
+        "status": "breach" if real_death else "quiet_ok",
+        "reason": reason,
         "last_seen": last_seen,
-        "age_hours": round(age_hours, 2),
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
         "slo_hours": slo_hours,
+        "dispatch_opens_count": opens,
+        "dispatch_activity_threshold": dispatch_threshold,
+        "dispatch_window_hours": slo_hours,
     }
 
 
@@ -299,11 +366,14 @@ async def _evaluate(
     digest_slo_days: int,
     narrative_slo_hours: int,
     tg_channel_stale_days: int,
+    dispatch_activity_threshold: int,
     now: datetime,
 ) -> dict:
     async with aiosqlite.connect(db_path) as conn:
         conn.row_factory = aiosqlite.Row
-        alert = await _check_alert_sent_rate(conn, sent_slo_hours, now)
+        alert = await _check_alert_sent_rate(
+            conn, sent_slo_hours, now, dispatch_activity_threshold
+        )
         digest = await _check_digest_write_rate(conn, digest_slo_days, now)
         narrative = await _check_narrative_inbound_rate(conn, narrative_slo_hours, now)
         tg_channel = await _check_tg_channel_staleness(conn, tg_channel_stale_days, now)
@@ -330,14 +400,19 @@ def _compose_message(checks: dict, include: list[str]) -> str:
             )
         elif a["reason"] == "no_sent_rows":
             lines.append(
-                "- tg_alert_log: NO 'sent' rows in table — the Telegram alert "
-                f"channel has never sent or is fully dark (SLO {a['slo_hours']}h)"
+                "- tg_alert_log: NO 'sent' rows in the last "
+                f"{a['slo_hours']}h AND the pipeline opened "
+                f"{a['dispatch_opens_count']} trade(s) in the same window "
+                f"(> {a['dispatch_activity_threshold']}) — the alert-send path "
+                "is likely broken (not a quiet market)"
             )
         else:
             lines.append(
                 f"- tg_alert_log: last 'sent' alert at {a['last_seen']} "
-                f"({a['age_hours']}h ago) exceeds SLO {a['slo_hours']}h — the "
-                "alert channel is likely dead"
+                f"({a['age_hours']}h ago) exceeds SLO {a['slo_hours']}h AND the "
+                f"pipeline opened {a['dispatch_opens_count']} trade(s) in the "
+                f"same window (> {a['dispatch_activity_threshold']}) — the "
+                "alert-send path is likely broken (not a quiet market)"
             )
 
     d = checks["digest_write_rate"]
@@ -390,6 +465,27 @@ def _compose_message(checks: dict, include: list[str]) -> str:
 
     lines.append("Check the pipeline/digest cron and the Telegram delivery path.")
     return "\n".join(lines)
+
+
+def _compose_quiet_message(check: dict) -> str:
+    """ALR-08 distinct log-only note for a LEGITIMATELY quiet alert channel:
+    0 'sent' within the SLO but the pipeline opened <= threshold trades in the
+    same window (universe filter + 24h dedup + quarantine legitimately produce
+    zero sends). Logged, never paged — protects watchdog credibility."""
+    if check["reason"] == "no_sent_rows":
+        why = f"NO 'sent' rows in the last {check['slo_hours']}h"
+    else:
+        why = (
+            f"last 'sent' alert {check['age_hours']}h ago "
+            f"(> {check['slo_hours']}h SLO)"
+        )
+    return (
+        "tg_alert_log quiet but LEGITIMATE: "
+        f"{why} AND the pipeline opened only {check['dispatch_opens_count']} "
+        f"trade(s) in the window (<= {check['dispatch_activity_threshold']} "
+        "dispatch-activity threshold) — the pipeline was idle, not the send "
+        "path. No page (log-only)."
+    )
 
 
 async def _send_via_alerter(text: str) -> None:
@@ -469,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--digest-slo-days", type=int, default=2)
     parser.add_argument("--narrative-inbound-slo-hours", type=int, default=72)
     parser.add_argument("--tg-channel-stale-days", type=int, default=14)
+    # ALR-08: a stale/empty tg_alert_log breaches only when the pipeline opened
+    # MORE than this many trades in the window (0 => any open with 0 sent pages;
+    # raise it to tolerate the dedup tail). See the qualifier in
+    # _check_alert_sent_rate.
+    parser.add_argument("--dispatch-activity-threshold", type=int, default=0)
     parser.add_argument("--cooldown-hours", type=int, default=24)
     parser.add_argument(
         "--state-dir", default="/var/lib/gecko-alpha/alert-channel-watchdog"
@@ -502,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
                 digest_slo_days=args.digest_slo_days,
                 narrative_slo_hours=args.narrative_inbound_slo_hours,
                 tg_channel_stale_days=args.tg_channel_stale_days,
+                dispatch_activity_threshold=args.dispatch_activity_threshold,
                 now=now,
             )
         )
@@ -515,6 +617,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     breaches = [k for k, v in checks.items() if v["status"] == "breach"]
+
+    # ALR-08: a legitimately-quiet alert channel (0 sent + no dispatch activity)
+    # is logged with a DISTINCT event and surfaced in the JSON, but never paged
+    # (its status is 'quiet_ok', not 'breach', so it is absent from `breaches`).
+    alert_check = checks["alert_sent_rate"]
+    quiet_msg = None
+    if alert_check["status"] == "quiet_ok":
+        quiet_msg = _compose_quiet_message(alert_check)
+        _log.info(
+            "alert_channel_watchdog_alert_channel_quiet_legitimate",
+            reason=alert_check["reason"],
+            last_seen=alert_check["last_seen"],
+            dispatch_opens_count=alert_check["dispatch_opens_count"],
+            dispatch_activity_threshold=alert_check["dispatch_activity_threshold"],
+            window_hours=alert_check["dispatch_window_hours"],
+        )
 
     if not breaches:
         # Healthy: one-line OK log carrying every check's freshness age.
@@ -530,31 +648,25 @@ def main(argv: list[str] | None = None) -> int:
                 checks["tg_channel_staleness"]["stale_channels"]
             ),
         )
-        print(
-            json.dumps(
-                {"ok": True, "breaches": 0, "checks": checks},
-                sort_keys=True,
-                default=str,
-            )
-        )
+        out = {"ok": True, "breaches": 0, "checks": checks}
+        if quiet_msg is not None:
+            out["quiet_legitimate"] = quiet_msg
+        print(json.dumps(out, sort_keys=True, default=str))
         return 0
 
     # dry-run: full preview of the current breach, no cooldown/state I/O, no send.
     if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "breaches": len(breaches),
-                    "checks": checks,
-                    "message": _compose_message(checks, breaches),
-                    "dry_run": True,
-                    "sent": False,
-                },
-                sort_keys=True,
-                default=str,
-            )
-        )
+        out = {
+            "ok": False,
+            "breaches": len(breaches),
+            "checks": checks,
+            "message": _compose_message(checks, breaches),
+            "dry_run": True,
+            "sent": False,
+        }
+        if quiet_msg is not None:
+            out["quiet_legitimate"] = quiet_msg
+        print(json.dumps(out, sort_keys=True, default=str))
         return 5
 
     # Real path: per-table cooldown gates the SEND (never the detection, S2-2).
@@ -603,20 +715,17 @@ def main(argv: list[str] | None = None) -> int:
             _write_cooldown_state(args.state_dir, checks[key]["table"], now)
         sent = True
 
-    print(
-        json.dumps(
-            {
-                "ok": False,
-                "breaches": len(breaches),
-                "checks": checks,
-                "sent": sent,
-                "sent_tables": [checks[k]["table"] for k in to_send],
-                "suppressed_by_cooldown": [checks[k]["table"] for k in suppressed],
-            },
-            sort_keys=True,
-            default=str,
-        )
-    )
+    out = {
+        "ok": False,
+        "breaches": len(breaches),
+        "checks": checks,
+        "sent": sent,
+        "sent_tables": [checks[k]["table"] for k in to_send],
+        "suppressed_by_cooldown": [checks[k]["table"] for k in suppressed],
+    }
+    if quiet_msg is not None:
+        out["quiet_legitimate"] = quiet_msg
+    print(json.dumps(out, sort_keys=True, default=str))
     return 5
 
 

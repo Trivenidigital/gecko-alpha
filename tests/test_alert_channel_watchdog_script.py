@@ -120,6 +120,25 @@ CREATE TABLE tg_social_health (
 )
 """
 
+# trade_decision_events: db.py:796 (ALR-08). The watchdog only reads
+# decision + created_at; the other NOT NULL columns are carried for schema
+# fidelity (FK + nullable columns dropped for the minimal schema). A
+# decision='opened' row is a dispatch that SHOULD have produced a tg_alert
+# 'sent' row; decision='blocked' rows (universe-filtered / deduped / quarantined
+# skips) must NOT count as dispatch activity.
+_CREATE_TRADE_DECISION_EVENTS = """
+CREATE TABLE trade_decision_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_id TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source_module TEXT NOT NULL,
+    event_data TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
 
 def _make_db(
     tmp_path,
@@ -131,6 +150,9 @@ def _make_db(
     create_alert=True,
     create_digest=True,
     create_narrative=True,
+    create_dispatch=True,
+    dispatch_opens=None,
+    dispatch_blocked=0,
 ):
     """Build a minimal SQLite DB and return its path.
 
@@ -145,6 +167,16 @@ def _make_db(
       gate), so the pre-existing tests are unaffected.
     create_alert / create_digest / create_narrative: when False, that table is
     not created at all (exercises the missing-table breach path).
+    create_dispatch: when True (default) create trade_decision_events (ALR-08
+      dispatch-activity qualifier). When False the table is absent -> the
+      qualifier counts 0 opens -> a stale/empty alert channel is quiet-legit.
+    dispatch_opens: number of fresh ``decision='opened'`` rows to seed. ``None``
+      (the default) seeds 10 recent opens so a stale/empty alert channel reads
+      as a REAL send-path death (the pre-existing stale-alert tests). ``0`` seeds
+      none -> quiet-legitimate.
+    dispatch_blocked: number of ``decision='blocked'`` rows to seed. These are
+      skips (universe-filtered / deduped / quarantined) and must NOT count as
+      dispatch activity — used to prove the all-blocked quiet case stays silent.
     """
     dbp = tmp_path / "wd.db"
     conn = sqlite3.connect(dbp)
@@ -185,8 +217,35 @@ def _make_db(
                     "VALUES (?, 'running', ?, ?)",
                     (f"channel:{handle}", last_message_at, now_iso),
                 )
+        if create_dispatch:
+            conn.execute(_CREATE_TRADE_DECISION_EVENTS)
+            n_opens = 10 if dispatch_opens is None else dispatch_opens
+            recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+            for i in range(n_opens):
+                conn.execute(
+                    "INSERT INTO trade_decision_events "
+                    "(token_id, signal_type, decision, reason, source_module, "
+                    " event_data, created_at) "
+                    "VALUES (?, 'volume_spike', 'opened', 'paper_trade_opened', "
+                    " 'scout.trading.engine', '{}', ?)",
+                    (f"op-{i}", recent),
+                )
+            for i in range(dispatch_blocked):
+                conn.execute(
+                    "INSERT INTO trade_decision_events "
+                    "(token_id, signal_type, decision, reason, source_module, "
+                    " event_data, created_at) "
+                    "VALUES (?, 'volume_spike', 'blocked', 'quarantined', "
+                    " 'scout.trading.engine', '{}', ?)",
+                    (f"bl-{i}", recent),
+                )
         # Guarantee at least one table exists so the DB file is non-trivial.
-        if not create_alert and not create_digest and not create_narrative:
+        if (
+            not create_alert
+            and not create_digest
+            and not create_narrative
+            and not create_dispatch
+        ):
             conn.execute("CREATE TABLE _placeholder (x INTEGER)")
         conn.commit()
     finally:
@@ -295,6 +354,158 @@ def test_only_sent_outcome_counts(tmp_path):
     body = json.loads(res.stdout)
     assert body["checks"]["alert_sent_rate"]["status"] == "breach"
     assert body["checks"]["alert_sent_rate"]["reason"] == "stale"
+
+
+# --- ALR-08: dispatch-activity qualifier on the alert-sent breach ----------
+# A stale/empty alert channel is only paged when the pipeline demonstrably
+# opened trades (decision='opened' in trade_decision_events) in the same window.
+# Under universe filter + 24h dedup + quarantine everything is BLOCKED (0 opens)
+# -> 48 quiet hours are legitimate and must NOT page (protects watchdog
+# credibility). A real send-path death has opens but 0 'sent'.
+
+
+def test_alert_quiet_legitimate_no_dispatch_activity_no_breach(tmp_path):
+    # Stale alert channel, but the pipeline opened NOTHING in the window ->
+    # quiet-is-legitimate: log-only, no breach, exit 0.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],  # > 48h SLO
+        digest_rows=[_day(1)],
+        dispatch_opens=0,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["ok"] is True
+    assert body["breaches"] == 0
+    a = body["checks"]["alert_sent_rate"]
+    assert a["status"] == "quiet_ok"
+    assert a["reason"] == "stale"
+    assert a["dispatch_opens_count"] == 0
+    # The distinct quiet-legitimate note is surfaced (not a page).
+    assert "quiet_legitimate" in body
+    assert "LEGITIMATE" in body["quiet_legitimate"]
+
+
+def test_alert_quiet_legitimate_when_dispatch_table_absent(tmp_path):
+    # No trade_decision_events table at all -> cannot prove activity -> do NOT
+    # page (fail safe toward silence, not toward a false page).
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(1)],
+        create_dispatch=False,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["alert_sent_rate"]["status"] == "quiet_ok"
+    assert body["checks"]["alert_sent_rate"]["dispatch_opens_count"] == 0
+
+
+def test_blocked_rows_do_not_count_as_dispatch_activity(tmp_path):
+    # The exact legitimate-quiet scenario ALR-08 targets: the table is FULL of
+    # 'blocked' skips (universe-filtered / deduped / quarantined) but 0 opens.
+    # A plain row-count would false-positive here; the opens-count must not.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(1)],
+        dispatch_opens=0,
+        dispatch_blocked=50,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["alert_sent_rate"]["status"] == "quiet_ok"
+
+
+def test_alert_real_death_with_dispatch_activity_is_breach(tmp_path):
+    # Stale alert channel AND the pipeline opened trades in the window -> the
+    # send path is likely broken -> REAL breach, page, exit 5.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(1)],
+        dispatch_opens=5,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    a = body["checks"]["alert_sent_rate"]
+    assert a["status"] == "breach"
+    assert a["reason"] == "stale"
+    assert a["dispatch_opens_count"] == 5
+    msg = body["message"]
+    assert "tg_alert_log" in msg
+    assert "5" in msg  # dispatch-activity count named
+    assert "*" not in msg  # plain text
+
+
+def test_empty_alert_channel_real_death_when_opens_present(tmp_path):
+    # No 'sent' rows EVER but the pipeline opened trades -> real death.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[],  # no sent rows
+        digest_rows=[_day(1)],
+        dispatch_opens=3,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    a = body["checks"]["alert_sent_rate"]
+    assert a["status"] == "breach"
+    assert a["reason"] == "no_sent_rows"
+    assert a["dispatch_opens_count"] == 3
+
+
+def test_quiet_legitimate_still_pages_other_breaches(tmp_path):
+    # Alert channel quiet-legit (0 opens) BUT the digest is stale -> the digest
+    # still breaches and pages; the alert line is NOT in the page.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(10)],  # > 2d SLO
+        dispatch_opens=0,
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["alert_sent_rate"]["status"] == "quiet_ok"
+    assert body["checks"]["digest_write_rate"]["status"] == "breach"
+    msg = body["message"]
+    assert "paper_daily_summary" in msg
+    assert "tg_alert_log" not in msg  # quiet-legit alert excluded from the page
+
+
+def test_dispatch_activity_threshold_flag(tmp_path):
+    # opens=3: with threshold 5 (3 <= 5) -> quiet-legit; with threshold 2
+    # (3 > 2) -> real breach.
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(1)],
+        dispatch_opens=3,
+    )
+    res_quiet = _run(
+        dbp, "--enabled", "true", "--dry-run", "--dispatch-activity-threshold", "5"
+    )
+    assert res_quiet.returncode == 0, res_quiet.stderr
+    assert json.loads(res_quiet.stdout)["checks"]["alert_sent_rate"]["status"] == (
+        "quiet_ok"
+    )
+
+    res_breach = _run(
+        dbp, "--enabled", "true", "--dry-run", "--dispatch-activity-threshold", "2"
+    )
+    assert res_breach.returncode == 5, res_breach.stderr
+    assert json.loads(res_breach.stdout)["checks"]["alert_sent_rate"]["status"] == (
+        "breach"
+    )
 
 
 # --- digest breach ---------------------------------------------------------
@@ -666,6 +877,32 @@ def test_send_via_alerter_passes_raise_on_failure(monkeypatch):
     assert captured["parse_mode"] is None
     assert captured["source"] == "alert_channel_watchdog"
     assert captured["text"] == "body-text"
+
+
+# --- ALR-08: quiet-legitimate never reaches the network send --------------
+
+
+def test_quiet_legitimate_does_not_page_in_process(tmp_path):
+    # Stale alert channel but 0 opens, everything else fresh -> no breach, no
+    # send, exit 0, and the distinct quiet-legitimate log fires (not a page).
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(100), "sent")],
+        digest_rows=[_day(1)],
+        dispatch_opens=0,
+    )
+    mod = _load_module()
+    rec = _Recorder()
+    sink = []
+    mod._log = rec
+    mod._SEND = _fake_send(sink)
+
+    rc = _main(mod, dbp, tmp_path / "state")
+
+    assert rc == 0
+    assert len(sink) == 0  # the send path is never reached
+    assert "alert_channel_watchdog_alert_channel_quiet_legitimate" in rec.names()
+    assert "alert_channel_watchdog_alert_dispatched" not in rec.names()
 
 
 # --- S2-2: per-table cooldown dedup ---------------------------------------
