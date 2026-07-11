@@ -111,12 +111,7 @@ from scout.live.resolver import OverrideStore, VenueResolver
 
 logger = structlog.get_logger()
 
-# Module-level tracking of pending social-loop restart tasks so the shutdown
-# path can cancel them (preventing a fresh loop from spawning against a
-# closed DB). Also prevents detached tasks from being GC'd mid-flight.
-_social_restart_tasks: set[asyncio.Task] = set()
-
-# Same pattern for counter-score follow-up tasks fired from run_cycle. The
+# Track counter-score follow-up tasks fired from run_cycle. The
 # add_done_callback that swallows the exception only fires AFTER the task
 # completes — without a stored reference, the task can be GC'd mid-flight
 # and never reach the callback.
@@ -125,9 +120,6 @@ _counter_followup_tasks: set[asyncio.Task] = set()
 # rationale as the sets above — hold a strong ref so a spawned task can't be
 # collected before its done-callback runs.
 _detection_alert_tasks: set[asyncio.Task] = set()
-# Shared counter for consecutive social-loop restarts; resets on any success
-# signal. Used by the done-callback to enforce LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS.
-_social_consecutive_restarts = [0]
 
 
 def _log_detection_alert_task_exception(task: asyncio.Task) -> None:
@@ -2034,7 +2026,6 @@ async def main(argv: list[str] | None = None) -> int:
         secondwave_enabled=settings.SECONDWAVE_ENABLED,
         briefing_enabled=settings.BRIEFING_ENABLED,
         tg_social_enabled=settings.TG_SOCIAL_ENABLED,
-        lunarcrush_enabled=getattr(settings, "LUNARCRUSH_ENABLED", False),
         cryptopanic_enabled=getattr(settings, "CRYPTOPANIC_ENABLED", False),
         live_trading_enabled=getattr(settings, "LIVE_TRADING_ENABLED", False),
         ingest_watchdog_enabled=settings.INGEST_WATCHDOG_ENABLED,
@@ -2052,7 +2043,12 @@ async def main(argv: list[str] | None = None) -> int:
     _cg_ratelimit_configure(settings)
 
     db = Database(settings.DB_PATH, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
-    await db.initialize()
+    # RETIRE_DEAD_TABLES_ENABLED gates the opt-in-destructive
+    # retire_dead_tables_v1 migration (NAR-06 + INF-07); default-off so the
+    # irreversible DROPs stay dormant until the operator flips it at a deploy.
+    await db.initialize(
+        retire_dead_tables=getattr(settings, "RETIRE_DEAD_TABLES_ENABLED", False)
+    )
 
     # --- BL-055 live-trading wiring (spec §10) --------------------------------
     # Built BEFORE the TradingEngine so we can inject the LiveEngine into
@@ -2653,87 +2649,11 @@ async def main(argv: list[str] | None = None) -> int:
                     )
                 )
 
-            # LunarCrush social-velocity loop runs OUTSIDE asyncio.gather --
-            # a social crash must never take down the main pipeline. The
-            # done-callback re-creates the task with a 30s back-off.
-            social_task: asyncio.Task | None = None
-            if getattr(settings, "LUNARCRUSH_ENABLED", False) and getattr(
-                settings, "LUNARCRUSH_API_KEY", ""
-            ):
-                from scout.social.lunarcrush.loop import (
-                    _make_done_callback,
-                    run_social_loop,
-                )
+            # NAR-06: the LunarCrush social-velocity loop was retired here.
 
-                def _spawn_social_task() -> asyncio.Task:
-                    t = asyncio.create_task(
-                        run_social_loop(settings, db, shutdown_event)
-                    )
-                    t.add_done_callback(
-                        _make_done_callback(
-                            restarter=_schedule_social_restart,
-                            backoff_seconds=30.0,
-                        )
-                    )
-                    return t
-
-                def _schedule_social_restart(delay: float) -> None:
-                    # Cap consecutive restarts -- if the loop keeps crashing
-                    # right back up, leave the social tier down rather than
-                    # cycling forever.
-                    max_restarts = int(
-                        getattr(
-                            settings,
-                            "LUNARCRUSH_MAX_CONSECUTIVE_RESTARTS",
-                            5,
-                        )
-                    )
-                    _social_consecutive_restarts[0] += 1
-                    if _social_consecutive_restarts[0] > max_restarts:
-                        logger.critical(
-                            "social_loop_restart_cap_reached",
-                            consecutive=_social_consecutive_restarts[0],
-                            max=max_restarts,
-                        )
-                        return
-                    # Pre-sleep shutdown guard.
-                    if shutdown_event.is_set():
-                        return
-
-                    async def _restart() -> None:
-                        try:
-                            await asyncio.sleep(delay)
-                        except asyncio.CancelledError:
-                            return
-                        # Post-sleep shutdown guard: the event may have
-                        # been set while we were asleep.
-                        if shutdown_event.is_set():
-                            return
-                        logger.info("social_loop_restarting", after_seconds=delay)
-                        _spawn_social_task()
-
-                    t = asyncio.create_task(_restart())
-                    _social_restart_tasks.add(t)
-
-                    def _cleanup(task: asyncio.Task) -> None:
-                        _social_restart_tasks.discard(task)
-                        if task.cancelled():
-                            return
-                        exc = task.exception()
-                        if exc is not None:
-                            logger.error(
-                                "social_restart_task_crashed",
-                                exc_info=exc,
-                            )
-
-                    t.add_done_callback(_cleanup)
-
-                social_task = _spawn_social_task()
-                logger.info("social_loop_task_spawned")
-
-            # Both loops share the same session and rate limiter intentionally.
-            # The coingecko_limiter (25 req/min) coordinates access; that IS
-            # the back-pressure mechanism.
+            # The worker loops share the same session and rate limiter
+            # intentionally. The coingecko_limiter (25 req/min) coordinates
+            # access; that IS the back-pressure mechanism.
             #
             # BL-NEW-PIPELINE-SIGTERM-HANDLER (PR #243): a bare
             # `asyncio.gather(*tasks, return_exceptions=True)` here blocks
@@ -2782,11 +2702,6 @@ async def main(argv: list[str] | None = None) -> int:
                     n_pending=sum(1 for t in pending if not t.done()),
                 )
 
-            # Cancel any pending restart-task so it cannot spin up a fresh
-            # social loop against the DB we're about to close.
-            for t in list(_social_restart_tasks):
-                t.cancel()
-
             # Cancel the perp watcher task (if running) on graceful shutdown.
             if perp_task is not None:
                 perp_task.cancel()
@@ -2803,15 +2718,6 @@ async def main(argv: list[str] | None = None) -> int:
                         logger.error("perp_task_shutdown_hard_timeout")
                 except Exception:
                     logger.exception("perp_loop_shutdown_error")
-
-            # Ensure the social task winds down cleanly after the main loops exit.
-            if social_task is not None and not social_task.done():
-                try:
-                    await asyncio.wait_for(social_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    social_task.cancel()
-                except Exception:
-                    logger.exception("social_loop_shutdown_error")
     finally:
         # BL-055 §10.3 — drain any in-flight PaperTrader → LiveEngine handoff
         # tasks before tearing down the DB connection. Orphaned writes against
