@@ -77,6 +77,7 @@ async def _make_engine(
     mode: str = "live",
     routing_flag: bool = True,
     signed_flag: bool = True,
+    closer_enabled: bool = True,
     routing: object | None = None,
     adapter: object | None = None,
 ):
@@ -85,6 +86,7 @@ async def _make_engine(
         LIVE_TRADING_ENABLED=True,
         LIVE_USE_REAL_SIGNED_REQUESTS=signed_flag,
         LIVE_USE_ROUTING_LAYER=routing_flag,
+        LIVE_CLOSER_ENABLED=closer_enabled,
         LIVE_SIGNAL_ALLOWLIST="first_signal",
     )
     config = LiveConfig(settings)
@@ -183,6 +185,45 @@ async def test_engine_init_no_crash_under_shadow_mode(tmp_path):
     await db.close()
 
 
+@pytest.mark.asyncio
+async def test_engine_init_crashes_on_routing_without_closer(tmp_path):
+    """LIVE-02 fail-closed guard: LIVE_USE_ROUTING_LAYER=True AND
+    LIVE_CLOSER_ENABLED=False under live mode -> RuntimeError at __init__. A
+    routing engine that can buy while the close/exit loop is disabled is the
+    buy-only orphan-money state the reconciler exists to prevent."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    with pytest.raises(RuntimeError, match="LIVE_CLOSER_ENABLED"):
+        await _make_engine(
+            db,
+            mode="live",
+            routing_flag=True,
+            signed_flag=True,
+            closer_enabled=False,
+            routing=MagicMock(),
+        )
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_init_no_crash_closer_disabled_when_routing_off(tmp_path):
+    """Closer disabled is fine when routing is off (single-venue M1.5a path
+    dispatches no live buys) — only the buy-capable routing path needs the
+    closer."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    engine = await _make_engine(
+        db,
+        mode="live",
+        routing_flag=False,
+        signed_flag=True,
+        closer_enabled=False,
+        routing=None,
+    )
+    assert engine is not None
+    await db.close()
+
+
 # ---------- _dispatch_live behavior tests ----------
 
 
@@ -237,6 +278,108 @@ async def test_dispatch_live_uses_full_cid_for_await_fill(tmp_path):
     assert cid.startswith("gecko-42-"), f"cid format wrong: {cid!r}"
     assert len(cid) == len("gecko-42-") + 8, f"cid length wrong: {cid!r}"
     assert cid != "42", "raw intent_uuid leaked through"
+    await db.close()
+
+
+def _recording_adapter(db, *, confirmation):
+    """Mock adapter whose place_order_request INSERTs the 'open' live_trades row
+    (mimicking the real BinanceSpotAdapter.record_pending_order) keyed by the
+    same cid the engine derives, so the post-fill UPDATE has a row to hit."""
+    from scout.live.idempotency import make_client_order_id, record_pending_order
+
+    adapter = MagicMock()
+
+    async def _place(request):
+        cid = make_client_order_id(request.paper_trade_id, request.intent_uuid)
+        await record_pending_order(
+            db,
+            client_order_id=cid,
+            paper_trade_id=request.paper_trade_id,
+            coin_id="btc",
+            symbol=request.canonical,
+            venue="binance",
+            pair=request.venue_pair,
+            signal_type="first_signal",
+            size_usd=str(request.size_usd),
+            mid_at_entry="10.0",
+        )
+        return "VENUE-1"
+
+    adapter.place_order_request = _place
+    adapter.await_fill_confirmation = AsyncMock(return_value=confirmation)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_filled_persists_entry_fill(tmp_path):
+    """LIVE-02: a FILLED buy persists entry_fill_price + entry_fill_qty to the
+    open live_trades row so the live evaluator can later size the sell and
+    compute realized PnL. Before the fix only fill_slippage_bps was written and
+    the fill price/qty were lost."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    pt = _make_paper_trade(id=42)
+    await _insert_paper_trade(db, trade_id=pt.id)
+    routing = MagicMock()
+    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    adapter = _recording_adapter(
+        db,
+        confirmation=OrderConfirmation(
+            venue="binance",
+            venue_order_id="VENUE-1",
+            client_order_id="cid",
+            status="filled",
+            filled_qty=1.25,
+            fill_price=8.0,
+            raw_response=None,
+        ),
+    )
+    engine = await _make_engine(db, routing=routing, adapter=adapter)
+    await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
+    cur = await db._conn.execute(
+        "SELECT status, entry_fill_price, entry_fill_qty FROM live_trades "
+        "WHERE paper_trade_id=?",
+        (pt.id,),
+    )
+    row = await cur.fetchone()
+    assert row[0] == "open"
+    assert float(row[1]) == 8.0
+    assert float(row[2]) == 1.25
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_rejected_buy_flags_needs_manual_review(tmp_path):
+    """LIVE-08: a non-filled terminal buy (rejected) must NOT leave a permanent
+    'open' row (which would silently inflate Gate 7 exposure) — terminalize it
+    to needs_manual_review."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    pt = _make_paper_trade(id=42)
+    await _insert_paper_trade(db, trade_id=pt.id)
+    routing = MagicMock()
+    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    adapter = _recording_adapter(
+        db,
+        confirmation=OrderConfirmation(
+            venue="binance",
+            venue_order_id="VENUE-1",
+            client_order_id="cid",
+            status="rejected",
+            filled_qty=None,
+            fill_price=None,
+            raw_response=None,
+        ),
+    )
+    engine = await _make_engine(db, routing=routing, adapter=adapter)
+    await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
+    cur = await db._conn.execute(
+        "SELECT status FROM live_trades WHERE paper_trade_id=?", (pt.id,)
+    )
+    assert (await cur.fetchone())[0] == "needs_manual_review"
+    # counter NOT incremented on a non-filled terminal
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_venue_correction_count")
+    assert (await cur.fetchone())[0] == 0
     await db.close()
 
 

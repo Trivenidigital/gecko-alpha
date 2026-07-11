@@ -51,6 +51,22 @@ def make_client_order_id(paper_trade_id: int, intent_uuid: str) -> str:
     return cid
 
 
+def make_exit_client_order_id(live_trade_id: int) -> str:
+    """Construct the deterministic EXIT (sell) client_order_id for a live_trade.
+
+    Format: ``gecko-x-{live_trade_id}`` (≤ 28 chars for id < 10**19). Distinct
+    from the entry cid (``gecko-{paper_trade_id}-{uuid8}``) so entry and exit
+    orders never collide. Deterministic per row: a crash-retry of the exit
+    re-submits the SAME cid, so Binance ``-2010`` (duplicate) dedups it and the
+    adapter recovers the existing order rather than double-selling (LIVE-02
+    exit-side idempotency, mirroring the entry-side contract above).
+    """
+    cid = f"gecko-x-{live_trade_id}"
+    if len(cid) > CLIENT_ORDER_ID_BINANCE_MAX_LEN:
+        cid = cid[:CLIENT_ORDER_ID_BINANCE_MAX_LEN]
+    return cid
+
+
 async def lookup_existing_order_id(db: Database, client_order_id: str) -> str | None:
     """Pre-retry dedup. Returns existing venue_order_id if a live_trades
     row already has this client_order_id; else None.

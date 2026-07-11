@@ -104,3 +104,33 @@ class ExchangeAdapter(ABC):
     async def fetch_account_balance(self, asset: str = "USDT") -> float:
         """Return free balance in `asset`. Used by balance_gate."""
         ...
+
+    # ------------------------------------------------------------------
+    # LIVE-02 exit / reconcile surface. Concrete defaults (NOT @abstractmethod)
+    # so existing subclasses + the ccxt scaffold keep constructing; Binance
+    # overrides both. M1 is Binance-only (LIVE-11 parks the other venues), so
+    # any other adapter raises until wired.
+    # ------------------------------------------------------------------
+    async def place_exit_order(
+        self,
+        *,
+        pair: str,
+        base_qty: Decimal,
+        client_order_id: str,
+        timeout_sec: float,
+    ) -> OrderConfirmation:
+        """Submit a MARKET SELL of ``base_qty`` base units keyed by
+        ``client_order_id`` and resolve to a terminal ``OrderConfirmation``.
+        Does NOT write a live_trades row (the evaluator owns the ledger)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement place_exit_order"
+        )
+
+    async def fetch_order_by_client_id(
+        self, *, pair: str, client_order_id: str
+    ) -> OrderConfirmation | None:
+        """Return the venue order matching ``client_order_id`` as an
+        ``OrderConfirmation``, or ``None`` if the venue has no such order."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement fetch_order_by_client_id"
+        )

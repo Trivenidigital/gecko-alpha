@@ -417,6 +417,23 @@ async def maybe_trigger_from_daily_loss(
         "  AND date(closed_at) = date('now')"
     )
     daily_sum = (await cur.fetchone())[0]
+    # LIVE-04 (audit S1-3): the shadow sum is blind to real live losses — in
+    # live mode the engine skips the shadow write and closed fills land in
+    # live_trades. Union today-UTC closed live PnL into the cap when
+    # LIVE_TRADING_ENABLED=True so LIVE_DAILY_LOSS_CAP_USD can actually fire on a
+    # real loss. Same date(closed_at)=date('now') predicate as the shadow query
+    # (SQLite parses the T-separated ISO8601 the ledger stores; no INF-04
+    # normalization regression — identical form both sides). Gated on the flag:
+    # live_trades is empty in shadow/paper mode, and the flag makes the intent
+    # explicit + the negative test precise.
+    if getattr(settings, "LIVE_TRADING_ENABLED", False):
+        cur = await db._conn.execute(
+            "SELECT COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) "
+            "FROM live_trades "
+            "WHERE status LIKE 'closed_%' "
+            "  AND date(closed_at) = date('now')"
+        )
+        daily_sum += (await cur.fetchone())[0]
     if daily_sum > -float(settings.LIVE_DAILY_LOSS_CAP_USD):
         return False
     # Cheap pre-check — not a guarantee under contention, the durable guard

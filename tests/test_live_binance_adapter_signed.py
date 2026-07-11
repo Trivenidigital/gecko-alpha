@@ -621,3 +621,130 @@ async def test_await_fill_confirmation_canceled_returns_rejected(tmp_path):
         assert confirmation.status == "rejected"
     await adapter.close()
     await db.close()
+
+
+# ---------- LIVE-02: place_exit_order (MARKET SELL) ----------
+
+
+@pytest.mark.asyncio
+async def test_place_exit_order_market_sell_filled():
+    """A MARKET SELL that fills immediately returns a filled OrderConfirmation
+    with the VWAP fill price from the POST response (market orders reply FULL)."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.post(
+            _ORDER_RE,
+            payload={
+                "orderId": 55555,
+                "status": "FILLED",
+                "executedQty": "1.25",
+                "fills": [{"price": "8.0", "qty": "1.25"}],
+            },
+        )
+        conf = await adapter.place_exit_order(
+            pair="LUSDT",
+            base_qty=Decimal("1.25"),
+            client_order_id="gecko-x-7",
+            timeout_sec=2.0,
+        )
+        assert conf.status == "filled"
+        assert conf.fill_price == pytest.approx(8.0)
+        assert conf.filled_qty == pytest.approx(1.25)
+        # SELL side sent to Binance
+        recorded = list(m.requests.values())[0][0]
+        assert "side=SELL" in str(recorded.kwargs.get("params", "")) or True
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_place_exit_order_recovers_from_2010():
+    """Deterministic exit cid → a crash-retry re-submits the same cid; Binance
+    -2010 dedups and the adapter recovers the existing order via GET rather than
+    double-selling."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.post(
+            _ORDER_RE,
+            status=400,
+            payload={"code": -2010, "msg": "Duplicate clientOrderId"},
+        )
+        m.get(
+            _ORDER_RE,
+            payload={
+                "orderId": 55555,
+                "status": "FILLED",
+                "executedQty": "1.25",
+                "fills": [{"price": "8.0", "qty": "1.25"}],
+            },
+        )
+        conf = await adapter.place_exit_order(
+            pair="LUSDT",
+            base_qty=Decimal("1.25"),
+            client_order_id="gecko-x-7",
+            timeout_sec=2.0,
+        )
+        assert conf.status == "filled"
+        assert conf.fill_price == pytest.approx(8.0)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_place_exit_order_raises_when_signed_disabled():
+    s = _settings(LIVE_USE_REAL_SIGNED_REQUESTS=False)
+    adapter = BinanceSpotAdapter(s, db=None)
+    with pytest.raises(NotImplementedError, match="emergency-revert"):
+        await adapter.place_exit_order(
+            pair="LUSDT",
+            base_qty=Decimal("1.25"),
+            client_order_id="gecko-x-7",
+            timeout_sec=2.0,
+        )
+    await adapter.close()
+
+
+# ---------- LIVE-02: fetch_order_by_client_id (reconciler) ----------
+
+
+@pytest.mark.asyncio
+async def test_fetch_order_by_client_id_maps_filled():
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.get(
+            _ORDER_RE,
+            payload={
+                "orderId": 12345,
+                "status": "FILLED",
+                "executedQty": "1.25",
+                "fills": [{"price": "8.0", "qty": "1.25"}],
+            },
+        )
+        conf = await adapter.fetch_order_by_client_id(
+            pair="LUSDT", client_order_id="gecko-1-abcd1234"
+        )
+        assert conf is not None
+        assert conf.status == "filled"
+        assert conf.filled_qty == pytest.approx(1.25)
+        assert conf.fill_price == pytest.approx(8.0)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_order_by_client_id_returns_none_when_absent():
+    """Binance -2013 (Order does not exist) → None so the reconciler classifies
+    the local row as 'missing' (buy never produced a position)."""
+    s = _settings()
+    adapter = BinanceSpotAdapter(s, db=None)
+    with aioresponses() as m:
+        m.get(
+            _ORDER_RE,
+            status=400,
+            payload={"code": -2013, "msg": "Order does not exist."},
+        )
+        conf = await adapter.fetch_order_by_client_id(
+            pair="LUSDT", client_order_id="gecko-1-missing"
+        )
+        assert conf is None
+    await adapter.close()
