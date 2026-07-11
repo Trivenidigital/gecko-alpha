@@ -701,4 +701,4 @@ async def test_trust_sizing_zero_skips_open_with_decision_row(
         ("bitcoin",),
     )
     row = await cursor.fetchone()
-    assert row == ("blocked", "trust_sized_zero")
+    assert tuple(row) == ("blocked", "trust_sized_zero")
