@@ -4,6 +4,8 @@ Scoring weights (must always document rationale):
 - vol_liq_ratio (>MIN_VOL_LIQ_RATIO): 30 points -- Primary pump precursor
 - market_cap_range (tiered: 8/5/2 pts): Pre-discovery range
 - holder_growth (>20 new/hour): 25 points -- Organic accumulation
+  (capability-gated on MORALIS holder enrichment; excluded from the divisor
+  when unconfigured -- SIG-02)
 - token_age (bell curve, peak 12-48h): 0-15 points -- Early stage
 DexScreener signals:
 - buy_pressure (buy_ratio > BUY_PRESSURE_THRESHOLD): 15 points -- Organic buying vs wash trade
@@ -20,9 +22,14 @@ Velocity signal:
 Chain bonus:
 - solana_bonus (chain == solana): 5 points -- Meme premium
 
-Max raw: 30+8+25+15+15+20+25+15+15+5+10+10 = 193 points
+Max raw (all capabilities configured): 30+8+25+15+15+20+25+15+15+5+10+10 = 193.
+The normalization divisor is DERIVED from the active-signal set (see
+``normalization_divisor``): a capability-gated signal that cannot fire in the
+current runtime is excluded so it does not dilute realized scores (SIG-02).
 Normalized to 0-100 scale, then co-occurrence multiplier (1.15x if 3+ signals) applied.
 """
+
+from collections.abc import Callable
 
 import structlog
 
@@ -31,8 +38,46 @@ from scout.models import CandidateToken
 
 logger = structlog.get_logger(__name__)
 
-# Theoretical maximum raw score — update if signal weights change
-SCORER_MAX_RAW = 193
+# Raw point weight of every scoring signal that participates in the 0-100
+# normalization divisor. The divisor is DERIVED from this table (see
+# ``normalization_divisor``) rather than a hardcoded constant, so it can never
+# silently drift from the signal set — and a capability-gated signal that
+# cannot fire in the current runtime is EXCLUDED from the divisor instead of
+# diluting realized scores (SIG-02).
+#
+# Deliberately excluded (matching pre-SIG-02 behavior): cryptopanic_bullish
+# (+10, gated off — see Signal 13) and stable_paired_liq (a bonus that is not
+# part of the denominator).
+_SIGNAL_WEIGHTS: dict[str, int] = {
+    "vol_liq_ratio": 30,
+    "market_cap_range": 8,
+    "holder_growth": 25,
+    "token_age": 15,
+    "buy_pressure": 15,
+    "momentum_ratio": 20,
+    "vol_acceleration": 25,
+    "cg_trending_rank": 15,
+    "gt_trending": 15,
+    "solana_bonus": 5,
+    "score_velocity": 10,
+    "perp_anomaly": 10,
+}
+
+# Signals that can only fire when an external enrichment capability is
+# configured. When a predicate returns False the signal CANNOT fire, so
+# ``score`` skips its contribution AND ``normalization_divisor`` omits its
+# weight — a phantom must never sit in the divisor (SIG-02). holder_growth
+# requires MORALIS holder enrichment (holder_enricher.py:37); with no
+# MORALIS_API_KEY, holder_snapshots are never written, holder_growth_1h stays
+# 0, and the +25 is structurally unreachable.
+_CAPABILITY_GATED_SIGNALS: dict[str, Callable[[Settings], bool]] = {
+    "holder_growth": lambda s: bool(s.MORALIS_API_KEY),
+}
+
+# Theoretical maximum raw score with every capability configured — DERIVED
+# from the weight table (was a hardcoded 193). Update the table, not a magic
+# number, when weights change.
+SCORER_MAX_RAW = sum(_SIGNAL_WEIGHTS.values())
 
 # The max-raw value at which Signal 14 (perp anomaly) is included in the
 # denominator. When SCORER_MAX_RAW equals this value the denominator guard
@@ -45,6 +90,55 @@ _PERP_ENABLED_MAX_RAW = 193
 # silent score inflation if PERP_SCORING_ENABLED is flipped ahead of the
 # recalibration PR that bumps SCORER_MAX_RAW to _PERP_ENABLED_MAX_RAW.
 _PERP_SCORING_DENOMINATOR_READY = SCORER_MAX_RAW >= _PERP_ENABLED_MAX_RAW
+
+
+def _signal_can_fire(name: str, settings: Settings) -> bool:
+    """Whether a capability-gated signal's dependency is configured.
+
+    Signals without a capability predicate always return True.
+    """
+    predicate = _CAPABILITY_GATED_SIGNALS.get(name)
+    return predicate is None or predicate(settings)
+
+
+def active_scoring_signals(settings: Settings) -> list[str]:
+    """Signal names that CAN fire (and thus participate in the normalization
+    divisor) under the current runtime capabilities (SIG-02)."""
+    return [name for name in _SIGNAL_WEIGHTS if _signal_can_fire(name, settings)]
+
+
+def normalization_divisor(settings: Settings) -> int:
+    """0-100 normalization divisor for the current runtime.
+
+    Equals the capability-on maximum (``SCORER_MAX_RAW``) minus the weight of
+    any capability-gated signal that cannot fire — so a phantom signal never
+    dilutes realized scores (SIG-02). Reads the module-level ``SCORER_MAX_RAW``
+    so recalibration-regime tests that patch it keep working.
+    """
+    divisor = SCORER_MAX_RAW
+    for name, predicate in _CAPABILITY_GATED_SIGNALS.items():
+        if not predicate(settings):
+            divisor -= _SIGNAL_WEIGHTS[name]
+    return divisor
+
+
+def log_active_scoring_config(settings: Settings) -> None:
+    """Emit one structured line naming the active scoring signals and the
+    resulting normalization divisor.
+
+    Called once at pipeline startup so future phantom-signal drift (a signal
+    in the divisor that can never fire in the current runtime) is visible in
+    logs (SIG-02, observability).
+    """
+    active = active_scoring_signals(settings)
+    inactive = [name for name in _SIGNAL_WEIGHTS if name not in active]
+    logger.info(
+        "scoring_config_active",
+        active_signals=active,
+        inactive_signals=inactive,
+        normalization_divisor=normalization_divisor(settings),
+        scorer_max_raw=SCORER_MAX_RAW,
+    )
 
 
 def score(
@@ -94,8 +188,11 @@ def score(
         points += 2
         signals.append("market_cap_range")
 
-    # Signal 3: Holder Growth -- 25 points
-    if token.holder_growth_1h > 20:
+    # Signal 3: Holder Growth -- 25 points (capability-gated on MORALIS holder
+    # enrichment). Without a MORALIS_API_KEY holder_growth_1h is never
+    # populated, so the signal cannot fire and is also dropped from the
+    # normalization divisor (SIG-02) — a phantom must not dilute scores.
+    if _signal_can_fire("holder_growth", settings) and token.holder_growth_1h > 20:
         points += 25
         signals.append("holder_growth")
 
@@ -242,8 +339,10 @@ def score(
         points += settings.STABLE_PAIRED_BONUS
         signals.append("stable_paired_liq")
 
-    # Normalize to 0-100 scale
-    points = min(100, int(points * 100 / SCORER_MAX_RAW))
+    # Normalize to 0-100 scale. The divisor derives from the active-signal set
+    # (SIG-02) so a capability-gated signal that cannot fire does not dilute
+    # realized scores.
+    points = min(100, int(points * 100 / normalization_divisor(settings)))
 
     # Co-occurrence multiplier: reward multi-signal confluence
     if len(signals) >= settings.CO_OCCURRENCE_MIN_SIGNALS:

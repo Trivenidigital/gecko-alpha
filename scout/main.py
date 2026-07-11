@@ -62,7 +62,7 @@ from scout.news.cryptopanic import (
 from scout.news.schemas import classify_macro, classify_sentiment
 from scout.ratelimit import coingecko_limiter
 from scout.safety import is_safe
-from scout.scorer import score
+from scout.scorer import log_active_scoring_config, score
 from scout.spikes.detector import (
     record_volume,
     detect_spikes,
@@ -1993,6 +1993,11 @@ async def main(argv: list[str] | None = None) -> int:
         ingest_watchdog_enabled=settings.INGEST_WATCHDOG_ENABLED,
         counter_enabled=settings.COUNTER_ENABLED,
     )
+
+    # SIG-02: one-line inventory of active scoring signals + the derived
+    # normalization divisor at process start, so phantom-signal drift (a signal
+    # in the divisor that can never fire in this runtime) is visible in logs.
+    log_active_scoring_config(settings)
 
     # Honour CoinGecko rolling-cap and burst-profile settings from config.
     from scout.ratelimit import configure_from_settings as _cg_ratelimit_configure

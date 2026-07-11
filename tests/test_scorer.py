@@ -16,7 +16,14 @@ def _scorer_helpers(settings_factory, token_factory):
     global _settings, _make_token
 
     def _s(**overrides):
-        return settings_factory(**overrides)
+        # SIG-02: these tests pin the capability-ON regime (holder_growth in
+        # the divisor, SCORER_MAX_RAW=193). MORALIS enrichment is configured so
+        # holder_growth can fire and the normalization divisor stays 193 —
+        # today's behavior. Capability-OFF renormalization is covered by
+        # test_scorer_phantom_renormalization.py.
+        defaults = {"MORALIS_API_KEY": "test-moralis-key"}
+        defaults.update(overrides)
+        return settings_factory(**defaults)
 
     def _mt(**overrides):
         defaults = dict(
