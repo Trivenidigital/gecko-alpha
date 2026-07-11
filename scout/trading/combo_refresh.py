@@ -257,8 +257,11 @@ async def refresh_all(db: Database, settings) -> dict:
     zero-trade combos (no auto-revival — constraint a).
 
     Returns ``{"refreshed": N, "failed": M, "chronic_failures": [keys],
-    "permanent_suppression": [keys]}`` where ``permanent_suppression`` lists the
-    combos newly alerted this run as entering permanent-suppression state.
+    "permanent_suppression": [keys], "suppression_reversals": [dicts]}`` where
+    ``permanent_suppression`` lists the combos newly alerted this run as entering
+    permanent-suppression state, and ``suppression_reversals`` lists the combos
+    whose 30d suppression state reversed operator-favorable (active) state this
+    run and were §12b-alerted (see :func:`_process_suppression_reversals`).
     """
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
     # INF-04: opened_at is stored as Python .isoformat() ('T'-separated,
@@ -280,6 +283,11 @@ async def refresh_all(db: Database, settings) -> dict:
     rows = await cur.fetchall()
     combos = [r[0] for r in rows if r[0]]
 
+    # §12b: snapshot the 30d suppression state BEFORE the refresh loop so a
+    # transition into (or re-latch of) suppression can be detected afterward
+    # and the operator alerted. Reads only — no mutation.
+    pre_state = await _snapshot_suppression_state(db._conn)
+
     refreshed = 0
     failed = 0
     for combo in combos:
@@ -288,6 +296,8 @@ async def refresh_all(db: Database, settings) -> dict:
             refreshed += 1
         else:
             failed += 1
+
+    post_state = await _snapshot_suppression_state(db._conn)
 
     cur = await db._conn.execute(
         "SELECT combo_key FROM combo_performance "
@@ -301,6 +311,8 @@ async def refresh_all(db: Database, settings) -> dict:
             combo_key=key,
         )
 
+    reversals = await _process_suppression_reversals(settings, pre_state, post_state)
+
     permanent = await _process_permanent_suppression(db, settings, window_cutoff)
 
     log.info(
@@ -309,13 +321,169 @@ async def refresh_all(db: Database, settings) -> dict:
         failed=failed,
         chronic=len(chronic),
         permanent_suppression=len(permanent),
+        suppression_reversals=len(reversals),
     )
     return {
         "refreshed": refreshed,
         "failed": failed,
         "chronic_failures": chronic,
         "permanent_suppression": permanent,
+        "suppression_reversals": reversals,
     }
+
+
+async def _snapshot_suppression_state(conn) -> dict[str, dict]:
+    """Return ``{combo_key: {suppressed, parole_at, win_rate_pct, trades}}`` for
+    every 30d ``combo_performance`` row.
+
+    Used by :func:`refresh_all` to diff the suppression state across the refresh
+    loop so a §12b reversal alert can fire on the exact transition.
+    """
+    cur = await conn.execute(
+        "SELECT combo_key, suppressed, parole_at, win_rate_pct, trades "
+        "FROM combo_performance WHERE window = '30d'"
+    )
+    rows = await cur.fetchall()
+    return {
+        r["combo_key"]: {
+            "suppressed": r["suppressed"],
+            "parole_at": r["parole_at"],
+            "win_rate_pct": r["win_rate_pct"],
+            "trades": r["trades"],
+        }
+        for r in rows
+    }
+
+
+def _classify_reversal(pre: dict | None, post: dict) -> str | None:
+    """Classify a combo's 30d suppression transition as an operator-favorable-
+    state reversal, or ``None`` if it is not one.
+
+    * ``newly_suppressed`` — was unsuppressed (or absent) and is now
+      ``suppressed = 1``. The dispatcher now blocks the combo's opens; the
+      active state the operator relied on has been reversed.
+    * ``parole_exhausted_resuppressed`` — stayed suppressed but a FRESH parole
+      window was opened (``parole_at`` advanced). ``combo_refresh`` does that on
+      exactly one branch: a paroled combo whose retest allowance was exhausted
+      and whose real-trade win-rate failed, so it re-latches. The preserve
+      branch keeps ``parole_at`` verbatim; the clear branch drops
+      ``suppressed`` to 0 — neither matches.
+
+    Naturally deduped: once ``suppressed = 1`` persists, the next refresh sees
+    ``pre.suppressed = 1`` with an unchanged ``parole_at`` → no transition.
+    """
+    if not post["suppressed"]:
+        return None
+    pre_suppressed = bool(pre["suppressed"]) if pre else False
+    if not pre_suppressed:
+        return "newly_suppressed"
+    if (
+        post["parole_at"] is not None
+        and pre is not None
+        and post["parole_at"] != pre["parole_at"]
+    ):
+        return "parole_exhausted_resuppressed"
+    return None
+
+
+async def _process_suppression_reversals(
+    settings, pre_state: dict, post_state: dict
+) -> list[dict]:
+    """Fire the §12b operator alert for every combo whose 30d suppression state
+    reversed operator-favorable (active) state during this refresh.
+
+    Covers the two write sites the frozen-refresh permanent-suppression alert
+    (#424) does NOT: the initial ``unsuppressed → suppressed`` latch and the
+    parole-exhausted re-suppression. gainers_early was combo-suppressed
+    2026-06-12 with no operator alert and sat dark 7.5 weeks — this closes that
+    gap at the transition itself.
+
+    Each alert is plain text (``parse_mode=None``, set in the sender) so the
+    underscore-laden combo/signal names and ``revive_signal_with_baseline`` are
+    not mangled by MarkdownV1. Dispatched/delivered/failed logs bracket the send
+    so a successful delivery is not silent. A delivery failure never breaks
+    refresh; the combo is simply not counted as alerted (the state persists, so
+    a future run re-attempts).
+
+    Returns the list of ``{"combo_key", "transition"}`` alerted this run.
+    """
+    wr_thresh = settings.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT
+    parole_days = settings.FEEDBACK_PAROLE_DAYS
+    alerted: list[dict] = []
+    for combo, post in post_state.items():
+        transition = _classify_reversal(pre_state.get(combo), post)
+        if transition is None:
+            continue
+        wr = post["win_rate_pct"] or 0.0
+        trades = post["trades"] or 0
+        revival = (
+            f"Revival: db.revive_signal_with_baseline('{combo}', reason=...) for "
+            f"a base combo, or clear combo_performance.suppressed for the base "
+            f"combo. See docs/runbook_gainers_early_revival.md"
+        )
+        if transition == "newly_suppressed":
+            message = (
+                f"combo {combo} auto-suppressed (win-rate {wr:.1f}% < "
+                f"{wr_thresh:.0f}% over n={trades} trades, 30d) — the dispatcher "
+                f"now blocks its opens. {revival}"
+            )
+        else:  # parole_exhausted_resuppressed
+            message = (
+                f"combo {combo} failed its parole retest (win-rate {wr:.1f}% < "
+                f"{wr_thresh:.0f}% over n={trades} trades, 30d) — re-suppressed "
+                f"with a fresh {parole_days}d parole window. {revival}"
+            )
+        log.info(
+            "suppression_reversal_alert_dispatched",
+            combo_key=combo,
+            transition=transition,
+        )
+        try:
+            await _send_suppression_reversal_alert(settings, message)
+        except Exception as exc:
+            # Alert failure must never break refresh. The combo stays in its
+            # reversed state, so a future run re-detects and re-attempts.
+            log.exception(
+                "suppression_reversal_alert_failed",
+                combo_key=combo,
+                transition=transition,
+                err=str(exc),
+                err_type=type(exc).__name__,
+            )
+            continue
+        log.info(
+            "suppression_reversal_alert_delivered",
+            combo_key=combo,
+            transition=transition,
+        )
+        alerted.append({"combo_key": combo, "transition": transition})
+
+    return alerted
+
+
+async def _send_suppression_reversal_alert(settings, message: str) -> None:
+    """Deliver a §12b suppression-reversal alert via a one-shot Telegram send.
+
+    Mirrors :func:`_send_permanent_suppression_alert`: ``aiohttp`` +
+    ``scout.alerter`` are imported lazily (a module-level ``import aiohttp``
+    aborts the interpreter on Windows dev boxes via OpenSSL Applink, and is
+    pointless on any run with no reversal). Tests monkeypatch this function so
+    the real aiohttp import never runs.
+    """
+    import aiohttp  # deferred — module-level import aborts on Windows
+
+    from scout import alerter  # deferred — pulls aiohttp at import time
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
+        await alerter.send_telegram_message(
+            message,
+            session,
+            settings,
+            parse_mode=None,
+            source="combo_refresh_suppression_reversal",
+        )
 
 
 async def _process_permanent_suppression(
