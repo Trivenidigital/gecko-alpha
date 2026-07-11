@@ -228,7 +228,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                   created_at, leg_1_filled_at, leg_2_filled_at,
                   remaining_qty, floor_armed, realized_pnl_usd,
                   checkpoint_6h_pct, checkpoint_24h_pct,
-                  moonshot_armed_at, conviction_locked_at
+                  moonshot_armed_at, conviction_locked_at,
+                  checkpoint_1h_pct
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -651,6 +652,9 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                 # BL-062 peak-fade checkpoint pct values (may be NULL)
                 cp_6h_pct = row[27] if row[27] is not None else None
                 cp_24h_pct = row[28] if row[28] is not None else None
+                # SIG-04 time-death: 1h checkpoint pct (row[31], appended to the
+                # SELECT). May be NULL before the 1h checkpoint is recorded.
+                cp_1h_pct = row[31] if row[31] is not None else None
                 # BL-063 moonshot state (NULL on pre-cutover or not-yet-armed
                 # rows). Indexed directly — schema migration guarantees the
                 # column exists; a `len(row)` guard would silently mask schema
@@ -1001,6 +1005,123 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                             signal_type=signal_type_row,
                             peak_pct=round(float(peak_pct), 2),
                             current_pct=round(float(change_pct), 2),
+                        )
+                # SIG-04 absolute time-death — dry-run-only, sub-leg-1
+                # flat-at-24h exit lane. Placed ABOVE expiry / BELOW peak_fade +
+                # momentum_death, close_reason-None-guarded.
+                #
+                # DISTINCT BAND (mutual exclusion):
+                #   - peak_fade / momentum_death gate on a *sustained fade from a
+                #     recorded running peak* (peak_pct >= their floor AND the 6h
+                #     AND 24h checkpoints both < RETRACE_RATIO * peak).
+                #   - time_death gates on *absolute flatness at 24h for a peak
+                #     that never reached leg 1*: leg_1_filled_at IS NULL AND
+                #     max(cp_1h,cp_6h,cp_24h) < PAPER_LADDER_LEG_1_PCT AND
+                #     checkpoint_24h_pct <= FLAT_PCT AND elapsed >= CHECKPOINT_H.
+                # The `leg_1_filled is None` + sub-leg-1 guards target the cohort
+                # peak_fade (peak>=10 confirmed runners) never sees. Because all
+                # three lanes are `close_reason is None`-guarded and ordered, at
+                # most one can ever REAL-close a trade — no double-close. (In
+                # DRY_RUN every enabled lane may still *observe* an overlapping
+                # trade; each records to its own reason so each soak counts its
+                # own cohort. The leg-1 guard keeps time_death silent on the
+                # momentum_death cohort, which fills leg 1 to reach the fade.)
+                #
+                # DRY_RUN=True (default): NEVER closes — records a would-fire
+                # observation only (structured log + one trade_decision_events
+                # row). The real-close branch below is unreachable until a future
+                # flip PR sets PAPER_TIME_DEATH_DRY_RUN=False, mirroring
+                # PAPER_MOMENTUM_DEATH_DRY_RUN above.
+                if (
+                    close_reason is None
+                    and settings.PAPER_TIME_DEATH_ENABLED
+                    and elapsed
+                    >= timedelta(hours=settings.PAPER_TIME_DEATH_CHECKPOINT_H)
+                    and cp_24h_pct is not None
+                    and cp_24h_pct <= settings.PAPER_TIME_DEATH_FLAT_PCT
+                    and leg_1_filled is None
+                    and max(
+                        v for v in (cp_1h_pct, cp_6h_pct, cp_24h_pct) if v is not None
+                    )
+                    < settings.PAPER_LADDER_LEG_1_PCT
+                ):
+                    if settings.PAPER_TIME_DEATH_DRY_RUN:
+                        # Fire at most once per trade. The flat-at-24h condition
+                        # persists on every 30-min eval until expiry, so an
+                        # unguarded emit would inflate the soak count by ~1
+                        # row/cycle. Same cheap dedup as momentum_death: a table
+                        # existence check on trade_decision_events — no
+                        # paper_trades schema change, survives evaluator
+                        # restarts, only runs when the band is already met.
+                        cur = await conn.execute(
+                            "SELECT 1 FROM trade_decision_events "
+                            "WHERE paper_trade_id = ? "
+                            "AND reason = 'time_death_would_fire' LIMIT 1",
+                            (trade_id,),
+                        )
+                        if await cur.fetchone() is None:
+                            log.info(
+                                "time_death_would_fire",
+                                trade_id=trade_id,
+                                symbol=symbol_row,
+                                signal_type=signal_type_row,
+                                peak_pct=(
+                                    round(float(peak_pct), 2)
+                                    if peak_pct is not None
+                                    else None
+                                ),
+                                current_pct=round(float(change_pct), 2),
+                                cp_24h_pct=round(float(cp_24h_pct), 2),
+                                elapsed_h=round(elapsed.total_seconds() / 3600.0, 1),
+                            )
+                            # Observability, not control flow — emit_trade_decision
+                            # is fail-soft, so a write error never blocks the trade.
+                            await emit_trade_decision(
+                                db,
+                                token_id=token_id,
+                                signal_type=signal_type_row or "",
+                                decision="observed",
+                                reason="time_death_would_fire",
+                                source_module="scout.trading.evaluator",
+                                paper_trade_id=trade_id,
+                                event_data={
+                                    "peak_pct": (
+                                        round(float(peak_pct), 4)
+                                        if peak_pct is not None
+                                        else None
+                                    ),
+                                    "current_pct": round(float(change_pct), 4),
+                                    "cp_1h_pct": (
+                                        round(float(cp_1h_pct), 4)
+                                        if cp_1h_pct is not None
+                                        else None
+                                    ),
+                                    "cp_6h_pct": (
+                                        round(float(cp_6h_pct), 4)
+                                        if cp_6h_pct is not None
+                                        else None
+                                    ),
+                                    "cp_24h_pct": round(float(cp_24h_pct), 4),
+                                    "flat_pct": settings.PAPER_TIME_DEATH_FLAT_PCT,
+                                    "checkpoint_h": (
+                                        settings.PAPER_TIME_DEATH_CHECKPOINT_H
+                                    ),
+                                    "ladder_leg_1_pct": (
+                                        settings.PAPER_LADDER_LEG_1_PCT
+                                    ),
+                                },
+                            )
+                    else:
+                        close_reason = "time_death"
+                        close_status = "closed_time_death"
+                        log.info(
+                            "time_death_fired",
+                            trade_id=trade_id,
+                            token_id=token_id,
+                            symbol=symbol_row,
+                            signal_type=signal_type_row,
+                            cp_24h_pct=round(float(cp_24h_pct), 2),
+                            elapsed_h=round(elapsed.total_seconds() / 3600.0, 1),
                         )
                 # Expiry — last resort
                 if close_reason is None and elapsed >= max_duration:
