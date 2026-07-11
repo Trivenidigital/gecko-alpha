@@ -860,14 +860,18 @@ async def test_postfold_a_tg_social_mcap_at_sighting_captured(db):
     assert bucket == "10_50m"
 
 
-async def test_tg_social_dex_token_uses_raw_contract_for_candidate_first_seen(db):
-    """DexScreener tg_social trades use token_id=dex:<chain>:<address>.
+async def test_tg_social_token_uses_raw_contract_for_candidate_first_seen(db):
+    """tg_social trades carry a token_id distinct from the raw contract.
 
     candidates.contract_address stores the raw address, so the entry snapshot
     must use signal_data.contract_address for candidate first_seen_at while
-    still using token_id for the tg_social channel lookup.
+    still using token_id for the tg_social channel lookup. The mapping is
+    keyed on signal_type=='tg_social' (entry_snapshot.py), not the token
+    shape, so a non-CG mint token_id exercises the identical path. (The
+    original dex:<chain>:<address> case can no longer open post-REC-06 — the
+    price_cache_row lane is refused for the dex: namespace.)
     """
-    token_id = "dex:ethereum:0xabcdef"
+    token_id = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     raw_contract = "0xabcdef"
     await _ensure_candidate_row(
         db,
@@ -882,7 +886,7 @@ async def test_tg_social_dex_token_uses_raw_contract_for_candidate_first_seen(db
         created_at="2026-05-20T00:00:00+00:00",
         msg_id=3101,
     )
-    # Phase 6 slice 2: dex: token_ids need a price_cache row to satisfy the
+    # Phase 6 slice 2: non-CG token_ids need a price_cache row to satisfy the
     # open-boundary invariant (price_source='price_cache_row').
     await _seed_price_cache_row(db, token_id)
 

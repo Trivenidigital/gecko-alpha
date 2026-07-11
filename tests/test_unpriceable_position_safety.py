@@ -32,6 +32,10 @@ from scout.trading.evaluator import evaluate_paper_trades
 from scout.trading.paper import PaperTrader
 
 DEX_TOKEN = "dex:solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# Non-dex, non-CG token (bare base58 mint): still admissible via the
+# 'price_cache_row' lane, so it can construct the open-then-lose-price zombie
+# state that a dex: token can no longer reach post-REC-06.
+NONCG_CACHE_TOKEN = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 _seq = [0]
 
@@ -203,26 +207,46 @@ async def test_dex_token_open_still_blocked_when_flag_off(
     assert (await cur.fetchone())[0] == 0
 
 
-async def test_dex_token_with_price_cache_row_is_refreshable(
+async def test_dex_token_with_price_cache_row_is_blocked(
     db, engine_settings, monkeypatch
 ):
-    """A non-CG-shaped token_id that DOES have a price_cache row is
-    refreshable → gate lets it through even with the flag on."""
+    """REC-06 funnel-reopening precondition: even a dex: token that DOES have
+    a price_cache row is BLOCKED — the price_cache_row lane is refused for the
+    dex: namespace (unenforced pre-REC-06). The tripwire warning fires because
+    a row exists, and the gate emits the standard blocked decision event."""
     _install_fake_alerter(monkeypatch, [])
     await _seed_price_cache(db, DEX_TOKEN, 0.5, age_seconds=60)
 
     engine = TradingEngine(mode="paper", db=db, settings=engine_settings)
-    trade_id = await engine.open_trade(
-        token_id=DEX_TOKEN,
-        symbol="USDC",
-        name="Dex Fallback",
-        chain="solana",
-        signal_type="volume_spike",
-        signal_data={},
-        entry_price=0.5,
-        signal_combo="volume_spike",
+    with structlog.testing.capture_logs() as log_events:
+        trade_id = await engine.open_trade(
+            token_id=DEX_TOKEN,
+            symbol="USDC",
+            name="Dex Fallback",
+            chain="solana",
+            signal_type="volume_spike",
+            signal_data={},
+            entry_price=0.5,
+            signal_combo="volume_spike",
+        )
+    assert trade_id is None
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_trades WHERE token_id = ?", (DEX_TOKEN,)
     )
-    assert trade_id is not None
+    assert (await cur.fetchone())[0] == 0
+
+    cur = await db._conn.execute(
+        """SELECT decision, reason FROM trade_decision_events
+           WHERE token_id = ? ORDER BY id DESC LIMIT 1""",
+        (DEX_TOKEN,),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert (row[0], row[1]) == ("blocked", "unpriceable_token_id")
+
+    events = [e for e in log_events if e["event"] == "dex_price_cache_row_blocked"]
+    assert len(events) == 1
 
 
 async def test_cg_token_open_unaffected_by_gate(db, engine_settings, monkeypatch):
@@ -307,7 +331,9 @@ async def test_fabricated_close_fires_exactly_one_alert(
     captured: list[dict] = []
     _install_fake_alerter(monkeypatch, captured)
     settings = settings_factory(PAPER_MAX_DURATION_HOURS=24)
-    trade_id = await _open_backdated_trade(db, token_id=DEX_TOKEN, opened_hours_ago=72)
+    trade_id = await _open_backdated_trade(
+        db, token_id=NONCG_CACHE_TOKEN, opened_hours_ago=72
+    )
 
     with structlog.testing.capture_logs() as log_events:
         await evaluate_paper_trades(db, settings, session=object())
@@ -329,7 +355,7 @@ async def test_fabricated_close_fires_exactly_one_alert(
     )
     assert payload.get("source") == "trade_expiry_anomaly"
     assert str(trade_id) in payload["text"]
-    assert DEX_TOKEN in payload["text"]
+    assert NONCG_CACHE_TOKEN in payload["text"]
     assert "volume_spike" in payload["text"]
     assert "3.0" in payload["text"]  # 72h = 3.0 days held
     assert "UNRELIABLE" in payload["text"]
@@ -373,7 +399,9 @@ async def test_alert_failure_does_not_break_close(db, settings_factory, monkeypa
     """Telegram failure is a side effect — the close must still commit."""
     _install_fake_alerter(monkeypatch, [], raise_on_send=True)
     settings = settings_factory(PAPER_MAX_DURATION_HOURS=24)
-    trade_id = await _open_backdated_trade(db, token_id=DEX_TOKEN, opened_hours_ago=72)
+    trade_id = await _open_backdated_trade(
+        db, token_id=NONCG_CACHE_TOKEN, opened_hours_ago=72
+    )
 
     with structlog.testing.capture_logs() as log_events:
         await evaluate_paper_trades(db, settings, session=object())
@@ -394,7 +422,9 @@ async def test_no_session_close_still_works(db, settings_factory):
     """Back-compat: callers that don't pass a session still get the close;
     the alert is skipped (logged), never raises."""
     settings = settings_factory(PAPER_MAX_DURATION_HOURS=24)
-    trade_id = await _open_backdated_trade(db, token_id=DEX_TOKEN, opened_hours_ago=72)
+    trade_id = await _open_backdated_trade(
+        db, token_id=NONCG_CACHE_TOKEN, opened_hours_ago=72
+    )
 
     await evaluate_paper_trades(db, settings)  # no session kwarg
 
