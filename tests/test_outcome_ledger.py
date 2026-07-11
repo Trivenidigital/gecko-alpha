@@ -1296,3 +1296,182 @@ def test_settings_ledger_defaults(settings_factory):
     assert settings.LEDGER_ENROLLMENT_TTL_DAYS == 7
     assert settings.LEDGER_ENROLLMENT_MAX_ACTIVE == 200
     assert settings.LEDGER_COVERAGE_FRESHNESS_MIN == 60
+
+
+# ---------------------------------------------------------------------------
+# Eviction DB marker (BL-NEW-LEDGER-EVICTION-DB-MARKER, #406 ruling)
+#
+# Cap eviction previously left ONLY a journal line (ledger_enrollment_evicted),
+# scraped weekly by scripts/ledger-eviction-export.sh into an interim JSONL —
+# lossy once journald rotates (~3wk clock). The durable DB marker
+# (ledger_enrollment_evictions) lets evicted-truncated vs liquidity-death
+# separate via DB state alone, surviving journald rotation.
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_evictions(db):
+    cur = await db._conn.execute(
+        "SELECT token_id, evicted_at, evicted_for, max_active, n_evicted, source "
+        "FROM ledger_enrollment_evictions ORDER BY id ASC"
+    )
+    return await cur.fetchall()
+
+
+async def test_migration_creates_eviction_marker_table(db):
+    cur = await db._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='ledger_enrollment_evictions'"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    ddl = row["sql"]
+    for col in (
+        "token_id",
+        "evicted_at",
+        "evicted_for",
+        "max_active",
+        "n_evicted",
+        "source",
+    ):
+        assert col in ddl, col
+    # Idempotency key: (token_id, evicted_at) unique so re-inserting the same
+    # eviction event (live double-write OR backfill re-run) is a no-op.
+    assert "UNIQUE" in ddl.upper()
+
+
+async def test_eviction_marker_migration_registers_schema_version(db):
+    cur = await db._conn.execute(
+        "SELECT description FROM schema_version WHERE version = 20260710"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["description"] == "ledger_enrollment_evictions_v1"
+
+
+async def test_eviction_marker_migration_idempotent_across_reinitialize(tmp_path):
+    """Upgrade-with-data path: a restart re-runs migrations; the marker table
+    and its rows must survive, and the migration must not raise."""
+    path = str(tmp_path / "evict_idempotent.db")
+    db1 = Database(path)
+    await db1.initialize()
+    await db1._conn.execute(
+        "INSERT INTO ledger_enrollment_evictions "
+        "(token_id, evicted_at, evicted_for, max_active, n_evicted, source) "
+        "VALUES (?, ?, ?, ?, ?, 'live')",
+        ("tok", _iso(_now()), "incoming", 1, 1),
+    )
+    await db1._conn.commit()
+    await db1.close()
+
+    db2 = Database(path)
+    await db2.initialize()  # full re-run of all migrations
+    cur = await db2._conn.execute(
+        "SELECT COUNT(*) AS n FROM ledger_enrollment_evictions"
+    )
+    assert (await cur.fetchone())["n"] == 1
+    await db2.close()
+
+
+async def test_eviction_marker_unique_key_is_idempotent(db):
+    now_iso = _iso(_now())
+    for _ in range(2):
+        await db._conn.execute(
+            "INSERT OR IGNORE INTO ledger_enrollment_evictions "
+            "(token_id, evicted_at, evicted_for, max_active, n_evicted, source) "
+            "VALUES (?, ?, ?, ?, ?, 'live')",
+            ("tok", now_iso, "incoming", 1, 1),
+        )
+    await db._conn.commit()
+    assert len(await _fetch_evictions(db)) == 1
+
+
+async def test_cap_eviction_writes_durable_marker(db):
+    """A cap eviction leaves a durable ledger_enrollment_evictions row naming
+    the evicted token, the incoming token, the cap, and the batch size — so the
+    censoring record survives journald rotation, not just the journal line."""
+    settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=1)
+    tok_a, tok_b = "dex:ethereum:0xtoka", "dex:ethereum:0xtokb"
+    for token in (tok_a, tok_b):
+        await record_emission(
+            db,
+            settings,
+            kind="gated_out_sample",
+            token_id=token,
+            surface="s",
+            price=None,
+            liquidity=None,
+            liquidity_source="none",
+            gate_verdicts=None,
+        )
+
+    evictions = await _fetch_evictions(db)
+    assert len(evictions) == 1
+    ev = evictions[0]
+    assert ev["token_id"] == tok_a
+    assert ev["evicted_for"] == tok_b
+    assert ev["max_active"] == 1
+    assert ev["n_evicted"] == 1
+    assert ev["source"] == "live"
+    # evicted_at present and parseable.
+    assert datetime.fromisoformat(ev["evicted_at"]).tzinfo is not None
+
+
+async def test_cap_eviction_marker_atomic_with_delete(db):
+    """The marker row and the enrollment DELETE land together: after the
+    eviction, the evicted token is GONE from ledger_enrollments AND present in
+    ledger_enrollment_evictions (same transaction)."""
+    settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=1)
+    tok_a, tok_b = "dex:ethereum:0xaaa", "dex:ethereum:0xbbb"
+    for token in (tok_a, tok_b):
+        await record_emission(
+            db,
+            settings,
+            kind="gated_out_sample",
+            token_id=token,
+            surface="s",
+            price=None,
+            liquidity=None,
+            liquidity_source="none",
+            gate_verdicts=None,
+        )
+    enrolled = [r["token_id"] for r in await _fetch_enrollments(db)]
+    evicted = [r["token_id"] for r in await _fetch_evictions(db)]
+    assert enrolled == [tok_b]
+    assert evicted == [tok_a]
+    # The evicted token appears in exactly one of the two tables — no overlap.
+    assert set(enrolled).isdisjoint(evicted)
+
+
+async def test_eviction_log_carries_evicted_at(db, monkeypatch):
+    """The journal line now carries evicted_at matching the DB marker's key, so
+    the backfill dedups journal rows against live rows on (token_id, evicted_at)."""
+    import scout.outcome_ledger as ol
+    from unittest.mock import MagicMock
+
+    capture = MagicMock()
+    monkeypatch.setattr(ol, "log", capture)
+
+    settings = _ledger_settings(LEDGER_ENROLLMENT_MAX_ACTIVE=1)
+    for token in ("dex:ethereum:0x1", "dex:ethereum:0x2"):
+        await record_emission(
+            db,
+            settings,
+            kind="gated_out_sample",
+            token_id=token,
+            surface="s",
+            price=None,
+            liquidity=None,
+            liquidity_source="none",
+            gate_verdicts=None,
+        )
+    evict_calls = [
+        c
+        for c in capture.info.call_args_list
+        if c.args and c.args[0] == "ledger_enrollment_evicted"
+    ]
+    assert len(evict_calls) == 1
+    kwargs = evict_calls[0].kwargs
+    assert "evicted_at" in kwargs
+    # Log's evicted_at equals the DB marker's evicted_at (same event key).
+    marker = (await _fetch_evictions(db))[0]
+    assert kwargs["evicted_at"] == marker["evicted_at"]
