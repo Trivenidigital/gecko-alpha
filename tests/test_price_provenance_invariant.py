@@ -34,6 +34,12 @@ from scout.trading.evaluator import evaluate_paper_trades
 from scout.trading.paper import PaperTrader
 
 DEX_TOKEN = "dex:solana:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+# A non-CG-shaped token_id that is NOT in the dex: namespace: a bare base58
+# Solana mint (mixed-case → not CG-id-shaped; no 'dex:' prefix → not caught
+# by the REC-06 exclusion). It exercises the surviving 'price_cache_row' lane
+# (some non-CG token with a demonstrable price_cache row), which the dex:
+# exclusion must NOT disturb.
+NONCG_CACHE_TOKEN = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 _seq = [0]
 
@@ -142,8 +148,12 @@ async def _open_trade(
     [
         ("bitcoin", False, "cg_lane"),
         ("bitcoin", True, "cg_lane"),  # CG shape wins over cache-row
-        (DEX_TOKEN, True, "price_cache_row"),
+        # REC-06: dex: NEVER resolves 'price_cache_row', row or not.
+        (DEX_TOKEN, True, None),
         (DEX_TOKEN, False, None),
+        # Surviving price_cache_row lane: non-CG, non-dex token WITH a row.
+        (NONCG_CACHE_TOKEN, True, "price_cache_row"),
+        (NONCG_CACHE_TOKEN, False, None),
         ("0x1234567890abcdef1234567890abcdef12345678", False, None),
         (None, False, None),
         ("", True, None),  # empty id can't be priced by any lane
@@ -153,6 +163,30 @@ def test_resolve_price_source(token_id, has_row, expected):
     from scout.price_sources import resolve_price_source
 
     assert resolve_price_source(token_id, has_row) == expected
+
+
+def test_resolve_price_source_dex_with_row_blocked_and_warns():
+    """REC-06 funnel-reopening precondition: a dex: token WITH a price_cache
+    row is refused the price_cache_row lane (returns None → blocked upstream)
+    AND emits the dex_price_cache_row_blocked §9c tripwire — a row existing
+    means a dex-keyed writer was added."""
+    from scout.price_sources import resolve_price_source
+
+    with structlog.testing.capture_logs() as log_events:
+        assert resolve_price_source(DEX_TOKEN, True) is None
+    warnings = [e for e in log_events if e["event"] == "dex_price_cache_row_blocked"]
+    assert len(warnings) == 1
+    assert warnings[0]["token_id"] == DEX_TOKEN
+
+
+def test_resolve_price_source_dex_without_row_is_silent():
+    """The expected steady state (no dex-keyed writer) → None with NO warning:
+    the tripwire fires only when a row actually EXISTS."""
+    from scout.price_sources import resolve_price_source
+
+    with structlog.testing.capture_logs() as log_events:
+        assert resolve_price_source(DEX_TOKEN, False) is None
+    assert not any(e["event"] == "dex_price_cache_row_blocked" for e in log_events)
 
 
 def test_registered_price_sources_exclude_legacy():
@@ -241,14 +275,16 @@ async def test_engine_open_stamps_cg_lane(db, engine_settings, monkeypatch):
 
 
 async def test_engine_open_stamps_price_cache_row(db, engine_settings, monkeypatch):
-    """Non-CG-shaped token WITH a price_cache row → 'price_cache_row'."""
+    """Non-CG-shaped, non-dex token WITH a price_cache row → 'price_cache_row'.
+    (A dex: token would be REC-06-blocked even with a row — see
+    test_price_provenance dex-block tests / test_unpriceable_position_safety.)"""
     _install_fake_alerter(monkeypatch, [])
-    await _seed_price_cache(db, DEX_TOKEN, 0.5, age_seconds=60)
+    await _seed_price_cache(db, NONCG_CACHE_TOKEN, 0.5, age_seconds=60)
     engine = TradingEngine(mode="paper", db=db, settings=engine_settings)
     trade_id = await engine.open_trade(
-        token_id=DEX_TOKEN,
+        token_id=NONCG_CACHE_TOKEN,
         symbol="USDC",
-        name="Dex Fallback",
+        name="Solana Mint",
         chain="solana",
         signal_type="volume_spike",
         signal_data={},
@@ -345,12 +381,12 @@ async def test_direct_execute_buy_refuses_unresolvable_source(db):
 
 async def test_direct_execute_buy_self_resolves_source(db):
     """Callers that don't pass price_source get it resolved from the
-    registry (CG-shaped → cg_lane; cache-row → price_cache_row)."""
+    registry (CG-shaped → cg_lane; non-dex cache-row → price_cache_row)."""
     trade_id = await _open_trade(db, token_id="bitcoin")
     assert await _fetch_price_source(db, trade_id) == "cg_lane"
 
-    await _seed_price_cache(db, DEX_TOKEN, 0.5)
-    trade_id2 = await _open_trade(db, token_id=DEX_TOKEN)
+    await _seed_price_cache(db, NONCG_CACHE_TOKEN, 0.5)
+    trade_id2 = await _open_trade(db, token_id=NONCG_CACHE_TOKEN)
     assert await _fetch_price_source(db, trade_id2) == "price_cache_row"
 
 
@@ -386,10 +422,13 @@ async def test_no_price_expiry_writes_entry_fallback(db, settings_factory, monke
     _install_fake_alerter(monkeypatch, [])
     settings = settings_factory(PAPER_MAX_DURATION_HOURS=24)
     # Open while a price_cache row exists (invariant), then simulate the
-    # token dropping from price_cache entirely (the prod zombie shape).
-    await _seed_price_cache(db, DEX_TOKEN, 0.5)
-    trade_id = await _open_trade(db, token_id=DEX_TOKEN, opened_hours_ago=72)
-    await db._conn.execute("DELETE FROM price_cache WHERE coin_id = ?", (DEX_TOKEN,))
+    # token dropping from price_cache entirely (the prod zombie shape). Uses a
+    # non-dex non-CG token because a dex: token can no longer open (REC-06).
+    await _seed_price_cache(db, NONCG_CACHE_TOKEN, 0.5)
+    trade_id = await _open_trade(db, token_id=NONCG_CACHE_TOKEN, opened_hours_ago=72)
+    await db._conn.execute(
+        "DELETE FROM price_cache WHERE coin_id = ?", (NONCG_CACHE_TOKEN,)
+    )
     await db._conn.commit()
 
     await evaluate_paper_trades(db, settings, session=object())
