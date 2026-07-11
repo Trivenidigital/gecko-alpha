@@ -902,9 +902,40 @@ body {
   font-size: 13px;
 }
 
+/* DASH-04 two-level nav — top lane row above the sub-tab bar */
+.nav-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.nav-group-btn {
+  padding: 6px 18px;
+  background: var(--color-bar-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: var(--font);
+}
+
+.nav-group-btn:hover {
+  color: var(--color-text-primary);
+}
+
+.nav-group-btn.active {
+  color: var(--color-bg-primary);
+  background: var(--color-accent-green);
+  border-color: var(--color-accent-green);
+}
+
 /* Tab bar */
 .tab-bar {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 16px;
   border-bottom: 1px solid var(--color-border);

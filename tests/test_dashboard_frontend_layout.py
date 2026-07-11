@@ -42,6 +42,30 @@ def test_trade_detail_drawer_surfaces_entry_snapshot_fields():
     assert "pre-cutover (no snapshot)" in jsx
 
 
+def test_two_level_nav_structure_present():
+    """DASH-04: the flat 14-button tab bar is replaced by a two-level nav — a
+    top group row (`nav-groups` / `nav-group-btn`) above the legacy sub-tab bar
+    (`tab-btn`). Both rows are data-driven from the `NAV_GROUPS` map; the four
+    lane labels and the new CSS classes are locked here so a refactor can't
+    quietly collapse the structure back to a flat bar."""
+    app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
+    css = (ROOT / "dashboard" / "frontend" / "style.css").read_text(encoding="utf-8")
+
+    assert "const NAV_GROUPS" in app
+    assert "NAV_GROUPS.map(" in app
+    assert 'className="nav-groups"' in app
+    assert "nav-group-btn" in app
+    # sub-tab row still uses the legacy tab-btn styling
+    assert "tab-btn" in app
+    for label in ("Act", "Watch", "Performance", "System"):
+        assert f"label: '{label}'" in app
+
+    # CSS for the new group row (reuses existing design tokens).
+    assert ".nav-groups" in css
+    assert ".nav-group-btn" in css
+    assert ".nav-group-btn.active" in css
+
+
 def test_trade_inbox_tab_is_wired_to_dashboard():
     app = (ROOT / "dashboard" / "frontend" / "App.jsx").read_text(encoding="utf-8")
     tab = (
@@ -314,9 +338,7 @@ def test_todays_focus_mobile_constraints_and_no_table_layout():
     assert ".todays-focus-regime-group" in css
     assert ".todays-focus-regime" in css
     assert ".todays-focus-regime-hostile" in css
-    hostile_rule = re.search(
-        r"\.todays-focus-regime-hostile\s*\{([^}]*)\}", css, re.S
-    )
+    hostile_rule = re.search(r"\.todays-focus-regime-hostile\s*\{([^}]*)\}", css, re.S)
     assert hostile_rule
     assert "color" in hostile_rule.group(1)
     assert "min-width: 0" in css
