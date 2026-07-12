@@ -328,13 +328,15 @@ async def notify_early_detections(
                 continue
 
             # Daily budget guard (freshest-first already ordered above).
+            # LOG-ONLY: an un-sent fresh+early token re-hits this branch every
+            # cycle until it ages out, so a DB audit row per hit flooded
+            # tg_alert_log (~9.8K rows/day observed 2026-07-11..12 vs 10 sent).
+            # The structlog line preserves observability; the dedup_24h and
+            # sent rows remain the durable audit trail.
             if remaining <= 0:
-                await _log_detection_outcome(
-                    db,
+                log.info(
+                    "detection_lane_rate_limited",
                     token_id=token_id,
-                    outcome="blocked_cooldown",
-                    detail="detection_lane:rate_limit",
-                    now=now,
                 )
                 continue
 

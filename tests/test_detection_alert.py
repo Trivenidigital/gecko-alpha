@@ -340,7 +340,8 @@ async def test_daily_rate_limit(tmp_path, monkeypatch):
     rows = await cur.fetchall()
     by_token = {r[0]: (r[1], r[2]) for r in rows}
     assert by_token["coin-a"] == ("sent", "detection_lane")
-    assert by_token["coin-b"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    # rate-limit overflow is LOG-ONLY since the audit-flood fix: no DB row.
+    assert "coin-b" not in by_token
     await db.close()
 
 
@@ -371,9 +372,8 @@ async def test_daily_cap_counts_preexisting_sent_rows(tmp_path, monkeypatch):
     cur = await db._conn.execute(
         "SELECT outcome, detail FROM tg_alert_log WHERE token_id='dogwifhat'"
     )
-    outcome, detail = await cur.fetchone()
-    assert outcome == "blocked_cooldown"
-    assert detail == "detection_lane:rate_limit"
+    # LOG-ONLY rate limiting: budget exhaustion writes no audit row (flood fix).
+    assert await cur.fetchone() is None
     await db.close()
 
 
