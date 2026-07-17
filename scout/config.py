@@ -779,6 +779,31 @@ class Settings(BaseSettings):
     # coins re-scored every cycle. Operationalizes "first_seen" in the trigger.
     DETECTION_ALERT_MAX_AGE_MIN: int = Field(default=180, ge=0)
 
+    # ALR-02 quality gate (2026-07-14). The scarce daily budget is spent
+    # HIGHEST-SCORE-FIRST among candidates that clear a quality gate, not
+    # merely freshest-first. Motivation — a 3.5-day evaluation
+    # (2026-07-11→07-14, lane forced on, 20 alerts sent): the ungated
+    # freshest-first lane filled all 5/day slots with quant_score=0 candidates
+    # (0/20 ever trended, several were $50M-$228M established coins mislabeled
+    # "EARLY DETECT"), while 8 of 10 genuine pre-trending early-catches in the
+    # pool DID fire scoring signals (cat-in-hood qs=8, cash-dog-in-hood qs=10,
+    # bycocket qs=4, ...) and were never sent. The gate + score-ordered
+    # selection recover them (recall 8/10, ~15x precision lift; the 2 misses,
+    # dodo/iota, are larger established coins that fired zero signals — an
+    # accepted tradeoff). See tasks/design_detection_time_alert_lane.md.
+    #
+    # A candidate must have fired at least one scoring signal (signals_fired
+    # non-empty) AND scored >= DETECTION_ALERT_MIN_QUANT_SCORE. These are the
+    # same structural bar (quant_score == 0 iff no signal fired — every signal
+    # contributes positive points), exposed as two independent knobs so the
+    # operator can tighten the numeric bar post-soak (e.g. 5 → ~71% precision
+    # on the evaluation cohort) without a code change. Defaults are the
+    # validated coarse gate: any fired signal qualifies. The gate runs BEFORE
+    # the daily cap; the pool→gated→sent funnel is emitted each run as a
+    # structured `detection_alert_funnel` log.
+    DETECTION_ALERT_REQUIRE_SIGNALS_FIRED: bool = True
+    DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the

@@ -18,6 +18,7 @@ from scout.db import Database
 from scout.models import CandidateToken
 from scout.trading.detection_alert import (
     _detection_trigger,
+    _passes_quality_gate,
     format_detection_alert,
     notify_early_detections,
 )
@@ -39,9 +40,21 @@ def _cand(
     symbol: str = "WIF",
     name: str = "dogwifhat",
     chain: str = "coingecko",
+    quant_score: int | None = 8,
+    signals_fired: list[str] | None = None,
 ) -> CandidateToken:
+    # Defaults clear the ALR-02 quality gate (a fired signal + non-zero score)
+    # so pre-gate tests that expect a send keep passing. Pass quant_score=0 /
+    # signals_fired=[] to model a score-0 candidate the gate must exclude.
     return CandidateToken(
-        contract_address=token_id, chain=chain, token_name=name, ticker=symbol
+        contract_address=token_id,
+        chain=chain,
+        token_name=name,
+        ticker=symbol,
+        quant_score=quant_score,
+        signals_fired=(
+            ["cg_trending_rank"] if signals_fired is None else signals_fired
+        ),
     )
 
 
@@ -135,6 +148,51 @@ def test_trigger_error_does_not_fire():
 
 def test_trigger_ok_none_lead_does_not_fire():
     assert _detection_trigger(None, "ok") is False
+
+
+# ---------- _passes_quality_gate (pure predicate) ----------
+
+
+def test_gate_passes_signal_and_score():
+    assert (
+        _passes_quality_gate(
+            _cand("x", quant_score=8, signals_fired=["cg_trending_rank"]), _settings()
+        )
+        is True
+    )
+
+
+def test_gate_blocks_empty_signals():
+    assert (
+        _passes_quality_gate(_cand("x", quant_score=0, signals_fired=[]), _settings())
+        is False
+    )
+
+
+def test_gate_blocks_score_below_bar():
+    s = _settings(DETECTION_ALERT_MIN_QUANT_SCORE=5)
+    assert (
+        _passes_quality_gate(
+            _cand("x", quant_score=4, signals_fired=["market_cap_range"]), s
+        )
+        is False
+    )
+
+
+def test_gate_require_signals_off_ignores_empty_list():
+    s = _settings(
+        DETECTION_ALERT_REQUIRE_SIGNALS_FIRED=False, DETECTION_ALERT_MIN_QUANT_SCORE=0
+    )
+    assert _passes_quality_gate(_cand("x", quant_score=0, signals_fired=[]), s) is True
+
+
+def test_gate_handles_none_fields():
+    """Model defaults (quant_score=None, signals_fired=None) never crash the
+    gate — they read as an un-scored candidate and are blocked."""
+    c = CandidateToken(
+        contract_address="x", chain="coingecko", token_name="n", ticker="T"
+    )
+    assert _passes_quality_gate(c, _settings()) is False
 
 
 # ---------- format_detection_alert (golden file) ----------
@@ -432,6 +490,180 @@ async def test_dedup_disabled_window_zero(tmp_path, monkeypatch):
 
     await notify_early_detections(
         db, settings, session=None, candidates=[_cand("dogwifhat")]
+    )
+    assert len(sent) == 1
+    await db.close()
+
+
+# ---------- ALR-02 quality gate + score-ordered slots ----------
+
+
+@pytest.mark.asyncio
+async def test_quality_gate_excludes_zero_score(tmp_path, monkeypatch):
+    """A quant_score=0 / signals_fired=[] candidate is dropped upstream of the
+    cap: no send, and (being a silent upstream skip) no tg_alert_log row."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
+    await _insert_candidate(db, "dogwifhat")
+    await _insert_price(db, "dogwifhat")
+    _block_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[_cand("dogwifhat", quant_score=0, signals_fired=[])],
+    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM tg_alert_log")
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_quality_gate_includes_qualifying(tmp_path, monkeypatch):
+    """A candidate that fired a signal (non-zero score) clears the gate."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
+    await _insert_candidate(db, "dogwifhat")
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[
+            _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+        ],
+    )
+    assert len(sent) == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_score_ordered_selection_beats_freshness(tmp_path, monkeypatch):
+    """With one slot, the HIGHER-scoring candidate wins even when it is older
+    than a fresher-but-lower-scoring one (score-desc, not age-asc)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MAX_PER_DAY=1
+    )
+    # coin-hi: older (100 min) but higher score; coin-lo: fresher (2 min), lower.
+    await _insert_candidate(db, "coin-hi", first_seen_min_ago=100.0)
+    await _insert_candidate(db, "coin-lo", first_seen_min_ago=2.0)
+    await _insert_price(db, "coin-hi")
+    await _insert_price(db, "coin-lo")
+    sent = _capture_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[
+            _cand("coin-lo", quant_score=5, signals_fired=["market_cap_range"]),
+            _cand("coin-hi", quant_score=20, signals_fired=["vol_acceleration"]),
+        ],
+    )
+    assert len(sent) == 1
+    cur = await db._conn.execute(
+        "SELECT token_id, outcome, detail FROM tg_alert_log ORDER BY token_id"
+    )
+    by_token = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    assert by_token["coin-hi"] == ("sent", "detection_lane")
+    assert by_token["coin-lo"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cap_enforced_after_gating(tmp_path, monkeypatch):
+    """The cap still binds AFTER gating: a zero-score candidate is gated out
+    (never audited, never consumes a slot) while two qualifying candidates
+    contend for the single slot."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MAX_PER_DAY=1
+    )
+    await _insert_candidate(db, "coin-a", first_seen_min_ago=2.0)
+    await _insert_candidate(db, "coin-b", first_seen_min_ago=9.0)
+    await _insert_candidate(db, "coin-noise", first_seen_min_ago=1.0)
+    for cid in ("coin-a", "coin-b", "coin-noise"):
+        await _insert_price(db, cid)
+    sent = _capture_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[
+            _cand("coin-a", quant_score=8, signals_fired=["cg_trending_rank"]),
+            _cand("coin-b", quant_score=8, signals_fired=["cg_trending_rank"]),
+            _cand("coin-noise", quant_score=0, signals_fired=[]),
+        ],
+    )
+    assert len(sent) == 1
+    cur = await db._conn.execute(
+        "SELECT token_id, outcome, detail FROM tg_alert_log ORDER BY token_id"
+    )
+    by_token = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    # Equal score → freshest (coin-a, 2 min) wins the slot; coin-b rate-limited.
+    assert by_token["coin-a"] == ("sent", "detection_lane")
+    assert by_token["coin-b"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    # The gated-out zero-score candidate is never audited.
+    assert "coin-noise" not in by_token
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_min_quant_score_threshold_excludes_below_bar(tmp_path, monkeypatch):
+    """DETECTION_ALERT_MIN_QUANT_SCORE gates on the numeric bar independently:
+    a signals-fired candidate scoring below the bar is excluded."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MIN_QUANT_SCORE=5
+    )
+    await _insert_candidate(db, "dogwifhat")
+    await _insert_price(db, "dogwifhat")
+    _block_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        # qs=4 clears REQUIRE_SIGNALS_FIRED but is below the numeric bar of 5.
+        candidates=[
+            _cand("dogwifhat", quant_score=4, signals_fired=["market_cap_range"])
+        ],
+    )
+    cur = await db._conn.execute("SELECT COUNT(*) FROM tg_alert_log")
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_gate_fully_disabled_sends_zero_score(tmp_path, monkeypatch):
+    """Both knobs relaxed (REQUIRE_SIGNALS_FIRED=False, MIN_QUANT_SCORE=0)
+    restores the ungated behavior — a zero-score candidate sends."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_ALERT_REQUIRE_SIGNALS_FIRED=False,
+        DETECTION_ALERT_MIN_QUANT_SCORE=0,
+    )
+    await _insert_candidate(db, "dogwifhat")
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[_cand("dogwifhat", quant_score=0, signals_fired=[])],
     )
     assert len(sent) == 1
     await db.close()
