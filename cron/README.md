@@ -430,3 +430,95 @@ sed -i '/alert-channel-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.
 | 5 | One or more breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
 | 1 | DB missing / runtime error / alert-dispatch failure (send raised) |
 | 64 | Unknown argument (wrapper) |
+
+## CoinGecko-ingestion freshness + persistent-outage watchdog (§12a)
+
+`scripts/cg-ingestion-watchdog.sh` (wrapping `scripts/cg_ingestion_watchdog.py`)
+is the ONLY alarm for a silent outage of the **primary ingestion source**.
+
+**Motivating incident (2026-07-14):** the CG Demo API key's quota exhausted
+~01:53Z; every pipeline cycle since logged `cg_429_backoff` (attempt 0) then
+`coingecko_lanes_stopped_for_backoff`, and the CG-sourced `trending_snapshots`
+writer went dead 2026-07-13 16:12Z. **1,559 backoff events over 6 days, ZERO
+operator alerts** — a 3-day silent outage discovered only by manual audit. The
+in-process ingest watchdog (`scout/heartbeat.observe_ingest_sources`) did NOT
+catch it: the breaker trips on the FIRST CG lane (`held_position_prices`,
+`main.py:727`) and short-circuits the scanner lanes BEFORE any of them records a
+zero `raw_count` sample, so the per-source `consecutive_misses` counter never
+accumulates (a §9c phantom — the lever exists but the data path never reaches
+it). This watchdog reads the CG writers' **OUTPUT rows** directly instead, so it
+fires even when the emitting path is short-circuited or the pipeline is down.
+
+Two checks, both OUTPUT-state:
+
+- **Check 1 — `trending_snapshots` freshness**: `MAX(snapshot_at)` must be within
+  `TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS` (Settings field, default **3h** — the
+  trending writer runs every cycle, so a >3h gap means the specific writer
+  stalled). A missing OR empty table is itself a breach (silence is never
+  ambiguous).
+- **Check 2 — persistent CG-outage**: "last successful CG fetch" is the freshest
+  `snapshot_at` across the CG per-cycle snapshot writers (`trending_snapshots` +
+  `gainers_snapshots` + `losers_snapshots`, all driven off the same
+  `/coins/markets` raw pull, so they go dark together in a backoff-stop). When
+  that is older than `CG_OUTAGE_ALERT_HOURS` (Settings field, default **2h**) the
+  ENTIRE CG ingestion is dark → the primary source is down, almost always Demo
+  key-quota exhaustion. Only tables that **exist** contribute to the MAX (a
+  flag-disabled empty table neither rescues nor trips the check); NONE existing,
+  or all-empty, is itself a breach. This is distinct from check 1: a
+  trending-writer-specific bug (CG healthy, other writers fresh) trips check 1
+  alone; a real CG outage trips both.
+
+On any breach the script sends ONE plain-text Telegram page (`parse_mode=None`,
+§12b — the table/signal names contain `_`) naming each breached check, its
+last-seen timestamp, the outage duration, and the likely quota cause, with
+`cg_ingestion_watchdog_alert_dispatched` / `_alert_delivered` / `_alert_failed`
+structured logs around the send. The send passes `raise_on_failure=True` so a
+rejected page raises (→ `_alert_failed` + exit 1) instead of the alerter's
+default swallow-and-return. Read-only on the DB; it queries table OUTPUT
+(rows/timestamps), not heartbeats.
+
+**Per-check SEND cooldown** (`CG_INGESTION_WATCHDOG_COOLDOWN_HOURS`, default 24;
+state files `last_alert_<check>` under `CG_INGESTION_WATCHDOG_STATE_DIR`, default
+`/var/lib/gecko-alpha/cg-ingestion-watchdog`, auto-`mkdir -p`): at most one page
+per breached check per window, so the hourly cron does not emit ~24 identical
+pages/day on a standing outage. The cooldown suppresses the SEND only — a breach
+**always** exits 5 (logged `_alert_suppressed_by_cooldown`); detection is never
+suppressed. State is written only after a successful send, so a failed send
+re-alerts next run.
+
+**Status: SCHEDULED in the managed block** (`40 * * * *`, hourly at :40), gated
+on `CG_INGESTION_WATCHDOG_ENABLED=true` (set inline in the cron line — the
+deploy-without-activate flag; a manual run without it is a safe no-op).
+Activation occurs when the operator runs `cron/deploy.sh`, per operator approval.
+Cadence rationale: hourly is well inside both SLOs (3h / 2h) while the cooldown
+keeps a standing outage to one page/check/day.
+
+### Smoke test
+
+```bash
+ssh root@srilu-vps
+cd /root/gecko-alpha && git pull
+# Preview WITHOUT sending or touching cooldown state:
+.venv/bin/python scripts/cg_ingestion_watchdog.py --db scout.db --enabled true --dry-run
+```
+
+### Disable / revert
+
+```bash
+crontab -l | grep -v cg-ingestion-watchdog | crontab -
+# clean revert:
+sed -i '/cg-ingestion-watchdog/d' cron/gecko-alpha.crontab && bash cron/deploy.sh
+```
+
+Config rollback (widen the SLOs / silence without removing the cron): set
+`TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS` / `CG_OUTAGE_ALERT_HOURS` higher in
+`.env`, or flip the cron line's `CG_INGESTION_WATCHDOG_ENABLED=false`.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Both checks fresh; OR watchdog disabled (no-op) |
+| 5 | One or more breaches (page dispatched and/or cooldown-suppressed, or `--dry-run` preview) |
+| 1 | DB missing / runtime error / alert-dispatch failure (send raised) |
+| 64 | Unknown argument (wrapper) |

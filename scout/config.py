@@ -37,6 +37,20 @@ class Settings(BaseSettings):
     )  # BL-033: periodic heartbeat summary
     INGEST_WATCHDOG_ENABLED: bool = True
     INGEST_STARVATION_THRESHOLD_CYCLES: int = Field(default=5, ge=1, le=100)
+    # INF §12a: freshness SLOs for the CoinGecko-ingestion outage watchdog
+    # (scripts/cg_ingestion_watchdog.py). The in-process ingest watchdog above
+    # is structurally blind to a persistent CG backoff-stop — the breaker trips
+    # on the first CG lane (main.py:727) and short-circuits the scanner lanes
+    # BEFORE they record a zero raw_count sample, so consecutive_misses never
+    # accumulates (2026-07-14 outage: 1,559 backoff events, 0 alerts). These
+    # SLOs drive a standalone cron watchdog that reads OUTPUT rows
+    # (trending_snapshots + gainers/losers snapshots) instead. Values flow to the
+    # cron script via .env (sourced by cg-ingestion-watchdog.sh); the script
+    # argparse defaults mirror these. Bounds: ge=1 (a sub-hour SLO would page on
+    # normal cadence jitter), le=168 (1-week ceiling — a longer SLO is a misconfig
+    # that would silence the very outage class this watchdog exists to catch).
+    TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS: int = Field(default=3, ge=1, le=168)
+    CG_OUTAGE_ALERT_HOURS: int = Field(default=2, ge=1, le=168)
 
     # --- Signal outcome ledger (P0, edge-audit 2026-07-02) -----------------
     # Observe-only writer + in-DB labeler: every emission (candidate alert,
