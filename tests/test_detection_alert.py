@@ -179,10 +179,10 @@ def test_gate_blocks_score_below_bar():
     )
 
 
-def test_gate_require_signals_off_ignores_empty_list():
-    s = _settings(
-        DETECTION_ALERT_REQUIRE_SIGNALS_FIRED=False, DETECTION_ALERT_MIN_QUANT_SCORE=0
-    )
+def test_gate_min_score_zero_disables_gate():
+    """MIN_QUANT_SCORE=0 is the single-knob off switch: a zero-score candidate
+    passes (score 0 >= 0)."""
+    s = _settings(DETECTION_ALERT_MIN_QUANT_SCORE=0)
     assert _passes_quality_gate(_cand("x", quant_score=0, signals_fired=[]), s) is True
 
 
@@ -634,7 +634,7 @@ async def test_min_quant_score_threshold_excludes_below_bar(tmp_path, monkeypatc
         db,
         settings,
         session=None,
-        # qs=4 clears REQUIRE_SIGNALS_FIRED but is below the numeric bar of 5.
+        # qs=4 fired a signal but is below the numeric bar of 5.
         candidates=[
             _cand("dogwifhat", quant_score=4, signals_fired=["market_cap_range"])
         ],
@@ -645,14 +645,13 @@ async def test_min_quant_score_threshold_excludes_below_bar(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_gate_fully_disabled_sends_zero_score(tmp_path, monkeypatch):
-    """Both knobs relaxed (REQUIRE_SIGNALS_FIRED=False, MIN_QUANT_SCORE=0)
-    restores the ungated behavior — a zero-score candidate sends."""
+async def test_gate_disabled_sends_zero_score(tmp_path, monkeypatch):
+    """MIN_QUANT_SCORE=0 (the single-knob off switch / rollback) restores the
+    ungated behavior — a zero-score candidate sends."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(
         DETECTION_ALERT_LANE_ENABLED=True,
-        DETECTION_ALERT_REQUIRE_SIGNALS_FIRED=False,
         DETECTION_ALERT_MIN_QUANT_SCORE=0,
     )
     await _insert_candidate(db, "dogwifhat")

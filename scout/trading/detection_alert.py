@@ -16,8 +16,8 @@ of EXISTING primitives — no new table, no schema_version, no CHECK change:
 - universe = tg_alert_dispatch._check_universe (reused verbatim).
 - dedup    = per-token 24h over sent detection_lane rows
   (TG_ALERT_DEDUP_WINDOW_HOURS; 0 disables).
-- gate     = ALR-02 quality gate (DETECTION_ALERT_REQUIRE_SIGNALS_FIRED +
-  DETECTION_ALERT_MIN_QUANT_SCORE), applied BEFORE the daily cap.
+- gate     = ALR-02 quality gate (quant_score >= DETECTION_ALERT_MIN_QUANT_SCORE),
+  applied BEFORE the daily cap.
 - budget   = DETECTION_ALERT_MAX_PER_DAY sent rows / UTC day, spent
   highest-score-first (freshest breaks ties).
 - audit    = one tg_alert_log row per decision, signal_type='detection_lane',
@@ -73,7 +73,7 @@ def _detection_trigger(
 
 
 def _passes_quality_gate(cand, settings: Settings) -> bool:
-    """True when a candidate clears the ALR-02 quality gate.
+    """True when a candidate's quant_score clears the ALR-02 quality bar.
 
     Applied BEFORE the scarce daily budget is spent, so the cap is filled with
     the highest-quality early candidates rather than merely the freshest. The
@@ -81,20 +81,12 @@ def _passes_quality_gate(cand, settings: Settings) -> bool:
     slot on quant_score=0 candidates (0/20 ever trended) while genuine
     pre-trending catches — which DID fire scoring signals — were never sent.
 
-    Two independently-tunable knobs, ANDed (both default to the validated
-    coarse gate — "any fired signal qualifies"):
-
-      - DETECTION_ALERT_REQUIRE_SIGNALS_FIRED: the candidate's signals_fired
-        list must be non-empty (the scorer found something).
-      - DETECTION_ALERT_MIN_QUANT_SCORE: quant_score must clear this bar.
-
-    quant_score == 0 iff signals_fired is empty (every signal contributes
-    positive points), so with defaults the two knobs coincide; they are split
-    so the operator can tighten the numeric bar post-soak without a code change.
+    Single source of truth: quant_score >= DETECTION_ALERT_MIN_QUANT_SCORE.
+    Because every scoring signal contributes positive points, quant_score == 0
+    iff no signal fired, so the default bar of 1 is exactly "at least one
+    scoring signal fired" (the validated coarse gate). A None score (un-scored
+    candidate) reads as 0 and is blocked.
     """
-    if settings.DETECTION_ALERT_REQUIRE_SIGNALS_FIRED:
-        if not getattr(cand, "signals_fired", None):
-            return False
     score = int(getattr(cand, "quant_score", None) or 0)
     return score >= settings.DETECTION_ALERT_MIN_QUANT_SCORE
 
@@ -328,7 +320,11 @@ async def notify_early_detections(
                 continue
             quant_score = int(getattr(cand, "quant_score", None) or 0)
             entries.append((quant_score, age_min, cand, mcap_db))
-        # Highest score first; freshest (smallest age) breaks ties.
+        # Highest score first; freshest (smallest age) breaks ties. NOTE: this
+        # ordering only changes WHICH candidates win slots when the gated pool
+        # exceeds the cap. At the default bar (>=1) the gated pool is ~4/day —
+        # below DETECTION_ALERT_MAX_PER_DAY=5 — so ordering is not load-bearing
+        # until the operator loosens the gate or CG detection volume rises.
         entries.sort(key=lambda e: (-e[0], e[1]))
 
         sent_count = 0
