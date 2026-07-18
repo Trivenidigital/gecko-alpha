@@ -167,8 +167,8 @@ repo. If it exists only on a local machine, commit it.
 
 | Action | Class | Approval record | Timestamp (UTC) |
 |---|---|---|---|
-| Merge PR #466 | merge | PENDING | — |
-| Push 2-assertion test fix to `fix/detection-audit-flood` + merge PR #464 | branch-push + merge | PENDING | — |
+| Merge PR #466 | merge | Operator reply "yes go ahead" to the enumerated two-item ask; re-affirmed "approved". EXECUTED: squash-merged `14dc370b`, CI green (job 87947216862) + local full-suite parity vs master baseline | 2026-07-18 ~03:50 |
+| Push 2-assertion test fix to `fix/detection-audit-flood` + merge PR #464 | branch-push + merge | Same approval, item 2. EXECUTED: fix pushed `4f47ac2` (29/29 detection tests local), CI green (job 88040901753, 04:11Z), squash-merged `e63a9a71` | 2026-07-18 ~04:12 |
 | CG key restore (Priority 1) | prod-state | operator-executed, not in session scope | — |
 | Watchdog activation via cron/deploy.sh (Priority 2) | deploy | operator-executed, not in session scope | — |
 | Flag flips (Priority 5) | flag | operator decision, briefs above | — |
