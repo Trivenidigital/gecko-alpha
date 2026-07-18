@@ -16,7 +16,10 @@ of EXISTING primitives — no new table, no schema_version, no CHECK change:
 - universe = tg_alert_dispatch._check_universe (reused verbatim).
 - dedup    = per-token 24h over sent detection_lane rows
   (TG_ALERT_DEDUP_WINDOW_HOURS; 0 disables).
-- budget   = DETECTION_ALERT_MAX_PER_DAY sent rows / UTC day, freshest-first.
+- gate     = ALR-02 quality gate (quant_score >= DETECTION_ALERT_MIN_QUANT_SCORE),
+  applied BEFORE the daily cap.
+- budget   = DETECTION_ALERT_MAX_PER_DAY sent rows / UTC day, spent
+  highest-score-first (freshest breaks ties).
 - audit    = one tg_alert_log row per decision, signal_type='detection_lane',
   detail='detection_lane[:reason]', paper_trade_id=NULL.
 
@@ -67,6 +70,25 @@ def _detection_trigger(
     if lead_time_status == "ok" and lead_time_min is not None and lead_time_min < 0:
         return True
     return False
+
+
+def _passes_quality_gate(cand, settings: Settings) -> bool:
+    """True when a candidate's quant_score clears the ALR-02 quality bar.
+
+    Applied BEFORE the scarce daily budget is spent, so the cap is filled with
+    the highest-quality early candidates rather than merely the freshest. The
+    ALR-02 evaluation (2026-07-11→07-14) found the ungated lane spent every
+    slot on quant_score=0 candidates (0/20 ever trended) while genuine
+    pre-trending catches — which DID fire scoring signals — were never sent.
+
+    Single source of truth: quant_score >= DETECTION_ALERT_MIN_QUANT_SCORE.
+    Because every scoring signal contributes positive points, quant_score == 0
+    iff no signal fired, so the default bar of 1 is exactly "at least one
+    scoring signal fired" (the validated coarse gate). A None score (un-scored
+    candidate) reads as 0 and is blocked.
+    """
+    score = int(getattr(cand, "quant_score", None) or 0)
+    return score >= settings.DETECTION_ALERT_MIN_QUANT_SCORE
 
 
 def _fmt_detection_line(
@@ -250,8 +272,11 @@ async def notify_early_detections(
 
     Never raises. Spawned fire-and-forget from run_cycle. ``candidates`` is the
     cycle's list of scored CandidateToken objects; the lane reads the
-    authoritative first_seen_at / price from the DB (not the in-memory model).
-    Budget is spent freshest-first and bounded by DETECTION_ALERT_MAX_PER_DAY.
+    authoritative first_seen_at / price from the DB (not the in-memory model),
+    but the quality gate reads the in-memory quant_score / signals_fired (the
+    scores computed THIS cycle at detection). Candidates that clear the ALR-02
+    quality gate are spent highest-score-first, bounded by
+    DETECTION_ALERT_MAX_PER_DAY.
     """
     if not settings.DETECTION_ALERT_LANE_ENABLED:
         return
@@ -273,9 +298,12 @@ async def notify_early_detections(
                 cap=settings.DETECTION_ALERT_MAX_PER_DAY,
             )
 
-        # Collect CG-sourced, fresh candidates with their true age; then spend
-        # the scarce daily budget freshest-first.
-        entries: list[tuple[float, object, float | None]] = []
+        # Collect CG-sourced, fresh candidates that clear the ALR-02 quality
+        # gate; then spend the scarce daily budget HIGHEST-SCORE-FIRST (freshest
+        # breaks ties). ``pool`` counts CG-sourced fresh candidates before the
+        # gate so the pool→gated→sent funnel is queryable per run.
+        pool = 0
+        entries: list[tuple[int, float, object, float | None]] = []
         for cand in candidates:
             if getattr(cand, "chain", None) != "coingecko":
                 continue
@@ -286,10 +314,21 @@ async def notify_early_detections(
             age_min = _age_minutes(first_seen_iso, now)
             if age_min is None or age_min > settings.DETECTION_ALERT_MAX_AGE_MIN:
                 continue
-            entries.append((age_min, cand, mcap_db))
-        entries.sort(key=lambda e: e[0])  # freshest first (smallest age)
+            pool += 1
+            # ALR-02 quality gate — upstream of universe/trigger/dedup/cap.
+            if not _passes_quality_gate(cand, settings):
+                continue
+            quant_score = int(getattr(cand, "quant_score", None) or 0)
+            entries.append((quant_score, age_min, cand, mcap_db))
+        # Highest score first; freshest (smallest age) breaks ties. NOTE: this
+        # ordering only changes WHICH candidates win slots when the gated pool
+        # exceeds the cap. At the default bar (>=1) the gated pool is ~4/day —
+        # below DETECTION_ALERT_MAX_PER_DAY=5 — so ordering is not load-bearing
+        # until the operator loosens the gate or CG detection volume rises.
+        entries.sort(key=lambda e: (-e[0], e[1]))
 
-        for age_min, cand, mcap_db in entries:
+        sent_count = 0
+        for quant_score, age_min, cand, mcap_db in entries:
             token_id = cand.contract_address
 
             # Universe filter (reused verbatim). Off when the flag is off.
@@ -386,6 +425,19 @@ async def notify_early_detections(
                 now=now,
             )
             remaining -= 1
+            sent_count += 1
+
+        # Queryable per-run funnel: how many CG-fresh candidates entered the
+        # pool, how many the quality gate dropped, how many were eligible, and
+        # how many were actually sent within the cap.
+        log.info(
+            "detection_alert_funnel",
+            pool=pool,
+            gated_out=pool - len(entries),
+            eligible=len(entries),
+            sent=sent_count,
+            cap=settings.DETECTION_ALERT_MAX_PER_DAY,
+        )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.
         log.exception("detection_alert_notify_unexpected_error")
