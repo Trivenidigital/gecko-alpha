@@ -48,6 +48,7 @@ not yet a runtime field.
 | Operator briefing | `briefing` | Periodic briefing synthesis | trading | None | info | N |
 | Calibration dry-run (calibrate module) | `calibrate` | Per-signal calibration proposals | trading | None | info | Y |
 | Legacy candidate alert | `candidate_alert` | Conviction-gate candidate alert (main.py gate → `send_alert`) | trading | Markdown | info | N |
+| CG-ingestion outage watchdog (script) | `cg_ingestion_watchdog` | `trending_snapshots` stale beyond SLO, or all CG snapshot writers dark beyond the outage window (primary-source quota exhaustion) | trading | None | warning | Y |
 | Chain-pattern completion | `chain_alert` | Chain signal pattern completes | trading | None | info | N |
 | Cohort digest | `cohort_digest` | Weekly `would_be_live` cohort digest | trading | None | info | N |
 | Permanent combo suppression | `combo_refresh_permanent_suppression` | Combo permanently suppressed after parole exhaustion — **state reversal** | trading | None | warning | Y |

@@ -30,4 +30,18 @@
 # (deployed 2026-07-10). n-gated: prints INSUFFICIENT_DATA until >=10 distinct
 # matured tokens (~2026-07-17+); never emits a dollar figure under the gate.
 30 9 * * 1 cd /root/gecko-alpha && .venv/bin/python scripts/suppression_cost_rollup.py --db /root/gecko-alpha/scout.db --send >> /var/log/gecko-alpha-suppression-cost-rollup.log 2>&1
+# CoinGecko-ingestion freshness + persistent-outage watchdog (§12a): hourly at
+# :40, reads OUTPUT rows (trending_snapshots freshness + freshest snapshot across
+# the CG snapshot writers) — never heartbeats — so it fires even when the CG lane
+# is short-circuited by the backoff breaker. Closes the 2026-07-14 gap where the
+# CG Demo-key quota exhausted, the in-process ingest watchdog never accumulated a
+# starvation counter (breaker trips before the scanner lanes record a zero
+# sample), and 1,559 backoff events produced ZERO alerts over 6 days. The inline
+# CG_INGESTION_WATCHDOG_ENABLED=true is the deploy-without-activate flag (safe
+# no-op if unset); ACTIVATION occurs when the operator runs cron/deploy.sh to
+# install this managed block, per operator approval. Per-check 24h send cooldown
+# bounds a standing outage to one page/check/day (not ~24). SLOs
+# (TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS / CG_OUTAGE_ALERT_HOURS) are Settings
+# fields, sourced from .env by the wrapper.
+40 * * * * CG_INGESTION_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/cg-ingestion-watchdog.sh >> /var/log/gecko-alpha-cg-ingestion-watchdog.log 2>&1
 # === END gecko-alpha managed block ===

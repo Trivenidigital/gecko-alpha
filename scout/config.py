@@ -37,6 +37,20 @@ class Settings(BaseSettings):
     )  # BL-033: periodic heartbeat summary
     INGEST_WATCHDOG_ENABLED: bool = True
     INGEST_STARVATION_THRESHOLD_CYCLES: int = Field(default=5, ge=1, le=100)
+    # INF §12a: freshness SLOs for the CoinGecko-ingestion outage watchdog
+    # (scripts/cg_ingestion_watchdog.py). The in-process ingest watchdog above
+    # is structurally blind to a persistent CG backoff-stop — the breaker trips
+    # on the first CG lane (main.py:727) and short-circuits the scanner lanes
+    # BEFORE they record a zero raw_count sample, so consecutive_misses never
+    # accumulates (2026-07-14 outage: 1,559 backoff events, 0 alerts). These
+    # SLOs drive a standalone cron watchdog that reads OUTPUT rows
+    # (trending_snapshots + gainers/losers snapshots) instead. Values flow to the
+    # cron script via .env (sourced by cg-ingestion-watchdog.sh); the script
+    # argparse defaults mirror these. Bounds: ge=1 (a sub-hour SLO would page on
+    # normal cadence jitter), le=168 (1-week ceiling — a longer SLO is a misconfig
+    # that would silence the very outage class this watchdog exists to catch).
+    TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS: int = Field(default=3, ge=1, le=168)
+    CG_OUTAGE_ALERT_HOURS: int = Field(default=2, ge=1, le=168)
 
     # --- Signal outcome ledger (P0, edge-audit 2026-07-02) -----------------
     # Observe-only writer + in-DB labeler: every emission (candidate alert,
@@ -778,6 +792,30 @@ class Settings(BaseSettings):
     # lane surfaces genuinely-new detections rather than stale not-yet-trending
     # coins re-scored every cycle. Operationalizes "first_seen" in the trigger.
     DETECTION_ALERT_MAX_AGE_MIN: int = Field(default=180, ge=0)
+
+    # ALR-02 quality gate (2026-07-14). The scarce daily budget is spent
+    # HIGHEST-SCORE-FIRST among candidates whose quant_score clears this bar,
+    # not merely freshest-first. Motivation — a 3.5-day evaluation
+    # (2026-07-11→07-14, lane forced on, 20 alerts sent): the ungated
+    # freshest-first lane filled all 5/day slots with quant_score=0 candidates
+    # (0/20 ever trended, several were $50M-$228M established coins mislabeled
+    # "EARLY DETECT"), while 8 of 10 genuine pre-trending early-catches in the
+    # pool DID fire scoring signals (cat-in-hood qs=8, cash-dog-in-hood qs=10,
+    # bycocket qs=4, ...) and were never sent. The gate + score-ordered
+    # selection recover them (recall 8/10, ~15x precision lift; the 2 misses,
+    # dodo/iota, are larger established coins that fired zero signals — an
+    # accepted tradeoff). See tasks/design_detection_time_alert_lane.md.
+    #
+    # Single source of truth: a candidate qualifies iff quant_score >= this bar.
+    # Because every scoring signal contributes positive points, quant_score == 0
+    # iff no signal fired — so the default of 1 is exactly "at least one scoring
+    # signal fired" (the validated coarse gate), with no separate boolean knob
+    # to disagree with it. Tighten post-soak to raise precision (5 → ~71% on the
+    # evaluation cohort) or set 0 to fully disable the gate (rollback) — both are
+    # one clean .env change. The gate runs BEFORE the daily cap; the
+    # pool→gated→sent funnel is emitted each run as a structured
+    # `detection_alert_funnel` log.
+    DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
 
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
