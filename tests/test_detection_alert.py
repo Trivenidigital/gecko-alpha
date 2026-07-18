@@ -398,7 +398,8 @@ async def test_daily_rate_limit(tmp_path, monkeypatch):
     rows = await cur.fetchall()
     by_token = {r[0]: (r[1], r[2]) for r in rows}
     assert by_token["coin-a"] == ("sent", "detection_lane")
-    assert by_token["coin-b"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    # rate-limit overflow is LOG-ONLY since the audit-flood fix: no DB row.
+    assert "coin-b" not in by_token
     await db.close()
 
 
@@ -429,9 +430,8 @@ async def test_daily_cap_counts_preexisting_sent_rows(tmp_path, monkeypatch):
     cur = await db._conn.execute(
         "SELECT outcome, detail FROM tg_alert_log WHERE token_id='dogwifhat'"
     )
-    outcome, detail = await cur.fetchone()
-    assert outcome == "blocked_cooldown"
-    assert detail == "detection_lane:rate_limit"
+    # LOG-ONLY rate limiting: budget exhaustion writes no audit row (flood fix).
+    assert await cur.fetchone() is None
     await db.close()
 
 
@@ -573,7 +573,8 @@ async def test_score_ordered_selection_beats_freshness(tmp_path, monkeypatch):
     )
     by_token = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
     assert by_token["coin-hi"] == ("sent", "detection_lane")
-    assert by_token["coin-lo"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    # rate-limit overflow is LOG-ONLY since the audit-flood fix: no DB row.
+    assert "coin-lo" not in by_token
     await db.close()
 
 
@@ -611,7 +612,8 @@ async def test_cap_enforced_after_gating(tmp_path, monkeypatch):
     by_token = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
     # Equal score → freshest (coin-a, 2 min) wins the slot; coin-b rate-limited.
     assert by_token["coin-a"] == ("sent", "detection_lane")
-    assert by_token["coin-b"] == ("blocked_cooldown", "detection_lane:rate_limit")
+    # rate-limit overflow is LOG-ONLY since the audit-flood fix: no DB row.
+    assert "coin-b" not in by_token
     # The gated-out zero-score candidate is never audited.
     assert "coin-noise" not in by_token
     await db.close()
