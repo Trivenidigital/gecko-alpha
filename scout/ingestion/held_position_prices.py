@@ -28,7 +28,8 @@ from typing import TYPE_CHECKING
 import aiohttp
 import structlog
 
-from scout.ingestion.coingecko import CG_BASE, _get_with_backoff
+from scout import cg_api
+from scout.ingestion.coingecko import _get_with_backoff
 
 # GA-01: heuristic extracted to scout.token_ids so the trading engine's
 # unpriceable-token dispatch gate shares the SAME predicate (no forked
@@ -159,9 +160,14 @@ async def _fetch_simple_price_batch(
         "include_market_cap": "true",
         "include_24hr_change": "true",
     }
-    if settings.COINGECKO_API_KEY:
-        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
-    result = await _get_with_backoff(session, f"{CG_BASE}/simple/price", params=params)
+    params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
+    result = await _get_with_backoff(
+        session,
+        f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/simple/price",
+        params=params,
+    )
     if not isinstance(result, dict):
         return {}
     return result

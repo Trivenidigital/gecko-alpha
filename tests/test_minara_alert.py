@@ -47,7 +47,7 @@ class _TimeoutEmissionDb:
 async def test_returns_command_for_solana_token(monkeypatch):
     """Token with platforms.solana set → formatted command returned."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -130,7 +130,7 @@ async def test_persistence_timeout_returns_command_and_logs(monkeypatch):
 async def test_returns_none_when_no_solana_platform(monkeypatch):
     """Token without platforms.solana → None."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"ethereum": "0xabc"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -147,7 +147,7 @@ async def test_returns_none_when_no_solana_platform(monkeypatch):
 async def test_returns_none_when_solana_platform_empty(monkeypatch):
     """Empty SPL address → None."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": ""}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -164,7 +164,7 @@ async def test_returns_none_when_solana_platform_empty(monkeypatch):
 async def test_returns_none_when_fetch_detail_fails(monkeypatch):
     """CG 404 / 429 / network error → None (never raises)."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return None
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -220,7 +220,7 @@ async def test_handles_unexpected_exception(monkeypatch):
 async def test_uses_settings_amount_not_caller(monkeypatch):
     """R2-C1 fold: command size uses MINARA_ALERT_AMOUNT_USD, NOT caller's amount."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -239,7 +239,7 @@ async def test_uses_settings_amount_not_caller(monkeypatch):
 async def test_default_amount_is_10_dollars(monkeypatch):
     """R2-C1 fold: default MINARA_ALERT_AMOUNT_USD=10."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -276,7 +276,7 @@ async def test_returns_none_when_session_is_none(monkeypatch):
 async def test_amount_clamps_to_minimum_1_dollar(monkeypatch):
     """R1-I2 fold: emit --amount-usd ≥ 1 even if Settings has tiny value."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -295,7 +295,7 @@ async def test_amount_clamps_to_minimum_1_dollar(monkeypatch):
 async def test_amount_handles_none_gracefully(monkeypatch):
     """R1-I3 fold: amount_usd=None doesn't crash; size from Settings."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -314,7 +314,7 @@ async def test_returns_none_when_platforms_is_not_dict(monkeypatch):
     """PR-V1-I1 fold: CG schema drift (platforms=string/list) → None,
     no spurious format_failed log."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": "oops"}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -331,7 +331,7 @@ async def test_returns_none_when_platforms_is_not_dict(monkeypatch):
 async def test_returns_none_when_platforms_is_null(monkeypatch):
     """Bitcoin literal: `{"platforms": null}` → None via `or {}` fallback."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": None}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -350,7 +350,7 @@ async def test_rejects_evm_shaped_address_under_solana_key(monkeypatch):
     (`0xabc...`, contains '0' which is not in base58 alphabet) under the
     solana platforms key must NOT emit a malformed Run: line."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {
             "platforms": {
                 "solana": "0xabcdef0123456789abcdef0123456789abcdef01",
@@ -371,7 +371,7 @@ async def test_rejects_evm_shaped_address_under_solana_key(monkeypatch):
 async def test_rejects_address_too_short(monkeypatch):
     """SPL addresses are 32-44 chars; reject shorter."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "abc"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -418,7 +418,7 @@ async def test_cg_slug_still_uses_lookup(monkeypatch):
     lookup — the native-id shortcut must not swallow the slug path."""
     fetch_count = [0]
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         fetch_count[0] += 1
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
@@ -450,7 +450,7 @@ async def test_native_solana_id_respects_disabled_flag(monkeypatch):
 async def test_accepts_real_world_spl_address(monkeypatch):
     """Sanity: a real BONK-like SPL address passes the shape check."""
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)

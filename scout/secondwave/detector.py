@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.config import Settings
 from scout.db import Database
 from scout.ratelimit import coingecko_limiter
@@ -16,7 +17,6 @@ from scout.secondwave.alerts import format_secondwave_alert
 logger = structlog.get_logger(__name__)
 
 # Hardcoded here to avoid a fragile import dependency on scout.ingestion.coingecko.
-CG_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 
 def score_reaccumulation(
@@ -151,16 +151,16 @@ async def fetch_current_prices(
     if not coingecko_ids:
         return {}
     ids_param = ",".join(coingecko_ids)
-    headers: dict[str, str] = {}
-    if settings.COINGECKO_API_KEY:
-        headers["x-cg-demo-api-key"] = settings.COINGECKO_API_KEY
+    headers: dict[str, str] = dict(
+        cg_api.auth_headers(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
     params = {"vs_currency": "usd", "ids": ids_param, "per_page": 250}
     try:
         # Honor the shared CoinGecko rate limit (25/min token bucket) so the
         # second-wave detector never bypasses the global budget.
         await coingecko_limiter.acquire()
         async with session.get(
-            CG_MARKETS_URL,
+            f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/coins/markets",
             params=params,
             headers=headers,
         ) as resp:

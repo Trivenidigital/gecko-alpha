@@ -170,6 +170,12 @@ class Settings(BaseSettings):
     MOMENTUM_MIN_24H_CHANGE_PCT: float = 3.0
     MIN_VOL_ACCEL_RATIO: float = 5.0
     COINGECKO_API_KEY: str = ""
+    # CoinGecko key tier. Paid plans (Basic/Analyst/Lite = "Pro API") use a
+    # DIFFERENT host (pro-api.coingecko.com) and auth name (x-cg-pro-api-key);
+    # mixing tiers yields CG errors 10010/10011. Both key formats start with
+    # "CG-" so the tier cannot be inferred from the key — set explicitly:
+    # "demo" (free) or "pro" (any paid plan). See scout/cg_api.py.
+    COINGECKO_API_TIER: str = "demo"
     COINGECKO_RATE_LIMIT_PER_MIN: int = 25  # buffer under 30/min free tier
     # Smooth concurrent CoinGecko lanes so the scanner stays under provider
     # burst/concurrency throttles, not only the rolling minute cap.
@@ -1381,6 +1387,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PAPER_TRAILING_* percent knobs must be in [0, 100]; "
                 f"drawdown > 100 yields a negative stop price. got={v}"
+            )
+        return v
+
+    @field_validator("COINGECKO_API_TIER")
+    @classmethod
+    def _validate_cg_api_tier(cls, v: str) -> str:
+        from scout.cg_api import VALID_TIERS
+
+        if v not in VALID_TIERS:
+            raise ValueError(
+                f"COINGECKO_API_TIER must be one of {VALID_TIERS}, got {v!r}"
             )
         return v
 

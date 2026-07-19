@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.db import Database
 from scout.narrative.strategy import Strategy
 from scout.ratelimit import coingecko_limiter
@@ -53,6 +54,7 @@ async def fetch_prices_batch(
     session: aiohttp.ClientSession,
     coin_ids: list[str],
     api_key: str = "",
+    api_tier: str = "demo",
 ) -> dict[str, float]:
     """Fetch current USD prices for a list of CoinGecko coin IDs.
 
@@ -71,14 +73,12 @@ async def fetch_prices_batch(
     if not coin_ids:
         return prices
 
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["x-cg-demo-api-key"] = api_key
+    headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
 
     for i in range(0, len(coin_ids), _BATCH_SIZE):
         batch = coin_ids[i : i + _BATCH_SIZE]
         ids_param = ",".join(batch)
-        url = "https://api.coingecko.com/api/v3/coins/markets"
+        url = f"{cg_api.base_url(api_tier)}/coins/markets"
         params = {
             "vs_currency": "usd",
             "ids": ids_param,
@@ -120,6 +120,7 @@ async def evaluate_pending(
     db: Database,
     strategy: Strategy,
     api_key: str = "",
+    api_tier: str = "demo",
 ) -> None:
     """Evaluate all pending predictions against current prices.
 
@@ -155,7 +156,9 @@ async def evaluate_pending(
 
     # Collect unique coin IDs and batch-fetch prices
     unique_ids = list({row[1] for row in rows})
-    prices = await fetch_prices_batch(session, unique_ids, api_key=api_key)
+    prices = await fetch_prices_batch(
+        session, unique_ids, api_key=api_key, api_tier=api_tier
+    )
 
     # Tokens missing from batch fetch — try direct CoinGecko /simple/price
     # Process in chunks of 20 (API limit per call)
@@ -172,11 +175,9 @@ async def evaluate_pending(
             try:
                 await coingecko_limiter.acquire()
                 ids_param = ",".join(chunk)
-                headers: dict[str, str] = {}
-                if api_key:
-                    headers["x-cg-demo-api-key"] = api_key
+                headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
                 async with session.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
+                    f"{cg_api.base_url(api_tier)}/simple/price",
                     params={"ids": ids_param, "vs_currencies": "usd"},
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
