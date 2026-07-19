@@ -141,6 +141,19 @@ against a synthetic DB in this session.
 6. **#424 deploy-to-prod unconfirmed** — merged 2026-07-10; runbook still
    phrases the nightly refresh as a precondition to verify. `[doc]` §3 above.
 
+## 5b. Post-investigation resolution (2026-07-19/20, VPS session)
+
+The stale-close counterfactual (`revival_evidence_queries.sh` §B-vs-§A) was
+run on prod by the VPS-keyed session on 2026-07-19: **no sign flips on any
+signal** — every suspension stands on clean evidence even with broken-era
+`stale_snapshot` closes excluded. The contaminated-suspension hypothesis is
+REFUTED; revival paths are forward-evidence only (parole retests + outcome
+ledger, first ripe read ~2026-07-31). Pipeline restored 2026-07-20: Pro-tier
+key routing live (#468), trending/gainers writers laying fresh rows for the
+first time since 07-13, detection lane re-enabled under the #466 gate.
+(Full query output lives in the VPS session's transcript; §F of the script
+was fixed post-run: the ledger column is `label_status`, not `status`.)
+
 ## 6. Current-state overlay (July)
 
 Even a perfect gate would alert on nothing today: CG (the only source feeding

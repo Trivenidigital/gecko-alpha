@@ -68,8 +68,8 @@ SELECT combo_key, window, trades, wins, win_rate_pct, suppressed, suppressed_at,
 FROM combo_performance ORDER BY suppressed DESC, combo_key;"
 
 Q "F. outcome-ledger ripeness (forward revival evidence per signal)" "
-SELECT surface, status, COUNT(*) FROM signal_outcome_ledger
-GROUP BY surface, status ORDER BY surface;"
+SELECT surface, label_status, COUNT(*) FROM signal_outcome_ledger
+GROUP BY surface, label_status ORDER BY surface;"
 
 echo; echo "### done — section B vs A per signal is the verdict:"
 echo "###   sign flips or hard_loss gate un-fires => suspension contaminated, revival case exists"
