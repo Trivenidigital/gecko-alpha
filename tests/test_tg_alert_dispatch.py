@@ -489,7 +489,7 @@ async def test_notify_includes_minara_command_for_solana_token(tmp_path, monkeyp
 
     _SPL = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"solana": _SPL}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
@@ -582,7 +582,7 @@ async def test_notify_no_minara_command_for_evm_only_token(tmp_path, monkeypatch
 
     monkeypatch.setattr("scout.alerter.send_telegram_message", _fake_send)
 
-    async def _fake_detail(session, coin_id, api_key=""):
+    async def _fake_detail(session, coin_id, api_key="", api_tier="demo"):
         return {"platforms": {"ethereum": "0xabc"}}
 
     monkeypatch.setattr("scout.trading.minara_alert.fetch_coin_detail", _fake_detail)
