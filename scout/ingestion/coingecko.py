@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.heartbeat import IngestSourceSample, increment_mcap_null_with_price
 from scout.models import CandidateToken
 from scout.ratelimit import coingecko_limiter
@@ -17,7 +18,17 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-CG_BASE = "https://api.coingecko.com/api/v3"
+# Legacy demo-tier constant. Kept for test fixtures that pin demo-tier URLs;
+# production call sites derive the base from settings via _base() so a paid
+# ("pro") key routes to pro-api.coingecko.com. See scout/cg_api.py.
+CG_BASE = cg_api.DEMO_BASE
+
+
+def _base(settings: "Settings") -> str:
+    """Tier-correct API base for this deployment (demo vs pro host)."""
+    return cg_api.base_url(settings.COINGECKO_API_TIER)
+
+
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 # Module-level store for raw /coins/markets responses.
@@ -99,8 +110,9 @@ async def fetch_top_movers(
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
     }
-    if settings.COINGECKO_API_KEY:
-        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+    base_params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
 
     # Query sequentially so a provider 429 can stop same-cycle fan-out before
     # queued requests consume more of the exhausted IP/key budget.
@@ -108,12 +120,12 @@ async def fetch_top_movers(
     params_volume = {**base_params, "order": "volume_desc"}
 
     data_small = await _get_with_backoff(
-        session, f"{CG_BASE}/coins/markets", params_small
+        session, f"{_base(settings)}/coins/markets", params_small
     )
     data_volume = None
     if not coingecko_limiter.is_backing_off():
         data_volume = await _get_with_backoff(
-            session, f"{CG_BASE}/coins/markets", params_volume
+            session, f"{_base(settings)}/coins/markets", params_volume
         )
 
     # Union both result sets, dedup by CG id
@@ -191,11 +203,12 @@ async def fetch_trending(
         IngestSourceSample(source="coingecko:trending", raw_count=0, error="pending")
     )
     params: dict[str, str] = {}
-    if settings.COINGECKO_API_KEY:
-        params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+    params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
 
     data = await _get_with_backoff(
-        session, f"{CG_BASE}/search/trending", params or None
+        session, f"{_base(settings)}/search/trending", params or None
     )
     if not data or not isinstance(data, dict):
         _set_watchdog_sample(
@@ -228,10 +241,11 @@ async def fetch_trending(
             "sparkline": "false",
             "price_change_percentage": "1h,24h,7d",
         }
-        if settings.COINGECKO_API_KEY:
-            market_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+        market_params.update(
+            cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+        )
         market_data = await _get_with_backoff(
-            session, f"{CG_BASE}/coins/markets", market_params
+            session, f"{_base(settings)}/coins/markets", market_params
         )
         if isinstance(market_data, list):
             market_rows_by_id = {
@@ -319,8 +333,9 @@ async def fetch_by_volume(
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
     }
-    if settings.COINGECKO_API_KEY:
-        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+    base_params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
 
     page_count = max(1, int(settings.COINGECKO_VOLUME_SCAN_PAGES))
     pages = []
@@ -328,7 +343,7 @@ async def fetch_by_volume(
         pages.append(
             await _get_with_backoff(
                 session,
-                f"{CG_BASE}/coins/markets",
+                f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
             )
         )
@@ -441,8 +456,9 @@ async def fetch_midcap_gainers(
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
     }
-    if settings.COINGECKO_API_KEY:
-        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+    base_params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
 
     start_page = max(1, int(settings.COINGECKO_MIDCAP_SCAN_START_PAGE))
     page_count = max(1, int(settings.COINGECKO_MIDCAP_SCAN_PAGES))
@@ -451,7 +467,7 @@ async def fetch_midcap_gainers(
         pages.append(
             await _get_with_backoff(
                 session,
-                f"{CG_BASE}/coins/markets",
+                f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
             )
         )
@@ -590,11 +606,12 @@ async def fetch_deep_volume(
         "sparkline": "false",
         "price_change_percentage": "1h,24h,7d",
     }
-    if settings.COINGECKO_API_KEY:
-        base_params["x_cg_demo_api_key"] = settings.COINGECKO_API_KEY
+    base_params.update(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
 
     data = await _get_with_backoff(
-        session, f"{CG_BASE}/coins/markets", {**base_params, "page": str(page)}
+        session, f"{_base(settings)}/coins/markets", {**base_params, "page": str(page)}
     )
     if isinstance(data, Exception) or not data or not isinstance(data, list):
         _set_watchdog_sample(

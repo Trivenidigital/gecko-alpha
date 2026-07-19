@@ -8,8 +8,8 @@ from aioresponses import aioresponses
 
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, CategorySnapshot
+from scout.cg_api import DEMO_BASE
 from scout.narrative.observer import (
-    CATEGORIES_URL,
     compute_acceleration,
     detect_market_regime,
     fetch_categories,
@@ -159,7 +159,7 @@ def test_detect_market_regime():
 async def test_fetch_categories_success():
     payload = [{"id": "defi", "name": "DeFi"}]
     with aioresponses() as m:
-        m.get(CATEGORIES_URL, payload=payload)
+        m.get(f"{DEMO_BASE}/coins/categories", payload=payload)
         async with aiohttp.ClientSession() as session:
             result = await fetch_categories(session, api_key="test-key")
     assert result == payload
@@ -168,8 +168,8 @@ async def test_fetch_categories_success():
 async def test_fetch_categories_429_retries():
     payload = [{"id": "defi", "name": "DeFi"}]
     with aioresponses() as m:
-        m.get(CATEGORIES_URL, status=429)
-        m.get(CATEGORIES_URL, payload=payload)
+        m.get(f"{DEMO_BASE}/coins/categories", status=429)
+        m.get(f"{DEMO_BASE}/coins/categories", payload=payload)
         async with aiohttp.ClientSession() as session:
             result = await fetch_categories(session, api_key="", max_retries=3)
     assert result == payload

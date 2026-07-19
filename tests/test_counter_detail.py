@@ -9,7 +9,6 @@ from aioresponses import aioresponses
 
 from scout.counter.detail import (
     CACHE_TTL_SECONDS,
-    CG_DETAIL_URL,
     _detail_cache,
     extract_counter_data,
     fetch_coin_detail,

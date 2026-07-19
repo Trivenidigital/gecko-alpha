@@ -33,6 +33,7 @@ async def resolve_coin_platforms(
             session=session,
             coin_id=coin_id,
             api_key=getattr(settings, "COINGECKO_API_KEY", "") or "",
+            api_tier=getattr(settings, "COINGECKO_API_TIER", "demo"),
         )
     except Exception:
         logger.warning("dex_resolver_fetch_failed", coin_id=coin_id)
@@ -99,9 +100,7 @@ async def run_resolver_pass(
             try:
                 await db.record_resolver_attempt(coin_id)
             except Exception:
-                logger.exception(
-                    "dex_resolver_attempt_record_failed", coin_id=coin_id
-                )
+                logger.exception("dex_resolver_attempt_record_failed", coin_id=coin_id)
         elif n:
             recorded += n
     logger.info(

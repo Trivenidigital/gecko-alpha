@@ -9,11 +9,10 @@ from typing import Any
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.ratelimit import coingecko_limiter
 
 logger = structlog.get_logger()
-
-CG_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}"
 # calibration era: undocumented -- see BL-NEW-CALIBRATION-ERA-DOC
 CACHE_TTL_SECONDS = 1800  # 30 minutes
 
@@ -24,6 +23,7 @@ async def fetch_coin_detail(
     session: aiohttp.ClientSession,
     coin_id: str,
     api_key: str = "",
+    api_tier: str = "demo",
 ) -> dict | None:
     """Fetch full coin detail from CoinGecko, with 30-min in-memory cache.
 
@@ -47,11 +47,9 @@ async def fetch_coin_detail(
         "developer_data": "true",
         "sparkline": "false",
     }
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["x-cg-demo-api-key"] = api_key
+    headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
 
-    url = CG_DETAIL_URL.format(coin_id=coin_id)
+    url = f"{cg_api.base_url(api_tier)}/coins/{coin_id}"
     await coingecko_limiter.acquire()
     try:
         async with session.get(url, params=params, headers=headers) as resp:

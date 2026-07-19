@@ -49,20 +49,19 @@ async def fetch_fear_greed(session: aiohttp.ClientSession) -> dict | None:
 
 
 async def fetch_cg_global(
-    session: aiohttp.ClientSession, api_key: str = ""
+    session: aiohttp.ClientSession, api_key: str = "", api_tier: str = "demo"
 ) -> dict | None:
     """Fetch CoinGecko /global endpoint for market overview.
 
     Uses the shared rate limiter. Returns market overview dict or None.
     """
     try:
+        from scout import cg_api
         from scout.ratelimit import coingecko_limiter
 
         await coingecko_limiter.acquire()
-        url = "https://api.coingecko.com/api/v3/global"
-        headers = {}
-        if api_key:
-            headers["x-cg-demo-api-key"] = api_key
+        url = f"{cg_api.base_url(api_tier)}/global"
+        headers = dict(cg_api.auth_headers(api_key, api_tier))
         async with session.get(url, headers=headers, timeout=_TIMEOUT) as resp:
             if resp.status != 200:
                 logger.warning("cg_global_fetch_failed", status=resp.status)
@@ -427,6 +426,7 @@ async def collect_briefing_data(
     are sequential but fast.
     """
     cg_api_key = getattr(settings, "COINGECKO_API_KEY", "")
+    cg_tier = getattr(settings, "COINGECKO_API_TIER", "demo")
     coinglass_key = getattr(settings, "COINGLASS_API_KEY", "")
 
     # External API calls (parallel)
@@ -439,7 +439,7 @@ async def collect_briefing_data(
         news,
     ) = await asyncio.gather(
         fetch_fear_greed(session),
-        fetch_cg_global(session, api_key=cg_api_key),
+        fetch_cg_global(session, api_key=cg_api_key, api_tier=cg_tier),
         fetch_funding_rates(session, api_key=coinglass_key),
         fetch_liquidations(session, api_key=coinglass_key),
         fetch_defi_tvl(session),

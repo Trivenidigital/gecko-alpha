@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Optional
 import aiohttp
 import structlog
 
-from scout.ingestion.coingecko import CG_BASE, _get_with_backoff
+from scout import cg_api
+from scout.ingestion.coingecko import _get_with_backoff
 from scout.trending.models import TrendingComparison, TrendingSnapshot, TrendingStats
 
 if TYPE_CHECKING:
@@ -82,17 +83,16 @@ async def fetch_and_store_trending(
     session: aiohttp.ClientSession,
     db: "Database",
     api_key: str = "",
+    api_tier: str = "demo",
 ) -> list[TrendingSnapshot]:
     """Fetch /search/trending and store each coin as a snapshot row.
 
     Returns the list of snapshots stored (empty on failure).
     """
-    params: dict[str, str] = {}
-    if api_key:
-        params["x_cg_demo_api_key"] = api_key
+    params: dict[str, str] = dict(cg_api.auth_query(api_key, api_tier))
 
     data = await _get_with_backoff(
-        session, f"{CG_BASE}/search/trending", params or None
+        session, f"{cg_api.base_url(api_tier)}/search/trending", params or None
     )
     if not data or not isinstance(data, dict):
         logger.warning("trending_tracker.fetch_empty")

@@ -8,29 +8,28 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, CategorySnapshot
 from scout.ratelimit import coingecko_limiter
 
 logger = structlog.get_logger(__name__)
 
-CATEGORIES_URL = "https://api.coingecko.com/api/v3/coins/categories"
-
 
 async def fetch_categories(
     session: aiohttp.ClientSession,
     api_key: str = "",
     max_retries: int = 3,
+    api_tier: str = "demo",
 ) -> list[dict]:
     """GET CoinGecko /coins/categories with exponential backoff on 429."""
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["x-cg-demo-api-key"] = api_key
+    headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
+    categories_url = f"{cg_api.base_url(api_tier)}/coins/categories"
 
     for attempt in range(max_retries):
         await coingecko_limiter.acquire()
         try:
-            async with session.get(CATEGORIES_URL, headers=headers) as resp:
+            async with session.get(categories_url, headers=headers) as resp:
                 if resp.status == 429:
                     wait = 2 ** (attempt + 1)
                     logger.warning("coingecko_429_retry", attempt=attempt, wait=wait)

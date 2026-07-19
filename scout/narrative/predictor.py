@@ -11,14 +11,13 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, LaggardToken
 from scout.narrative.prompts import NARRATIVE_FIT_SYSTEM, NARRATIVE_FIT_TEMPLATE
 from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
-
-CG_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 
 # ------------------------------------------------------------------
@@ -30,6 +29,7 @@ async def fetch_laggards(
     session: aiohttp.ClientSession,
     category_id: str,
     api_key: str = "",
+    api_tier: str = "demo",
 ) -> list[dict]:
     """Fetch coins in a CoinGecko category sorted by market cap descending.
 
@@ -44,13 +44,14 @@ async def fetch_laggards(
         "price_change_percentage": "24h,7d",
     }
     headers: dict[str, str] = {}
-    if api_key:
-        headers["x-cg-demo-api-key"] = api_key
+    headers.update(cg_api.auth_headers(api_key, api_tier))
     for attempt in range(2):  # 1 retry on 429
         await coingecko_limiter.acquire()
         try:
             async with session.get(
-                CG_MARKETS_URL, params=params, headers=headers
+                f"{cg_api.base_url(api_tier)}/coins/markets",
+                params=params,
+                headers=headers,
             ) as resp:
                 if resp.status == 429:
                     log.warning(
