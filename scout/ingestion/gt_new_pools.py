@@ -44,7 +44,7 @@ _poll_cycle_counter: int = 0
 #   succeeded  = enrolled + not_needed
 # candidates counts NEW discoveries only — dedup re-sightings and dust pools
 # are excluded by definition (they never reach the ledger stage). Operational
-# ledger-write failures are contained by record_emission and returned as
+# ledger-write failures are contained by record_emission_with_status and returned as
 # None; counted as failed_none, never described as enrolled. Intentional
 # disablement (LEDGER_ENABLED=False) is NOT failure: the ledger stage is not
 # attempted, candidates excludes the globally-disabled work by definition,
@@ -111,9 +111,12 @@ async def discover_new_pools(
         return 0
 
     recorded = 0
+    poll_ok = False
     ledger_on = ledger_enabled(settings)
     counters = {
         "ledger_enabled": ledger_on,
+        "poll_ok": False,
+        "heartbeat_written": False,
         "candidates": 0,
         "attempted": 0,
         "succeeded": 0,
@@ -125,12 +128,29 @@ async def discover_new_pools(
     for network in settings.DEX_DISCOVERY_NETWORKS:
         url = f"{GECKO_BASE}/networks/{network}/new_pools"
         data = await _get_json(session, url, chain=network)
-        if not isinstance(data, dict):
+        raw_pools = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(raw_pools, list):
+            # {} / error-object / non-list "data": a provider 200 carrying no
+            # pool list is NOT a valid poll and must not advance the heartbeat.
+            logger.warning("dex_discovery_malformed_payload", network=network)
             continue
-        raw_pools = data.get("data") or []
+        # Parse ONCE; the same parse results drive both the validity rule and
+        # the discovery loop. Validity: an empty list is a healthy quiet
+        # market; a NONEMPTY list where every record is structurally unusable
+        # is schema drift, not a valid poll.
+        parsed_pools = [
+            _parse_pool(pool if isinstance(pool, dict) else {}) for pool in raw_pools
+        ]
+        if raw_pools and not any(pp is not None for pp in parsed_pools):
+            logger.warning(
+                "dex_discovery_schema_invalid_pool_set",
+                network=network,
+                raw=len(raw_pools),
+            )
+            continue
+        poll_ok = True
         seen = 0
-        for pool in raw_pools:
-            parsed = _parse_pool(pool if isinstance(pool, dict) else {})
+        for parsed in parsed_pools:
             if parsed is None:
                 continue
             liq = parsed["liquidity_usd"]
@@ -200,6 +220,19 @@ async def discover_new_pools(
             eligible=seen,
             new=recorded,
         )
+    counters["poll_ok"] = poll_ok
+    if poll_ok:
+        # Durable liveness heartbeat (PR-C seam): a SUCCESSFUL poll (>=1
+        # network yielded valid data — independent of whether any NEW pool
+        # appeared) upserts source='dex_discovery' with misses=0; its
+        # updated_at is last_successful_poll_at. An unsuccessful pass writes
+        # nothing, so watchdog staleness is measured from the last SUCCESS.
+        # Poller health, not market activity: a quiet market stays healthy.
+        try:
+            await db.upsert_ingest_watchdog_state("dex_discovery", 0)
+            counters["heartbeat_written"] = True
+        except Exception:
+            logger.exception("dex_discovery_heartbeat_write_failed")
     last_pass_counters = counters
     logger.info("dex_discovery_ledger_pass", **counters)
     return recorded
