@@ -23,6 +23,7 @@ import aiohttp
 import structlog
 
 from scout.ingestion.geckoterminal import GECKO_BASE, _get_json
+from scout.outcome_ledger import ledger_enabled, record_emission_with_status
 
 if TYPE_CHECKING:
     from scout.config import Settings
@@ -33,6 +34,22 @@ logger = structlog.get_logger()
 # Cycle cadence gate (precedent: coingecko._midcap_scan_cycle_counter). The
 # lane runs on cycle 1 of every DEX_DISCOVERY_POLL_EVERY_N_CYCLES window.
 _poll_cycle_counter: int = 0
+
+# PR-B reconciling counters for the most recent EXECUTED polling pass
+# (test/ops introspection). Reset to {} when the last invocation was flag-off
+# or cadence-skipped, so a stale nonzero snapshot can never survive a skipped
+# pass. Contract (design review 2026-07-20):
+#   candidates = attempted + budget_skipped
+#   attempted  = succeeded + failed_none
+#   succeeded  = enrolled + not_needed
+# candidates counts NEW discoveries only — dedup re-sightings and dust pools
+# are excluded by definition (they never reach the ledger stage). Operational
+# ledger-write failures are contained by record_emission and returned as
+# None; counted as failed_none, never described as enrolled. Intentional
+# disablement (LEDGER_ENABLED=False) is NOT failure: the ledger stage is not
+# attempted, candidates excludes the globally-disabled work by definition,
+# and the pass log carries ledger_enabled=False.
+last_pass_counters: dict = {}
 
 
 def _parse_pool(pool: dict) -> dict | None:
@@ -82,16 +99,29 @@ async def discover_new_pools(
     Returns the number of NEW discoveries recorded this pass (0 when the
     flag is off, the cadence gate skips, or nothing new/eligible appeared).
     """
-    global _poll_cycle_counter
+    global _poll_cycle_counter, last_pass_counters
 
     if not settings.DEX_DISCOVERY_ENABLED:
+        last_pass_counters = {}
         return 0
 
     _poll_cycle_counter += 1
     if (_poll_cycle_counter - 1) % settings.DEX_DISCOVERY_POLL_EVERY_N_CYCLES != 0:
+        last_pass_counters = {}
         return 0
 
     recorded = 0
+    ledger_on = ledger_enabled(settings)
+    counters = {
+        "ledger_enabled": ledger_on,
+        "candidates": 0,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed_none": 0,
+        "budget_skipped": 0,
+        "enrolled": 0,
+        "not_needed": 0,
+    }
     for network in settings.DEX_DISCOVERY_NETWORKS:
         url = f"{GECKO_BASE}/networks/{network}/new_pools"
         data = await _get_json(session, url, chain=network)
@@ -110,6 +140,42 @@ async def discover_new_pools(
             is_new = await db.record_pool_discovery(network=network, **parsed)
             if is_new:
                 recorded += 1
+                # Ledger stage. Intentional disablement is not failure:
+                # when the kill switch is off the stage is never attempted
+                # and globally-disabled work is excluded from `candidates`
+                # by definition (equation holds trivially at all-zero).
+                if ledger_on:
+                    counters["candidates"] += 1
+                    if (
+                        counters["attempted"]
+                        < settings.DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE
+                    ):
+                        counters["attempted"] += 1
+                        result = await record_emission_with_status(
+                            db,
+                            settings,
+                            kind="gated_out_sample",
+                            token_id=f"dex:{network}:{parsed['base_token_address']}",
+                            surface="dex_new_pool",
+                            price=None,
+                            liquidity=parsed["liquidity_usd"],
+                            liquidity_source="gt_new_pools",
+                            gate_verdicts={
+                                "lane": "dex_discovery",
+                                "pool": parsed["pool_address"],
+                            },
+                        )
+                        if result is None:
+                            counters["failed_none"] += 1
+                        else:
+                            _row_id, enrollment_status = result
+                            counters["succeeded"] += 1
+                            if enrollment_status == "enrolled":
+                                counters["enrolled"] += 1
+                            else:
+                                counters["not_needed"] += 1
+                    else:
+                        counters["budget_skipped"] += 1
                 # Forward identity at the graduation moment: coin_id=NULL row
                 # keyed by mint address; the I1 resolver upserts the CG
                 # coin_id over it if/when the token ever lists.
@@ -134,4 +200,6 @@ async def discover_new_pools(
             eligible=seen,
             new=recorded,
         )
+    last_pass_counters = counters
+    logger.info("dex_discovery_ledger_pass", **counters)
     return recorded
