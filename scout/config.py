@@ -351,6 +351,13 @@ class Settings(BaseSettings):
     DEX_DISCOVERY_POLL_EVERY_N_CYCLES: int = Field(default=3, ge=1, le=60)
     # Drop dust pools at ingest; GT reserve_in_usd below this is not recorded.
     DEX_DISCOVERY_MIN_LIQUIDITY_USD: float = Field(default=1000.0, ge=0.0)
+    # PR-B: outcome-ledger enrollment budget per discovery pass — the ONLY
+    # limit on ledger writes from this lane (no embedded fallback). Each NEW
+    # discovery inside the budget is recorded via record_emission
+    # (kind=gated_out_sample, surface=dex_new_pool); fresh mints without
+    # in-DB price coverage are enrolled for DexScreener labeling. 0 disables
+    # ledger writes while keeping discovery itself on.
+    DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE: int = Field(default=3, ge=0, le=100)
 
     # Database
     DB_PATH: Path = Path("scout.db")
