@@ -14,7 +14,10 @@
 # .env IS sourced so (a) the alert path can read Telegram credentials via
 # Settings and (b) the knobs (DEX_DISCOVERY_POLL_STALENESS_ALERT_HOURS /
 # DEX_DISCOVERY_WATCHDOG_CLOCK_SKEW_SECONDS) flow through; the enable flag
-# itself is intentionally kept OUT of .env.
+# itself is intentionally kept OUT of .env — it is captured from the cron
+# environment BEFORE .env is sourced and the variable is unset afterwards,
+# so a stray DEX_DISCOVERY_WATCHDOG_ENABLED line in .env can neither arm
+# nor disarm the watchdog.
 #
 # Exit codes: 0 ok/disabled/lock-held · 5 breach · 1 error · 64 unknown arg
 
@@ -24,6 +27,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PYTHON="${GECKO_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 
+# Capture the watchdog gate from the CRON ENVIRONMENT before .env is
+# sourced, then unset it so no .env value can override the cron decision.
+WATCHDOG_ENABLED_FROM_CRON="${DEX_DISCOVERY_WATCHDOG_ENABLED:-false}"
+
 ENV_FILE="${GECKO_ENV_FILE:-${REPO_ROOT}/.env}"
 if [[ -f "$ENV_FILE" ]]; then
     set -a
@@ -31,10 +38,11 @@ if [[ -f "$ENV_FILE" ]]; then
     source "$ENV_FILE"
     set +a
 fi
+unset DEX_DISCOVERY_WATCHDOG_ENABLED
 
 DB_PATH="${REPO_ROOT}/scout.db"
-# Watchdog gate: cron environment only; deliberately not in .env.
-ENABLED="${DEX_DISCOVERY_WATCHDOG_ENABLED:-false}"
+# Watchdog gate: cron environment only (captured above); never .env.
+ENABLED="${WATCHDOG_ENABLED_FROM_CRON}"
 # Lane gate: from .env (the lane's own operator flag).
 DISCOVERY_ENABLED="${DEX_DISCOVERY_ENABLED:-false}"
 STALENESS_HOURS="${DEX_DISCOVERY_POLL_STALENESS_ALERT_HOURS:-2}"

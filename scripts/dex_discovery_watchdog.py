@@ -14,10 +14,15 @@ future-corrupted discovery timestamp must not mask a dead poller).
 
 Armed semantics (both gates on):
   - heartbeat row missing ............................ breach (heartbeat_absent)
+  - heartbeat timestamp unparseable .................. breach (heartbeat_invalid)
   - heartbeat older than --staleness-hours ........... breach (stale)
   - heartbeat in the FUTURE beyond --clock-skew-seconds
     (named allowance, no embedded constant) .......... breach (future_invalid)
   - fresh heartbeat, however old the discoveries ..... ok (discovery_age logged)
+A malformed DIAGNOSTIC timestamp (last_new_discovery_at) never affects the
+verdict: it is reported as ``discovery_timestamp_valid=false`` with
+``discovery_age_hours=null`` and the primary verdict proceeds from the
+heartbeat alone.
 Gate semantics:
   - --discovery-enabled falsy (lane intentionally off) → clean exit 0, no page
     (disablement is never represented as failure)
@@ -30,16 +35,27 @@ Send path mirrors the CG watchdog: ONE plain-text Telegram page
 ``raise_on_failure=True``. Per-check SEND cooldown (default 24h, state file
 under --state-dir) — cooldown state is written ONLY after a successful send,
 so a failed page re-alerts next run; a cooled breach still exits 5
-(``_alert_suppressed_by_cooldown``). A non-blocking ``flock`` on
-``<state-dir>/lock`` prevents concurrent invocations from double-sending
-(loser logs and exits 0). ``--dry-run`` runs the check and prints the composed
-alert without sending, locking, or touching cooldown state. Read-only on the
-DB.
+(``_alert_suppressed_by_cooldown``). Cooldown state uses the same named
+clock-skew allowance: a cooldown timestamp in the future WITHIN the allowance
+still counts as active; beyond it the state is treated as corrupted — logged
+and IGNORED, so future-corrupted state can never suppress a current breach.
+A malformed cooldown file is likewise eligible-to-send. A non-blocking
+``flock`` on ``<state-dir>/lock`` prevents concurrent invocations from
+double-sending (loser logs and exits 0). ``--dry-run`` runs the check and
+prints the composed alert without sending, locking, or touching cooldown
+state. The DB is opened read-only (sqlite ``mode=ro`` URI).
+
+Runtime knobs are range-validated at the script boundary BEFORE any DB or
+state access (finite values only; staleness-hours in [1, 168],
+clock-skew-seconds in [0, 3600], cooldown-hours in (0, 168] — the 168h/one-
+week upper bound keeps a typo'd cooldown from silencing the check
+indefinitely). Invalid configuration → structured ``invalid_configuration``
+output, exit 1.
 
 Exit codes:
   0 — ok / disabled no-op / lock already held
   5 — breach (page dispatched, cooldown-suppressed, or dry-run preview)
-  1 — DB missing, runtime error, or alert-dispatch failure
+  1 — invalid configuration, DB missing, runtime error, or dispatch failure
 """
 
 from __future__ import annotations
@@ -48,6 +64,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import math
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -84,11 +101,55 @@ def _parse_ts(raw: str) -> datetime:
     return dt
 
 
+# Malformed persisted timestamps must degrade per-field, never crash the run:
+# a non-string or unparseable value raises one of these from _parse_ts.
+_TS_PARSE_ERRORS = (ValueError, TypeError, AttributeError)
+
+# Named bounds for the runtime knobs, enforced at the script boundary before
+# any DB/state access. The cooldown upper bound (one week) exists so a typo'd
+# value cannot silence the check indefinitely.
+_STALENESS_HOURS_RANGE = (1.0, 168.0)
+_CLOCK_SKEW_SECONDS_RANGE = (0.0, 3600.0)
+_COOLDOWN_HOURS_MAX = 168.0
+
+
+def _validate_config(args: argparse.Namespace) -> str | None:
+    """Return a human-readable error for out-of-range knobs, else None."""
+    lo, hi = _STALENESS_HOURS_RANGE
+    if not math.isfinite(args.staleness_hours) or not (
+        lo <= args.staleness_hours <= hi
+    ):
+        return (
+            f"--staleness-hours must be finite and within [{lo}, {hi}], "
+            f"got {args.staleness_hours}"
+        )
+    lo, hi = _CLOCK_SKEW_SECONDS_RANGE
+    if not math.isfinite(args.clock_skew_seconds) or not (
+        lo <= args.clock_skew_seconds <= hi
+    ):
+        return (
+            f"--clock-skew-seconds must be finite and within [{lo}, {hi}], "
+            f"got {args.clock_skew_seconds}"
+        )
+    if not math.isfinite(args.cooldown_hours) or not (
+        0.0 < args.cooldown_hours <= _COOLDOWN_HOURS_MAX
+    ):
+        return (
+            f"--cooldown-hours must be finite and within (0, "
+            f"{_COOLDOWN_HOURS_MAX}], got {args.cooldown_hours}"
+        )
+    return None
+
+
 async def _read_state(
     db_path: str, now: datetime, staleness_hours: float, clock_skew_seconds: float
 ) -> dict:
-    """Run the liveness check + gather diagnostic context. Read-only."""
-    async with aiosqlite.connect(db_path) as conn:
+    """Run the liveness check + gather diagnostic context.
+
+    Opens the DB read-only (sqlite mode=ro URI) so this path structurally
+    cannot mutate pipeline state.
+    """
+    async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         try:
             cur = await conn.execute(
                 "SELECT updated_at FROM ingest_watchdog_state WHERE source = ?",
@@ -111,11 +172,18 @@ async def _read_state(
             if "no such table" not in str(exc).lower():
                 raise
 
+    # Diagnostic timestamp: malformed → flagged invalid, age null, verdict
+    # UNAFFECTED (it proceeds from the heartbeat alone).
     discovery_age_hours = None
+    discovery_timestamp_valid = True if last_new_discovery_at else None
     if last_new_discovery_at:
-        discovery_age_hours = round(
-            (now - _parse_ts(last_new_discovery_at)).total_seconds() / 3600.0, 2
-        )
+        try:
+            discovery_age_hours = round(
+                (now - _parse_ts(last_new_discovery_at)).total_seconds() / 3600.0, 2
+            )
+        except _TS_PARSE_ERRORS:
+            discovery_timestamp_valid = False
+            discovery_age_hours = None
 
     result = {
         "check": _CHECK_KEY,
@@ -124,6 +192,7 @@ async def _read_state(
         "poll_age_hours": None,
         "poll_age_seconds_signed": None,
         "discovery_age_hours": discovery_age_hours,
+        "discovery_timestamp_valid": discovery_timestamp_valid,
         "staleness_hours": staleness_hours,
         "clock_skew_seconds": clock_skew_seconds,
     }
@@ -132,7 +201,13 @@ async def _read_state(
         result.update(status="breach", reason="heartbeat_absent")
         return result
 
-    signed_age = (now - _parse_ts(row[0])).total_seconds()
+    try:
+        signed_age = (now - _parse_ts(row[0])).total_seconds()
+    except _TS_PARSE_ERRORS:
+        # A heartbeat that exists but cannot be parsed is corrupted liveness
+        # state: page-worthy invalid-state breach, never a generic crash.
+        result.update(status="breach", reason="heartbeat_invalid")
+        return result
     result["poll_age_seconds_signed"] = round(signed_age, 1)
     result["poll_age_hours"] = round(signed_age / 3600.0, 2)
     if signed_age < -clock_skew_seconds:
@@ -153,6 +228,12 @@ def _compose_message(check: dict) -> str:
             "- dex_discovery heartbeat: NO successful-poll record exists in "
             "ingest_watchdog_state — the discovery lane has never completed a "
             f"valid poll (SLO {check['staleness_hours']}h)"
+        )
+    elif reason == "heartbeat_invalid":
+        lines.append(
+            "- dex_discovery heartbeat: last_successful_poll_at "
+            f"{check['last_successful_poll_at']!r} is UNPARSEABLE — corrupted "
+            "heartbeat state; liveness cannot be trusted"
         )
     elif reason == "future_invalid":
         lines.append(
@@ -178,6 +259,11 @@ def _compose_message(check: dict) -> str:
             if check["discovery_age_hours"] is not None
             else ""
         )
+        + (
+            " [timestamp unparseable]"
+            if check.get("discovery_timestamp_valid") is False
+            else ""
+        )
         + " — diagnostic only, not the paging signal"
     )
     return "\n".join(lines)
@@ -197,15 +283,33 @@ async def _send_via_alerter(text: str) -> None:
         )
 
 
-def _cooldown_active(state_dir: str, now: datetime, cooldown_hours: float) -> bool:
+def _cooldown_active(
+    state_dir: str, now: datetime, cooldown_hours: float, clock_skew_seconds: float
+) -> bool:
+    """Whether the send-cooldown window is active.
+
+    Uses the same named clock-skew allowance as the liveness check: a
+    cooldown timestamp in the future WITHIN the allowance still counts as
+    active; beyond it the state is corrupted — logged and ignored so it can
+    never suppress a current breach. Malformed state is eligible-to-send.
+    """
     sf = Path(state_dir) / f"last_alert_{_CHECK_KEY}"
     if not sf.exists():
         return False
     try:
         last = _parse_ts(sf.read_text())
-    except (ValueError, OSError):
+    except (OSError, *_TS_PARSE_ERRORS):
         return False
-    return (now - last).total_seconds() < cooldown_hours * 3600.0
+    delta = (now - last).total_seconds()
+    if delta < -clock_skew_seconds:
+        _log.warning(
+            "dex_discovery_watchdog_cooldown_state_invalid_future",
+            cooldown_recorded_at=last.isoformat(),
+            signed_age_seconds=round(delta, 1),
+            clock_skew_seconds=clock_skew_seconds,
+        )
+        return False
+    return delta < cooldown_hours * 3600.0
 
 
 def _write_cooldown_state(state_dir: str, now: datetime) -> None:
@@ -227,6 +331,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+
+    # Boundary validation BEFORE any gate/DB/state access: argparse accepts
+    # any float (including nan/inf/negatives), so range-check here.
+    config_error = _validate_config(args)
+    if config_error is not None:
+        _log.error("dex_discovery_watchdog_invalid_configuration", error=config_error)
+        print(json.dumps({"status": "invalid_configuration", "error": config_error}))
+        return 1
 
     if not _is_enabled(args.enabled):
         _log.info("dex_discovery_watchdog_disabled_noop")
@@ -282,7 +394,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        if _cooldown_active(args.state_dir, now, args.cooldown_hours):
+        if _cooldown_active(
+            args.state_dir, now, args.cooldown_hours, args.clock_skew_seconds
+        ):
             _log.info(
                 "dex_discovery_watchdog_alert_suppressed_by_cooldown",
                 check=_CHECK_KEY,

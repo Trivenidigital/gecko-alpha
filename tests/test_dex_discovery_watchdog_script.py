@@ -16,7 +16,15 @@ import pytest
 from scripts.dex_discovery_watchdog import main as watchdog_main
 
 
-def _mkdb(tmp_path, heartbeat_at=None, discovery_at=None):
+def _mkdb(
+    tmp_path,
+    heartbeat_at=None,
+    discovery_at=None,
+    heartbeat_raw=None,
+    discovery_raw=None,
+):
+    """Build a fixture DB. *_at take datetimes; *_raw take raw strings so
+    malformed persisted timestamps can be exercised directly."""
     db = tmp_path / "scout.db"
     conn = sqlite3.connect(db)
     conn.execute(
@@ -29,17 +37,27 @@ def _mkdb(tmp_path, heartbeat_at=None, discovery_at=None):
         "network TEXT, pool_address TEXT, base_token_address TEXT, "
         "first_seen_at TEXT)"
     )
-    if heartbeat_at is not None:
+    hb = (
+        heartbeat_raw
+        if heartbeat_raw is not None
+        else (heartbeat_at.isoformat() if heartbeat_at is not None else None)
+    )
+    if hb is not None:
         conn.execute(
             "INSERT INTO ingest_watchdog_state VALUES ('dex_discovery', 0, ?)",
-            (heartbeat_at.isoformat(),),
+            (hb,),
         )
-    if discovery_at is not None:
+    disc = (
+        discovery_raw
+        if discovery_raw is not None
+        else (discovery_at.isoformat() if discovery_at is not None else None)
+    )
+    if disc is not None:
         conn.execute(
             "INSERT INTO dex_pool_discoveries "
             "(network, pool_address, base_token_address, first_seen_at) "
             "VALUES ('solana', 'P', 'M', ?)",
-            (discovery_at.isoformat(),),
+            (disc,),
         )
     conn.commit()
     conn.close()
@@ -178,6 +196,158 @@ def test_future_heartbeat_within_named_skew_is_healthy(tmp_path, capsys):
     db = _mkdb(tmp_path, heartbeat_at=NOW + timedelta(seconds=60))
     rc = _run(db, tmp_path, dry_run=True, skew=300.0)
     assert rc == 0
+
+
+# ------------------------------------------------------ malformed timestamps
+
+
+def test_malformed_heartbeat_timestamp_is_invalid_breach(tmp_path, capsys):
+    """Corrupted heartbeat state is page-worthy, never a generic crash."""
+    db = _mkdb(tmp_path, heartbeat_raw="not-a-timestamp")
+    rc = _run(db, tmp_path, dry_run=True)
+    assert rc == 5
+    payload, extra = _out(capsys)
+    assert payload["status"] == "breach_dry_run"
+    assert payload["check"]["reason"] == "heartbeat_invalid"
+    assert "UNPARSEABLE" in "\n".join(extra)
+
+
+def test_stale_heartbeat_still_pages_with_malformed_discovery_ts(tmp_path, capsys):
+    """A malformed DIAGNOSTIC timestamp must not mask a real stale breach."""
+    db = _mkdb(
+        tmp_path,
+        heartbeat_at=NOW - timedelta(hours=7),
+        discovery_raw="garbage-ts",
+    )
+    rc = _run(db, tmp_path, dry_run=True)
+    assert rc == 5
+    payload, _ = _out(capsys)
+    assert payload["check"]["reason"] == "stale"
+    assert payload["check"]["discovery_timestamp_valid"] is False
+    assert payload["check"]["discovery_age_hours"] is None
+
+
+def test_healthy_heartbeat_with_malformed_diagnostic_stays_healthy(tmp_path, capsys):
+    """A malformed diagnostic-only timestamp never flips a healthy verdict."""
+    db = _mkdb(
+        tmp_path,
+        heartbeat_at=NOW - timedelta(minutes=10),
+        discovery_raw="%%bad%%",
+    )
+    rc = _run(db, tmp_path, dry_run=True)
+    assert rc == 0
+    payload, _ = _out(capsys)
+    assert payload["status"] == "ok"
+    assert payload["check"]["discovery_timestamp_valid"] is False
+    assert payload["check"]["discovery_age_hours"] is None
+
+
+# --------------------------------------------------------- config validation
+
+
+@pytest.mark.parametrize(
+    "knob,value",
+    [
+        ("staleness", -1.0),
+        ("staleness", 0.5),
+        ("staleness", 200.0),
+        ("staleness", float("nan")),
+        ("staleness", float("inf")),
+        ("skew", -1.0),
+        ("skew", 4000.0),
+        ("skew", float("nan")),
+        ("skew", float("inf")),
+        ("cooldown", 0.0),
+        ("cooldown", -5.0),
+        ("cooldown", 200.0),
+        ("cooldown", float("nan")),
+        ("cooldown", float("inf")),
+    ],
+)
+def test_out_of_range_config_is_rejected_before_db_access(
+    tmp_path, capsys, knob, value
+):
+    """Invalid knobs → structured invalid_configuration + exit 1, BEFORE any
+    DB/state access — proven by pointing --db at a nonexistent path: the
+    result must be invalid_configuration, never db_missing."""
+    kwargs = {knob: value}
+    rc = _run(str(tmp_path / "absent.db"), tmp_path, dry_run=True, **kwargs)
+    assert rc == 1
+    payload, _ = _out(capsys)
+    assert payload["status"] == "invalid_configuration"
+    assert not (tmp_path / "state").exists()  # no state mutation either
+
+
+def test_boundary_config_values_are_accepted(tmp_path, capsys):
+    """Inclusive bounds: staleness 1h & 168h, skew 0s & 3600s, cooldown 168h."""
+    db = _mkdb(tmp_path, heartbeat_at=NOW - timedelta(minutes=10))
+    assert _run(db, tmp_path, dry_run=True, staleness=1.0, skew=0.0) == 0
+    assert (
+        _run(db, tmp_path, dry_run=True, staleness=168.0, skew=3600.0, cooldown=168.0)
+        == 0
+    )
+
+
+# ----------------------------------------------- corrupted cooldown state
+
+
+def test_future_corrupted_cooldown_cannot_suppress_breach(
+    tmp_path, capsys, monkeypatch
+):
+    """A cooldown timestamp arbitrarily far in the future (beyond the named
+    clock-skew allowance) is corrupted state: logged, ignored, page sent."""
+    import scripts.dex_discovery_watchdog as wd
+
+    sent = []
+
+    async def _fake_send(text):
+        sent.append(text)
+
+    monkeypatch.setattr(wd, "_send_via_alerter", _fake_send)
+    db = _mkdb(tmp_path)  # no heartbeat → breach
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "last_alert_poll_liveness").write_text(
+        (NOW + timedelta(days=10)).isoformat()
+    )
+    rc = _run(db, tmp_path)
+    assert rc == 5
+    payload, _ = _out(capsys)
+    assert payload["status"] == "breach_paged"
+    assert len(sent) == 1
+    # Corrupted state was overwritten with a sane value by the send path.
+    rewritten = (state / "last_alert_poll_liveness").read_text()
+    assert (
+        (NOW - timedelta(minutes=5)).isoformat()
+        < rewritten
+        < (NOW + timedelta(minutes=5)).isoformat()
+    )
+
+
+def test_future_cooldown_within_skew_allowance_stays_active(
+    tmp_path, capsys, monkeypatch
+):
+    """Future within the allowance is ordinary skew, not corruption: the
+    cooldown holds (no second send), breach still exits 5."""
+    import scripts.dex_discovery_watchdog as wd
+
+    sent = []
+
+    async def _fake_send(text):
+        sent.append(text)
+
+    monkeypatch.setattr(wd, "_send_via_alerter", _fake_send)
+    db = _mkdb(tmp_path)  # no heartbeat → breach
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "last_alert_poll_liveness").write_text(
+        (NOW + timedelta(seconds=60)).isoformat()
+    )
+    rc = _run(db, tmp_path, skew=300.0)
+    assert rc == 5
+    payload, _ = _out(capsys)
+    assert payload["status"] == "breach_cooldown_suppressed"
+    assert sent == []
 
 
 # ------------------------------------------------------- send/cooldown/lock
