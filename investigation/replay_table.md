@@ -1,5 +1,8 @@
 # Phase 3 — Case replay table
 
+> **POINT-IN-TIME DOCUMENT (2026-07-18).** Historical forensic evidence;
+> for what has changed on master since, see `investigation/FINDINGS.md` §7.
+
 Read-only reconstruction from committed evidence. Rows marked `[NEEDS-DB]`
 require `investigation/case_replay.py --db /root/gecko-alpha/scout.db <tokens>`
 on the VPS — this repo carries no DB, and `gainers_snapshots` 7-day retention

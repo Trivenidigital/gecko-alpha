@@ -2,6 +2,12 @@
 
 Date: 2026-07-18 · Read-only investigation · No pipeline code was modified.
 
+> **POINT-IN-TIME DOCUMENT.** Findings below are as of **2026-07-18** (master
+> `749882e`); §5b/§7 record later updates. For what has changed on master
+> since (DEX-first Phase 1 implemented via PRs #469/#470/#471, merged
+> 2026-07-20), see **§7 Current-state addendum** at the end of this file —
+> the historical analysis is NOT the current state of the codebase.
+
 **Evidence classes used below** (per claim):
 - `[git]` — verified against this repo's git history at origin/master `749882e`.
 - `[code]` — file:line at origin/master.
@@ -154,10 +160,37 @@ first time since 07-13, detection lane re-enabled under the #466 gate.
 (Full query output lives in the VPS session's transcript; §F of the script
 was fixed post-run: the ledger column is `label_status`, not `status`.)
 
-## 6. Current-state overlay (July)
+## 6. Current-state overlay (as of 2026-07-18 — SUPERSEDED, see §7)
 
 Even a perfect gate would alert on nothing today: CG (the only source feeding
 the trending/gainers lanes) is quota-dead since 2026-07-13, and the newer
 detection lane — the one lane with validated early-catch recall (8/10) — is
 default-OFF pending #466 + operator flag flip. Restoration sequence and
 command packs: `tasks/ops_pack_priorities_2026_07_18.md`.
+
+## 7. Current-state addendum (2026-07-20)
+
+What has changed on master since the point-in-time findings above:
+
+- **Pipeline restored** (2026-07-19/20): Pro-tier CG key routing merged
+  (#468) and confirmed live by the VPS session; trending/gainers writers
+  active again; detection lane re-enabled under the #466 gate. §6's
+  "quota-dead" state no longer holds.
+- **The H4/H3 wall now has an implemented (not yet activated) answer.**
+  DEX-first Phase 1 — the retargeting option the DECISION_MEMO described as
+  future work — is merged to master:
+  - PR #469 (`fdb875a4`): GT `new_pools` discovery lane (`dex:` namespace,
+    `dex_pool_discoveries` + `contract_coin_map` forward identity),
+    flag-off by default.
+  - PR #470 (`8b2f9144`): outcome-ledger enrollment for DEX discoveries
+    with a reconciling counter contract.
+  - PR #471 (`32d1ca4e`): durable poll heartbeat + §12a poll-liveness
+    watchdog, deploy-without-activate cron.
+- **Not yet proven deployed or activated:** merge to master does not prove
+  the VPS is running `32d1ca4e`, that the managed crontab was refreshed, or
+  that `DEX_DISCOVERY_ENABLED` was flipped. Activation follows the staged
+  sequence recorded in the PR-C review; the first-ripe-ledger-evidence date
+  (~2026-07-31 was provisional) is computed from the first PRODUCTION
+  enrollment timestamp, not the merge date.
+- The suspension-evidence question is closed (§5b): no sign flips;
+  suspensions stand on clean evidence.

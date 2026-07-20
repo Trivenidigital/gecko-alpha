@@ -1,5 +1,19 @@
 # Ops pack — priority closeout 2026-07-18
 
+> **POINT-IN-TIME DOCUMENT (2026-07-18) — NOT the current operator queue.**
+> Status as of 2026-07-20:
+>
+> | Priority | Status |
+> |---|---|
+> | 1 — restore CoinGecko ingestion | **COMPLETED 2026-07-19/20** — resolved by Pro-tier key + tier routing (#468), not the Demo-key options below; pipeline confirmed back online by the VPS session |
+> | 2 — activate CG-ingestion watchdog | **COMPLETED per VPS session report 2026-07-19/20** (pipeline-restoration closeout) |
+> | 3 — PR #466 review brief | **COMPLETED** — merged 2026-07-18 with recorded approval |
+> | 4 — PR #464 review brief | **COMPLETED** — cross-PR conflict fixed, merged 2026-07-18 with recorded approval |
+> | 5 — inert-flag decision briefs | **OPEN** (operator decision still pending) |
+>
+> The command packs below are retained as historical trace + reusable
+> runbook material; do not execute them as a queue.
+
 Session deliverable for the five priorities ranked from the 2026-07-17 state
 (CG outage + #465/#466/#464 + inert flags). Structure per LOOPS.md: this file
 is STATE + TRACE for the effort; per-PR approvals are recorded in the

@@ -4,7 +4,46 @@
 # Every query is a SELECT / PRAGMA / journalctl read. Nothing writes.
 set -uo pipefail
 DB="${GECKO_DB:-/root/gecko-alpha/scout.db}"
+ENV_FILE="${GECKO_ENV:-/root/gecko-alpha/.env}"
 Q() { echo; echo "=== $1 ==="; sqlite3 -readonly "$DB" "$2" 2>&1; }
+
+# Threshold values are printed by EXACT-NAME allowlist only — never prefix
+# matches (a prefix like NARRATIVE would also match NARRATIVE_API_KEY, and
+# the recommended invocation redirects output into /tmp). As a second layer,
+# any name containing KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL is REFUSED even
+# if it appears in the allowlist (or in EXTRA_THRESHOLD_NAMES, a
+# space-separated operator extension for ad-hoc non-secret knobs).
+THRESHOLD_ALLOWLIST=(
+  MIN_SCORE
+  CONVICTION_THRESHOLD
+  QUANT_WEIGHT
+  NARRATIVE_WEIGHT
+  CONVICTION_GATE_ENABLED
+)
+env_report() {
+  echo "=== P0.env gate+flags (exact-name allowlist for threshold values; flags shown as set/unset) ==="
+  local name line
+  for name in "${THRESHOLD_ALLOWLIST[@]}" ${EXTRA_THRESHOLD_NAMES:-}; do
+    case "$name" in
+      *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*)
+        echo "$name: REFUSED (secret-like name never printed)"
+        continue
+        ;;
+    esac
+    line=$(grep -E "^${name}=" "$ENV_FILE" 2>/dev/null | head -1)
+    if [[ -n "$line" ]]; then echo "$line"; else echo "$name unset"; fi
+  done
+  local f
+  for f in DETECTION_ALERT_LANE_ENABLED MOVED_ALREADY_POSTMORTEM_ENABLED LIQUIDITY_ENRICHMENT_ENABLED RETIRE_DEAD_TABLES_ENABLED; do
+    grep -q "^$f=" "$ENV_FILE" 2>/dev/null && echo "$f set: $(grep "^$f=" "$ENV_FILE")" || echo "$f unset"
+  done
+}
+
+# Test seam: report only the (secret-safe) env section, touching nothing else.
+if [[ "${1:-}" == "--env-report-only" ]]; then
+  env_report
+  exit 0
+fi
 
 echo "### gecko-alpha forensic snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "### DB: $DB ($(stat -c%s "$DB" 2>/dev/null) bytes)"
@@ -15,11 +54,8 @@ systemctl is-active gecko-pipeline 2>&1
 systemctl show gecko-pipeline -p ActiveEnterTimestamp -p MainPID 2>&1
 echo; echo "=== P0.cron (managed block) ==="
 crontab -l 2>/dev/null | sed -n '/BEGIN gecko-alpha/,/END gecko-alpha/p'
-echo; echo "=== P0.env gate+flags (values only for thresholds; flags shown as set/unset) ==="
-grep -E "^(CONVICTION|MIN_CONVICTION|GATE|QUANT|NARRATIVE)" /root/gecko-alpha/.env 2>/dev/null
-for f in DETECTION_ALERT_LANE_ENABLED MOVED_ALREADY_POSTMORTEM_ENABLED LIQUIDITY_ENRICHMENT_ENABLED RETIRE_DEAD_TABLES_ENABLED; do
-  grep -q "^$f=" /root/gecko-alpha/.env 2>/dev/null && echo "$f set: $(grep "^$f=" /root/gecko-alpha/.env)" || echo "$f unset"
-done
+echo
+env_report
 
 Q "P0.last_writes_per_stage (freshness of each pipeline output)" "
 SELECT 'candidates.first_seen_at'  AS stage, MAX(first_seen_at) FROM candidates

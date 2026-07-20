@@ -4,6 +4,14 @@ Read-only investigation, 2026-07-18. Evidence base: `investigation/FINDINGS.md`
 (every claim cited there), `investigation/replay_table.md`. This memo lays out
 what the data says per option. **No recommendation is made.**
 
+> **POINT-IN-TIME DOCUMENT (2026-07-18).** The "retarget" option's DEX/new-
+> pools direction discussed below has SINCE BEEN IMPLEMENTED on master as
+> DEX-first Phase 1 (PRs #469/#470/#471, merged 2026-07-20) — implemented
+> and merged, not yet proven deployed or activated on the VPS. See
+> `investigation/FINDINGS.md` §7 for the current-state addendum. Read this
+> memo as the evidence record that informed that decision, not as an open
+> decision.
+
 ---
 
 ## Hypothesis adjudication

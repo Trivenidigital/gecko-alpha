@@ -16,6 +16,7 @@ Usage (VPS):
   python3 investigation/ledger_backfill.py --db /root/gecko-alpha/scout.db \
       --days 90 --out /tmp/ledger_backfill_90d.csv
 """
+
 import argparse
 import csv
 import sqlite3
@@ -45,16 +46,15 @@ def time_to_peak_min(conn, coin_id, opened_at, peak_price):
     return round(row["m"], 1) if row and row["m"] is not None else None
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
     ap.add_argument("--days", type=int, default=90)
     ap.add_argument("--out", default="-")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     conn = ro_connect(args.db)
-    rows = conn.execute(
-        f"""
+    rows = conn.execute(f"""
         SELECT pt.token_id, pt.symbol, pt.chain, pt.signal_type, pt.opened_at,
                pt.entry_price, pt.status, pt.exit_reason, pt.pnl_pct,
                pt.checkpoint_1h_pct, pt.checkpoint_6h_pct,
@@ -65,18 +65,32 @@ def main() -> int:
         LEFT JOIN candidates c ON c.contract_address = pt.token_id
         WHERE pt.opened_at >= datetime('now', '-{args.days} days')
         ORDER BY pt.opened_at
-        """
-    ).fetchall()
+        """).fetchall()
 
     out = sys.stdout if args.out == "-" else open(args.out, "w", newline="")
     w = csv.writer(out)
     w.writerow(
         [
-            "token_id", "symbol", "chain", "signal_type", "opened_at",
-            "entry_price", "quant_score", "conviction_score", "signals_fired",
-            "alerted_at", "pct_1h", "pct_6h", "pct_24h", "pct_48h",
-            "max_multiple", "time_to_peak_min", "status", "exit_reason",
-            "realized_pnl_pct", "sim_fixed_24h_pct",
+            "token_id",
+            "symbol",
+            "chain",
+            "signal_type",
+            "opened_at",
+            "entry_price",
+            "quant_score",
+            "conviction_score",
+            "signals_fired",
+            "alerted_at",
+            "pct_1h",
+            "pct_6h",
+            "pct_24h",
+            "pct_48h",
+            "max_multiple",
+            "time_to_peak_min",
+            "status",
+            "exit_reason",
+            "realized_pnl_pct",
+            "sim_fixed_24h_pct",
         ]
     )
     for r in rows:
@@ -87,21 +101,31 @@ def main() -> int:
         )
         w.writerow(
             [
-                r["token_id"], r["symbol"], r["chain"], r["signal_type"],
-                r["opened_at"], r["entry_price"], r["quant_score"],
-                r["conviction_score"], r["signals_fired"], r["alerted_at"],
-                r["checkpoint_1h_pct"], r["checkpoint_6h_pct"],
-                r["checkpoint_24h_pct"], r["checkpoint_48h_pct"],
+                r["token_id"],
+                r["symbol"],
+                r["chain"],
+                r["signal_type"],
+                r["opened_at"],
+                r["entry_price"],
+                r["quant_score"],
+                r["conviction_score"],
+                r["signals_fired"],
+                r["alerted_at"],
+                r["checkpoint_1h_pct"],
+                r["checkpoint_6h_pct"],
+                r["checkpoint_24h_pct"],
+                r["checkpoint_48h_pct"],
                 max_mult,
                 time_to_peak_min(conn, r["token_id"], r["opened_at"], r["peak_price"]),
-                r["status"], r["exit_reason"], r["pnl_pct"],
+                r["status"],
+                r["exit_reason"],
+                r["pnl_pct"],
                 r["checkpoint_24h_pct"],
             ]
         )
 
     # Aggregate footer to stderr so the CSV stays clean.
-    agg = conn.execute(
-        f"""
+    agg = conn.execute(f"""
         SELECT COUNT(*) n,
                ROUND(AVG(checkpoint_24h_pct), 2) fixed24,
                ROUND(AVG(pnl_pct), 2) realized,
@@ -109,8 +133,7 @@ def main() -> int:
         FROM paper_trades
         WHERE opened_at >= datetime('now', '-{args.days} days')
           AND status != 'open'
-        """
-    ).fetchone()
+        """).fetchone()
     print(
         f"[ledger_backfill] closed n={agg['n']} avg_fixed24h={agg['fixed24']}% "
         f"avg_realized={agg['realized']}% avg_peak={agg['peak']}%",
