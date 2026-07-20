@@ -131,7 +131,7 @@ async def test_ledger_failure_counted_not_enrolled(
     async def _none(*a, **k):
         return None  # contained operational failure per record_emission contract
 
-    monkeypatch.setattr(gt_new_pools, "record_emission", _none)
+    monkeypatch.setattr(gt_new_pools, "record_emission_with_status", _none)
     n = await _run(db, settings, [_pool(1)])
     assert n == 1  # discovery itself still recorded
     cur = await db._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
@@ -162,18 +162,80 @@ async def test_counters_reconcile_exactly(tmp_path, settings_factory):
     await db.close()
 
 
-async def test_ledger_kill_switch_respected(tmp_path, settings_factory):
+async def test_ledger_kill_switch_not_counted_as_failure(tmp_path, settings_factory):
+    """Intentional disablement: discovery continues, ledger stage never
+    attempted, and NO counter reports failure (ruling: disablement != failure)."""
     db = await _db(tmp_path)
     settings = _settings(
         settings_factory, LEDGER_ENABLED=False, DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=3
     )
     n = await _run(db, settings, [_pool(1)])
-    assert n == 1
+    assert n == 1  # discovery continues
     cur = await db._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
-    assert (await cur.fetchone())[0] == 0  # record_emission returns None when disabled
+    assert (await cur.fetchone())[0] == 0
+    c = gt_new_pools.last_pass_counters
+    assert c["ledger_enabled"] is False
+    assert c["candidates"] == 0  # globally-disabled work excluded by definition
+    assert c["attempted"] == 0
+    assert c["failed_none"] == 0
+    assert c["enrolled"] == 0
+    assert c["not_needed"] == 0
+    await db.close()
+
+
+async def test_sequence_disable_produces_no_stale_or_fabricated_failures(
+    tmp_path, settings_factory
+):
+    """Nonzero enabled pass, then a disabled pass: the second snapshot must
+    contain no stale values and no fabricated failures."""
+    db = await _db(tmp_path)
+    on = _settings(settings_factory, DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=3)
+    off = _settings(
+        settings_factory, LEDGER_ENABLED=False, DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=3
+    )
+    await _run(db, on, [_pool(1)])
+    assert gt_new_pools.last_pass_counters["enrolled"] == 1  # nonzero baseline
+    await _run(db, off, [_pool(2)])  # NEW discovery under disabled ledger
+    c = gt_new_pools.last_pass_counters
+    assert c["ledger_enabled"] is False
+    assert c["candidates"] == 0
+    assert c["failed_none"] == 0
+    assert c["enrolled"] == 0
+    assert c["not_needed"] == 0
+    await db.close()
+
+
+async def test_snapshot_cleared_on_flag_off_invocation(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    on = _settings(settings_factory, DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=3)
+    await _run(db, on, [_pool(1)])
+    assert gt_new_pools.last_pass_counters["candidates"] == 1
+    off = settings_factory(DEX_DISCOVERY_ENABLED=False)
+    async with aiohttp.ClientSession() as session:
+        await gt_new_pools.discover_new_pools(session, db, off)
+    assert gt_new_pools.last_pass_counters == {}  # prior snapshot cannot survive
+    await db.close()
+
+
+async def test_snapshot_cleared_on_cadence_skip(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    settings = _settings(
+        settings_factory,
+        DEX_DISCOVERY_POLL_EVERY_N_CYCLES=2,
+        DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=3,
+    )
+    await _run(db, settings, [_pool(1)])  # executed pass (cycle 1 of 2)
+    assert gt_new_pools.last_pass_counters["candidates"] == 1
+    async with aiohttp.ClientSession() as session:
+        await gt_new_pools.discover_new_pools(session, db, settings)  # skipped
+    assert gt_new_pools.last_pass_counters == {}
     await db.close()
 
 
 def test_budget_setting_named_and_bounded(settings_factory):
     s = settings_factory()
-    assert s.DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE >= 0
+    assert s.DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE == 3  # documented default
+    with pytest.raises(Exception):
+        settings_factory(DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=-1)
+    with pytest.raises(Exception):
+        settings_factory(DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=101)

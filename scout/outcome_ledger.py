@@ -310,7 +310,7 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
     return price
 
 
-async def record_emission(
+async def record_emission_with_status(
     db: Database,
     settings: Any,
     *,
@@ -323,8 +323,11 @@ async def record_emission(
     liquidity_source: str = "none",
     gate_verdicts: dict[str, Any] | None = None,
     emitted_at: str | None = None,
-) -> int | None:
-    """Append one emission row to signal_outcome_ledger.
+) -> tuple[int, str] | None:
+    """Append one emission row; return (row_id, enrollment_status) or None.
+
+    Fail-soft atomic result: either a trustworthy (row_id, enrollment_status)
+    pair from the SAME operation (status computed before the INSERT), or None.
 
     Observability, not control flow: NEVER raises. Any failure logs
     ``ledger_record_failed`` and returns None so the host path (alert send /
@@ -454,7 +457,7 @@ async def record_emission(
             token_id=token_id,
             surface=surface,
         )
-        return row_id
+        return row_id, enrollment_status
     except Exception as exc:
         log.warning(
             "ledger_record_failed",
@@ -469,6 +472,21 @@ async def record_emission(
         except Exception as rb_exc:
             log.warning("ledger_record_rollback_failed", error=str(rb_exc))
         return None
+
+
+def ledger_enabled(settings: Any) -> bool:
+    """Public check for the LEDGER_ENABLED kill switch (no private imports)."""
+    return _ledger_enabled(settings)
+
+
+async def record_emission(db: Database, settings: Any, **kwargs: Any) -> int | None:
+    """Backward-compatible wrapper over record_emission_with_status.
+
+    Returns the ledger row id, or None (disabled / contained operational
+    failure) — the original int | None contract for existing callers.
+    """
+    result = await record_emission_with_status(db, settings, **kwargs)
+    return result[0] if result is not None else None
 
 
 def _parse_ts(value: str) -> datetime | None:
