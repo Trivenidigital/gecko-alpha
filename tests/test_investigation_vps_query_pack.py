@@ -12,6 +12,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "investigation" / "vps_query_pack.sh"
 
@@ -84,6 +86,46 @@ def test_secret_like_name_refused_even_if_allowlisted(tmp_path):
     assert "supersecret" not in proc.stdout
     assert "NARRATIVE_API_KEY: REFUSED" in proc.stdout
     assert "QUANT_PROVIDER_SECRET: REFUSED" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["NARRATIVE_API_.*", "QUANT_PROVIDER_.*", ".*"],
+)
+def test_regex_pattern_extension_cannot_disclose_values(tmp_path, pattern):
+    """The residual-blocker class: a regex pattern passes a substring
+    denylist (it names no secret word) yet would MATCH secret variables
+    under regex lookup. The grammar gate must REJECT any non-plain name and
+    the lookup must be literal, so no value is disclosed."""
+    proc = _run(tmp_path, extra_env={"EXTRA_THRESHOLD_NAMES": pattern})
+    assert proc.returncode == 0
+    assert "supersecret" not in proc.stdout
+    assert "supersecret" not in proc.stderr
+    assert f"{pattern}: REJECTED" in proc.stdout
+
+
+def test_legitimate_plain_name_extension_still_works(tmp_path):
+    """The intended feature survives the hardening: a plain, non-secret
+    extension name is looked up literally and printed."""
+    env_file_extra = "DEX_DISCOVERY_MIN_LIQUIDITY_USD=1000\n"
+    env_file = tmp_path / "fixture.env"
+    env_file.write_text(FIXTURE_ENV + env_file_extra)
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "GECKO_ENV": str(env_file),
+        "GECKO_DB": str(tmp_path / "absent.db"),
+        "EXTRA_THRESHOLD_NAMES": "DEX_DISCOVERY_MIN_LIQUIDITY_USD",
+    }
+    proc = subprocess.run(
+        ["bash", str(SCRIPT), "--env-report-only"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0
+    assert "DEX_DISCOVERY_MIN_LIQUIDITY_USD=1000" in proc.stdout
+    assert "supersecret" not in proc.stdout
 
 
 def test_shell_syntax_is_valid():

@@ -23,14 +23,27 @@ THRESHOLD_ALLOWLIST=(
 env_report() {
   echo "=== P0.env gate+flags (exact-name allowlist for threshold values; flags shown as set/unset) ==="
   local name line
-  for name in "${THRESHOLD_ALLOWLIST[@]}" ${EXTRA_THRESHOLD_NAMES:-}; do
+  # Split EXTRA_THRESHOLD_NAMES without pathname expansion (a value like
+  # '.*' must reach the grammar check as-is, never glob against the cwd).
+  local -a extra=()
+  read -ra extra <<< "${EXTRA_THRESHOLD_NAMES:-}"
+  for name in "${THRESHOLD_ALLOWLIST[@]}" "${extra[@]}"; do
+    # 1) Strict shell-variable-name grammar: a requested name may never be
+    #    a pattern. This closes the regex bypass (NARRATIVE_API_.* passes a
+    #    substring denylist yet would MATCH NARRATIVE_API_KEY under grep -E).
+    if ! [[ "$name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+      echo "$name: REJECTED (not a plain variable name — patterns never accepted)"
+      continue
+    fi
+    # 2) Secret-word denylist on the validated identifier.
     case "$name" in
       *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*)
         echo "$name: REFUSED (secret-like name never printed)"
         continue
         ;;
     esac
-    line=$(grep -E "^${name}=" "$ENV_FILE" 2>/dev/null | head -1)
+    # 3) LITERAL key comparison (no regex engine on the lookup path).
+    line=$(awk -F= -v wanted="$name" '$1 == wanted { print; exit }' "$ENV_FILE" 2>/dev/null)
     if [[ -n "$line" ]]; then echo "$line"; else echo "$name unset"; fi
   done
   local f
