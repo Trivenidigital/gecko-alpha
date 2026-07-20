@@ -239,3 +239,64 @@ def test_budget_setting_named_and_bounded(settings_factory):
         settings_factory(DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=-1)
     with pytest.raises(Exception):
         settings_factory(DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE=101)
+
+
+# ------------------------------------------------------- poll heartbeat (PR-C)
+
+
+async def test_successful_poll_writes_heartbeat(tmp_path, settings_factory):
+    """A successful executed poll (>=1 network yielded valid data) upserts the
+    durable dex_discovery heartbeat — even when zero NEW pools were found,
+    because liveness measures the poller, not market activity."""
+    db = await _db(tmp_path)
+    settings = _settings(settings_factory)
+    await _run(db, settings, [])  # valid response, zero pools
+    cur = await db._conn.execute(
+        "SELECT consecutive_misses, updated_at FROM ingest_watchdog_state "
+        "WHERE source='dex_discovery'"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row[0] == 0
+    assert row[1]  # last_successful_poll_at stamped
+    assert gt_new_pools.last_pass_counters["poll_ok"] is True
+    await db.close()
+
+
+async def test_failed_poll_does_not_advance_heartbeat(tmp_path, settings_factory):
+    """When no network yields valid data, the heartbeat is NOT written, so
+    updated_at remains the last SUCCESS (staleness measured from success)."""
+    db = await _db(tmp_path)
+    settings = _settings(settings_factory)
+    await _run(db, settings, [])  # success -> heartbeat t1
+    cur = await db._conn.execute(
+        "SELECT updated_at FROM ingest_watchdog_state WHERE source='dex_discovery'"
+    )
+    t1 = (await cur.fetchone())[0]
+    with aioresponses() as m:
+        m.get(NEW_POOLS_URL, status=500)
+        m.get(NEW_POOLS_URL, status=500)
+        m.get(NEW_POOLS_URL, status=500)  # retries exhausted -> invalid pass
+        async with aiohttp.ClientSession() as session:
+            await gt_new_pools.discover_new_pools(session, db, settings)
+    cur = await db._conn.execute(
+        "SELECT updated_at FROM ingest_watchdog_state WHERE source='dex_discovery'"
+    )
+    assert (await cur.fetchone())[0] == t1  # unchanged
+    assert gt_new_pools.last_pass_counters["poll_ok"] is False
+    await db.close()
+
+
+async def test_heartbeat_write_failure_never_breaks_lane(
+    tmp_path, settings_factory, monkeypatch
+):
+    db = await _db(tmp_path)
+    settings = _settings(settings_factory)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(db, "upsert_ingest_watchdog_state", _boom)
+    n = await _run(db, settings, [_pool(1)])
+    assert n == 1  # discovery unaffected; failure logged, not raised
+    await db.close()

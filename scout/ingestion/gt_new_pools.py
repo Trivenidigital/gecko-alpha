@@ -111,9 +111,11 @@ async def discover_new_pools(
         return 0
 
     recorded = 0
+    poll_ok = False
     ledger_on = ledger_enabled(settings)
     counters = {
         "ledger_enabled": ledger_on,
+        "poll_ok": False,
         "candidates": 0,
         "attempted": 0,
         "succeeded": 0,
@@ -127,6 +129,7 @@ async def discover_new_pools(
         data = await _get_json(session, url, chain=network)
         if not isinstance(data, dict):
             continue
+        poll_ok = True
         raw_pools = data.get("data") or []
         seen = 0
         for pool in raw_pools:
@@ -200,6 +203,18 @@ async def discover_new_pools(
             eligible=seen,
             new=recorded,
         )
+    counters["poll_ok"] = poll_ok
+    if poll_ok:
+        # Durable liveness heartbeat (PR-C seam): a SUCCESSFUL poll (>=1
+        # network yielded valid data — independent of whether any NEW pool
+        # appeared) upserts source='dex_discovery' with misses=0; its
+        # updated_at is last_successful_poll_at. An unsuccessful pass writes
+        # nothing, so watchdog staleness is measured from the last SUCCESS.
+        # Poller health, not market activity: a quiet market stays healthy.
+        try:
+            await db.upsert_ingest_watchdog_state("dex_discovery", 0)
+        except Exception:
+            logger.exception("dex_discovery_heartbeat_write_failed")
     last_pass_counters = counters
     logger.info("dex_discovery_ledger_pass", **counters)
     return recorded
