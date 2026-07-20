@@ -170,6 +170,8 @@ class Database:
         # watchdog can feed a REAL count into narrative_resolution_alarms'
         # resolver_error branch (previously fed a hardcoded 0 — silent §12a).
         await self._migrate_narrative_resolver_errors_v1()
+        # DEX-first Phase 1: GT new-pools discovery record (research-only).
+        await self._migrate_dex_discovery_v1()
         # C2 (#392): forward-only price snapshots for CA-keyed source calls.
         # Additive table; the snapshot-writer cron populates it. No source_calls
         # columns are added. The (separate) C3 pricing hookup reads it.
@@ -217,6 +219,102 @@ class Database:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+    async def _migrate_dex_discovery_v1(self) -> None:
+        """Migration dex_discovery_v1, schema_version 20260720.
+
+        DEX-first Phase 1 (design_dex_first_discovery_2026_07_20): additive
+        table recording every first-seen GT new-pool. Research-only — never
+        read by scorer/gate/alert/paper paths. UNIQUE(network, pool_address)
+        makes discovery idempotent across polls.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS dex_pool_discoveries (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    network            TEXT NOT NULL,
+                    pool_address       TEXT NOT NULL,
+                    base_token_address TEXT NOT NULL,
+                    base_token_symbol  TEXT,
+                    quote_token_symbol TEXT,
+                    pool_created_at    TEXT,
+                    first_seen_at      TEXT NOT NULL,
+                    fdv_usd            REAL,
+                    liquidity_usd      REAL,
+                    volume_h1_usd      REAL,
+                    goplus_safe        INTEGER,
+                    UNIQUE(network, pool_address)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dex_pool_disc_token "
+                "ON dex_pool_discoveries(base_token_address, first_seen_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260720, now_iso, "dex_discovery_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception("schema_migration_failed", migration="dex_discovery_v1")
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed", migration="dex_discovery_v1"
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="dex_discovery_v1")
+            raise
+
+    async def record_pool_discovery(
+        self,
+        network: str,
+        pool_address: str,
+        base_token_address: str,
+        base_token_symbol: str | None,
+        quote_token_symbol: str | None,
+        pool_created_at: str | None,
+        fdv_usd: float | None,
+        liquidity_usd: float | None,
+        volume_h1_usd: float | None,
+    ) -> bool:
+        """Insert a first-seen pool; returns True when the row is new.
+
+        Idempotent via UNIQUE(network, pool_address) + INSERT OR IGNORE, so
+        re-polling the same GT page never duplicates a discovery.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            """INSERT OR IGNORE INTO dex_pool_discoveries
+               (network, pool_address, base_token_address, base_token_symbol,
+                quote_token_symbol, pool_created_at, first_seen_at,
+                fdv_usd, liquidity_usd, volume_h1_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                network,
+                pool_address,
+                base_token_address,
+                base_token_symbol,
+                quote_token_symbol,
+                pool_created_at,
+                datetime.now(timezone.utc).isoformat(),
+                fdv_usd,
+                liquidity_usd,
+                volume_h1_usd,
+            ),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
 
     async def _migrate_dex_instrumentation_v1(self) -> None:
         """Migration dex_instrumentation_v1, schema_version 20260629.
@@ -6056,7 +6154,6 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
-
 
     async def _migrate_retire_dead_tables_v1(self, *, enabled: bool = False) -> None:
         """NAR-06 + INF-07: retire dead tables. schema_version 20260711.

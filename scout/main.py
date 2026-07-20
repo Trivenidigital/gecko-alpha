@@ -42,6 +42,7 @@ from scout.ingestion import dexscreener as _dex_module
 from scout.ingestion import geckoterminal as _gt_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
+from scout.ingestion.gt_new_pools import discover_new_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
 from scout.narrative.agent import narrative_agent_loop
@@ -1095,6 +1096,16 @@ async def run_cycle(
                 )
         except Exception:
             logger.exception("gainer_acceleration_error")
+
+    # DEX-first Phase 1 (design_dex_first_discovery_2026_07_20): GT new-pools
+    # research lane. Observe-only — persists to dex_pool_discoveries +
+    # contract_coin_map; emits no candidates, no alert, no paper trade. Public
+    # GT API (keyless), cadence-gated inside the module; flag off = no call.
+    if settings.DEX_DISCOVERY_ENABLED:
+        try:
+            await discover_new_pools(session, db, settings)
+        except Exception:
+            logger.exception("dex_discovery_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(

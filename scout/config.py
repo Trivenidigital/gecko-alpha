@@ -339,6 +339,19 @@ class Settings(BaseSettings):
     # System-health alerts only, NEVER trading/signal alerts.
     TELEGRAM_HEALTH_CHAT_ID: str = ""
 
+    # DEX-first Phase 1 (design_dex_first_discovery_2026_07_20): GT new-pools
+    # research lane. Observe-only — discoveries persist to dex_pool_discoveries
+    # + contract_coin_map; no candidate emission, no scoring, no alerts, no
+    # paper trades. When False the pipeline is byte-identical (no GT new_pools
+    # call). Public GT API (keyless): NOT on the CoinGecko credit budget.
+    DEX_DISCOVERY_ENABLED: bool = False
+    DEX_DISCOVERY_NETWORKS: list[str] = ["solana"]
+    # Poll 1 cycle in N (60s cycles -> default one new_pools page per network
+    # every ~3 min; GT public tier is 30 req/min so this is far under budget).
+    DEX_DISCOVERY_POLL_EVERY_N_CYCLES: int = Field(default=3, ge=1, le=60)
+    # Drop dust pools at ingest; GT reserve_in_usd below this is not recorded.
+    DEX_DISCOVERY_MIN_LIQUIDITY_USD: float = Field(default=1000.0, ge=0.0)
+
     # Database
     DB_PATH: Path = Path("scout.db")
     # GA-22: connection-level PRAGMA busy_timeout applied at

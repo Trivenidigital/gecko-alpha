@@ -65,6 +65,7 @@ number to appear in the table below.
 | 20260710 | ledger_enrollment_evictions_v1 | #448 |
 | 20260713 | moved_already_postmortems_v1 | #459 |
 | 20260711 | retire_dead_tables_v1 | #461 |
+| 20260720 | dex_discovery_v1 | #469 |
 
 ## Notes / gaps
 
