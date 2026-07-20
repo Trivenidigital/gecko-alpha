@@ -116,6 +116,7 @@ async def discover_new_pools(
     counters = {
         "ledger_enabled": ledger_on,
         "poll_ok": False,
+        "heartbeat_written": False,
         "candidates": 0,
         "attempted": 0,
         "succeeded": 0,
@@ -127,13 +128,29 @@ async def discover_new_pools(
     for network in settings.DEX_DISCOVERY_NETWORKS:
         url = f"{GECKO_BASE}/networks/{network}/new_pools"
         data = await _get_json(session, url, chain=network)
-        if not isinstance(data, dict):
+        raw_pools = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(raw_pools, list):
+            # {} / error-object / non-list "data": a provider 200 carrying no
+            # pool list is NOT a valid poll and must not advance the heartbeat.
+            logger.warning("dex_discovery_malformed_payload", network=network)
+            continue
+        # Parse ONCE; the same parse results drive both the validity rule and
+        # the discovery loop. Validity: an empty list is a healthy quiet
+        # market; a NONEMPTY list where every record is structurally unusable
+        # is schema drift, not a valid poll.
+        parsed_pools = [
+            _parse_pool(pool if isinstance(pool, dict) else {}) for pool in raw_pools
+        ]
+        if raw_pools and not any(pp is not None for pp in parsed_pools):
+            logger.warning(
+                "dex_discovery_schema_invalid_pool_set",
+                network=network,
+                raw=len(raw_pools),
+            )
             continue
         poll_ok = True
-        raw_pools = data.get("data") or []
         seen = 0
-        for pool in raw_pools:
-            parsed = _parse_pool(pool if isinstance(pool, dict) else {})
+        for parsed in parsed_pools:
             if parsed is None:
                 continue
             liq = parsed["liquidity_usd"]
@@ -213,6 +230,7 @@ async def discover_new_pools(
         # Poller health, not market activity: a quiet market stays healthy.
         try:
             await db.upsert_ingest_watchdog_state("dex_discovery", 0)
+            counters["heartbeat_written"] = True
         except Exception:
             logger.exception("dex_discovery_heartbeat_write_failed")
     last_pass_counters = counters

@@ -299,4 +299,75 @@ async def test_heartbeat_write_failure_never_breaks_lane(
     monkeypatch.setattr(db, "upsert_ingest_watchdog_state", _boom)
     n = await _run(db, settings, [_pool(1)])
     assert n == 1  # discovery unaffected; failure logged, not raised
+    c = gt_new_pools.last_pass_counters
+    assert c["poll_ok"] is True  # the poll itself was valid
+    assert c["heartbeat_written"] is False  # persistence truthfully separate
+    await db.close()
+
+
+async def _run_raw(db, settings, payload):
+    with aioresponses() as m:
+        m.get(NEW_POOLS_URL, payload=payload)
+        async with aiohttp.ClientSession() as session:
+            return await gt_new_pools.discover_new_pools(session, db, settings)
+
+
+async def _heartbeat_row(db):
+    cur = await db._conn.execute(
+        "SELECT updated_at FROM ingest_watchdog_state WHERE source='dex_discovery'"
+    )
+    return await cur.fetchone()
+
+
+async def test_empty_data_list_advances_heartbeat(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    await _run_raw(db, _settings(settings_factory), {"data": []})
+    assert await _heartbeat_row(db) is not None  # quiet market is healthy
+    assert gt_new_pools.last_pass_counters["poll_ok"] is True
+    assert gt_new_pools.last_pass_counters["heartbeat_written"] is True
+    await db.close()
+
+
+async def test_empty_dict_does_not_advance_heartbeat(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    await _run_raw(db, _settings(settings_factory), {})
+    assert await _heartbeat_row(db) is None
+    assert gt_new_pools.last_pass_counters["poll_ok"] is False
+    await db.close()
+
+
+async def test_error_dict_does_not_advance_heartbeat(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    await _run_raw(db, _settings(settings_factory), {"error": "rate limited"})
+    assert await _heartbeat_row(db) is None
+    assert gt_new_pools.last_pass_counters["poll_ok"] is False
+    await db.close()
+
+
+async def test_non_list_data_does_not_advance_heartbeat(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    await _run_raw(db, _settings(settings_factory), {"data": "unexpected-schema"})
+    assert await _heartbeat_row(db) is None
+    assert gt_new_pools.last_pass_counters["poll_ok"] is False
+    await db.close()
+
+
+async def test_all_malformed_nonempty_list_does_not_advance_heartbeat(
+    tmp_path, settings_factory
+):
+    db = await _db(tmp_path)
+    broken = {"id": "solana_x", "attributes": None, "relationships": {}}
+    await _run_raw(db, _settings(settings_factory), {"data": [broken, broken]})
+    assert await _heartbeat_row(db) is None  # schema drift is not a valid poll
+    assert gt_new_pools.last_pass_counters["poll_ok"] is False
+    await db.close()
+
+
+async def test_dust_filtered_valid_list_still_healthy(tmp_path, settings_factory):
+    """A parseable pool set advances the heartbeat even when every pool is
+    dust-filtered — validity is structural, not outcome-based."""
+    db = await _db(tmp_path)
+    await _run_raw(db, _settings(settings_factory), {"data": [_pool(1, reserve=1.0)]})
+    assert await _heartbeat_row(db) is not None
+    assert gt_new_pools.last_pass_counters["poll_ok"] is True
     await db.close()
