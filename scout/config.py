@@ -358,6 +358,13 @@ class Settings(BaseSettings):
     # in-DB price coverage are enrolled for DexScreener labeling. 0 disables
     # ledger writes while keeping discovery itself on.
     DEX_DISCOVERY_LEDGER_ENROLL_PER_CYCLE: int = Field(default=3, ge=0, le=100)
+    # PR-C watchdog SLOs (read by scripts/dex-discovery-watchdog.sh from .env).
+    # Staleness bar for the durable successful-poll heartbeat
+    # (ingest_watchdog_state source='dex_discovery'); the lane polls ~every 3
+    # minutes, so 2h is generous-but-decisive. Named clock-skew allowance for
+    # future-dated heartbeats (beyond it = invalid-state breach, never healthy).
+    DEX_DISCOVERY_POLL_STALENESS_ALERT_HOURS: int = Field(default=2, ge=1, le=168)
+    DEX_DISCOVERY_WATCHDOG_CLOCK_SKEW_SECONDS: int = Field(default=300, ge=0, le=3600)
 
     # Database
     DB_PATH: Path = Path("scout.db")

@@ -44,4 +44,15 @@
 # (TRENDING_SNAPSHOT_STALENESS_ALERT_HOURS / CG_OUTAGE_ALERT_HOURS) are Settings
 # fields, sourced from .env by the wrapper.
 40 * * * * CG_INGESTION_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/cg-ingestion-watchdog.sh >> /var/log/gecko-alpha-cg-ingestion-watchdog.log 2>&1
+# DEX-discovery poll-liveness watchdog (§12a, PR-C): hourly at :25, reads the
+# durable successful-poll heartbeat (ingest_watchdog_state source=dex_discovery)
+# — poller health, never market activity; MAX(first_seen_at) is diagnostic
+# context only. Armed ONLY while DEX_DISCOVERY_ENABLED=true in .env (an
+# intentionally-off lane exits clean, no page). The inline
+# DEX_DISCOVERY_WATCHDOG_ENABLED=true is the deploy-without-activate flag.
+# *** ACTIVATION SEQUENCE (operator, per PR-C review): deploy with both gates
+# off -> enable DEX_DISCOVERY_ENABLED -> verify one successful poll +
+# ledger-pass reconciliation -> enable this line -> run the wrapper manually
+# once and confirm the healthy JSON + delivery logs BEFORE relying on cron. ***
+25 * * * * DEX_DISCOVERY_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/dex-discovery-watchdog.sh >> /var/log/gecko-alpha-dex-discovery-watchdog.log 2>&1
 # === END gecko-alpha managed block ===

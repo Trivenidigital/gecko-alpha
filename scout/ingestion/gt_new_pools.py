@@ -44,7 +44,7 @@ _poll_cycle_counter: int = 0
 #   succeeded  = enrolled + not_needed
 # candidates counts NEW discoveries only — dedup re-sightings and dust pools
 # are excluded by definition (they never reach the ledger stage). Operational
-# ledger-write failures are contained by record_emission and returned as
+# ledger-write failures are contained by record_emission_with_status and returned as
 # None; counted as failed_none, never described as enrolled. Intentional
 # disablement (LEDGER_ENABLED=False) is NOT failure: the ledger stage is not
 # attempted, candidates excludes the globally-disabled work by definition,
