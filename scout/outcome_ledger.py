@@ -329,10 +329,12 @@ async def record_emission_with_status(
     Fail-soft atomic result: either a trustworthy (row_id, enrollment_status)
     pair from the SAME operation (status computed before the INSERT), or None.
 
-    Observability, not control flow: NEVER raises. Any failure logs
-    ``ledger_record_failed`` and returns None so the host path (alert send /
-    trade open / gate block) keeps its exact prior behavior. Respects the
-    ``LEDGER_ENABLED`` kill switch.
+    Observability, not control flow: operational ledger-write exceptions are
+    logged as ``ledger_record_failed`` (with rollback attempted) and returned
+    as None so the host path (alert send / trade open / gate block) keeps its
+    exact prior behavior. Cancellation and non-operational control-flow
+    exceptions are not claimed to be contained; the kill-switch check runs
+    before the guarded body. Respects the ``LEDGER_ENABLED`` kill switch.
 
     Args:
         kind: 'alert' | 'dispatch' | 'gated_out_sample' (CHECK-enforced).
