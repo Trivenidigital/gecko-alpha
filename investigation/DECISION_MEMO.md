@@ -117,3 +117,24 @@ Where do you want to hunt?
 Blank spots an operator VPS run would fill before deciding (scripts ready):
 60-day live score distribution, current suppression state (#424 live?),
 90-day ledger backfill aggregates, CATCASH/JOTCHUA ever-seen verdicts.
+
+## Addendum — response to review ruling 2026-07-20 (condition enumeration)
+
+Per the approvals-discipline standing rule, each ruled condition and where
+it was satisfied (or who owns it):
+
+| # | Ruled condition | Disposition | Where |
+|---|-----------------|-------------|-------|
+| 1 | No positive-expectancy claim for `gainers_early` (closed +$175.52 vs open MTM ~−$169 ≈ flat pre-cost) | Satisfied — evidence-language constraint recorded | operator pack Part C (`cdc2b85`) |
+| 2 | Suppression wording limited to "observed cleared following a subsequent nightly refresh" | Satisfied — recorded verbatim | operator pack Part C (`cdc2b85`) |
+| 3 | Cohort artifact repair: machine-captured output, re-query at exactly `2026-07-17T12:28:52.954712Z`, 52.95 s window reported separately | Instructions recorded; execution is operator/VPS-side | operator pack Part C (`cdc2b85`) |
+| 4 | Next checkpoint reports unique token/contract count alongside trade IDs | Recorded as checkpoint requirement | operator pack Part C (`cdc2b85`) |
+| 5 | `time_death` restated as "realized-loss-making, pending counterfactual adjudication"; adjudication via forward replay of actual exit rules, measured / dry-run-era / unresolved never blended, per-trade incremental_benefit, no look-ahead | Satisfied — tool + 5 tests built; prod run is operator/VPS-side | `investigation/time_death_counterfactual.py` (`cdc2b85`) |
+| 6 | Activation held behind revised 12-step gate (key rotation → untracked-file resolution → inert cron install → discovery enable → verified pass → T0 → watchdog wrapper → cron enable) | Satisfied — gate rewritten in executable form; execution is operator/VPS-side | operator pack Part B (`cdc2b85`) |
+| 7 | DEX evidence clock T0 = first verified production ledger enrollment; first ripe checkpoint ~T0 + 11 d | Recorded in gate steps 10–12 | operator pack Part B (`cdc2b85`) |
+
+Approvals log (this session, post-ruling): no implementation/merge/deploy/
+flag-or-prod-state actions were taken. Both post-ruling commits
+(`cdc2b85` tool + docs, `29d4d0d` test portability fix) are additive
+branch commits pending normal PR review — no standing approval consumed,
+none claimed.
