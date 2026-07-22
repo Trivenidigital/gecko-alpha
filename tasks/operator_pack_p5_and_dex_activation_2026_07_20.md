@@ -91,64 +91,89 @@ as authoritative but is not in the repo. If it exists locally, commit it.
 
 ---
 
-## Part B — DEX-first activation (staged sequence, approved 2026-07-20)
+## Part B — DEX-first activation (REVISED 12-step gate, ruling 2026-07-20)
 
-Approved only through this exact sequence (PR #471 merge ruling). Evidence
-note for the record at each step; production is **Solana-only**
-(`DEX_DISCOVERY_NETWORKS`) — multi-network expansion requires per-network
-heartbeats first.
+Supersedes the earlier 6-step sequence: activation is now HELD until the
+CoinGecko key is rotated, all untracked worktree files are resolved, and
+the watchdog cron entry is proven installed-but-inert BEFORE discovery is
+enabled. Production is Solana-only; the DEX evidence clock (T0) starts at
+the first verified production ledger enrollment, first ripe checkpoint
+~T0 + 11 days. Record evidence at every step.
 
 ```bash
-# 0. Deploy master 32d1ca4e with BOTH gates off (deploy-without-activate)
-cd /root/gecko-alpha && git fetch origin master && git checkout 32d1ca4e
-# (or your normal deploy script) ; refresh the managed crontab block so the
-# :25 watchdog line (gated, inert) is installed; restart the pipeline.
-grep -E "^DEX_DISCOVERY_ENABLED=" .env          # absent or =false
-crontab -l | grep dex-discovery-watchdog        # line present, gate var =true only in cron... NOT yet
-
-# 1. Confirm Solana-only
+# 1. Install the NEW CoinGecko key without printing it (no-echo entry per
+#    tasks/runbook_cg_demo_api_key_2026_05_18.md hygiene; backup .env first).
+# 2. Restart and verify several authenticated CG cycles:
+systemctl restart gecko-pipeline
+journalctl -u gecko-pipeline --since "30 minutes ago" --no-pager | grep -c cg_cycle_ok
+# 3. Revoke the OLD key in the CG dashboard (only after step 2 is clean).
+# 4. Resolve or document ALL 13 untracked files: record paths, then prove
+#    none are imported modules / executable scripts / config-env files /
+#    service DB files / files inside managed deploy or cron paths — or
+#    remove/archive them:
+cd /root/gecko-alpha && git status --porcelain | grep '^??'
+# 5. Deploy/cron-refresh pass with BOTH features off:
+#    DEX_DISCOVERY_ENABLED=False in .env, watchdog cron env gate false —
+#    this pass INSTALLS the missing watchdog crontab line (it is currently
+#    absent, not merely gated).
+# 6. Verify the watchdog cron entry is installed but inert:
+crontab -l | grep dex-discovery-watchdog
+# 7. Reconfirm Solana-only:
 grep -E "^DEX_DISCOVERY_NETWORKS=" .env || echo "default: solana-only"
-
-# 2. Enable discovery (lane only, watchdog still off)
-echo 'DEX_DISCOVERY_ENABLED=true' >> .env && systemctl restart gecko-pipeline
-
-# 3. Verify one successful poll + ledger reconciliation (within ~3 cycles)
+# 8. Enable discovery:
+#    set DEX_DISCOVERY_ENABLED=true in .env && systemctl restart gecko-pipeline
+# 9. Verify an EXECUTED pass: poll_ok=true, heartbeat_written=true, counter
+#    equations reconcile, and NO failed_none:
 journalctl -u gecko-pipeline --since "30 minutes ago" --no-pager \
   | grep dex_discovery_ledger_pass | tail -3
-#    expect: poll_ok=true, heartbeat_written=true, and
-#    candidates = attempted + budget_skipped ; attempted = succeeded + failed_none
 sqlite3 -readonly scout.db \
   "SELECT source, consecutive_misses, updated_at FROM ingest_watchdog_state
    WHERE source='dex_discovery';"
-sqlite3 -readonly scout.db "SELECT COUNT(*) FROM dex_pool_discoveries;"
-
-# 4. Arm the watchdog via CRON ENV ONLY (never .env — a stray .env entry is
-#    ignored by design and tested)
-crontab -e   # the managed line already carries DEX_DISCOVERY_WATCHDOG_ENABLED=true
-
-# 5. One manual wrapper run BEFORE trusting cron — expect healthy JSON
-DEX_DISCOVERY_WATCHDOG_ENABLED=true bash scripts/dex-discovery-watchdog.sh
-#    expect stdout: {"status": "ok", ...} and exit 0 (echo $?)
-
-# 6. Record the activation evidence (timestamps of steps 3+5, Solana-only
-#    note) — the ledger evidence clock starts at the FIRST PRODUCTION
-#    ENROLLMENT timestamp from step 3, not the merge date. First ripe read
-#    ≈ that timestamp + 11 days.
+# 10. Record T0 = first successful production ledger enrollment:
 sqlite3 -readonly scout.db \
   "SELECT MIN(created_at) FROM signal_outcome_ledger WHERE surface='dex_new_pool';"
+# 11. Manual wrapper run with the gate EXPLICITLY in the process env —
+#     expect healthy JSON and exit 0:
+DEX_DISCOVERY_WATCHDOG_ENABLED=true bash scripts/dex-discovery-watchdog.sh; echo $?
+# 12. Enable the watchdog in the CRON environment and verify its first
+#     scheduled execution (next :25 run) in syslog/cron logs.
 ```
 
 Abort/rollback at any step: `DEX_DISCOVERY_ENABLED=false` + restart (lane
-is byte-identical off), and remove the cron gate var. Nothing else changes.
+is byte-identical off) and remove the cron gate var. Nothing else changes.
 
 ---
 
-## Standing items (unchanged)
+## Part C — evidence-language constraints (ruling 2026-07-20)
 
-1. **CG key regeneration** after a day of clean operation — the current key
-   appeared in session transcripts; regenerate in the CG dashboard, update
-   `.env`, restart, verify one cycle.
-2. **`COINGECKO_RATE_LIMIT_PER_MIN` raise** (25 → ~50–100) once burn-rate
+- `gainers_early`: revival gate PASSED on registered closed-trade terms —
+  keep enabled and unsuppressed. Do NOT claim positive expectancy: closed
+  realized +$175.52, open-position MTM ~−$169 → combined ~+$6.52, i.e.
+  approximately flat before fees/execution realism. Wait for the open
+  positions to close and a net-of-cost cohort.
+- Suppression wording: "Suppression was observed cleared following a
+  subsequent nightly refresh." Do not claim the exact clearing mechanism
+  more strongly without a transition log or before/after audit row.
+- Cohort artifact repair (VPS): preserve the machine-captured query/output
+  verbatim (no transcription), and re-run the cohort window from the EXACT
+  revival audit timestamp 2026-07-17T12:28:52.954712Z; separately report
+  qualifying trades opened in 12:28:00→12:28:52.954712Z (zero → 43-trade
+  result stands; nonzero → recompute).
+- Next checkpoint must report unique token/contract count alongside unique
+  trade IDs (43 rows ≠ 43 independent exposures).
+- `time_death`: "loss-making in realized terms and pending counterfactual
+  adjudication as a possible loss-mitigation mechanism." Adjudicate with
+  `investigation/time_death_counterfactual.py` (measured / dry-run-era /
+  unresolved never blended; per-trade incremental_benefit; coverage %;
+  no look-ahead).
+
+---
+
+## Standing items
+
+1. **PR #467 + DEX series**: merged (`9690df1a` / `32d1ca4e`). Docs rescue
+   may proceed independently of runtime state.
+2. **CG key rotation** is now step 1 of the activation gate above — not a
+   separate afterthought.
+3. **`COINGECKO_RATE_LIMIT_PER_MIN` raise** (25 → ~50–100) once burn-rate
    data is in (couples with A3).
-3. **PR #467 merge ruling** — gate closed on head `dac97b5`, CI green,
-   awaiting reviewer decision.
