@@ -158,7 +158,9 @@ is byte-identical off) and remove the cron gate var. Nothing else changes.
   verbatim (no transcription), and re-run the cohort window from the EXACT
   revival audit timestamp 2026-07-17T12:28:52.954712Z; separately report
   qualifying trades opened in 12:28:00→12:28:52.954712Z (zero → 43-trade
-  result stands; nonzero → recompute).
+  result stands; nonzero → recompute). One-command collector (also covers
+  unique-token counts and the time_death counterfactual run):
+  `bash investigation/ruling_response_queries.sh 2>&1 | tee /tmp/ruling_response_$(date -u +%Y%m%dT%H%M%SZ).log`
 - Next checkpoint must report unique token/contract count alongside unique
   trade IDs (43 rows ≠ 43 independent exposures).
 - `time_death`: "loss-making in realized terms and pending counterfactual
