@@ -249,7 +249,9 @@ async def test_upsert_path_used_is_on_conflict_not_replace(tmp_path, token_facto
 
     await db.upsert_candidate(token_factory(contract_address=addr))
     await db._conn.execute(
-        "UPDATE candidates SET liquidity_usd_enriched = 50_000.0, "
+        # 50000.0 spelled without an underscore separator: SQL underscore
+        # literals require SQLite >= 3.46, which not every runtime ships.
+        "UPDATE candidates SET liquidity_usd_enriched = 50000.0, "
         "  liquidity_enriched_confidence = 'definite' "
         "WHERE contract_address = ?",
         (addr,),
