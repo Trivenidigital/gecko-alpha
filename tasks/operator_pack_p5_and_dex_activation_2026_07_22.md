@@ -47,13 +47,25 @@ a regime turn re-suspends and notifies without operator action.
 
 Decision: leave enabled, no flag flip. Keep watching the auto-suspend gate.
 
-### A3. `time_death` exit — LIVE, classification PENDING (do NOT call it successful)
+### A3. `time_death` exit — CLASSIFIED as loss-mitigation (KEEP live)
 
-Live since 2026-07-17; 21 closes, −$462.59 realized to date. Do **not** read
-the negative sum as failure: classification is **PENDING the actual-vs-riding
-counterfactual** (the reviewer's condition — did closing beat letting the
-position ride?). Hold the verdict until that counterfactual is computed. No
-flag change now.
+Live since 2026-07-17; 21 closes, −$462.59 realized to date. The negative
+sum is **not** failure: the reviewer's actual-vs-riding counterfactual has
+now been computed and time_death is **CLASSIFIED 2026-07-22 as a
+loss-mitigation mechanism** (it caps the bleed on flat/decaying positions),
+**not a profitable signal**. Keep `PAPER_TIME_DEATH_DRY_RUN=false` — leave
+it live.
+
+Evidence: matched dry-run pairs (n=15, fire-point vs the observed ride on
+the same trades) show cutting saved **+$152.70 with 14/15 worse off riding**;
+live-cohort drift estimate adds **+$59–150** saved; the clipped-runner gate
+holds (0/21 real closes peaked ≥25%, max 9.72%) — it is not clipping winners.
+
+Residual / open items (do not block the classification):
+- A shadow `would_fire` logging arm would harden the live-cohort estimate
+  (currently a drift estimate off the matched pairs).
+- Deeper open item is **entry quality on flat-profile lanes** — time_death
+  caps the bleed, it does not fix the entries that produce it.
 
 ### A4. `momentum_death` exit — still DRY-RUN (hold)
 
