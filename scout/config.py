@@ -850,6 +850,20 @@ class Settings(BaseSettings):
     # `detection_alert_funnel` log.
     DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
 
+    # DORMANCY FLAG (reviewer dormant-deployment ruling, 2026-07-26). Master
+    # kill-switch for the ENTIRE decision-receipt subsystem. **Default DISABLED**:
+    # enabling requires explicit configuration + a clean process activation. When
+    # False, the detection lane still runs (candidate evaluation, gating, ranking,
+    # and SENDING are BYTE-IDENTICAL) but the receipts subsystem is fully skipped —
+    # NO receipt inserts, NO replay/conflict lookups, NO disk-pressure work, NO
+    # archive work, NO cohort accrual. Every receipt write is skipped BEFORE any
+    # persistence/lookup. A single structured ``detection_receipts_disabled`` log
+    # fires at the first skip per process; the per-cycle summary is still emitted
+    # but clearly flags ``receipts_disabled=true`` + ``coverage_healthy=false`` so a
+    # reader can NEVER mistake dormancy for clean coverage. Lets the receipt code
+    # deploy DORMANT (present but inert) ahead of replacement-cohort activation.
+    DETECTION_RECEIPTS_ENABLED: bool = False
+
     # Retention floor (days) for detection_decision_receipts — the ALR-02
     # decision-receipt audit substrate (behavior-neutral observability that
     # records one receipt per evaluated detection-lane candidate so the
@@ -876,6 +890,65 @@ class Settings(BaseSettings):
     # guard makes that structurally impossible without an explicit operator
     # close-out. Set it only after the cohort's final analysis is frozen.
     DETECTION_RECEIPTS_COHORT_CLOSED_AT: str = ""
+
+    # --- Receipt lifecycle archive (approved architecture, 2026-07-26) --------
+    # Ordinary post-index receipts (the ~99.9% too_old re-polls) leave the hot
+    # scout.db table ONLY via the 7-step fail-closed archival transaction in
+    # scout/trading/receipt_archive.py: select frozen range → write temp
+    # partition → flush+verify → reconcile count+hash → atomically publish
+    # partition+manifest → confirm independent durable copy → THEN delete hot
+    # rows. Cold partitions are gzip-compressed JSONL; an integrity manifest lives
+    # HOT in scout.db. See tasks/capacity_detection_receipts_2026_07.md.
+    #
+    # Default OFF — archiving only runs when explicitly enabled. The hot tier
+    # keeps: cohort defs/status, analytical-index receipts, in-lifecycle rows,
+    # and anything unreconciled/under-investigation.
+    DETECTION_RECEIPT_ARCHIVE_ENABLED: bool = False
+    # Local directory for published cold partitions + temp partitions. Empty
+    # disables archiving (the writer is inert). Must be on a durable filesystem.
+    DETECTION_RECEIPT_ARCHIVE_DIR: str = ""
+    # Maturity horizon (hours): a receipt is archive-ELIGIBLE only once its
+    # outcome horizon has matured AND its source cycle is reconciled. >= 72 so the
+    # 72h key-secondary endpoint is always observed on hot rows before archival.
+    DETECTION_RECEIPT_ARCHIVE_HORIZON_HOURS: int = Field(default=72, ge=72)
+    # Max receipts per cold partition (bounds partition size + verify cost).
+    DETECTION_RECEIPT_ARCHIVE_PARTITION_MAX_ROWS: int = Field(
+        default=50_000, ge=1_000, le=1_000_000
+    )
+    # Independent durable off-host copy destination (step 6). A LOCAL-ONLY dir is
+    # INSUFFICIENT for durability, so this is a path the box's existing off-host
+    # mechanism replicates (e.g. an rsync/scp target dir or an S3-synced dir).
+    # DISCOVERY (srilu, 2026-07-26): the gecko backup (gecko-backup.service) is
+    # LOCAL-ONLY (GECKO_BACKUP_DIR=/root/gecko-alpha, keep-3, no rsync/scp/s3);
+    # no off-host tooling (rclone/restic/borg/aws) is provisioned. So this is
+    # EMPTY by default → step 6 fails closed and holds rows HOT until an operator
+    # provisions an off-host destination. "off-host = operator-provisioned
+    # dependency." When set, the archiver requires the partition to also exist +
+    # hash-match at this destination before deleting hot rows.
+    DETECTION_RECEIPT_OFFHOST_DIR: str = ""
+    # Disk-pressure fail-closed guard. Default OFF (a new behavior; observe-first
+    # + avoids surprising the lane on a low-disk dev/CI box). When enabled, on
+    # breach the receipts writer stops ACCRUING (send path UNCHANGED), alerts
+    # (parse_mode=None), marks coverage unhealthy, and preserves existing
+    # receipts+manifests — never silently prunes/samples/reduces detail.
+    DETECTION_RECEIPT_DISK_GUARD_ENABLED: bool = False
+    DETECTION_RECEIPT_DISK_MIN_FREE_GB: float = Field(default=10.0, ge=1.0)
+    DETECTION_RECEIPT_DISK_MIN_FREE_PCT: float = Field(default=15.0, ge=1.0, le=90.0)
+    # Cooldown (hours) between disk-pressure TELEGRAM alerts. Without it the lane
+    # would page on every breached cycle (~500/day at 2.9-min cadence). The
+    # structured ``detection_receipt_disk_pressure`` WARNING stays per-cycle in the
+    # journal; only the operator page is rate-limited. The last-alert timestamp is
+    # in-memory (module-level) — a process restart resets it, which is acceptable
+    # (a restart is itself a signal, and one extra page is harmless).
+    DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS: float = Field(
+        default=6.0, ge=0.0, le=168.0
+    )
+    # Hard-critical free-space bound (GB). Below this (a materially worse crossing
+    # than DETECTION_RECEIPT_DISK_MIN_FREE_GB), a page is dispatched IMMEDIATELY,
+    # bypassing the cooldown — an escalation. Must be < the min-free bound (a
+    # deeper breach). The cooldown is notification-rate control ONLY; it never
+    # delays receipt suspension or coverage invalidation, which fire on ANY breach.
+    DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB: float = Field(default=3.0, ge=0.5)
 
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept

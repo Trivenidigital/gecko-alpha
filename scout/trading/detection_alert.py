@@ -40,6 +40,7 @@ from scout import alerter
 from scout.config import Settings
 from scout.db import Database
 from scout.trading.engine import _compute_lead_time_vs_trending
+from scout.trading.receipt_archive import check_disk_pressure
 
 # Reuse the paper-lane formatters + universe guard verbatim (card-v2 parity).
 from scout.trading.tg_alert_dispatch import (
@@ -49,6 +50,82 @@ from scout.trading.tg_alert_dispatch import (
 )
 
 log = structlog.get_logger(__name__)
+
+# Dormancy: emit the `detection_receipts_disabled` breadcrumb only ONCE per
+# process (at the first skip), not every cycle — avoids dormant-mode log spam.
+_receipts_disabled_logged = False
+
+# Disk-pressure operator-paging state (module-level, per process). A restart
+# resets it — an immediate single page on restart-while-breached is acceptable
+# (a restart is itself a signal; one extra page is harmless) and cannot storm.
+_disk_pressure_active = False  # currently in a breached (suspended) state
+_disk_last_alert_at: datetime | None = None  # last dispatched page time
+_disk_paged_severity: str | None = None  # "warning" | "critical" while active
+
+
+def _log_receipts_disabled_once() -> None:
+    """Emit the dormant-mode breadcrumb exactly once per process."""
+    global _receipts_disabled_logged
+    if not _receipts_disabled_logged:
+        log.info("detection_receipts_disabled")
+        _receipts_disabled_logged = True
+
+
+def _disk_paging_decision(
+    healthy: bool, severity: str, now: datetime, cooldown_hours: float
+) -> str:
+    """Operator-paging state machine for disk pressure. Returns the action:
+
+    - ``"page_breach"``     — first breach after being healthy (page immediately);
+    - ``"page_escalation"`` — a materially worse crossing (warning→critical) while
+      already breached — bypasses the cooldown, pages immediately;
+    - ``"page_cooled_due"`` — sustained breach and the cooldown has elapsed;
+    - ``"page_recovery"``   — pressure cleared after being breached (distinct page);
+    - ``"suppressed"``      — breached but within the cooldown (page rate-limited);
+    - ``"none"``            — healthy and not previously breached.
+
+    This gates ONLY the Telegram page; it NEVER delays receipt suspension or
+    coverage invalidation (those fire on any breach, upstream of this).
+    """
+    global _disk_pressure_active, _disk_last_alert_at, _disk_paged_severity
+    if healthy:
+        if _disk_pressure_active:
+            _disk_pressure_active = False
+            _disk_paged_severity = None
+            return "page_recovery"
+        return "none"
+    # Breached.
+    if not _disk_pressure_active:
+        _disk_pressure_active = True
+        _disk_paged_severity = severity
+        _disk_last_alert_at = now
+        return "page_breach"
+    if severity == "critical" and _disk_paged_severity != "critical":
+        # Escalation: a deeper breach bypasses the cooldown.
+        _disk_paged_severity = "critical"
+        _disk_last_alert_at = now
+        return "page_escalation"
+    if _disk_last_alert_at is None or (now - _disk_last_alert_at) >= timedelta(
+        hours=cooldown_hours
+    ):
+        _disk_last_alert_at = now
+        return "page_cooled_due"
+    return "suppressed"
+
+
+async def _send_disk_page(session, settings, body: str, source: str) -> None:
+    """Dispatch one operator page (parse_mode=None; §12b dispatched/delivered
+    logs bracket the send). Fail-soft — never breaks the lane."""
+    prefix = f"{source}_alert"
+    try:
+        log.info(f"{prefix}_dispatched")
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None, source=source
+        )
+        log.info(f"{prefix}_delivered")
+    except Exception as e:  # never break the lane on an alert failure
+        log.warning(f"{prefix}_failed", err=str(e))
+
 
 # ALR-02 decision-receipt gate version (reviewer LOCK 2). A literal that pins
 # the gate/threshold logic in force when a receipt was written, so a receipt is
@@ -134,25 +211,38 @@ def _receipt_idempotency_key(
     outcome: str,
     source_observation_ts: str | None,
     gate_version: str,
+    evaluation_instance: str,
 ) -> str:
-    """Deterministic idempotency key for a decision receipt (reviewer LOCK 3).
+    """Deterministic idempotency key for a decision receipt.
 
-    Recipe (documented identically in
-    tasks/prereg_detection_gate_enrichment_cohort.md):
+    TWO-IDENTITY MODEL (reviewer, 2026-07-26). The key is the **EVALUATION
+    IDENTITY**: it incorporates the evaluation instance (the cycle
+    ``decided_at``), so each later poll of a candidate is a NEW receipt. Recipe
+    (documented identically in tasks/prereg_detection_gate_enrichment_cohort.md):
 
-        sha256_hex( "{token_id}|{outcome}|{source_observation_ts}|{gate_version}" )
+        sha256_hex(
+          "{token_id}|{outcome}|{source_observation_ts}|{gate_version}|{evaluation_instance}"
+        )
 
     where a None ``source_observation_ts`` is rendered as the empty string and
-    the field separator is a literal ``|``. Because ``decided_at`` is NOT in the
-    key, re-evaluating the SAME token in the SAME state across successive polling
-    cycles yields the SAME key — the writer's ``INSERT OR IGNORE`` + the UNIQUE
-    index then collapse those re-evaluations to a single analytical row. A
-    genuine state change (outcome flips, or the token is re-observed with a new
-    first_seen, or the gate version is bumped) produces a DIFFERENT key and a new
-    row; the pre-registered primary analytical unit is the token's FIRST decision
-    after cohort start (MIN(decided_at) per token_id).
+    the field separator is a literal ``|``. Because the cycle ``decided_at`` is
+    IN the key, cycle-N and cycle-N+1 evaluations of the same token yield
+    DIFFERENT keys and DISTINCT rows — routine re-polls are never collapsed and
+    never mis-classified as conflicts (the earlier full-payload comparison over
+    an evaluation-instance-independent key mis-counted 715 unchanged re-polls/
+    cycle as conflicts on 2026-07-26; see the prereg §7 + capacity artifact).
+
+    ``INSERT OR IGNORE`` + the UNIQUE index now only collapse an exact repeat of
+    the SAME evaluation instance (an intra-cycle crash/retry or a duplicated
+    input) → ``exact_idempotent_replay``; a same-instance payload mismatch is a
+    genuine ``conflicting_duplicate``. The separate ANALYTICAL INDEX IDENTITY —
+    the token's FIRST valid evaluation after cohort start, which fixes its arm +
+    endpoint anchor — is a query-time definition (prereg §4), not this key.
     """
-    raw = f"{token_id}|{outcome}|{source_observation_ts or ''}|{gate_version}"
+    raw = (
+        f"{token_id}|{outcome}|{source_observation_ts or ''}"
+        f"|{gate_version}|{evaluation_instance}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -175,9 +265,9 @@ async def _write_detection_receipt(
     once. It NEVER raises: a write failure is caught, logged as a structured
     ``detection_receipt_write_failed`` event, and counted, after which the lane
     proceeds exactly as before — a receipt-write failure can never change
-    sending behavior. ``counters`` accumulates the per-cycle reconciliation
-    triple (evaluated / written / failures) plus the conflict tally surfaced in
-    ``detection_receipt_summary``.
+    sending behavior. ``counters`` accumulates the per-cycle reconciliation set
+    (evaluated / newly_written / exact_replays / write_failures / conflicts)
+    surfaced in ``detection_receipt_summary``.
 
     Persists the RAW decision inputs (reviewer correction 2), not merely fired
     signals: the derived score BEFORE (raw model value) and AFTER the gate's
@@ -186,7 +276,17 @@ async def _write_detection_receipt(
     values + per-input missingness/default indicators (plus any outcome-specific
     inputs the caller passes via ``extra_inputs``).
     """
+    if counters.get("receipts_disabled"):
+        # DORMANCY: skip BEFORE any persistence attempt and BEFORE counting, so a
+        # dormant deployment writes zero rows and emits no per-candidate work.
+        return
     counters["evaluated"] += 1
+    if counters.get("disk_suspended"):
+        # Disk-pressure fail-closed: accrual is SUSPENDED this cycle. We count the
+        # evaluation as skipped (coverage is unhealthy) but write NO receipt and
+        # NEVER prune/sample/reduce detail. The send path is unaffected upstream.
+        counters["skipped_disk_pressure"] += 1
+        return
     quant_raw = getattr(cand, "quant_score", None)  # int | None (raw model value)
     score_before = quant_raw if isinstance(quant_raw, int) else None
     score_after = int(quant_raw or 0)  # the operand the gate actually compares
@@ -196,7 +296,8 @@ async def _write_detection_receipt(
 
     # raw_inputs — the raw values the decision consumed + missingness/default
     # indicators. sort_keys=True → a deterministic serialization so the
-    # conflict-classifier can compare payloads byte-for-byte across cycles.
+    # conflict-classifier can compare payloads byte-for-byte for a repeat of the
+    # SAME evaluation instance (an intra-cycle retry).
     raw_inputs: dict = {
         "quant_score_raw": quant_raw,
         "quant_score_missing": quant_raw is None,
@@ -212,8 +313,14 @@ async def _write_detection_receipt(
         raw_inputs.update(extra_inputs)
     raw_inputs_json = json.dumps(raw_inputs, sort_keys=True)
 
+    # Evaluation-identity key: decided_at (the cycle instant) is the evaluation
+    # instance, so each cycle's evaluation of a token is a DISTINCT row.
     idempotency_key = _receipt_idempotency_key(
-        token_id, outcome, source_observation_ts, DETECTION_GATE_VERSION
+        token_id,
+        outcome,
+        source_observation_ts,
+        DETECTION_GATE_VERSION,
+        decided_at,
     )
     try:
         result = await db.insert_detection_decision_receipt(
@@ -233,17 +340,17 @@ async def _write_detection_receipt(
             idempotency_key=idempotency_key,
         )
         # Bucket by result so the per-cycle reconciliation identity holds exactly
-        # (reviewer amendment 2):
-        #   evaluated == receipts_written + exact_replays + write_failures
+        # (reviewer naming, 2026-07-26):
+        #   evaluated == newly_written + exact_replays + write_failures
         #              + conflicting_duplicates
         if result == "inserted":
-            counters["receipts_written"] += 1
+            counters["newly_written"] += 1
         elif result == "idempotent_replay":
             counters["exact_replays"] += 1
         elif result == "conflict":
-            # Same idempotency key, materially different payload — a correctness
-            # defect (e.g. the gate changed without a gate_version bump). Surface
-            # it; it must never pass as healthy coverage (reviewer correction 3).
+            # Same evaluation-instance key, different payload — a correctness
+            # defect (the same evaluation produced two payloads). Surface it; it
+            # must never pass as healthy coverage (reviewer correction 3).
             counters["conflicts"] += 1
             log.warning(
                 "detection_receipt_conflict",
@@ -521,25 +628,102 @@ async def notify_early_detections(
         return
 
     now = now or datetime.now(timezone.utc)
+    # EVALUATION-INSTANCE IDENTIFIER (reviewer, 2026-07-26): created ONCE here,
+    # BEFORE any persistence, and reused for every receipt in this cycle AND for
+    # every retry of the same insert. It is the cycle-frozen ``decided_at`` — a
+    # deterministic value, NOT a per-insert-attempt UUID/timestamp, so an exact
+    # retry re-derives the SAME idempotency key (via _receipt_idempotency_key)
+    # and collapses to one row rather than becoming a new evaluation.
     decided_at = now.isoformat()
-    # Reviewer LOCK 4 + corrections 3 & 2: per-cycle reconciliation counters.
-    # Every terminal decision (past the evaluation boundary) writes exactly one
-    # receipt via _write_detection_receipt, bucketed so the identity
-    #   evaluated == receipts_written + exact_replays + write_failures + conflicts
-    # holds exactly; `conflicts` (same key, materially different payload) can
-    # never pass as healthy coverage. filtered_* count PRE-boundary rejected
-    # inputs SEPARATELY BY REASON — they never inflate `evaluated` and never
-    # disappear silently. All are surfaced each cycle in detection_receipt_summary.
+    # Reviewer LOCK 4 + corrections 2 & 3 + two-identity naming: per-cycle
+    # reconciliation counters. Every terminal decision (past the evaluation
+    # boundary) writes exactly one receipt via _write_detection_receipt, bucketed
+    # so the identity
+    #   evaluated == newly_written + exact_replays + write_failures + conflicts
+    # holds exactly. Under evaluation-identity every fresh cycle re-writes each
+    # token as a NEW row, so `newly_written` ≈ evaluated and `exact_replays` /
+    # `conflicts` are ~0 on healthy cycles (a same-instance payload mismatch is a
+    # true defect). filtered_* count PRE-boundary rejected inputs SEPARATELY BY
+    # REASON — they never inflate `evaluated` and never disappear silently. All
+    # are surfaced each cycle in detection_receipt_summary.
     receipt_counters = {
         "evaluated": 0,
-        "receipts_written": 0,
+        "newly_written": 0,
         "exact_replays": 0,
         "write_failures": 0,
         "conflicts": 0,
         "filtered_missing_id": 0,
         "filtered_non_cg_source": 0,
         "filtered_malformed": 0,
+        "skipped_disk_pressure": 0,
+        "disk_suspended": False,
+        "disk_pressure_active": False,
+        "paging_cooled": False,
+        "receipts_disabled": False,
     }
+    # DORMANCY: master kill-switch. When receipts are disabled the lane still runs
+    # (candidate evaluation, gating, ranking, and SENDING byte-identical) but the
+    # ENTIRE receipts subsystem is skipped — no inserts/lookups/disk-work/archive/
+    # accrual. _write_detection_receipt no-ops before any persistence. A single
+    # breadcrumb fires per process; the summary below still fires but clearly flags
+    # receipts_disabled so dormancy can't be mistaken for clean coverage.
+    receipts_enabled = settings.DETECTION_RECEIPTS_ENABLED
+    if not receipts_enabled:
+        receipt_counters["receipts_disabled"] = True
+        _log_receipts_disabled_once()
+    # Disk-pressure fail-closed guard (only when receipts are actually accruing).
+    # Suspension + coverage-invalidation fire on ANY breach; the operator PAGE is
+    # rate-limited by a cooldown, with immediate paging on first breach + on a
+    # critical escalation, and a distinct recovery page when pressure clears. The
+    # cooldown is notification-rate control ONLY — never delaying suspension.
+    _disk = (
+        check_disk_pressure(db._db_path, settings)
+        if (receipts_enabled and settings.DETECTION_RECEIPT_DISK_GUARD_ENABLED)
+        else None
+    )
+    if _disk is not None:
+        breached = not _disk.healthy
+        severity = (
+            "critical"
+            if _disk.free_bytes < settings.DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB * 1e9
+            else "warning"
+        )
+        if breached:
+            # SUSPENSION + coverage invalidation — independent of paging.
+            receipt_counters["disk_suspended"] = True
+            receipt_counters["disk_pressure_active"] = True
+            # The structured WARNING stays per-cycle (journal signal, always).
+            log.warning(
+                "detection_receipt_disk_pressure",
+                reason=_disk.reason(),
+                severity=severity,
+                free_gb=round(_disk.free_bytes / 1e9, 2),
+                free_pct=round(_disk.free_pct, 1),
+            )
+        decision = _disk_paging_decision(
+            _disk.healthy,
+            severity,
+            now,
+            settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS,
+        )
+        receipt_counters["paging_cooled"] = decision == "suppressed"
+        if decision in ("page_breach", "page_escalation", "page_cooled_due"):
+            body = (
+                f"disk pressure ({severity}): detection receipt accrual SUSPENDED "
+                f"({_disk.reason()})"
+            )
+            await _send_disk_page(
+                session, settings, body, "detection_receipt_disk_pressure"
+            )
+        elif decision == "page_recovery":
+            await _send_disk_page(
+                session,
+                settings,
+                f"disk pressure CLEARED: detection receipt accrual resumed "
+                f"(free={round(_disk.free_bytes / 1e9, 2)}GB, "
+                f"{round(_disk.free_pct, 1)}%)",
+                "detection_receipt_disk_recovery",
+            )
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -849,25 +1033,42 @@ async def notify_early_detections(
             sent=sent_count,
             cap=settings.DETECTION_ALERT_MAX_PER_DAY,
         )
-        # Reviewer LOCK 4 + corrections 2 & 3: per-cycle receipt reconciliation.
-        # Identity (must hold every cycle):
-        #   evaluated_n == receipts_written_n + exact_replays_n
+        # Reviewer LOCK 4 + corrections 2 & 3 + two-identity naming: per-cycle
+        # receipt reconciliation. Identity (must hold every cycle):
+        #   evaluated_n == newly_written_n + exact_replays_n
         #              + write_failures_n + conflicting_duplicates_n
         # If it does not hold, or receipts otherwise cannot be reconciled, the
         # cohort is INVALID (documented in the prereg). conflicting_duplicates_n
-        # must be 0 for healthy coverage. filtered_*_n are reported BESIDE the
-        # identity (excluded from evaluated_n) so pre-boundary rejections stay
-        # visible by reason and never inflate the evaluated cohort.
+        # must be 0 for healthy coverage; under evaluation-identity a clean cycle
+        # following a prior cycle shows newly_written_n == evaluated_n with
+        # exact_replays_n == conflicting_duplicates_n == 0. filtered_*_n are
+        # reported BESIDE the identity (excluded from evaluated_n) so pre-boundary
+        # rejections stay visible by reason and never inflate the evaluated cohort.
+        # ``coverage_healthy`` is False whenever coverage is NOT clean — i.e. when
+        # receipts are dormant (receipts_disabled) OR disk-pressure suspended
+        # accrual. In those states the identity intentionally does NOT close,
+        # flagging the gap so a dashboard/log reader can NEVER mistake dormancy or
+        # a suspended cycle for healthy coverage. The summary is ALWAYS emitted (it
+        # is the per-cycle status record); dormancy is surfaced via
+        # receipts_disabled + coverage_healthy=false, not by hiding the summary.
+        coverage_healthy = not (
+            receipt_counters["receipts_disabled"] or receipt_counters["disk_suspended"]
+        )
         log.info(
             "detection_receipt_summary",
+            receipts_disabled=receipt_counters["receipts_disabled"],
             evaluated_n=receipt_counters["evaluated"],
-            receipts_written_n=receipt_counters["receipts_written"],
+            newly_written_n=receipt_counters["newly_written"],
             exact_replays_n=receipt_counters["exact_replays"],
             write_failures_n=receipt_counters["write_failures"],
             conflicting_duplicates_n=receipt_counters["conflicts"],
+            skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
+            disk_pressure_active=receipt_counters["disk_pressure_active"],
+            paging_cooled=receipt_counters["paging_cooled"],
             filtered_missing_id_n=receipt_counters["filtered_missing_id"],
             filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
             filtered_malformed_n=receipt_counters["filtered_malformed"],
+            coverage_healthy=coverage_healthy,
         )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.

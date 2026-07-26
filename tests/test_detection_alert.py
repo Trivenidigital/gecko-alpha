@@ -39,7 +39,11 @@ _REQUIRED = {
 
 
 def _settings(**overrides) -> Settings:
-    return Settings(_env_file=None, **{**_REQUIRED, **overrides})
+    # Receipts default DISABLED in prod (dormant-deployment ruling); these tests
+    # exercise the receipts subsystem, so enable it unless a test overrides.
+    base = {"DETECTION_RECEIPTS_ENABLED": True}
+    base.update(overrides)
+    return Settings(_env_file=None, **{**_REQUIRED, **base})
 
 
 def _cand(
@@ -723,12 +727,26 @@ def _receipt_kwargs(**overrides) -> dict:
 def test_idempotency_key_recipe_matches_sha256():
     import hashlib
 
-    key = _receipt_idempotency_key("tok", "sent", "2026-07-20T11:00:00+00:00", "466.1")
-    raw = "tok|sent|2026-07-20T11:00:00+00:00|466.1"
+    # Two-identity model: the key incorporates the evaluation instance (decided_at).
+    key = _receipt_idempotency_key(
+        "tok", "sent", "2026-07-20T11:00:00+00:00", "466.1", "2026-07-20T12:00:00+00:00"
+    )
+    raw = "tok|sent|2026-07-20T11:00:00+00:00|466.1|2026-07-20T12:00:00+00:00"
     assert key == hashlib.sha256(raw.encode("utf-8")).hexdigest()
     # A None source-observation renders as the empty string.
-    key2 = _receipt_idempotency_key("tok", "too_old", None, "466.1")
-    assert key2 == hashlib.sha256("tok|too_old||466.1".encode("utf-8")).hexdigest()
+    key2 = _receipt_idempotency_key(
+        "tok", "too_old", None, "466.1", "2026-07-20T12:00:00+00:00"
+    )
+    assert (
+        key2
+        == hashlib.sha256(
+            "tok|too_old||466.1|2026-07-20T12:00:00+00:00".encode("utf-8")
+        ).hexdigest()
+    )
+    # Different evaluation instances (cycles) → DIFFERENT keys for the same token.
+    key_c1 = _receipt_idempotency_key("tok", "too_old", "obs", "466.1", "cycle-1")
+    key_c2 = _receipt_idempotency_key("tok", "too_old", "obs", "466.1", "cycle-2")
+    assert key_c1 != key_c2
 
 
 # ---------- correction 1: both arms share the index_decision_at anchor ----------
@@ -810,12 +828,14 @@ async def test_receipt_fields_persisted_gate_fail(tmp_path, monkeypatch):
     assert raw["score_before"] == 4 and raw["score_after"] == 4
     assert raw["comparator"] == ">=" and raw["threshold"] == 5
     assert raw["gate_expr"] == "score_after >= 5"
-    # Idempotency key reproduces from the documented recipe.
+    # Idempotency key reproduces from the documented recipe (incl. the
+    # evaluation instance = decided_at).
     assert r["idempotency_key"] == _receipt_idempotency_key(
         "failer",
         "gate_fail_quality",
         r["source_observation_ts"],
         DETECTION_GATE_VERSION,
+        r["decided_at"],
     )
     await db.close()
 
@@ -883,32 +903,35 @@ async def test_receipt_score_before_after_clip_on_unscored(tmp_path, monkeypatch
     await db.close()
 
 
-# ---------- correction 3: idempotent replay vs conflicting duplicate ----------
+# ---------- two-identity: intra-cycle replay vs conflict (same instance) -------
 
 
 @pytest.mark.asyncio
-async def test_receipt_idempotent_replay_counted_as_replay(tmp_path):
-    """Same key + same payload (different decided_at) → idempotent_replay, one
-    row, FIRST decided_at preserved."""
+async def test_receipt_intra_cycle_exact_retry_is_replay(tmp_path):
+    """Same evaluation-instance key + IDENTICAL payload (an intra-cycle
+    crash/retry or duplicated input) → idempotent_replay, one row, first write
+    preserved. ``decided_at`` is in the key so a same-key hit is the same
+    evaluation instance."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
         **_receipt_kwargs(idempotency_key="k1")
     )
     assert r1 == "inserted"
+    # Byte-identical retry of the same evaluation instance → replay.
     r2 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k1", decided_at="2026-07-20T13:00:00+00:00")
+        **_receipt_kwargs(idempotency_key="k1")
     )
     assert r2 == "idempotent_replay"
     rows = await _fetch_receipts(db, "tok")
     assert len(rows) == 1
-    assert rows[0]["decided_at"] == "2026-07-20T12:00:00+00:00"  # first write kept
     await db.close()
 
 
 @pytest.mark.asyncio
-async def test_receipt_conflicting_duplicate_detected(tmp_path):
-    """Same key + materially different payload → conflict; original preserved."""
+async def test_receipt_same_instance_payload_mismatch_is_conflict(tmp_path):
+    """Same evaluation-instance key + DIFFERENT payload (the same evaluation
+    produced two payloads — a genuine defect) → conflict; original preserved."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
@@ -925,6 +948,99 @@ async def test_receipt_conflicting_duplicate_detected(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_receipt_outcome_contradiction_is_conflict(tmp_path):
+    """Same key + a contradictory machine OUTCOME (simulated corruption) →
+    conflict."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    r1 = await db.insert_detection_decision_receipt(
+        **_receipt_kwargs(idempotency_key="k3", outcome="gate_fail_quality")
+    )
+    assert r1 == "inserted"
+    r2 = await db.insert_detection_decision_receipt(
+        **_receipt_kwargs(idempotency_key="k3", outcome="sent")
+    )
+    assert r2 == "conflict"
+    await db.close()
+
+
+# ---------- two-identity: a clean cycle following a prior cycle ---------------
+
+
+@pytest.mark.asyncio
+async def test_clean_cycle_after_prior_cycle_all_newly_written(tmp_path, monkeypatch):
+    """EVALUATION IDENTITY (reviewer, 2026-07-26): the SAME candidate re-evaluated
+    the NEXT cycle is a NEW receipt row, NOT a replay and NOT a conflict. A clean
+    cycle following a prior cycle shows newly_written_n == evaluated_n (minus
+    filtered) with exact_replays_n == conflicting_duplicates_n == 0. This is the
+    positive proof that the 715-conflicts/cycle false-conflict class is gone."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MIN_QUANT_SCORE=5
+    )
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _block_send(monkeypatch)
+    cand = _cand("failer", quant_score=4, signals_fired=["market_cap_range"])
+    now1 = datetime.now(timezone.utc)
+    now2 = now1 + timedelta(minutes=3)  # next cycle, distinct evaluation instance
+
+    with capture_logs() as logs1:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now1
+        )
+    with capture_logs() as logs2:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now2
+        )
+    # Two DISTINCT rows — one per cycle (evaluation identity).
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 2
+    assert {r["decided_at"] for r in rows} == {now1.isoformat(), now2.isoformat()}
+
+    summ1 = [e for e in logs1 if e["event"] == "detection_receipt_summary"][-1]
+    summ2 = [e for e in logs2 if e["event"] == "detection_receipt_summary"][-1]
+    for summ in (summ1, summ2):
+        assert summ["evaluated_n"] == 1
+        assert summ["newly_written_n"] == 1  # each cycle writes a NEW row
+        assert summ["exact_replays_n"] == 0
+        assert summ["conflicting_duplicates_n"] == 0
+        assert summ["write_failures_n"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_same_cycle_duplicate_input_is_replay(tmp_path, monkeypatch):
+    """Within ONE cycle (one evaluation instance), a duplicated input candidate
+    collapses to a single row and counts as an exact replay — not a new row."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MIN_QUANT_SCORE=5
+    )
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _block_send(monkeypatch)
+    cand = _cand("failer", quant_score=4, signals_fired=["market_cap_range"])
+    now = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        # Same candidate appears twice in the SAME cycle → same evaluation instance.
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand, cand], now=now
+        )
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 1  # collapsed to a single row
+    summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+    assert summ["evaluated_n"] == 2
+    assert summ["newly_written_n"] == 1
+    assert summ["exact_replays_n"] == 1
+    assert summ["conflicting_duplicates_n"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_receipt_conflict_counted_and_warned():
     """When the DB reports a conflict, the writer counts it AND warns (never
     hides it) — reviewer correction 3."""
@@ -936,7 +1052,7 @@ async def test_receipt_conflict_counted_and_warned():
     settings = _settings()
     counters = {
         "evaluated": 0,
-        "receipts_written": 0,
+        "newly_written": 0,
         "exact_replays": 0,
         "write_failures": 0,
         "conflicts": 0,
@@ -956,7 +1072,7 @@ async def test_receipt_conflict_counted_and_warned():
     # A conflict is evaluated + counted as a conflict, but is NOT a new insert.
     assert counters["evaluated"] == 1
     assert counters["conflicts"] == 1
-    assert counters["receipts_written"] == 0
+    assert counters["newly_written"] == 0
     assert counters["exact_replays"] == 0
     assert counters["write_failures"] == 0
     assert any(e["event"] == "detection_receipt_conflict" for e in logs)
@@ -990,12 +1106,12 @@ async def test_receipt_summary_counts_write_failures(tmp_path, monkeypatch):
     summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
     assert summ["evaluated_n"] == 1
     assert summ["write_failures_n"] == 1
-    assert summ["receipts_written_n"] == 0
+    assert summ["newly_written_n"] == 0
     assert summ["exact_replays_n"] == 0
     assert summ["conflicting_duplicates_n"] == 0
     # Reconciliation identity holds.
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1008,7 +1124,7 @@ async def test_receipt_summary_counts_write_failures(tmp_path, monkeypatch):
 async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
     """conflicting_duplicates_n surfaces in the per-cycle summary so a conflict
     can never pass as healthy coverage (reviewer correction 3). A conflict is
-    NOT a new insert, so receipts_written_n stays 0."""
+    NOT a new insert, so newly_written_n stays 0."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
@@ -1030,11 +1146,11 @@ async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
     summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
     assert summ["evaluated_n"] == 1
     assert summ["conflicting_duplicates_n"] == 1
-    assert summ["receipts_written_n"] == 0
+    assert summ["newly_written_n"] == 0
     assert summ["exact_replays_n"] == 0
     assert summ["write_failures_n"] == 0
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1136,7 +1252,7 @@ async def test_filtered_inputs_never_reach_gate_and_counted_by_reason(
     # Filtered inputs never inflate the evaluated cohort; identity holds at 0.
     assert summ["evaluated_n"] == 0
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1144,13 +1260,15 @@ async def test_filtered_inputs_never_reach_gate_and_counted_by_reason(
     await db.close()
 
 
-# ---------- LOCK 3 (lane-level idempotency): repeated cycles → one row ----------
+# ---------- two-identity: distinct cycles → distinct rows ---------------------
 
 
 @pytest.mark.asyncio
-async def test_repeated_cycles_single_receipt_row(tmp_path, monkeypatch):
-    """Re-evaluating the same token in the same state across cycles collapses to
-    a SINGLE receipt row (no analytical-unit inflation)."""
+async def test_distinct_cycles_produce_distinct_rows(tmp_path, monkeypatch):
+    """EVALUATION IDENTITY: re-evaluating the same token across 3 DISTINCT cycles
+    (distinct evaluation instances) produces 3 DISTINCT rows — later polls are
+    new receipts, never collapsed. The analytical unit (first evaluation) is
+    recovered at query time as MIN(decided_at) per token."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(
@@ -1160,10 +1278,24 @@ async def test_repeated_cycles_single_receipt_row(tmp_path, monkeypatch):
     await _insert_price(db, "failer")
     _block_send(monkeypatch)
     cands = [_cand("failer", quant_score=4, signals_fired=["market_cap_range"])]
+    base = datetime.now(timezone.utc)
 
-    for _ in range(3):
-        await notify_early_detections(db, settings, session=None, candidates=cands)
-    assert len(await _fetch_receipts(db, "failer")) == 1
+    for k in range(3):
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=cands,
+            now=base + timedelta(minutes=3 * k),
+        )
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 3
+    assert len({r["decided_at"] for r in rows}) == 3
+    # The analytical index unit = the first evaluation (MIN decided_at).
+    cur = await db._conn.execute(
+        "SELECT MIN(decided_at) FROM detection_decision_receipts WHERE token_id='failer'"
+    )
+    assert (await cur.fetchone())[0] == base.isoformat()
     await db.close()
 
 
@@ -1321,4 +1453,457 @@ async def test_migration_idempotent(tmp_path):
     )
     assert r1 == "inserted" and r2 == "idempotent_replay"
     assert len(await _fetch_receipts(db, "tok")) == 1
+    await db.close()
+
+
+# ---------- two-identity: evaluation instance created before persistence -------
+
+
+def test_evaluation_instance_key_reused_not_regenerated():
+    """The evaluation-instance identifier (decided_at) is created BEFORE
+    persistence and REUSED: re-deriving the key for the SAME evaluation yields a
+    byte-identical key (an exact retry collapses), while a different evaluation
+    instance (a later cycle) yields a different key (a new evaluation)."""
+    a1 = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-1"
+    )
+    a2 = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-1"
+    )
+    assert a1 == a2  # reused, not regenerated → retry is NOT a new evaluation
+    b = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-2"
+    )
+    assert a1 != b  # a later cycle is a distinct evaluation
+
+
+# ---------- disk-pressure fail-closed: accrual suspended, send path intact ------
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_suspends_accrual_send_unaffected(tmp_path, monkeypatch):
+    """With the disk guard enabled and an impossible free-space floor, receipt
+    accrual is SUSPENDED (no rows written, coverage_healthy=False,
+    skipped_disk_pressure_n>0) while the SEND path is unaffected (the EARLY DETECT
+    alert still fires). Never prunes/samples."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # forces disk pressure
+    )
+    await _insert_candidate(db, "dogwifhat", first_seen_min_ago=5.0)
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[
+                _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+            ],
+        )
+    # Send path unaffected — the detection alert still went out.
+    assert any(t.startswith("🔎 EARLY DETECT") for t in sent)
+    # Accrual suspended — NO receipts written, coverage flagged unhealthy.
+    assert await _fetch_receipts(db) == []
+    summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+    assert summ["coverage_healthy"] is False
+    assert summ["skipped_disk_pressure_n"] == summ["evaluated_n"] >= 1
+    assert summ["newly_written_n"] == 0
+    assert any(e["event"] == "detection_receipt_disk_pressure" for e in logs)
+    await db.close()
+
+
+# ---------- dormancy flag: DETECTION_RECEIPTS_ENABLED=False ----------
+
+
+def _reset_disk_state(monkeypatch):
+    monkeypatch.setattr("scout.trading.detection_alert._disk_pressure_active", False)
+    monkeypatch.setattr("scout.trading.detection_alert._disk_last_alert_at", None)
+    monkeypatch.setattr("scout.trading.detection_alert._disk_paged_severity", None)
+
+
+def _dp(healthy, free_gb):
+    from scout.trading.receipt_archive import DiskPressure
+
+    return DiskPressure(
+        healthy=healthy,
+        free_bytes=int(free_gb * 1e9),
+        total_bytes=int(100e9),
+        free_pct=free_gb,
+        min_free_gb=10.0,
+        min_free_pct=15.0,
+    )
+
+
+def _stub_disk(monkeypatch, states):
+    seq = list(states)
+
+    def _fake(path, settings):
+        return seq.pop(0) if seq else states[-1]
+
+    monkeypatch.setattr("scout.trading.detection_alert.check_disk_pressure", _fake)
+
+
+@pytest.mark.asyncio
+async def test_receipts_disabled_writes_nothing_send_unaffected(tmp_path, monkeypatch):
+    """Dormant deployment (DETECTION_RECEIPTS_ENABLED=False): across TWO cycles NO
+    receipts are written, the send path + tg_alert_log audit are unaffected, and the
+    per-cycle summary IS emitted but clearly flags receipts_disabled=true +
+    coverage_healthy=false (never mistakable for clean coverage). The
+    detection_receipts_disabled breadcrumb fires exactly ONCE per process."""
+    monkeypatch.setattr(
+        "scout.trading.detection_alert._receipts_disabled_logged", False
+    )
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_RECEIPTS_ENABLED=False
+    )
+    await _insert_candidate(db, "dogwifhat", first_seen_min_ago=5.0)
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+    cand = _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+    now1 = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now1
+        )
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=now1 + timedelta(minutes=3),
+        )
+    # Zero receipts written across both cycles.
+    assert await _fetch_receipts(db) == []
+    # Send path unaffected (cycle 1 fired) + tg_alert_log audit still written.
+    assert any(t.startswith("🔎 EARLY DETECT") for t in sent)
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE outcome='sent' AND detail='detection_lane'"
+    )
+    assert (await cur.fetchone())[0] >= 1
+    # Exactly one dormant breadcrumb.
+    assert sum(1 for e in logs if e["event"] == "detection_receipts_disabled") == 1
+    # Summary emitted per cycle, clearly flagged dormant (not clean coverage).
+    summaries = [e for e in logs if e["event"] == "detection_receipt_summary"]
+    assert len(summaries) == 2
+    for s in summaries:
+        assert s["receipts_disabled"] is True
+        assert s["coverage_healthy"] is False
+        assert s["evaluated_n"] == 0 and s["newly_written_n"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_receipts_flag_behavior_equivalence(tmp_path, monkeypatch):
+    """Toggling the flag changes NOTHING about candidate evaluation, gating,
+    ranking, or sending: the sent messages + tg_alert_log rows are IDENTICAL with
+    receipts enabled vs disabled (behavior-equivalence)."""
+
+    async def _run(enabled):
+        monkeypatch.setattr(
+            "scout.trading.detection_alert._receipts_disabled_logged", False
+        )
+        db = Database(tmp_path / f"eq-{enabled}.db")
+        await db.initialize()
+        settings = _settings(
+            DETECTION_ALERT_LANE_ENABLED=True,
+            ALERT_UNIVERSE_FILTER_ENABLED=True,
+            DETECTION_RECEIPTS_ENABLED=enabled,
+        )
+        await _insert_candidate(db, "sendme", first_seen_min_ago=5.0)
+        await _insert_price(db, "sendme")
+        await _insert_candidate(
+            db, "spy-bstocks-tokenized-stock", first_seen_min_ago=6.0
+        )
+        await _insert_price(db, "spy-bstocks-tokenized-stock")
+        await _insert_candidate(db, "lowscore", first_seen_min_ago=7.0)
+        await _insert_price(db, "lowscore")
+        sent = _capture_send(monkeypatch)
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[
+                _cand(
+                    "sendme",
+                    symbol="SEND",
+                    quant_score=8,
+                    signals_fired=["cg_trending_rank"],
+                ),
+                _cand(
+                    "spy-bstocks-tokenized-stock",
+                    symbol="SPY",
+                    quant_score=8,
+                    signals_fired=["cg_trending_rank"],
+                ),
+                _cand("lowscore", symbol="LOW", quant_score=0, signals_fired=[]),
+            ],
+        )
+        cur = await db._conn.execute(
+            "SELECT token_id, outcome, detail, signal_type, paper_trade_id "
+            "FROM tg_alert_log ORDER BY token_id, alerted_at"
+        )
+        rows = [tuple(r) for r in await cur.fetchall()]
+        await db.close()
+        return sent, rows
+
+    sent_on, rows_on = await _run(True)
+    sent_off, rows_off = await _run(False)
+    assert sent_on == sent_off  # identical send-path decisions
+    assert rows_on == rows_off  # identical audit rows
+    assert len(sent_on) == 1 and sent_on[0].startswith("🔎 EARLY DETECT · SEND")
+
+
+# ---------- disk-pressure alert cooldown + escalation + recovery ----------
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_alert_respects_cooldown(tmp_path, monkeypatch):
+    """First breach pages IMMEDIATELY; a second breached cycle within the cooldown
+    does NOT page; a cycle after the cooldown pages again. The structured WARNING
+    fires every breached cycle regardless of paging."""
+    _reset_disk_state(monkeypatch)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # force pressure (warning, not critical)
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+    )
+    _capture_send(monkeypatch)
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+        dispatched_after_two = sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(hours=7)
+        )
+    dispatched_total = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    warnings = sum(1 for e in logs if e["event"] == "detection_receipt_disk_pressure")
+    assert (
+        dispatched_after_two == 1
+    )  # first breach paged, second suppressed by cooldown
+    assert dispatched_total == 2  # a second page after the cooldown elapsed
+    assert warnings == 3  # per-cycle warning, not rate-limited
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_critical_escalation_bypasses_cooldown(
+    tmp_path, monkeypatch
+):
+    """A materially worse crossing (warning → critical) within the cooldown pages
+    IMMEDIATELY, bypassing the cooldown."""
+    _reset_disk_state(monkeypatch)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+        DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB=3.0,
+    )
+    _capture_send(monkeypatch)
+    # cycle 1: warning breach (8 GB free). cycle 2: critical breach (2 GB) within cooldown.
+    _stub_disk(monkeypatch, [_dp(False, 8.0), _dp(False, 2.0)])
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+    dispatched = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    assert dispatched == 2  # first breach + critical escalation (cooldown bypassed)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_recovery_notification(tmp_path, monkeypatch):
+    """When pressure clears after a breach, a DISTINCT one-shot recovery page fires."""
+    _reset_disk_state(monkeypatch)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+    )
+    _capture_send(monkeypatch)
+    _stub_disk(monkeypatch, [_dp(False, 8.0), _dp(True, 40.0)])
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+    pressure = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    recovery = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_recovery_alert_dispatched"
+    )
+    assert pressure == 1 and recovery == 1
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_restart_no_page_storm_full_lifecycle(
+    tmp_path, monkeypatch
+):
+    """RESTART-WHILE-BREACHED: a process crashes/restarts while disk pressure is
+    ALREADY breached. Restart is simulated by resetting the module-level paging
+    state (what a fresh process has). Proves the restarted process:
+
+    (1) emits at most ONE immediate page;
+    (2) then respects the cooldown on subsequent breached cycles;
+    (3) keeps the breached status visible (disk_pressure_active / paging_cooled);
+    (4) has suspension + cohort invalidation active IMMEDIATELY on the first
+        post-restart cycle (no receipts written, coverage_healthy=false);
+    (5) still lets a critical escalation bypass the cooldown post-restart;
+    (6) emits exactly ONE distinct recovery notification when pressure clears.
+    """
+
+    def _pressure(logs):
+        return sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+        )
+
+    def _recovery(logs):
+        return sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_recovery_alert_dispatched"
+        )
+
+    def _summary(logs):
+        return [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+        DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB=3.0,
+    )
+    # A gate-fail candidate never sends, so the only pages are disk pages; under
+    # suspension it is skipped (no receipt), proving accrual is suspended.
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _capture_send(monkeypatch)
+    cand = _cand("failer", quant_score=0, signals_fired=[])
+    # Disk sequence: old(warn 8) | restart | N1(warn 8) N2(warn 8) N3(crit 2) N4(ok 40)
+    _stub_disk(
+        monkeypatch,
+        [
+            _dp(False, 8.0),
+            _dp(False, 8.0),
+            _dp(False, 8.0),
+            _dp(False, 2.0),
+            _dp(True, 40.0),
+        ],
+    )
+    base = datetime.now(timezone.utc)
+
+    # OLD process: an ongoing breach that has already paged once.
+    _reset_disk_state(monkeypatch)
+    with capture_logs() as l_old:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=base
+        )
+    assert _pressure(l_old) == 1
+
+    # ---- RESTART: a fresh process starts with EMPTY module paging state ----
+    _reset_disk_state(monkeypatch)
+
+    # (1)+(4) First post-restart cycle (still breached): exactly ONE immediate page,
+    # suspension + invalidation active immediately.
+    with capture_logs() as l1:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=5),
+        )
+    assert _pressure(l1) == 1
+    s1 = _summary(l1)
+    assert s1["disk_pressure_active"] is True
+    assert s1["coverage_healthy"] is False
+    assert s1["skipped_disk_pressure_n"] >= 1
+    assert await _fetch_receipts(db) == []  # accrual suspended → nothing persisted
+
+    # (2)+(3) Next breached cycle within cooldown: NO page, breach still visible.
+    with capture_logs() as l2:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=6),
+        )
+    assert _pressure(l2) == 0
+    s2 = _summary(l2)
+    assert s2["disk_pressure_active"] is True
+    assert s2["paging_cooled"] is True
+
+    # (5) Critical escalation within cooldown post-restart: pages immediately.
+    with capture_logs() as l3:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=7),
+        )
+    assert _pressure(l3) == 1
+
+    # (6) Recovery: exactly ONE distinct recovery page.
+    with capture_logs() as l4:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=8),
+        )
+    assert _recovery(l4) == 1
+    assert _pressure(l4) == 0
     await db.close()

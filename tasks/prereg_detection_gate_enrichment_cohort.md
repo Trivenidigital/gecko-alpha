@@ -51,21 +51,50 @@ Any statement of the form "sending caused X" is out of scope for this cohort.
 
 ## 3. Cohort start — deployment timestamp, no retroactive reconstruction (LOCK 5)
 
-Verbatim definition (reviewer amendment 3):
+Verbatim definition:
 
 > **Cohort start = the first healthy production process activation after BOTH
-> the schema migration AND the PR #474 code are deployed.**
+> the schema migration AND the two-identity fix code are deployed, recorded as
+> an application-ready timestamp AFTER migrations complete.**
 
 This is **one immutable timestamp** — not merge time, not migration time, not an
-approximate window. Pre-timestamp decisions are **outside the cohort and cannot
+approximate window, and not deploy alone (see the replacement-cohort gate at the
+end of this section). Pre-timestamp decisions are **outside the cohort and cannot
 be reconstructed** (gainers/trending snapshot retention is short and the
-dropped-candidate stream was never recorded). There is no retroactive
-reconstruction from pre-deployment data.
+dropped-candidate stream was never recorded).
 
-> **Cohort start (UTC): __________________ (TBD — record the first healthy
-> post-deploy process activation timestamp here at deploy)**
+**Shakedown exclusion (2026-07-26).** The first production activation
+(2026-07-26T02:47:23Z) ran with two successive pre-fix classifiers:
 
-Rows with `decided_at` before this timestamp (there should be none) are excluded.
+1. the original evaluation-instance-independent key, under which cross-cycle
+   re-polls of the same token collapsed to one row and were mis-classified as
+   **conflicting duplicates** (715/cycle — see §7); and it also exposed
+2. the **volume** consequence that motivated the two-identity model + capacity
+   artifact (`tasks/capacity_detection_receipts_2026_07.md`).
+
+All receipts written in the range **`[2026-07-26T02:47:23Z, <fix-activation-ts>)`**
+are **pre-cohort shakedown data**: they are RETAINED and labeled invalid **by this
+documented timestamp-range exclusion**, NOT deleted or rewritten. No existing
+receipt row is mutated. (If a marker is ever added it must be additive — e.g. a
+cohort-registry row — never an `UPDATE` of receipt rows.) The 733 shakedown rows
+present on srilu scout.db (02:49:25Z–03:12:41Z) are the measured basis for the
+capacity artifact.
+
+> **Cohort start (UTC): __________________ (TBD — the application-ready
+> timestamp, recorded AFTER migrations complete, of the first healthy process
+> activation following the two-identity fix deploy)**
+
+Rows with `decided_at` in the shakedown range above (or otherwise before this
+re-anchored timestamp) are excluded.
+
+**Replacement-cohort gate (the cohort does NOT start on deploy alone).** The
+re-anchored cohort start is valid only once ALL hold: (a) a new reviewed head on
+an exact green CI run; (b) a reviewer-APPROVED evidence-storage design (§8 +
+capacity artifact); (c) migration + code deployed; (d) the application-ready
+post-migration timestamp recorded; (e) one clean production reconciliation cycle
+(§8 identity holds, `conflicting_duplicates_n == write_failures_n == 0`); and (f)
+evidence storage demonstrably cannot threaten the service or silently truncate the
+evidence lifecycle.
 
 ---
 
@@ -93,6 +122,39 @@ are reported SEPARATELY and NEVER reassign the primary cohort.** A token whose
 index decision is `gate_fail_quality` but which later sends stays in the
 gate-failer arm for the primary analysis; its later send is a secondary
 observation.
+
+**Two-identity model — analytical index identity (reviewer, 2026-07-26).** Under
+the evaluation-identity write model (§7), every cycle writes a NEW receipt per
+evaluated token, so a token has MANY receipts. The **analytical index identity**
+is the token's FIRST VALID evaluation after cohort start; it permanently fixes
+the arm assignment and the endpoint anchor `index_decision_at`. It is a
+deterministic **query-time** definition (NOT a write-time key):
+
+```sql
+-- index_decisions: one row per token = its first VALID (post-shakedown,
+-- in-cohort) evaluation. Deterministic: MIN(decided_at); ties broken by MIN(id).
+WITH valid AS (
+  SELECT * FROM detection_decision_receipts
+  WHERE decided_at >= :cohort_start          -- excludes the shakedown range (§3)
+),
+firsts AS (
+  SELECT token_id, MIN(decided_at) AS index_decision_at
+  FROM valid GROUP BY token_id
+)
+SELECT v.token_id,
+       v.decided_at AS index_decision_at,
+       v.outcome    AS index_outcome,        -- fixes the arm (mapping below)
+       v.id         AS index_receipt_id
+FROM valid v
+JOIN firsts f
+  ON f.token_id = v.token_id AND f.index_decision_at = v.decided_at
+GROUP BY v.token_id
+HAVING v.id = MIN(v.id);                      -- deterministic tie-break
+```
+
+Post-index evaluations exist as receipts but carry **no arm/endpoint weight** —
+they are "reported separately" (flow attrition, repeated-token accounting). The
+endpoint windows (§5) are measured from `index_decision_at`.
 
 Arm mapping frozen for the primary analysis (index-receipt outcome → arm):
 
@@ -151,39 +213,63 @@ No cap changes are proposed or implied by this analysis.
 
 ---
 
-## 7. Repeated-token reconciliation & idempotency (LOCK 3)
+## 7. Two-identity model — evaluation identity vs analytical index identity
 
-Repeated polling must not inflate the analytical unit. Each receipt carries a
-deterministic **idempotency key**:
+**Reviewer, 2026-07-26.** There are TWO distinct identities. Conflating them is
+what produced the 715-conflicts/cycle defect.
+
+### 7a. EVALUATION IDENTITY (the write-time idempotency key)
+
+Each later poll of a candidate is a **NEW receipt**. The idempotency key
+incorporates the **evaluation instance** (the cycle's `decided_at`):
 
 ```
-idempotency_key = sha256_hex( "{token_id}|{outcome}|{source_observation_ts}|{gate_version}" )
+idempotency_key = sha256_hex(
+  "{token_id}|{outcome}|{source_observation_ts}|{gate_version}|{evaluation_instance}"
+)
+# evaluation_instance = the cycle decided_at (UTC isoformat)
 ```
 
-where a null `source_observation_ts` renders as the empty string and the field
-separator is a literal `|`. Because `decided_at` is **not** in the key,
-re-evaluating the same token in the same state across successive polling cycles
-produces the same key; a `UNIQUE` index + `INSERT OR IGNORE` collapse those
-re-evaluations to a single row, and the FIRST write's `decided_at` is preserved
-(so `MIN(decided_at)` = the true first-evaluation time). A genuine state change
-(outcome flips, the token is re-observed with a new `first_seen`, or
-`gate_version` is bumped) yields a different key and a new row.
+A null `source_observation_ts` renders as the empty string; the separator is a
+literal `|`. Because the cycle instant is IN the key, cycle-N and cycle-N+1
+evaluations of the same token yield **different keys and DISTINCT rows**. Routine
+re-polls are therefore never collapsed and never mis-classified as conflicts —
+this eliminates the false-conflict class **by construction**.
 
-**Conflict surfacing (reviewer correction 3):** an `INSERT OR IGNORE` that
-no-ops is classified against the persisted row:
+`INSERT OR IGNORE` + the `UNIQUE` index now collapse only an **exact repeat of
+the SAME evaluation instance** (an intra-cycle crash/retry, or a candidate
+duplicated within one cycle's input list):
 
-- **exact idempotent replay** (stored payload == attempted payload) — benign,
-  counted as written;
-- **conflicting duplicate** (same key, materially different payload — e.g. the
-  gate's threshold/comparator/score changed without a `gate_version` bump) — a
-  **correctness defect**: counted, a structured `detection_receipt_conflict`
+- **exact idempotent replay** — same evaluation-instance key AND byte-identical
+  payload. Benign. Counted as `exact_replays`.
+- **conflicting duplicate** — same evaluation-instance key but a DIFFERENT
+  payload (the *same* evaluation produced two payloads — a genuine defect, or the
+  gate config/code changed without a `gate_version` bump within one instant).
+  Counted as `conflicting_duplicates`, a structured `detection_receipt_conflict`
   warning is emitted, and the count appears in the per-cycle
   `detection_receipt_summary` so it can never pass as healthy coverage.
 
-The pre-registered **primary analytical unit is the token's first decision after
-cohort start** (§4). Duplicate rows for a token (genuine state changes) are
-reconciled to that single unit for the primary analysis and reported in the
-repeated-token accounting.
+Why the earlier fixes were rejected: the ORIGINAL key omitted the evaluation
+instance, so cross-cycle re-polls hit the same key and (under full-payload
+comparison) were counted as conflicts — 715/cycle on 2026-07-26 02:53Z
+(`evaluated=724, newly_written=9, conflicting_duplicates=715`). A *reduced-field*
+comparison was also rejected as insufficient; the correct fix is the
+evaluation-identity key, which makes each poll its own row.
+
+### 7b. ANALYTICAL INDEX IDENTITY (the query-time analytical unit)
+
+The token's **first valid evaluation after cohort start** permanently fixes its
+arm and endpoint anchor `index_decision_at`. This is the deterministic query in
+§4 (`MIN(decided_at)` per token over in-cohort rows, `MIN(id)` tie-break).
+Post-index evaluations remain as receipts but carry **no** arm/endpoint weight
+(reported separately as flow attrition + repeated-token accounting).
+
+**Consequence for volume:** because each poll is now a distinct row, the receipts
+table grows per-evaluation, not per-decision-change. The measured/projected volume
+and the resulting evidence-storage design constraints are documented in the
+**capacity artifact** `tasks/capacity_detection_receipts_2026_07.md`; the
+replacement cohort does not start until that storage design is reviewer-approved
+(§3 gate).
 
 ---
 
@@ -205,20 +291,22 @@ equivalent) is **mandatory** for every terminal decision. Filtered inputs are
 counted **separately by reason** in `detection_receipt_summary` so they never
 disappear silently and never inflate `evaluated`.
 
-**Per-cycle reconciliation identity.** Every cycle the lane emits
-`detection_receipt_summary` with
-`evaluated_n / receipts_written_n / exact_replays_n / write_failures_n /
+**Per-cycle reconciliation identity (reviewer naming).** Every cycle the lane
+emits `detection_receipt_summary` with
+`evaluated_n / newly_written_n / exact_replays_n / write_failures_n /
 conflicting_duplicates_n` plus the `filtered_*_n` reasons. The identity is:
 
 ```
-evaluated = receipts_written + exact_replays + write_failures + conflicting_duplicates
+evaluated = newly_written + exact_replays + write_failures + conflicting_duplicates
 ```
 
 with the `filtered_*` counts reported BESIDE it and EXCLUDED from `evaluated`.
-This is also the **first-cycle reconciliation identity** used to validate the
-cohort at activation (reviewer amendment 3): on the first healthy post-deploy
-cycle the identity must hold and `write_failures` / `conflicting_duplicates` must
-be 0.
+Under the two-identity model a **clean cycle following a prior cycle** shows
+`newly_written == evaluated` (minus filtered) with
+`exact_replays == conflicting_duplicates == 0` — this is the positive proof that
+the false-conflict class is gone, and the **first-cycle reconciliation identity**
+used to validate the replacement cohort at activation (§3 gate): the identity
+must hold and `write_failures` / `conflicting_duplicates` must be 0.
 
 **If receipts cannot be reconciled (the identity fails, or `write_failures` or
 `conflicting_duplicates` is non-zero over the cohort window), the cohort is
@@ -246,6 +334,19 @@ cohort.** The close marker is set by the operator only after the final analysis
 is frozen. A prune-guard test (`test_prune_blocked_until_cohort_closed`,
 `test_prune_respects_cohort_close_marker`, `test_retention_floor_rejects_below_120`)
 enforces both guards.
+
+**120d is an EVIDENCE-retention requirement, not a single-file mandate.** Under
+the two-identity model the per-evaluation row volume makes a single 120-day
+SQLite file infeasible on the current box (see the capacity artifact
+`tasks/capacity_detection_receipts_2026_07.md`). The evidence lifecycle
+(reconciliation → both horizons → cohort closure → final analysis → audit buffer)
+is preserved for ≥120 days across the approved + IMPLEMENTED **lifecycle-tiered
+hot SQLite + time-partitioned compressed cold archive + queryable integrity
+manifest** (`scout/trading/receipt_archive.py`). Ordinary post-index receipts
+leave the hot table only via the fail-closed 7-step archival transaction (which
+holds rows hot until an independent off-host durable copy is confirmed); the hot
+prune guards above still protect index receipts + in-lifecycle rows. The
+two-identity write model is unchanged by the storage tiering.
 
 ---
 
