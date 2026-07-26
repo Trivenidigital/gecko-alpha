@@ -851,15 +851,18 @@ class Settings(BaseSettings):
     DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
 
     # DORMANCY FLAG (reviewer dormant-deployment ruling, 2026-07-26). Master
-    # kill-switch for the decision-receipt subsystem. When False, the detection
-    # lane still runs (sends/gate/dedup/tg_alert_log audit are BYTE-IDENTICAL) but
-    # writes ZERO receipts — every write is skipped BEFORE any persistence attempt,
-    # the disk-pressure guard is bypassed, and the per-cycle
-    # ``detection_receipt_summary`` is suppressed to avoid dormant-mode log spam. A
-    # single structured ``detection_receipts_disabled`` log fires at the first skip
-    # per process. Lets the receipt code deploy DORMANT (present but inert) ahead
-    # of the replacement-cohort activation. Default True (receipts active).
-    DETECTION_RECEIPTS_ENABLED: bool = True
+    # kill-switch for the ENTIRE decision-receipt subsystem. **Default DISABLED**:
+    # enabling requires explicit configuration + a clean process activation. When
+    # False, the detection lane still runs (candidate evaluation, gating, ranking,
+    # and SENDING are BYTE-IDENTICAL) but the receipts subsystem is fully skipped —
+    # NO receipt inserts, NO replay/conflict lookups, NO disk-pressure work, NO
+    # archive work, NO cohort accrual. Every receipt write is skipped BEFORE any
+    # persistence/lookup. A single structured ``detection_receipts_disabled`` log
+    # fires at the first skip per process; the per-cycle summary is still emitted
+    # but clearly flags ``receipts_disabled=true`` + ``coverage_healthy=false`` so a
+    # reader can NEVER mistake dormancy for clean coverage. Lets the receipt code
+    # deploy DORMANT (present but inert) ahead of replacement-cohort activation.
+    DETECTION_RECEIPTS_ENABLED: bool = False
 
     # Retention floor (days) for detection_decision_receipts — the ALR-02
     # decision-receipt audit substrate (behavior-neutral observability that
@@ -940,6 +943,12 @@ class Settings(BaseSettings):
     DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS: float = Field(
         default=6.0, ge=0.0, le=168.0
     )
+    # Hard-critical free-space bound (GB). Below this (a materially worse crossing
+    # than DETECTION_RECEIPT_DISK_MIN_FREE_GB), a page is dispatched IMMEDIATELY,
+    # bypassing the cooldown — an escalation. Must be < the min-free bound (a
+    # deeper breach). The cooldown is notification-rate control ONLY; it never
+    # delays receipt suspension or coverage invalidation, which fire on ANY breach.
+    DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB: float = Field(default=3.0, ge=0.5)
 
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept

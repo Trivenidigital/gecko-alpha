@@ -35,6 +35,7 @@ _REQUIRED = {
 
 def _settings(tmp_path, **overrides) -> Settings:
     base = dict(
+        DETECTION_RECEIPTS_ENABLED=True,  # receipts default off in prod; enable for tests
         DETECTION_RECEIPT_ARCHIVE_ENABLED=True,
         DETECTION_RECEIPT_ARCHIVE_DIR=str(tmp_path / "cold"),
         DETECTION_RECEIPT_OFFHOST_DIR=str(tmp_path / "offhost"),
@@ -331,6 +332,27 @@ async def test_hot_storage_stays_bounded_after_archival(tmp_path):
 
 
 # ---------- migration idempotency ----------
+
+
+@pytest.mark.asyncio
+async def test_archive_disabled_when_receipts_disabled(tmp_path):
+    """Dormancy: archive_once does NO work when the receipts subsystem is off."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    await _ins(db, token_id="A", decided_at=(now - timedelta(days=5)).isoformat())
+    await _ins(db, token_id="A", decided_at=(now - timedelta(days=4)).isoformat())
+    settings = _settings(tmp_path, DETECTION_RECEIPTS_ENABLED=False)
+    res = await ReceiptArchiver(db, settings).archive_once(_cohort(now), now=now)
+    assert res.status == "disabled"
+    # Hot rows untouched; no manifest written.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM detection_decision_receipts")
+    assert (await cur.fetchone())[0] == 2
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM detection_receipt_archive_manifest"
+    )
+    assert (await cur.fetchone())[0] == 0
+    await db.close()
 
 
 @pytest.mark.asyncio

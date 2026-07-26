@@ -55,10 +55,12 @@ log = structlog.get_logger(__name__)
 # process (at the first skip), not every cycle — avoids dormant-mode log spam.
 _receipts_disabled_logged = False
 
-# Disk-pressure operator page cooldown: in-memory timestamp of the last dispatched
-# Telegram alert. Module-level (per process); a restart resets it (documented in
-# Settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS — acceptable for a page).
-_last_disk_alert_at: datetime | None = None
+# Disk-pressure operator-paging state (module-level, per process). A restart
+# resets it — an immediate single page on restart-while-breached is acceptable
+# (a restart is itself a signal; one extra page is harmless) and cannot storm.
+_disk_pressure_active = False  # currently in a breached (suspended) state
+_disk_last_alert_at: datetime | None = None  # last dispatched page time
+_disk_paged_severity: str | None = None  # "warning" | "critical" while active
 
 
 def _log_receipts_disabled_once() -> None:
@@ -69,17 +71,60 @@ def _log_receipts_disabled_once() -> None:
         _receipts_disabled_logged = True
 
 
-def _disk_alert_due(now: datetime, cooldown_hours: float) -> bool:
-    """True (and records ``now``) when a disk-pressure page is due — i.e. no page
-    has fired within ``cooldown_hours``. The per-cycle structured WARNING is NOT
-    gated by this; only the Telegram page is."""
-    global _last_disk_alert_at
-    if _last_disk_alert_at is None or (now - _last_disk_alert_at) >= timedelta(
+def _disk_paging_decision(
+    healthy: bool, severity: str, now: datetime, cooldown_hours: float
+) -> str:
+    """Operator-paging state machine for disk pressure. Returns the action:
+
+    - ``"page_breach"``     — first breach after being healthy (page immediately);
+    - ``"page_escalation"`` — a materially worse crossing (warning→critical) while
+      already breached — bypasses the cooldown, pages immediately;
+    - ``"page_cooled_due"`` — sustained breach and the cooldown has elapsed;
+    - ``"page_recovery"``   — pressure cleared after being breached (distinct page);
+    - ``"suppressed"``      — breached but within the cooldown (page rate-limited);
+    - ``"none"``            — healthy and not previously breached.
+
+    This gates ONLY the Telegram page; it NEVER delays receipt suspension or
+    coverage invalidation (those fire on any breach, upstream of this).
+    """
+    global _disk_pressure_active, _disk_last_alert_at, _disk_paged_severity
+    if healthy:
+        if _disk_pressure_active:
+            _disk_pressure_active = False
+            _disk_paged_severity = None
+            return "page_recovery"
+        return "none"
+    # Breached.
+    if not _disk_pressure_active:
+        _disk_pressure_active = True
+        _disk_paged_severity = severity
+        _disk_last_alert_at = now
+        return "page_breach"
+    if severity == "critical" and _disk_paged_severity != "critical":
+        # Escalation: a deeper breach bypasses the cooldown.
+        _disk_paged_severity = "critical"
+        _disk_last_alert_at = now
+        return "page_escalation"
+    if _disk_last_alert_at is None or (now - _disk_last_alert_at) >= timedelta(
         hours=cooldown_hours
     ):
-        _last_disk_alert_at = now
-        return True
-    return False
+        _disk_last_alert_at = now
+        return "page_cooled_due"
+    return "suppressed"
+
+
+async def _send_disk_page(session, settings, body: str, source: str) -> None:
+    """Dispatch one operator page (parse_mode=None; §12b dispatched/delivered
+    logs bracket the send). Fail-soft — never breaks the lane."""
+    prefix = f"{source}_alert"
+    try:
+        log.info(f"{prefix}_dispatched")
+        await alerter.send_telegram_message(
+            body, session, settings, parse_mode=None, source=source
+        )
+        log.info(f"{prefix}_delivered")
+    except Exception as e:  # never break the lane on an alert failure
+        log.warning(f"{prefix}_failed", err=str(e))
 
 
 # ALR-02 decision-receipt gate version (reviewer LOCK 2). A literal that pins
@@ -612,52 +657,73 @@ async def notify_early_detections(
         "filtered_malformed": 0,
         "skipped_disk_pressure": 0,
         "disk_suspended": False,
+        "disk_pressure_active": False,
+        "paging_cooled": False,
         "receipts_disabled": False,
     }
     # DORMANCY: master kill-switch. When receipts are disabled the lane still runs
-    # (sends/gate/dedup/audit byte-identical) but writes NOTHING — _write_detection
-    # _receipt no-ops before any persistence, the disk guard is bypassed, and the
-    # per-cycle summary is suppressed. A single breadcrumb fires per process.
+    # (candidate evaluation, gating, ranking, and SENDING byte-identical) but the
+    # ENTIRE receipts subsystem is skipped — no inserts/lookups/disk-work/archive/
+    # accrual. _write_detection_receipt no-ops before any persistence. A single
+    # breadcrumb fires per process; the summary below still fires but clearly flags
+    # receipts_disabled so dormancy can't be mistaken for clean coverage.
     receipts_enabled = settings.DETECTION_RECEIPTS_ENABLED
     if not receipts_enabled:
         receipt_counters["receipts_disabled"] = True
         _log_receipts_disabled_once()
     # Disk-pressure fail-closed guard (only when receipts are actually accruing).
-    # If the box is low on space, SUSPEND receipt accrual for this cycle: mark
-    # coverage unhealthy, page the operator (rate-limited), and preserve existing
-    # receipts+manifests. The SEND PATH is never touched, and we NEVER silently
-    # prune/sample/reduce detail.
+    # Suspension + coverage-invalidation fire on ANY breach; the operator PAGE is
+    # rate-limited by a cooldown, with immediate paging on first breach + on a
+    # critical escalation, and a distinct recovery page when pressure clears. The
+    # cooldown is notification-rate control ONLY — never delaying suspension.
     _disk = (
         check_disk_pressure(db._db_path, settings)
         if (receipts_enabled and settings.DETECTION_RECEIPT_DISK_GUARD_ENABLED)
         else None
     )
-    if _disk is not None and not _disk.healthy:
-        receipt_counters["disk_suspended"] = True
-        # The structured WARNING stays per-cycle (journal signal).
-        log.warning(
-            "detection_receipt_disk_pressure",
-            reason=_disk.reason(),
-            free_gb=round(_disk.free_bytes / 1e9, 2),
-            free_pct=round(_disk.free_pct, 1),
+    if _disk is not None:
+        breached = not _disk.healthy
+        severity = (
+            "critical"
+            if _disk.free_bytes < settings.DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB * 1e9
+            else "warning"
         )
-        # The Telegram PAGE is rate-limited to one per cooldown window so a
-        # sustained breach (~500 cycles/day) does not page every cycle.
-        if _disk_alert_due(now, settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS):
-            try:
-                # §12b: plain text (parse_mode=None), bracketed dispatched/delivered.
-                log.info("detection_receipt_disk_pressure_alert_dispatched")
-                await alerter.send_telegram_message(
-                    f"disk pressure: detection receipt accrual SUSPENDED "
-                    f"({_disk.reason()})",
-                    session,
-                    settings,
-                    parse_mode=None,
-                    source="detection_receipt_disk_pressure",
-                )
-                log.info("detection_receipt_disk_pressure_alert_delivered")
-            except Exception as _e:  # never break the lane on an alert failure
-                log.warning("detection_receipt_disk_pressure_alert_failed", err=str(_e))
+        if breached:
+            # SUSPENSION + coverage invalidation — independent of paging.
+            receipt_counters["disk_suspended"] = True
+            receipt_counters["disk_pressure_active"] = True
+            # The structured WARNING stays per-cycle (journal signal, always).
+            log.warning(
+                "detection_receipt_disk_pressure",
+                reason=_disk.reason(),
+                severity=severity,
+                free_gb=round(_disk.free_bytes / 1e9, 2),
+                free_pct=round(_disk.free_pct, 1),
+            )
+        decision = _disk_paging_decision(
+            _disk.healthy,
+            severity,
+            now,
+            settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS,
+        )
+        receipt_counters["paging_cooled"] = decision == "suppressed"
+        if decision in ("page_breach", "page_escalation", "page_cooled_due"):
+            body = (
+                f"disk pressure ({severity}): detection receipt accrual SUSPENDED "
+                f"({_disk.reason()})"
+            )
+            await _send_disk_page(
+                session, settings, body, "detection_receipt_disk_pressure"
+            )
+        elif decision == "page_recovery":
+            await _send_disk_page(
+                session,
+                settings,
+                f"disk pressure CLEARED: detection receipt accrual resumed "
+                f"(free={round(_disk.free_bytes / 1e9, 2)}GB, "
+                f"{round(_disk.free_pct, 1)}%)",
+                "detection_receipt_disk_recovery",
+            )
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -978,26 +1044,32 @@ async def notify_early_detections(
         # exact_replays_n == conflicting_duplicates_n == 0. filtered_*_n are
         # reported BESIDE the identity (excluded from evaluated_n) so pre-boundary
         # rejections stay visible by reason and never inflate the evaluated cohort.
-        # ``coverage_healthy`` is False when disk-pressure suspended accrual
-        # (skipped_disk_pressure_n > 0): the identity intentionally does NOT close
-        # then, flagging the coverage gap so the cohort window is marked invalid.
-        # DORMANCY: when receipts are disabled the summary is SUPPRESSED entirely
-        # (the single detection_receipts_disabled breadcrumb already fired) so a
-        # dormant deployment produces no per-cycle receipt telemetry.
-        if not receipt_counters["receipts_disabled"]:
-            log.info(
-                "detection_receipt_summary",
-                evaluated_n=receipt_counters["evaluated"],
-                newly_written_n=receipt_counters["newly_written"],
-                exact_replays_n=receipt_counters["exact_replays"],
-                write_failures_n=receipt_counters["write_failures"],
-                conflicting_duplicates_n=receipt_counters["conflicts"],
-                skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
-                filtered_missing_id_n=receipt_counters["filtered_missing_id"],
-                filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
-                filtered_malformed_n=receipt_counters["filtered_malformed"],
-                coverage_healthy=not receipt_counters["disk_suspended"],
-            )
+        # ``coverage_healthy`` is False whenever coverage is NOT clean — i.e. when
+        # receipts are dormant (receipts_disabled) OR disk-pressure suspended
+        # accrual. In those states the identity intentionally does NOT close,
+        # flagging the gap so a dashboard/log reader can NEVER mistake dormancy or
+        # a suspended cycle for healthy coverage. The summary is ALWAYS emitted (it
+        # is the per-cycle status record); dormancy is surfaced via
+        # receipts_disabled + coverage_healthy=false, not by hiding the summary.
+        coverage_healthy = not (
+            receipt_counters["receipts_disabled"] or receipt_counters["disk_suspended"]
+        )
+        log.info(
+            "detection_receipt_summary",
+            receipts_disabled=receipt_counters["receipts_disabled"],
+            evaluated_n=receipt_counters["evaluated"],
+            newly_written_n=receipt_counters["newly_written"],
+            exact_replays_n=receipt_counters["exact_replays"],
+            write_failures_n=receipt_counters["write_failures"],
+            conflicting_duplicates_n=receipt_counters["conflicts"],
+            skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
+            disk_pressure_active=receipt_counters["disk_pressure_active"],
+            paging_cooled=receipt_counters["paging_cooled"],
+            filtered_missing_id_n=receipt_counters["filtered_missing_id"],
+            filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
+            filtered_malformed_n=receipt_counters["filtered_malformed"],
+            coverage_healthy=coverage_healthy,
+        )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.
         log.exception("detection_alert_notify_unexpected_error")

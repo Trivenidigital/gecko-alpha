@@ -39,7 +39,11 @@ _REQUIRED = {
 
 
 def _settings(**overrides) -> Settings:
-    return Settings(_env_file=None, **{**_REQUIRED, **overrides})
+    # Receipts default DISABLED in prod (dormant-deployment ruling); these tests
+    # exercise the receipts subsystem, so enable it unless a test overrides.
+    base = {"DETECTION_RECEIPTS_ENABLED": True}
+    base.update(overrides)
+    return Settings(_env_file=None, **{**_REQUIRED, **base})
 
 
 def _cand(
@@ -1517,12 +1521,41 @@ async def test_disk_pressure_suspends_accrual_send_unaffected(tmp_path, monkeypa
 # ---------- dormancy flag: DETECTION_RECEIPTS_ENABLED=False ----------
 
 
+def _reset_disk_state(monkeypatch):
+    monkeypatch.setattr("scout.trading.detection_alert._disk_pressure_active", False)
+    monkeypatch.setattr("scout.trading.detection_alert._disk_last_alert_at", None)
+    monkeypatch.setattr("scout.trading.detection_alert._disk_paged_severity", None)
+
+
+def _dp(healthy, free_gb):
+    from scout.trading.receipt_archive import DiskPressure
+
+    return DiskPressure(
+        healthy=healthy,
+        free_bytes=int(free_gb * 1e9),
+        total_bytes=int(100e9),
+        free_pct=free_gb,
+        min_free_gb=10.0,
+        min_free_pct=15.0,
+    )
+
+
+def _stub_disk(monkeypatch, states):
+    seq = list(states)
+
+    def _fake(path, settings):
+        return seq.pop(0) if seq else states[-1]
+
+    monkeypatch.setattr("scout.trading.detection_alert.check_disk_pressure", _fake)
+
+
 @pytest.mark.asyncio
 async def test_receipts_disabled_writes_nothing_send_unaffected(tmp_path, monkeypatch):
     """Dormant deployment (DETECTION_RECEIPTS_ENABLED=False): across TWO cycles NO
-    receipts are written, the send path + tg_alert_log audit are unaffected, no
-    per-cycle summary is emitted, and the detection_receipts_disabled breadcrumb
-    fires exactly ONCE per process."""
+    receipts are written, the send path + tg_alert_log audit are unaffected, and the
+    per-cycle summary IS emitted but clearly flags receipts_disabled=true +
+    coverage_healthy=false (never mistakable for clean coverage). The
+    detection_receipts_disabled breadcrumb fires exactly ONCE per process."""
     monkeypatch.setattr(
         "scout.trading.detection_alert._receipts_disabled_logged", False
     )
@@ -1556,34 +1589,100 @@ async def test_receipts_disabled_writes_nothing_send_unaffected(tmp_path, monkey
         "SELECT COUNT(*) FROM tg_alert_log WHERE outcome='sent' AND detail='detection_lane'"
     )
     assert (await cur.fetchone())[0] >= 1
-    # Exactly one dormant breadcrumb; NO per-cycle receipt summary.
+    # Exactly one dormant breadcrumb.
     assert sum(1 for e in logs if e["event"] == "detection_receipts_disabled") == 1
-    assert not any(e["event"] == "detection_receipt_summary" for e in logs)
+    # Summary emitted per cycle, clearly flagged dormant (not clean coverage).
+    summaries = [e for e in logs if e["event"] == "detection_receipt_summary"]
+    assert len(summaries) == 2
+    for s in summaries:
+        assert s["receipts_disabled"] is True
+        assert s["coverage_healthy"] is False
+        assert s["evaluated_n"] == 0 and s["newly_written_n"] == 0
     await db.close()
 
 
-# ---------- disk-pressure alert cooldown ----------
+@pytest.mark.asyncio
+async def test_receipts_flag_behavior_equivalence(tmp_path, monkeypatch):
+    """Toggling the flag changes NOTHING about candidate evaluation, gating,
+    ranking, or sending: the sent messages + tg_alert_log rows are IDENTICAL with
+    receipts enabled vs disabled (behavior-equivalence)."""
+
+    async def _run(enabled):
+        monkeypatch.setattr(
+            "scout.trading.detection_alert._receipts_disabled_logged", False
+        )
+        db = Database(tmp_path / f"eq-{enabled}.db")
+        await db.initialize()
+        settings = _settings(
+            DETECTION_ALERT_LANE_ENABLED=True,
+            ALERT_UNIVERSE_FILTER_ENABLED=True,
+            DETECTION_RECEIPTS_ENABLED=enabled,
+        )
+        await _insert_candidate(db, "sendme", first_seen_min_ago=5.0)
+        await _insert_price(db, "sendme")
+        await _insert_candidate(
+            db, "spy-bstocks-tokenized-stock", first_seen_min_ago=6.0
+        )
+        await _insert_price(db, "spy-bstocks-tokenized-stock")
+        await _insert_candidate(db, "lowscore", first_seen_min_ago=7.0)
+        await _insert_price(db, "lowscore")
+        sent = _capture_send(monkeypatch)
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[
+                _cand(
+                    "sendme",
+                    symbol="SEND",
+                    quant_score=8,
+                    signals_fired=["cg_trending_rank"],
+                ),
+                _cand(
+                    "spy-bstocks-tokenized-stock",
+                    symbol="SPY",
+                    quant_score=8,
+                    signals_fired=["cg_trending_rank"],
+                ),
+                _cand("lowscore", symbol="LOW", quant_score=0, signals_fired=[]),
+            ],
+        )
+        cur = await db._conn.execute(
+            "SELECT token_id, outcome, detail, signal_type, paper_trade_id "
+            "FROM tg_alert_log ORDER BY token_id, alerted_at"
+        )
+        rows = [tuple(r) for r in await cur.fetchall()]
+        await db.close()
+        return sent, rows
+
+    sent_on, rows_on = await _run(True)
+    sent_off, rows_off = await _run(False)
+    assert sent_on == sent_off  # identical send-path decisions
+    assert rows_on == rows_off  # identical audit rows
+    assert len(sent_on) == 1 and sent_on[0].startswith("🔎 EARLY DETECT · SEND")
+
+
+# ---------- disk-pressure alert cooldown + escalation + recovery ----------
 
 
 @pytest.mark.asyncio
 async def test_disk_pressure_alert_respects_cooldown(tmp_path, monkeypatch):
-    """Two consecutive breached cycles page the operator only ONCE; a cycle after
-    the cooldown elapses pages a second time. The per-cycle structured WARNING is
-    NOT rate-limited (fires every breached cycle)."""
-    monkeypatch.setattr("scout.trading.detection_alert._last_disk_alert_at", None)
+    """First breach pages IMMEDIATELY; a second breached cycle within the cooldown
+    does NOT page; a cycle after the cooldown pages again. The structured WARNING
+    fires every breached cycle regardless of paging."""
+    _reset_disk_state(monkeypatch)
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(
         DETECTION_ALERT_LANE_ENABLED=True,
         DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
-        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # force disk pressure
+        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # force pressure (warning, not critical)
         DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
     )
     _capture_send(monkeypatch)
     base = datetime.now(timezone.utc)
 
     with capture_logs() as logs:
-        # Cycle 1 (breach) → page. Cycle 2 (+1min, within cooldown) → no page.
         await notify_early_detections(
             db, settings, session=None, candidates=[], now=base
         )
@@ -1595,7 +1694,6 @@ async def test_disk_pressure_alert_respects_cooldown(tmp_path, monkeypatch):
             for e in logs
             if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
         )
-        # Cycle 3 (+7h, cooldown elapsed) → second page.
         await notify_early_detections(
             db, settings, session=None, candidates=[], now=base + timedelta(hours=7)
         )
@@ -1605,7 +1703,79 @@ async def test_disk_pressure_alert_respects_cooldown(tmp_path, monkeypatch):
         if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
     )
     warnings = sum(1 for e in logs if e["event"] == "detection_receipt_disk_pressure")
-    assert dispatched_after_two == 1  # exactly one page across the two breached cycles
+    assert (
+        dispatched_after_two == 1
+    )  # first breach paged, second suppressed by cooldown
     assert dispatched_total == 2  # a second page after the cooldown elapsed
-    assert warnings == 3  # the structured warning is per-cycle, not rate-limited
+    assert warnings == 3  # per-cycle warning, not rate-limited
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_critical_escalation_bypasses_cooldown(
+    tmp_path, monkeypatch
+):
+    """A materially worse crossing (warning → critical) within the cooldown pages
+    IMMEDIATELY, bypassing the cooldown."""
+    _reset_disk_state(monkeypatch)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+        DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB=3.0,
+    )
+    _capture_send(monkeypatch)
+    # cycle 1: warning breach (8 GB free). cycle 2: critical breach (2 GB) within cooldown.
+    _stub_disk(monkeypatch, [_dp(False, 8.0), _dp(False, 2.0)])
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+    dispatched = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    assert dispatched == 2  # first breach + critical escalation (cooldown bypassed)
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_recovery_notification(tmp_path, monkeypatch):
+    """When pressure clears after a breach, a DISTINCT one-shot recovery page fires."""
+    _reset_disk_state(monkeypatch)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+    )
+    _capture_send(monkeypatch)
+    _stub_disk(monkeypatch, [_dp(False, 8.0), _dp(True, 40.0)])
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+    pressure = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    recovery = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_recovery_alert_dispatched"
+    )
+    assert pressure == 1 and recovery == 1
     await db.close()

@@ -229,6 +229,9 @@ class ReceiptArchiver:
         self, cohort: dict, *, now: datetime | None = None
     ) -> ArchiveResult:
         s = self.settings
+        # DORMANCY: when the receipts subsystem is disabled, do NO archive work.
+        if not s.DETECTION_RECEIPTS_ENABLED:
+            return ArchiveResult("disabled", detail="receipts subsystem disabled")
         if (
             not s.DETECTION_RECEIPT_ARCHIVE_ENABLED
             or not s.DETECTION_RECEIPT_ARCHIVE_DIR
