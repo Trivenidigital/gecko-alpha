@@ -47,23 +47,41 @@ a regime turn re-suspends and notifies without operator action.
 
 Decision: leave enabled, no flag flip. Keep watching the auto-suspend gate.
 
-### A3. `time_death` exit — CLASSIFIED as loss-mitigation (KEEP live)
+### A3. `time_death` exit — adjudication STILL PROVISIONAL (KEEP live pending 07-28 rerun)
 
-Live since 2026-07-17; 21 closes, −$462.59 realized to date. The negative
-sum is **not** failure: the reviewer's actual-vs-riding counterfactual has
-now been computed and time_death is **CLASSIFIED 2026-07-22 as a
-loss-mitigation mechanism** (it caps the bleed on flat/decaying positions),
-**not a profitable signal**. Keep `PAPER_TIME_DEATH_DRY_RUN=false` — leave
-it live.
+Live since 2026-07-17. The earlier "classified as loss-mitigation" read was
+premature: the maturity-gated rerun (2026-07-26, as-of 01:22:11 UTC) returns
+**STILL PROVISIONAL** — the classification is **NOT validated and NOT
+rejected**.
 
-Evidence: matched dry-run pairs (n=15, fire-point vs the observed ride on
-the same trades) show cutting saved **+$152.70 with 14/15 worse off riding**;
-live-cohort drift estimate adds **+$59–150** saved; the clipped-runner gate
-holds (0/21 real closes peaked ≥25%, max 9.72%) — it is not clipping winners.
+- **0/9 Group-B counterfactual windows have matured** — earliest maturity
+  2026-07-27 07:44 UTC; full maturity after 2026-07-28 15:27 UTC, at which
+  point the next rerun evaluates all 9 in one pass.
+- **Class-1 measured evidence unchanged at n=5**, now refined to **3 clean**
+  (TLM / HANA / XAN — dense pre-SL observation) + **2 gap-caveated**
+  (BLAST / PALU — zero pre-SL observations; SL inferred from a single
+  post-gap point; lower confidence). All 5 show positive
+  `incremental_benefit`, but n=5 neither validates nor rejects the
+  classification.
 
-Residual / open items (do not block the classification):
-- A shadow `would_fire` logging arm would harden the live-cohort estimate
-  (currently a drift estimate off the matched pairs).
+**MATERIAL RISK FLAG for the 07-28 rerun.** CHECK (trade 2692) is a
+**confirmed post-cut runner** — cut flat at −9.79%, then ran to **+94.3% vs
+entry** (verified, 548 obs ≥ +10%). Its matured counterfactual requires the
+full ladder/trailing cascade (not SL-or-expiry) and may contribute
+`incremental_benefit` ≈ **−$55 to −$105**, potentially moving the class-1
+aggregate toward flat/negative. Related caveat: the earlier "0 clipped
+runners" check measured **peak AT CLOSE** and is structurally blind to
+post-cut runs — the maturity-gated counterfactual **supersedes it**.
+
+Realized time_death total (separate forward set, **not** this counterfactual
+denominator): **48 closes, −$907.29** as of 2026-07-26.
+
+Decision: mechanism **stays LIVE pending the 2026-07-28 adjudication**; keep
+`PAPER_TIME_DEATH_DRY_RUN=false`. Do **not** record a final classification
+until the matured rerun lands.
+
+Residual / open items (unchanged):
+- A shadow `would_fire` logging arm would harden the live-cohort estimate.
 - Deeper open item is **entry quality on flat-profile lanes** — time_death
   caps the bleed, it does not fix the entries that produce it.
 
