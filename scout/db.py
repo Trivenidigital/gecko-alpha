@@ -204,6 +204,12 @@ class Database:
         # takes the next free literal.
         await self._migrate_moved_already_postmortems_v1()
 
+        # ALR-02 decision-receipt audit substrate: one bare-additive table
+        # (#424-style). schema_version 20260726. Forward-only observability that
+        # records one receipt per evaluated detection-lane candidate so the
+        # gate-FAILER comparison cohort is recoverable (behavior-neutral).
+        await self._migrate_detection_decision_receipts_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -1200,6 +1206,287 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount > 0
+
+    async def _migrate_detection_decision_receipts_v1(self) -> None:
+        """ALR-02 decision-receipt audit substrate, schema_version 20260726.
+
+        One bare-additive table (#424-style). Forward-only observability: the
+        ALR-02 detection lane (scout/trading/detection_alert.py) records a
+        decision-time receipt for EVERY candidate it evaluates — gate passes,
+        gate failures, and every other terminal decision (too_old /
+        universe_filter / not_early / dedup_24h / rate_limit / dispatch_failed
+        / sent). Purpose: recover the gate-FAILER comparison cohort the lane
+        previously dropped SILENTLY (unlogged ``continue``), so gate-enrichment
+        can be estimated. Observe-only: nothing here feeds the
+        scorer/gate/trader/sender — the lane's send/gate/product behavior is
+        unchanged (behavior-neutral).
+
+        ``idempotency_key`` is UNIQUE so the writer's ``INSERT OR IGNORE``
+        collapses re-evaluations of the same
+        (token_id, outcome, source_observation_ts, gate_version) state to a
+        single row — repeated polling never inflates the analytical unit
+        (LOCK 3). An ignored insert whose stored payload differs from the attempt
+        is a CONFLICTING DUPLICATE, surfaced (never hidden) by
+        insert_detection_decision_receipt + the caller's
+        ``detection_receipt_conflict`` warning (reviewer correction 3). The
+        pre-registered primary INDEX decision is the token's FIRST RECORDED
+        EVALUATION after cohort start, any outcome (MIN(decided_at) per token_id
+        at analysis time); the arm is the outcome AT that index row. See
+        tasks/prereg_detection_gate_enrichment_cohort.md for the full
+        pre-registration.
+
+        Each receipt persists the RAW decision inputs (reviewer correction 2),
+        not merely fired signals: ``score_before``/``score_after`` (the derived
+        score before/after ``int(x or 0)`` clipping), the ``comparator`` and
+        ``threshold_value`` actually applied, ``gate_version`` + ``code_version``
+        (deployed code identity) to resolve the precise decision logic, and a
+        ``raw_inputs`` JSON blob carrying the raw component values +
+        missingness/default indicators. ``signals_fired`` is retained as a
+        convenience only — it cannot substitute for the underlying values.
+
+        §12a freshness expectation: the writer runs ONLY while
+        DETECTION_ALERT_LANE_ENABLED is true. Expected write rate then ~ the
+        CG-fresh candidate pool evaluated per cycle (tens–low-hundreds of
+        receipts/day). Coverage is reconciled PER-CYCLE in-log via the
+        ``detection_receipt_summary`` event
+        (evaluated_n == receipts_written_n + write_failures_n); a standalone
+        cron watchdog is intentionally NOT added for this table — the lane
+        itself is already watchdogged and the per-cycle summary makes coverage
+        gaps detectable without one. Pruned hourly
+        (DETECTION_DECISION_RECEIPTS_RETENTION_DAYS, floor 45d).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version    INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS detection_decision_receipts (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_id              TEXT NOT NULL,
+                    decided_at            TEXT NOT NULL,
+                    outcome               TEXT NOT NULL,
+                    reason                TEXT,
+                    source_observation_ts TEXT,
+                    gate_version          TEXT NOT NULL,
+                    code_version          TEXT,
+                    score_before          INTEGER,
+                    score_after           INTEGER NOT NULL,
+                    comparator            TEXT NOT NULL,
+                    threshold_value       INTEGER NOT NULL,
+                    signals_fired         TEXT,
+                    raw_inputs            TEXT,
+                    idempotency_key       TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ddr_idempotency "
+                "ON detection_decision_receipts(idempotency_key)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ddr_token_decided "
+                "ON detection_decision_receipts(token_id, decided_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260726, now_iso, "detection_decision_receipts_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed",
+                migration="detection_decision_receipts_v1",
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="detection_decision_receipts_v1",
+                )
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED", migration="detection_decision_receipts_v1"
+            )
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260726,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "detection_decision_receipts_v1 schema_version row missing "
+                "after migration"
+            )
+
+    # Decision-content columns that define a receipt's PAYLOAD (everything
+    # except id + decided_at). Two receipts with the same idempotency_key but a
+    # different payload are a CONFLICTING DUPLICATE — a correctness defect the
+    # writer must surface, never silently ignore (reviewer correction 3). Ordered
+    # to match the SELECT in insert_detection_decision_receipt.
+    _RECEIPT_PAYLOAD_COLUMNS = (
+        "token_id",
+        "outcome",
+        "reason",
+        "source_observation_ts",
+        "gate_version",
+        "code_version",
+        "score_before",
+        "score_after",
+        "comparator",
+        "threshold_value",
+        "signals_fired",
+        "raw_inputs",
+    )
+
+    async def insert_detection_decision_receipt(
+        self,
+        *,
+        token_id: str,
+        decided_at: str,
+        outcome: str,
+        reason: str | None,
+        source_observation_ts: str | None,
+        gate_version: str,
+        code_version: str | None,
+        score_before: int | None,
+        score_after: int,
+        comparator: str,
+        threshold_value: int,
+        signals_fired: str | None,
+        raw_inputs: str | None,
+        idempotency_key: str,
+    ) -> str:
+        """Insert one ALR-02 decision receipt; dedup per ``idempotency_key`` via
+        ``INSERT OR IGNORE`` + the UNIQUE index (LOCK 3), classifying the result
+        so an ignored insert can never hide a conflict (reviewer correction 3).
+
+        Returns one of:
+          - ``"inserted"``          — a NEW row was written.
+          - ``"idempotent_replay"`` — the key already existed AND the existing
+            row's payload matches this attempt exactly (a benign re-evaluation
+            of the same state across polling cycles). ``decided_at`` intentionally
+            is NOT part of the payload — the FIRST write's timestamp is preserved.
+          - ``"conflict"``          — the key already existed but the existing
+            row's payload MATERIALLY DIFFERS from this attempt (e.g. the gate's
+            threshold/comparator/score changed without ``gate_version`` being
+            bumped). A correctness defect; the caller emits a
+            ``detection_receipt_conflict`` warning and counts it.
+
+        RAISES on a real DB error — the caller
+        (detection_alert.notify_early_detections) wraps this fail-soft so a
+        receipt-write failure can never change sending behavior (LOCK 4).
+        ``signals_fired`` and ``raw_inputs`` are JSON-encoded strings (or None).
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        # Values in the exact order of _RECEIPT_PAYLOAD_COLUMNS.
+        payload = (
+            token_id,
+            outcome,
+            reason,
+            source_observation_ts,
+            gate_version,
+            code_version,
+            score_before,
+            score_after,
+            comparator,
+            threshold_value,
+            signals_fired,
+            raw_inputs,
+        )
+        async with self._txn_lock:
+            cur = await self._conn.execute(
+                "INSERT OR IGNORE INTO detection_decision_receipts "
+                "(token_id, decided_at, outcome, reason, source_observation_ts, "
+                " gate_version, code_version, score_before, score_after, "
+                " comparator, threshold_value, signals_fired, raw_inputs, "
+                " idempotency_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token_id,
+                    decided_at,
+                    outcome,
+                    reason,
+                    source_observation_ts,
+                    gate_version,
+                    code_version,
+                    score_before,
+                    score_after,
+                    comparator,
+                    threshold_value,
+                    signals_fired,
+                    raw_inputs,
+                    idempotency_key,
+                ),
+            )
+            if cur.rowcount and cur.rowcount > 0:
+                await self._conn.commit()
+                return "inserted"
+            # Ignored: the key already exists. Classify replay vs conflict by
+            # comparing the persisted payload to this attempt.
+            select_cols = ", ".join(self._RECEIPT_PAYLOAD_COLUMNS)
+            cur2 = await self._conn.execute(
+                f"SELECT {select_cols} FROM detection_decision_receipts "
+                "WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            existing = await cur2.fetchone()
+            await self._conn.commit()
+        if existing is None:
+            # Concurrent delete between the ignored insert and the read; treat as
+            # a benign replay (nothing to conflict with).
+            return "idempotent_replay"
+        return "idempotent_replay" if tuple(existing) == payload else "conflict"
+
+    async def prune_detection_decision_receipts(
+        self, *, keep_days: int, cohort_closed_at: str | None
+    ) -> int:
+        """Delete ``detection_decision_receipts`` rows older than ``keep_days``,
+        GUARDED by cohort completeness (reviewer correction e).
+
+        A row is pruned ONLY when ALL hold:
+          - a cohort-close marker (``cohort_closed_at``) is set — an empty/None
+            marker means no cohort has been closed, so NOTHING is pruned (an
+            in-flight cohort's receipts must survive manifest freeze + final
+            analysis; pruning mid-lifecycle INVALIDATES the cohort); AND
+          - the row is older than the retention floor (``keep_days``); AND
+          - the row predates the cohort-close marker (rows newer than the marker
+            belong to a still-open cohort and are never pruned).
+
+        ``decided_at`` and ``cohort_closed_at`` are ISO-8601 UTC, so the string
+        comparisons order-correctly. Both cutoffs are applied as independent SQL
+        predicates (not a lexical ``min``) so mixed precisions still compare
+        safely. Returns rowcount.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        if not cohort_closed_at:
+            # No cohort closed → the guard blocks all pruning.
+            return 0
+        retention_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=keep_days)
+        ).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM detection_decision_receipts "
+            "WHERE decided_at <= ? AND decided_at <= ?",
+            (retention_cutoff, cohort_closed_at),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
 
     # ------------------------------------------------------------------
     # BL-076: shared metadata resolver

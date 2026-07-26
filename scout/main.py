@@ -1673,6 +1673,26 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("volume_history_cg_prune_failed")
 
+    # ALR-02 decision-receipt audit substrate. Grows per-candidate-per-day only
+    # while DETECTION_ALERT_LANE_ENABLED is on. Cohort-completeness GUARDED:
+    # prune_detection_decision_receipts prunes nothing until
+    # DETECTION_RECEIPTS_COHORT_CLOSED_AT is set (an in-flight cohort's receipts
+    # must survive both outcome horizons + reconciliation + manifest freeze +
+    # final analysis). Retention floor is >= 120d.
+    try:
+        pruned_ddr = await db.prune_detection_decision_receipts(
+            keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
+            cohort_closed_at=settings.DETECTION_RECEIPTS_COHORT_CLOSED_AT or None,
+        )
+        if pruned_ddr:
+            logger.info(
+                "detection_decision_receipts_pruned",
+                rows_deleted=pruned_ddr,
+                keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("detection_decision_receipts_prune_failed")
+
     # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
     # tables parameterized + decoupled from narrative daily loop.
     # NOTE: cycle 1's score_history + volume_snapshots prunes above are
