@@ -723,12 +723,26 @@ def _receipt_kwargs(**overrides) -> dict:
 def test_idempotency_key_recipe_matches_sha256():
     import hashlib
 
-    key = _receipt_idempotency_key("tok", "sent", "2026-07-20T11:00:00+00:00", "466.1")
-    raw = "tok|sent|2026-07-20T11:00:00+00:00|466.1"
+    # Two-identity model: the key incorporates the evaluation instance (decided_at).
+    key = _receipt_idempotency_key(
+        "tok", "sent", "2026-07-20T11:00:00+00:00", "466.1", "2026-07-20T12:00:00+00:00"
+    )
+    raw = "tok|sent|2026-07-20T11:00:00+00:00|466.1|2026-07-20T12:00:00+00:00"
     assert key == hashlib.sha256(raw.encode("utf-8")).hexdigest()
     # A None source-observation renders as the empty string.
-    key2 = _receipt_idempotency_key("tok", "too_old", None, "466.1")
-    assert key2 == hashlib.sha256("tok|too_old||466.1".encode("utf-8")).hexdigest()
+    key2 = _receipt_idempotency_key(
+        "tok", "too_old", None, "466.1", "2026-07-20T12:00:00+00:00"
+    )
+    assert (
+        key2
+        == hashlib.sha256(
+            "tok|too_old||466.1|2026-07-20T12:00:00+00:00".encode("utf-8")
+        ).hexdigest()
+    )
+    # Different evaluation instances (cycles) → DIFFERENT keys for the same token.
+    key_c1 = _receipt_idempotency_key("tok", "too_old", "obs", "466.1", "cycle-1")
+    key_c2 = _receipt_idempotency_key("tok", "too_old", "obs", "466.1", "cycle-2")
+    assert key_c1 != key_c2
 
 
 # ---------- correction 1: both arms share the index_decision_at anchor ----------
@@ -810,12 +824,14 @@ async def test_receipt_fields_persisted_gate_fail(tmp_path, monkeypatch):
     assert raw["score_before"] == 4 and raw["score_after"] == 4
     assert raw["comparator"] == ">=" and raw["threshold"] == 5
     assert raw["gate_expr"] == "score_after >= 5"
-    # Idempotency key reproduces from the documented recipe.
+    # Idempotency key reproduces from the documented recipe (incl. the
+    # evaluation instance = decided_at).
     assert r["idempotency_key"] == _receipt_idempotency_key(
         "failer",
         "gate_fail_quality",
         r["source_observation_ts"],
         DETECTION_GATE_VERSION,
+        r["decided_at"],
     )
     await db.close()
 
@@ -883,60 +899,43 @@ async def test_receipt_score_before_after_clip_on_unscored(tmp_path, monkeypatch
     await db.close()
 
 
-# ---------- correction 3: idempotent replay vs conflicting duplicate ----------
+# ---------- two-identity: intra-cycle replay vs conflict (same instance) -------
 
 
 @pytest.mark.asyncio
-async def test_receipt_idempotent_replay_counted_as_replay(tmp_path):
-    """Same key + same DECISION-INVARIANT signature but DIFFERENT time-varying
-    fields (decided_at, reason/age, raw_inputs, raw score below the same bar) →
-    idempotent_replay, one row, first write preserved. This is the production
-    re-poll case: only observation fields changed, the decision did not."""
+async def test_receipt_intra_cycle_exact_retry_is_replay(tmp_path):
+    """Same evaluation-instance key + IDENTICAL payload (an intra-cycle
+    crash/retry or duplicated input) → idempotent_replay, one row, first write
+    preserved. ``decided_at`` is in the key so a same-key hit is the same
+    evaluation instance."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(
-            idempotency_key="k1",
-            outcome="gate_fail_quality",
-            score_after=4,
-            threshold_value=5,
-            reason="age_min=5",
-            raw_inputs='{"age_min": 5, "score_after": 4}',
-        )
+        **_receipt_kwargs(idempotency_key="k1")
     )
     assert r1 == "inserted"
+    # Byte-identical retry of the same evaluation instance → replay.
     r2 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(
-            idempotency_key="k1",
-            outcome="gate_fail_quality",
-            decided_at="2026-07-20T13:00:00+00:00",
-            score_after=3,  # drifted, but still below the bar → same pass/fail side
-            threshold_value=5,
-            reason="age_min=35",  # time-varying
-            raw_inputs='{"age_min": 35, "score_after": 3}',  # time-varying
-        )
+        **_receipt_kwargs(idempotency_key="k1")
     )
     assert r2 == "idempotent_replay"
     rows = await _fetch_receipts(db, "tok")
     assert len(rows) == 1
-    assert rows[0]["decided_at"] == "2026-07-20T12:00:00+00:00"  # first write kept
-    assert rows[0]["score_after"] == 4  # original row untouched
     await db.close()
 
 
 @pytest.mark.asyncio
-async def test_receipt_conflicting_duplicate_detected(tmp_path):
-    """Same key + CONTRADICTORY decision-invariant signature (pass/fail SIDE
-    flips: score crosses the bar) → conflict; original preserved."""
+async def test_receipt_same_instance_payload_mismatch_is_conflict(tmp_path):
+    """Same evaluation-instance key + DIFFERENT payload (the same evaluation
+    produced two payloads — a genuine defect) → conflict; original preserved."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k2", score_after=0, threshold_value=1)
+        **_receipt_kwargs(idempotency_key="k2", score_after=0)
     )
     assert r1 == "inserted"
-    # score_after 0 (fail side) vs 99 (pass side) at threshold 1 → SIDE flips.
     r2 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k2", score_after=99, threshold_value=1)
+        **_receipt_kwargs(idempotency_key="k2", score_after=99)
     )
     assert r2 == "conflict"
     rows = await _fetch_receipts(db, "tok")
@@ -947,7 +946,7 @@ async def test_receipt_conflicting_duplicate_detected(tmp_path):
 @pytest.mark.asyncio
 async def test_receipt_outcome_contradiction_is_conflict(tmp_path):
     """Same key + a contradictory machine OUTCOME (simulated corruption) →
-    conflict, even though all time-varying fields would otherwise be ignored."""
+    conflict."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
@@ -961,14 +960,16 @@ async def test_receipt_outcome_contradiction_is_conflict(tmp_path):
     await db.close()
 
 
+# ---------- two-identity: a clean cycle following a prior cycle ---------------
+
+
 @pytest.mark.asyncio
-async def test_repoll_changed_observation_same_decision_is_replay(
-    tmp_path, monkeypatch
-):
-    """Production reproduction (srilu 2026-07-26): the SAME candidate re-evaluated
-    a later cycle with a changed decision AGE (and thus changed reason/raw_inputs)
-    but an UNCHANGED decision classifies as an exact replay — NOT a conflict — so
-    routine re-polls do not inflate conflicting_duplicates."""
+async def test_clean_cycle_after_prior_cycle_all_newly_written(tmp_path, monkeypatch):
+    """EVALUATION IDENTITY (reviewer, 2026-07-26): the SAME candidate re-evaluated
+    the NEXT cycle is a NEW receipt row, NOT a replay and NOT a conflict. A clean
+    cycle following a prior cycle shows newly_written_n == evaluated_n (minus
+    filtered) with exact_replays_n == conflicting_duplicates_n == 0. This is the
+    positive proof that the 715-conflicts/cycle false-conflict class is gone."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(
@@ -979,9 +980,9 @@ async def test_repoll_changed_observation_same_decision_is_replay(
     _block_send(monkeypatch)
     cand = _cand("failer", quant_score=4, signals_fired=["market_cap_range"])
     now1 = datetime.now(timezone.utc)
-    now2 = now1 + timedelta(minutes=30)  # age (a time-varying field) changes
+    now2 = now1 + timedelta(minutes=3)  # next cycle, distinct evaluation instance
 
-    with capture_logs():
+    with capture_logs() as logs1:
         await notify_early_detections(
             db, settings, session=None, candidates=[cand], now=now1
         )
@@ -989,17 +990,49 @@ async def test_repoll_changed_observation_same_decision_is_replay(
         await notify_early_detections(
             db, settings, session=None, candidates=[cand], now=now2
         )
-    # Single row (idempotent), and cycle 2 classified it as a replay, not conflict.
+    # Two DISTINCT rows — one per cycle (evaluation identity).
     rows = await _fetch_receipts(db, "failer")
-    assert len(rows) == 1 and rows[0]["outcome"] == "gate_fail_quality"
+    assert len(rows) == 2
+    assert {r["decided_at"] for r in rows} == {now1.isoformat(), now2.isoformat()}
+
+    summ1 = [e for e in logs1 if e["event"] == "detection_receipt_summary"][-1]
     summ2 = [e for e in logs2 if e["event"] == "detection_receipt_summary"][-1]
-    assert summ2["evaluated_n"] == 1
-    assert summ2["exact_replays_n"] == 1
-    assert summ2["conflicting_duplicates_n"] == 0
-    assert summ2["receipts_written_n"] == 0
-    # The stored receipt kept the FIRST cycle's age-based reason.
-    raw = json.loads(rows[0]["raw_inputs"])
-    assert raw["age_min"] is not None
+    for summ in (summ1, summ2):
+        assert summ["evaluated_n"] == 1
+        assert summ["newly_written_n"] == 1  # each cycle writes a NEW row
+        assert summ["exact_replays_n"] == 0
+        assert summ["conflicting_duplicates_n"] == 0
+        assert summ["write_failures_n"] == 0
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_same_cycle_duplicate_input_is_replay(tmp_path, monkeypatch):
+    """Within ONE cycle (one evaluation instance), a duplicated input candidate
+    collapses to a single row and counts as an exact replay — not a new row."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MIN_QUANT_SCORE=5
+    )
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _block_send(monkeypatch)
+    cand = _cand("failer", quant_score=4, signals_fired=["market_cap_range"])
+    now = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        # Same candidate appears twice in the SAME cycle → same evaluation instance.
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand, cand], now=now
+        )
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 1  # collapsed to a single row
+    summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+    assert summ["evaluated_n"] == 2
+    assert summ["newly_written_n"] == 1
+    assert summ["exact_replays_n"] == 1
+    assert summ["conflicting_duplicates_n"] == 0
     await db.close()
 
 
@@ -1015,7 +1048,7 @@ async def test_receipt_conflict_counted_and_warned():
     settings = _settings()
     counters = {
         "evaluated": 0,
-        "receipts_written": 0,
+        "newly_written": 0,
         "exact_replays": 0,
         "write_failures": 0,
         "conflicts": 0,
@@ -1035,7 +1068,7 @@ async def test_receipt_conflict_counted_and_warned():
     # A conflict is evaluated + counted as a conflict, but is NOT a new insert.
     assert counters["evaluated"] == 1
     assert counters["conflicts"] == 1
-    assert counters["receipts_written"] == 0
+    assert counters["newly_written"] == 0
     assert counters["exact_replays"] == 0
     assert counters["write_failures"] == 0
     assert any(e["event"] == "detection_receipt_conflict" for e in logs)
@@ -1069,12 +1102,12 @@ async def test_receipt_summary_counts_write_failures(tmp_path, monkeypatch):
     summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
     assert summ["evaluated_n"] == 1
     assert summ["write_failures_n"] == 1
-    assert summ["receipts_written_n"] == 0
+    assert summ["newly_written_n"] == 0
     assert summ["exact_replays_n"] == 0
     assert summ["conflicting_duplicates_n"] == 0
     # Reconciliation identity holds.
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1087,7 +1120,7 @@ async def test_receipt_summary_counts_write_failures(tmp_path, monkeypatch):
 async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
     """conflicting_duplicates_n surfaces in the per-cycle summary so a conflict
     can never pass as healthy coverage (reviewer correction 3). A conflict is
-    NOT a new insert, so receipts_written_n stays 0."""
+    NOT a new insert, so newly_written_n stays 0."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
@@ -1109,11 +1142,11 @@ async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
     summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
     assert summ["evaluated_n"] == 1
     assert summ["conflicting_duplicates_n"] == 1
-    assert summ["receipts_written_n"] == 0
+    assert summ["newly_written_n"] == 0
     assert summ["exact_replays_n"] == 0
     assert summ["write_failures_n"] == 0
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1215,7 +1248,7 @@ async def test_filtered_inputs_never_reach_gate_and_counted_by_reason(
     # Filtered inputs never inflate the evaluated cohort; identity holds at 0.
     assert summ["evaluated_n"] == 0
     assert summ["evaluated_n"] == (
-        summ["receipts_written_n"]
+        summ["newly_written_n"]
         + summ["exact_replays_n"]
         + summ["write_failures_n"]
         + summ["conflicting_duplicates_n"]
@@ -1223,13 +1256,15 @@ async def test_filtered_inputs_never_reach_gate_and_counted_by_reason(
     await db.close()
 
 
-# ---------- LOCK 3 (lane-level idempotency): repeated cycles → one row ----------
+# ---------- two-identity: distinct cycles → distinct rows ---------------------
 
 
 @pytest.mark.asyncio
-async def test_repeated_cycles_single_receipt_row(tmp_path, monkeypatch):
-    """Re-evaluating the same token in the same state across cycles collapses to
-    a SINGLE receipt row (no analytical-unit inflation)."""
+async def test_distinct_cycles_produce_distinct_rows(tmp_path, monkeypatch):
+    """EVALUATION IDENTITY: re-evaluating the same token across 3 DISTINCT cycles
+    (distinct evaluation instances) produces 3 DISTINCT rows — later polls are
+    new receipts, never collapsed. The analytical unit (first evaluation) is
+    recovered at query time as MIN(decided_at) per token."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(
@@ -1239,10 +1274,24 @@ async def test_repeated_cycles_single_receipt_row(tmp_path, monkeypatch):
     await _insert_price(db, "failer")
     _block_send(monkeypatch)
     cands = [_cand("failer", quant_score=4, signals_fired=["market_cap_range"])]
+    base = datetime.now(timezone.utc)
 
-    for _ in range(3):
-        await notify_early_detections(db, settings, session=None, candidates=cands)
-    assert len(await _fetch_receipts(db, "failer")) == 1
+    for k in range(3):
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=cands,
+            now=base + timedelta(minutes=3 * k),
+        )
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 3
+    assert len({r["decided_at"] for r in rows}) == 3
+    # The analytical index unit = the first evaluation (MIN decided_at).
+    cur = await db._conn.execute(
+        "SELECT MIN(decided_at) FROM detection_decision_receipts WHERE token_id='failer'"
+    )
+    assert (await cur.fetchone())[0] == base.isoformat()
     await db.close()
 
 

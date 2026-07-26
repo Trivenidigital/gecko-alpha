@@ -134,25 +134,38 @@ def _receipt_idempotency_key(
     outcome: str,
     source_observation_ts: str | None,
     gate_version: str,
+    evaluation_instance: str,
 ) -> str:
-    """Deterministic idempotency key for a decision receipt (reviewer LOCK 3).
+    """Deterministic idempotency key for a decision receipt.
 
-    Recipe (documented identically in
-    tasks/prereg_detection_gate_enrichment_cohort.md):
+    TWO-IDENTITY MODEL (reviewer, 2026-07-26). The key is the **EVALUATION
+    IDENTITY**: it incorporates the evaluation instance (the cycle
+    ``decided_at``), so each later poll of a candidate is a NEW receipt. Recipe
+    (documented identically in tasks/prereg_detection_gate_enrichment_cohort.md):
 
-        sha256_hex( "{token_id}|{outcome}|{source_observation_ts}|{gate_version}" )
+        sha256_hex(
+          "{token_id}|{outcome}|{source_observation_ts}|{gate_version}|{evaluation_instance}"
+        )
 
     where a None ``source_observation_ts`` is rendered as the empty string and
-    the field separator is a literal ``|``. Because ``decided_at`` is NOT in the
-    key, re-evaluating the SAME token in the SAME state across successive polling
-    cycles yields the SAME key — the writer's ``INSERT OR IGNORE`` + the UNIQUE
-    index then collapse those re-evaluations to a single analytical row. A
-    genuine state change (outcome flips, or the token is re-observed with a new
-    first_seen, or the gate version is bumped) produces a DIFFERENT key and a new
-    row; the pre-registered primary analytical unit is the token's FIRST decision
-    after cohort start (MIN(decided_at) per token_id).
+    the field separator is a literal ``|``. Because the cycle ``decided_at`` is
+    IN the key, cycle-N and cycle-N+1 evaluations of the same token yield
+    DIFFERENT keys and DISTINCT rows — routine re-polls are never collapsed and
+    never mis-classified as conflicts (the earlier full-payload comparison over
+    an evaluation-instance-independent key mis-counted 715 unchanged re-polls/
+    cycle as conflicts on 2026-07-26; see the prereg §7 + capacity artifact).
+
+    ``INSERT OR IGNORE`` + the UNIQUE index now only collapse an exact repeat of
+    the SAME evaluation instance (an intra-cycle crash/retry or a duplicated
+    input) → ``exact_idempotent_replay``; a same-instance payload mismatch is a
+    genuine ``conflicting_duplicate``. The separate ANALYTICAL INDEX IDENTITY —
+    the token's FIRST valid evaluation after cohort start, which fixes its arm +
+    endpoint anchor — is a query-time definition (prereg §4), not this key.
     """
-    raw = f"{token_id}|{outcome}|{source_observation_ts or ''}|{gate_version}"
+    raw = (
+        f"{token_id}|{outcome}|{source_observation_ts or ''}"
+        f"|{gate_version}|{evaluation_instance}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -175,9 +188,9 @@ async def _write_detection_receipt(
     once. It NEVER raises: a write failure is caught, logged as a structured
     ``detection_receipt_write_failed`` event, and counted, after which the lane
     proceeds exactly as before — a receipt-write failure can never change
-    sending behavior. ``counters`` accumulates the per-cycle reconciliation
-    triple (evaluated / written / failures) plus the conflict tally surfaced in
-    ``detection_receipt_summary``.
+    sending behavior. ``counters`` accumulates the per-cycle reconciliation set
+    (evaluated / newly_written / exact_replays / write_failures / conflicts)
+    surfaced in ``detection_receipt_summary``.
 
     Persists the RAW decision inputs (reviewer correction 2), not merely fired
     signals: the derived score BEFORE (raw model value) and AFTER the gate's
@@ -196,7 +209,8 @@ async def _write_detection_receipt(
 
     # raw_inputs — the raw values the decision consumed + missingness/default
     # indicators. sort_keys=True → a deterministic serialization so the
-    # conflict-classifier can compare payloads byte-for-byte across cycles.
+    # conflict-classifier can compare payloads byte-for-byte for a repeat of the
+    # SAME evaluation instance (an intra-cycle retry).
     raw_inputs: dict = {
         "quant_score_raw": quant_raw,
         "quant_score_missing": quant_raw is None,
@@ -212,8 +226,14 @@ async def _write_detection_receipt(
         raw_inputs.update(extra_inputs)
     raw_inputs_json = json.dumps(raw_inputs, sort_keys=True)
 
+    # Evaluation-identity key: decided_at (the cycle instant) is the evaluation
+    # instance, so each cycle's evaluation of a token is a DISTINCT row.
     idempotency_key = _receipt_idempotency_key(
-        token_id, outcome, source_observation_ts, DETECTION_GATE_VERSION
+        token_id,
+        outcome,
+        source_observation_ts,
+        DETECTION_GATE_VERSION,
+        decided_at,
     )
     try:
         result = await db.insert_detection_decision_receipt(
@@ -233,17 +253,17 @@ async def _write_detection_receipt(
             idempotency_key=idempotency_key,
         )
         # Bucket by result so the per-cycle reconciliation identity holds exactly
-        # (reviewer amendment 2):
-        #   evaluated == receipts_written + exact_replays + write_failures
+        # (reviewer naming, 2026-07-26):
+        #   evaluated == newly_written + exact_replays + write_failures
         #              + conflicting_duplicates
         if result == "inserted":
-            counters["receipts_written"] += 1
+            counters["newly_written"] += 1
         elif result == "idempotent_replay":
             counters["exact_replays"] += 1
         elif result == "conflict":
-            # Same idempotency key, materially different payload — a correctness
-            # defect (e.g. the gate changed without a gate_version bump). Surface
-            # it; it must never pass as healthy coverage (reviewer correction 3).
+            # Same evaluation-instance key, different payload — a correctness
+            # defect (the same evaluation produced two payloads). Surface it; it
+            # must never pass as healthy coverage (reviewer correction 3).
             counters["conflicts"] += 1
             log.warning(
                 "detection_receipt_conflict",
@@ -522,17 +542,20 @@ async def notify_early_detections(
 
     now = now or datetime.now(timezone.utc)
     decided_at = now.isoformat()
-    # Reviewer LOCK 4 + corrections 3 & 2: per-cycle reconciliation counters.
-    # Every terminal decision (past the evaluation boundary) writes exactly one
-    # receipt via _write_detection_receipt, bucketed so the identity
-    #   evaluated == receipts_written + exact_replays + write_failures + conflicts
-    # holds exactly; `conflicts` (same key, materially different payload) can
-    # never pass as healthy coverage. filtered_* count PRE-boundary rejected
-    # inputs SEPARATELY BY REASON — they never inflate `evaluated` and never
-    # disappear silently. All are surfaced each cycle in detection_receipt_summary.
+    # Reviewer LOCK 4 + corrections 2 & 3 + two-identity naming: per-cycle
+    # reconciliation counters. Every terminal decision (past the evaluation
+    # boundary) writes exactly one receipt via _write_detection_receipt, bucketed
+    # so the identity
+    #   evaluated == newly_written + exact_replays + write_failures + conflicts
+    # holds exactly. Under evaluation-identity every fresh cycle re-writes each
+    # token as a NEW row, so `newly_written` ≈ evaluated and `exact_replays` /
+    # `conflicts` are ~0 on healthy cycles (a same-instance payload mismatch is a
+    # true defect). filtered_* count PRE-boundary rejected inputs SEPARATELY BY
+    # REASON — they never inflate `evaluated` and never disappear silently. All
+    # are surfaced each cycle in detection_receipt_summary.
     receipt_counters = {
         "evaluated": 0,
-        "receipts_written": 0,
+        "newly_written": 0,
         "exact_replays": 0,
         "write_failures": 0,
         "conflicts": 0,
@@ -849,19 +872,21 @@ async def notify_early_detections(
             sent=sent_count,
             cap=settings.DETECTION_ALERT_MAX_PER_DAY,
         )
-        # Reviewer LOCK 4 + corrections 2 & 3: per-cycle receipt reconciliation.
-        # Identity (must hold every cycle):
-        #   evaluated_n == receipts_written_n + exact_replays_n
+        # Reviewer LOCK 4 + corrections 2 & 3 + two-identity naming: per-cycle
+        # receipt reconciliation. Identity (must hold every cycle):
+        #   evaluated_n == newly_written_n + exact_replays_n
         #              + write_failures_n + conflicting_duplicates_n
         # If it does not hold, or receipts otherwise cannot be reconciled, the
         # cohort is INVALID (documented in the prereg). conflicting_duplicates_n
-        # must be 0 for healthy coverage. filtered_*_n are reported BESIDE the
-        # identity (excluded from evaluated_n) so pre-boundary rejections stay
-        # visible by reason and never inflate the evaluated cohort.
+        # must be 0 for healthy coverage; under evaluation-identity a clean cycle
+        # following a prior cycle shows newly_written_n == evaluated_n with
+        # exact_replays_n == conflicting_duplicates_n == 0. filtered_*_n are
+        # reported BESIDE the identity (excluded from evaluated_n) so pre-boundary
+        # rejections stay visible by reason and never inflate the evaluated cohort.
         log.info(
             "detection_receipt_summary",
             evaluated_n=receipt_counters["evaluated"],
-            receipts_written_n=receipt_counters["receipts_written"],
+            newly_written_n=receipt_counters["newly_written"],
             exact_replays_n=receipt_counters["exact_replays"],
             write_failures_n=receipt_counters["write_failures"],
             conflicting_duplicates_n=receipt_counters["conflicts"],
