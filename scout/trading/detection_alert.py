@@ -29,7 +29,10 @@ pipeline cycle. It is spawned fire-and-forget from scout/main.py::run_cycle.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import structlog
 
@@ -46,6 +49,217 @@ from scout.trading.tg_alert_dispatch import (
 )
 
 log = structlog.get_logger(__name__)
+
+# ALR-02 decision-receipt gate version (reviewer LOCK 2). A literal that pins
+# the gate/threshold logic in force when a receipt was written, so a receipt is
+# reproducible even after the gate changes. BUMP this on ANY future change to
+# the detection-lane gate logic (_passes_quality_gate, the trigger, universe,
+# dedup, or cap semantics) so receipts written under the old and new gates are
+# distinguishable; it is also part of the idempotency-key recipe, so bumping it
+# opens a fresh analytical unit per token rather than colliding with pre-bump
+# rows. Format is free-text; "466.1" = PR #466 gate shape, revision 1.
+DETECTION_GATE_VERSION = "466.1"
+
+# The gate comparator actually applied by _passes_quality_gate: score >= bar.
+# Recorded first-class on every receipt (reviewer correction 2) so the precise
+# decision logic is resolvable from the row alone.
+DETECTION_GATE_COMPARATOR = ">="
+
+
+def _resolve_code_version() -> str | None:
+    """Best-effort deployed-code identity (git SHA), read ONCE at import.
+
+    Reviewer correction 2 wants the deployed code identity persisted alongside
+    the gate version so a receipt resolves to the EXACT decision logic in force.
+    Reads ``.git/HEAD`` (and the referenced ref) from the repo root — no env
+    reads (project rule: no os.getenv in business logic), no subprocess. Handles
+    both a normal checkout (``.git`` is a directory) and a git WORKTREE
+    (``.git`` is a file ``gitdir: <path>``; refs resolve via ``commondir``).
+    Returns the 40-char SHA, or None when ``.git`` is unavailable (e.g. a
+    tarball deploy); in that case DETECTION_GATE_VERSION is the documented
+    resolver of record (see tasks/prereg_detection_gate_enrichment_cohort.md).
+    Never raises.
+    """
+    try:
+        # scout/trading/detection_alert.py → repo root is two parents above scout/.
+        root = Path(__file__).resolve().parents[2]
+        git = root / ".git"
+        if git.is_file():
+            # Worktree: ".git" is a file pointing at the per-worktree gitdir.
+            gitdir = Path(git.read_text(encoding="utf-8").split(":", 1)[1].strip())
+            head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+            commondir_f = gitdir / "commondir"
+            common = (
+                (gitdir / commondir_f.read_text(encoding="utf-8").strip()).resolve()
+                if commondir_f.exists()
+                else gitdir
+            )
+        else:
+            gitdir = git
+            common = git
+            head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            return (common / ref).read_text(encoding="utf-8").strip()[:40]
+        return head[:40] or None
+    except Exception:
+        return None
+
+
+# Resolved once at import — the code identity of the running process.
+DETECTION_CODE_VERSION = _resolve_code_version()
+
+# The machine-readable terminal outcomes a receipt can carry, one per decision
+# point in the evaluation loop (reviewer LOCK 1 — a receipt for EVERY evaluated
+# candidate). "not_early" is the trigger-fail decision (gate-passer that CG has
+# already trended past): it is a real terminal decision in the loop, so LOCK 1
+# requires a receipt for it even though it is not one of the reviewer's seven
+# example outcome strings. See tasks/prereg_detection_gate_enrichment_cohort.md.
+DETECTION_RECEIPT_OUTCOMES = frozenset(
+    {
+        "sent",
+        "gate_fail_quality",
+        "dedup_24h",
+        "universe_filter",
+        "too_old",
+        "rate_limit",
+        "dispatch_failed",
+        "not_early",
+    }
+)
+
+
+def _receipt_idempotency_key(
+    token_id: str,
+    outcome: str,
+    source_observation_ts: str | None,
+    gate_version: str,
+) -> str:
+    """Deterministic idempotency key for a decision receipt (reviewer LOCK 3).
+
+    Recipe (documented identically in
+    tasks/prereg_detection_gate_enrichment_cohort.md):
+
+        sha256_hex( "{token_id}|{outcome}|{source_observation_ts}|{gate_version}" )
+
+    where a None ``source_observation_ts`` is rendered as the empty string and
+    the field separator is a literal ``|``. Because ``decided_at`` is NOT in the
+    key, re-evaluating the SAME token in the SAME state across successive polling
+    cycles yields the SAME key — the writer's ``INSERT OR IGNORE`` + the UNIQUE
+    index then collapse those re-evaluations to a single analytical row. A
+    genuine state change (outcome flips, or the token is re-observed with a new
+    first_seen, or the gate version is bumped) produces a DIFFERENT key and a new
+    row; the pre-registered primary analytical unit is the token's FIRST decision
+    after cohort start (MIN(decided_at) per token_id).
+    """
+    raw = f"{token_id}|{outcome}|{source_observation_ts or ''}|{gate_version}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _write_detection_receipt(
+    db: Database,
+    settings: Settings,
+    counters: dict[str, int],
+    *,
+    token_id: str,
+    outcome: str,
+    reason: str | None,
+    cand,
+    source_observation_ts: str | None,
+    decided_at: str,
+    extra_inputs: dict | None = None,
+) -> None:
+    """Persist ONE decision receipt, fail-soft (reviewer LOCK 4).
+
+    Every terminal decision in ``notify_early_detections`` calls this exactly
+    once. It NEVER raises: a write failure is caught, logged as a structured
+    ``detection_receipt_write_failed`` event, and counted, after which the lane
+    proceeds exactly as before — a receipt-write failure can never change
+    sending behavior. ``counters`` accumulates the per-cycle reconciliation
+    triple (evaluated / written / failures) plus the conflict tally surfaced in
+    ``detection_receipt_summary``.
+
+    Persists the RAW decision inputs (reviewer correction 2), not merely fired
+    signals: the derived score BEFORE (raw model value) and AFTER the gate's
+    ``int(x or 0)`` clipping, the comparator + threshold actually applied, the
+    gate + code versions, and a ``raw_inputs`` JSON blob of the raw component
+    values + per-input missingness/default indicators (plus any outcome-specific
+    inputs the caller passes via ``extra_inputs``).
+    """
+    counters["evaluated"] += 1
+    quant_raw = getattr(cand, "quant_score", None)  # int | None (raw model value)
+    score_before = quant_raw if isinstance(quant_raw, int) else None
+    score_after = int(quant_raw or 0)  # the operand the gate actually compares
+    signals = getattr(cand, "signals_fired", None)
+    signals_json = json.dumps(signals) if signals is not None else None
+    threshold = settings.DETECTION_ALERT_MIN_QUANT_SCORE
+
+    # raw_inputs — the raw values the decision consumed + missingness/default
+    # indicators. sort_keys=True → a deterministic serialization so the
+    # conflict-classifier can compare payloads byte-for-byte across cycles.
+    raw_inputs: dict = {
+        "quant_score_raw": quant_raw,
+        "quant_score_missing": quant_raw is None,
+        "signals_fired": signals,
+        "signals_fired_missing": signals is None,
+        "score_before": score_before,
+        "score_after": score_after,
+        "comparator": DETECTION_GATE_COMPARATOR,
+        "threshold": threshold,
+        "gate_expr": f"score_after {DETECTION_GATE_COMPARATOR} {threshold}",
+    }
+    if extra_inputs:
+        raw_inputs.update(extra_inputs)
+    raw_inputs_json = json.dumps(raw_inputs, sort_keys=True)
+
+    idempotency_key = _receipt_idempotency_key(
+        token_id, outcome, source_observation_ts, DETECTION_GATE_VERSION
+    )
+    try:
+        result = await db.insert_detection_decision_receipt(
+            token_id=token_id,
+            decided_at=decided_at,
+            outcome=outcome,
+            reason=reason,
+            source_observation_ts=source_observation_ts,
+            gate_version=DETECTION_GATE_VERSION,
+            code_version=DETECTION_CODE_VERSION,
+            score_before=score_before,
+            score_after=score_after,
+            comparator=DETECTION_GATE_COMPARATOR,
+            threshold_value=threshold,
+            signals_fired=signals_json,
+            raw_inputs=raw_inputs_json,
+            idempotency_key=idempotency_key,
+        )
+        # Bucket by result so the per-cycle reconciliation identity holds exactly
+        # (reviewer amendment 2):
+        #   evaluated == receipts_written + exact_replays + write_failures
+        #              + conflicting_duplicates
+        if result == "inserted":
+            counters["receipts_written"] += 1
+        elif result == "idempotent_replay":
+            counters["exact_replays"] += 1
+        elif result == "conflict":
+            # Same idempotency key, materially different payload — a correctness
+            # defect (e.g. the gate changed without a gate_version bump). Surface
+            # it; it must never pass as healthy coverage (reviewer correction 3).
+            counters["conflicts"] += 1
+            log.warning(
+                "detection_receipt_conflict",
+                token_id=token_id,
+                outcome=outcome,
+                idempotency_key=idempotency_key,
+                gate_version=DETECTION_GATE_VERSION,
+            )
+    except Exception as e:
+        counters["write_failures"] += 1
+        log.warning(
+            "detection_receipt_write_failed",
+            token_id=token_id,
+            outcome=outcome,
+            err=str(e),
+        )
 
 
 def _detection_trigger(
@@ -204,6 +418,28 @@ async def _fetch_price_mcap(
         return (None, None)
 
 
+async def _fetch_first_trending_at(db: Database, token_id: str) -> str | None:
+    """First CG-trending snapshot time for a token — the SAME value the trigger
+    classification reads (``MIN(snapshot_at)`` in
+    engine._compute_lead_time_vs_trending).
+
+    Preserved verbatim on a ``not_early`` receipt as ``pre_index_trending_at``
+    (reviewer amendment 1) so the pre-index trending timestamp that drove the
+    "already trending" classification is durable. Fail-soft: None when the token
+    has no snapshot (e.g. a status='error' classification) or the read fails.
+    """
+    try:
+        cur = await db._conn.execute(
+            "SELECT MIN(snapshot_at) FROM trending_snapshots WHERE coin_id = ?",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        log.exception("detection_alert_trending_fetch_failed", token_id=token_id)
+        return None
+
+
 async def _count_sent_today(db: Database, now: datetime) -> int:
     """Number of detection-lane alerts sent since UTC midnight."""
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -285,6 +521,25 @@ async def notify_early_detections(
         return
 
     now = now or datetime.now(timezone.utc)
+    decided_at = now.isoformat()
+    # Reviewer LOCK 4 + corrections 3 & 2: per-cycle reconciliation counters.
+    # Every terminal decision (past the evaluation boundary) writes exactly one
+    # receipt via _write_detection_receipt, bucketed so the identity
+    #   evaluated == receipts_written + exact_replays + write_failures + conflicts
+    # holds exactly; `conflicts` (same key, materially different payload) can
+    # never pass as healthy coverage. filtered_* count PRE-boundary rejected
+    # inputs SEPARATELY BY REASON — they never inflate `evaluated` and never
+    # disappear silently. All are surfaced each cycle in detection_receipt_summary.
+    receipt_counters = {
+        "evaluated": 0,
+        "receipts_written": 0,
+        "exact_replays": 0,
+        "write_failures": 0,
+        "conflicts": 0,
+        "filtered_missing_id": 0,
+        "filtered_non_cg_source": 0,
+        "filtered_malformed": 0,
+    }
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -303,23 +558,79 @@ async def notify_early_detections(
         # breaks ties). ``pool`` counts CG-sourced fresh candidates before the
         # gate so the pool→gated→sent funnel is queryable per run.
         pool = 0
-        entries: list[tuple[int, float, object, float | None]] = []
+        entries: list[tuple[int, float, object, float | None, str | None]] = []
         for cand in candidates:
-            if getattr(cand, "chain", None) != "coingecko":
+            # ---- INPUT-FILTER ZONE (pre-evaluation boundary) ----------------
+            # Rejections here are FILTERED INPUTS, NOT evaluated candidates: no
+            # substantive decision logic (score read, gate comparison,
+            # arm-relevant branching) has run yet, so NO receipt is emitted. Each
+            # reason is counted SEPARATELY (reviewer amendment 2) so filtered
+            # inputs never disappear silently and never inflate `evaluated`.
+            try:
+                chain = getattr(cand, "chain", None)
+                token_id = getattr(cand, "contract_address", None)
+            except Exception:
+                # A candidate so malformed its own attributes cannot be read.
+                receipt_counters["filtered_malformed"] += 1
                 continue
-            token_id = getattr(cand, "contract_address", None)
+            if chain != "coingecko":
+                receipt_counters["filtered_non_cg_source"] += 1
+                continue
             if not token_id:
+                receipt_counters["filtered_missing_id"] += 1
                 continue
+            # ===== EVALUATION BOUNDARY =======================================
+            # Past this line substantive decision logic executes (the first read
+            # of decision input — the authoritative first_seen/observation time),
+            # so EVERY terminal decision below MUST emit exactly one receipt.
             first_seen_iso, mcap_db = await _fetch_first_seen_mcap(db, token_id)
             age_min = _age_minutes(first_seen_iso, now)
             if age_min is None or age_min > settings.DETECTION_ALERT_MAX_AGE_MIN:
+                # Terminal decision: too old (or unparseable observation time).
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="too_old",
+                    reason=(
+                        "no_first_seen"
+                        if age_min is None
+                        else f"age_min={int(age_min)}"
+                    ),
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={
+                        "age_min": age_min,
+                        "max_age_min": settings.DETECTION_ALERT_MAX_AGE_MIN,
+                        "first_seen_missing": first_seen_iso is None,
+                    },
+                )
                 continue
             pool += 1
             # ALR-02 quality gate — upstream of universe/trigger/dedup/cap.
             if not _passes_quality_gate(cand, settings):
+                # Terminal decision: the previously-silent gate-FAILER cohort.
+                # score_before/after + comparator + threshold on the receipt make
+                # the exact gate arithmetic reproducible.
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="gate_fail_quality",
+                    reason=None,
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={"age_min": age_min},
+                )
                 continue
             quant_score = int(getattr(cand, "quant_score", None) or 0)
-            entries.append((quant_score, age_min, cand, mcap_db))
+            # Gate-passers defer their terminal receipt to the second loop (each
+            # entry reaches exactly one terminal decision below).
+            entries.append((quant_score, age_min, cand, mcap_db, first_seen_iso))
         # Highest score first; freshest (smallest age) breaks ties. NOTE: this
         # ordering only changes WHICH candidates win slots when the gated pool
         # exceeds the cap. At the default bar (>=1) the gated pool is ~4/day —
@@ -328,7 +639,7 @@ async def notify_early_detections(
         entries.sort(key=lambda e: (-e[0], e[1]))
 
         sent_count = 0
-        for quant_score, age_min, cand, mcap_db in entries:
+        for quant_score, age_min, cand, mcap_db, first_seen_iso in entries:
             token_id = cand.contract_address
 
             # Universe filter (reused verbatim). Off when the flag is off.
@@ -340,6 +651,18 @@ async def notify_early_detections(
                     outcome="blocked_eligibility",
                     detail=f"detection_lane:universe_filter:{pattern}",
                     now=now,
+                )
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="universe_filter",
+                    reason=pattern,
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={"universe_pattern": pattern},
                 )
                 log.info(
                     "detection_alert_blocked_universe",
@@ -353,6 +676,29 @@ async def notify_early_detections(
                 db, token_id, now
             )
             if not _detection_trigger(lead_time_min, status):
+                # Terminal decision: gate-passer CG has already trended past.
+                # Previously an unlogged `continue`; the receipt makes this
+                # (evaluated-but-not-early) cohort recoverable (LOCK 1). Preserve
+                # the pre-index trending timestamp that drove the classification
+                # (reviewer amendment 1) so not_early is auditable as flow
+                # attrition — never a primary-arm hit/miss.
+                pre_index_trending_at = await _fetch_first_trending_at(db, token_id)
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="not_early",
+                    reason=status,
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={
+                        "lead_time_min": lead_time_min,
+                        "lead_time_status": status,
+                        "pre_index_trending_at": pre_index_trending_at,
+                    },
+                )
                 continue
 
             # Per-token 24h dedup (scoped to the detection lane).
@@ -364,18 +710,49 @@ async def notify_early_detections(
                     detail="detection_lane:dedup_24h",
                     now=now,
                 )
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="dedup_24h",
+                    reason=None,
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={
+                        "dedup_window_hours": settings.TG_ALERT_DEDUP_WINDOW_HOURS
+                    },
+                )
                 continue
 
             # Daily budget guard (freshest-first already ordered above).
-            # LOG-ONLY: an un-sent fresh+early token re-hits this branch every
-            # cycle until it ages out, so a DB audit row per hit flooded
-            # tg_alert_log (~9.8K rows/day observed 2026-07-11..12 vs 10 sent).
-            # The structlog line preserves observability; the dedup_24h and
-            # sent rows remain the durable audit trail.
+            # LOG-ONLY (tg_alert_log): an un-sent fresh+early token re-hits this
+            # branch every cycle until it ages out, so a DB audit row per hit
+            # flooded tg_alert_log (~9.8K rows/day observed 2026-07-11..12 vs 10
+            # sent). The structlog line preserves observability; the dedup_24h
+            # and sent rows remain the durable tg_alert_log trail. The decision
+            # receipt (idempotency-collapsed per token+state) does NOT re-flood:
+            # every cycle re-hit maps to the same key → a single row.
             if remaining <= 0:
                 log.info(
                     "detection_lane_rate_limited",
                     token_id=token_id,
+                )
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="rate_limit",
+                    reason=None,
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={
+                        "remaining": remaining,
+                        "cap": settings.DETECTION_ALERT_MAX_PER_DAY,
+                    },
                 )
                 continue
 
@@ -417,6 +794,21 @@ async def notify_early_detections(
                     detail="detection_lane",
                     now=now,
                 )
+                await _write_detection_receipt(
+                    db,
+                    settings,
+                    receipt_counters,
+                    token_id=token_id,
+                    outcome="dispatch_failed",
+                    reason=str(e),
+                    cand=cand,
+                    source_observation_ts=first_seen_iso,
+                    decided_at=decided_at,
+                    extra_inputs={
+                        "lead_time_min": lead_time_min,
+                        "lead_time_status": status,
+                    },
+                )
                 continue
             log.info("detection_alert_delivered", token_id=token_id)
             await _log_detection_outcome(
@@ -425,6 +817,23 @@ async def notify_early_detections(
                 outcome="sent",
                 detail="detection_lane",
                 now=now,
+            )
+            # Receipt AFTER the send + tg_alert_log write: a receipt-write
+            # failure here cannot un-send or change budget accounting (LOCK 4).
+            await _write_detection_receipt(
+                db,
+                settings,
+                receipt_counters,
+                token_id=token_id,
+                outcome="sent",
+                reason=None,
+                cand=cand,
+                source_observation_ts=first_seen_iso,
+                decided_at=decided_at,
+                extra_inputs={
+                    "lead_time_min": lead_time_min,
+                    "lead_time_status": status,
+                },
             )
             remaining -= 1
             sent_count += 1
@@ -439,6 +848,26 @@ async def notify_early_detections(
             eligible=len(entries),
             sent=sent_count,
             cap=settings.DETECTION_ALERT_MAX_PER_DAY,
+        )
+        # Reviewer LOCK 4 + corrections 2 & 3: per-cycle receipt reconciliation.
+        # Identity (must hold every cycle):
+        #   evaluated_n == receipts_written_n + exact_replays_n
+        #              + write_failures_n + conflicting_duplicates_n
+        # If it does not hold, or receipts otherwise cannot be reconciled, the
+        # cohort is INVALID (documented in the prereg). conflicting_duplicates_n
+        # must be 0 for healthy coverage. filtered_*_n are reported BESIDE the
+        # identity (excluded from evaluated_n) so pre-boundary rejections stay
+        # visible by reason and never inflate the evaluated cohort.
+        log.info(
+            "detection_receipt_summary",
+            evaluated_n=receipt_counters["evaluated"],
+            receipts_written_n=receipt_counters["receipts_written"],
+            exact_replays_n=receipt_counters["exact_replays"],
+            write_failures_n=receipt_counters["write_failures"],
+            conflicting_duplicates_n=receipt_counters["conflicts"],
+            filtered_missing_id_n=receipt_counters["filtered_missing_id"],
+            filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
+            filtered_malformed_n=receipt_counters["filtered_malformed"],
         )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.

@@ -850,6 +850,33 @@ class Settings(BaseSettings):
     # `detection_alert_funnel` log.
     DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
 
+    # Retention floor (days) for detection_decision_receipts — the ALR-02
+    # decision-receipt audit substrate (behavior-neutral observability that
+    # records one receipt per evaluated detection-lane candidate so the
+    # gate-FAILER comparison cohort is recoverable). Pruned hourly in
+    # scout/main.py::_run_hourly_maintenance. Floor >= 120d — DELIBERATELY well
+    # beyond the analysis lifecycle: receipts MUST survive through BOTH outcome
+    # horizons (24h + 72h from index decision), reconciliation, manifest freeze,
+    # and final analysis. Pruning a row merely because its 72h window matured
+    # INVALIDATES the cohort (see tasks/prereg_detection_gate_enrichment_cohort.md);
+    # the 120d floor guarantees the whole cohort lifecycle fits on-disk. The
+    # ``ge=120`` floor makes it structurally impossible to set a value that
+    # could prune mid-analysis.
+    DETECTION_DECISION_RECEIPTS_RETENTION_DAYS: int = Field(default=120, ge=120)
+
+    # Cohort-completeness prune guard (reviewer correction e). An ISO-8601 UTC
+    # timestamp marking the point up to which the gate-enrichment cohort's
+    # manifest/final-analysis lifecycle is COMPLETE. Empty (the default) means
+    # NO cohort has been closed → detection_decision_receipts is NEVER pruned,
+    # so an in-flight cohort's receipts always survive manifest freeze + final
+    # analysis. When set, only rows whose ``decided_at`` is at/older than BOTH
+    # this marker AND the retention floor are pruned; rows newer than the marker
+    # (a still-open cohort) are never pruned. Pruning receipts before their
+    # cohort analysis completes INVALIDATES the cohort (see the prereg doc); this
+    # guard makes that structurally impossible without an explicit operator
+    # close-out. Set it only after the cohort's final analysis is frozen.
+    DETECTION_RECEIPTS_COHORT_CLOSED_AT: str = ""
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the
