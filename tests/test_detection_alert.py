@@ -888,39 +888,118 @@ async def test_receipt_score_before_after_clip_on_unscored(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_receipt_idempotent_replay_counted_as_replay(tmp_path):
-    """Same key + same payload (different decided_at) → idempotent_replay, one
-    row, FIRST decided_at preserved."""
+    """Same key + same DECISION-INVARIANT signature but DIFFERENT time-varying
+    fields (decided_at, reason/age, raw_inputs, raw score below the same bar) →
+    idempotent_replay, one row, first write preserved. This is the production
+    re-poll case: only observation fields changed, the decision did not."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k1")
+        **_receipt_kwargs(
+            idempotency_key="k1",
+            outcome="gate_fail_quality",
+            score_after=4,
+            threshold_value=5,
+            reason="age_min=5",
+            raw_inputs='{"age_min": 5, "score_after": 4}',
+        )
     )
     assert r1 == "inserted"
     r2 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k1", decided_at="2026-07-20T13:00:00+00:00")
+        **_receipt_kwargs(
+            idempotency_key="k1",
+            outcome="gate_fail_quality",
+            decided_at="2026-07-20T13:00:00+00:00",
+            score_after=3,  # drifted, but still below the bar → same pass/fail side
+            threshold_value=5,
+            reason="age_min=35",  # time-varying
+            raw_inputs='{"age_min": 35, "score_after": 3}',  # time-varying
+        )
     )
     assert r2 == "idempotent_replay"
     rows = await _fetch_receipts(db, "tok")
     assert len(rows) == 1
     assert rows[0]["decided_at"] == "2026-07-20T12:00:00+00:00"  # first write kept
+    assert rows[0]["score_after"] == 4  # original row untouched
     await db.close()
 
 
 @pytest.mark.asyncio
 async def test_receipt_conflicting_duplicate_detected(tmp_path):
-    """Same key + materially different payload → conflict; original preserved."""
+    """Same key + CONTRADICTORY decision-invariant signature (pass/fail SIDE
+    flips: score crosses the bar) → conflict; original preserved."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     r1 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k2", score_after=0)
+        **_receipt_kwargs(idempotency_key="k2", score_after=0, threshold_value=1)
     )
     assert r1 == "inserted"
+    # score_after 0 (fail side) vs 99 (pass side) at threshold 1 → SIDE flips.
     r2 = await db.insert_detection_decision_receipt(
-        **_receipt_kwargs(idempotency_key="k2", score_after=99)
+        **_receipt_kwargs(idempotency_key="k2", score_after=99, threshold_value=1)
     )
     assert r2 == "conflict"
     rows = await _fetch_receipts(db, "tok")
     assert len(rows) == 1 and rows[0]["score_after"] == 0  # original untouched
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_outcome_contradiction_is_conflict(tmp_path):
+    """Same key + a contradictory machine OUTCOME (simulated corruption) →
+    conflict, even though all time-varying fields would otherwise be ignored."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    r1 = await db.insert_detection_decision_receipt(
+        **_receipt_kwargs(idempotency_key="k3", outcome="gate_fail_quality")
+    )
+    assert r1 == "inserted"
+    r2 = await db.insert_detection_decision_receipt(
+        **_receipt_kwargs(idempotency_key="k3", outcome="sent")
+    )
+    assert r2 == "conflict"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_repoll_changed_observation_same_decision_is_replay(
+    tmp_path, monkeypatch
+):
+    """Production reproduction (srilu 2026-07-26): the SAME candidate re-evaluated
+    a later cycle with a changed decision AGE (and thus changed reason/raw_inputs)
+    but an UNCHANGED decision classifies as an exact replay — NOT a conflict — so
+    routine re-polls do not inflate conflicting_duplicates."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_ALERT_MIN_QUANT_SCORE=5
+    )
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _block_send(monkeypatch)
+    cand = _cand("failer", quant_score=4, signals_fired=["market_cap_range"])
+    now1 = datetime.now(timezone.utc)
+    now2 = now1 + timedelta(minutes=30)  # age (a time-varying field) changes
+
+    with capture_logs():
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now1
+        )
+    with capture_logs() as logs2:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now2
+        )
+    # Single row (idempotent), and cycle 2 classified it as a replay, not conflict.
+    rows = await _fetch_receipts(db, "failer")
+    assert len(rows) == 1 and rows[0]["outcome"] == "gate_fail_quality"
+    summ2 = [e for e in logs2 if e["event"] == "detection_receipt_summary"][-1]
+    assert summ2["evaluated_n"] == 1
+    assert summ2["exact_replays_n"] == 1
+    assert summ2["conflicting_duplicates_n"] == 0
+    assert summ2["receipts_written_n"] == 0
+    # The stored receipt kept the FIRST cycle's age-based reason.
+    raw = json.loads(rows[0]["raw_inputs"])
+    assert raw["age_min"] is not None
     await db.close()
 
 

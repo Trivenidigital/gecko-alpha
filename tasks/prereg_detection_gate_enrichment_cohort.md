@@ -62,10 +62,19 @@ be reconstructed** (gainers/trending snapshot retention is short and the
 dropped-candidate stream was never recorded). There is no retroactive
 reconstruction from pre-deployment data.
 
-> **Cohort start (UTC): __________________ (TBD — record the first healthy
-> post-deploy process activation timestamp here at deploy)**
+**Cohort re-anchor (replay/conflict fix, 2026-07-26).** The first production
+activation (2026-07-26 02:47:23Z) ran with the pre-fix replay/conflict
+classification, which mis-counted routine re-polls as conflicting duplicates (see
+§7). Those receipts are **pre-cohort shakedown data and are EXCLUDED**. The cohort
+start is therefore re-anchored, under the SAME immutable-timestamp definition, to
+**the first healthy production process activation after THIS fix
+(`fix/receipt-replay-classification`) deploys**. Receipts with `decided_at` from
+02:47:23Z through the fix deployment are excluded as shakedown.
 
-Rows with `decided_at` before this timestamp (there should be none) are excluded.
+> **Cohort start (UTC): __________________ (TBD — record the first healthy
+> process activation AFTER the replay/conflict fix deploys)**
+
+Rows with `decided_at` before this (re-anchored) timestamp are excluded.
 
 ---
 
@@ -169,16 +178,42 @@ re-evaluations to a single row, and the FIRST write's `decided_at` is preserved
 (outcome flips, the token is re-observed with a new `first_seen`, or
 `gate_version` is bumped) yields a different key and a new row.
 
-**Conflict surfacing (reviewer correction 3):** an `INSERT OR IGNORE` that
-no-ops is classified against the persisted row:
+**Conflict surfacing (reviewer correction 3 + replay/conflict fix 2026-07-26):**
+an `INSERT OR IGNORE` that no-ops is classified against the persisted row over
+**DECISION-INVARIANT fields ONLY**. Comparing the full payload was a defect:
+routine re-polls of an unchanged decision carry TIME-VARYING observation fields
+that legitimately differ cycle-to-cycle, so unchanged re-polls were mis-classified
+as conflicts (srilu journal, 2026-07-26 02:53Z: `evaluated=724, written=9,
+conflicting_duplicates=715`), burying any real conflict.
 
-- **exact idempotent replay** (stored payload == attempted payload) — benign,
-  counted as written;
-- **conflicting duplicate** (same key, materially different payload — e.g. the
-  gate's threshold/comparator/score changed without a `gate_version` bump) — a
-  **correctness defect**: counted, a structured `detection_receipt_conflict`
-  warning is emitted, and the count appears in the per-cycle
-  `detection_receipt_summary` so it can never pass as healthy coverage.
+The exact **compared decision-invariant field list** is:
+
+| Field | Note |
+|---|---|
+| `outcome` | the machine decision / arm (also in the idem key) |
+| `gate_version` | pins the gate logic (also in the idem key) |
+| `comparator` | the gate comparator actually applied |
+| `threshold_value` | the gate threshold actually applied |
+| `code_version` | deployed code identity |
+| `gate_pass_side` (derived) | `score_after >= threshold_value` — the arm-relevant pass/fail SIDE, **not** the raw score |
+
+**Excluded from the comparison** (time-varying / observation — still STORED on the
+original receipt, just not compared): `reason` (carries age at decision),
+`raw_inputs` (age, live price/volume, `pre_index_trending_at` re-reads),
+`score_before` / `score_after` (raw scores recomputed each cycle), `signals_fired`,
+`decided_at`. `token_id` and `source_observation_ts` are in the idem key, so a
+matching key already fixes them.
+
+Classification:
+
+- **exact idempotent replay** (same key, same decision-invariant signature) —
+  benign; a routine unchanged-decision re-poll. Counted as `exact_replays`.
+- **conflicting duplicate** (same key, CONTRADICTORY decision-invariant signature
+  — e.g. `outcome` flipped for the same source observation, or the gate
+  threshold/comparator/code changed without a `gate_version` bump) — a
+  **correctness defect**: counted as `conflicting_duplicates`, a structured
+  `detection_receipt_conflict` warning is emitted, and the count appears in the
+  per-cycle `detection_receipt_summary` so it can never pass as healthy coverage.
 
 The pre-registered **primary analytical unit is the token's first decision after
 cohort start** (§4). Duplicate rows for a token (genuine state changes) are

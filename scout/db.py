@@ -1332,25 +1332,65 @@ class Database:
                 "after migration"
             )
 
-    # Decision-content columns that define a receipt's PAYLOAD (everything
-    # except id + decided_at). Two receipts with the same idempotency_key but a
-    # different payload are a CONFLICTING DUPLICATE — a correctness defect the
-    # writer must surface, never silently ignore (reviewer correction 3). Ordered
-    # to match the SELECT in insert_detection_decision_receipt.
-    _RECEIPT_PAYLOAD_COLUMNS = (
-        "token_id",
+    # Decision-INVARIANT columns — the ONLY stored columns compared to classify
+    # an ignored insert as an exact replay vs a conflicting duplicate (replay/
+    # conflict classification fix, 2026-07-26).
+    #
+    # Why NOT the full payload: routine re-polls of an UNCHANGED decision carry
+    # TIME-VARYING observation fields that legitimately differ cycle-to-cycle —
+    # age at decision (in ``reason`` and ``raw_inputs``), live price/volume
+    # components, ``pre_index_trending_at`` re-reads, and the raw score
+    # (recomputed each cycle). Comparing the full payload classified 715/cycle
+    # unchanged re-polls as conflicts (srilu journal, 2026-07-26 02:53Z:
+    # evaluated=724, written=9, conflicting_duplicates=715), which would bury any
+    # real conflict. So the comparison is restricted to the fields that DEFINE
+    # the decision; the time-varying fields remain STORED on the original receipt
+    # but are excluded from the conflict comparison.
+    #
+    # Compared here directly: outcome (the machine decision / arm — also in the
+    # idem key), gate_version (pins the gate logic — also in the idem key),
+    # comparator + threshold_value (the gate comparison actually applied),
+    # code_version (deployed code identity). The arm-relevant decision state
+    # (score pass/fail SIDE) is compared as a DERIVED boolean
+    # ``score_after >= threshold_value`` (see _receipt_decision_signature), NOT
+    # the raw ``score_after`` (which varies). A genuine conflict — same key but a
+    # contradictory decision (outcome flipped for the same source observation, or
+    # threshold/comparator/code changed without a gate_version bump) — still
+    # differs on this set and is flagged.
+    _RECEIPT_DECISION_INVARIANT_COLUMNS = (
         "outcome",
-        "reason",
-        "source_observation_ts",
         "gate_version",
-        "code_version",
-        "score_before",
-        "score_after",
         "comparator",
         "threshold_value",
-        "signals_fired",
-        "raw_inputs",
+        "code_version",
     )
+
+    @staticmethod
+    def _receipt_decision_signature(
+        *,
+        outcome: str,
+        gate_version: str,
+        comparator: str,
+        threshold_value: int,
+        code_version: str | None,
+        score_after: int,
+    ) -> tuple:
+        """Decision-invariant signature used to classify replay vs conflict.
+
+        Includes the arm-relevant pass/fail SIDE as a derived boolean
+        (``score_after >= threshold_value``) rather than the raw score, so a
+        score that drifts cycle-to-cycle WITHOUT crossing the gate does not
+        register as a conflict.
+        """
+        gate_pass_side = score_after >= threshold_value
+        return (
+            outcome,
+            gate_version,
+            comparator,
+            threshold_value,
+            code_version,
+            gate_pass_side,
+        )
 
     async def insert_detection_decision_receipt(
         self,
@@ -1377,14 +1417,18 @@ class Database:
         Returns one of:
           - ``"inserted"``          — a NEW row was written.
           - ``"idempotent_replay"`` — the key already existed AND the existing
-            row's payload matches this attempt exactly (a benign re-evaluation
-            of the same state across polling cycles). ``decided_at`` intentionally
-            is NOT part of the payload — the FIRST write's timestamp is preserved.
-          - ``"conflict"``          — the key already existed but the existing
-            row's payload MATERIALLY DIFFERS from this attempt (e.g. the gate's
-            threshold/comparator/score changed without ``gate_version`` being
-            bumped). A correctness defect; the caller emits a
-            ``detection_receipt_conflict`` warning and counts it.
+            row's DECISION-INVARIANT signature matches this attempt (a benign
+            re-evaluation of the same decision across polling cycles). Only the
+            decision-invariant fields are compared (see
+            ``_RECEIPT_DECISION_INVARIANT_COLUMNS``); time-varying observation
+            fields (age, live price/volume, ``pre_index_trending_at``, raw score)
+            and ``decided_at`` are intentionally NOT compared — the FIRST write's
+            row is preserved.
+          - ``"conflict"``          — the key already existed but the
+            decision-invariant signature CONTRADICTS this attempt (outcome flipped
+            for the same source observation, or the gate threshold/comparator/code
+            changed without ``gate_version`` being bumped). A correctness defect;
+            the caller emits a ``detection_receipt_conflict`` warning and counts it.
 
         RAISES on a real DB error — the caller
         (detection_alert.notify_early_detections) wraps this fail-soft so a
@@ -1393,21 +1437,6 @@ class Database:
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
-        # Values in the exact order of _RECEIPT_PAYLOAD_COLUMNS.
-        payload = (
-            token_id,
-            outcome,
-            reason,
-            source_observation_ts,
-            gate_version,
-            code_version,
-            score_before,
-            score_after,
-            comparator,
-            threshold_value,
-            signals_fired,
-            raw_inputs,
-        )
         async with self._txn_lock:
             cur = await self._conn.execute(
                 "INSERT OR IGNORE INTO detection_decision_receipts "
@@ -1437,11 +1466,12 @@ class Database:
                 await self._conn.commit()
                 return "inserted"
             # Ignored: the key already exists. Classify replay vs conflict by
-            # comparing the persisted payload to this attempt.
-            select_cols = ", ".join(self._RECEIPT_PAYLOAD_COLUMNS)
+            # comparing only the DECISION-INVARIANT signature — time-varying
+            # observation fields legitimately differ on routine re-polls.
+            select_cols = ", ".join(self._RECEIPT_DECISION_INVARIANT_COLUMNS)
             cur2 = await self._conn.execute(
-                f"SELECT {select_cols} FROM detection_decision_receipts "
-                "WHERE idempotency_key = ?",
+                f"SELECT {select_cols}, score_after "
+                "FROM detection_decision_receipts WHERE idempotency_key = ?",
                 (idempotency_key,),
             )
             existing = await cur2.fetchone()
@@ -1450,7 +1480,24 @@ class Database:
             # Concurrent delete between the ignored insert and the read; treat as
             # a benign replay (nothing to conflict with).
             return "idempotent_replay"
-        return "idempotent_replay" if tuple(existing) == payload else "conflict"
+        e_outcome, e_gate, e_comp, e_thr, e_code, e_score_after = tuple(existing)
+        existing_sig = self._receipt_decision_signature(
+            outcome=e_outcome,
+            gate_version=e_gate,
+            comparator=e_comp,
+            threshold_value=e_thr,
+            code_version=e_code,
+            score_after=e_score_after,
+        )
+        attempted_sig = self._receipt_decision_signature(
+            outcome=outcome,
+            gate_version=gate_version,
+            comparator=comparator,
+            threshold_value=threshold_value,
+            code_version=code_version,
+            score_after=score_after,
+        )
+        return "idempotent_replay" if existing_sig == attempted_sig else "conflict"
 
     async def prune_detection_decision_receipts(
         self, *, keep_days: int, cohort_closed_at: str | None
