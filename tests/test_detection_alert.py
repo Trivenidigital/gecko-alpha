@@ -1512,3 +1512,100 @@ async def test_disk_pressure_suspends_accrual_send_unaffected(tmp_path, monkeypa
     assert summ["newly_written_n"] == 0
     assert any(e["event"] == "detection_receipt_disk_pressure" for e in logs)
     await db.close()
+
+
+# ---------- dormancy flag: DETECTION_RECEIPTS_ENABLED=False ----------
+
+
+@pytest.mark.asyncio
+async def test_receipts_disabled_writes_nothing_send_unaffected(tmp_path, monkeypatch):
+    """Dormant deployment (DETECTION_RECEIPTS_ENABLED=False): across TWO cycles NO
+    receipts are written, the send path + tg_alert_log audit are unaffected, no
+    per-cycle summary is emitted, and the detection_receipts_disabled breadcrumb
+    fires exactly ONCE per process."""
+    monkeypatch.setattr(
+        "scout.trading.detection_alert._receipts_disabled_logged", False
+    )
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True, DETECTION_RECEIPTS_ENABLED=False
+    )
+    await _insert_candidate(db, "dogwifhat", first_seen_min_ago=5.0)
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+    cand = _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+    now1 = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=now1
+        )
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=now1 + timedelta(minutes=3),
+        )
+    # Zero receipts written across both cycles.
+    assert await _fetch_receipts(db) == []
+    # Send path unaffected (cycle 1 fired) + tg_alert_log audit still written.
+    assert any(t.startswith("🔎 EARLY DETECT") for t in sent)
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE outcome='sent' AND detail='detection_lane'"
+    )
+    assert (await cur.fetchone())[0] >= 1
+    # Exactly one dormant breadcrumb; NO per-cycle receipt summary.
+    assert sum(1 for e in logs if e["event"] == "detection_receipts_disabled") == 1
+    assert not any(e["event"] == "detection_receipt_summary" for e in logs)
+    await db.close()
+
+
+# ---------- disk-pressure alert cooldown ----------
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_alert_respects_cooldown(tmp_path, monkeypatch):
+    """Two consecutive breached cycles page the operator only ONCE; a cycle after
+    the cooldown elapses pages a second time. The per-cycle structured WARNING is
+    NOT rate-limited (fires every breached cycle)."""
+    monkeypatch.setattr("scout.trading.detection_alert._last_disk_alert_at", None)
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # force disk pressure
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+    )
+    _capture_send(monkeypatch)
+    base = datetime.now(timezone.utc)
+
+    with capture_logs() as logs:
+        # Cycle 1 (breach) → page. Cycle 2 (+1min, within cooldown) → no page.
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base
+        )
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(minutes=1)
+        )
+        dispatched_after_two = sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+        )
+        # Cycle 3 (+7h, cooldown elapsed) → second page.
+        await notify_early_detections(
+            db, settings, session=None, candidates=[], now=base + timedelta(hours=7)
+        )
+    dispatched_total = sum(
+        1
+        for e in logs
+        if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+    )
+    warnings = sum(1 for e in logs if e["event"] == "detection_receipt_disk_pressure")
+    assert dispatched_after_two == 1  # exactly one page across the two breached cycles
+    assert dispatched_total == 2  # a second page after the cooldown elapsed
+    assert warnings == 3  # the structured warning is per-cycle, not rate-limited
+    await db.close()

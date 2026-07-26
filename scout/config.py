@@ -850,6 +850,17 @@ class Settings(BaseSettings):
     # `detection_alert_funnel` log.
     DETECTION_ALERT_MIN_QUANT_SCORE: int = Field(default=1, ge=0, le=100)
 
+    # DORMANCY FLAG (reviewer dormant-deployment ruling, 2026-07-26). Master
+    # kill-switch for the decision-receipt subsystem. When False, the detection
+    # lane still runs (sends/gate/dedup/tg_alert_log audit are BYTE-IDENTICAL) but
+    # writes ZERO receipts — every write is skipped BEFORE any persistence attempt,
+    # the disk-pressure guard is bypassed, and the per-cycle
+    # ``detection_receipt_summary`` is suppressed to avoid dormant-mode log spam. A
+    # single structured ``detection_receipts_disabled`` log fires at the first skip
+    # per process. Lets the receipt code deploy DORMANT (present but inert) ahead
+    # of the replacement-cohort activation. Default True (receipts active).
+    DETECTION_RECEIPTS_ENABLED: bool = True
+
     # Retention floor (days) for detection_decision_receipts — the ALR-02
     # decision-receipt audit substrate (behavior-neutral observability that
     # records one receipt per evaluated detection-lane candidate so the
@@ -920,6 +931,15 @@ class Settings(BaseSettings):
     DETECTION_RECEIPT_DISK_GUARD_ENABLED: bool = False
     DETECTION_RECEIPT_DISK_MIN_FREE_GB: float = Field(default=10.0, ge=1.0)
     DETECTION_RECEIPT_DISK_MIN_FREE_PCT: float = Field(default=15.0, ge=1.0, le=90.0)
+    # Cooldown (hours) between disk-pressure TELEGRAM alerts. Without it the lane
+    # would page on every breached cycle (~500/day at 2.9-min cadence). The
+    # structured ``detection_receipt_disk_pressure`` WARNING stays per-cycle in the
+    # journal; only the operator page is rate-limited. The last-alert timestamp is
+    # in-memory (module-level) — a process restart resets it, which is acceptable
+    # (a restart is itself a signal, and one extra page is harmless).
+    DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS: float = Field(
+        default=6.0, ge=0.0, le=168.0
+    )
 
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept

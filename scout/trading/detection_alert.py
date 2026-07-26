@@ -51,6 +51,37 @@ from scout.trading.tg_alert_dispatch import (
 
 log = structlog.get_logger(__name__)
 
+# Dormancy: emit the `detection_receipts_disabled` breadcrumb only ONCE per
+# process (at the first skip), not every cycle — avoids dormant-mode log spam.
+_receipts_disabled_logged = False
+
+# Disk-pressure operator page cooldown: in-memory timestamp of the last dispatched
+# Telegram alert. Module-level (per process); a restart resets it (documented in
+# Settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS — acceptable for a page).
+_last_disk_alert_at: datetime | None = None
+
+
+def _log_receipts_disabled_once() -> None:
+    """Emit the dormant-mode breadcrumb exactly once per process."""
+    global _receipts_disabled_logged
+    if not _receipts_disabled_logged:
+        log.info("detection_receipts_disabled")
+        _receipts_disabled_logged = True
+
+
+def _disk_alert_due(now: datetime, cooldown_hours: float) -> bool:
+    """True (and records ``now``) when a disk-pressure page is due — i.e. no page
+    has fired within ``cooldown_hours``. The per-cycle structured WARNING is NOT
+    gated by this; only the Telegram page is."""
+    global _last_disk_alert_at
+    if _last_disk_alert_at is None or (now - _last_disk_alert_at) >= timedelta(
+        hours=cooldown_hours
+    ):
+        _last_disk_alert_at = now
+        return True
+    return False
+
+
 # ALR-02 decision-receipt gate version (reviewer LOCK 2). A literal that pins
 # the gate/threshold logic in force when a receipt was written, so a receipt is
 # reproducible even after the gate changes. BUMP this on ANY future change to
@@ -200,6 +231,10 @@ async def _write_detection_receipt(
     values + per-input missingness/default indicators (plus any outcome-specific
     inputs the caller passes via ``extra_inputs``).
     """
+    if counters.get("receipts_disabled"):
+        # DORMANCY: skip BEFORE any persistence attempt and BEFORE counting, so a
+        # dormant deployment writes zero rows and emits no per-candidate work.
+        return
     counters["evaluated"] += 1
     if counters.get("disk_suspended"):
         # Disk-pressure fail-closed: accrual is SUSPENDED this cycle. We count the
@@ -577,38 +612,52 @@ async def notify_early_detections(
         "filtered_malformed": 0,
         "skipped_disk_pressure": 0,
         "disk_suspended": False,
+        "receipts_disabled": False,
     }
-    # Disk-pressure fail-closed guard (approved architecture). If the box is low
-    # on space, SUSPEND receipt accrual for this cycle: mark coverage unhealthy,
-    # alert, and preserve existing receipts+manifests. The SEND PATH is never
-    # touched (that lives in the paper/detection dispatch, not here), and we NEVER
-    # silently prune/sample/reduce detail.
+    # DORMANCY: master kill-switch. When receipts are disabled the lane still runs
+    # (sends/gate/dedup/audit byte-identical) but writes NOTHING — _write_detection
+    # _receipt no-ops before any persistence, the disk guard is bypassed, and the
+    # per-cycle summary is suppressed. A single breadcrumb fires per process.
+    receipts_enabled = settings.DETECTION_RECEIPTS_ENABLED
+    if not receipts_enabled:
+        receipt_counters["receipts_disabled"] = True
+        _log_receipts_disabled_once()
+    # Disk-pressure fail-closed guard (only when receipts are actually accruing).
+    # If the box is low on space, SUSPEND receipt accrual for this cycle: mark
+    # coverage unhealthy, page the operator (rate-limited), and preserve existing
+    # receipts+manifests. The SEND PATH is never touched, and we NEVER silently
+    # prune/sample/reduce detail.
     _disk = (
         check_disk_pressure(db._db_path, settings)
-        if settings.DETECTION_RECEIPT_DISK_GUARD_ENABLED
+        if (receipts_enabled and settings.DETECTION_RECEIPT_DISK_GUARD_ENABLED)
         else None
     )
     if _disk is not None and not _disk.healthy:
         receipt_counters["disk_suspended"] = True
+        # The structured WARNING stays per-cycle (journal signal).
         log.warning(
             "detection_receipt_disk_pressure",
             reason=_disk.reason(),
             free_gb=round(_disk.free_bytes / 1e9, 2),
             free_pct=round(_disk.free_pct, 1),
         )
-        try:
-            # §12b: plain text (parse_mode=None), bracketed dispatched/delivered.
-            log.info("detection_receipt_disk_pressure_alert_dispatched")
-            await alerter.send_telegram_message(
-                f"disk pressure: detection receipt accrual SUSPENDED ({_disk.reason()})",
-                session,
-                settings,
-                parse_mode=None,
-                source="detection_receipt_disk_pressure",
-            )
-            log.info("detection_receipt_disk_pressure_alert_delivered")
-        except Exception as _e:  # never break the lane on an alert failure
-            log.warning("detection_receipt_disk_pressure_alert_failed", err=str(_e))
+        # The Telegram PAGE is rate-limited to one per cooldown window so a
+        # sustained breach (~500 cycles/day) does not page every cycle.
+        if _disk_alert_due(now, settings.DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS):
+            try:
+                # §12b: plain text (parse_mode=None), bracketed dispatched/delivered.
+                log.info("detection_receipt_disk_pressure_alert_dispatched")
+                await alerter.send_telegram_message(
+                    f"disk pressure: detection receipt accrual SUSPENDED "
+                    f"({_disk.reason()})",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="detection_receipt_disk_pressure",
+                )
+                log.info("detection_receipt_disk_pressure_alert_delivered")
+            except Exception as _e:  # never break the lane on an alert failure
+                log.warning("detection_receipt_disk_pressure_alert_failed", err=str(_e))
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -932,19 +981,23 @@ async def notify_early_detections(
         # ``coverage_healthy`` is False when disk-pressure suspended accrual
         # (skipped_disk_pressure_n > 0): the identity intentionally does NOT close
         # then, flagging the coverage gap so the cohort window is marked invalid.
-        log.info(
-            "detection_receipt_summary",
-            evaluated_n=receipt_counters["evaluated"],
-            newly_written_n=receipt_counters["newly_written"],
-            exact_replays_n=receipt_counters["exact_replays"],
-            write_failures_n=receipt_counters["write_failures"],
-            conflicting_duplicates_n=receipt_counters["conflicts"],
-            skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
-            filtered_missing_id_n=receipt_counters["filtered_missing_id"],
-            filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
-            filtered_malformed_n=receipt_counters["filtered_malformed"],
-            coverage_healthy=not receipt_counters["disk_suspended"],
-        )
+        # DORMANCY: when receipts are disabled the summary is SUPPRESSED entirely
+        # (the single detection_receipts_disabled breadcrumb already fired) so a
+        # dormant deployment produces no per-cycle receipt telemetry.
+        if not receipt_counters["receipts_disabled"]:
+            log.info(
+                "detection_receipt_summary",
+                evaluated_n=receipt_counters["evaluated"],
+                newly_written_n=receipt_counters["newly_written"],
+                exact_replays_n=receipt_counters["exact_replays"],
+                write_failures_n=receipt_counters["write_failures"],
+                conflicting_duplicates_n=receipt_counters["conflicts"],
+                skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
+                filtered_missing_id_n=receipt_counters["filtered_missing_id"],
+                filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
+                filtered_malformed_n=receipt_counters["filtered_malformed"],
+                coverage_healthy=not receipt_counters["disk_suspended"],
+            )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.
         log.exception("detection_alert_notify_unexpected_error")
