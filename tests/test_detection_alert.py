@@ -934,7 +934,13 @@ async def test_receipt_conflict_counted_and_warned():
             return "conflict"
 
     settings = _settings()
-    counters = {"evaluated": 0, "written": 0, "failures": 0, "conflicts": 0}
+    counters = {
+        "evaluated": 0,
+        "receipts_written": 0,
+        "exact_replays": 0,
+        "write_failures": 0,
+        "conflicts": 0,
+    }
     with capture_logs() as logs:
         await _write_detection_receipt(
             _StubDB(),
@@ -947,9 +953,12 @@ async def test_receipt_conflict_counted_and_warned():
             source_observation_ts="2026-07-20T11:00:00+00:00",
             decided_at="2026-07-20T12:00:00+00:00",
         )
-    assert counters["written"] == 1
+    # A conflict is evaluated + counted as a conflict, but is NOT a new insert.
+    assert counters["evaluated"] == 1
     assert counters["conflicts"] == 1
-    assert counters["failures"] == 0
+    assert counters["receipts_written"] == 0
+    assert counters["exact_replays"] == 0
+    assert counters["write_failures"] == 0
     assert any(e["event"] == "detection_receipt_conflict" for e in logs)
 
 
@@ -982,16 +991,24 @@ async def test_receipt_summary_counts_write_failures(tmp_path, monkeypatch):
     assert summ["evaluated_n"] == 1
     assert summ["write_failures_n"] == 1
     assert summ["receipts_written_n"] == 0
-    assert summ["conflicts_n"] == 0
-    assert summ["evaluated_n"] == summ["receipts_written_n"] + summ["write_failures_n"]
+    assert summ["exact_replays_n"] == 0
+    assert summ["conflicting_duplicates_n"] == 0
+    # Reconciliation identity holds.
+    assert summ["evaluated_n"] == (
+        summ["receipts_written_n"]
+        + summ["exact_replays_n"]
+        + summ["write_failures_n"]
+        + summ["conflicting_duplicates_n"]
+    )
     assert any(e["event"] == "detection_receipt_write_failed" for e in logs)
     await db.close()
 
 
 @pytest.mark.asyncio
 async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
-    """conflicts_n surfaces in the per-cycle summary so a conflict can never pass
-    as healthy coverage (reviewer correction 3)."""
+    """conflicting_duplicates_n surfaces in the per-cycle summary so a conflict
+    can never pass as healthy coverage (reviewer correction 3). A conflict is
+    NOT a new insert, so receipts_written_n stays 0."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
@@ -1011,10 +1028,119 @@ async def test_receipt_summary_counts_conflicts(tmp_path, monkeypatch):
             candidates=[_cand("failer", quant_score=0, signals_fired=[])],
         )
     summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
-    assert summ["conflicts_n"] == 1
-    assert summ["receipts_written_n"] == 1
+    assert summ["evaluated_n"] == 1
+    assert summ["conflicting_duplicates_n"] == 1
+    assert summ["receipts_written_n"] == 0
+    assert summ["exact_replays_n"] == 0
     assert summ["write_failures_n"] == 0
+    assert summ["evaluated_n"] == (
+        summ["receipts_written_n"]
+        + summ["exact_replays_n"]
+        + summ["write_failures_n"]
+        + summ["conflicting_duplicates_n"]
+    )
     assert any(e["event"] == "detection_receipt_conflict" for e in logs)
+    await db.close()
+
+
+# ---------- amendment 1: not_early preserves the pre-index trending timestamp --
+
+
+@pytest.mark.asyncio
+async def test_not_early_receipt_preserves_pre_index_trending_at(tmp_path, monkeypatch):
+    """A gate-PASSER that CG had already trended past gets a not_early receipt
+    carrying pre_index_trending_at = the trending snapshot that drove the
+    classification (reviewer amendment 1). It is flow attrition, never a
+    primary-arm hit/miss."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
+    await _insert_candidate(db, "dogwifhat", first_seen_min_ago=8.0)
+    await _insert_price(db, "dogwifhat")
+    # Trending crossover 30 min ago vs first-seen 8 min ago → positive lead →
+    # already trending → not_early.
+    await _insert_trending(db, "dogwifhat", snapshot_min_ago=30.0)
+    _block_send(monkeypatch)
+
+    await notify_early_detections(
+        db,
+        settings,
+        session=None,
+        candidates=[
+            _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+        ],
+    )
+    rows = await _fetch_receipts(db, "dogwifhat")
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "not_early"
+    raw = json.loads(rows[0]["raw_inputs"])
+    # The pre-index trending timestamp is preserved and matches the stored snapshot.
+    assert raw["pre_index_trending_at"] is not None
+    cur = await db._conn.execute(
+        "SELECT MIN(snapshot_at) FROM trending_snapshots WHERE coin_id = 'dogwifhat'"
+    )
+    assert raw["pre_index_trending_at"] == (await cur.fetchone())[0]
+    await db.close()
+
+
+# ---------- amendment 2: filtered inputs never reach the gate; counted by reason --
+
+
+@pytest.mark.asyncio
+async def test_filtered_inputs_never_reach_gate_and_counted_by_reason(
+    tmp_path, monkeypatch
+):
+    """Pre-boundary rejects (non-CG source, missing id, malformed) never reach the
+    gate/score/arm logic, emit NO receipt, and are counted SEPARATELY BY REASON —
+    excluded from evaluated_n (reviewer amendment 2)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(DETECTION_ALERT_LANE_ENABLED=True)
+    _block_send(monkeypatch)
+
+    # Spy: the gate must receive ZERO calls for filtered inputs.
+    gate_calls: list = []
+
+    def _spy_gate(cand, settings):
+        gate_calls.append(getattr(cand, "contract_address", "?"))
+        return False
+
+    monkeypatch.setattr("scout.trading.detection_alert._passes_quality_gate", _spy_gate)
+
+    class _Malformed:
+        chain = "coingecko"
+
+        @property
+        def contract_address(self):
+            raise RuntimeError("boom")
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[
+                _cand("x", chain="solana"),  # non-CG source
+                _cand(""),  # missing id (empty contract_address)
+                _Malformed(),  # unreadable attributes
+            ],
+        )
+    # The gate (first substantive decision) was never reached.
+    assert gate_calls == []
+    # No receipts written for filtered inputs.
+    assert await _fetch_receipts(db) == []
+    summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+    assert summ["filtered_non_cg_source_n"] == 1
+    assert summ["filtered_missing_id_n"] == 1
+    assert summ["filtered_malformed_n"] == 1
+    # Filtered inputs never inflate the evaluated cohort; identity holds at 0.
+    assert summ["evaluated_n"] == 0
+    assert summ["evaluated_n"] == (
+        summ["receipts_written_n"]
+        + summ["exact_replays_n"]
+        + summ["write_failures_n"]
+        + summ["conflicting_duplicates_n"]
+    )
     await db.close()
 
 

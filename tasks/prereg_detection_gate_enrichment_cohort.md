@@ -51,13 +51,19 @@ Any statement of the form "sending caused X" is out of scope for this cohort.
 
 ## 3. Cohort start — deployment timestamp, no retroactive reconstruction (LOCK 5)
 
-The cohort begins at the **instrumentation DEPLOYMENT timestamp** (the moment
-the receipts writer goes live on the VPS). There is **no** retroactive
-reconstruction from pre-deployment data: gainers/trending snapshot retention is
-short and the dropped-candidate stream was never recorded, so pre-deployment
-decisions are permanently unrecoverable.
+Verbatim definition (reviewer amendment 3):
 
-> **Cohort start (UTC): __________________ (TBD — fill at deploy)**
+> **Cohort start = the first healthy production process activation after BOTH
+> the schema migration AND the PR #474 code are deployed.**
+
+This is **one immutable timestamp** — not merge time, not migration time, not an
+approximate window. Pre-timestamp decisions are **outside the cohort and cannot
+be reconstructed** (gainers/trending snapshot retention is short and the
+dropped-candidate stream was never recorded). There is no retroactive
+reconstruction from pre-deployment data.
+
+> **Cohort start (UTC): __________________ (TBD — record the first healthy
+> post-deploy process activation timestamp here at deploy)**
 
 Rows with `decided_at` before this timestamp (there should be none) are excluded.
 
@@ -95,6 +101,19 @@ Arm mapping frozen for the primary analysis (index-receipt outcome → arm):
 | `gate_fail_quality` | gate-failer (comparison) |
 | `sent` | gate-passer |
 | `not_early`, `universe_filter`, `dedup_24h`, `rate_limit`, `dispatch_failed`, `too_old` | reported separately (ineligible / non-gate drops); NOT part of the pass-vs-fail primary contrast |
+
+**`not_early` — verbatim semantics (reviewer amendment 1).**
+
+> `not_early`: the token had already entered CG trending before
+> `index_decision_at`; excluded from both primary arms and reported as flow
+> attrition.
+
+It **must never** count as a 24h/72h hit, a miss, a gate-passer, or a
+gate-failer in the primary comparison. The receipt preserves the underlying
+pre-index trending timestamp used for the classification in its `raw_inputs`
+payload as **`pre_index_trending_at`** (= `MIN(snapshot_at)` from
+`trending_snapshots`, the exact value the trigger read), so the "already
+trending" determination is durable and auditable.
 
 ---
 
@@ -168,22 +187,46 @@ repeated-token accounting.
 
 ---
 
-## 8. Reconciliation, coverage & retention (LOCK 4 + reviewer corrections)
+## 8. Evaluation boundary, reconciliation, coverage & retention (LOCK 4 + corrections)
 
-Every cycle the lane emits `detection_receipt_summary` with
-`evaluated_n / receipts_written_n / write_failures_n / conflicts_n`. The
-reconciliation invariant is:
+**Evaluation boundary (reviewer amendment 2).** In
+`notify_early_detections` there is an explicit boundary: rejection BEFORE it is a
+**filtered input** (no substantive decision logic — no score read, no gate
+comparison, no arm-relevant branching — has executed), so **no receipt** is
+emitted. The current pre-boundary filters are, by reason:
+
+- `filtered_non_cg_source` — `chain != "coingecko"` (the lane only evaluates CG);
+- `filtered_missing_id` — no `contract_address` (cannot key a receipt);
+- `filtered_malformed` — the candidate's own attributes cannot even be read.
+
+Once execution crosses the boundary (the first read of decision input — the
+authoritative `first_seen`/observation time), a receipt (or a separately-keyed
+equivalent) is **mandatory** for every terminal decision. Filtered inputs are
+counted **separately by reason** in `detection_receipt_summary` so they never
+disappear silently and never inflate `evaluated`.
+
+**Per-cycle reconciliation identity.** Every cycle the lane emits
+`detection_receipt_summary` with
+`evaluated_n / receipts_written_n / exact_replays_n / write_failures_n /
+conflicting_duplicates_n` plus the `filtered_*_n` reasons. The identity is:
 
 ```
-evaluated_n == receipts_written_n + write_failures_n     (conflicts_n must be 0)
+evaluated = receipts_written + exact_replays + write_failures + conflicting_duplicates
 ```
 
-**If receipts cannot be reconciled (the invariant fails, or `write_failures_n`
-or `conflicts_n` is non-zero over the cohort window), the cohort is INVALID for
-the affected window.** Coverage is reconciled per-cycle in-log; a standalone
-cron watchdog is intentionally not added for this table (§12a is satisfied by
-the per-cycle summary + the fact that the lane itself is already watchdogged and
-the writer only runs while `DETECTION_ALERT_LANE_ENABLED` is true).
+with the `filtered_*` counts reported BESIDE it and EXCLUDED from `evaluated`.
+This is also the **first-cycle reconciliation identity** used to validate the
+cohort at activation (reviewer amendment 3): on the first healthy post-deploy
+cycle the identity must hold and `write_failures` / `conflicting_duplicates` must
+be 0.
+
+**If receipts cannot be reconciled (the identity fails, or `write_failures` or
+`conflicting_duplicates` is non-zero over the cohort window), the cohort is
+INVALID for the affected window.** Coverage is reconciled per-cycle in-log; a
+standalone cron watchdog is intentionally not added for this table (§12a is
+satisfied by the per-cycle summary + the fact that the lane itself is already
+watchdogged and the writer only runs while `DETECTION_ALERT_LANE_ENABLED` is
+true).
 
 **Retention / prune guard (reviewer correction e).** Receipts MUST survive
 through both outcome horizons, reconciliation, manifest freeze, and final

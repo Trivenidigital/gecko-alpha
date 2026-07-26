@@ -232,9 +232,15 @@ async def _write_detection_receipt(
             raw_inputs=raw_inputs_json,
             idempotency_key=idempotency_key,
         )
-        # "inserted" and "idempotent_replay" are both healthy persisted state.
-        counters["written"] += 1
-        if result == "conflict":
+        # Bucket by result so the per-cycle reconciliation identity holds exactly
+        # (reviewer amendment 2):
+        #   evaluated == receipts_written + exact_replays + write_failures
+        #              + conflicting_duplicates
+        if result == "inserted":
+            counters["receipts_written"] += 1
+        elif result == "idempotent_replay":
+            counters["exact_replays"] += 1
+        elif result == "conflict":
             # Same idempotency key, materially different payload — a correctness
             # defect (e.g. the gate changed without a gate_version bump). Surface
             # it; it must never pass as healthy coverage (reviewer correction 3).
@@ -247,7 +253,7 @@ async def _write_detection_receipt(
                 gate_version=DETECTION_GATE_VERSION,
             )
     except Exception as e:
-        counters["failures"] += 1
+        counters["write_failures"] += 1
         log.warning(
             "detection_receipt_write_failed",
             token_id=token_id,
@@ -412,6 +418,28 @@ async def _fetch_price_mcap(
         return (None, None)
 
 
+async def _fetch_first_trending_at(db: Database, token_id: str) -> str | None:
+    """First CG-trending snapshot time for a token — the SAME value the trigger
+    classification reads (``MIN(snapshot_at)`` in
+    engine._compute_lead_time_vs_trending).
+
+    Preserved verbatim on a ``not_early`` receipt as ``pre_index_trending_at``
+    (reviewer amendment 1) so the pre-index trending timestamp that drove the
+    "already trending" classification is durable. Fail-soft: None when the token
+    has no snapshot (e.g. a status='error' classification) or the read fails.
+    """
+    try:
+        cur = await db._conn.execute(
+            "SELECT MIN(snapshot_at) FROM trending_snapshots WHERE coin_id = ?",
+            (token_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        log.exception("detection_alert_trending_fetch_failed", token_id=token_id)
+        return None
+
+
 async def _count_sent_today(db: Database, now: datetime) -> int:
     """Number of detection-lane alerts sent since UTC midnight."""
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -494,14 +522,24 @@ async def notify_early_detections(
 
     now = now or datetime.now(timezone.utc)
     decided_at = now.isoformat()
-    # Reviewer LOCK 4 + correction 3: per-cycle reconciliation counters. Every
-    # terminal decision writes exactly one receipt via _write_detection_receipt,
-    # which advances these; the invariant evaluated == written + failures is
-    # surfaced each cycle in the detection_receipt_summary log so coverage gaps
-    # (a cohort is INVALID if receipts cannot be reconciled) are detectable, and
-    # ``conflicts`` (same idempotency key, materially different payload) can
-    # never pass as healthy coverage.
-    receipt_counters = {"evaluated": 0, "written": 0, "failures": 0, "conflicts": 0}
+    # Reviewer LOCK 4 + corrections 3 & 2: per-cycle reconciliation counters.
+    # Every terminal decision (past the evaluation boundary) writes exactly one
+    # receipt via _write_detection_receipt, bucketed so the identity
+    #   evaluated == receipts_written + exact_replays + write_failures + conflicts
+    # holds exactly; `conflicts` (same key, materially different payload) can
+    # never pass as healthy coverage. filtered_* count PRE-boundary rejected
+    # inputs SEPARATELY BY REASON — they never inflate `evaluated` and never
+    # disappear silently. All are surfaced each cycle in detection_receipt_summary.
+    receipt_counters = {
+        "evaluated": 0,
+        "receipts_written": 0,
+        "exact_replays": 0,
+        "write_failures": 0,
+        "conflicts": 0,
+        "filtered_missing_id": 0,
+        "filtered_non_cg_source": 0,
+        "filtered_malformed": 0,
+    }
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -522,15 +560,29 @@ async def notify_early_detections(
         pool = 0
         entries: list[tuple[int, float, object, float | None, str | None]] = []
         for cand in candidates:
-            # Input filter (NOT an evaluated candidate — the CG detection lane
-            # does not evaluate non-CG rows, and a null id cannot key a receipt):
-            # no receipt is emitted here. The evaluated cohort begins once a
-            # candidate is confirmed CG-sourced with a token_id.
-            if getattr(cand, "chain", None) != "coingecko":
+            # ---- INPUT-FILTER ZONE (pre-evaluation boundary) ----------------
+            # Rejections here are FILTERED INPUTS, NOT evaluated candidates: no
+            # substantive decision logic (score read, gate comparison,
+            # arm-relevant branching) has run yet, so NO receipt is emitted. Each
+            # reason is counted SEPARATELY (reviewer amendment 2) so filtered
+            # inputs never disappear silently and never inflate `evaluated`.
+            try:
+                chain = getattr(cand, "chain", None)
+                token_id = getattr(cand, "contract_address", None)
+            except Exception:
+                # A candidate so malformed its own attributes cannot be read.
+                receipt_counters["filtered_malformed"] += 1
                 continue
-            token_id = getattr(cand, "contract_address", None)
+            if chain != "coingecko":
+                receipt_counters["filtered_non_cg_source"] += 1
+                continue
             if not token_id:
+                receipt_counters["filtered_missing_id"] += 1
                 continue
+            # ===== EVALUATION BOUNDARY =======================================
+            # Past this line substantive decision logic executes (the first read
+            # of decision input — the authoritative first_seen/observation time),
+            # so EVERY terminal decision below MUST emit exactly one receipt.
             first_seen_iso, mcap_db = await _fetch_first_seen_mcap(db, token_id)
             age_min = _age_minutes(first_seen_iso, now)
             if age_min is None or age_min > settings.DETECTION_ALERT_MAX_AGE_MIN:
@@ -626,7 +678,11 @@ async def notify_early_detections(
             if not _detection_trigger(lead_time_min, status):
                 # Terminal decision: gate-passer CG has already trended past.
                 # Previously an unlogged `continue`; the receipt makes this
-                # (evaluated-but-not-early) cohort recoverable (LOCK 1).
+                # (evaluated-but-not-early) cohort recoverable (LOCK 1). Preserve
+                # the pre-index trending timestamp that drove the classification
+                # (reviewer amendment 1) so not_early is auditable as flow
+                # attrition — never a primary-arm hit/miss.
+                pre_index_trending_at = await _fetch_first_trending_at(db, token_id)
                 await _write_detection_receipt(
                     db,
                     settings,
@@ -640,6 +696,7 @@ async def notify_early_detections(
                     extra_inputs={
                         "lead_time_min": lead_time_min,
                         "lead_time_status": status,
+                        "pre_index_trending_at": pre_index_trending_at,
                     },
                 )
                 continue
@@ -792,17 +849,25 @@ async def notify_early_detections(
             sent=sent_count,
             cap=settings.DETECTION_ALERT_MAX_PER_DAY,
         )
-        # Reviewer LOCK 4 + correction 3: per-cycle receipt reconciliation. The
-        # invariant is evaluated_n == receipts_written_n + write_failures_n; if
-        # it does not hold, or receipts otherwise cannot be reconciled, the
-        # cohort is INVALID (documented in the prereg). conflicts_n must be 0 for
-        # healthy coverage.
+        # Reviewer LOCK 4 + corrections 2 & 3: per-cycle receipt reconciliation.
+        # Identity (must hold every cycle):
+        #   evaluated_n == receipts_written_n + exact_replays_n
+        #              + write_failures_n + conflicting_duplicates_n
+        # If it does not hold, or receipts otherwise cannot be reconciled, the
+        # cohort is INVALID (documented in the prereg). conflicting_duplicates_n
+        # must be 0 for healthy coverage. filtered_*_n are reported BESIDE the
+        # identity (excluded from evaluated_n) so pre-boundary rejections stay
+        # visible by reason and never inflate the evaluated cohort.
         log.info(
             "detection_receipt_summary",
             evaluated_n=receipt_counters["evaluated"],
-            receipts_written_n=receipt_counters["written"],
-            write_failures_n=receipt_counters["failures"],
-            conflicts_n=receipt_counters["conflicts"],
+            receipts_written_n=receipt_counters["receipts_written"],
+            exact_replays_n=receipt_counters["exact_replays"],
+            write_failures_n=receipt_counters["write_failures"],
+            conflicting_duplicates_n=receipt_counters["conflicts"],
+            filtered_missing_id_n=receipt_counters["filtered_missing_id"],
+            filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
+            filtered_malformed_n=receipt_counters["filtered_malformed"],
         )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.
