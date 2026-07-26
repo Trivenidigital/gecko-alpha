@@ -1450,3 +1450,65 @@ async def test_migration_idempotent(tmp_path):
     assert r1 == "inserted" and r2 == "idempotent_replay"
     assert len(await _fetch_receipts(db, "tok")) == 1
     await db.close()
+
+
+# ---------- two-identity: evaluation instance created before persistence -------
+
+
+def test_evaluation_instance_key_reused_not_regenerated():
+    """The evaluation-instance identifier (decided_at) is created BEFORE
+    persistence and REUSED: re-deriving the key for the SAME evaluation yields a
+    byte-identical key (an exact retry collapses), while a different evaluation
+    instance (a later cycle) yields a different key (a new evaluation)."""
+    a1 = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-1"
+    )
+    a2 = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-1"
+    )
+    assert a1 == a2  # reused, not regenerated → retry is NOT a new evaluation
+    b = _receipt_idempotency_key(
+        "tok", "too_old", "obs", DETECTION_GATE_VERSION, "cyc-2"
+    )
+    assert a1 != b  # a later cycle is a distinct evaluation
+
+
+# ---------- disk-pressure fail-closed: accrual suspended, send path intact ------
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_suspends_accrual_send_unaffected(tmp_path, monkeypatch):
+    """With the disk guard enabled and an impossible free-space floor, receipt
+    accrual is SUSPENDED (no rows written, coverage_healthy=False,
+    skipped_disk_pressure_n>0) while the SEND path is unaffected (the EARLY DETECT
+    alert still fires). Never prunes/samples."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_MIN_FREE_GB=100000.0,  # forces disk pressure
+    )
+    await _insert_candidate(db, "dogwifhat", first_seen_min_ago=5.0)
+    await _insert_price(db, "dogwifhat")
+    sent = _capture_send(monkeypatch)
+
+    with capture_logs() as logs:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[
+                _cand("dogwifhat", quant_score=8, signals_fired=["cg_trending_rank"])
+            ],
+        )
+    # Send path unaffected — the detection alert still went out.
+    assert any(t.startswith("🔎 EARLY DETECT") for t in sent)
+    # Accrual suspended — NO receipts written, coverage flagged unhealthy.
+    assert await _fetch_receipts(db) == []
+    summ = [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+    assert summ["coverage_healthy"] is False
+    assert summ["skipped_disk_pressure_n"] == summ["evaluated_n"] >= 1
+    assert summ["newly_written_n"] == 0
+    assert any(e["event"] == "detection_receipt_disk_pressure" for e in logs)
+    await db.close()

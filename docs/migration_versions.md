@@ -67,6 +67,7 @@ number to appear in the table below.
 | 20260711 | retire_dead_tables_v1 | #461 |
 | 20260720 | dex_discovery_v1 | #469 |
 | 20260726 | detection_decision_receipts_v1 | #474 |
+| 20260727 | detection_receipt_archive_v1 | #475 |
 
 ## Notes / gaps
 

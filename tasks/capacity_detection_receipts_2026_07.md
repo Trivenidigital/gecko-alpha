@@ -7,13 +7,16 @@ two-identity write model ships in `scout/db.py` + `scout/trading/detection_alert
 > line above included for hygiene only. This doc DESCRIBES storage options and
 > reports measurements; it does not implement any storage change.
 
-**Status: BLOCKING.** Under the reviewer-mandated **evaluation-identity** model
-(each poll of a candidate is a new receipt row), the receipts table grows
-per-evaluation. Measured production shakedown + a calibrated benchmark show a
-single-file 120-day retention is **not sustainable** on the current VPS. The
-two-identity write model ships as specified; the storage design below is
-DESCRIBED for reviewer ruling, and the replacement cohort does not start until a
-storage design is approved (prereg §3 gate).
+**Status: architecture APPROVED + IMPLEMENTED (2026-07-26).** Under the
+evaluation-identity model each poll is a new receipt row, so a single-file
+120-day retention is not sustainable (measurements below). The approved
+**lifecycle-tiered hot SQLite + time-partitioned compressed cold archive +
+queryable integrity manifest** is now implemented in
+`scout/trading/receipt_archive.py` (+ migration `20260727` in `scout/db.py`,
+config in `scout/config.py`). §11 records the backup-multiplier clarification and
+the off-host destination finding. The replacement cohort still does not start
+until the storage design is confirmed operationally + an off-host destination is
+provisioned (prereg §3 gate + §11).
 
 All prod reads were `sqlite3 -readonly`; the benchmark ran on a `/tmp` scratch
 file. scout.db was never written.
@@ -133,18 +136,22 @@ projected volume.** (Bench calibrated to the real `raw_inputs` shape + the real
 
 ---
 
-## 7. Disk headroom + proposed fail-closed disk-pressure threshold (DESCRIBE)
+## 7. Disk headroom + fail-closed disk-pressure guard (IMPLEMENTED)
 
-Headroom: **36 GB free / 75 GB (51% used)**. Proposed guard (fail-closed,
-consistent with LOCK 4) — **describe, do not implement here**:
+Headroom: **36 GB free / 75 GB (51% used)**. Guard (fail-closed, consistent with
+LOCK 4) — now implemented (`check_disk_pressure` + the lane guard, gated behind
+`DETECTION_RECEIPT_DISK_GUARD_ENABLED`, default OFF):
 
-- When free disk `< max(10 GB, 15%)`, the receipts writer **stops writing new
-  receipts**; the **send path is unaffected**.
-- The gap is surfaced: a `detection_receipt_disk_pressure` structured event + a
-  new `skipped_disk_pressure_n` counter in `detection_receipt_summary`, so the
-  coverage gap is explicit and the affected cohort window is flagged invalid (a
-  window with skipped receipts cannot be reconciled).
-- Fail-closed = stop writing rather than fill the disk and take down the pipeline.
+- When free disk `< max(DETECTION_RECEIPT_DISK_MIN_FREE_GB=10 GB,
+  DETECTION_RECEIPT_DISK_MIN_FREE_PCT=15%)`, receipt **accrual is suspended** for
+  the cycle; the **send path is unaffected**.
+- The gap is surfaced: a `detection_receipt_disk_pressure` structured event + an
+  operator alert (parse_mode=None, §12b dispatched/delivered logs) + a
+  `skipped_disk_pressure_n` counter and `coverage_healthy=false` in
+  `detection_receipt_summary`, so the reconciliation identity intentionally does
+  NOT close and the window is flagged invalid.
+- Fail-closed = stop accruing rather than fill the disk; never prune/sample/reduce
+  detail. Test: `test_disk_pressure_suspends_accrual_send_unaffected`.
 
 ---
 
@@ -174,7 +181,7 @@ documented timestamp-range only — never deleted/mutated (prereg §3).
 
 ---
 
-## 10. Storage-design options (DESCRIBE — for reviewer ruling; NOT implemented)
+## 10. Storage-design options (APPROVED choice C+D+B IMPLEMENTED; §12)
 
 120 days is an **evidence-retention** requirement, not a single-file mandate. All
 options below preserve the COMPLETE evidence model (every evaluation reconstructable;
@@ -210,3 +217,71 @@ backup amplification) with **D** (lifecycle tiering, fixes hot-row count), and
 optionally **B** (normalization) to cut per-row cost. This keeps `scout.db` and
 its backups small while preserving the full 120-day reproducible evidence lifecycle.
 Final choice is the reviewer's; the two-identity write model is independent of it.
+
+---
+
+## 11. Backup topology + off-host destination finding (DISCOVERED, srilu 2026-07-26)
+
+**Backup mechanism (read-only discovery).** `gecko-backup.service` (systemd
+`gecko-backup.timer`, daily 03:00) runs `/usr/local/bin/gecko-backup-create.sh`
+(sqlite3 online `.backup` + `PRAGMA integrity_check`) then
+`/usr/local/bin/gecko-backup-rotate.sh` (keep top-N by mtime).
+`gecko-backup-watchdog.timer` alerts on staleness. Env:
+`GECKO_BACKUP_DIR=/root/gecko-alpha`, `GECKO_BACKUP_KEEP=3`.
+
+**The gecko backup is LOCAL-ONLY.** Neither script does any off-host transfer —
+no `rsync`/`scp`/`s3`/`rclone` step. `rclone`/`restic`/`borg`/`aws`/`b2` are NOT
+installed (`rsync` + `scp` binaries exist but no destination is configured). The
+only S3 path on the box is in a DIFFERENT project's `shift-agent-backup.sh`
+(optional `aws s3 sync`, gated on `S3_BUCKET` + `aws`, both currently absent).
+
+**⇒ Off-host destination = operator-provisioned dependency.** No reachable
+off-host destination is currently discoverable for gecko. Per the reviewer's
+directive, everything else is implemented and the archival transaction's **step 6
+fails closed**: with `DETECTION_RECEIPT_OFFHOST_DIR` empty (the default), the
+archiver publishes the partition + manifest but **holds the hot rows** (status
+`held_hot_no_offhost`) and never deletes them until an operator provisions a
+genuine off-host / replicated destination. When set, the archiver copies +
+fsyncs + hash-verifies the partition at that destination before any hot delete;
+the operator must also arrange manifest+hash verification after transfer,
+missing/corrupt-partition monitoring, and a periodic scratch restore-and-query
+test (a local-only dir is INSUFFICIENT for durability).
+
+**Backup multiplier — clarified.** `GECKO_BACKUP_KEEP=3` means **3 RETAINED
+backup files PLUS the live DB = 4 full copies**, ALL on the same host/disk
+(`/dev/sda1`). Projected totals (2.9-min cadence, 749 B/row all-in):
+
+| Component | Now | + 30d receipts (single-file) | + 120d receipts (single-file) |
+|---|--:|--:|--:|
+| Live scout.db | 4.0 GB | ~12.1 GB | ~36.2 GB |
+| WAL + headroom | ~0.03 GB | ~0.03 GB | ~0.03 GB |
+| Retained backup ×1 | 4.0 GB | ~12.1 GB | ~36.2 GB |
+| Retained backup ×2 | 3.7 GB | ~12.1 GB | ~36.2 GB |
+| Retained backup ×3 | 3.5 GB | ~12.1 GB | ~36.2 GB |
+| **Total (4 copies)** | **~15.2 GB** | **~48.4 GB** | **~144.8 GB** |
+| Disk capacity | 75 GB | 75 GB | 75 GB |
+| **Fits?** | yes | **NO (>75 GB)** | **NO (>75 GB)** |
+
+Single-file retention breaks the keep-3 rotation at ~30 days and catastrophically
+at 120 days. The implemented hot/cold split keeps the **hot** table bounded to
+index receipts + in-lifecycle rows (bench: 24 hot rows → 4 after archival), so the
+live DB + its 3 rotated backups stay near today's ~15 GB, while the ~99.9%
+post-index `too_old` re-polls live in immutable compressed cold partitions that
+sit OUTSIDE the keep-3 rotation and are replicated once to the operator-provisioned
+off-host destination.
+
+---
+
+## 12. Implementation map (what the next head added)
+
+| Reviewer requirement | Where | Test(s) |
+|---|---|---|
+| Archive/lifecycle (hot+cold, manifest) | `receipt_archive.ReceiptArchiver.archive_once` (7-step); migration `20260727` | `test_archive_once_publishes_and_deletes_hot`, `test_hot_storage_stays_bounded_after_archival` |
+| Unique analytical-index guarantee | `receipt_archive.index_decisions` (ROW_NUMBER over `decided_at,id`, cohort+shakedown scoped) | `test_index_decisions_unique_per_token_even_with_ties`, `test_index_excludes_shakedown_and_pre_cohort` |
+| Evaluation-instance id before persistence + reused on retry | `detection_alert._receipt_idempotency_key` (+ frozen `decided_at`) | `test_evaluation_instance_key_reused_not_regenerated`, `test_receipt_intra_cycle_exact_retry_is_replay` |
+| Backup + restore controls | `restore_and_reconcile`, `ColdArchiveReader`, `verify_partition`, off-host copy+verify | `test_restore_and_reconcile_after_archive`, `test_verify_and_reader_detect_corruption` |
+| Archive atomicity + corruption | 7-step fail-closed (verify/reconcile/off-host gates) | `test_no_offhost_holds_rows_hot`, `test_reconcile_mismatch_leaves_hot_untouched`, `test_verify_and_reader_detect_corruption` |
+| Disk-pressure fail-closed | `check_disk_pressure` + lane guard (suspend accrual, alert, coverage unhealthy, send path intact) | `test_disk_pressure_suspends_accrual_send_unaffected`, `test_disk_pressure_flags_when_below_threshold` |
+| Hot storage stays bounded | archival deletes post-index rows only after off-host confirm | `test_hot_storage_stays_bounded_after_archival` (bench: 24→4) |
+| End-to-end restore-and-reconcile | `restore_and_reconcile` (verify + id-hash + no-duplication) | `test_restore_and_reconcile_after_archive` |
+| Migration idempotency | `_migrate_detection_receipt_archive_v1` | `test_archive_migration_idempotent` |

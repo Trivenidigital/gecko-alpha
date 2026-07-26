@@ -210,6 +210,10 @@ class Database:
         # gate-FAILER comparison cohort is recoverable (behavior-neutral).
         await self._migrate_detection_decision_receipts_v1()
 
+        # Receipt lifecycle-archive substrate (hot cohort/manifest tables) for
+        # the approved hot+cold storage architecture. schema_version 20260727.
+        await self._migrate_detection_receipt_archive_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -1501,6 +1505,120 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount or 0
+
+    async def _migrate_detection_receipt_archive_v1(self) -> None:
+        """Receipt lifecycle-archive substrate, schema_version 20260727.
+
+        Two bare-additive HOT-tier tables (#424-style) supporting the approved
+        hot/cold architecture (tasks/capacity_detection_receipts_2026_07.md):
+
+        - ``detection_receipt_cohorts`` — cohort definitions + status. Carries the
+          immutable cohort start (application-ready, post-migration), the
+          shakedown exclusion range, the reconciled-through watermark (how far
+          per-cycle reconciliation has verified), and the close/analysis status.
+          The analytical-index selection embeds a cohort id + shakedown exclusion
+          via this table.
+        - ``detection_receipt_archive_manifest`` — one row per PUBLISHED immutable
+          cold partition. Each carries schema+serialization version, record count,
+          min/max evaluation timestamps, cohort ids represented, a deterministic
+          content hash, the source hot receipt-id range + a hash of the exact
+          source ids, creation+verification timestamps, the archive-tool version,
+          the partition path/bytes, and off-host durable-copy confirmation. The
+          cold data is queryable via the manifest + the reader in
+          scout/trading/receipt_archive.py.
+
+        Observe-only substrate; nothing here feeds the scorer/gate/trader/sender.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS detection_receipt_cohorts (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cohort_key         TEXT NOT NULL UNIQUE,
+                    cohort_start       TEXT NOT NULL,
+                    shakedown_start    TEXT,
+                    shakedown_end      TEXT,
+                    reconciled_through TEXT,
+                    status             TEXT NOT NULL,
+                    closed_at          TEXT,
+                    created_at         TEXT NOT NULL
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS detection_receipt_archive_manifest (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    partition_id          TEXT NOT NULL UNIQUE,
+                    schema_version        INTEGER NOT NULL,
+                    serialization         TEXT NOT NULL,
+                    archive_tool_version  TEXT NOT NULL,
+                    record_count          INTEGER NOT NULL,
+                    min_decided_at        TEXT NOT NULL,
+                    max_decided_at        TEXT NOT NULL,
+                    cohort_ids            TEXT NOT NULL,
+                    content_hash          TEXT NOT NULL,
+                    source_min_receipt_id INTEGER NOT NULL,
+                    source_max_receipt_id INTEGER NOT NULL,
+                    source_ids_hash       TEXT NOT NULL,
+                    partition_path        TEXT NOT NULL,
+                    compressed_bytes      INTEGER NOT NULL,
+                    created_at            TEXT NOT NULL,
+                    verified_at           TEXT,
+                    offhost_confirmed     INTEGER NOT NULL DEFAULT 0,
+                    offhost_confirmed_at  TEXT,
+                    status                TEXT NOT NULL
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ddr_manifest_decided "
+                "ON detection_receipt_archive_manifest(min_decided_at, max_decided_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ddr_manifest_status "
+                "ON detection_receipt_archive_manifest(status)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260727, now_iso, "detection_receipt_archive_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception(
+                "schema_migration_failed", migration="detection_receipt_archive_v1"
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="detection_receipt_archive_v1",
+                )
+            _log.error(
+                "SCHEMA_DRIFT_DETECTED", migration="detection_receipt_archive_v1"
+            )
+            raise
+
+        cur = await conn.execute(
+            "SELECT description FROM schema_version WHERE version = ?", (20260727,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "detection_receipt_archive_v1 schema_version row missing after migration"
+            )
 
     # ------------------------------------------------------------------
     # BL-076: shared metadata resolver

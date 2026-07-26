@@ -40,6 +40,7 @@ from scout import alerter
 from scout.config import Settings
 from scout.db import Database
 from scout.trading.engine import _compute_lead_time_vs_trending
+from scout.trading.receipt_archive import check_disk_pressure
 
 # Reuse the paper-lane formatters + universe guard verbatim (card-v2 parity).
 from scout.trading.tg_alert_dispatch import (
@@ -200,6 +201,12 @@ async def _write_detection_receipt(
     inputs the caller passes via ``extra_inputs``).
     """
     counters["evaluated"] += 1
+    if counters.get("disk_suspended"):
+        # Disk-pressure fail-closed: accrual is SUSPENDED this cycle. We count the
+        # evaluation as skipped (coverage is unhealthy) but write NO receipt and
+        # NEVER prune/sample/reduce detail. The send path is unaffected upstream.
+        counters["skipped_disk_pressure"] += 1
+        return
     quant_raw = getattr(cand, "quant_score", None)  # int | None (raw model value)
     score_before = quant_raw if isinstance(quant_raw, int) else None
     score_after = int(quant_raw or 0)  # the operand the gate actually compares
@@ -541,6 +548,12 @@ async def notify_early_detections(
         return
 
     now = now or datetime.now(timezone.utc)
+    # EVALUATION-INSTANCE IDENTIFIER (reviewer, 2026-07-26): created ONCE here,
+    # BEFORE any persistence, and reused for every receipt in this cycle AND for
+    # every retry of the same insert. It is the cycle-frozen ``decided_at`` — a
+    # deterministic value, NOT a per-insert-attempt UUID/timestamp, so an exact
+    # retry re-derives the SAME idempotency key (via _receipt_idempotency_key)
+    # and collapses to one row rather than becoming a new evaluation.
     decided_at = now.isoformat()
     # Reviewer LOCK 4 + corrections 2 & 3 + two-identity naming: per-cycle
     # reconciliation counters. Every terminal decision (past the evaluation
@@ -562,7 +575,40 @@ async def notify_early_detections(
         "filtered_missing_id": 0,
         "filtered_non_cg_source": 0,
         "filtered_malformed": 0,
+        "skipped_disk_pressure": 0,
+        "disk_suspended": False,
     }
+    # Disk-pressure fail-closed guard (approved architecture). If the box is low
+    # on space, SUSPEND receipt accrual for this cycle: mark coverage unhealthy,
+    # alert, and preserve existing receipts+manifests. The SEND PATH is never
+    # touched (that lives in the paper/detection dispatch, not here), and we NEVER
+    # silently prune/sample/reduce detail.
+    _disk = (
+        check_disk_pressure(db._db_path, settings)
+        if settings.DETECTION_RECEIPT_DISK_GUARD_ENABLED
+        else None
+    )
+    if _disk is not None and not _disk.healthy:
+        receipt_counters["disk_suspended"] = True
+        log.warning(
+            "detection_receipt_disk_pressure",
+            reason=_disk.reason(),
+            free_gb=round(_disk.free_bytes / 1e9, 2),
+            free_pct=round(_disk.free_pct, 1),
+        )
+        try:
+            # §12b: plain text (parse_mode=None), bracketed dispatched/delivered.
+            log.info("detection_receipt_disk_pressure_alert_dispatched")
+            await alerter.send_telegram_message(
+                f"disk pressure: detection receipt accrual SUSPENDED ({_disk.reason()})",
+                session,
+                settings,
+                parse_mode=None,
+                source="detection_receipt_disk_pressure",
+            )
+            log.info("detection_receipt_disk_pressure_alert_delivered")
+        except Exception as _e:  # never break the lane on an alert failure
+            log.warning("detection_receipt_disk_pressure_alert_failed", err=str(_e))
     try:
         remaining = settings.DETECTION_ALERT_MAX_PER_DAY - await _count_sent_today(
             db, now
@@ -883,6 +929,9 @@ async def notify_early_detections(
         # exact_replays_n == conflicting_duplicates_n == 0. filtered_*_n are
         # reported BESIDE the identity (excluded from evaluated_n) so pre-boundary
         # rejections stay visible by reason and never inflate the evaluated cohort.
+        # ``coverage_healthy`` is False when disk-pressure suspended accrual
+        # (skipped_disk_pressure_n > 0): the identity intentionally does NOT close
+        # then, flagging the coverage gap so the cohort window is marked invalid.
         log.info(
             "detection_receipt_summary",
             evaluated_n=receipt_counters["evaluated"],
@@ -890,9 +939,11 @@ async def notify_early_detections(
             exact_replays_n=receipt_counters["exact_replays"],
             write_failures_n=receipt_counters["write_failures"],
             conflicting_duplicates_n=receipt_counters["conflicts"],
+            skipped_disk_pressure_n=receipt_counters["skipped_disk_pressure"],
             filtered_missing_id_n=receipt_counters["filtered_missing_id"],
             filtered_non_cg_source_n=receipt_counters["filtered_non_cg_source"],
             filtered_malformed_n=receipt_counters["filtered_malformed"],
+            coverage_healthy=not receipt_counters["disk_suspended"],
         )
     except Exception:
         # Belt-and-braces: the lane must never break the pipeline cycle.

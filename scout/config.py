@@ -877,6 +877,50 @@ class Settings(BaseSettings):
     # close-out. Set it only after the cohort's final analysis is frozen.
     DETECTION_RECEIPTS_COHORT_CLOSED_AT: str = ""
 
+    # --- Receipt lifecycle archive (approved architecture, 2026-07-26) --------
+    # Ordinary post-index receipts (the ~99.9% too_old re-polls) leave the hot
+    # scout.db table ONLY via the 7-step fail-closed archival transaction in
+    # scout/trading/receipt_archive.py: select frozen range → write temp
+    # partition → flush+verify → reconcile count+hash → atomically publish
+    # partition+manifest → confirm independent durable copy → THEN delete hot
+    # rows. Cold partitions are gzip-compressed JSONL; an integrity manifest lives
+    # HOT in scout.db. See tasks/capacity_detection_receipts_2026_07.md.
+    #
+    # Default OFF — archiving only runs when explicitly enabled. The hot tier
+    # keeps: cohort defs/status, analytical-index receipts, in-lifecycle rows,
+    # and anything unreconciled/under-investigation.
+    DETECTION_RECEIPT_ARCHIVE_ENABLED: bool = False
+    # Local directory for published cold partitions + temp partitions. Empty
+    # disables archiving (the writer is inert). Must be on a durable filesystem.
+    DETECTION_RECEIPT_ARCHIVE_DIR: str = ""
+    # Maturity horizon (hours): a receipt is archive-ELIGIBLE only once its
+    # outcome horizon has matured AND its source cycle is reconciled. >= 72 so the
+    # 72h key-secondary endpoint is always observed on hot rows before archival.
+    DETECTION_RECEIPT_ARCHIVE_HORIZON_HOURS: int = Field(default=72, ge=72)
+    # Max receipts per cold partition (bounds partition size + verify cost).
+    DETECTION_RECEIPT_ARCHIVE_PARTITION_MAX_ROWS: int = Field(
+        default=50_000, ge=1_000, le=1_000_000
+    )
+    # Independent durable off-host copy destination (step 6). A LOCAL-ONLY dir is
+    # INSUFFICIENT for durability, so this is a path the box's existing off-host
+    # mechanism replicates (e.g. an rsync/scp target dir or an S3-synced dir).
+    # DISCOVERY (srilu, 2026-07-26): the gecko backup (gecko-backup.service) is
+    # LOCAL-ONLY (GECKO_BACKUP_DIR=/root/gecko-alpha, keep-3, no rsync/scp/s3);
+    # no off-host tooling (rclone/restic/borg/aws) is provisioned. So this is
+    # EMPTY by default → step 6 fails closed and holds rows HOT until an operator
+    # provisions an off-host destination. "off-host = operator-provisioned
+    # dependency." When set, the archiver requires the partition to also exist +
+    # hash-match at this destination before deleting hot rows.
+    DETECTION_RECEIPT_OFFHOST_DIR: str = ""
+    # Disk-pressure fail-closed guard. Default OFF (a new behavior; observe-first
+    # + avoids surprising the lane on a low-disk dev/CI box). When enabled, on
+    # breach the receipts writer stops ACCRUING (send path UNCHANGED), alerts
+    # (parse_mode=None), marks coverage unhealthy, and preserves existing
+    # receipts+manifests — never silently prunes/samples/reduces detail.
+    DETECTION_RECEIPT_DISK_GUARD_ENABLED: bool = False
+    DETECTION_RECEIPT_DISK_MIN_FREE_GB: float = Field(default=10.0, ge=1.0)
+    DETECTION_RECEIPT_DISK_MIN_FREE_PCT: float = Field(default=15.0, ge=1.0, le=90.0)
+
     # BL-NEW-TRADE-SURFACE-TG-ALERTS: optional scarce Telegram alert lane
     # sourced from the Today Focus and Now Tradable dashboard surfaces. Kept
     # behind an env flag because it creates new operator-facing messages; the

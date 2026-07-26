@@ -340,11 +340,13 @@ the two-identity model the per-evaluation row volume makes a single 120-day
 SQLite file infeasible on the current box (see the capacity artifact
 `tasks/capacity_detection_receipts_2026_07.md`). The evidence lifecycle
 (reconciliation → both horizons → cohort closure → final analysis → audit buffer)
-must still be preserved for ≥120 days, but MAY be preserved across an immutable,
-reproducible archive rather than one hot table. The concrete storage design is
-DESCRIBED (not implemented) in the capacity artifact for reviewer ruling; the
-two-identity write model ships unchanged regardless of which storage option is
-chosen.
+is preserved for ≥120 days across the approved + IMPLEMENTED **lifecycle-tiered
+hot SQLite + time-partitioned compressed cold archive + queryable integrity
+manifest** (`scout/trading/receipt_archive.py`). Ordinary post-index receipts
+leave the hot table only via the fail-closed 7-step archival transaction (which
+holds rows hot until an independent off-host durable copy is confirmed); the hot
+prune guards above still protect index receipts + in-lifecycle rows. The
+two-identity write model is unchanged by the storage tiering.
 
 ---
 
