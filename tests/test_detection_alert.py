@@ -1779,3 +1779,131 @@ async def test_disk_pressure_recovery_notification(tmp_path, monkeypatch):
     )
     assert pressure == 1 and recovery == 1
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_disk_pressure_restart_no_page_storm_full_lifecycle(
+    tmp_path, monkeypatch
+):
+    """RESTART-WHILE-BREACHED: a process crashes/restarts while disk pressure is
+    ALREADY breached. Restart is simulated by resetting the module-level paging
+    state (what a fresh process has). Proves the restarted process:
+
+    (1) emits at most ONE immediate page;
+    (2) then respects the cooldown on subsequent breached cycles;
+    (3) keeps the breached status visible (disk_pressure_active / paging_cooled);
+    (4) has suspension + cohort invalidation active IMMEDIATELY on the first
+        post-restart cycle (no receipts written, coverage_healthy=false);
+    (5) still lets a critical escalation bypass the cooldown post-restart;
+    (6) emits exactly ONE distinct recovery notification when pressure clears.
+    """
+
+    def _pressure(logs):
+        return sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_pressure_alert_dispatched"
+        )
+
+    def _recovery(logs):
+        return sum(
+            1
+            for e in logs
+            if e["event"] == "detection_receipt_disk_recovery_alert_dispatched"
+        )
+
+    def _summary(logs):
+        return [e for e in logs if e["event"] == "detection_receipt_summary"][-1]
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    settings = _settings(
+        DETECTION_ALERT_LANE_ENABLED=True,
+        DETECTION_RECEIPT_DISK_GUARD_ENABLED=True,
+        DETECTION_RECEIPT_DISK_ALERT_COOLDOWN_HOURS=6.0,
+        DETECTION_RECEIPT_DISK_CRITICAL_FREE_GB=3.0,
+    )
+    # A gate-fail candidate never sends, so the only pages are disk pages; under
+    # suspension it is skipped (no receipt), proving accrual is suspended.
+    await _insert_candidate(db, "failer", first_seen_min_ago=6.0)
+    await _insert_price(db, "failer")
+    _capture_send(monkeypatch)
+    cand = _cand("failer", quant_score=0, signals_fired=[])
+    # Disk sequence: old(warn 8) | restart | N1(warn 8) N2(warn 8) N3(crit 2) N4(ok 40)
+    _stub_disk(
+        monkeypatch,
+        [
+            _dp(False, 8.0),
+            _dp(False, 8.0),
+            _dp(False, 8.0),
+            _dp(False, 2.0),
+            _dp(True, 40.0),
+        ],
+    )
+    base = datetime.now(timezone.utc)
+
+    # OLD process: an ongoing breach that has already paged once.
+    _reset_disk_state(monkeypatch)
+    with capture_logs() as l_old:
+        await notify_early_detections(
+            db, settings, session=None, candidates=[cand], now=base
+        )
+    assert _pressure(l_old) == 1
+
+    # ---- RESTART: a fresh process starts with EMPTY module paging state ----
+    _reset_disk_state(monkeypatch)
+
+    # (1)+(4) First post-restart cycle (still breached): exactly ONE immediate page,
+    # suspension + invalidation active immediately.
+    with capture_logs() as l1:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=5),
+        )
+    assert _pressure(l1) == 1
+    s1 = _summary(l1)
+    assert s1["disk_pressure_active"] is True
+    assert s1["coverage_healthy"] is False
+    assert s1["skipped_disk_pressure_n"] >= 1
+    assert await _fetch_receipts(db) == []  # accrual suspended → nothing persisted
+
+    # (2)+(3) Next breached cycle within cooldown: NO page, breach still visible.
+    with capture_logs() as l2:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=6),
+        )
+    assert _pressure(l2) == 0
+    s2 = _summary(l2)
+    assert s2["disk_pressure_active"] is True
+    assert s2["paging_cooled"] is True
+
+    # (5) Critical escalation within cooldown post-restart: pages immediately.
+    with capture_logs() as l3:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=7),
+        )
+    assert _pressure(l3) == 1
+
+    # (6) Recovery: exactly ONE distinct recovery page.
+    with capture_logs() as l4:
+        await notify_early_detections(
+            db,
+            settings,
+            session=None,
+            candidates=[cand],
+            now=base + timedelta(minutes=8),
+        )
+    assert _recovery(l4) == 1
+    assert _pressure(l4) == 0
+    await db.close()
