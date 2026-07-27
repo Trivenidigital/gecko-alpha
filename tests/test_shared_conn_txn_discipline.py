@@ -21,6 +21,7 @@ import inspect
 import io
 import json
 import pathlib
+import re
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -508,6 +509,52 @@ def test_no_unmanaged_commit_on_shared_connection():
         "Unmanaged commit on the shared connection (route the write through "
         f"db.execute_write()/db.transaction() or hold _txn_lock): {violations}"
     )
+
+
+_NETWORK_CALL_RE = re.compile(
+    r"(send_telegram_message|send_chain_alert|_send_[a-z_]*alert"
+    r"|fetch_token_fdv|fetch_venue_metadata|\bfetcher\("
+    r"|session\.(get|post|put|delete|request|ws_connect)"
+    r"|aiohttp\.ClientSession|\.place_order\(|\.cancel_order\()"
+)
+
+
+def _network_awaits_under_lock() -> list[tuple[str, int, str]]:
+    """AST-scan scout/ for network awaits lexically inside a manager-owned
+    transaction (``async with X.transaction()``) or a ``_txn_lock``-held region
+    (``async with X._txn_lock``). Returns (module, lineno, snippet) per hit."""
+    scout_root = pathlib.Path(__file__).resolve().parents[1] / "scout"
+    hits: list[tuple[str, int, str]] = []
+    for path in scout_root.rglob("*.py"):
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        rel = path.relative_to(scout_root.parent).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncWith) and any(
+                ast.unparse(item.context_expr).endswith(
+                    (".transaction()", "._txn_lock")
+                )
+                for item in node.items
+            ):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Await):
+                        snippet = ast.unparse(sub)
+                        if _NETWORK_CALL_RE.search(snippet):
+                            hits.append((rel, sub.lineno, snippet[:80]))
+    return hits
+
+
+def test_no_network_await_under_txn_lock():
+    """F2 regression fence (defect 4): no HTTP/Telegram/provider await may occur
+    lexically inside a manager-owned transaction (``async with db.transaction()``)
+    or a ``_txn_lock``-held region — a slow/hung network call there freezes every
+    writer in the process. This is a STATIC fence; because it can miss indirect
+    awaits hidden behind helper calls, the runtime lock-state-guard tests in
+    tests/test_chain_txn_atomicity.py (fetch + alert-send assert
+    ``not db._txn_lock.locked()``) cover the transitive paths end-to-end.
+    """
+    hits = _network_awaits_under_lock()
+    assert hits == [], f"network await under _txn_lock/transaction(): {hits}"
 
 
 async def test_manager_failed_begin_does_not_rollback(tmp_path):

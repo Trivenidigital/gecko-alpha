@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -218,3 +218,70 @@ async def test_txn_lock_not_held_across_dexscreener_fetch(db, settings_factory):
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id = '0xnolock'"
     )
     assert (await cur.fetchone())[0] == 2_000_000.0
+
+
+async def test_txn_lock_not_held_during_chain_alert_send(
+    db, settings_factory, monkeypatch
+):
+    """Runtime guard (defect 4): the post-commit chain-completion alert send
+    observes `_txn_lock` UNHELD — alert delivery is phase 4, outside the write
+    transaction."""
+    # Promote full_conviction to high so the alert phase fires.
+    await db.execute_write(
+        "UPDATE chain_patterns SET alert_priority='high' WHERE name='full_conviction'"
+    )
+    await _emit_completing_events(db, "0xalertlock", "memecoin")
+
+    lock_states: list[bool] = []
+
+    async def _guarded_alert(db_, chain, pattern, settings):
+        # If the alert ran inside the transaction, _txn_lock would be held.
+        lock_states.append(db._txn_lock.locked())
+
+    monkeypatch.setattr("scout.chains.alerts.send_chain_alert", _guarded_alert)
+
+    settings = settings_factory(
+        **{**_CHAIN_SETTINGS_KW, "CHAIN_ALERT_ON_COMPLETE": True}
+    )
+    await check_chains(db, settings)
+
+    assert lock_states, "alert was not sent — completion did not fire"
+    assert all(
+        held is False for held in lock_states
+    ), f"_txn_lock must be UNHELD during the chain alert send; observed {lock_states}"
+
+
+async def test_txn_lock_not_held_during_outcome_hydration_fetch(db, settings_factory):
+    """Runtime guard (defect 4): update_chain_outcomes fetches DexScreener FDV
+    with `_txn_lock` UNHELD — the network gather runs before the write
+    transaction."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+    from scout.chains.tracker import update_chain_outcomes
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db.execute_write(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, steps_matched, total_steps, "
+        " anchor_time, completed_at, chain_duration_hours, conviction_boost, "
+        " outcome_class, mcap_at_completion) "
+        "VALUES ('0xhydlock','memecoin',1,'p',1,2,?,?,0.0,0,NULL,1000000.0)",
+        (long_ago, long_ago),
+    )
+
+    lock_states: list[bool] = []
+
+    async def _guarded_fetcher(session, contract):
+        lock_states.append(db._txn_lock.locked())
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    s = settings_factory(
+        **{**_CHAIN_SETTINGS_KW, "CHAIN_OUTCOME_HIT_THRESHOLD_PCT": 50.0}
+    )
+    updated = await update_chain_outcomes(
+        db, settings=s, session=object(), mcap_fetcher=_guarded_fetcher
+    )
+    assert updated == 1
+    assert lock_states, "fetcher was not called"
+    assert all(
+        held is False for held in lock_states
+    ), f"_txn_lock must be UNHELD during the hydration fetch; observed {lock_states}"

@@ -242,6 +242,20 @@ async def _count_sent_today(db: Database) -> int:
     return int(row[0] or 0)
 
 
+async def _demote_claimed_row(
+    db: Database, sent_row_id: int | None, detail: dict, error: str
+) -> None:
+    """Demote a claimed 'sent' row to 'dispatch_failed' via a short disciplined
+    write (F2: no network, and no _txn_lock held across a send). Used when the
+    out-of-lock Telegram send fails or is cancelled."""
+    if sent_row_id is None:
+        return
+    await db.execute_write(
+        "UPDATE tg_alert_log SET outcome='dispatch_failed', detail=? WHERE id=?",
+        (json.dumps({**detail, "error": error}, sort_keys=True), sent_row_id),
+    )
+
+
 async def _send_claimed_alert(
     db: Database,
     settings: Settings,
@@ -250,11 +264,13 @@ async def _send_claimed_alert(
     candidate: TradeSurfaceAlertCandidate,
     window_hours: int,
 ) -> str:
-    """Claim, send, and commit under one DB lock.
+    """Claim the dedup slot in one disciplined transaction, then send OUTSIDE
+    the lock.
 
-    This prevents a failed surface alert from briefly looking like a durable
-    `sent` row to concurrent paper-trade dispatch. The lock is held across a
-    Telegram call, but this opt-in lane is capped to 5/day.
+    F2 (defect 4): the Telegram send never runs while ``_txn_lock`` is held.
+    The 'sent' row is claimed + committed first (so concurrent dispatch dedups
+    against it); the send happens out-of-lock; a send failure demotes the row
+    to 'dispatch_failed'. This opt-in lane is capped to 5/day.
     """
     if db._conn is None:
         return "dispatch_failed"
@@ -264,14 +280,21 @@ async def _send_claimed_alert(
         "verdict": candidate.verdict,
         "reasons": list(candidate.reasons),
     }
-    async with db._txn_lock:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        sent_row_id: int | None = None
+    # F2: claim the dedup slot in ONE disciplined transaction (no network), then
+    # send Telegram OUTSIDE the lock (defect 4 — never hold _txn_lock across a
+    # network send), then demote the claimed row to 'dispatch_failed' via a
+    # short disciplined write if the send fails. Micro-tradeoff vs the old
+    # lock-across-send design: a send that ultimately fails is briefly visible
+    # as a committed 'sent' row until the demote lands — it self-corrects to
+    # 'dispatch_failed', and this opt-in lane is capped to 5/day.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sent_row_id: int | None = None
+    async with db.transaction() as conn:
         if window_hours > 0:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(hours=window_hours)
             ).isoformat()
-            cur = await db._conn.execute(
+            cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
                 "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
                 "SELECT NULL, ?, ?, ?, 'sent', ? "
@@ -291,7 +314,7 @@ async def _send_claimed_alert(
             )
             row = await cur.fetchone()
             if row is None:
-                await db._conn.execute(
+                await conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
                     "VALUES (NULL, ?, ?, ?, 'blocked_dedup_24h', ?)",
@@ -305,11 +328,10 @@ async def _send_claimed_alert(
                         ),
                     ),
                 )
-                await db._conn.commit()
                 return "blocked_dedup_24h"
             sent_row_id = int(row[0])
         else:
-            cur = await db._conn.execute(
+            cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
                 "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
                 "VALUES (NULL, ?, ?, ?, 'sent', ?) RETURNING id",
@@ -322,67 +344,45 @@ async def _send_claimed_alert(
             )
             row = await cur.fetchone()
             sent_row_id = int(row[0]) if row else None
+    # The claim (outcome='sent') is committed here — BEFORE the network send.
 
-        try:
-            body = format_trade_surface_alert(candidate)
-            log.info(
-                "trade_surface_alert_dispatched",
-                tg_alert_log_id=sent_row_id,
-                token_id=candidate.token_id,
-                surface=candidate.surface,
-            )
-            await alerter.send_telegram_message(
-                body,
-                session,
-                settings,
-                parse_mode=None,
-                raise_on_failure=True,
-                source="trade_surface_alerts",
-            )
-            await db._conn.commit()
-            log.info(
-                "trade_surface_alert_delivered",
-                tg_alert_log_id=sent_row_id,
-                token_id=candidate.token_id,
-                surface=candidate.surface,
-            )
-            return "sent"
-        except asyncio.CancelledError:
-            if sent_row_id is not None:
-                await db._conn.execute(
-                    "UPDATE tg_alert_log "
-                    "SET outcome='dispatch_failed', detail=? WHERE id=?",
-                    (
-                        json.dumps(
-                            {**detail, "error": "cancelled_during_telegram_send"},
-                            sort_keys=True,
-                        ),
-                        sent_row_id,
-                    ),
-                )
-                await db._conn.commit()
-            raise
-        except Exception as exc:
-            if sent_row_id is not None:
-                await db._conn.execute(
-                    "UPDATE tg_alert_log "
-                    "SET outcome='dispatch_failed', detail=? WHERE id=?",
-                    (
-                        json.dumps(
-                            {**detail, "error": str(exc)[:200]},
-                            sort_keys=True,
-                        ),
-                        sent_row_id,
-                    ),
-                )
-            await db._conn.commit()
-            log.warning(
-                "trade_surface_alert_dispatch_failed",
-                token_id=candidate.token_id,
-                surface=candidate.surface,
-                err=str(exc),
-            )
-            return "dispatch_failed"
+    try:
+        body = format_trade_surface_alert(candidate)
+        log.info(
+            "trade_surface_alert_dispatched",
+            tg_alert_log_id=sent_row_id,
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+        )
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            parse_mode=None,
+            raise_on_failure=True,
+            source="trade_surface_alerts",
+        )
+        log.info(
+            "trade_surface_alert_delivered",
+            tg_alert_log_id=sent_row_id,
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+        )
+        return "sent"
+    except asyncio.CancelledError:
+        await _demote_claimed_row(
+            db, sent_row_id, detail, "cancelled_during_telegram_send"
+        )
+        raise
+    except Exception as exc:
+        await _demote_claimed_row(db, sent_row_id, detail, str(exc)[:200])
+        log.warning(
+            "trade_surface_alert_dispatch_failed",
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+            err=str(exc),
+        )
+        return "dispatch_failed"
 
 
 async def send_trade_surface_alerts(
