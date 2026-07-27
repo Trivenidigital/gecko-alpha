@@ -1,10 +1,20 @@
-# Pre-registration — Detection-lane gate-enrichment cohort
+# Pre-registration — Detection-lane gate-enrichment cohort (I1, v0.6)
 
-**New primitives introduced:** detection_decision_receipts table + DETECTION_GATE_VERSION constant
+**New primitives introduced:** detection_decision_receipts table + DETECTION_GATE_VERSION constant + independent control-plane journal (design selection only in this revision — no implementation)
 
 > Filename note: `prereg_*.md` matches none of the plan/design/spec gated
 > patterns (`plan_*`, `design_*`, `spec_*`), so the new-primitives hook does not
 > gate this file. The marker line above is included anyway for hygiene.
+
+**v0.6 (2026-07-27) — I1 finalization per reviewer ruling.** Changes from v0.5:
+Session-1 markers resolved (§3: shakedown census frozen per the PR #475
+dormant-deployment ruling; cohort-start marker re-scoped to the I4 authorization
+gate); the fenced-admission (§3a), segregated-census (§3b) and canonical
+sampling-hash (§7a) clarifications incorporated; per-component F2 persistence
+architecture selected and recorded (§12). Phase map: **I1 = this document**;
+**I2/I3 = implementation**; **I4 = cohort activation**. I2/I3/I4 are HELD until
+the standalone P0 corrective PR for the shared-connection transaction defect
+(F2, `classified_but_not_remediated`) is merged, deployed, and verified clean.
 
 This document pre-registers the analysis that the **behavior-neutral**
 `detection_decision_receipts` instrumentation (PR
@@ -72,20 +82,77 @@ dropped-candidate stream was never recorded).
 2. the **volume** consequence that motivated the two-identity model + capacity
    artifact (`tasks/capacity_detection_receipts_2026_07.md`).
 
-All receipts written in the range **`[2026-07-26T02:47:23Z, <fix-activation-ts>)`**
-are **pre-cohort shakedown data**: they are RETAINED and labeled invalid **by this
-documented timestamp-range exclusion**, NOT deleted or rewritten. No existing
-receipt row is mutated. (If a marker is ever added it must be additive — e.g. a
-cohort-registry row — never an `UPDATE` of receipt rows.) The 733 shakedown rows
-present on srilu scout.db (02:49:25Z–03:12:41Z) are the measured basis for the
-capacity artifact.
+All receipts written in the range **`[2026-07-26T02:47:23Z,
+2026-07-26T15:32:08Z)`** are **pre-cohort shakedown data**: they are RETAINED and
+labeled invalid **by this documented timestamp-range exclusion**, NOT deleted or
+rewritten. No existing receipt row is mutated. (If a marker is ever added it must
+be additive — e.g. a cohort-registry row — never an `UPDATE` of receipt rows.)
 
-> **Cohort start (UTC): __________________ (TBD — the application-ready
-> timestamp, recorded AFTER migrations complete, of the first healthy process
-> activation following the two-identity fix deploy)**
+**Frozen shakedown census (Session-1 marker RESOLVED — PR #475 dormant-deployment
+ruling, 2026-07-26).** The governing values, superseding the interim 733-row
+snapshot previously cited here:
 
-Rows with `decided_at` in the shakedown range above (or otherwise before this
-re-anchored timestamp) are excluded.
+- Invalid-range end = the dormant-release application-ready timestamp
+  **2026-07-26T15:32:08Z** (conservative post-migration readiness boundary: the
+  first demonstrated healthy post-migration cycle; process activation 15:30:06Z
+  and migration execution 15:30:08Z are recorded as such, NOT as readiness).
+- Last invalid receipt: **2026-07-26T15:10:32.411166Z**.
+- **Final invalid receipt count: 1,068** — frozen, retained, analytically
+  excluded, and never reclassified into any future cohort.
+- Receipt accrual has been DISABLED since that deployment
+  (`DETECTION_RECEIPTS_ENABLED=false`, dormant per the #475 ruling); the count
+  cannot grow.
+
+The 1,068-row population (which subsumes the earlier 733-row 02:49:25Z–03:12:41Z
+measurement) is the measured basis for the capacity artifact.
+
+> **Cohort start (UTC): NOT STARTED — intentionally unresolved (I4 gate).**
+> The two-identity fix is deployed (dormant), so the original "TBD pending fix
+> deploy" wording is obsolete; what remains is AUTHORIZATION. The value will be
+> the application-ready timestamp (recorded AFTER migrations complete) of the
+> first healthy process activation following an explicit reviewer cohort-start
+> authorization (I4). It is written to the control-plane journal (§12) at
+> activation, never retro-fitted.
+
+Rows with `decided_at` in the shakedown range above (or otherwise before the
+authorized cohort-start timestamp) are excluded.
+
+### 3a. Fenced admission (v0.6 clarification)
+
+Cohort admission is **fenced on both sides**, and the fence is definitional, not
+procedural:
+
+1. **Lower fence — the invalid shakedown range.** No receipt with `decided_at <
+   2026-07-26T15:32:08Z` is ever admissible, regardless of its content, key
+   shape, or later reclassification pressure. The 1,068 invalid rows are
+   permanently outside the fence: retained for audit, excluded from analysis,
+   never mutated, never reclassified.
+2. **Admission fence — the authorized cohort start.** A receipt is admitted to
+   the cohort **only** if `decided_at >= cohort_start`, where `cohort_start` is
+   the I4-authorized application-ready timestamp recorded in the control-plane
+   journal (§12). Receipts written while the lane is enabled but BEFORE an
+   authorized cohort start (should that state ever occur) are fenced out exactly
+   like shakedown rows: a new documented invalid range is opened for them.
+3. **No third state.** Every receipt is either inside the fence (admitted,
+   in-cohort) or outside it (in a documented invalid range). "Unclassified"
+   receipts are a reconciliation failure and invalidate the affected window (§8).
+
+### 3b. Segregated census (v0.6 clarification)
+
+The census of every fenced-out population is **frozen and segregated**:
+
+- The invalid shakedown census (n=1,068; range end 15:32:08Z; last row
+  15:10:32.411166Z) is recorded once, in this document and in the control-plane
+  journal (§12), and is never recomputed against live tables as if it could
+  drift.
+- Valid-cohort counts and invalid-population counts are NEVER merged, summed, or
+  reported in a shared denominator. Any table or query that reports cohort size
+  must report `in_cohort_n` and, separately labeled, `invalid_excluded_n`.
+- The hot/cold archive tiering (§8) preserves segregation: archival moves rows
+  between tiers but never across the fence, and per-tier census totals must
+  reconcile to the frozen invalid census + the running valid census
+  (`hot_n + cold_n = invalid_frozen_n + valid_running_n`, checked at every
+  archive transaction and at manifest freeze).
 
 **Replacement-cohort gate (the cohort does NOT start on deploy alone).** The
 re-anchored cohort start is valid only once ALL hold: (a) a new reviewed head on
@@ -230,8 +297,21 @@ idempotency_key = sha256_hex(
 # evaluation_instance = the cycle decided_at (UTC isoformat)
 ```
 
-A null `source_observation_ts` renders as the empty string; the separator is a
-literal `|`. Because the cycle instant is IN the key, cycle-N and cycle-N+1
+**Canonical sampling-hash (v0.6 clarification).** The string above is THE
+canonical identity hash for a receipt — one canonicalization, three uses:
+write-time idempotency (this section), analysis-time sampling/dedup (any
+subsample of receipts is drawn and de-duplicated on this key, never on ad-hoc
+column subsets), and archive-manifest integrity (§8 — cold-partition manifests
+list member rows by this key, so a restored partition is verifiable
+row-for-row). Canonicalization rules are frozen: a null
+`source_observation_ts` renders as the **empty string**; the separator is a
+**literal `|`**; `evaluation_instance` is the cycle `decided_at` in **UTC
+isoformat**; the digest is **sha256 hex, lowercase**. Any alternative or
+"reduced-field" hash is rejected (see the rejected-fixes note below); a change
+to the canonicalization is a breaking change requiring a `gate_version` bump
+AND a new cohort.
+
+Because the cycle instant is IN the key, cycle-N and cycle-N+1
 evaluations of the same token yield **different keys and DISTINCT rows**. Routine
 re-polls are therefore never collapsed and never mis-classified as conflicts —
 this eliminates the false-conflict class **by construction**.
@@ -396,3 +476,44 @@ the detection-lane gate logic. Bumping it opens a fresh analytical unit per toke
 distinguishable. A gate change that is NOT accompanied by a version bump is
 surfaced as a `detection_receipt_conflict` (§7) rather than silently corrupting
 the cohort.
+
+---
+
+## 12. Per-component persistence architecture (v0.6 — F2-informed, selected and recorded)
+
+**Context (F2, status `classified_but_not_remediated`).** The standalone P0
+investigation established that transactions on the process-shared aiosqlite
+connection (`db._conn`) are only serialized for callers that take `db._txn_lock`;
+the chain tracker and the DEX discovery writers bypass it, producing
+nested-transaction collisions AND a foreign-rollback hazard (a colliding caller's
+`ROLLBACK` can silently discard another writer's uncommitted work). Suppression
+enforcement was verified fail-closed with zero escapes in the tested window, but
+that finding is scoped to suppression enforcement only — the defect itself
+remains active until the standalone P0 corrective PR (transaction-lock
+discipline, foreign-rollback prevention, exception-detail retention,
+deterministic concurrency tests) is merged, deployed and verified clean.
+
+**Selection rule applied:** no load-bearing cohort evidence may depend for its
+integrity on a write path that shares an unserialized connection with unrelated
+writers; the control plane must additionally survive a pipeline-process defect
+entirely.
+
+| # | Component | Load-bearing? | Selected persistence | F2 rationale |
+|---|---|---|---|---|
+| 1 | `detection_decision_receipts` (hot tier) | YES — primary cohort evidence | scout.db table, ALL writes through the common disciplined transaction manager (P0 PR); `INSERT OR IGNORE` + UNIQUE(idempotency_key) preserved | Collisions eliminated at the mechanism level, not per-caller convention; a receipt write can neither be victim nor perpetrator of a foreign rollback |
+| 2 | Cold archive partitions + integrity manifest (`scout/trading/receipt_archive.py`) | YES — evidence lifecycle ≥120d | Time-partitioned compressed files OUTSIDE SQLite + queryable manifest keyed by the canonical sampling-hash (§7a); fail-closed 7-step archival transaction; rows stay hot until the independent off-host durable copy is confirmed (off-host destination = standing operator dependency) | File-level artifacts are immune to connection-sharing defects; manifest hashes make silent truncation/corruption detectable at restore |
+| 3 | **Independent control-plane journal** (cohort lifecycle: cohort-start authorization + app-ready timestamp, census freezes, invalid-range declarations, close marker, invalidation events, archive/restore proofs) | YES — the cohort's authority record | **NEW, SEPARATE SQLite database file** (`control_plane.db`), append-only event table, hash-chained rows (each row carries sha256 of predecessor), opened by a DEDICATED connection; written ONLY by operator-invoked scripts, NEVER by the pipeline process or on `db._conn` | Independence is the point: the journal must remain trustworthy even if the pipeline process or scout.db's shared connection misbehaves (F2's exact failure class). Append-only + hash chain makes retro-editing evident |
+| 4 | Per-cycle reconciliation census (`detection_receipt_summary`) | Supporting (validity gate §8) | Structured journal (journald) at cycle time — unchanged; but every census FREEZE and every validity verdict derived from it is durably recorded in the control-plane journal (#3) | journald retention is finite (the F9 lesson: journal-only evidence expires); freezes must outlive it |
+| 5 | DEX outcome-ledger evidence (`signal_outcome_ledger`, `ledger_enrollments`) | YES (Session-1 T0 clock; separate cohort) | scout.db under the same disciplined transaction manager as #1 after the P0 PR | Same shared-connection exposure; same remedy |
+
+**Explicitly rejected alternatives:** (a) control-plane rows as another scout.db
+table — rejected: shares the failure domain the journal must referee; (b)
+plain-JSONL control-plane file without hash chaining — rejected: silent
+edit/truncation undetectable; (c) per-caller "remember to take the lock"
+convention without a structural manager — rejected: that convention is exactly
+what failed (chain tracker/DEX writers predate it and bypassed it).
+
+**Hold discipline.** This section records the SELECTION only (I1). Implementing
+the control-plane journal and migrating writers onto the disciplined manager are
+I2/I3 work, and cohort activation is I4 — all held until the P0 corrective PR is
+merged, deployed, and verified clean.
