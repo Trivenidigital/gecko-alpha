@@ -9,12 +9,19 @@
 **v0.6 (2026-07-27) — I1 finalization per reviewer ruling.** Changes from v0.5:
 Session-1 markers resolved (§3: shakedown census frozen per the PR #475
 dormant-deployment ruling; cohort-start marker re-scoped to the I4 authorization
-gate); the fenced-admission (§3a), segregated-census (§3b) and canonical
-sampling-hash (§7a) clarifications incorporated; per-component F2 persistence
-architecture selected and recorded (§12). Phase map: **I1 = this document**;
-**I2/I3 = implementation**; **I4 = cohort activation**. I2/I3/I4 are HELD until
-the standalone P0 corrective PR for the shared-connection transaction defect
-(F2, `classified_but_not_remediated`) is merged, deployed, and verified clean.
+gate); fenced admission defined (§3a) with its enforcement mechanism (§12b:
+admission ledger + fencing token); segregated census (§3b); domain-separated
+hashes replacing the single generic identity hash (§7a: idempotency / sampling /
+archive-manifest, separately versioned pre-images); the 1,068-row shakedown
+permanently labeled `invalid validation evidence` with an explicit allowed/
+prohibited-use list (§3); per-component F2 persistence architecture selected and
+recorded (§12), including the two-class control-plane writer model (§12a:
+runtime supervisor for automatic transitions + operator scripts for
+authorization-class events). Phase map: **I1 = this document**; **I2/I3 =
+implementation** (incl. the observation-only live inflow census); **I4 = cohort
+activation**. I2/I3/I4 are HELD until the standalone P0 corrective PR for the
+shared-connection transaction defect (F2, `classified_but_not_remediated`) is
+merged, deployed, and verified clean.
 
 This document pre-registers the analysis that the **behavior-neutral**
 `detection_decision_receipts` instrumentation (PR
@@ -103,8 +110,20 @@ snapshot previously cited here:
   (`DETECTION_RECEIPTS_ENABLED=false`, dormant per the #475 ruling); the count
   cannot grow.
 
-The 1,068-row population (which subsumes the earlier 733-row 02:49:25Z–03:12:41Z
-measurement) is the measured basis for the capacity artifact.
+**Evidentiary role — permanently labeled `invalid validation evidence` (reviewer
+correction).** The 1,068-row population (which subsumes the earlier 733-row
+02:49:25Z–03:12:41Z measurement) MAY support exactly three uses:
+
+- proof that invalid rows remain segregated (§3b);
+- hot/cold reconciliation exercises;
+- validation of timestamp and archival conventions.
+
+It MUST NOT be used as a substitute for: valid blocked-candidate inflow; a
+production cohort capacity census; provider-accepted delivery latency; or valid
+CP1/CP2 denominators. Where the capacity artifact cites these rows, it cites
+them as a shakedown-era measurement instrument, not as production cohort
+evidence — the **live, observation-only I3 census of passed/blocked inflow is
+still required** and must be measured without creating production cohort rows.
 
 > **Cohort start (UTC): NOT STARTED — intentionally unresolved (I4 gate).**
 > The two-identity fix is deployed (dormant), so the original "TBD pending fix
@@ -136,6 +155,12 @@ procedural:
 3. **No third state.** Every receipt is either inside the fence (admitted,
    in-cohort) or outside it (in a documented invalid range). "Unclassified"
    receipts are a reconciliation failure and invalidate the affected window (§8).
+
+The fence is a DEFINITION; its runtime ENFORCEMENT is the fenced-admission
+critical section of §12b (authoritative admission ledger + fencing-token
+compare-and-commit inside `control_plane.db`). Every assignment admission
+validates the current active fencing token; stale tokens are rejected across
+process and crash boundaries.
 
 ### 3b. Segregated census (v0.6 clarification)
 
@@ -297,19 +322,41 @@ idempotency_key = sha256_hex(
 # evaluation_instance = the cycle decided_at (UTC isoformat)
 ```
 
-**Canonical sampling-hash (v0.6 clarification).** The string above is THE
-canonical identity hash for a receipt — one canonicalization, three uses:
-write-time idempotency (this section), analysis-time sampling/dedup (any
-subsample of receipts is drawn and de-duplicated on this key, never on ad-hoc
-column subsets), and archive-manifest integrity (§8 — cold-partition manifests
-list member rows by this key, so a restored partition is verifiable
-row-for-row). Canonicalization rules are frozen: a null
-`source_observation_ts` renders as the **empty string**; the separator is a
-**literal `|`**; `evaluation_instance` is the cycle `decided_at` in **UTC
-isoformat**; the digest is **sha256 hex, lowercase**. Any alternative or
-"reduced-field" hash is rejected (see the rejected-fixes note below); a change
-to the canonicalization is a breaking change requiring a `gate_version` bump
-AND a new cohort.
+**Domain-separated hashes (v0.6, reviewer correction).** Purposes share
+identity FIELDS but never hash semantics: one generic identity hash reused for
+idempotency, sampling, and archive integrity is rejected. Three separately
+versioned pre-images:
+
+1. **Idempotency** (write-time, deployed): the pipe-joined pre-image above —
+   versioned as `receipt-idempotency-v1`, exactly the shape shipped in #475.
+   Its canonicalization rules are frozen: null `source_observation_ts` renders
+   as the **empty string**; the separator is a **literal `|`**;
+   `evaluation_instance` is the cycle `decided_at` in **UTC isoformat**; digest
+   **sha256 hex, lowercase**. Used ONLY for write-time idempotency/dedup of
+   receipt rows. Any change is a breaking change requiring a `gate_version`
+   bump AND a new cohort.
+2. **Cohort sampling** (analysis-time): a canonical STRUCTURED pre-image with
+   explicit domain separation and a frozen salt:
+
+   ```text
+   sampling_hash = SHA256(canonical_json({
+     "domain": "gecko-alpha-cohort-sampling-v1",
+     "chain": "<lane chain, e.g. COINGECKO | SOLANA>",
+     "canonical_contract": "<token_id / mint>",
+     "fixed_salt": "<frozen salt — generated once at cohort registration,
+                     recorded in the control-plane journal (§12)>"
+   }))
+   ```
+
+   `canonical_json` = UTF-8, sorted keys, no insignificant whitespace. Any
+   subsample of tokens is drawn/de-duplicated on `sampling_hash`, never on
+   ad-hoc column subsets and never on the idempotency key.
+3. **Archive-manifest integrity** (§8): the integrity hash covers the
+   **manifest itself** — `SHA256("gecko-alpha-archive-manifest-v1" || canonical
+   manifest bytes)`; the manifest lists member rows by their identity fields
+   (including `idempotency_key` as a FIELD, which is fine — shared fields, not
+   shared hash semantics). A restored partition is verified against the
+   manifest hash, and its membership against the listed keys.
 
 Because the cycle instant is IN the key, cycle-N and cycle-N+1
 evaluations of the same token yield **different keys and DISTINCT rows**. Routine
@@ -502,16 +549,72 @@ entirely.
 |---|---|---|---|---|
 | 1 | `detection_decision_receipts` (hot tier) | YES — primary cohort evidence | scout.db table, ALL writes through the common disciplined transaction manager (P0 PR); `INSERT OR IGNORE` + UNIQUE(idempotency_key) preserved | Collisions eliminated at the mechanism level, not per-caller convention; a receipt write can neither be victim nor perpetrator of a foreign rollback |
 | 2 | Cold archive partitions + integrity manifest (`scout/trading/receipt_archive.py`) | YES — evidence lifecycle ≥120d | Time-partitioned compressed files OUTSIDE SQLite + queryable manifest keyed by the canonical sampling-hash (§7a); fail-closed 7-step archival transaction; rows stay hot until the independent off-host durable copy is confirmed (off-host destination = standing operator dependency) | File-level artifacts are immune to connection-sharing defects; manifest hashes make silent truncation/corruption detectable at restore |
-| 3 | **Independent control-plane journal** (cohort lifecycle: cohort-start authorization + app-ready timestamp, census freezes, invalid-range declarations, close marker, invalidation events, archive/restore proofs) | YES — the cohort's authority record | **NEW, SEPARATE SQLite database file** (`control_plane.db`), append-only event table, hash-chained rows (each row carries sha256 of predecessor), opened by a DEDICATED connection; written ONLY by operator-invoked scripts, NEVER by the pipeline process or on `db._conn` | Independence is the point: the journal must remain trustworthy even if the pipeline process or scout.db's shared connection misbehaves (F2's exact failure class). Append-only + hash chain makes retro-editing evident |
+| 3 | **Independent control-plane journal** (cohort lifecycle: cohort-start authorization + app-ready timestamp, fencing-token epochs, census freezes, invalid-range declarations, close marker, invalidation/pause events, archive/restore proofs, admission ledger) | YES — the cohort's authority record | **NEW, SEPARATE SQLite database file** (`control_plane.db`), append-only event table, hash-chained rows (each row carries sha256 of predecessor), opened by DEDICATED connections; NEVER on `db._conn`. **Two writer classes** (§12a): a narrowly scoped runtime **control-plane supervisor** for automatic protocol transitions, and operator-invoked scripts for manual authorization/pause/recovery | Independence is the point: the journal must remain trustworthy even if scout.db's shared connection misbehaves (F2's exact failure class). Append-only + hash chain makes retro-editing evident |
 | 4 | Per-cycle reconciliation census (`detection_receipt_summary`) | Supporting (validity gate §8) | Structured journal (journald) at cycle time — unchanged; but every census FREEZE and every validity verdict derived from it is durably recorded in the control-plane journal (#3) | journald retention is finite (the F9 lesson: journal-only evidence expires); freezes must outlive it |
 | 5 | DEX outcome-ledger evidence (`signal_outcome_ledger`, `ledger_enrollments`) | YES (Session-1 T0 clock; separate cohort) | scout.db under the same disciplined transaction manager as #1 after the P0 PR | Same shared-connection exposure; same remedy |
+
+### 12a. Control-plane writer model (reviewer correction — NOT operator-only)
+
+The v0.6 protocol requires AUTOMATIC transitions the moment the system detects:
+a load-bearing evidence write failure; spool fsync failure; canonicalization
+failure; quote-queue threshold breach; the quoter breaker remaining open; a
+stale outcome worker; or unavailability of the control journal itself. An
+operator-only writer cannot deliver those. Two writer classes are therefore
+defined:
+
+1. **Runtime control-plane supervisor** (narrowly scoped; I2 implementation:
+   `scout/control_plane/supervisor.py`): the ONLY runtime writer. It holds a
+   dedicated `control_plane.db` connection (never `db._conn`) and may write
+   exactly the automatic-transition event types enumerated above (pause,
+   breach, invalidation, degradation, journal-unavailability fallback). It may
+   NOT write cohort-start authorizations, close markers, census freezes, or
+   token-epoch grants — those are authorization-class events.
+2. **Operator-invoked scripts**: manual activation, pause, and recovery
+   actions, and all authorization-class events (cohort start, close marker,
+   census freeze, fencing-token epoch grant) — recorded with operator identity.
+
+If the control journal itself is unavailable, the supervisor fails CLOSED for
+admission (no admission proceeds without a validated token — see §12b) and
+emits the §12b degradation page; it never queues admissions for later
+retro-write.
+
+### 12b. Admission critical section + fencing token (the enforceable mechanism)
+
+"Two-sided definitional fence" (§3a) states WHAT is admissible; this section
+names the mechanism that ENFORCES it across process and crash boundaries. A
+separate control DB plus a separate measurement DB is not automatically atomic,
+so admission is made atomic in ONE store:
+
+- **Authoritative admission ledger inside `control_plane.db`** (the selected
+  mechanism, per the reviewer's option list). Every cohort admission is a
+  single SQLite transaction ON `control_plane.db` (`BEGIN IMMEDIATE` on the
+  dedicated connection — SQLite's file lock IS the OS-level cross-process
+  mutex) that: (1) reads the current active **fencing token** (a monotonic
+  epoch integer granted by authorization-class events; pause/invalidate events
+  retire it); (2) validates the admitting writer's held token equals the
+  active token; (3) inserts the admission-ledger row carrying that token.
+  Stale-token admission fails the same transaction — compare-and-commit, not
+  compare-then-commit. A crashed process that restarts with a retired token is
+  rejected on its first admission attempt, because token state and admission
+  live in the same transactional store.
+- **Measurement-store mirror**: the receipt/assignment row in scout.db is a
+  MIRROR of the admission, written after the ledger commit and carrying the
+  ledger row id + token. Mirrors are advisory until reconciled: any scout.db
+  cohort row without a matching admission-ledger row (or carrying a retired
+  token) is excluded by the §4 index query and surfaced as a reconciliation
+  failure (§8) — it can never silently join the cohort.
 
 **Explicitly rejected alternatives:** (a) control-plane rows as another scout.db
 table — rejected: shares the failure domain the journal must referee; (b)
 plain-JSONL control-plane file without hash chaining — rejected: silent
 edit/truncation undetectable; (c) per-caller "remember to take the lock"
 convention without a structural manager — rejected: that convention is exactly
-what failed (chain tracker/DEX writers predate it and bypassed it).
+what failed (chain tracker/DEX writers predate it and bypassed it); (d)
+operator-only control-plane writes — rejected by reviewer ruling: automatic
+transitions and fenced admission require a runtime writer (§12a); (e) advisory
+cross-DB "atomicity" by ordering writes across control_plane.db and scout.db —
+rejected: not crash-safe; replaced by the single-store admission ledger +
+mirror-reconciliation above.
 
 **Hold discipline.** This section records the SELECTION only (I1). Implementing
 the control-plane journal and migrating writers onto the disciplined manager are
