@@ -413,7 +413,9 @@ async def record_emission_with_status(
             db, token_id, settings
         )
         enrollment_status = "enrolled" if enroll_needed else "not_needed"
-        async with db._txn_lock:
+        # F2 P0-3: use the manager so any ROLLBACK on failure happens UNDER the
+        # lock — never in an outer except after the lock is released.
+        async with db.transaction() as conn:
             cur = await conn.execute(
                 """INSERT INTO signal_outcome_ledger
                    (kind, token_id, surface, price_at_emission,
@@ -450,8 +452,7 @@ async def record_emission_with_status(
                 await _enroll_token_locked(
                     conn, token_id, settings, datetime.now(timezone.utc)
                 )
-            await conn.commit()
-        row_id = int(cur.lastrowid)
+            row_id = int(cur.lastrowid)
         log.debug(
             "ledger_emission_recorded",
             ledger_id=row_id,
@@ -461,6 +462,7 @@ async def record_emission_with_status(
         )
         return row_id, enrollment_status
     except Exception as exc:
+        # The manager already rolled back under the lock; just record the failure.
         log.warning(
             "ledger_record_failed",
             kind=kind,
@@ -468,11 +470,6 @@ async def record_emission_with_status(
             surface=surface,
             error=str(exc),
         )
-        try:
-            if db._conn is not None:
-                await db._conn.rollback()
-        except Exception as rb_exc:
-            log.warning("ledger_record_rollback_failed", error=str(rb_exc))
         return None
 
 
@@ -619,7 +616,10 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
         rows = await cur.fetchall()
         stats["n_examined"] = len(rows)
 
-        async with db._txn_lock:
+        # F2 P0-3: manager holds the lock across the labeling pass and rolls back
+        # UNDER the lock on failure (no outer-except rollback). The helpers below
+        # (_price_at_or_after / _peak_price_in_window) are in-DB reads only.
+        async with db.transaction() as conn:
             for row in rows:
                 emitted = _parse_ts(row["emitted_at"])
                 if emitted is None:
@@ -686,7 +686,6 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
                     )
                 if updates:
                     stats["n_labeled"] += 1
-            await conn.commit()
 
         cur = await conn.execute(
             "SELECT COUNT(*) FROM signal_outcome_ledger "
@@ -696,12 +695,8 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
         log.info("ledger_label_pass", **stats)
         return stats
     except Exception as exc:
+        # The manager already rolled back under the lock; just record the failure.
         log.warning("ledger_label_pass_failed", error=str(exc))
-        try:
-            if db._conn is not None:
-                await db._conn.rollback()
-        except Exception as rb_exc:
-            log.warning("ledger_label_rollback_failed", error=str(rb_exc))
         return stats
     finally:
         # Liveness heartbeat — exactly once per pass, every path (finally runs

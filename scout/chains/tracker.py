@@ -38,6 +38,12 @@ logger = structlog.get_logger()
 # stuck-row count drops to zero (logged via *_cleared INFO event).
 _persistent_failure_alert_state: dict | None = None
 
+# P0-2a cycle-level single-flight guard. Process-local; safe because gecko-alpha
+# runs a single event-loop process. Set True at the start of a check_chains pass
+# and cleared in finally, so a second overlapping invocation returns immediately
+# rather than interleaving its phase-1 reads with the first pass's phase-3 writes.
+_check_chains_inflight: bool = False
+
 
 def _parse_time(value) -> datetime:
     """Coerce a value to a timezone-aware datetime.
@@ -95,6 +101,30 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
 
 
 async def check_chains(
+    db: Database,
+    settings: Settings,
+    *,
+    session: Any | None = None,
+    mcap_fetcher: McapFetcher | None = None,
+) -> None:
+    """One pass of the pattern matching engine, guarded by a cycle-level
+    single-flight (P0-2a): two passes cannot overlap. If a pass is already in
+    flight (e.g. a slow phase-2 fetch), a second invocation returns immediately
+    instead of interleaving its reads with the first pass's writes."""
+    global _check_chains_inflight
+    if _check_chains_inflight:
+        logger.info("chain_check_skipped_inflight")
+        return
+    _check_chains_inflight = True
+    try:
+        await _check_chains_impl(
+            db, settings, session=session, mcap_fetcher=mcap_fetcher
+        )
+    finally:
+        _check_chains_inflight = False
+
+
+async def _check_chains_impl(
     db: Database,
     settings: Settings,
     *,
@@ -212,12 +242,32 @@ async def check_chains(
     # completion set rolls back (defect 2 / atomicity). ----
     try:
         async with db.transaction() as conn:
+            # _persist_active_chain is idempotent by construction: a chain with a
+            # known id UPDATEs by id (a no-op if that row was concurrently
+            # deleted — no stale write), a new chain uses INSERT OR IGNORE with
+            # conflict re-resolution. So the persist step self-revalidates.
             for chain in dirty_chains:
                 await _persist_active_chain(conn, chain)
             for chain, pattern in expirations:
                 await _record_expired_chain(conn, chain, pattern, now)
                 await _delete_active_chain(conn, chain)
             for chain, pattern in completions:
+                # P0-2a optimistic revalidation: re-check cooldown INSIDE the
+                # write transaction before inserting the completion. A completion
+                # for this (token,pipeline,pattern) that landed since the phase-1
+                # read (e.g. during the phase-2 fetch await, from another path)
+                # is visible on the shared conn here, so we skip the stale
+                # duplicate rather than writing it.
+                if await _in_cooldown(
+                    db, chain.token_id, chain.pipeline, pattern, settings
+                ):
+                    logger.info(
+                        "chain_completion_revalidation_skipped",
+                        token_id=chain.token_id,
+                        pattern=pattern.name,
+                        reason="recent_completion_or_cooldown",
+                    )
+                    continue
                 await _write_completion(
                     conn, db, chain, pattern, mcap_by_chain.get(id(chain))
                 )
@@ -874,21 +924,37 @@ async def _update_chain_outcomes_inner(
         # no DB write happens while a DexScreener fetch could still run.
         updates.append((outcome, outcome_change_pct, now_iso, match_id))
 
-    # F2 (defect 4): apply ALL gathered outcome writes in a SINGLE manager
-    # transaction — no network await inside, no bare commit. The gather loop
-    # above already finished every fetch.
+    # F2 (defect 4 + P0-2b fetch-then-write revalidation): apply ALL gathered
+    # outcome writes in ONE manager transaction — no network await inside, no
+    # bare commit. The gather loop above already finished every fetch.
+    #
+    # Each UPDATE retains ``AND outcome_class IS NULL`` so a row that was
+    # concurrently resolved (e.g. by another hydration pass or a manual write)
+    # between the gather read and this write is NEVER overwritten. ``updated``
+    # is the count of rows ACTUALLY changed (summed cursor.rowcount), not
+    # ``len(updates)`` — so a revalidation miss is reported truthfully.
+    updated = 0
     if updates:
         async with db.transaction() as wconn:
-            await wconn.executemany(
-                """UPDATE chain_matches
-                   SET outcome_class = ?, outcome_change_pct = ?, evaluated_at = ?
-                   WHERE id = ?""",
-                updates,
-            )
-    updated = len(updates)
+            for outcome_c, change_pct, evaluated_at, mid in updates:
+                cur = await wconn.execute(
+                    """UPDATE chain_matches
+                       SET outcome_class = ?, outcome_change_pct = ?, evaluated_at = ?
+                       WHERE id = ? AND outcome_class IS NULL""",
+                    (outcome_c, change_pct, evaluated_at, mid),
+                )
+                updated += cur.rowcount or 0
 
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
+    if updated != len(updates):
+        logger.info(
+            "chain_outcomes_hydrate_revalidation_skips",
+            gathered=len(updates),
+            applied=updated,
+            skipped=len(updates) - updated,
+            note="rows concurrently resolved between gather and write were not overwritten",
+        )
 
     # BL-071a' v3: aggregate WARNINGS distinguished by cause
     if memecoin_unhydrateable:

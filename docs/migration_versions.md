@@ -68,6 +68,7 @@ number to appear in the table below.
 | 20260720 | dex_discovery_v1 | #469 |
 | 20260726 | detection_decision_receipts_v1 | #474 |
 | 20260727 | detection_receipt_archive_v1 | #475 |
+| 20260728 | bl_tg_alert_log_dispatch_pending_outcome | #477 | F2 P0-1: widen tg_alert_log.outcome CHECK for write-ahead dispatch-intent states |
 
 ## Notes / gaps
 

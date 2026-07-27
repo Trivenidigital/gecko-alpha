@@ -285,3 +285,144 @@ async def test_txn_lock_not_held_during_outcome_hydration_fetch(db, settings_fac
     assert all(
         held is False for held in lock_states
     ), f"_txn_lock must be UNHELD during the hydration fetch; observed {lock_states}"
+
+
+# ---------------------------------------------------------------------------
+# P0-2a/b: fetch-then-write revalidation + cycle-level single-flight.
+# Event-ordered (asyncio.Event); no timing sleeps.
+# ---------------------------------------------------------------------------
+
+
+async def test_p0_2a_completion_revalidated_against_concurrent_completion(
+    db, settings_factory
+):
+    """Pause the phase-2 fetch, insert a competing completion for the SAME
+    (token,pipeline,pattern) (trips cooldown), resume → phase-3 revalidation
+    skips the stale duplicate: no second full_conviction completion is written."""
+    from scout.chains import tracker as _t
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    _t._check_chains_inflight = False
+    await _emit_completing_events(db, "0xreval", "memecoin")
+
+    fetch_started = asyncio.Event()
+    may_resume = asyncio.Event()
+
+    async def _paused_fetcher(session, contract):
+        fetch_started.set()
+        await may_resume.wait()
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    settings = settings_factory(**_CHAIN_SETTINGS_KW)
+    task = asyncio.create_task(
+        check_chains(db, settings, session=object(), mcap_fetcher=_paused_fetcher)
+    )
+    await fetch_started.wait()
+    # Concurrently commit a full_conviction (pattern_id=1) completion for the
+    # SAME token, within cooldown — mimics a completion landing during the fetch.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.execute_write(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, steps_matched, total_steps, "
+        " anchor_time, completed_at, chain_duration_hours, conviction_boost) "
+        "VALUES ('0xreval','memecoin',1,'full_conviction',3,4,?,?,0.0,25)",
+        (now_iso, now_iso),
+    )
+    may_resume.set()
+    await task
+
+    # The pass's own full_conviction completion was revalidation-skipped (cooldown
+    # now trips) → exactly ONE full_conviction row, the concurrently-inserted one.
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM chain_matches WHERE token_id='0xreval' AND pattern_id=1"
+    )
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_p0_2b_outcome_not_overwritten_when_concurrently_resolved(
+    db, settings_factory
+):
+    """Pause update_chain_outcomes' fetch, concurrently resolve the pending row's
+    outcome, resume → the ``AND outcome_class IS NULL`` guard prevents overwrite
+    and ``updated`` reports 0 actual rows changed."""
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+    from scout.chains.tracker import update_chain_outcomes
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    await db.execute_write(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, steps_matched, total_steps, "
+        " anchor_time, completed_at, chain_duration_hours, conviction_boost, "
+        " outcome_class, mcap_at_completion) "
+        "VALUES ('0xrace','memecoin',1,'p',1,2,?,?,0.0,0,NULL,1000000.0)",
+        (long_ago, long_ago),
+    )
+
+    fetch_started = asyncio.Event()
+    may_resume = asyncio.Event()
+
+    async def _paused(session, contract):
+        fetch_started.set()
+        await may_resume.wait()
+        return FetchResult(2_000_000.0, FetchStatus.OK)  # +100% -> would be 'hit'
+
+    s = settings_factory(
+        **{**_CHAIN_SETTINGS_KW, "CHAIN_OUTCOME_HIT_THRESHOLD_PCT": 50.0}
+    )
+    task = asyncio.create_task(
+        update_chain_outcomes(db, settings=s, session=object(), mcap_fetcher=_paused)
+    )
+    await fetch_started.wait()
+    # Concurrently resolve to a DIFFERENT value while the fetch is paused.
+    await db.execute_write(
+        "UPDATE chain_matches SET outcome_class='miss', outcome_change_pct=-10 "
+        "WHERE token_id='0xrace'"
+    )
+    may_resume.set()
+    updated = await task
+
+    cur = await db._conn.execute(
+        "SELECT outcome_class FROM chain_matches WHERE token_id='0xrace'"
+    )
+    assert (await cur.fetchone())[0] == "miss"  # concurrent value NOT overwritten
+    assert updated == 0  # actual affected rows (revalidation miss reported truthfully)
+    await db.close()
+
+
+async def test_p0_2a_single_flight_second_pass_does_not_interleave(
+    db, settings_factory
+):
+    """While one check_chains pass is mid-fetch, a second concurrent invocation
+    returns immediately (single-flight) instead of interleaving its phase-1 reads
+    with the first pass's phase-3 writes."""
+    from scout.chains import tracker as _t
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    _t._check_chains_inflight = False
+    await _emit_completing_events(db, "0xsf", "memecoin")
+
+    fetch_started = asyncio.Event()
+    may_resume = asyncio.Event()
+    fetch_calls: list[str] = []
+
+    async def _paused(session, contract):
+        fetch_calls.append(contract)
+        fetch_started.set()
+        await may_resume.wait()
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    s = settings_factory(**_CHAIN_SETTINGS_KW)
+    first = asyncio.create_task(
+        check_chains(db, s, session=object(), mcap_fetcher=_paused)
+    )
+    await fetch_started.wait()  # first pass is provably mid-fetch (inflight)
+    before = len(fetch_calls)
+
+    # Second concurrent pass must SKIP immediately — no fetch, no interleave.
+    await check_chains(db, s, session=object(), mcap_fetcher=_paused)
+    assert len(fetch_calls) == before, "single-flight breached — second pass fetched"
+
+    may_resume.set()
+    await first  # first pass finishes its own completions (fetch count may rise)
+    await db.close()

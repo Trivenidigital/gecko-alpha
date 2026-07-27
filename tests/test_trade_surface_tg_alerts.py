@@ -335,7 +335,9 @@ async def test_dispatch_cancel_demotes_claimed_sent_row(tmp_path, monkeypatch):
         "SELECT outcome, detail FROM tg_alert_log ORDER BY id DESC LIMIT 1"
     )
     row = await cur.fetchone()
-    assert row["outcome"] == "dispatch_failed"
+    # P0-1: cancel occurs after dispatch_attempted (send began) → the provider
+    # result is unprovable, so the row is delivery_unknown_after_send, never sent.
+    assert row["outcome"] == "delivery_unknown_after_send"
     detail = json.loads(row["detail"])
     assert detail["source_corpus"] == "paper"
     assert detail["error"] == "cancelled_during_telegram_send"
@@ -500,3 +502,236 @@ def test_dispatcher_does_not_call_todays_focus_endpoint_helper():
 
     assert "get_todays_focus(" not in src
     assert "get_trade_inbox(" in src
+
+
+# ---------------------------------------------------------------------------
+# P0-1: write-ahead-intent state model (dispatch_pending → sent / dispatch_failed
+# / delivery_unknown_after_send). No false 'sent' under crash; pending reserves
+# the dedup + cap slot but is never counted as delivered.
+# ---------------------------------------------------------------------------
+
+_ALERTER = "scout.trading.trade_surface_alerts.alerter.send_telegram_message"
+
+
+def _patch_candidates(monkeypatch, token: str = "mocaverse") -> None:
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts._load_today_focus_alert_payload",
+        lambda db_path, window_hours=36: {"rows": [_focus_row(token)]},
+    )
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.dashboard_db.get_live_candidates",
+        lambda db_path, limit=30, window_hours=36: {"rows": [_now_row(token)]},
+    )
+
+
+def _patch_no_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts._load_today_focus_alert_payload",
+        lambda db_path, window_hours=36: {"rows": []},
+    )
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.dashboard_db.get_live_candidates",
+        lambda db_path, limit=30, window_hours=36: {"rows": []},
+    )
+
+
+async def _seed_alert(db, token, outcome, alerted_at):
+    await db.execute_write(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+        "VALUES (NULL, 'trade_surface', ?, ?, ?)",
+        (token, alerted_at, outcome),
+    )
+
+
+@pytest.mark.asyncio
+async def test_p0_1_success_promotes_pending_to_sent(tmp_path, monkeypatch):
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+    sent = []
+
+    async def _ok(*a, **k):
+        sent.append(a)
+
+    monkeypatch.setattr(_ALERTER, _ok)
+    _patch_candidates(monkeypatch)
+    result = await send_trade_surface_alerts(db, _settings(), object())
+    assert result["sent"] == 1 and sent
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE signal_type='trade_surface'"
+    )
+    outcomes = [r[0] for r in await cur.fetchall()]
+    assert "sent" in outcomes
+    assert "dispatch_pending" not in outcomes  # promoted; none left pending
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_failure_demotes_to_dispatch_failed(tmp_path, monkeypatch):
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+
+    async def _fail(*a, **k):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr(_ALERTER, _fail)
+    _patch_candidates(monkeypatch)
+    result = await send_trade_surface_alerts(db, _settings(), object())
+    assert result["dispatch_failed"] == 1
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE signal_type='trade_surface' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_failed"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_cancellation_never_leaves_sent(tmp_path, monkeypatch):
+    """Cancel during the send (after dispatch_attempted) → delivery_unknown, never
+    a false 'sent'."""
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+
+    async def _cancel(*a, **k):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_ALERTER, _cancel)
+    _patch_candidates(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        await send_trade_surface_alerts(db, _settings(), object())
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE signal_type='trade_surface'"
+    )
+    outcomes = [r[0] for r in await cur.fetchall()]
+    assert "sent" not in outcomes
+    assert outcomes == ["delivery_unknown_after_send"]
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_crash_during_format_stays_pending(tmp_path, monkeypatch):
+    """Crash (uncaught BaseException) during preprocessing/formatting — BEFORE the
+    provider call — leaves the row dispatch_pending (send never started), never a
+    false 'sent'. Distinguishable from a crash after the send began."""
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+
+    class _Kill(BaseException):
+        pass
+
+    def _kill_format(candidate):
+        raise _Kill("SIGKILL during format (preprocessing)")
+
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.format_trade_surface_alert", _kill_format
+    )
+    _patch_candidates(monkeypatch)
+    with pytest.raises(_Kill):
+        await send_trade_surface_alerts(db, _settings(), object())
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE signal_type='trade_surface' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_pending"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_crash_during_send_stays_attempted(tmp_path, monkeypatch):
+    """Crash (uncaught BaseException) during the send — AFTER dispatch_attempted —
+    leaves the row dispatch_attempted (reconciled later to
+    delivery_unknown_after_send), never a false 'sent'."""
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+
+    class _Kill(BaseException):
+        pass
+
+    async def _kill(*a, **k):
+        raise _Kill("SIGKILL mid-send")
+
+    monkeypatch.setattr(_ALERTER, _kill)
+    _patch_candidates(monkeypatch)
+    with pytest.raises(_Kill):
+        await send_trade_surface_alerts(db, _settings(), object())
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE signal_type='trade_surface' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_attempted"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_stale_reconciliation_pending_failed_attempted_unknown(
+    tmp_path, monkeypatch
+):
+    """Stale-intent sweep: stale dispatch_pending → dispatch_failed (never reached
+    the provider); stale dispatch_attempted → delivery_unknown_after_send."""
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+    old = (datetime.now(timezone.utc) - timedelta(seconds=1000)).isoformat()
+    await _seed_alert(db, "crashed-pending", "dispatch_pending", old)
+    await _seed_alert(db, "crashed-attempted", "dispatch_attempted", old)
+
+    async def _ok(*a, **k):
+        pass
+
+    monkeypatch.setattr(_ALERTER, _ok)
+    _patch_no_candidates(monkeypatch)
+    await send_trade_surface_alerts(db, _settings(), object())
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='crashed-pending'"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_failed"
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='crashed-attempted'"
+    )
+    assert (await cur.fetchone())[0] == "delivery_unknown_after_send"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_pending_reserves_dedup_slot(tmp_path, monkeypatch):
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    await _seed_alert(db, "mocaverse", "dispatch_pending", now)
+    sent = []
+
+    async def _ok(*a, **k):
+        sent.append(a)
+
+    monkeypatch.setattr(_ALERTER, _ok)
+    _patch_candidates(monkeypatch, "mocaverse")
+    result = await send_trade_surface_alerts(db, _settings(), object())
+    assert result["blocked_dedup_24h"] == 1 and result["sent"] == 0
+    assert sent == []  # deduped against the pending reservation — no send
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_pending_counts_toward_cap_not_delivered(tmp_path, monkeypatch):
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(5):  # fill the cap entirely with RESERVED pending rows
+        await _seed_alert(db, f"tok{i}", "dispatch_pending", now)
+    sent = []
+
+    async def _ok(*a, **k):
+        sent.append(a)
+
+    monkeypatch.setattr(_ALERTER, _ok)
+    _patch_candidates(monkeypatch, "newtok")
+    result = await send_trade_surface_alerts(
+        db, _settings(TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY=5), object()
+    )
+    assert sent == []  # cap reserved by pending rows → no new send
+    assert result["sent"] == 0
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE outcome='sent'"
+    )
+    assert (await cur.fetchone())[0] == 0  # pending is NEVER counted as delivered
+    await db.close()

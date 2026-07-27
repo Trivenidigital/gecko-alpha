@@ -658,7 +658,9 @@ async def test_notify_demotes_sent_row_on_cancelled_error_during_minara_lookup(
 async def test_notify_demotes_sent_row_on_cancelled_error_during_telegram_send(
     tmp_path, monkeypatch
 ):
-    """Cancellation during Telegram send must not leave pre-claimed row as sent."""
+    """Cancellation during the Telegram send (after dispatch_attempted) must
+    NEVER leave the row 'sent'. P0-1: the send began but its result is
+    unprovable, so the row becomes delivery_unknown_after_send."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings()
@@ -694,8 +696,9 @@ async def test_notify_demotes_sent_row_on_cancelled_error_during_telegram_send(
         "WHERE token_id='bonk' ORDER BY id DESC LIMIT 1"
     )
     outcome, detail = await cur.fetchone()
-    assert outcome == "dispatch_failed"
-    assert "telegram" in (detail or "").lower()
+    assert outcome == "delivery_unknown_after_send"
+    assert outcome != "sent"
+    assert "cancelled" in (detail or "").lower()
     cur = await db._conn.execute("SELECT COUNT(*) FROM minara_alert_emissions")
     assert (await cur.fetchone())[0] == 0
     await db.close()
@@ -1139,4 +1142,135 @@ async def test_dedup_audit_log_emitted_on_suppress(tmp_path, monkeypatch):
     assert ev["dedup_window_hours"] == 24
     assert ev["reason"] == "dedup_24h"
     assert ev["prior_alerted_at"] is not None
+    await db.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-1 paper-trade lane crash-window coverage (shared lifecycle contract).
+# ---------------------------------------------------------------------------
+
+
+async def _run_notify(db, token="bonk"):
+    await notify_paper_trade_opened(
+        db,
+        _settings(),
+        session=object(),
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id=token,
+        symbol="BONK",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+    )
+
+
+async def _last_outcome(db, token="bonk"):
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id=? ORDER BY id DESC LIMIT 1",
+        (token,),
+    )
+    return (await cur.fetchone())[0]
+
+
+class _Kill(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_success_promotes_to_sent(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _ok)
+    await _run_notify(db)
+    cur = await db._conn.execute(
+        "SELECT outcome, COUNT(*) FROM tg_alert_log WHERE token_id='bonk' GROUP BY outcome"
+    )
+    rows = {r[0]: r[1] for r in await cur.fetchall()}
+    assert rows == {"sent": 1}  # promoted exactly once; no pending/attempted left
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_minara_stays_pending(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _kill(*a, **k):
+        raise _Kill("SIGKILL during minara lookup")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _kill)
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    assert await _last_outcome(db) == "dispatch_pending"  # send never started
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_format_stays_pending(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    def _kill_format(**k):
+        raise _Kill("SIGKILL during format")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr(
+        "scout.trading.tg_alert_dispatch.format_paper_trade_alert", _kill_format
+    )
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    assert await _last_outcome(db) == "dispatch_pending"  # crash before attempted
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_send_stays_attempted(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    async def _kill_send(*a, **k):
+        raise _Kill("SIGKILL mid-send")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _kill_send)
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    # Crash AFTER dispatch_attempted → row stays attempted (reconciled later to
+    # delivery_unknown), never a false 'sent'.
+    assert await _last_outcome(db) == "dispatch_attempted"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_provider_failure_demotes_to_failed(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    async def _fail(*a, **k):
+        raise RuntimeError("provider 500")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fail)
+    await _run_notify(db)  # notify never raises on a confirmed Exception failure
+    assert await _last_outcome(db) == "dispatch_failed"
     await db.close()

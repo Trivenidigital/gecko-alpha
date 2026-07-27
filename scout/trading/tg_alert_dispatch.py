@@ -37,6 +37,7 @@ from scout import alerter
 from scout.config import Settings
 from scout.db import Database
 from scout.token_ids import match_universe_exclude
+from scout.trading import alert_dispatch_lifecycle as lifecycle
 
 log = structlog.get_logger(__name__)
 
@@ -57,17 +58,32 @@ async def _demote_sent_row(
     detail: str,
     log_event: str,
 ) -> None:
-    if sent_row_id is None or db._conn is None:
+    """Demote a pending/attempted dispatch row to dispatch_failed on a CONFIRMED
+    non-delivery (preprocessing error, cancel before the send began, or a
+    provider error return) via the shared lifecycle contract. Swallows demote
+    errors so alert bookkeeping never propagates into the caller."""
+    if sent_row_id is None:
         return
     try:
-        async with db._txn_lock:
-            await db._conn.execute(
-                "UPDATE tg_alert_log "
-                "SET outcome='dispatch_failed', detail=? "
-                "WHERE id=?",
-                (detail, sent_row_id),
-            )
-            await db._conn.commit()
+        await lifecycle.demote_failed(db, sent_row_id, detail=detail)
+    except Exception:
+        log.exception(log_event, sent_row_id=sent_row_id)
+
+
+async def _mark_unknown_row(
+    db: Database,
+    *,
+    sent_row_id: int | None,
+    detail: str,
+    log_event: str,
+) -> None:
+    """Mark an attempted dispatch row delivery_unknown_after_send when the send
+    was interrupted after it began (e.g. cancelled mid-await) and the provider
+    result cannot be proven. Swallows errors."""
+    if sent_row_id is None:
+        return
+    try:
+        await lifecycle.mark_delivery_unknown(db, sent_row_id, detail=detail)
     except Exception:
         log.exception(log_event, sent_row_id=sent_row_id)
 
@@ -374,13 +390,21 @@ async def notify_paper_trade_opened(
     an out-of-universe token_id (e.g. a tokenized equity) is suppressed.
 
     R2-C2 design-stage fold: atomic check-then-write under db._txn_lock.
-    Cooldown check + pre-emptive 'sent' row INSERT happen under a single
-    lock, so concurrent tasks for the same token serialize cleanly.
+    P0-1 shared lifecycle: the dedup claim commits a ``dispatch_pending`` row
+    (NOT a pre-emptive ``sent``); the row is marked ``dispatch_attempted``
+    immediately before the Telegram send and promoted to ``sent`` ONLY after the
+    provider accepts. A crash during Minara lookup/formatting stays
+    ``dispatch_pending``; a crash during/after the send is reconciled to
+    ``delivery_unknown_after_send``. Neither is ever a false ``sent``.
 
     Mid-flight task loss on shutdown is acceptable — paper_trades row is
     already committed; only the TG alert + tg_alert_log row is lost.
     """
     try:
+        # P0-1 deterministic, self-owned stale-intent reconciliation at dispatch
+        # entry (frozen STALE_RECONCILE_SECONDS): stale dispatch_pending ->
+        # dispatch_failed, stale dispatch_attempted -> delivery_unknown_after_send.
+        await lifecycle.reconcile_stale(db, signal_type)
         if not await _check_eligibility(db, signal_type):
             await _log_outcome(
                 db,
@@ -441,13 +465,16 @@ async def notify_paper_trade_opened(
                 cutoff = (
                     datetime.now(timezone.utc) - timedelta(hours=window_hours)
                 ).isoformat()
+                # P0-1: claim a RESERVED slot as 'dispatch_pending' (NOT a
+                # pre-emptive 'sent'); dedup treats sent + pending + attempted
+                # as claimed.
                 cur = await db._conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "SELECT ?, ?, ?, ?, 'sent' "
+                    "SELECT ?, ?, ?, ?, 'dispatch_pending' "
                     "WHERE NOT EXISTS ("
                     "  SELECT 1 FROM tg_alert_log "
-                    "  WHERE token_id = ? AND outcome = 'sent' "
+                    f"  WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
                     "  AND alerted_at >= ?"
                     ") "
                     "RETURNING id",
@@ -464,7 +491,7 @@ async def notify_paper_trade_opened(
                 if claimed is None:
                     cur = await db._conn.execute(
                         "SELECT alerted_at FROM tg_alert_log "
-                        "WHERE token_id = ? AND outcome = 'sent' "
+                        f"WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
                         "AND alerted_at >= ? "
                         "ORDER BY alerted_at DESC LIMIT 1",
                         (token_id, cutoff),
@@ -497,13 +524,15 @@ async def notify_paper_trade_opened(
                         reason="dedup_24h",
                     )
                     return
+                # NOTE: sent_row_id holds the DISPATCH row id (state
+                # dispatch_pending here; promoted to 'sent' only post-acceptance).
                 sent_row_id = claimed[0]
             else:
-                # Dedup disabled: direct claim, preserving the clean revert path.
+                # Dedup disabled: direct claim as 'dispatch_pending'.
                 cur = await db._conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "VALUES (?, ?, ?, ?, 'sent') RETURNING id",
+                    "VALUES (?, ?, ?, ?, 'dispatch_pending') RETURNING id",
                     (
                         paper_trade_id,
                         signal_type,
@@ -585,6 +614,10 @@ async def notify_paper_trade_opened(
                 signal_type=signal_type,
                 token_id=token_id,
             )
+            # P0-1: mark ATTEMPTED immediately before the provider call. A crash
+            # from here on is reconciled to delivery_unknown_after_send, never a
+            # false 'sent'.
+            await lifecycle.mark_attempted(db, sent_row_id)
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
                 body,
@@ -594,6 +627,9 @@ async def notify_paper_trade_opened(
                 raise_on_failure=True,
                 source="tg_alert_dispatch",
             )
+            # P0-1: provider accepted — promote attempted -> sent (delivered).
+            # Idempotent (guarded on dispatch_attempted).
+            await lifecycle.promote_sent(db, sent_row_id)
             # §12b: emit AFTER the send returns (delivery succeeded — the
             # call raises on failure). Together with tg_alert_dispatched this
             # makes "no logs" unambiguous between delivered vs skipped.
@@ -604,11 +640,12 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
             )
         except asyncio.CancelledError:
-            await _demote_sent_row(
+            # Interrupted after the send began — result unprovable -> unknown.
+            await _mark_unknown_row(
                 db,
                 sent_row_id=sent_row_id,
                 detail="cancelled_during_telegram_send",
-                log_event="tg_alert_log_demote_failed_on_send_cancel",
+                log_event="tg_alert_log_unknown_on_send_cancel",
             )
             raise
         except Exception as e:
@@ -619,24 +656,13 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
                 err=str(e),
             )
-            # Demote pre-emptive 'sent' row to 'dispatch_failed'.
-            # Cooldown query filters on outcome='sent', so demotion clears
-            # the cooldown for the next legitimate fire.
-            if sent_row_id is not None and db._conn is not None:
+            # Confirmed provider failure — demote attempted -> dispatch_failed
+            # (frees the dedup/cap slot for the next legitimate fire).
+            if sent_row_id is not None:
                 try:
-                    async with db._txn_lock:
-                        await db._conn.execute(
-                            "UPDATE tg_alert_log "
-                            "SET outcome='dispatch_failed', detail=? "
-                            "WHERE id=?",
-                            (str(e)[:200], sent_row_id),
-                        )
-                        await db._conn.commit()
+                    await lifecycle.demote_failed(db, sent_row_id, detail=str(e)[:200])
                 except Exception:
-                    log.exception(
-                        "tg_alert_log_demote_failed",
-                        sent_row_id=sent_row_id,
-                    )
+                    log.exception("tg_alert_log_demote_failed", sent_row_id=sent_row_id)
             return
 
         if minara_cmd is not None:

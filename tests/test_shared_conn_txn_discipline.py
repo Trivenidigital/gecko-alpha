@@ -310,7 +310,9 @@ def test_f2_writers_route_through_transaction_manager():
     assert 'execute("BEGIN IMMEDIATE")' not in should_src
     assert 'execute("ROLLBACK")' not in should_src
 
-    check_src = inspect.getsource(tracker.check_chains)
+    # check_chains is a thin single-flight wrapper; the transaction lives in
+    # _check_chains_impl (the phased write body).
+    check_src = inspect.getsource(tracker._check_chains_impl)
     assert "db.transaction(" in check_src
     assert 'execute("BEGIN")' not in check_src
 
@@ -723,3 +725,183 @@ def test_log_processors_emit_exception_info():
     # format_exc_info populated the exception field with the traceback text.
     assert "exception" in payload
     assert "f2-boom-marker" in payload["exception"]
+
+
+# ---------------------------------------------------------------------------
+# P0-3: structural (AST-ancestry) enforcement for shared-connection DML,
+# commit, and rollback — with local-alias tracking, conn=-misuse detection,
+# an exact reviewed allowlist, and scanner-negative fixtures.
+# ---------------------------------------------------------------------------
+
+# Exact, reviewed allowlist of functions permitted to touch the shared
+# connection's DML / commit / rollback WITHOUT an `async with transaction()` /
+# `_txn_lock` ancestor. Each is safe for the enumerated reason:
+#   - "transaction": IS the manager (owns BEGIN IMMEDIATE / commit / rollback).
+#   - _migrate_* / _create_*: init-time DDL migrations, serial before any
+#     create_task (no concurrency); use BEGIN EXCLUSIVE directly.
+#   - record_minara_command_emission / record_tg_alert_operator_action: hold the
+#     lock via `await self._txn_lock.acquire()` + try/finally (not async-with),
+#     so ancestry cannot see it — enumerated here instead.
+_DML_ALLOWLIST_FUNCS = frozenset(
+    {
+        "transaction",
+        "record_minara_alert_emission",
+        "record_tg_alert_operator_action",
+    }
+)
+
+_DML_RE = re.compile(r"^\s*(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
+
+
+def _ctx_is_protective(item: ast.withitem) -> bool:
+    s = ast.unparse(item.context_expr)
+    return s.endswith(".transaction()") or s.endswith("._txn_lock")
+
+
+class _SharedConnAudit(ast.NodeVisitor):
+    """Flags shared-connection DML / commit / rollback that is NOT lexically
+    inside an `async with X.transaction()` / `X._txn_lock` region and NOT in the
+    allowlist, plus transaction-aware helpers called with a shared connection as
+    ``conn=`` OUTSIDE such a region. Tracks local aliases (``conn = db._conn``)
+    structurally via the AST (no source-substring lock detection)."""
+
+    def __init__(self) -> None:
+        self.protect_stack: list[bool] = []
+        self.func_stack: list[str] = []
+        self.alias_stack: list[set] = [set()]
+        self.violations: list[tuple] = []
+
+    def visit_FunctionDef(self, node):
+        self._fn(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._fn(node)
+
+    def _fn(self, node):
+        self.func_stack.append(node.name)
+        self.alias_stack.append(set())
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+        self.alias_stack.pop()
+        self.func_stack.pop()
+
+    def visit_AsyncWith(self, node):
+        protective = any(_ctx_is_protective(i) for i in node.items)
+        self.protect_stack.append(protective)
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+        self.protect_stack.pop()
+
+    def visit_Assign(self, node):
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and ast.unparse(node.value).endswith("._conn")
+        ):
+            self.alias_stack[-1].add(node.targets[0].id)
+        self.generic_visit(node)
+
+    def _protected(self) -> bool:
+        return any(self.protect_stack)
+
+    def _allowed(self) -> bool:
+        fn = self.func_stack[-1] if self.func_stack else "<module>"
+        return (
+            fn in _DML_ALLOWLIST_FUNCS
+            or fn.startswith("_migrate")
+            or fn.startswith("_create")
+        )
+
+    def _is_shared(self, recv) -> bool:
+        s = ast.unparse(recv)
+        if s.endswith("._conn"):
+            return True
+        return isinstance(recv, ast.Name) and recv.id in self.alias_stack[-1]
+
+    def _flag(self, node, kind: str) -> None:
+        fn = self.func_stack[-1] if self.func_stack else "<module>"
+        self.violations.append((fn, node.lineno, kind))
+
+    def visit_Call(self, node):
+        fn = node.func
+        if isinstance(fn, ast.Attribute):
+            if (
+                self._is_shared(fn.value)
+                and not self._protected()
+                and not self._allowed()
+            ):
+                if fn.attr in ("commit", "rollback"):
+                    self._flag(node, "shared .%s()" % fn.attr)
+                elif fn.attr in ("execute", "executemany") and node.args:
+                    a0 = node.args[0]
+                    if (
+                        isinstance(a0, ast.Constant)
+                        and isinstance(a0.value, str)
+                        and _DML_RE.match(a0.value)
+                    ):
+                        self._flag(node, "shared DML")
+        for kw in node.keywords:
+            if (
+                kw.arg == "conn"
+                and self._is_shared(kw.value)
+                and not self._protected()
+                and not self._allowed()
+            ):
+                self._flag(node, "conn=<shared> outside transaction")
+        self.generic_visit(node)
+
+
+def _audit_source(src: str) -> list:
+    audit = _SharedConnAudit()
+    audit.visit(ast.parse(src))
+    return audit.violations
+
+
+def test_ast_no_unmanaged_shared_conn_dml_commit_or_rollback():
+    """Structural AST-ancestry enforcement (P0-3): every shared-connection DML /
+    commit / rollback (incl. via a local `conn = db._conn` alias) must be
+    lexically inside an `async with X.transaction()` / `X._txn_lock` region, or
+    in the exact reviewed allowlist. No source-substring lock detection is used.
+    """
+    scout_root = pathlib.Path(__file__).resolve().parents[1] / "scout"
+    all_violations = []
+    for path in scout_root.rglob("*.py"):
+        rel = path.relative_to(scout_root.parent).as_posix()
+        for fn, lineno, kind in _audit_source(path.read_text(encoding="utf-8")):
+            all_violations.append((rel, fn, lineno, kind))
+    assert all_violations == [], (
+        "Unmanaged shared-connection write/commit/rollback outside a "
+        "transaction()/_txn_lock region: %r" % (all_violations,)
+    )
+
+
+_BAD_FIXTURES = {
+    "module_dml": "async def f(db):\n await db._conn.execute('INSERT INTO t VALUES (1)')\n",
+    "alias_dml": "async def f(db):\n conn = db._conn\n await conn.execute('UPDATE t SET x=1')\n",
+    "self_conn_delete": "class C:\n async def m(self):\n  await self._conn.execute('DELETE FROM t')\n",
+    "bare_commit": "async def f(db):\n await db._conn.commit()\n",
+    "bare_rollback": "async def f(db):\n await db._conn.rollback()\n",
+    "alias_commit": "async def f(db):\n c = db._conn\n await c.commit()\n",
+    "conn_kwarg_misuse": "async def f(db):\n await emit_event(db, 'x', conn=db._conn)\n",
+    "self_db_conn": "class C:\n async def m(self):\n  await self._db._conn.execute('REPLACE INTO t VALUES (1)')\n",
+}
+
+_GOOD_FIXTURES = {
+    "in_transaction": "async def f(db):\n async with db.transaction() as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n",
+    "in_txn_lock": "async def f(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
+    "conn_kwarg_in_txn": "async def f(db):\n async with db.transaction() as conn:\n  await emit_event(db, 'x', conn=db._conn)\n",
+    "migration_ok": "class C:\n async def _migrate_x(self):\n  await self._conn.execute('INSERT INTO schema_version VALUES (1)')\n  await self._conn.commit()\n",
+    "separate_conn": "async def f(db_path):\n async with aiosqlite.connect(db_path) as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n  await conn.commit()\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BAD_FIXTURES))
+def test_scanner_flags_forbidden_pattern(name):
+    """Each forbidden snippet MUST be flagged — a broken scanner fails loudly."""
+    assert _audit_source(_BAD_FIXTURES[name]), "scanner missed %r" % name
+
+
+@pytest.mark.parametrize("name", sorted(_GOOD_FIXTURES))
+def test_scanner_accepts_disciplined_pattern(name):
+    """Each disciplined snippet MUST NOT be flagged (no false positives)."""
+    assert _audit_source(_GOOD_FIXTURES[name]) == [], "false-positive on %r" % name

@@ -44,7 +44,10 @@ async def emit_trade_decision(
     payload = event_data or {}
     created_at = datetime.now(timezone.utc).isoformat()
     try:
-        async with db._txn_lock:
+        # F2 P0-3: use the manager (BEGIN IMMEDIATE + _txn_lock) so any ROLLBACK
+        # on failure happens UNDER the lock — never in an outer except after the
+        # lock has been released.
+        async with db.transaction() as conn:
             cursor = await conn.execute(
                 """INSERT INTO trade_decision_events
                    (token_id, signal_type, decision, reason, source_module,
@@ -62,8 +65,7 @@ async def emit_trade_decision(
                     created_at,
                 ),
             )
-            await conn.commit()
-        event_id = int(cursor.lastrowid)
+            event_id = int(cursor.lastrowid)
         log.debug(
             "trade_decision_event_emitted",
             event_id=event_id,
@@ -74,6 +76,7 @@ async def emit_trade_decision(
         )
         return event_id
     except Exception as exc:
+        # The manager already rolled back under the lock; just record the failure.
         log.warning(
             "trade_decision_event_emit_failed",
             token_id=token_id,
@@ -82,15 +85,4 @@ async def emit_trade_decision(
             reason=reason,
             error=str(exc),
         )
-        try:
-            await conn.rollback()
-        except Exception as rollback_exc:
-            log.warning(
-                "trade_decision_event_rollback_failed",
-                token_id=token_id,
-                signal_type=signal_type,
-                decision=decision,
-                reason=reason,
-                error=str(rollback_exc),
-            )
         return None

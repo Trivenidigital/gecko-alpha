@@ -16,6 +16,7 @@ from dashboard import db as dashboard_db
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.trading import alert_dispatch_lifecycle as lifecycle
 from scout.trading.tg_alert_dispatch import _fmt_mcap, _fmt_price
 
 log = structlog.get_logger(__name__)
@@ -227,7 +228,15 @@ async def _maybe_await(value):
     return value
 
 
-async def _count_sent_today(db: Database) -> int:
+async def _count_reserved_today(db: Database) -> int:
+    """Count RESERVED daily send slots (P0-1 cap arithmetic) using the shared
+    lifecycle's cap-reservation set: ``sent`` + ``dispatch_pending`` +
+    ``dispatch_attempted`` + ``delivery_unknown_after_send`` (a confirmed
+    ``dispatch_failed`` frees its slot). Cap-reservation ONLY — delivered
+    reporting still keys strictly on ``outcome='sent'`` (alerts_scoreboard /
+    operator-action consumers), so a pending/attempted/unknown row is NEVER
+    counted as delivered.
+    """
     if db._conn is None:
         return 0
     start = datetime.now(timezone.utc).replace(
@@ -235,25 +244,13 @@ async def _count_sent_today(db: Database) -> int:
     )
     cur = await db._conn.execute(
         "SELECT COUNT(*) FROM tg_alert_log "
-        "WHERE signal_type = ? AND outcome = 'sent' AND alerted_at >= ?",
+        "WHERE signal_type = ? "
+        f"  AND outcome IN {lifecycle.cap_reserved_in_clause()} "
+        "  AND alerted_at >= ?",
         (SIGNAL_TYPE, start.isoformat()),
     )
     row = await cur.fetchone()
     return int(row[0] or 0)
-
-
-async def _demote_claimed_row(
-    db: Database, sent_row_id: int | None, detail: dict, error: str
-) -> None:
-    """Demote a claimed 'sent' row to 'dispatch_failed' via a short disciplined
-    write (F2: no network, and no _txn_lock held across a send). Used when the
-    out-of-lock Telegram send fails or is cancelled."""
-    if sent_row_id is None:
-        return
-    await db.execute_write(
-        "UPDATE tg_alert_log SET outcome='dispatch_failed', detail=? WHERE id=?",
-        (json.dumps({**detail, "error": error}, sort_keys=True), sent_row_id),
-    )
 
 
 async def _send_claimed_alert(
@@ -264,13 +261,18 @@ async def _send_claimed_alert(
     candidate: TradeSurfaceAlertCandidate,
     window_hours: int,
 ) -> str:
-    """Claim the dedup slot in one disciplined transaction, then send OUTSIDE
-    the lock.
+    """Claim a RESERVED slot as ``dispatch_pending`` in one disciplined
+    transaction, do preprocessing (format) while pending, mark
+    ``dispatch_attempted`` IMMEDIATELY before the provider call, send OUTSIDE the
+    lock, then promote to ``sent`` only after provider acceptance — the shared
+    :mod:`scout.trading.alert_dispatch_lifecycle` contract.
 
-    F2 (defect 4): the Telegram send never runs while ``_txn_lock`` is held.
-    The 'sent' row is claimed + committed first (so concurrent dispatch dedups
-    against it); the send happens out-of-lock; a send failure demotes the row
-    to 'dispatch_failed'. This opt-in lane is capped to 5/day.
+    Crash distinguishability (P0-1): a crash during formatting leaves the row
+    ``dispatch_pending`` (send never started); a crash during/after the send
+    leaves it ``dispatch_attempted`` (reconciled to
+    ``delivery_unknown_after_send``). Neither is ever a false ``sent``. Dedup
+    treats ``sent`` + ``dispatch_pending`` + ``dispatch_attempted`` as claimed.
+    Opt-in lane, 5/day.
     """
     if db._conn is None:
         return "dispatch_failed"
@@ -280,28 +282,23 @@ async def _send_claimed_alert(
         "verdict": candidate.verdict,
         "reasons": list(candidate.reasons),
     }
-    # F2: claim the dedup slot in ONE disciplined transaction (no network), then
-    # send Telegram OUTSIDE the lock (defect 4 — never hold _txn_lock across a
-    # network send), then demote the claimed row to 'dispatch_failed' via a
-    # short disciplined write if the send fails. Micro-tradeoff vs the old
-    # lock-across-send design: a send that ultimately fails is briefly visible
-    # as a committed 'sent' row until the demote lands — it self-corrects to
-    # 'dispatch_failed', and this opt-in lane is capped to 5/day.
     now_iso = datetime.now(timezone.utc).isoformat()
-    sent_row_id: int | None = None
+    pending_row_id: int | None = None
     async with db.transaction() as conn:
         if window_hours > 0:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(hours=window_hours)
             ).isoformat()
+            # Dedup treats RESERVED (sent + pending + attempted) as claimed.
             cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
                 "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "SELECT NULL, ?, ?, ?, 'sent', ? "
+                "SELECT NULL, ?, ?, ?, 'dispatch_pending', ? "
                 "WHERE NOT EXISTS ("
                 "  SELECT 1 FROM tg_alert_log "
-                "  WHERE token_id = ? AND outcome = 'sent' "
-                "  AND alerted_at >= ?"
+                "  WHERE token_id = ? "
+                f"    AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
+                "    AND alerted_at >= ?"
                 ") RETURNING id",
                 (
                     SIGNAL_TYPE,
@@ -329,12 +326,12 @@ async def _send_claimed_alert(
                     ),
                 )
                 return "blocked_dedup_24h"
-            sent_row_id = int(row[0])
+            pending_row_id = int(row[0])
         else:
             cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
                 "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "VALUES (NULL, ?, ?, ?, 'sent', ?) RETURNING id",
+                "VALUES (NULL, ?, ?, ?, 'dispatch_pending', ?) RETURNING id",
                 (
                     SIGNAL_TYPE,
                     candidate.token_id,
@@ -343,17 +340,22 @@ async def _send_claimed_alert(
                 ),
             )
             row = await cur.fetchone()
-            sent_row_id = int(row[0]) if row else None
-    # The claim (outcome='sent') is committed here — BEFORE the network send.
+            pending_row_id = int(row[0]) if row else None
+    # Claim committed as dispatch_pending — a crash before mark_attempted below
+    # leaves it pending (send never started), NEVER a false 'sent'.
 
     try:
+        # Preprocessing (formatting) happens while the row is still pending.
         body = format_trade_surface_alert(candidate)
         log.info(
             "trade_surface_alert_dispatched",
-            tg_alert_log_id=sent_row_id,
+            tg_alert_log_id=pending_row_id,
             token_id=candidate.token_id,
             surface=candidate.surface,
         )
+        # Mark ATTEMPTED immediately before the provider call — a crash from here
+        # on is reconciled to delivery_unknown_after_send, not a false 'sent'.
+        await lifecycle.mark_attempted(db, pending_row_id)
         await alerter.send_telegram_message(
             body,
             session,
@@ -362,20 +364,32 @@ async def _send_claimed_alert(
             raise_on_failure=True,
             source="trade_surface_alerts",
         )
+        # Provider accepted — promote attempted -> sent (delivered). Idempotent.
+        await lifecycle.promote_sent(db, pending_row_id)
         log.info(
             "trade_surface_alert_delivered",
-            tg_alert_log_id=sent_row_id,
+            tg_alert_log_id=pending_row_id,
             token_id=candidate.token_id,
             surface=candidate.surface,
         )
         return "sent"
     except asyncio.CancelledError:
-        await _demote_claimed_row(
-            db, sent_row_id, detail, "cancelled_during_telegram_send"
+        # Interrupted after the send began — the provider result is unprovable.
+        await lifecycle.mark_delivery_unknown(
+            db,
+            pending_row_id,
+            detail=lifecycle.merge_error_detail(
+                detail, "cancelled_during_telegram_send"
+            ),
         )
         raise
     except Exception as exc:
-        await _demote_claimed_row(db, sent_row_id, detail, str(exc)[:200])
+        # Confirmed failure (format error or provider error return).
+        await lifecycle.demote_failed(
+            db,
+            pending_row_id,
+            detail=lifecycle.merge_error_detail(detail, str(exc)[:200]),
+        )
         log.warning(
             "trade_surface_alert_dispatch_failed",
             token_id=candidate.token_id,
@@ -399,10 +413,23 @@ async def send_trade_surface_alerts(
     if not settings.TRADE_SURFACE_TG_ALERTS_ENABLED:
         return counts
     try:
-        sent_today = await _count_sent_today(db)
-        remaining = max(0, settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY - sent_today)
+        # P0-1 claim-time stale-intent reconciliation via the shared lifecycle
+        # (frozen STALE_RECONCILE_SECONDS). A prior crashed run's rows are swept
+        # BEFORE counting reserved slots: stale dispatch_pending ->
+        # dispatch_failed (send never started), stale dispatch_attempted ->
+        # delivery_unknown_after_send (unprovable). Deterministic + self-owned.
+        reconciled = await lifecycle.reconcile_stale(db, SIGNAL_TYPE)
+        if reconciled["pending_failed"] or reconciled["attempted_unknown"]:
+            log.info("trade_surface_pending_reconciled", **reconciled)
+        # Cap arithmetic counts RESERVED slots (sent + pending + attempted + unknown).
+        reserved_today = await _count_reserved_today(db)
+        remaining = max(
+            0, settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY - reserved_today
+        )
         if remaining <= 0:
-            log.info("trade_surface_alert_daily_cap_reached", sent_today=sent_today)
+            log.info(
+                "trade_surface_alert_daily_cap_reached", reserved_today=reserved_today
+            )
             return counts
 
         max_candidates = min(settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_RUN, remaining)
