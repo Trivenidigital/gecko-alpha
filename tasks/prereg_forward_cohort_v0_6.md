@@ -1232,7 +1232,8 @@ failure.
 
 ```text
 §3.3  gate_code_hash manifest file list + selection rationale — RESOLVED
-      (token_ids.py, trading/detection_alert.py, trading/engine.py)
+      (scout/token_ids.py, scout/trading/detection_alert.py,
+       scout/trading/engine.py, scout/trading/tg_alert_dispatch.py)
 §7.4  complete per-component persistence matrix (evaluations, assignments,
       dispositions, delivery evidence, quotes, outcomes, health
       transitions, control-plane journal) — RESOLVED

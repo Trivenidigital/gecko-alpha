@@ -28,11 +28,14 @@ permanently labeled `invalid validation evidence` with an explicit allowed/
 prohibited-use list (§3); per-component F2 persistence architecture selected and
 recorded (§12), including the two-class control-plane writer model (§12a:
 runtime supervisor for automatic transitions + operator scripts for
-authorization-class events). Phase map: **I1 = this document**; **I2/I3 =
-implementation** (incl. the observation-only live inflow census); **I4 = cohort
-activation**. I2/I3/I4 are HELD until the standalone P0 corrective PR for the
-shared-connection transaction defect (F2, `classified_but_not_remediated`) is
-merged, deployed, and verified clean.
+authorization-class events). Phase map: **I1 = the document SET — the
+canonical protocol `tasks/prereg_forward_cohort_v0_6.md` PLUS this
+subordinate annex, merged and internally consistent together (the canonical
+document controls on any conflict)**; **I2/I3 = implementation** (incl. the
+observation-only live inflow census); **I4 = cohort activation**. I2/I3/I4
+are HELD until the standalone P0 corrective PR for the shared-connection
+transaction defect (F2, `classified_but_not_remediated`) is merged,
+deployed, and verified clean.
 
 This document pre-registers the analysis that the **behavior-neutral**
 `detection_decision_receipts` instrumentation (PR
