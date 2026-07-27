@@ -14,11 +14,11 @@ draft controls earlier draft) with the issued S1 and C1–C6 reviewer rulings
 of 2026-07-27 applied last (rulings control all drafts). Section-by-section
 provenance: §13.
 
-**I1 merge blockers:** F2 persistence selection completion (scope per §7.4,
-including the control-plane journal — the remaining `PENDING-F2` input);
-the `PENDING-S1` gate_code_hash manifest file list (§3.3); reviewer
-sign-off; product-owner authorization. These two document-level markers are
-the ONLY unresolved inputs (enumerated in §13.2); all former
+**I1 merge blockers:** reviewer sign-off only. Both document-level inputs
+are RESOLVED inline (gate_code_hash manifest list + rationale, §3.3;
+complete per-component persistence matrix, §7.4). Product-owner
+authorization: RECORDED 2026-07-27 (return directive requiring resolution
+of the final inputs and recording of authorization). All former
 implementation-verification items are explicit I2/I3 gate obligations in
 §12 and do not block document merge.
 
@@ -263,9 +263,40 @@ gate_code_hash = SHA-256 over the canonical serialization (§3.2) of the manifes
   {"path": "<normalized POSIX path, repo-root-relative>", "sha256": "<full file hash>"},
   ...
 ]
-sorted lexicographically by path. PENDING-S1: the manifest file list
-(quality-gate module set) from the drift-table reconciliation.
+sorted lexicographically by path.
 ```
+
+**Manifest file list — RESOLVED (from the Session 1 drift-table
+reconciliation of the deployed decision path):**
+
+```text
+scout/token_ids.py                    # match_universe_exclude — the universe-
+                                      # filter matcher the gate's eligibility
+                                      # decision consumes
+scout/trading/detection_alert.py      # the quality gate itself: freshness
+                                      # gate, quality (quant-score) comparison,
+                                      # universe-filter application, early-vs-
+                                      # trending trigger, dedup + cap decisions,
+                                      # DETECTION_GATE_VERSION constant
+scout/trading/engine.py               # _compute_lead_time_vs_trending — the
+                                      # not_early trigger computation
+```
+
+**Selection rationale:** the manifest contains exactly the files whose code
+can alter a gate DECISION given identical inputs and identical runtime
+configuration. Excluded, with reasons: `scout/config.py` (resolved runtime
+values are captured separately in `runtime_gate_config` within the same
+pre-image; Settings field definitions do not alter decisions);
+`scout/scorer.py` and ingestion (they produce the `quant_score` INPUT, which
+is recorded per evaluation — upstream changes alter inputs, not gate logic,
+and are visible in the recorded score fields); `scout/alerter.py`,
+`scout/db.py`, `scout/trading/tg_alert_dispatch.py`,
+`scout/trading/receipt_archive.py` (post-decision dispatch/persistence
+machinery). Known tradeoff, accepted: `engine.py` hosts mostly non-gate
+code, so unrelated engine edits will churn `gate_version` and open
+sub-cohorts conservatively — false sub-cohort splits are analytically safe
+(sub-cohorts can be pooled after verifying gate-relevant code was
+unchanged), whereas a missed gate change is not.
 
 ## 4. Prices, costs, quoting
 
@@ -668,11 +699,12 @@ viewing, and no field in this protocol claims it does.
 
 Delivery evidence persists to a **durable spool independent of the primary
 database path** — no shared SQLite connection, transaction, or lock path
-with suppression, cohort, or any production write. Candidate mechanisms:
-separate SQLite database file, fsync-on-append JSONL, or another existing
-durable seam. **F2's investigation selects the mechanism** (`PENDING-F2:`
-recorded selection with rationale, per §7.4); this document constrains the
-properties, not the implementation.
+with suppression, cohort, or any production write. **Mechanism SELECTED
+(F2-informed, §7.4 matrix): fsync-on-append, length+checksum-framed JSONL
+segments** — chosen over a separate SQLite file because the send path must
+never wait on any database lock and torn appends must be detectable by
+framing alone; this document constrains the properties, the I2 gate
+demonstrates them.
 
 ### 7.2 Sequence (two-phase, spool-first)
 
@@ -748,20 +780,33 @@ component **only if** F2 proves its transaction and lock path is independent
 of, and safe against, the production detection/dispatch path; otherwise the
 measurement store is isolated.
 
-**Control-plane seam — RESOLVED (F2 + reviewer rulings 2026-07-27):** a
-separate SQLite database file `control_plane.db` — append-only hash-chained
-event journal + authoritative admission ledger, dedicated connections (never
-the pipeline's shared connection), two writer classes (narrowly scoped
-runtime supervisor for automatic transitions; operator scripts for
-authorization-class events). Architecture, writer model, and rejected
-alternatives: annex §12/§12a/§12b
-(`tasks/prereg_detection_gate_enrichment_cohort.md`).
+**Per-component persistence matrix — RESOLVED (F2-informed selection,
+recorded per the reviewer's return directive of 2026-07-27).** Selection
+rule applied: no load-bearing cohort evidence may share a connection,
+transaction, or lock path with the production detection/dispatch path
+(scout.db's process-shared connection — F2's failure domain); the control
+plane must survive a measurement-store failure entirely.
 
-`PENDING-F2:` the remaining per-component selections (measurement-store
-components + spool mechanism) with rationale, recorded before I1 sign-off —
-prepared analysis exists (Session-2 preparation pack) but the recorded
-selection awaits the F2 corrective PR's merge/deploy/verification and
-reviewer confirmation.
+| Component | Store | Writer / connection | Rationale |
+|---|---|---|---|
+| gate_evaluations | `measurement.db` — NEW separate SQLite file, WAL, dedicated writer connection | recording seam on the evaluation path; non-blocking handoff (bounded queue), never `db._conn` | High-volume evidence; a separate file gives lock-path independence BY CONSTRUCTION (v0.5 §7.4 test), not by discipline; production scout.db contention structurally impossible |
+| primary_assignments | Authoritative row in `control_plane.db` admission ledger (§11.3 fenced admission) + mirror row in `measurement.db` | supervisor-mediated admission transaction (dedicated cp connection); mirror written after ledger commit | Admission atomicity and fencing-token compare-and-commit must live in ONE store (annex §12b); mirrors advisory until reconciled |
+| downstream dispositions | `measurement.db` event stream (keyed by gate_evaluation_id) | same dedicated measurement connection | Same failure domain as the evaluations they annotate; ordering preserved per evaluation |
+| delivery evidence | Durable spool: fsync-on-append, length+checksum-framed JSONL segments (spool-first §7.2), reconciled asynchronously into `measurement.db` mirrors | alerter-side appender, own file handles; no SQLite in the send path | Send path must never wait on ANY database lock (§7.3 fail-open); torn writes detectable by framing; provider message_id persisted (closes the Session-1 F9 gap for cohort evidence) |
+| quote events | `measurement.db` | isolated quote worker's OWN connection (separate process, §4.7) | Worker isolation requirement; quota and lock separation from both production and the evaluation writer |
+| outcome events | `measurement.db` | outcome worker's OWN connection | Same isolation argument; freshness breach is a §11.3 pause trigger |
+| health transitions (§11.3 state machine) | `control_plane.db` journal | supervisor (automatic transitions) / operator scripts (authorization-class) | Must be recordable even when `measurement.db` is the failed component — separate file, separate connections, no shared lock |
+| control-plane journal | `control_plane.db` — append-only, hash-chained rows | dedicated connections only; two writer classes (annex §12a); fencing token = status_version (§11.3) | The cohort's authority record; hash chain makes retro-editing evident; SQLite file lock is the cross-process mutex for admission (annex §12b) |
+
+Boundary statements: (1) production scout.db carries NO forward-cohort
+measurement component — the only forward-cohort touchpoint on the
+production path is the non-blocking enqueue to the recording seam; (2)
+`measurement.db` and `control_plane.db` never share a connection or lock
+with each other or with scout.db; (3) all three stores fail independently,
+and every cross-store reference (admission→mirror, spool→mirror) is
+reconciliation-checked rather than transactionally assumed. Architecture
+details, writer model, and rejected alternatives: annex §12/§12a/§12b
+(`tasks/prereg_detection_gate_enrichment_cohort.md`).
 
 ## 8. Versioning
 
@@ -954,18 +999,17 @@ failure.
 [x] Session 1 narrow reconciliation complete (§4.3 supersession branch
     CLOSED — 60s final for the initial gate version; no strata-refinement
     evidence produced, default bands stand)
-[ ] F2 persistence selected for all §7.4 components INCLUDING the
-    control-plane journal (control-plane seam resolved; remaining
-    per-component selections = the PENDING-F2 input)
-[ ] Frozen at I1: 60s latency (final), $1.00 dust threshold, 30/80%
+[x] F2 persistence selected for all §7.4 components INCLUDING the
+    control-plane journal (complete per-component matrix recorded, §7.4)
+[x] Frozen at I1: 60s latency (final), $1.00 dust threshold, 30/80%
     thresholds, entry-only $500 rule, Hájek estimator, sampling METHOD
     (strata, algorithm, formula, budget rule, selection rule, minimum
     constraint), pause-trigger definitions and thresholds
-[ ] Both document-level markers resolved inline: PENDING-S1 (§3.3 manifest
-    list) + PENDING-F2 (§7.4 selections). Implementation-verification
-    items are I2/I3 obligations and do NOT gate document merge.
+[x] Both document-level inputs resolved inline: §3.3 manifest list +
+    rationale; §7.4 persistence matrix. Implementation-verification items
+    are I2/I3 obligations and do NOT gate document merge.
 [ ] Reviewer sign-off recorded
-[ ] Product-owner authorization recorded
+[x] Product-owner authorization recorded (2026-07-27 return directive)
 ```
 
 ### I2 — persistence-merge gate
@@ -1060,16 +1104,19 @@ failure.
 | §11.5 | — (new) | C1 verbatim |
 | §12 | v0.5 §12 (U1 four gates) + v0.6 §12 (V2/V3 amendments); I2 gate = v0.5 list + v0.6 addition | Ruling 1 (2nd): five implementation obligations added to I2/I3 checklists; I1 marker line narrowed to the two document-level inputs |
 
-### 13.2 Document-level markers vs implementation obligations
+### 13.2 Document-level inputs vs implementation obligations
 
-**The only two unresolved I1 inputs (document-level; must be supplied and
-resolved inline before I1 merge):**
+**Both document-level I1 inputs are RESOLVED inline (2026-07-27):**
 
 ```text
-PENDING-S1  §3.3  gate_code_hash manifest file list (drift-table reconciliation)
-PENDING-F2  §7.4  remaining per-component persistence selections (measurement
-                  store + spool mechanism); control-plane seam already resolved
+§3.3  gate_code_hash manifest file list + selection rationale — RESOLVED
+      (token_ids.py, trading/detection_alert.py, trading/engine.py)
+§7.4  complete per-component persistence matrix (evaluations, assignments,
+      dispositions, delivery evidence, quotes, outcomes, health
+      transitions, control-plane journal) — RESOLVED
 ```
+
+No unresolved marker tokens remain anywhere in this document.
 
 **Implementation obligations (former verification markers), relocated to
 their gate checklists — these do NOT block document merge and require no
