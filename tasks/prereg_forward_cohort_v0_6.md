@@ -14,13 +14,21 @@ draft controls earlier draft) with the issued S1 and C1–C6 reviewer rulings
 of 2026-07-27 applied last (rulings control all drafts). Section-by-section
 provenance: §13.
 
-**I1 merge blockers:** reviewer sign-off only. Both document-level inputs
-are RESOLVED inline (gate_code_hash manifest list + rationale, §3.3;
-complete per-component persistence matrix, §7.4). Product-owner
-authorization: RECORDED 2026-07-27 (return directive requiring resolution
-of the final inputs and recording of authorization). All former
-implementation-verification items are explicit I2/I3 gate obligations in
-§12 and do not block document merge.
+**I1 merge blockers:** reviewer sign-off + explicit product-owner
+authorization. Both document-level inputs are RESOLVED inline
+(gate_code_hash manifest list + rationale, §3.3; complete per-component
+persistence matrix with recovery contract, §7.4). **Product-owner
+authorization: NOT YET RECORDED** — the earlier entry citing the reviewer's
+return directive was invalid (a reviewer instruction about the return
+package is not owner authorization). The required form, to be recorded
+verbatim with its date (or by reference to its durable ruling record):
+
+> "As product owner, I authorize the I1 document merge of PR #476 after
+> reviewer approval. This authorizes documentation only and does not
+> authorize I2, I3, I4, deployment, production changes, or cohort accrual."
+
+All former implementation-verification items are explicit I2/I3 gate
+obligations in §12 and do not block document merge.
 
 ## Changelog (cumulative)
 
@@ -280,23 +288,34 @@ scout/trading/detection_alert.py      # the quality gate itself: freshness
                                       # DETECTION_GATE_VERSION constant
 scout/trading/engine.py               # _compute_lead_time_vs_trending — the
                                       # not_early trigger computation
+scout/trading/tg_alert_dispatch.py    # _check_universe — reused by the
+                                      # detection lane as GATE-DECISION code:
+                                      # it applies the enabled flag and
+                                      # exclusion patterns (before delegating
+                                      # to match_universe_exclude) to produce
+                                      # the terminal universe-block decision
 ```
 
 **Selection rationale:** the manifest contains exactly the files whose code
 can alter a gate DECISION given identical inputs and identical runtime
-configuration. Excluded, with reasons: `scout/config.py` (resolved runtime
-values are captured separately in `runtime_gate_config` within the same
-pre-image; Settings field definitions do not alter decisions);
-`scout/scorer.py` and ingestion (they produce the `quant_score` INPUT, which
-is recorded per evaluation — upstream changes alter inputs, not gate logic,
-and are visible in the recorded score fields); `scout/alerter.py`,
-`scout/db.py`, `scout/trading/tg_alert_dispatch.py`,
+configuration. `tg_alert_dispatch.py` is **conservatively included**: most
+of that file is post-decision dispatch behavior, but its `_check_universe`
+helper is imported and executed by the detection lane as the terminal
+universe-block decision, so a change to it can alter a gate decision — a
+three-file manifest would miss that edit. Excluded, with reasons:
+`scout/config.py` (resolved runtime values are captured separately in
+`runtime_gate_config` within the same pre-image; Settings field definitions
+do not alter decisions); `scout/scorer.py` and ingestion (they produce the
+`quant_score` INPUT, which is recorded per evaluation — upstream changes
+alter inputs, not gate logic, and are visible in the recorded score
+fields); `scout/alerter.py`, `scout/db.py`,
 `scout/trading/receipt_archive.py` (post-decision dispatch/persistence
-machinery). Known tradeoff, accepted: `engine.py` hosts mostly non-gate
-code, so unrelated engine edits will churn `gate_version` and open
-sub-cohorts conservatively — false sub-cohort splits are analytically safe
-(sub-cohorts can be pooled after verifying gate-relevant code was
-unchanged), whereas a missed gate change is not.
+machinery with no decision-reaching helpers). Known tradeoff, accepted:
+`engine.py` and `tg_alert_dispatch.py` host mostly non-gate code, so
+unrelated edits there will churn `gate_version` and open sub-cohorts
+conservatively — false sub-cohort splits are analytically safe (sub-cohorts
+can be pooled after verifying gate-relevant code was unchanged), whereas a
+missed gate change is not.
 
 ## 4. Prices, costs, quoting
 
@@ -712,20 +731,22 @@ demonstrates them.
 1. Durably append pre-send intent to the spool (fsynced before step 3):
    internal alert ID, correlation ID, provider, destination identity,
    intent timestamp, gate-evaluation link
-2. Best-effort mirror of the intent into the primary DB (failure tolerated)
+2. Best-effort mirror of the intent into measurement.db (failure tolerated)
 3. Send once
 4. Durably append provider response (provider message_id, acceptance
    timestamp, response status, persistence_status, intent link) to the spool
-5. Reconcile the primary DB asynchronously from the spool
+5. Reconcile measurement.db asynchronously from the spool
 ```
 
 ### 7.3 Behavior-neutral failure semantics
 
 ```text
-intent DB mirror fails, spool succeeds      → send proceeds normally
-provider accepted, DB persistence fails     → delivery remains provable from
+intent measurement.db mirror fails,
+spool succeeds                              → send proceeds normally
+provider accepted, measurement.db
+persistence fails                           → delivery remains provable from
                                               the spool; reconciliation
-                                              restores DB state
+                                              restores measurement.db state
 spool unavailable                           → send behavior UNCHANGED (alerts
                                               are production; instrumentation
                                               never blocks them); the
@@ -775,10 +796,12 @@ the failed component. It must not share a write path, connection, or lock
 with the measurement store.
 ```
 
-The primary SQLite database remains acceptable for any measurement-store
-component **only if** F2 proves its transaction and lock path is independent
-of, and safe against, the production detection/dispatch path; otherwise the
-measurement store is isolated.
+The production SQLite database (`scout.db`) would have been acceptable for a
+measurement-store component **only if** F2 proved its transaction and lock
+path independent of, and safe against, the production detection/dispatch
+path. F2's findings (shared-connection transaction collisions;
+`classified_but_not_remediated`) mean it fails that test; the matrix below
+therefore isolates every Forward Cohort component from `scout.db`.
 
 **Per-component persistence matrix — RESOLVED (F2-informed selection,
 recorded per the reviewer's return directive of 2026-07-27).** Selection
@@ -787,24 +810,121 @@ transaction, or lock path with the production detection/dispatch path
 (scout.db's process-shared connection — F2's failure domain); the control
 plane must survive a measurement-store failure entirely.
 
-| Component | Store | Writer / connection | Rationale |
-|---|---|---|---|
-| gate_evaluations | `measurement.db` — NEW separate SQLite file, WAL, dedicated writer connection | recording seam on the evaluation path; non-blocking handoff (bounded queue), never `db._conn` | High-volume evidence; a separate file gives lock-path independence BY CONSTRUCTION (v0.5 §7.4 test), not by discipline; production scout.db contention structurally impossible |
-| primary_assignments | Authoritative row in `control_plane.db` admission ledger (§11.3 fenced admission) + mirror row in `measurement.db` | supervisor-mediated admission transaction (dedicated cp connection); mirror written after ledger commit | Admission atomicity and fencing-token compare-and-commit must live in ONE store (annex §12b); mirrors advisory until reconciled |
-| downstream dispositions | `measurement.db` event stream (keyed by gate_evaluation_id) | same dedicated measurement connection | Same failure domain as the evaluations they annotate; ordering preserved per evaluation |
-| delivery evidence | Durable spool: fsync-on-append, length+checksum-framed JSONL segments (spool-first §7.2), reconciled asynchronously into `measurement.db` mirrors | alerter-side appender, own file handles; no SQLite in the send path | Send path must never wait on ANY database lock (§7.3 fail-open); torn writes detectable by framing; provider message_id persisted (closes the Session-1 F9 gap for cohort evidence) |
-| quote events | `measurement.db` | isolated quote worker's OWN connection (separate process, §4.7) | Worker isolation requirement; quota and lock separation from both production and the evaluation writer |
-| outcome events | `measurement.db` | outcome worker's OWN connection | Same isolation argument; freshness breach is a §11.3 pause trigger |
-| health transitions (§11.3 state machine) | `control_plane.db` journal | supervisor (automatic transitions) / operator scripts (authorization-class) | Must be recordable even when `measurement.db` is the failed component — separate file, separate connections, no shared lock |
-| control-plane journal | `control_plane.db` — append-only, hash-chained rows | dedicated connections only; two writer classes (annex §12a); fencing token = status_version (§11.3) | The cohort's authority record; hash chain makes retro-editing evident; SQLite file lock is the cross-process mutex for admission (annex §12b) |
+Each component below records: store · writer/connection · relationship to
+`scout.db` · recovery/reconciliation mechanism · failure isolation ·
+rationale.
 
-Boundary statements: (1) production scout.db carries NO forward-cohort
-measurement component — the only forward-cohort touchpoint on the
+**1. gate_evaluations** — `measurement.db` (NEW separate SQLite file, WAL,
+dedicated writer connection). *scout.db relationship:* NONE — never written
+to or read from scout.db. *Recovery:* the recording seam is a bounded
+non-blocking queue; on measurement.db write failure the evaluation record
+is retried within the seam's bounded budget, and on exhaustion it is
+UNRECOVERABLE — no assignment may be admitted for it (ordering rule 6
+below) and a measurement-failure episode opens/joins (§11.3 store-write
+trigger). *Failure isolation:* an evaluation-write failure never blocks the
+production gate decision or dispatch (§11.5); it stops ADMISSION only.
+*Rationale:* high-volume evidence; a separate file gives lock-path
+independence BY CONSTRUCTION, not by discipline.
+
+**2. primary_assignments** — authoritative row in `control_plane.db`
+admission ledger (§11.3 fenced admission); supervisor-mediated admission
+transaction on the dedicated cp connection. *scout.db relationship:* NONE.
+*Recovery:* governed by the frozen cross-store ordering below; a failed
+measurement.db mirror is reconstructed FROM the authoritative ledger
+(rule 5). *Failure isolation:* ledger unwritable → admission fails closed
+(no assignment, gap observation per §6.5); production unaffected.
+*Rationale:* admission atomicity + fencing-token compare-and-commit must
+live in ONE store (annex §12b).
+
+**3. assignment mirrors** — `measurement.db`, written after ledger commit,
+carrying `admission ledger row id + fencing_token`. *scout.db relationship:*
+NONE. *Recovery:* reconstructed from the admission ledger by the
+reconciliation sweep (rule 5); a mirror without a ledger match is excluded
+and surfaced as a reconciliation failure. *Failure isolation:* mirror
+failure never invalidates the admission (the ledger is authoritative).
+*Rationale:* analysis queries read the measurement store; authority stays
+in the control plane.
+
+**4. downstream dispositions** — `measurement.db` event stream keyed by
+`gate_evaluation_id`, same dedicated measurement connection as #1.
+*scout.db relationship:* NONE (production dispatch state in scout.db is
+production's own; cohort disposition EVENTS are recorded independently).
+*Recovery:* none across stores — a failed disposition write follows the
+same bounded-retry-then-episode path as #1; the affected assignment's
+derived states are computed with the gap disclosed. *Failure isolation:*
+never blocks dispatch. *Rationale:* same failure domain as the evaluations
+they annotate; per-evaluation ordering preserved.
+
+**5. delivery evidence** — durable spool: fsync-on-append,
+length+checksum-framed JSONL segments (spool-first, §7.2); alerter-side
+appender with its own file handles; NO SQLite in the send path;
+asynchronously reconciled into `measurement.db` mirrors. *scout.db
+relationship:* NONE for cohort evidence (production's own tg_alert_log
+remains production machinery, not cohort evidence). *Recovery:* the spool
+IS the durable source — measurement.db delivery mirrors are rebuilt from
+the spool at any time; spool fsync failure is a §11.3 pause trigger; spool
+unavailability → `delivery_evidence_unavailable` (§7.3), never fabricated.
+*Failure isolation:* send behavior unchanged under every failure mode
+(§7.3). *Rationale:* the send path must never wait on any database lock;
+torn appends detectable by framing; provider message_id persisted (closes
+the Session-1 F9 gap for cohort evidence).
+
+**6. quote events** — `measurement.db`, written by the isolated quote
+worker over its OWN connection (separate process, §4.7). *scout.db
+relationship:* NONE. *Recovery:* NO durable worker outbox is provided, by
+design — on measurement.db write failure the worker retries within its
+frozen retry budget; on exhaustion the quote event is UNRECOVERABLE, is
+reported through the measurement-failure episode it opens/joins (§11.3
+store-write trigger), and the affected assignments' CP2 coverage is
+classified through that episode (quote_gap / indeterminate — never
+silently dropped). *Failure isolation:* worker failure degrades coverage
+only; breaker-open >10min is itself a pause trigger. *Rationale:* an
+outbox would let quoting continue against a failed evidence store,
+accruing unverifiable coverage; pausing admission is the pre-registered
+behavior.
+
+**7. outcome events** — `measurement.db`, outcome worker's OWN connection.
+*scout.db relationship:* NONE. *Recovery:* same contract as #6 (bounded
+retry → unrecoverable → episode; affected windows classified through the
+episode); additionally, outcome-worker staleness (> 3 × refresh cadence)
+is an independent §11.3 pause trigger. *Failure isolation:* never touches
+production. *Rationale:* as #6.
+
+**8. health transitions + control-plane journal** — `control_plane.db`:
+append-only, hash-chained rows; dedicated connections only; two writer
+classes (annex §12a); fencing token = status_version (§11.3). *scout.db
+relationship:* NONE. *Recovery:* the journal is the recovery ROOT for the
+experiment — it is reconstructed from nothing else; if it is unwritable,
+admission fails closed by construction (no readable active status = no
+admission) and the episode is recorded upon recovery, including the fact
+that observation itself was unavailable (§6.5). *Failure isolation:* must
+remain recordable when `measurement.db` is the failed component — separate
+file, separate connections, no shared lock. *Rationale:* the cohort's
+authority record; hash chain makes retro-editing evident; the SQLite file
+lock is the cross-process mutex for admission (annex §12b).
+
+**Frozen cross-store ordering (the recovery contract's spine):**
+
+```text
+1. gate_evaluation becomes durable in measurement.db
+2. only then may its primary_assignment be admitted in control_plane.db
+3. the admission row stores gate_evaluation_id + feature_snapshot_hash
+4. the measurement.db assignment mirror is written after admission
+5. a failed mirror is reconstructed from the authoritative admission ledger
+6. a failed gate_evaluation write admits no assignment and opens/joins a
+   measurement-failure episode
+```
+
+This ordering makes it impossible for an authoritative assignment to exist
+without its load-bearing evaluation evidence.
+
+Boundary statements: (1) production scout.db carries NO Forward Cohort
+measurement component — the only Forward Cohort touchpoint on the
 production path is the non-blocking enqueue to the recording seam; (2)
 `measurement.db` and `control_plane.db` never share a connection or lock
-with each other or with scout.db; (3) all three stores fail independently,
-and every cross-store reference (admission→mirror, spool→mirror) is
-reconciliation-checked rather than transactionally assumed. Architecture
+with each other or with scout.db; (3) every cross-store reference
+(admission→mirror, spool→mirror, evaluation→admission) is governed by the
+ordering and reconciliation rules above — never transactionally assumed. Architecture
 details, writer model, and rejected alternatives: annex §12/§12a/§12b
 (`tasks/prereg_detection_gate_enrichment_cohort.md`).
 
@@ -1009,7 +1129,9 @@ failure.
     rationale; §7.4 persistence matrix. Implementation-verification items
     are I2/I3 obligations and do NOT gate document merge.
 [ ] Reviewer sign-off recorded
-[x] Product-owner authorization recorded (2026-07-27 return directive)
+[ ] Product-owner authorization recorded — awaiting the explicit statement
+    (verbatim template in the header; a reviewer return directive is not
+    owner authorization)
 ```
 
 ### I2 — persistence-merge gate

@@ -601,11 +601,11 @@ entirely.
 
 | # | Component | Load-bearing? | Selected persistence | F2 rationale |
 |---|---|---|---|---|
-| 1 | `detection_decision_receipts` (hot tier) | YES — primary cohort evidence | scout.db table, ALL writes through the common disciplined transaction manager (P0 PR); `INSERT OR IGNORE` + UNIQUE(idempotency_key) preserved | Collisions eliminated at the mechanism level, not per-caller convention; a receipt write can neither be victim nor perpetrator of a foreign rollback |
+| 1 | `detection_decision_receipts` (hot tier) | **Subordinate detection-receipt audit/validation evidence** for THIS annex's cohort — NOT authoritative Forward Cohort gate_evaluations or assignments (those are authoritative in `measurement.db` / `control_plane.db` per the canonical §7.4 matrix) | scout.db table, ALL writes through the common disciplined transaction manager (P0 PR); `INSERT OR IGNORE` + UNIQUE(idempotency_key) preserved | Collisions eliminated at the mechanism level, not per-caller convention; a receipt write can neither be victim nor perpetrator of a foreign rollback |
 | 2 | Cold archive partitions + integrity manifest (`scout/trading/receipt_archive.py`) | YES — evidence lifecycle ≥120d | Time-partitioned compressed files OUTSIDE SQLite + queryable manifest. The manifest enumerates member rows using their persisted identity and idempotency fields. Manifest integrity is protected by `gecko-alpha-archive-manifest-v1` over canonical manifest bytes. The sampling hash is not the archive integrity key. Fail-closed 7-step archival transaction; rows stay hot until the independent off-host durable copy is confirmed (off-host destination = standing operator dependency) | File-level artifacts are immune to connection-sharing defects; manifest hashes make silent truncation/corruption detectable at restore |
 | 3 | **Independent control-plane journal** (cohort lifecycle: cohort-start authorization + app-ready timestamp, fencing-token epochs, census freezes, invalid-range declarations, close marker, invalidation/pause events, archive/restore proofs, admission ledger) | YES — the cohort's authority record | **NEW, SEPARATE SQLite database file** (`control_plane.db`), append-only event table, hash-chained rows (each row carries sha256 of predecessor), opened by DEDICATED connections; NEVER on `db._conn`. **Two writer classes** (§12a): a narrowly scoped runtime **control-plane supervisor** for automatic protocol transitions, and operator-invoked scripts for manual authorization/pause/recovery | Independence is the point: the journal must remain trustworthy even if scout.db's shared connection misbehaves (F2's exact failure class). Append-only + hash chain makes retro-editing evident |
 | 4 | Per-cycle reconciliation census (`detection_receipt_summary`) | Supporting (validity gate §8) | Structured journal (journald) at cycle time — unchanged; but every census FREEZE and every validity verdict derived from it is durably recorded in the control-plane journal (#3) | journald retention is finite (the F9 lesson: journal-only evidence expires); freezes must outlive it |
-| 5 | DEX outcome-ledger evidence (`signal_outcome_ledger`, `ledger_enrollments`) | YES (Session-1 T0 clock; separate cohort) | scout.db under the same disciplined transaction manager as #1 after the P0 PR | Same shared-connection exposure; same remedy |
+| 5 | DEX outcome-ledger evidence (`signal_outcome_ledger`, `ledger_enrollments`) | YES — **the separate Session 1 DEX cohort (T0 clock); explicitly NOT Session 2 Forward Cohort evidence** | scout.db under the same disciplined transaction manager as #1 after the P0 PR | Same shared-connection exposure; same remedy; may remain in scout.db because it is not Forward Cohort evidence |
 
 ### 12a. Control-plane writer model (reviewer correction — NOT operator-only)
 
@@ -664,12 +664,13 @@ so admission is made atomic in ONE store:
   compare-then-commit. A crashed process that restarts with a retired token is
   rejected on its first admission attempt, because token state and admission
   live in the same transactional store.
-- **Measurement-store mirror**: the receipt/assignment row in scout.db is a
-  MIRROR of the admission, written after the ledger commit and carrying the
-  ledger row id + token. Mirrors are advisory until reconciled: any scout.db
-  cohort row without a matching admission-ledger row (or carrying a retired
-  token) is excluded by the §4 index query and surfaced as a reconciliation
-  failure (§8) — it can never silently join the cohort.
+- **Measurement-store mirror**: the assignment mirror row is written to the
+  MEASUREMENT store (`measurement.db` for the Forward Cohort, per the
+  canonical §7.4 matrix — NOT production scout.db), after the ledger commit,
+  carrying the ledger row id + token. Mirrors are advisory until reconciled:
+  any measurement-store cohort row without a matching admission-ledger row
+  (or carrying a retired token) is excluded by the index query and surfaced
+  as a reconciliation failure — it can never silently join the cohort.
 
 **Explicitly rejected alternatives:** (a) control-plane rows as another scout.db
 table — rejected: shares the failure domain the journal must referee; (b)
