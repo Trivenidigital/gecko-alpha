@@ -14,12 +14,13 @@ draft controls earlier draft) with the issued S1 and C1–C6 reviewer rulings
 of 2026-07-27 applied last (rulings control all drafts). Section-by-section
 provenance: §13.
 
-**I1 merge blockers:** Session 1 narrow reconciliation; F2 classification +
-persistence selection (scope per §7.4, including the control-plane journal);
-resolution of all `PENDING-S1:` / `PENDING-F2:` / `VERIFY:` markers (these
-are the protocol's own gate-scoped markers, enumerated in §13.2 — each
-resolves at its designated gate, per the §12 checklists); reviewer sign-off;
-product-owner authorization.
+**I1 merge blockers:** F2 persistence selection completion (scope per §7.4,
+including the control-plane journal — the remaining `PENDING-F2` input);
+the `PENDING-S1` gate_code_hash manifest file list (§3.3); reviewer
+sign-off; product-owner authorization. These two document-level markers are
+the ONLY unresolved inputs (enumerated in §13.2); all former
+implementation-verification items are explicit I2/I3 gate obligations in
+§12 and do not block document merge.
 
 ## Changelog (cumulative)
 
@@ -52,6 +53,14 @@ Rulings    S1 topology (this canonical file + subordinate annex); C1
            canonical_contract, fixed_salt})), big-endian mod 1000; C5
            fencing token increments on EVERY transition; C6 gap-observation
            record carries control_status_version + failure-episode link.
+Rulings    (1) marker/gate contradiction fixed: I1 resolves only the two
+2026-07-27 document-level inputs; the five former VERIFY items are I2/I3
+(2nd)      gate obligations (§12); (2) crossover delivery linkage: provider
+           acceptance is an event on the producing gate_evaluation_id;
+           delivered_crossover derived state defined (§2.4-2.5); (3)
+           reporting maturity split: 24h evidentiary report + 72h
+           completion supplement (§10); (4) §4.3 supersession branch
+           CLOSED — 60s final for the initial gate version.
 ```
 
 ---
@@ -147,19 +156,36 @@ quote events:         scheduled | quoted | quote_failed | quote_not_scheduled (�
 
 No stored field ever encodes "not delivered" as a terminal state, because
 delivery evidence arrives after the decision and may arrive late
-(reconciliation). Derived reporting states are computed at report time per
-assignment from its bound evaluation's event stream — never stored as
-stages — with the computation timestamp disclosed:
+(reconciliation). **Provider acceptance is a delivery EVENT linked to the
+actual producing `gate_evaluation_id`** — never inferred at the assignment
+level — because a first-blocked identity may later pass and be delivered
+from that later evaluation. Derived reporting states are computed at report
+time per assignment from the event streams of its identity's evaluations —
+never stored as stages — with the computation timestamp disclosed:
 
 ```text
-provider_accepted_delivery        assigned_cohort=quality_passed AND a linked
-                                  provider-acceptance evidence record exists
+provider_accepted_delivery        assigned_cohort=quality_passed AND a
+                                  provider-acceptance delivery event is
+                                  linked to the assignment's BOUND
+                                  gate_evaluation_id (or a same-cohort
+                                  reevaluation of it)
 quality_passed_but_not_delivered  assigned_cohort=quality_passed AND no
                                   provider-acceptance evidence at report time
                                   (with disposition breakdown)
+delivered_crossover               assigned_cohort=quality_blocked AND a
+                                  LATER quality_passed gate_evaluation exists
+                                  for the identity AND that later evaluation
+                                  has a linked provider-acceptance delivery
+                                  event
 delivery_unknown_after_send       per §7
 delivery_evidence_unavailable     per §7.3
 ```
+
+**Clocks:** primary clocks stay bound to the FIRST assigned evaluation
+(§4.3 `quote_time` from the bound evaluation's `decision_timestamp`; CP1
+from the same). The secondary crossover delivery clock uses the LATER
+actual provider-acceptance event's timestamp (Analysis 2 anchor for
+`delivered_crossover` rows).
 
 ### 2.5 Assignment rule and crossover treatment
 
@@ -173,8 +199,9 @@ Re-evaluations under the same gate version after a terminal decision do not
 create new primary rows; a gate_version change starts a new sub-cohort (§8).
 
 **Secondary-analysis crossover treatment:** in the delivered-vs-blocked
-contrast, crossover deliveries (identities whose first decision was blocked
-but which were later delivered) are reported separately, and the contrast is
+contrast, `delivered_crossover` rows (§2.4 — blocked primary assignments
+whose identity was later passed and provider-accepted-delivered from the
+later evaluation) are reported separately, and the contrast is
 presented **both including and excluding** crossover deliveries. The
 secondary contrast is descriptive and non-independent: the same identity is
 never counted as two independent observations — where an identity appears on
@@ -213,8 +240,9 @@ schema_version        integer, bumped on any field addition/removal
 encoding              UTF-8 canonical JSON
 key order             lexicographically sorted at every object level
 numbers               decimals serialized as strings with explicit scale;
-                      floats forbidden in the canonical form (VERIFY: map
-                      deployed float features to fixed-scale decimal strings)
+                      floats forbidden in the canonical form (the deployed
+                      float-feature → fixed-scale-decimal mapping is an I2
+                      implementation obligation, §12 I2 gate)
 timestamps            ISO-8601 UTC, millisecond precision, trailing 'Z'
 null                  explicit JSON null; absent ≠ null (absence is a schema
                       violation for schema_version's field set)
@@ -296,14 +324,13 @@ rationale: recorded operator estimate of the decision→dispatch→provider-
 scope:     all chains/venues until a gate_version change; bound per §8
 ```
 
-Sole supersession path: if, **before I1 merge**, the Session 1 narrow
-reconciliation produces ≥10 provably timestamped decision→acceptance
-intervals per stratum (provider acceptance evidenced by
-correlation-ID-matched structured logs whose acceptance timestamps the
-reconciliation certifies as provider-side, not enqueue-side), the
-pre-registered estimator computes and its result replaces 60s in the merged
-document. After I1 merge, the frozen value changes only via §9 amendment.
-Nothing about this remains pending at I4. Implementation requirement: the
+**Supersession branch CLOSED (reviewer correction 4, 2026-07-27):** the
+Session 1 narrow reconciliation is complete and did NOT meet the
+historical-interval requirement (≥10 provably provider-side-timestamped
+decision→acceptance intervals per stratum). The frozen 60-second latency is
+therefore **final for the initial gate version**; future changes require §9
+amendment only. Nothing about this remains pending at any gate.
+Implementation requirement: the
 quote scheduler must fire a live executable quote at `quote_time` for
 **every** scheduled assignment, both cohorts — quotes cannot be
 reconstructed retroactively.
@@ -346,8 +373,8 @@ incapable of harming production:**
 - circuit breaker: on repeated quoter failures, open the breaker, write
   quote_failed (reason=breaker_open) durably, never retry into the gate path
 - writes go through the measurement store but must not hold locks the
-  detection/dispatch path contends on (VERIFY at I2/I3: table/connection
-  isolation per the F2-selected architecture)
+  detection/dispatch path contends on (table/connection isolation per the
+  F2-selected architecture is demonstrated at the I2/I3 gates, §12)
 - a quoter outage can degrade coverage but can never delay a detection
   decision, an alert dispatch, or a delivery-evidence write
 ```
@@ -484,9 +511,10 @@ The −50% arm intentionally measures tradeability; chart-flat tokens with
 poor round-trip liquidity may correctly register the loss outcome. Reports
 must not "correct" this.
 
-CP2 evaluation cadence: `VERIFY:` deployed price-refresh cadence; the merged
-version states it explicitly ("evaluated each refresh tick, ≤N minutes
-apart") as a known granularity bound.
+CP2 evaluation cadence: the deployed price-refresh cadence is measured and
+recorded in the I3 gate record ("evaluated each refresh tick, ≤N minutes
+apart") as a known granularity bound — an I3 implementation obligation
+(§12), not an I1 input.
 
 ### 5.2 Secondary endpoints
 
@@ -569,8 +597,9 @@ cg_indeterminate      window not adequately observed; in denominator
 cg_source_outage      CG API outage on record; in denominator, flagged
 ```
 
-`VERIFY:` trending-snapshot capture cadence in deployed ingestion; state it
-in the merged version.
+The trending-snapshot capture cadence of deployed ingestion is measured and
+recorded in the I3 gate record — an I3 implementation obligation (§12), not
+an I1 input.
 
 ### 6.3 Reporting rule
 
@@ -775,17 +804,26 @@ are additionally broken out by the changed version where feasible.
 
 ## 10. Evaluation and reporting
 
-First evidentiary report at §2.7 maturity: primary contrast (Analysis 1)
-with CP1/CP2 rates and full coverage breakdowns; secondary contrast
-(Analysis 2) with the §2.5 crossover presentations; disposition-cost
-analysis; crossover outcomes; latency_tax distribution;
-gate_version/sub-cohort history; all §4.7 sampling-related reporting rules
-(Hájek + unweighted + per-stratum; sampled-in/out counts per stratum in
-every denominator table); resolution record of every former
-`PENDING-S1`/`PENDING-F2`/`VERIFY` marker. Reports state the evaluation
-timestamp at which derived states were computed. The report contains no
-threshold/cap change recommendations; those go to a separate ruling request
-referencing the report.
+**Reporting maturity is split (reviewer correction 3, 2026-07-27):**
+
+1. **24-hour evidentiary report**, at §2.7 maturity: primary contrast
+   (Analysis 1) with CP1/CP2 rates and full coverage breakdowns; secondary
+   contrast (Analysis 2) with the §2.5 crossover presentations;
+   disposition-cost analysis; crossover outcomes; latency_tax distribution;
+   the MATURED 6h/24h secondary measures only; gate_version/sub-cohort
+   history; all §4.7 sampling-related reporting rules (Hájek + unweighted +
+   per-stratum; sampled-in/out counts per stratum in every denominator
+   table); resolution record of every former protocol marker. This report
+   MUST NOT claim or imply that any 72-hour endpoint is complete.
+2. **72-hour completion supplement**, published when the corresponding 72h
+   windows have closed coverage-resolved: 72h MFE, maximum drawdown within
+   72h, liquidity survival at 72h, tail-concentration outputs, and
+   time-to-outcome measures extending beyond 24h. The supplement carries
+   the same coverage and denominator disciplines as the 24-hour report.
+
+Reports state the evaluation timestamp at which derived states were
+computed. Neither report contains threshold/cap change recommendations;
+those go to a separate ruling request referencing the report.
 
 ## 11. Implementation increments and experiment lifecycle
 
@@ -809,8 +847,9 @@ Before I4, I2 and I3 process **only synthetic validation identities**:
 - synthetic identities use a reserved namespace: canonical_contract prefixed
   with the sentinel "VALIDATION-" (impossible as a base58 mint) AND stored
   with is_synthetic = true AND written to a segregated validation store/
-  namespace (VERIFY at I2: separate DB file vs schema-enforced partition,
-  per F2's architecture)
+  namespace (the concrete mechanism — separate DB file vs schema-enforced
+  partition, per F2's architecture — is selected and demonstrated at the I2
+  gate, §12)
 - every cohort query excludes synthetics BY CONSTRUCTION (query layer reads
   only the production namespace; is_synthetic is defense-in-depth, not the
   primary guard)
@@ -912,15 +951,19 @@ failure.
 ### I1 — document-merge gate (amended per V2)
 
 ```text
-[ ] Session 1 narrow reconciliation complete (incl. §4.3 supersession
-    resolution and any strata-refinement evidence)
-[ ] F2 classified; persistence selected for all §7.4 components INCLUDING
-    the control-plane journal
-[ ] Frozen at I1: 60s latency (or superseded value), $1.00 dust threshold,
-    30/80% thresholds, entry-only $500 rule, Hájek estimator, sampling
-    METHOD (strata, algorithm, formula, budget rule, selection rule,
-    minimum constraint), pause-trigger definitions and thresholds
-[ ] All PENDING-S1 / PENDING-F2 / VERIFY markers resolved inline
+[x] Session 1 narrow reconciliation complete (§4.3 supersession branch
+    CLOSED — 60s final for the initial gate version; no strata-refinement
+    evidence produced, default bands stand)
+[ ] F2 persistence selected for all §7.4 components INCLUDING the
+    control-plane journal (control-plane seam resolved; remaining
+    per-component selections = the PENDING-F2 input)
+[ ] Frozen at I1: 60s latency (final), $1.00 dust threshold, 30/80%
+    thresholds, entry-only $500 rule, Hájek estimator, sampling METHOD
+    (strata, algorithm, formula, budget rule, selection rule, minimum
+    constraint), pause-trigger definitions and thresholds
+[ ] Both document-level markers resolved inline: PENDING-S1 (§3.3 manifest
+    list) + PENDING-F2 (§7.4 selections). Implementation-verification
+    items are I2/I3 obligations and do NOT gate document merge.
 [ ] Reviewer sign-off recorded
 [ ] Product-owner authorization recorded
 ```
@@ -933,6 +976,12 @@ failure.
     unavailable fail-open — all semantics of §7.3 demonstrated
 [ ] Synthetic-namespace segregation demonstrated (§11.2); zero production-
     namespace writes under live traffic with activation off
+[ ] Validation-namespace mechanism selected and demonstrated (separate DB
+    file vs schema-enforced partition, per F2's architecture — §11.2)
+[ ] Float-feature → fixed-scale-decimal canonicalization mapping
+    implemented and test-asserted (§3.2)
+[ ] Measurement-store table/connection/lock isolation from the production
+    detection/dispatch path demonstrated (§4.7)
 [ ] Behavior-neutrality: no diff in gate/dispatch behavior (test-asserted)
 [ ] Control-plane journal implemented per F2 selection; fenced admission
     protocol implemented; admission provably fails closed when the control
@@ -943,7 +992,11 @@ failure.
 
 ```text
 [ ] Isolation demonstrated (queue bound, quota separation, breaker,
-    lock isolation); retry/timeout constants recorded
+    lock isolation per §4.7); retry/timeout constants recorded
+[ ] CP2 price-refresh cadence measured and recorded in the I3 gate record
+    (§5.1 granularity bound)
+[ ] Trending-snapshot capture cadence measured and recorded in the I3 gate
+    record (§6.2)
 [ ] Dedicated-credential rate limit confirmed; worker budget instantiated
     per the I1-frozen budget rule
 [ ] Bounded non-cohort capacity census executed (≥72h, observation-only,
@@ -978,15 +1031,15 @@ failure.
 | §2.1 | v0.4 §2.1 (T1) | — |
 | §2.2 | v0.4 §2.2 (T1; subsumes v0.2 §2.3 schema + v0.3 §2.5 version fields) | — |
 | §2.3 | v0.4 §2.3 (T1) | §11.3 admission cross-ref (V3) |
-| §2.4 | v0.3 §2.2–2.3 (S1) + v0.4 §2.4 (T1 evaluation-linking) + v0.4 §7.3 delivery_evidence_unavailable state | — |
-| §2.5 | v0.2 §2.4 (R2) + v0.3 §2.4 (S2) + v0.4 §2.5 | — |
+| §2.4 | v0.3 §2.2–2.3 (S1) + v0.4 §2.4 (T1 evaluation-linking) + v0.4 §7.3 delivery_evidence_unavailable state | Ruling 2 (2nd): event-level provider-acceptance linkage; delivered_crossover state; clock binding |
+| §2.5 | v0.2 §2.4 (R2) + v0.3 §2.4 (S2) + v0.4 §2.5 | Ruling 2 (2nd): delivered_crossover terminology |
 | §2.6 | v0.2 §2.2 | — |
 | §2.7 | v0.4 §2.6 (assignments basis) + v0.2 §2.5 (health-check labeling) | — |
 | §3.1–3.2 | v0.2 §3.1–3.2 (R7; unchanged thereafter) | — |
 | §3.3 | v0.4 §3.3 (T5 full-SHA; supersedes v0.3 §3.3 truncated form) | — |
 | §4.1 | v0.2 §4.1 | — |
 | §4.2 | v0.2 §4.2 (R4) + v0.6 §4.2 (V4) | — |
-| §4.3 | v0.2 §4.3 clock + v0.4 §4.3 estimator (T4, summarized as the invoked-fallback's basis) + v0.5 §4.3 (U4 resolution: 60s frozen + supersession path) | — |
+| §4.3 | v0.2 §4.3 clock + v0.4 §4.3 estimator (T4, summarized as the invoked-fallback's basis) + v0.5 §4.3 (U4 resolution: 60s frozen) | Ruling 4 (2nd): supersession branch closed; 60s final for initial gate version |
 | §4.4–4.6 | v0.2 §4.4–4.6 (unchanged thereafter) | — |
 | §4.7 | v0.3 §4.7 isolation (S3) + v0.4 §4.7 thresholds/IPW (T3) + v0.5 §4.7 formula + Hájek (U4) + v0.6 §4.7 split freeze (V2) | C3 (I3 freezes values), C4 (digest formulation replaces `\|\|` concatenation of v0.3/v0.4/v0.6) |
 | §5 | v0.2 §5 (R5 incl. crossing_order_indeterminate; unchanged thereafter) | — |
@@ -999,30 +1052,36 @@ failure.
 | §7.4 | v0.5 §7.4 (U3 broadened scope) + v0.6 §7.4 (V1 control-plane seam) | Control-plane selection RESOLVED per C-rulings; annex §12 referenced |
 | §8 | v0.3 §8 (S5; unchanged thereafter) | — |
 | §9 | v0.2 §8 + v0.3 §9 + v0.4 §9 extensions + v0.5/v0.6 frozen-value list | C5 noted via §11.3 |
-| §10 | v0.2 §9 + v0.3 §2.3 (computation-timestamp disclosure) + v0.4 §10 (sampling reporting) | — |
+| §10 | v0.2 §9 + v0.3 §2.3 (computation-timestamp disclosure) + v0.4 §10 (sampling reporting) | Ruling 3 (2nd): 24h evidentiary report / 72h completion supplement split |
 | §11.1 | v0.4 §11 (T5) + v0.5 §11.1 (U1 naming) + control-plane journal added to I2 (V1) | — |
 | §11.2 | v0.5 §11.2 (U2) | — |
 | §11.3 | v0.5 §11.3 (U3 state machine) + v0.6 §11.3 (V3 fencing/admission/triggers) | C5 (every-transition increment) |
 | §11.4 | v0.5 §11.4 + v0.6 §11.4 (V3 three-part proof) | — |
 | §11.5 | — (new) | C1 verbatim |
-| §12 | v0.5 §12 (U1 four gates) + v0.6 §12 (V2/V3 amendments); I2 gate = v0.5 list + v0.6 addition | — |
+| §12 | v0.5 §12 (U1 four gates) + v0.6 §12 (V2/V3 amendments); I2 gate = v0.5 list + v0.6 addition | Ruling 1 (2nd): five implementation obligations added to I2/I3 checklists; I1 marker line narrowed to the two document-level inputs |
 
-### 13.2 Remaining protocol markers (gate-scoped, NOT consolidation placeholders)
+### 13.2 Document-level markers vs implementation obligations
+
+**The only two unresolved I1 inputs (document-level; must be supplied and
+resolved inline before I1 merge):**
 
 ```text
 PENDING-S1  §3.3  gate_code_hash manifest file list (drift-table reconciliation)
 PENDING-F2  §7.4  remaining per-component persistence selections (measurement
                   store + spool mechanism); control-plane seam already resolved
-VERIFY      §3.2  float→decimal mapping of deployed float features (I2)
-VERIFY      §4.7  measurement-store lock/connection isolation (I2/I3, per F2
-                  architecture)
-VERIFY      §5.1  deployed CP2 price-refresh cadence (state at merge)
-VERIFY      §6.2  deployed trending-snapshot capture cadence (state at merge)
-VERIFY      §11.2 validation-namespace mechanism: separate DB file vs
-                  schema-enforced partition (I2, per F2 architecture)
 ```
 
-Each marker resolves at its designated gate per §12; the I1 gate requires
-all of them resolved inline before merge. No source-chain consolidation
-placeholders or inherited-section stubs remain — every section above is
-fully stated.
+**Implementation obligations (former verification markers), relocated to
+their gate checklists — these do NOT block document merge and require no
+I2/I3 implementation to exist at I1:**
+
+```text
+I2 gate  §3.2   float→decimal canonicalization mapping (test-asserted)
+I2 gate  §11.2  validation-namespace mechanism selection + demonstration
+I2 gate  §4.7   measurement-store table/connection/lock isolation
+I3 gate  §5.1   CP2 price-refresh cadence measured + recorded
+I3 gate  §6.2   trending-snapshot capture cadence measured + recorded
+```
+
+No source-chain consolidation placeholders or inherited-section stubs
+remain — every section above is fully stated.
