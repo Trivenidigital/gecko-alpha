@@ -34,7 +34,7 @@ class RateLimitAccountantStub(VenueService):
         if db._conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        await db._conn.execute(
+        await db.execute_write(
             """INSERT INTO venue_rate_state
                (venue, last_updated_at, requests_per_min_cap,
                 requests_seen_60s, headroom_pct)
@@ -44,7 +44,6 @@ class RateLimitAccountantStub(VenueService):
                  headroom_pct = excluded.headroom_pct""",
             (venue, now_iso, self.HEADROOM_PCT),
         )
-        await db._conn.commit()
         log.debug(
             "rate_limit_stub_updated",
             venue=venue,

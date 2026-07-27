@@ -515,8 +515,8 @@ async def _process_permanent_suppression(
 
     # Re-arm: clear the dedup marker for any combo that has LEFT the
     # permanent-suppression state since it was last alerted, so a future
-    # re-entry alerts again.
-    await conn.execute(
+    # re-entry alerts again. F2: disciplined single write (self-committing).
+    await db.execute_write(
         "UPDATE combo_performance "
         "SET perm_suppression_alerted_at = NULL "
         "WHERE window = '30d' "
@@ -529,6 +529,7 @@ async def _process_permanent_suppression(
     )
 
     # Pending = suppressed, no recent trade, not yet alerted for this entry.
+    # Read (no transaction) — sees the just-committed re-arm.
     cur = await conn.execute(
         "SELECT combo_key FROM combo_performance cp "
         "WHERE cp.window = '30d' "
@@ -541,7 +542,6 @@ async def _process_permanent_suppression(
         (window_cutoff,),
     )
     pending = [r[0] for r in await cur.fetchall()]
-    await conn.commit()
 
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
     alerted: list[str] = []
@@ -571,14 +571,15 @@ async def _process_permanent_suppression(
             continue
         log.info("permanent_suppression_alert_delivered", combo_key=combo)
 
-        # Set the dedup marker only after a confirmed send.
+        # Set the dedup marker only after a confirmed send. F2: disciplined
+        # single write (self-committing) — the alert send above was OUTSIDE any
+        # transaction, so no network await ever held the lock.
         try:
-            await conn.execute(
+            await db.execute_write(
                 "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
                 "WHERE combo_key = ? AND window = '30d'",
                 (now_iso, combo),
             )
-            await conn.commit()
         except aiosqlite.Error as exc:
             log.exception(
                 "permanent_suppression_marker_update_failed",

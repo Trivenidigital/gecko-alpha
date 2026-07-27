@@ -24,7 +24,7 @@ async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
         raise RuntimeError("Database not initialized.")
 
     now = datetime.now(timezone.utc).isoformat()
-    count = 0
+    rows_to_store: list[tuple] = []
     for coin in raw_coins:
         coin_id = coin.get("id")
         if not coin_id:
@@ -32,10 +32,7 @@ async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
         volume = coin.get("total_volume") or 0
         if volume <= 0:
             continue
-        await db._conn.execute(
-            """INSERT INTO volume_history_cg
-               (coin_id, symbol, name, volume_24h, market_cap, price, recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        rows_to_store.append(
             (
                 coin_id,
                 (coin.get("symbol") or "???").upper(),
@@ -44,18 +41,23 @@ async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
                 coin.get("market_cap"),
                 coin.get("current_price"),
                 now,
-            ),
+            )
         )
-        count += 1
 
+    count = len(rows_to_store)
     if count:
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                """INSERT INTO volume_history_cg
+                   (coin_id, symbol, name, volume_24h, market_cap, price, recorded_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                rows_to_store,
+            )
 
     # Prune records older than 7 days
-    await db._conn.execute(
+    await db.execute_write(
         "DELETE FROM volume_history_cg WHERE datetime(recorded_at) < datetime('now', '-7 days')"
     )
-    await db._conn.commit()
 
     logger.info("volume_history_recorded", count=count)
     return count
@@ -114,6 +116,7 @@ async def detect_spikes(
     rows = await cursor.fetchall()
 
     spikes: list[VolumeSpike] = []
+    spike_rows: list[tuple] = []
     today = now.strftime("%Y-%m-%d")  # UTC date -- avoids local timezone drift
 
     for row in rows:
@@ -147,11 +150,7 @@ async def detect_spikes(
             price_change_24h = pc_row[0]
 
         # Insert into volume_spikes
-        await db._conn.execute(
-            """INSERT INTO volume_spikes
-               (coin_id, symbol, name, current_volume, avg_volume_7d,
-                spike_ratio, market_cap, price, price_change_24h, detected_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        spike_rows.append(
             (
                 coin_id,
                 symbol,
@@ -163,7 +162,7 @@ async def detect_spikes(
                 price,
                 price_change_24h,
                 now_iso,
-            ),
+            )
         )
 
         spike = VolumeSpike(
@@ -181,7 +180,14 @@ async def detect_spikes(
         spikes.append(spike)
 
     if spikes:
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                """INSERT INTO volume_spikes
+                   (coin_id, symbol, name, current_volume, avg_volume_7d,
+                    spike_ratio, market_cap, price, price_change_24h, detected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                spike_rows,
+            )
         logger.info("volume_spikes_detected", count=len(spikes))
 
     return spikes
@@ -207,6 +213,7 @@ async def detect_7d_momentum(
     now = now_dt.isoformat()
     today_utc = now_dt.strftime("%Y-%m-%d")  # UTC date -- avoids local timezone drift
     results: list[dict] = []
+    insert_rows: list[tuple] = []
 
     for coin in raw_coins:
         cid = coin.get("id")
@@ -241,11 +248,7 @@ async def detect_7d_momentum(
         }
 
         # Persist to momentum_7d table
-        await db._conn.execute(
-            """INSERT INTO momentum_7d
-               (coin_id, symbol, name, price_change_7d, price_change_24h,
-                market_cap, current_price, volume_24h, detected_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        insert_rows.append(
             (
                 row_data["coin_id"],
                 row_data["symbol"],
@@ -256,13 +259,20 @@ async def detect_7d_momentum(
                 row_data["current_price"],
                 row_data["volume_24h"],
                 now,
-            ),
+            )
         )
 
         results.append(row_data)
 
     if results:
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                """INSERT INTO momentum_7d
+                   (coin_id, symbol, name, price_change_7d, price_change_24h,
+                    market_cap, current_price, volume_24h, detected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                insert_rows,
+            )
         logger.info("momentum_7d_detected", count=len(results))
 
     return results
@@ -413,14 +423,16 @@ async def detect_slow_burn_7d(
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
     results: list[dict] = []
+    insert_rows: list[tuple] = []
     coerce_failures = 0
     coins_skipped = 0
 
     for coin in raw_coins:
         # R6 CRITICAL fix: per-coin try/except so one malformed row
-        # doesn't take down the entire cycle. Earlier writes are
-        # safe because we commit after the loop and per-row execute
-        # without commit just queues the write in the txn.
+        # doesn't take down the entire cycle — the real failure surface
+        # (row_data build/coercion) is caught here per-coin. Rows are
+        # accumulated and written together via one disciplined
+        # executemany after the loop (F2).
         try:
             cid = coin.get("id")
             if not cid:
@@ -505,12 +517,7 @@ async def detect_slow_burn_7d(
                 "also_in_momentum_7d": also_in_momentum,
             }
 
-            await db._conn.execute(
-                """INSERT INTO slow_burn_candidates
-                   (coin_id, symbol, name, price_change_7d, price_change_1h,
-                    price_change_24h, market_cap, current_price, volume_24h,
-                    also_in_momentum_7d, detected_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            insert_rows.append(
                 (
                     row_data["coin_id"],
                     row_data["symbol"],
@@ -523,7 +530,7 @@ async def detect_slow_burn_7d(
                     row_data["volume_24h"],
                     row_data["also_in_momentum_7d"],
                     now,
-                ),
+                )
             )
 
             results.append(row_data)
@@ -540,7 +547,15 @@ async def detect_slow_burn_7d(
             continue
 
     if results:
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                """INSERT INTO slow_burn_candidates
+                   (coin_id, symbol, name, price_change_7d, price_change_1h,
+                    price_change_24h, market_cap, current_price, volume_24h,
+                    also_in_momentum_7d, detected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                insert_rows,
+            )
         # R6 MUST-FIX: increment counter inside its own try/except so a
         # heartbeat-module bug can never silently desync DB-vs-counter.
         try:

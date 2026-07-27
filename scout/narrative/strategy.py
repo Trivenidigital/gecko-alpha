@@ -74,27 +74,27 @@ class Strategy:
 
         # Seed any missing defaults
         now = datetime.now(timezone.utc).isoformat()
-        for key, default in STRATEGY_DEFAULTS.items():
-            if key not in self._cache:
-                bounds = STRATEGY_BOUNDS.get(key)
-                min_b = bounds[0] if bounds else None
-                max_b = bounds[1] if bounds else None
-                await conn.execute(
-                    """INSERT INTO agent_strategy
-                       (key, value, updated_at, updated_by, reason, min_bound, max_bound)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        key,
-                        json.dumps(default),
-                        now,
-                        "init",
-                        "seeded default",
-                        min_b,
-                        max_b,
-                    ),
-                )
-                self._cache[key] = default
-        await conn.commit()
+        async with self._db.transaction() as conn:
+            for key, default in STRATEGY_DEFAULTS.items():
+                if key not in self._cache:
+                    bounds = STRATEGY_BOUNDS.get(key)
+                    min_b = bounds[0] if bounds else None
+                    max_b = bounds[1] if bounds else None
+                    await conn.execute(
+                        """INSERT INTO agent_strategy
+                           (key, value, updated_at, updated_by, reason, min_bound, max_bound)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            key,
+                            json.dumps(default),
+                            now,
+                            "init",
+                            "seeded default",
+                            min_b,
+                            max_b,
+                        ),
+                    )
+                    self._cache[key] = default
 
     def get(self, key: str) -> object:
         """Return the typed Python value for a strategy key."""
@@ -132,13 +132,12 @@ class Strategy:
         min_b = bounds[0] if bounds else None
         max_b = bounds[1] if bounds else None
 
-        await conn.execute(
+        await self._db.execute_write(
             """INSERT OR REPLACE INTO agent_strategy
                (key, value, updated_at, updated_by, reason, min_bound, max_bound)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (key, json.dumps(value), now, updated_by, reason, min_b, max_b),
         )
-        await conn.commit()
         self._cache[key] = value
 
     async def lock(self, key: str) -> None:
@@ -146,16 +145,18 @@ class Strategy:
         conn = self._db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
-        await conn.execute("UPDATE agent_strategy SET locked = 1 WHERE key = ?", (key,))
-        await conn.commit()
+        await self._db.execute_write(
+            "UPDATE agent_strategy SET locked = 1 WHERE key = ?", (key,)
+        )
 
     async def unlock(self, key: str) -> None:
         """Unlock a key so it can be changed again."""
         conn = self._db._conn
         if conn is None:
             raise RuntimeError("Database not initialized.")
-        await conn.execute("UPDATE agent_strategy SET locked = 0 WHERE key = ?", (key,))
-        await conn.commit()
+        await self._db.execute_write(
+            "UPDATE agent_strategy SET locked = 0 WHERE key = ?", (key,)
+        )
 
     def get_timestamp(self, key: str, default: datetime | None = None) -> datetime:
         """Get a timestamp value, returning default (or datetime.min) if not set."""

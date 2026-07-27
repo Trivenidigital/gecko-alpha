@@ -110,23 +110,24 @@ async def record_pending_order(
     from datetime import datetime, timezone
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    cur = await db._conn.execute(
-        """INSERT INTO live_trades
-           (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
-            size_usd, mid_at_entry, status, client_order_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-        (
-            paper_trade_id,
-            coin_id,
-            symbol,
-            venue,
-            pair,
-            signal_type,
-            size_usd,
-            mid_at_entry,
-            client_order_id,
-            now_iso,
-        ),
-    )
-    await db._conn.commit()
-    return cur.lastrowid or 0
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            """INSERT INTO live_trades
+               (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+                size_usd, mid_at_entry, status, client_order_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+            (
+                paper_trade_id,
+                coin_id,
+                symbol,
+                venue,
+                pair,
+                signal_type,
+                size_usd,
+                mid_at_entry,
+                client_order_id,
+                now_iso,
+            ),
+        )
+        inserted_id = cur.lastrowid or 0
+    return inserted_id

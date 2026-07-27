@@ -183,37 +183,48 @@ class RoutingLayer:
         if self._db._conn is None:
             raise RuntimeError("Database not initialized.")
         now_iso = datetime.now(timezone.utc).isoformat()
+        # F2 (defect 4): fetch ALL venue metadata OUTSIDE any transaction so
+        # _txn_lock is never held across a provider REST call, then apply the
+        # writes in one short transaction (fetch -> short-txn shape).
+        fetched: list[tuple] = []
         for venue, adapter in self._adapters.items():
             try:
                 meta = await adapter.fetch_venue_metadata(canonical)
-                if meta is not None:
-                    await self._db._conn.execute(
-                        """INSERT OR REPLACE INTO venue_listings
-                           (venue, canonical, venue_pair, quote, asset_class,
-                            refreshed_at)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            venue,
-                            canonical,
-                            meta.venue_pair,
-                            meta.quote,
-                            meta.asset_class,
-                            now_iso,
-                        ),
-                    )
             except NotImplementedError:
                 log.info(
                     "on_demand_listing_fetch_not_implemented",
                     venue=venue,
                     canonical=canonical,
                 )
+                continue
             except Exception:
                 log.exception(
                     "on_demand_listing_fetch_failed",
                     venue=venue,
                     canonical=canonical,
                 )
-        await self._db._conn.commit()
+                continue
+            if meta is not None:
+                fetched.append(
+                    (
+                        venue,
+                        canonical,
+                        meta.venue_pair,
+                        meta.quote,
+                        meta.asset_class,
+                        now_iso,
+                    )
+                )
+        if not fetched:
+            return
+        async with self._db.transaction() as conn:
+            await conn.executemany(
+                """INSERT OR REPLACE INTO venue_listings
+                   (venue, canonical, venue_pair, quote, asset_class,
+                    refreshed_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                fetched,
+            )
 
     async def _apply_override_prepend(
         self, canonical: str, candidates: list[RouteCandidate]

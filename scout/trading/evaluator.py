@@ -371,14 +371,13 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                     # so dashboard reads stack-at-arm without re-computing.
                     if conviction_locked_at is None:
                         armed_iso = now.isoformat()
-                        await conn.execute(
+                        await db.execute_write(
                             "UPDATE paper_trades "
                             "SET conviction_locked_at = ?, "
                             "    conviction_locked_stack = ? "
                             "WHERE id = ?",
                             (armed_iso, stack, trade_id),
                         )
-                        await conn.commit()
                         log.info(
                             "conviction_lock_armed",
                             trade_id=trade_id,
@@ -519,7 +518,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                         price_provenance="stale_snapshot",
                     )
                     if closed:
-                        await conn.execute(
+                        await db.execute_write(
                             "UPDATE paper_trades SET "
                             "stale_age_seconds_at_exit = ?, "
                             "last_good_price_at = ?, "
@@ -532,7 +531,6 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                                 trade_id,
                             ),
                         )
-                        await conn.commit()
                         log.info(
                             "trade_eval_stale_onset_exit",
                             trade_id=trade_id,
@@ -591,7 +589,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             if current_price > reference:
                 peak_price = current_price
                 peak_pct = ((current_price - entry_price) / entry_price) * 100
-                await conn.execute(
+                await db.execute_write(
                     "UPDATE paper_trades SET peak_price = ?, peak_pct = ? WHERE id = ?",
                     (peak_price, round(peak_pct, 4), trade_id),
                 )
@@ -617,7 +615,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             if updates:
                 set_clause = ", ".join(f"{k} = ?" for k in updates)
                 values = list(updates.values()) + [trade_id]
-                await conn.execute(
+                await db.execute_write(
                     f"UPDATE paper_trades SET {set_clause} WHERE id = ?",
                     values,
                 )
@@ -852,7 +850,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                     fired_at = datetime.now(timezone.utc).isoformat()
                     dry_run = settings.PAPER_HIGH_PEAK_FADE_DRY_RUN
                     retrace_pct_value = (1 - current_price / float(peak_price)) * 100.0
-                    await conn.execute(
+                    await db.execute_write(
                         "INSERT OR IGNORE INTO high_peak_fade_audit "
                         "(trade_id, token_id, signal_type, peak_pct, peak_price, "
                         " current_price, threshold_pct, retrace_pct, fired_at, dry_run) "
@@ -911,7 +909,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                 ):
                     close_reason = "peak_fade"
                     close_status = "closed_peak_fade"
-                    await conn.execute(
+                    await db.execute_write(
                         "UPDATE paper_trades SET peak_fade_fired_at = ? WHERE id = ?",
                         (datetime.now(timezone.utc).isoformat(), trade_id),
                     )
@@ -1257,7 +1255,7 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                     sell_amount = original_amount * tp_sell_pct
                     keep_amount = original_amount * (1 - tp_sell_pct)
 
-                    await conn.execute(
+                    await db.execute_write(
                         "UPDATE paper_trades SET amount_usd = ?, quantity = ? WHERE id = ? AND status = 'open'",
                         (sell_amount, original_qty * tp_sell_pct, trade_id),
                     )
@@ -1349,5 +1347,3 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
         except Exception:
             log.exception("trade_eval_row_error", trade_id=trade_id)
             continue
-
-    await conn.commit()

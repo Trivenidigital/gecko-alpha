@@ -26,11 +26,9 @@ async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cursor = await db._conn.execute(
+    deleted = await db.execute_write(
         "DELETE FROM losers_snapshots WHERE snapshot_at < ?", (cutoff,)
     )
-    await db._conn.commit()
-    deleted = cursor.rowcount
     if deleted:
         logger.info(
             "losers_snapshots_pruned", deleted=deleted, retention_days=retention_days
@@ -70,27 +68,27 @@ async def store_top_losers(
     losers.sort(key=lambda c: c.get("price_change_percentage_24h") or 0)
 
     # Take top 20
-    for coin in losers[:20]:
-        await db._conn.execute(
-            """INSERT INTO losers_snapshots
-               (coin_id, symbol, name, price_change_24h, market_cap,
-                volume_24h, price_at_snapshot, snapshot_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                coin["id"],
-                (coin.get("symbol") or "???").upper(),
-                coin.get("name") or "Unknown",
-                coin.get("price_change_percentage_24h") or 0,
-                coin.get("market_cap"),
-                coin.get("total_volume"),
-                coin.get("current_price"),
-                now,
-            ),
-        )
-        count += 1
-
-    if count:
-        await db._conn.commit()
+    top = losers[:20]
+    if top:
+        async with db.transaction() as conn:
+            for coin in top:
+                await conn.execute(
+                    """INSERT INTO losers_snapshots
+                       (coin_id, symbol, name, price_change_24h, market_cap,
+                        volume_24h, price_at_snapshot, snapshot_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        coin["id"],
+                        (coin.get("symbol") or "???").upper(),
+                        coin.get("name") or "Unknown",
+                        coin.get("price_change_percentage_24h") or 0,
+                        coin.get("market_cap"),
+                        coin.get("total_volume"),
+                        coin.get("current_price"),
+                        now,
+                    ),
+                )
+                count += 1
         logger.info("losers_snapshots_stored", count=count)
 
     return count
@@ -219,39 +217,39 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
         comparisons.append(comp)
 
     # Store comparisons (delete old for same coin_id then insert)
-    for comp in comparisons:
-        await db._conn.execute(
-            "DELETE FROM losers_comparisons WHERE coin_id = ?",
-            (comp["coin_id"],),
-        )
-        await db._conn.execute(
-            """INSERT INTO losers_comparisons
-               (coin_id, symbol, name, price_change_24h,
-                appeared_on_losers_at,
-                detected_by_narrative, narrative_lead_minutes,
-                detected_by_pipeline, pipeline_lead_minutes,
-                detected_by_chains, chains_lead_minutes,
-                detected_by_spikes, spikes_lead_minutes,
-                is_gap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                comp["coin_id"],
-                comp["symbol"],
-                comp["name"],
-                comp["price_change_24h"],
-                comp["appeared_on_losers_at"],
-                comp["detected_by_narrative"],
-                comp["narrative_lead_minutes"],
-                comp["detected_by_pipeline"],
-                comp["pipeline_lead_minutes"],
-                comp["detected_by_chains"],
-                comp["chains_lead_minutes"],
-                comp["detected_by_spikes"],
-                comp["spikes_lead_minutes"],
-                comp["is_gap"],
-            ),
-        )
-    await db._conn.commit()
+    async with db.transaction() as conn:
+        for comp in comparisons:
+            await conn.execute(
+                "DELETE FROM losers_comparisons WHERE coin_id = ?",
+                (comp["coin_id"],),
+            )
+            await conn.execute(
+                """INSERT INTO losers_comparisons
+                   (coin_id, symbol, name, price_change_24h,
+                    appeared_on_losers_at,
+                    detected_by_narrative, narrative_lead_minutes,
+                    detected_by_pipeline, pipeline_lead_minutes,
+                    detected_by_chains, chains_lead_minutes,
+                    detected_by_spikes, spikes_lead_minutes,
+                    is_gap)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    comp["coin_id"],
+                    comp["symbol"],
+                    comp["name"],
+                    comp["price_change_24h"],
+                    comp["appeared_on_losers_at"],
+                    comp["detected_by_narrative"],
+                    comp["narrative_lead_minutes"],
+                    comp["detected_by_pipeline"],
+                    comp["pipeline_lead_minutes"],
+                    comp["detected_by_chains"],
+                    comp["chains_lead_minutes"],
+                    comp["detected_by_spikes"],
+                    comp["spikes_lead_minutes"],
+                    comp["is_gap"],
+                ),
+            )
 
     caught = sum(1 for c in comparisons if not c["is_gap"])
     logger.info(

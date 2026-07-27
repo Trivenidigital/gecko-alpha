@@ -48,7 +48,7 @@ class DormancyJob(VenueService):
         has_probe = (await cur.fetchone()) is not None
         if has_probe:
             # Update most-recent row's is_dormant + fills_30d_count
-            await db._conn.execute(
+            await db.execute_write(
                 """UPDATE venue_health
                    SET is_dormant = ?, fills_30d_count = ?
                    WHERE venue = ?
@@ -58,7 +58,7 @@ class DormancyJob(VenueService):
                 (is_dormant, fills_30d, venue, venue),
             )
         else:
-            await db._conn.execute(
+            await db.execute_write(
                 """INSERT INTO venue_health
                    (venue, probe_at, rest_responsive, ws_connected,
                     auth_ok, last_balance_fetch_ok, is_dormant,
@@ -66,7 +66,6 @@ class DormancyJob(VenueService):
                    VALUES (?, ?, 0, 0, 0, 0, ?, ?)""",
                 (venue, now_iso, is_dormant, fills_30d),
             )
-        await db._conn.commit()
         log.info(
             "dormancy_job_updated",
             venue=venue,

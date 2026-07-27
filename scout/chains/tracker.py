@@ -10,9 +10,9 @@ from typing import Any
 import structlog
 
 from scout.chains.events import (
+    emit_event,
     load_recent_events,
     prune_old_events,
-    safe_emit,
 )
 from scout.chains.mcap_fetcher import (
     FetchResult,
@@ -101,8 +101,23 @@ async def check_chains(
     session: Any | None = None,
     mcap_fetcher: McapFetcher | None = None,
 ) -> None:
-    """One pass of the pattern matching engine, wrapped in a single
-    transaction so that writes across helpers commit atomically."""
+    """One pass of the pattern matching engine.
+
+    F2 structure (defects 2-4): the pass is split into phases so that (a) no
+    network/provider await ever happens while ``_txn_lock`` is held, and (b) all
+    DB writes for the pass commit atomically in ONE manager transaction with no
+    callee committing early:
+
+      1. read + in-memory match (no txn, no lock) -> dirty chains, expirations,
+         completions;
+      2. network phase (no txn, no lock) -> fetch DexScreener FDV for memecoin
+         completions into a local map;
+      3. write phase (one ``db.transaction()``) -> persist chains, record
+         expirations + completions (chain_matches + a transaction-aware event
+         insert via ``emit_event(conn=...)``), prune; the manager commits;
+      4. alert phase (AFTER commit, no txn) -> deliver chain-completion alerts;
+         a delivery failure can never roll back committed chain state.
+    """
     patterns = await load_active_patterns(db)
     if not patterns:
         logger.error("chain_no_active_patterns", chains_enabled=settings.CHAINS_ENABLED)
@@ -110,86 +125,118 @@ async def check_chains(
 
     events = await load_recent_events(db, max_hours=settings.CHAIN_MAX_WINDOW_HOURS)
 
-    # F2: run the whole matching pass inside the shared transaction-lock
-    # discipline (db.transaction() = BEGIN IMMEDIATE + the process-wide
-    # asyncio.Lock, COMMIT on clean exit / ROLLBACK on error). This replaces the
-    # old bare ``BEGIN`` + try/except-pass "join the in-flight transaction" hack:
-    # holding a transaction open across these helper awaits (and the up-to-15s
-    # DexScreener fetch in _record_completion) on the shared connection WITHOUT
-    # the lock is exactly what collided with should_open's BEGIN IMMEDIATE and
-    # got its transaction silently rolled back. None of the helpers below
-    # acquire _txn_lock, so holding it here cannot deadlock.
-    try:
-        async with db.transaction():
-            if not events:
-                await _prune_stale(db, settings)
-                return
+    if not events:
+        async with db.transaction() as conn:
+            await _prune_stale(db, settings, conn=conn)
+        return
 
-            # Deterministic order: timestamp then id
-            events.sort(key=lambda e: (e.created_at, e.id or 0))
+    # ---- Phase 1: read + in-memory match (no transaction, no lock) ----
+    events.sort(key=lambda e: (e.created_at, e.id or 0))
+    groups: dict[tuple[str, str], list[ChainEvent]] = {}
+    for ev in events:
+        groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
 
-            # Group by (token_id, pipeline)
-            groups: dict[tuple[str, str], list[ChainEvent]] = {}
-            for ev in events:
-                groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
+    active_by_key = await _load_active_chains(db)
+    now = datetime.now(timezone.utc)
 
-            active_by_key = await _load_active_chains(db)
+    dirty_chains: list[ActiveChain] = []
+    expirations: list[tuple[ActiveChain, ChainPattern]] = []
+    completions: list[tuple[ActiveChain, ChainPattern]] = []
 
-            now = datetime.now(timezone.utc)
-            completed_chains: list[tuple[ActiveChain, ChainPattern]] = []
+    for (token_id, pipeline), token_events in groups.items():
+        for pattern in patterns:
+            key = (token_id, pipeline, pattern.id)
+            chain = active_by_key.get(key)
 
-            for (token_id, pipeline), token_events in groups.items():
-                for pattern in patterns:
-                    key = (token_id, pipeline, pattern.id)
-                    chain = active_by_key.get(key)
-
-                    # Expiry check for pre-existing chain
-                    if chain is not None and not chain.is_complete:
-                        age_h = (now - chain.anchor_time).total_seconds() / 3600.0
-                        if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
-                            await _record_expired_chain(db, chain, pattern, now)
-                            await _delete_active_chain(db, chain)
-                            active_by_key.pop(key, None)
-                            chain = None
-                            logger.info(
-                                "chain_expired",
-                                token_id=token_id,
-                                pattern=pattern.name,
-                            )
-
-                    # Skip entirely if a recent completion exists (cooldown)
-                    if chain is None and await _in_cooldown(
-                        db, token_id, pipeline, pattern, settings
-                    ):
-                        continue
-
-                    # Advance or create
-                    chain, newly_complete = _advance_chain(
-                        chain, pattern, token_id, pipeline, token_events, now
+            # Expiry check for pre-existing chain
+            if chain is not None and not chain.is_complete:
+                age_h = (now - chain.anchor_time).total_seconds() / 3600.0
+                if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
+                    expirations.append((chain, pattern))
+                    active_by_key.pop(key, None)
+                    chain = None
+                    logger.info(
+                        "chain_expired", token_id=token_id, pattern=pattern.name
                     )
-                    if chain is None:
-                        continue
 
-                    active_by_key[key] = chain
-                    await _persist_active_chain(db, chain)
+            # Skip entirely if a recent completion exists (cooldown)
+            if chain is None and await _in_cooldown(
+                db, token_id, pipeline, pattern, settings
+            ):
+                continue
 
-                    if newly_complete:
-                        completed_chains.append((chain, pattern))
+            # Advance or create
+            chain, newly_complete = _advance_chain(
+                chain, pattern, token_id, pipeline, token_events, now
+            )
+            if chain is None:
+                continue
 
-            for chain, pattern in completed_chains:
-                await _record_completion(
-                    db,
-                    chain,
-                    pattern,
-                    settings,
-                    session=session,
-                    mcap_fetcher=mcap_fetcher,
+            active_by_key[key] = chain
+            dirty_chains.append(chain)
+            if newly_complete:
+                completions.append((chain, pattern))
+
+    # ---- Phase 2: network (no transaction, no lock). The lock must NEVER be
+    # held across these DexScreener awaits (defect 4). ----
+    mcap_by_chain: dict[int, float] = {}
+    if session is not None and completions:
+        fetcher = mcap_fetcher or fetch_token_fdv
+        min_mcap = getattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD", 1000.0)
+        for chain, _pattern in completions:
+            if chain.pipeline != "memecoin":
+                continue
+            try:
+                result = await fetcher(session, chain.token_id)
+            except Exception:
+                # Fail-soft — never block the chain write on the snapshot.
+                logger.exception(
+                    "mcap_at_completion_fetch_unexpected_error",
+                    token_id=chain.token_id,
+                )
+                result = None
+            fdv = getattr(result, "fdv", None) if result is not None else None
+            if fdv is not None and fdv >= min_mcap:
+                mcap_by_chain[id(chain)] = fdv
+            elif fdv is not None:
+                logger.debug(
+                    "chain_outcome_mcap_below_floor",
+                    token_id=chain.token_id,
+                    fdv=fdv,
+                    floor=min_mcap,
+                    note="writing NULL — dust mcap would produce fake hits",
                 )
 
-            await _prune_stale(db, settings)
+    # ---- Phase 3: write phase — ONE atomic manager transaction, no network,
+    # no callee commit. If any write (incl. the event insert) fails, the whole
+    # completion set rolls back (defect 2 / atomicity). ----
+    try:
+        async with db.transaction() as conn:
+            for chain in dirty_chains:
+                await _persist_active_chain(conn, chain)
+            for chain, pattern in expirations:
+                await _record_expired_chain(conn, chain, pattern, now)
+                await _delete_active_chain(conn, chain)
+            for chain, pattern in completions:
+                await _write_completion(
+                    conn, db, chain, pattern, mcap_by_chain.get(id(chain))
+                )
+            await _prune_stale(db, settings, conn=conn)
     except Exception:
         logger.exception("chain_check_failed")
         raise
+
+    # ---- Phase 4: alerts AFTER commit (no transaction). A send failure can
+    # never roll back committed chain state (defect 3). ----
+    if settings.CHAIN_ALERT_ON_COMPLETE:
+        for chain, pattern in completions:
+            if pattern.alert_priority in ("high", "medium"):
+                try:
+                    from scout.chains.alerts import send_chain_alert  # lazy import
+
+                    await send_chain_alert(db, chain, pattern, settings)
+                except Exception:
+                    logger.exception("chain_alert_failed", pattern=pattern.name)
 
 
 def _advance_chain(
@@ -369,8 +416,8 @@ async def _load_active_chains(
     return out
 
 
-async def _persist_active_chain(db: Database, chain: ActiveChain) -> None:
-    conn = db._conn
+async def _persist_active_chain(conn, chain: ActiveChain) -> None:
+    """Upsert one active chain on the caller's manager-owned ``conn`` (no commit)."""
     steps_json = json.dumps(chain.steps_matched)
     events_json = json.dumps({str(k): v for k, v in chain.step_events.items()})
     if chain.id is None:
@@ -456,10 +503,11 @@ async def _persist_active_chain(db: Database, chain: ActiveChain) -> None:
         )
 
 
-async def _delete_active_chain(db: Database, chain: ActiveChain) -> None:
+async def _delete_active_chain(conn, chain: ActiveChain) -> None:
+    """Delete one active chain on the caller's manager-owned ``conn`` (no commit)."""
     if chain.id is None:
         return
-    await db._conn.execute("DELETE FROM active_chains WHERE id = ?", (chain.id,))
+    await conn.execute("DELETE FROM active_chains WHERE id = ?", (chain.id,))
 
 
 async def _in_cooldown(
@@ -484,64 +532,30 @@ async def _in_cooldown(
     return row is not None
 
 
-async def _record_completion(
+async def _write_completion(
+    conn,
     db: Database,
     chain: ActiveChain,
     pattern: ChainPattern,
-    settings: Settings,
-    *,
-    session: Any | None = None,
-    mcap_fetcher: McapFetcher | None = None,
+    mcap_at_completion: float | None,
 ) -> None:
-    """Write chain_matches row + emit chain_complete event + optional alert.
+    """Write one completed chain atomically on the caller's manager-owned ``conn``.
 
-    BL-071a' v3 (2026-05-04): for memecoin pipeline, captures a DexScreener
-    FDV snapshot in `mcap_at_completion` so the hydrator can later compute
-    pct change vs current FDV. Narrative pipeline skips the fetch
-    (token_id is a CoinGecko slug, not a contract; FDV lookup would fail).
+    F2 (defects 2-4): pure DB writes only — NO network and NO commit. The
+    DexScreener FDV snapshot is pre-fetched OUTSIDE the transaction by
+    :func:`check_chains` and passed in as ``mcap_at_completion``; the
+    chain_complete event is inserted via ``emit_event(conn=conn)`` so it joins
+    THIS transaction (no early commit). If the event insert fails, the manager
+    rolls the whole completion back — chain_matches + chain_patterns bump +
+    event row are all-or-nothing. Alert delivery happens after commit in
+    :func:`check_chains`.
 
-    Enforces CHAIN_OUTCOME_MIN_MCAP_USD floor (per design-review R1-M2):
-    dust mcap (e.g. 0.5 USD from pump.fun) would compute fake +500,000%
-    hits at hydration time and poison the LEARN feedback loop. Below floor
-    → write NULL, fall through to legacy outcomes path.
-
-    Failures are graceful: row writes with mcap_at_completion=NULL.
-
-    SCOPE NOTE (deferred to BL-071a''): the DS fetch happens INSIDE the
-    check_chains transaction. SQLite write lock is held for up to 15s
-    (DS timeout) per memecoin completion. Acceptable today (single-process
-    pipeline, ~0-2 completions per cycle); pre-fetch outside transaction
-    is a future optimization.
+    Enforces the CHAIN_OUTCOME_MIN_MCAP_USD floor upstream (dust mcap → NULL);
+    below-floor / narrative completions carry ``mcap_at_completion=None``.
     """
     duration_h = (chain.last_step_time - chain.anchor_time).total_seconds() / 3600.0
 
-    # BL-071a' v3: fetch FDV snapshot for memecoin chains, gated by floor.
-    mcap_at_completion: float | None = None
-    if chain.pipeline == "memecoin" and session is not None:
-        fetcher = mcap_fetcher or fetch_token_fdv
-        min_mcap = getattr(settings, "CHAIN_OUTCOME_MIN_MCAP_USD", 1000.0)
-        try:
-            result = await fetcher(session, chain.token_id)
-        except Exception:
-            # Fail-soft — never block chain write on the snapshot
-            logger.exception(
-                "mcap_at_completion_fetch_unexpected_error",
-                token_id=chain.token_id,
-            )
-            result = None
-        if result is not None and result.fdv is not None:
-            if result.fdv >= min_mcap:
-                mcap_at_completion = result.fdv
-            else:
-                logger.debug(
-                    "chain_outcome_mcap_below_floor",
-                    token_id=chain.token_id,
-                    fdv=result.fdv,
-                    floor=min_mcap,
-                    note="writing NULL — dust mcap would produce fake hits",
-                )
-
-    await db._conn.execute(
+    await conn.execute(
         """INSERT INTO chain_matches
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
@@ -561,17 +575,20 @@ async def _record_completion(
             mcap_at_completion,
         ),
     )
-    await db._conn.execute(
+    await conn.execute(
         "UPDATE chain_patterns SET total_triggers = total_triggers + 1 WHERE id = ?",
         (pattern.id,),
     )
 
-    await safe_emit(
+    # Transaction-aware event insert on the SAME connection — no commit here, so
+    # the event row is atomic with the chain_matches row (defect 2). A raise
+    # propagates and rolls the whole completion back (atomicity).
+    await emit_event(
         db,
-        token_id=chain.token_id,
-        pipeline=chain.pipeline,
-        event_type="chain_complete",
-        event_data={
+        chain.token_id,
+        chain.pipeline,
+        "chain_complete",
+        {
             "pattern_name": pattern.name,
             "steps_matched": len(chain.steps_matched),
             "total_steps": len(pattern.steps),
@@ -579,28 +596,20 @@ async def _record_completion(
             "chain_duration_hours": round(duration_h, 3),
             "mcap_at_completion": mcap_at_completion,
         },
-        source_module="chains.tracker",
+        "chains.tracker",
+        conn=conn,
     )
-
-    if settings.CHAIN_ALERT_ON_COMPLETE and pattern.alert_priority in (
-        "high",
-        "medium",
-    ):
-        try:
-            from scout.chains.alerts import send_chain_alert  # lazy import
-
-            await send_chain_alert(db, chain, pattern, settings)
-        except Exception:
-            logger.exception("chain_alert_failed", pattern=pattern.name)
 
 
 async def _record_expired_chain(
-    db: Database,
+    conn,
     chain: ActiveChain,
     pattern: ChainPattern,
     now: datetime,
 ) -> None:
     """Record an expired (unresolved) chain as a pending miss in chain_matches.
+
+    Writes on the caller's manager-owned ``conn`` (no commit).
 
     BL-071b fix (2026-05-03): writes outcome_class=NULL (not 'EXPIRED') so the
     hydrator `update_chain_outcomes` can later resolve the outcome from the
@@ -619,7 +628,7 @@ async def _record_expired_chain(
     steps_matched = len(chain.steps_matched)
     if steps_matched <= 0:
         return
-    await db._conn.execute(
+    await conn.execute(
         """INSERT INTO chain_matches
            (token_id, pipeline, pattern_id, pattern_name, steps_matched,
             total_steps, anchor_time, completed_at, chain_duration_hours,
@@ -678,33 +687,33 @@ async def update_chain_outcomes(
 
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     try:
-        # F2: the hydration loop opens an (implicit) transaction on the shared
-        # connection and holds it across DexScreener fetches; route it through
-        # the shared transaction-lock discipline so it can never overlap
-        # should_open's BEGIN IMMEDIATE (which would collide and roll this work
-        # back). db.transaction() owns COMMIT/ROLLBACK — the inner body no
-        # longer commits itself.
-        async with db.transaction() as conn:
-            return await _update_chain_outcomes_inner(
-                conn,
-                session,
-                fetcher,
-                settings,
-            )
+        # F2 (defect 4): reads + DexScreener fetches happen OUTSIDE any
+        # transaction; the inner gathers every outcome update, then applies them
+        # in a SINGLE manager transaction at the end. _txn_lock is therefore
+        # never held across a network await.
+        return await _update_chain_outcomes_inner(db, session, fetcher, settings)
     finally:
         if own_session and session is not None:
             await session.close()
 
 
 async def _update_chain_outcomes_inner(
-    conn,
+    db: Database,
     session: Any,
     fetcher: McapFetcher,
     settings: Settings | None,
 ) -> int:
     """Inner body of update_chain_outcomes (split out so the session
-    self-create wrapper stays small and the inner logic is testable)."""
+    self-create wrapper stays small and the inner logic is testable).
+
+    F2 (defect 4): all SELECTs and DexScreener fetches run on ``db._conn``
+    WITHOUT a transaction; each resolved outcome is collected into ``updates``
+    and the writes are applied in ONE ``db.transaction()`` after the loop, so
+    ``_txn_lock`` is never held across a network await."""
     global _persistent_failure_alert_state
+
+    # Reads only — no transaction. Writes are batched to the tail.
+    conn = db._conn
 
     hit_threshold_pct = (
         settings.CHAIN_OUTCOME_HIT_THRESHOLD_PCT if settings is not None else 50.0
@@ -732,6 +741,9 @@ async def _update_chain_outcomes_inner(
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     updated = 0
+    # (outcome, outcome_change_pct, evaluated_at, match_id) tuples — applied in a
+    # single manager transaction after the (network-bearing) gather loop.
+    updates: list[tuple] = []
     memecoin_unhydrateable = 0
     memecoin_ds_failures = 0
     memecoin_ds_attempts = 0
@@ -858,17 +870,23 @@ async def _update_chain_outcomes_inner(
         if outcome is None:
             continue
 
-        await conn.execute(
-            """UPDATE chain_matches
-               SET outcome_class = ?, outcome_change_pct = ?, evaluated_at = ?
-               WHERE id = ?""",
-            (outcome, outcome_change_pct, now_iso, match_id),
-        )
-        updated += 1
+        # Defer the write — collected here, applied in one transaction below so
+        # no DB write happens while a DexScreener fetch could still run.
+        updates.append((outcome, outcome_change_pct, now_iso, match_id))
 
-    # F2: COMMIT is owned by the enclosing db.transaction() in
-    # update_chain_outcomes (BEGIN IMMEDIATE + _txn_lock held); this body must
-    # not commit — doing so would end the disciplined transaction early.
+    # F2 (defect 4): apply ALL gathered outcome writes in a SINGLE manager
+    # transaction — no network await inside, no bare commit. The gather loop
+    # above already finished every fetch.
+    if updates:
+        async with db.transaction() as wconn:
+            await wconn.executemany(
+                """UPDATE chain_matches
+                   SET outcome_class = ?, outcome_change_pct = ?, evaluated_at = ?
+                   WHERE id = ?""",
+                updates,
+            )
+    updated = len(updates)
+
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
 
@@ -984,10 +1002,15 @@ async def _update_chain_outcomes_inner(
     return updated
 
 
-async def _prune_stale(db: Database, settings: Settings) -> None:
-    """Prune old signal_events and stale/completed active_chains."""
+async def _prune_stale(db: Database, settings: Settings, *, conn) -> None:
+    """Prune old signal_events and stale/completed active_chains.
+
+    Runs on the caller's manager-owned ``conn`` (no commit — the enclosing
+    ``db.transaction()`` commits). ``prune_old_events`` is called
+    transaction-aware so it does not commit early either.
+    """
     deleted_events = await prune_old_events(
-        db, retention_days=settings.CHAIN_EVENT_RETENTION_DAYS
+        db, retention_days=settings.CHAIN_EVENT_RETENTION_DAYS, conn=conn
     )
     if deleted_events:
         logger.debug("chain_events_pruned", count=deleted_events)
@@ -996,7 +1019,7 @@ async def _prune_stale(db: Database, settings: Settings) -> None:
         datetime.now(timezone.utc)
         - timedelta(days=settings.CHAIN_ACTIVE_RETENTION_DAYS)
     ).isoformat()
-    cursor = await db._conn.execute(
+    cursor = await conn.execute(
         """DELETE FROM active_chains
            WHERE (is_complete = 1 AND completed_at < ?)
               OR (is_complete = 0 AND anchor_time < ?)""",

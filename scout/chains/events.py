@@ -18,29 +18,52 @@ logger = structlog.get_logger()
 
 
 async def emit_event(
-    db: Database,
+    db: Database | None,
     token_id: str,
     pipeline: str,
     event_type: str,
     event_data: dict,
     source_module: str,
+    *,
+    conn=None,
 ) -> int:
-    """Append a signal event. Returns the new event row id."""
-    conn = db._conn
-    if conn is None:
-        raise RuntimeError("Database not initialized")
+    """Append a signal event. Returns the new event row id.
+
+    F2 transaction-awareness (change #2): when ``conn`` is provided the caller
+    is inside an open ``db.transaction()``; the INSERT runs on that connection
+    and is NOT committed here — the caller's manager owns COMMIT/ROLLBACK, so
+    the event row is atomic with the caller's other writes (no early commit of
+    the outer transaction). When ``conn`` is None the write goes through the
+    disciplined single-write path (its own locked transaction), so no bare
+    commit is ever issued on the shared connection.
+    """
     if pipeline not in ("narrative", "memecoin"):
         raise ValueError(f"Invalid pipeline: {pipeline!r}")
 
     now = datetime.now(timezone.utc).isoformat()
-    cursor = await conn.execute(
-        """INSERT INTO signal_events
-           (token_id, pipeline, event_type, event_data, source_module, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (token_id, pipeline, event_type, json.dumps(event_data), source_module, now),
+    sql = (
+        "INSERT INTO signal_events "
+        "(token_id, pipeline, event_type, event_data, source_module, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)"
     )
-    await conn.commit()
-    eid = cursor.lastrowid
+    params = (
+        token_id,
+        pipeline,
+        event_type,
+        json.dumps(event_data),
+        source_module,
+        now,
+    )
+    if conn is not None:
+        # Inside a caller's manager transaction — write only, no commit.
+        cursor = await conn.execute(sql, params)
+        eid = cursor.lastrowid
+    else:
+        if db is None or db._conn is None:
+            raise RuntimeError("Database not initialized")
+        async with db.transaction() as txn_conn:
+            cursor = await txn_conn.execute(sql, params)
+            eid = cursor.lastrowid
     logger.debug(
         "chain_event_emitted",
         event_id=eid,
@@ -81,17 +104,21 @@ async def load_recent_events(db: Database, max_hours: float) -> list[ChainEvent]
     ]
 
 
-async def prune_old_events(db: Database, retention_days: int) -> int:
-    """Delete events older than retention_days. Returns rows deleted."""
-    conn = db._conn
-    if conn is None:
-        raise RuntimeError("Database not initialized")
+async def prune_old_events(db: Database, retention_days: int, *, conn=None) -> int:
+    """Delete events older than retention_days. Returns rows deleted.
+
+    F2 transaction-awareness: with ``conn`` (inside a caller's transaction) the
+    DELETE runs on that connection WITHOUT committing; standalone it uses the
+    disciplined single-write path so no bare commit is issued.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cursor = await conn.execute(
-        "DELETE FROM signal_events WHERE created_at < ?", (cutoff,)
-    )
-    await conn.commit()
-    return cursor.rowcount or 0
+    sql = "DELETE FROM signal_events WHERE created_at < ?"
+    if conn is not None:
+        cursor = await conn.execute(sql, (cutoff,))
+        return cursor.rowcount or 0
+    if db._conn is None:
+        raise RuntimeError("Database not initialized")
+    return await db.execute_write(sql, (cutoff,)) or 0
 
 
 async def safe_emit(
@@ -101,12 +128,16 @@ async def safe_emit(
     event_type: str,
     event_data: dict,
     source_module: str,
+    *,
+    conn=None,
 ) -> int | None:
     """Call emit_event, log and swallow any exception.
 
     Use this from existing pipeline modules so chain tracking failures
     never break the main pipeline. When `CHAINS_ENABLED=False` this is a
-    total no-op — no DB row is inserted.
+    total no-op — no DB row is inserted. Pass ``conn`` when already inside a
+    ``db.transaction()`` so the event insert joins that transaction without an
+    early commit (F2 change #2).
     """
     try:
         from scout.config import get_settings  # lazy import to avoid cycle
@@ -123,7 +154,7 @@ async def safe_emit(
         return None
     try:
         return await emit_event(
-            db, token_id, pipeline, event_type, event_data, source_module
+            db, token_id, pipeline, event_type, event_data, source_module, conn=conn
         )
     except Exception as exc:
         logger.warning(

@@ -191,27 +191,27 @@ async def detect_acceleration(db: "Database", settings: "Settings") -> list[dict
     qualified = qualified[: settings.ACCELERATION_TOP_N]
 
     now_iso = now.isoformat()
-    for d in qualified:
-        await conn.execute(
-            """INSERT INTO gainer_acceleration
-               (coin_id, symbol, name, change_1h, change_4h, vol_expansion,
-                market_cap, current_price, detected_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                d["coin_id"],
-                d["symbol"],
-                d["name"],
-                d["change_1h"],
-                d["change_4h"],
-                d["vol_expansion"],
-                d["market_cap"],
-                d["current_price"],
-                now_iso,
-            ),
-        )
-        d["detected_at"] = now_iso
     if qualified:
-        await conn.commit()
+        async with db.transaction() as conn:
+            for d in qualified:
+                await conn.execute(
+                    """INSERT INTO gainer_acceleration
+                       (coin_id, symbol, name, change_1h, change_4h, vol_expansion,
+                        market_cap, current_price, detected_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        d["coin_id"],
+                        d["symbol"],
+                        d["name"],
+                        d["change_1h"],
+                        d["change_4h"],
+                        d["vol_expansion"],
+                        d["market_cap"],
+                        d["current_price"],
+                        now_iso,
+                    ),
+                )
+                d["detected_at"] = now_iso
 
     logger.info(
         "acceleration_scan_complete",

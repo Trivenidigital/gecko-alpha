@@ -235,54 +235,56 @@ async def seed_built_in_patterns(db: Database) -> int:
     inserted = 0
     synced = 0
     reactivated = 0
-    for pattern in BUILT_IN_PATTERNS:
-        row = existing.get(pattern.name)
-        if row is None:
-            await conn.execute(
-                """INSERT INTO chain_patterns
-                   (name, description, steps_json, min_steps_to_trigger,
-                    conviction_boost, alert_priority, is_active,
-                    is_protected_builtin, disabled_reason, disabled_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                _pattern_to_row(pattern),
-            )
-            inserted += 1
-            continue
+    # F2: the multi-statement seed/reconcile runs in one disciplined
+    # transaction (manager owns COMMIT/ROLLBACK; holds _txn_lock).
+    async with db.transaction() as conn:
+        for pattern in BUILT_IN_PATTERNS:
+            row = existing.get(pattern.name)
+            if row is None:
+                await conn.execute(
+                    """INSERT INTO chain_patterns
+                       (name, description, steps_json, min_steps_to_trigger,
+                        conviction_boost, alert_priority, is_active,
+                        is_protected_builtin, disabled_reason, disabled_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    _pattern_to_row(pattern),
+                )
+                inserted += 1
+                continue
 
-        steps_json = json.dumps([s.model_dump() for s in pattern.steps])
-        disabled_reason = row["disabled_reason"]
-        disabled_at = row["disabled_at"]
-        is_active = int(row["is_active"])
-        if disabled_reason in ("legacy_lifecycle_retired", "lifecycle_retired"):
-            is_active = 1
-            disabled_reason = None
-            disabled_at = None
-            reactivated += 1
-        await conn.execute(
-            """UPDATE chain_patterns
-               SET description = ?,
-                   steps_json = ?,
-                   min_steps_to_trigger = ?,
-                   conviction_boost = ?,
-                   is_protected_builtin = 1,
-                   is_active = ?,
-                   disabled_reason = ?,
-                   disabled_at = ?,
-                   updated_at = datetime('now')
-               WHERE name = ?""",
-            (
-                pattern.description,
-                steps_json,
-                pattern.min_steps_to_trigger,
-                pattern.conviction_boost,
-                is_active,
-                disabled_reason,
-                disabled_at,
-                pattern.name,
-            ),
-        )
-        synced += 1
-    await conn.commit()
+            steps_json = json.dumps([s.model_dump() for s in pattern.steps])
+            disabled_reason = row["disabled_reason"]
+            disabled_at = row["disabled_at"]
+            is_active = int(row["is_active"])
+            if disabled_reason in ("legacy_lifecycle_retired", "lifecycle_retired"):
+                is_active = 1
+                disabled_reason = None
+                disabled_at = None
+                reactivated += 1
+            await conn.execute(
+                """UPDATE chain_patterns
+                   SET description = ?,
+                       steps_json = ?,
+                       min_steps_to_trigger = ?,
+                       conviction_boost = ?,
+                       is_protected_builtin = 1,
+                       is_active = ?,
+                       disabled_reason = ?,
+                       disabled_at = ?,
+                       updated_at = datetime('now')
+                   WHERE name = ?""",
+                (
+                    pattern.description,
+                    steps_json,
+                    pattern.min_steps_to_trigger,
+                    pattern.conviction_boost,
+                    is_active,
+                    disabled_reason,
+                    disabled_at,
+                    pattern.name,
+                ),
+            )
+            synced += 1
     logger.info(
         "chain_patterns_seeded_or_synced",
         inserted=inserted,
@@ -381,98 +383,98 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
         )
         return
 
-    conn = db._conn
-    for pid, s in by_pattern.items():
-        async with conn.execute(
-            """SELECT alert_priority, is_active, is_protected_builtin,
-                      disabled_reason, disabled_at
-               FROM chain_patterns WHERE id = ?""",
-            (pid,),
-        ) as cur:
-            row = await cur.fetchone()
-        if row is None:
-            continue
-        prio = row["alert_priority"]
-        is_active = bool(row["is_active"])
-        is_protected_builtin = bool(row["is_protected_builtin"])
-        new_prio = prio
-        new_active = is_active
-        new_disabled_reason = row["disabled_reason"]
-        new_disabled_at = row["disabled_at"]
-        disabled_by_operator_or_code = new_disabled_reason in (
-            "operator_disabled",
-            "code_disabled",
-        )
+    # F2: the lifecycle read+update sweep runs in one disciplined transaction
+    # (manager owns COMMIT/ROLLBACK; holds _txn_lock). No network inside.
+    async with db.transaction() as conn:
+        for pid, s in by_pattern.items():
+            async with conn.execute(
+                """SELECT alert_priority, is_active, is_protected_builtin,
+                          disabled_reason, disabled_at
+                   FROM chain_patterns WHERE id = ?""",
+                (pid,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                continue
+            prio = row["alert_priority"]
+            is_active = bool(row["is_active"])
+            is_protected_builtin = bool(row["is_protected_builtin"])
+            new_prio = prio
+            new_active = is_active
+            new_disabled_reason = row["disabled_reason"]
+            new_disabled_at = row["disabled_at"]
+            disabled_by_operator_or_code = new_disabled_reason in (
+                "operator_disabled",
+                "code_disabled",
+            )
 
-        if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
-            if s["hit_rate"] < _RETIREMENT_HIT_RATE:
-                if disabled_by_operator_or_code:
-                    pass
-                elif is_protected_builtin:
-                    if is_active:
+            if s["total_evaluated"] >= settings.CHAIN_MIN_TRIGGERS_FOR_STATS:
+                if s["hit_rate"] < _RETIREMENT_HIT_RATE:
+                    if disabled_by_operator_or_code:
+                        pass
+                    elif is_protected_builtin:
+                        if is_active:
+                            logger.info(
+                                "chain_pattern_retirement_blocked_protected",
+                                pattern=s["pattern_name"],
+                                hit_rate=s["hit_rate"],
+                                total_evaluated=s["total_evaluated"],
+                            )
+                    else:
+                        new_active = False
+                        new_disabled_reason = "lifecycle_retired"
+                        new_disabled_at = datetime.now(timezone.utc).isoformat()
                         logger.info(
-                            "chain_pattern_retirement_blocked_protected",
+                            "chain_pattern_retired",
                             pattern=s["pattern_name"],
                             hit_rate=s["hit_rate"],
-                            total_evaluated=s["total_evaluated"],
                         )
-                else:
-                    new_active = False
-                    new_disabled_reason = "lifecycle_retired"
-                    new_disabled_at = datetime.now(timezone.utc).isoformat()
+                elif (
+                    not disabled_by_operator_or_code
+                    and prio == "low"
+                    and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD
+                ):
+                    new_prio = "medium"
                     logger.info(
-                        "chain_pattern_retired",
+                        "chain_pattern_promoted",
                         pattern=s["pattern_name"],
+                        from_priority="low",
+                        to_priority="medium",
                         hit_rate=s["hit_rate"],
                     )
-            elif (
+
+            if (
                 not disabled_by_operator_or_code
-                and prio == "low"
-                and s["hit_rate"] >= settings.CHAIN_PROMOTION_THRESHOLD
+                and prio == "medium"
+                and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
+                and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
             ):
-                new_prio = "medium"
+                new_prio = "high"
                 logger.info(
-                    "chain_pattern_promoted",
+                    "chain_pattern_graduated",
                     pattern=s["pattern_name"],
-                    from_priority="low",
-                    to_priority="medium",
                     hit_rate=s["hit_rate"],
                 )
 
-        if (
-            not disabled_by_operator_or_code
-            and
-            prio == "medium"
-            and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
-            and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
-        ):
-            new_prio = "high"
-            logger.info(
-                "chain_pattern_graduated",
-                pattern=s["pattern_name"],
-                hit_rate=s["hit_rate"],
+            await conn.execute(
+                """UPDATE chain_patterns
+                   SET alert_priority = ?,
+                       is_active      = ?,
+                       disabled_reason = ?,
+                       disabled_at     = ?,
+                       historical_hit_rate = ?,
+                       total_triggers = ?,
+                       total_hits     = ?,
+                       updated_at     = datetime('now')
+                   WHERE id = ?""",
+                (
+                    new_prio,
+                    1 if new_active else 0,
+                    new_disabled_reason,
+                    new_disabled_at,
+                    s["hit_rate"],
+                    s["total_evaluated"],
+                    s["hits"],
+                    pid,
+                ),
             )
-
-        await conn.execute(
-            """UPDATE chain_patterns
-               SET alert_priority = ?,
-                   is_active      = ?,
-                   disabled_reason = ?,
-                   disabled_at     = ?,
-                   historical_hit_rate = ?,
-                   total_triggers = ?,
-                   total_hits     = ?,
-                   updated_at     = datetime('now')
-               WHERE id = ?""",
-            (
-                new_prio,
-                1 if new_active else 0,
-                new_disabled_reason,
-                new_disabled_at,
-                s["hit_rate"],
-                s["total_evaluated"],
-                s["hits"],
-                pid,
-            ),
-        )
-    await conn.commit()

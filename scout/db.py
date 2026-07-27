@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -319,6 +320,30 @@ class Database:
             self._txn_owner = None
             self._txn_lock.release()
 
+    async def execute_write(self, sql: str, params: "Sequence | None" = None) -> int:
+        """Disciplined single-statement write on the shared connection.
+
+        Thin wrapper over :meth:`transaction` for the common
+        ``execute(INSERT/UPDATE/DELETE) + commit`` pattern: acquires
+        ``_txn_lock``, runs the one statement inside ``BEGIN IMMEDIATE``, and
+        COMMITs (ROLLBACK on error). This is the sanctioned replacement for the
+        old bare ``self._conn.execute(...); await self._conn.commit()`` autocommit
+        writes (F2 change #1 — no write on the shared connection may commit
+        outside the manager/lock). Returns the statement's ``rowcount``. Callers
+        that need ``lastrowid`` or multiple statements must use
+        :meth:`transaction` directly.
+        """
+        async with self.transaction() as conn:
+            cur = await conn.execute(sql, params or ())
+            return cur.rowcount
+
+    async def executemany_write(self, sql: str, seq_of_params) -> int:
+        """Disciplined batched write on the shared connection (see
+        :meth:`execute_write`). Returns the batch ``rowcount``."""
+        async with self.transaction() as conn:
+            cur = await conn.executemany(sql, seq_of_params)
+            return cur.rowcount
+
     async def _migrate_dex_discovery_v1(self) -> None:
         """Migration dex_discovery_v1, schema_version 20260720.
 
@@ -542,56 +567,55 @@ class Database:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         if not is_dex(contract_address):
             return
-        conn = self._conn
-        cur = await conn.execute(
-            "SELECT captured_at FROM entry_mcap_snapshots WHERE contract_address = ?",
-            (contract_address,),
-        )
-        existing = await cur.fetchone()
-        if existing is not None and existing[0] is not None:
-            return  # already finalized -> write-once
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "SELECT captured_at FROM entry_mcap_snapshots WHERE contract_address = ?",
+                (contract_address,),
+            )
+            existing = await cur.fetchone()
+            if existing is not None and existing[0] is not None:
+                return  # already finalized -> write-once
 
-        earliest_merge = (
-            "first_seen_at = CASE "
-            "WHEN datetime(excluded.first_seen_at) "
-            "< datetime(entry_mcap_snapshots.first_seen_at) "
-            "THEN excluded.first_seen_at "
-            "ELSE entry_mcap_snapshots.first_seen_at END"
-        )
-        if mcap_usd and mcap_usd > 0:
-            now = datetime.now(timezone.utc).isoformat()
-            await conn.execute(
-                "INSERT INTO entry_mcap_snapshots "
-                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
-                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(contract_address) DO UPDATE SET "
-                f"{earliest_merge}, "
-                "mcap_usd_at_entry = excluded.mcap_usd_at_entry, "
-                "liquidity_usd_at_entry = excluded.liquidity_usd_at_entry, "
-                "token_age_days_at_entry = excluded.token_age_days_at_entry, "
-                "captured_at = excluded.captured_at",
-                (
-                    contract_address,
-                    chain,
-                    first_seen_at,
-                    mcap_usd,
-                    liquidity_usd,
-                    token_age_days,
-                    now,
-                ),
+            earliest_merge = (
+                "first_seen_at = CASE "
+                "WHEN datetime(excluded.first_seen_at) "
+                "< datetime(entry_mcap_snapshots.first_seen_at) "
+                "THEN excluded.first_seen_at "
+                "ELSE entry_mcap_snapshots.first_seen_at END"
             )
-        else:
-            await conn.execute(
-                "INSERT INTO entry_mcap_snapshots "
-                "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
-                "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
-                "VALUES (?, ?, ?, NULL, NULL, NULL, NULL) "
-                "ON CONFLICT(contract_address) DO UPDATE SET "
-                f"{earliest_merge}",
-                (contract_address, chain, first_seen_at),
-            )
-        await conn.commit()
+            if mcap_usd and mcap_usd > 0:
+                now = datetime.now(timezone.utc).isoformat()
+                await conn.execute(
+                    "INSERT INTO entry_mcap_snapshots "
+                    "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                    "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(contract_address) DO UPDATE SET "
+                    f"{earliest_merge}, "
+                    "mcap_usd_at_entry = excluded.mcap_usd_at_entry, "
+                    "liquidity_usd_at_entry = excluded.liquidity_usd_at_entry, "
+                    "token_age_days_at_entry = excluded.token_age_days_at_entry, "
+                    "captured_at = excluded.captured_at",
+                    (
+                        contract_address,
+                        chain,
+                        first_seen_at,
+                        mcap_usd,
+                        liquidity_usd,
+                        token_age_days,
+                        now,
+                    ),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO entry_mcap_snapshots "
+                    "(contract_address, chain, first_seen_at, mcap_usd_at_entry, "
+                    "liquidity_usd_at_entry, token_age_days_at_entry, captured_at) "
+                    "VALUES (?, ?, ?, NULL, NULL, NULL, NULL) "
+                    "ON CONFLICT(contract_address) DO UPDATE SET "
+                    f"{earliest_merge}",
+                    (contract_address, chain, first_seen_at),
+                )
 
     async def log_txns_snapshot(
         self,
@@ -612,25 +636,25 @@ class Database:
         if txns_h1_buys is None and txns_h1_sells is None:
             return
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO txns_h1_buys_snapshots "
             "(contract_address, txns_h1_buys, txns_h1_sells, source, scanned_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (contract_address, txns_h1_buys, txns_h1_sells, source, now),
         )
-        await self._conn.commit()
 
     async def prune_txns_snapshots(self, *, keep_days: int) -> int:
         """Prune raw proxy snapshots older than keep_days. Returns rows deleted."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM txns_h1_buys_snapshots WHERE scanned_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM txns_h1_buys_snapshots WHERE scanned_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def compute_dex_coverage_metrics(self) -> dict:
         """C5: substrate-health + analysis-readiness coverage metrics (B1/B2).
@@ -736,7 +760,7 @@ class Database:
         # filter on a durable column, not query-time inference or the pruned
         # candidates.chain.
         address_type = classify_contract(contract_address)
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO contract_coin_map "
             "(contract_address, chain, coin_id, resolved_at, source, confidence, "
             "address_type) "
@@ -747,7 +771,6 @@ class Database:
             "address_type = excluded.address_type",
             (contract_address, chain, coin_id, now, source, confidence, address_type),
         )
-        await self._conn.commit()
 
     async def contract_coin_map_has(self, contract_address: str) -> bool:
         """True if any resolution row (incl. attempted/NULL) exists — TTL guard."""
@@ -784,7 +807,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO contract_coin_map "
             "(contract_address, chain, coin_id, resolved_at, source, confidence, "
             "address_type) "
@@ -793,7 +816,6 @@ class Database:
             "resolved_at = excluded.resolved_at",
             (f"__attempt__:{coin_id}", now),
         )
-        await self._conn.commit()
 
     async def coin_id_attempt_fresh(self, coin_id: str, ttl_seconds: int) -> bool:
         """True if coin_id had a failed attempt within ttl_seconds (TTL guard)."""
@@ -1297,14 +1319,15 @@ class Database:
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
-        cur = await self._conn.execute(
-            "INSERT OR IGNORE INTO moved_already_postmortems "
-            "(token_id, detected_at, run_pct, evidence, dropping_gate) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (token_id, detected_at, run_pct, json.dumps(evidence), dropping_gate),
-        )
-        await self._conn.commit()
-        return cur.rowcount > 0
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "INSERT OR IGNORE INTO moved_already_postmortems "
+                "(token_id, detected_at, run_pct, evidence, dropping_gate) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_id, detected_at, run_pct, json.dumps(evidence), dropping_gate),
+            )
+            rowcount = cur.rowcount
+        return rowcount > 0
 
     async def _migrate_detection_decision_receipts_v1(self) -> None:
         """ALR-02 decision-receipt audit substrate, schema_version 20260726.
@@ -1593,13 +1616,14 @@ class Database:
         retention_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=keep_days)
         ).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM detection_decision_receipts "
-            "WHERE decided_at <= ? AND decided_at <= ?",
-            (retention_cutoff, cohort_closed_at),
+        return (
+            await self.execute_write(
+                "DELETE FROM detection_decision_receipts "
+                "WHERE decided_at <= ? AND decided_at <= ?",
+                (retention_cutoff, cohort_closed_at),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def _migrate_detection_receipt_archive_v1(self) -> None:
         """Receipt lifecycle-archive substrate, schema_version 20260727.
@@ -6957,7 +6981,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now_iso = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO ingest_watchdog_state "
             "(source, consecutive_misses, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(source) DO UPDATE SET "
@@ -6965,7 +6989,6 @@ class Database:
             "updated_at=excluded.updated_at",
             (source, consecutive_misses, now_iso),
         )
-        await self._conn.commit()
 
     async def _assert_minara_alert_emissions_schema(
         self, conn, *, require_indexes: bool = True
@@ -7599,26 +7622,24 @@ class Database:
         other field (V30 MUST-FIX — sub-SELECT prevents NULL clobber)."""
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT OR REPLACE INTO cohort_digest_state "
             "(marker, last_digest_date, last_final_block_fired_at) VALUES (1, ?, "
             "(SELECT last_final_block_fired_at FROM cohort_digest_state WHERE marker = 1))",
             (date_iso,),
         )
-        await self._conn.commit()
 
     async def cohort_digest_stamp_final_block_fired(self, ts_iso: str) -> None:
         """Stamp ``last_final_block_fired_at`` on the singleton row,
         preserving the other field."""
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT OR REPLACE INTO cohort_digest_state "
             "(marker, last_digest_date, last_final_block_fired_at) VALUES (1, "
             "(SELECT last_digest_date FROM cohort_digest_state WHERE marker = 1), ?)",
             (ts_iso,),
         )
-        await self._conn.commit()
 
     async def _migrate_chain_matches_completed_at_index(self) -> None:
         """V12 PR-review SHOULD-FIX #1 fold: chain_matches index promoted
@@ -8214,12 +8235,11 @@ class Database:
             elif isinstance(v, list):
                 v = json.dumps(v)
             values.append(v)
-        await self._conn.execute(
+        await self.execute_write(
             f"INSERT INTO candidates ({cols}) VALUES ({placeholders}) "
             f"ON CONFLICT(contract_address) DO UPDATE SET {update_clause}",
             values,
         )
-        await self._conn.commit()
 
     async def get_candidates_above_score(self, min_score: int) -> list[dict]:
         """Get candidates with quant_score >= min_score."""
@@ -8250,7 +8270,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             """INSERT INTO alerts
                (contract_address, chain, conviction_score, alert_market_cap,
                 price_usd, token_name, ticker, alerted_at)
@@ -8266,7 +8286,6 @@ class Database:
                 now,
             ),
         )
-        await self._conn.commit()
 
     async def get_unchecked_alerts(self) -> list[dict]:
         """Get alerts that don't have an outcome recorded yet."""
@@ -8293,7 +8312,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             """INSERT OR REPLACE INTO outcomes
                (id, contract_address, alert_price, check_price, check_time, price_change_pct)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -8306,7 +8325,6 @@ class Database:
                 price_change_pct,
             ),
         )
-        await self._conn.commit()
 
     async def was_recently_alerted(self, contract_address: str, hours: int = 4) -> bool:
         """Check if a token was alerted within the last N hours."""
@@ -8351,11 +8369,10 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO mirofish_jobs (contract_address, created_at) VALUES (?, ?)",
             (contract_address, now),
         )
-        await self._conn.commit()
 
     # ------------------------------------------------------------------
     # Holder snapshots
@@ -8368,11 +8385,10 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO holder_snapshots (contract_address, holder_count, scanned_at) VALUES (?, ?, ?)",
             (contract_address, holder_count, now),
         )
-        await self._conn.commit()
 
     async def get_previous_holder_count(self, contract_address: str) -> int | None:
         """Get the most recent holder count for a contract, or None if no history."""
@@ -8394,11 +8410,10 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO score_history (contract_address, score, scanned_at) VALUES (?, ?, ?)",
             (contract_address, score, now),
         )
-        await self._conn.commit()
 
     async def get_recent_scores(
         self, contract_address: str, limit: int = 3
@@ -8436,11 +8451,10 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT INTO volume_snapshots (contract_address, volume_24h_usd, scanned_at) VALUES (?, ?, ?)",
             (contract_address, volume, now),
         )
-        await self._conn.commit()
 
     async def get_daily_summary_data(self) -> dict:
         """Gather data for the daily Telegram summary."""
@@ -8512,12 +8526,10 @@ class Database:
         """Delete candidates older than keep_days. Returns rows deleted."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
-        cursor = await self._conn.execute(
+        return await self.execute_write(
             "DELETE FROM candidates WHERE datetime(first_seen_at) < datetime('now', ?)",
             (f"-{keep_days} days",),
         )
-        await self._conn.commit()
-        return cursor.rowcount
 
     async def get_daily_mirofish_count(self) -> int:
         """Count MiroFish jobs run today (UTC)."""
@@ -8616,7 +8628,7 @@ class Database:
     async def insert_secondwave_candidate(self, candidate: dict) -> None:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
-        await self._conn.execute(
+        await self.execute_write(
             """INSERT INTO second_wave_candidates
                (contract_address, chain, token_name, ticker, coingecko_id,
                 peak_quant_score, peak_signals_fired, first_seen_at,
@@ -8653,7 +8665,6 @@ class Database:
                 candidate.get("alerted_at"),
             ),
         )
-        await self._conn.commit()
 
     async def get_recent_secondwave_candidates(self, days: int = 7) -> list[dict]:
         if self._conn is None:
@@ -8692,34 +8703,33 @@ class Database:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         now = datetime.now(timezone.utc).isoformat()
         count = 0
-        for coin in raw_coins:
-            cid = coin.get("id")
-            if not cid:
-                continue
-            await self._conn.execute(
-                """INSERT INTO price_cache
-                   (coin_id, current_price, price_change_24h, price_change_7d,
-                    market_cap, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(coin_id) DO UPDATE SET
-                     current_price = excluded.current_price,
-                     price_change_24h = excluded.price_change_24h,
-                     price_change_7d = COALESCE(
-                       excluded.price_change_7d, price_cache.price_change_7d),
-                     market_cap = excluded.market_cap,
-                     updated_at = excluded.updated_at""",
-                (
-                    cid,
-                    coin.get("current_price"),
-                    coin.get("price_change_percentage_24h"),
-                    coin.get("price_change_percentage_7d_in_currency"),
-                    coin.get("market_cap"),
-                    now,
-                ),
-            )
-            count += 1
-        if count:
-            await self._conn.commit()
+        async with self.transaction() as conn:
+            for coin in raw_coins:
+                cid = coin.get("id")
+                if not cid:
+                    continue
+                await conn.execute(
+                    """INSERT INTO price_cache
+                       (coin_id, current_price, price_change_24h, price_change_7d,
+                        market_cap, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(coin_id) DO UPDATE SET
+                         current_price = excluded.current_price,
+                         price_change_24h = excluded.price_change_24h,
+                         price_change_7d = COALESCE(
+                           excluded.price_change_7d, price_cache.price_change_7d),
+                         market_cap = excluded.market_cap,
+                         updated_at = excluded.updated_at""",
+                    (
+                        cid,
+                        coin.get("current_price"),
+                        coin.get("price_change_percentage_24h"),
+                        coin.get("price_change_percentage_7d_in_currency"),
+                        coin.get("market_cap"),
+                        now,
+                    ),
+                )
+                count += 1
         return count
 
     async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:
@@ -8781,13 +8791,21 @@ class Database:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         if created_at is None:
             created_at = datetime.now(timezone.utc).isoformat()
-        cursor = await self._conn.execute(
-            """INSERT INTO briefings (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at),
-        )
-        await self._conn.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """INSERT INTO briefings (briefing_type, raw_data, synthesis, model_used, tokens_used, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    briefing_type,
+                    raw_data,
+                    synthesis,
+                    model_used,
+                    tokens_used,
+                    created_at,
+                ),
+            )
+            new_id = cursor.lastrowid
+        return new_id  # type: ignore[return-value]
 
     async def get_latest_briefing(self) -> dict | None:
         """Return the most recent briefing row, or None."""
@@ -8829,7 +8847,7 @@ class Database:
         -- the UNIQUE(exchange, symbol, kind, observed_at) constraint prevents
         duplicate rows.
         """
-        await self._conn.execute(
+        await self.execute_write(
             "INSERT OR IGNORE INTO perp_anomalies "
             "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -8843,7 +8861,6 @@ class Database:
                 anomaly.observed_at.isoformat(),
             ),
         )
-        await self._conn.commit()
 
     async def insert_perp_anomalies_batch(self, rows: list["PerpAnomaly"]) -> int:
         """Primary write path. Single transaction via executemany.
@@ -8893,13 +8910,12 @@ class Database:
             )
         if not payload:
             return 0
-        await self._conn.executemany(
+        await self.executemany_write(
             "INSERT OR IGNORE INTO perp_anomalies "
             "(exchange, symbol, ticker, kind, magnitude, baseline, observed_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             payload,
         )
-        await self._conn.commit()
         return len(rows)
 
     async def fetch_recent_perp_anomalies(
@@ -8945,35 +8961,38 @@ class Database:
     async def prune_perp_anomalies(self, *, keep_days: int) -> int:
         """Delete anomaly rows older than ``keep_days``. Returns rows deleted."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM perp_anomalies WHERE observed_at <= ?", (cutoff,)
+        return (
+            await self.execute_write(
+                "DELETE FROM perp_anomalies WHERE observed_at <= ?", (cutoff,)
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_score_history(self, *, keep_days: int) -> int:
         """Delete ``score_history`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM score_history WHERE scanned_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM score_history WHERE scanned_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_volume_snapshots(self, *, keep_days: int) -> int:
         """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_trade_decision_events(self, *, keep_days: int) -> int:
         """Delete ``trade_decision_events`` rows older than ``keep_days`` (INF-02).
@@ -8985,12 +9004,13 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM trade_decision_events WHERE created_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM trade_decision_events WHERE created_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_volume_history_cg(self, *, keep_days: int) -> int:
         """Delete ``volume_history_cg`` rows older than ``keep_days`` (INF-06).
@@ -9003,12 +9023,13 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM volume_history_cg WHERE recorded_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM volume_history_cg WHERE recorded_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     # ------------------------------------------------------------------
     # Observability — measurement-only methods (no DB mutations)
@@ -9328,16 +9349,16 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM conviction_watchlist_snapshots WHERE snapshot_at <= ?",
-            (cutoff,),
-        )
-        deleted = cur.rowcount or 0
-        await self._conn.execute(
-            "DELETE FROM conviction_watchlist_runs WHERE run_at <= ?",
-            (cutoff,),
-        )
-        await self._conn.commit()
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "DELETE FROM conviction_watchlist_snapshots WHERE snapshot_at <= ?",
+                (cutoff,),
+            )
+            deleted = cur.rowcount or 0
+            await conn.execute(
+                "DELETE FROM conviction_watchlist_runs WHERE run_at <= ?",
+                (cutoff,),
+            )
         return deleted
 
     async def prune_volume_spikes(self, *, keep_days: int) -> int:
@@ -9345,36 +9366,39 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM volume_spikes WHERE detected_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM volume_spikes WHERE detected_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_momentum_7d(self, *, keep_days: int) -> int:
         """Delete ``momentum_7d`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM momentum_7d WHERE detected_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM momentum_7d WHERE detected_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_trending_snapshots(self, *, keep_days: int) -> int:
         """Delete ``trending_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM trending_snapshots WHERE snapshot_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM trending_snapshots WHERE snapshot_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_learn_logs(self, *, keep_days: int) -> int:
         """Delete ``learn_logs`` rows older than ``keep_days``. Returns rowcount.
@@ -9397,36 +9421,39 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
-        cur = await self._conn.execute(
-            "DELETE FROM learn_logs WHERE created_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM learn_logs WHERE created_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_chain_matches(self, *, keep_days: int) -> int:
         """Delete ``chain_matches`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM chain_matches WHERE completed_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM chain_matches WHERE completed_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     async def prune_holder_snapshots(self, *, keep_days: int) -> int:
         """Delete ``holder_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM holder_snapshots WHERE scanned_at <= ?",
-            (cutoff,),
+        return (
+            await self.execute_write(
+                "DELETE FROM holder_snapshots WHERE scanned_at <= ?",
+                (cutoff,),
+            )
+            or 0
         )
-        await self._conn.commit()
-        return cur.rowcount or 0
 
     # ------------------------------------------------------------------
     # CryptoPanic posts
@@ -9443,7 +9470,7 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         fetched_at = datetime.now(timezone.utc).isoformat()
-        cur = await self._conn.execute(
+        return await self.execute_write(
             """
             INSERT OR IGNORE INTO cryptopanic_posts (
                 post_id, title, url, published_at, currencies_json,
@@ -9463,8 +9490,6 @@ class Database:
                 fetched_at,
             ),
         )
-        await self._conn.commit()
-        return cur.rowcount
 
     async def fetch_all_cryptopanic_posts(self) -> list[dict]:
         """Return all rows (test helper)."""
@@ -9486,9 +9511,7 @@ class Database:
         # and ISO-string comparisons can tie on low-resolution clocks
         # (observed on Windows). Semantics: "prune rows at or older
         # than keep_days."
-        cur = await self._conn.execute(
+        return await self.execute_write(
             "DELETE FROM cryptopanic_posts WHERE published_at <= ?",
             (cutoff,),
         )
-        await self._conn.commit()
-        return cur.rowcount

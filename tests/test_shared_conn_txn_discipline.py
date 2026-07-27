@@ -313,7 +313,10 @@ def test_f2_writers_route_through_transaction_manager():
     assert "db.transaction(" in check_src
     assert 'execute("BEGIN")' not in check_src
 
-    hydrate_src = inspect.getsource(tracker.update_chain_outcomes)
+    # update_chain_outcomes gathers reads + fetches (no txn), then applies the
+    # writes in db.transaction() inside its inner helper — assert the discipline
+    # lives there and that the outer wrapper no longer wraps the fetch loop.
+    hydrate_src = inspect.getsource(tracker._update_chain_outcomes_inner)
     assert "db.transaction(" in hydrate_src
 
     refresh_src = inspect.getsource(combo_refresh.refresh_combo)
@@ -418,6 +421,92 @@ def test_no_unmanaged_begin_on_shared_connection():
     assert violations == [], (
         "Unmanaged BEGIN on the shared connection (route it through "
         f"db.transaction() or hold _txn_lock): {violations}"
+    )
+
+
+def _commit_sites() -> list[tuple[str, str, bool]]:
+    """AST-scan scout/ for every ``.commit()`` call on the SHARED connection.
+
+    Returns ``(module_relpath, enclosing_function, allowed)`` per site. A commit
+    is on the shared connection when its receiver is ``*._conn`` (``db._conn`` /
+    ``self._conn`` / ``self._db._conn``) or a local name bound to a ``*._conn``
+    expression. Commits on a separate connection (a ``conn`` parameter typed
+    ``aiosqlite.Connection``, or a locally ``aiosqlite.connect(...)``-opened
+    connection — the class-(d) separate-connection writers) are NOT shared and
+    are exempt. A shared-connection commit is allowed only inside the manager
+    (``transaction``), an init-time DDL migration (``_migrate_*`` / ``_create_*``),
+    or a function that holds ``_txn_lock``.
+    """
+    import re
+
+    scout_root = pathlib.Path(__file__).resolve().parents[1] / "scout"
+    sites: list[tuple[str, str, bool]] = []
+    for path in scout_root.rglob("*.py"):
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        rel = path.relative_to(scout_root.parent).as_posix()
+
+        class _Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.stack: list[ast.AST] = []
+
+            def visit_FunctionDef(self, node):
+                self._fn(node)
+
+            def visit_AsyncFunctionDef(self, node):
+                self._fn(node)
+
+            def _fn(self, node):
+                self.stack.append(node)
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+                self.stack.pop()
+
+            def visit_Call(self, node):
+                fn = node.func
+                if isinstance(fn, ast.Attribute) and fn.attr == "commit":
+                    enclosing = self.stack[-1] if self.stack else None
+                    if enclosing is not None:
+                        recv = ast.unparse(fn.value)
+                        fn_src = ast.get_source_segment(src, enclosing) or ""
+                        shared = recv.endswith("._conn")
+                        if not shared:
+                            # bare local name bound to a *._conn expression?
+                            m = re.search(
+                                rf"(?m)^\s*{re.escape(recv)}\s*=\s*(.+)$", fn_src
+                            )
+                            if m and m.group(1).strip().endswith("._conn"):
+                                shared = True
+                        if shared:
+                            allowed = (
+                                enclosing.name == "transaction"
+                                or enclosing.name.startswith("_migrate")
+                                or enclosing.name.startswith("_create")
+                                or "_txn_lock" in fn_src
+                            )
+                            sites.append((rel, enclosing.name, allowed))
+                for child in ast.iter_child_nodes(node):
+                    self.visit(child)
+
+        _Visitor().visit(tree)
+    return sites
+
+
+def test_no_unmanaged_commit_on_shared_connection():
+    """Static enforcement (F2 change #1, exhaustive): NO bare ``.commit()`` on the
+    shared connection may occur outside the approved manager. Every commit on
+    ``db._conn`` / ``self._conn`` / ``self._db._conn`` (or a local bound to one)
+    must be issued by ``Database.transaction()``, an init-time DDL migration, or
+    a function holding ``_txn_lock``. Separate-connection writers (own
+    connection) are out of scope. A NEW autocommit writer that commits the shared
+    connection directly (the exact defect-1 shape) fails this test.
+    """
+    sites = _commit_sites()
+    assert sites, "scanner found no shared-connection commits — scanner is broken"
+    violations = [(m, f) for (m, f, ok) in sites if not ok]
+    assert violations == [], (
+        "Unmanaged commit on the shared connection (route the write through "
+        f"db.execute_write()/db.transaction() or hold _txn_lock): {violations}"
     )
 
 

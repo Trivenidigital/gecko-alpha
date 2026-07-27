@@ -294,18 +294,20 @@ async def test_slow_burn_all_coins_throw_emits_visible_telemetry(db):
             "total_volume": 200_000,
         },
     ]
-    # Force INSERT failure by closing the connection (drastic but reliable).
-    # The per-coin try/except should catch the failure and continue.
+    # F2: writes are now batched via executemany() AFTER the loop, so the
+    # surviving per-coin failure surface is the per-coin dedup SELECT inside the
+    # loop's try/except. Force THAT to fail so every coin is skipped and the
+    # all-skipped telemetry fires (identical observable outcome to the old
+    # per-row INSERT-failure injection).
     saved_conn = db._conn
     saved_execute = saved_conn.execute
 
     fail_count = [0]
-    select_failed = [False]
 
     async def boom_execute(sql, *args, **kwargs):
-        if "INSERT INTO slow_burn_candidates" in sql:
+        if "SELECT id FROM slow_burn_candidates" in sql:
             fail_count[0] += 1
-            raise RuntimeError("simulated INSERT failure")
+            raise RuntimeError("simulated per-coin query failure")
         return await saved_execute(sql, *args, **kwargs)
 
     saved_conn.execute = boom_execute
@@ -341,10 +343,12 @@ async def test_slow_burn_partial_skip_still_reports_results(db):
     saved_execute = saved_conn.execute
 
     async def selective_boom(sql, *args, **kwargs):
-        if "INSERT INTO slow_burn_candidates" in sql:
+        # F2: target the per-coin dedup SELECT (the surviving per-coin failure
+        # surface after writes were batched) for the "bad" coin only.
+        if "SELECT id FROM slow_burn_candidates" in sql:
             params = args[0] if args else ()
             if params and params[0] == "bad":
-                raise RuntimeError("simulated INSERT failure for bad coin")
+                raise RuntimeError("simulated per-coin query failure for bad coin")
         return await saved_execute(sql, *args, **kwargs)
 
     saved_conn.execute = selective_boom
