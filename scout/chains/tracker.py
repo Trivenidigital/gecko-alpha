@@ -74,7 +74,9 @@ async def run_chain_tracker(db: Database, settings: Settings) -> None:
         "chain_tracker_started",
         interval_sec=settings.CHAIN_CHECK_INTERVAL_SEC,
     )
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
         while True:
             try:
                 await check_chains(db, settings, session=session)
@@ -108,92 +110,84 @@ async def check_chains(
 
     events = await load_recent_events(db, max_hours=settings.CHAIN_MAX_WINDOW_HOURS)
 
-    conn = db._conn
+    # F2: run the whole matching pass inside the shared transaction-lock
+    # discipline (db.transaction() = BEGIN IMMEDIATE + the process-wide
+    # asyncio.Lock, COMMIT on clean exit / ROLLBACK on error). This replaces the
+    # old bare ``BEGIN`` + try/except-pass "join the in-flight transaction" hack:
+    # holding a transaction open across these helper awaits (and the up-to-15s
+    # DexScreener fetch in _record_completion) on the shared connection WITHOUT
+    # the lock is exactly what collided with should_open's BEGIN IMMEDIATE and
+    # got its transaction silently rolled back. None of the helpers below
+    # acquire _txn_lock, so holding it here cannot deadlock.
     try:
-        await conn.execute("BEGIN")
-    except Exception:
-        # Another BEGIN may already be in flight (test harness); fall back
-        # to the existing transaction.
-        pass
+        async with db.transaction():
+            if not events:
+                await _prune_stale(db, settings)
+                return
 
-    try:
-        if not events:
-            await _prune_stale(db, settings)
-            await conn.commit()
-            return
+            # Deterministic order: timestamp then id
+            events.sort(key=lambda e: (e.created_at, e.id or 0))
 
-        # Deterministic order: timestamp then id
-        events.sort(key=lambda e: (e.created_at, e.id or 0))
+            # Group by (token_id, pipeline)
+            groups: dict[tuple[str, str], list[ChainEvent]] = {}
+            for ev in events:
+                groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
 
-        # Group by (token_id, pipeline)
-        groups: dict[tuple[str, str], list[ChainEvent]] = {}
-        for ev in events:
-            groups.setdefault((ev.token_id, ev.pipeline), []).append(ev)
+            active_by_key = await _load_active_chains(db)
 
-        active_by_key = await _load_active_chains(db)
+            now = datetime.now(timezone.utc)
+            completed_chains: list[tuple[ActiveChain, ChainPattern]] = []
 
-        now = datetime.now(timezone.utc)
-        completed_chains: list[tuple[ActiveChain, ChainPattern]] = []
+            for (token_id, pipeline), token_events in groups.items():
+                for pattern in patterns:
+                    key = (token_id, pipeline, pattern.id)
+                    chain = active_by_key.get(key)
 
-        for (token_id, pipeline), token_events in groups.items():
-            for pattern in patterns:
-                key = (token_id, pipeline, pattern.id)
-                chain = active_by_key.get(key)
+                    # Expiry check for pre-existing chain
+                    if chain is not None and not chain.is_complete:
+                        age_h = (now - chain.anchor_time).total_seconds() / 3600.0
+                        if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
+                            await _record_expired_chain(db, chain, pattern, now)
+                            await _delete_active_chain(db, chain)
+                            active_by_key.pop(key, None)
+                            chain = None
+                            logger.info(
+                                "chain_expired",
+                                token_id=token_id,
+                                pattern=pattern.name,
+                            )
 
-                # Expiry check for pre-existing chain
-                if chain is not None and not chain.is_complete:
-                    age_h = (now - chain.anchor_time).total_seconds() / 3600.0
-                    if age_h > settings.CHAIN_MAX_WINDOW_HOURS:
-                        await _record_expired_chain(db, chain, pattern, now)
-                        await _delete_active_chain(db, chain)
-                        active_by_key.pop(key, None)
-                        chain = None
-                        logger.info(
-                            "chain_expired",
-                            token_id=token_id,
-                            pattern=pattern.name,
-                        )
+                    # Skip entirely if a recent completion exists (cooldown)
+                    if chain is None and await _in_cooldown(
+                        db, token_id, pipeline, pattern, settings
+                    ):
+                        continue
 
-                # Skip entirely if a recent completion exists (cooldown)
-                if chain is None and await _in_cooldown(
-                    db, token_id, pipeline, pattern, settings
-                ):
-                    continue
+                    # Advance or create
+                    chain, newly_complete = _advance_chain(
+                        chain, pattern, token_id, pipeline, token_events, now
+                    )
+                    if chain is None:
+                        continue
 
-                # Advance or create
-                chain, newly_complete = _advance_chain(
-                    chain, pattern, token_id, pipeline, token_events, now
+                    active_by_key[key] = chain
+                    await _persist_active_chain(db, chain)
+
+                    if newly_complete:
+                        completed_chains.append((chain, pattern))
+
+            for chain, pattern in completed_chains:
+                await _record_completion(
+                    db,
+                    chain,
+                    pattern,
+                    settings,
+                    session=session,
+                    mcap_fetcher=mcap_fetcher,
                 )
-                if chain is None:
-                    continue
 
-                active_by_key[key] = chain
-                await _persist_active_chain(db, chain)
-
-                if newly_complete:
-                    completed_chains.append((chain, pattern))
-
-        for chain, pattern in completed_chains:
-            await _record_completion(
-                db,
-                chain,
-                pattern,
-                settings,
-                session=session,
-                mcap_fetcher=mcap_fetcher,
-            )
-
-        await _prune_stale(db, settings)
-        await conn.commit()
+            await _prune_stale(db, settings)
     except Exception:
-        try:
-            await conn.rollback()
-        except Exception as rb_err:
-            # Don't mask the original chain_check_failed via the raise
-            # below, but emit a structured log so disk/lock/WAL failures
-            # during the cleanup are observable rather than silently
-            # swallowed. PR Round 4 silent-swallow sweep.
-            logger.exception("chain_check_rollback_failed", err=str(rb_err))
         logger.exception("chain_check_failed")
         raise
 
@@ -672,8 +666,7 @@ async def update_chain_outcomes(
 
     Returns the number of rows updated. Designed for once-per-LEARN-cycle.
     """
-    conn = db._conn
-    if conn is None:
+    if db._conn is None:
         raise RuntimeError("Database not initialized")
 
     fetcher = mcap_fetcher or fetch_token_fdv
@@ -685,12 +678,19 @@ async def update_chain_outcomes(
 
         session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
     try:
-        return await _update_chain_outcomes_inner(
-            conn,
-            session,
-            fetcher,
-            settings,
-        )
+        # F2: the hydration loop opens an (implicit) transaction on the shared
+        # connection and holds it across DexScreener fetches; route it through
+        # the shared transaction-lock discipline so it can never overlap
+        # should_open's BEGIN IMMEDIATE (which would collide and roll this work
+        # back). db.transaction() owns COMMIT/ROLLBACK — the inner body no
+        # longer commits itself.
+        async with db.transaction() as conn:
+            return await _update_chain_outcomes_inner(
+                conn,
+                session,
+                fetcher,
+                settings,
+            )
     finally:
         if own_session and session is not None:
             await session.close()
@@ -866,7 +866,9 @@ async def _update_chain_outcomes_inner(
         )
         updated += 1
 
-    await conn.commit()
+    # F2: COMMIT is owned by the enclosing db.transaction() in
+    # update_chain_outcomes (BEGIN IMMEDIATE + _txn_lock held); this body must
+    # not commit — doing so would end the disciplined transaction early.
     if updated:
         logger.info("chain_outcomes_hydrated", count=updated)
 

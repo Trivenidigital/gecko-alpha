@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,6 +26,18 @@ class DbNotInitializedError(RuntimeError):
 class CoinIdResolutionError(RuntimeError):
     """Raised by Database.coin_id_resolves on aiosqlite.OperationalError
     (column rename / table lock). Caller decides fail-CLOSED vs fail-OPEN."""
+
+
+class NestedTransactionError(RuntimeError):
+    """Raised when :meth:`Database.transaction` is re-entered on the SAME task.
+
+    The shared-connection transaction manager is intentionally NON-nesting: the
+    process-shared aiosqlite connection has a single transaction slot, so a
+    nested ``BEGIN`` would raise "cannot start a transaction within a
+    transaction" and corrupt the outer transaction. We reject re-entry
+    explicitly with this domain exception instead of deadlocking on the
+    non-reentrant ``_txn_lock``. To write inside an open transaction, pass the
+    yielded connection down and reuse it — do not open a second one."""
 
 
 from scout.models import CandidateToken
@@ -77,6 +90,10 @@ class Database:
         self._busy_timeout_ms = int(busy_timeout_ms)
         self._conn: aiosqlite.Connection | None = None
         self._txn_lock: asyncio.Lock | None = None
+        # Task that currently holds an open transaction() context, if any —
+        # used to reject same-task re-entry (see NestedTransactionError) rather
+        # than deadlock on the non-reentrant _txn_lock.
+        self._txn_owner: "asyncio.Task | None" = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -230,6 +247,78 @@ class Database:
             await self._conn.close()
             self._conn = None
 
+    @asynccontextmanager
+    async def transaction(self):
+        """Serialize a ``BEGIN IMMEDIATE`` transaction on the shared connection.
+
+        This is the single common discipline for every explicit / multi-statement
+        write path on the process-shared ``self._conn`` (F2 corrective). It:
+
+        * acquires the process-wide ``self._txn_lock`` so two coroutines on the
+          same event loop can never hold overlapping transactions on the one
+          shared connection (which SQLite rejects with "cannot start a
+          transaction within a transaction");
+        * issues ``BEGIN IMMEDIATE`` and ``yield``s the connection;
+        * ``COMMIT``s on clean exit, ``ROLLBACK``s on error.
+
+        Guarantees (each has a dedicated test in
+        ``tests/test_shared_conn_txn_discipline.py``):
+
+        * **Owner-scoped rollback** — the ``txn_started`` guard means a ROLLBACK
+          is only ever issued by the code path that successfully opened the
+          transaction. A failed ``BEGIN`` (or any caller that never opened a
+          transaction) can NEVER roll back another writer's work (F2 change #2).
+        * **Cancellation-safe** — ``asyncio.CancelledError`` is a
+          ``BaseException``, so a cancellation inside the body still rolls the
+          transaction back (owner path) and the ``finally`` guarantees the lock
+          is released — cancellation can never strand ``_txn_lock``.
+        * **Non-nesting** — re-entry on the SAME task raises
+          :class:`NestedTransactionError` immediately (before touching the lock)
+          rather than deadlocking on the non-reentrant lock. To write inside an
+          open transaction, reuse the yielded connection.
+
+        Usage::
+
+            async with db.transaction() as conn:
+                await conn.execute(...)
+                await conn.execute(...)
+            # committed here on clean exit; rolled back if the body raised
+        """
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError(
+                "Database not initialized — initialize() must be awaited before "
+                "transaction()."
+            )
+        current = asyncio.current_task()
+        if current is not None and self._txn_owner is current:
+            raise NestedTransactionError(
+                "Database.transaction() cannot be nested on the same task — the "
+                "shared connection has a single transaction slot. Reuse the "
+                "yielded connection inside the outer transaction instead of "
+                "opening a new one."
+            )
+        await self._txn_lock.acquire()
+        self._txn_owner = current
+        txn_started = False
+        try:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            txn_started = True
+            yield self._conn
+            await self._conn.commit()
+            txn_started = False
+        except BaseException:
+            if txn_started:
+                try:
+                    await self._conn.rollback()
+                except Exception as rb_err:
+                    _db_log.exception("transaction_rollback_failed", err=str(rb_err))
+            raise
+        finally:
+            # Always runs — including on CancelledError — so the lock can never
+            # be stranded and a later writer is never blocked forever.
+            self._txn_owner = None
+            self._txn_lock.release()
+
     async def _migrate_dex_discovery_v1(self) -> None:
         """Migration dex_discovery_v1, schema_version 20260720.
 
@@ -304,27 +393,33 @@ class Database:
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
-        cur = await self._conn.execute(
-            """INSERT OR IGNORE INTO dex_pool_discoveries
-               (network, pool_address, base_token_address, base_token_symbol,
-                quote_token_symbol, pool_created_at, first_seen_at,
-                fdv_usd, liquidity_usd, volume_h1_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                network,
-                pool_address,
-                base_token_address,
-                base_token_symbol,
-                quote_token_symbol,
-                pool_created_at,
-                datetime.now(timezone.utc).isoformat(),
-                fdv_usd,
-                liquidity_usd,
-                volume_h1_usd,
-            ),
-        )
-        await self._conn.commit()
-        return cur.rowcount > 0
+        # F2: route the DEX discovery write through the shared transaction-lock
+        # discipline so its (implicit) transaction can never overlap another
+        # writer's transaction on the shared connection (which raised
+        # "cannot start a transaction within a transaction" and caused foreign
+        # rollbacks under the old unlocked execute+commit path).
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                """INSERT OR IGNORE INTO dex_pool_discoveries
+                   (network, pool_address, base_token_address, base_token_symbol,
+                    quote_token_symbol, pool_created_at, first_seen_at,
+                    fdv_usd, liquidity_usd, volume_h1_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    network,
+                    pool_address,
+                    base_token_address,
+                    base_token_symbol,
+                    quote_token_symbol,
+                    pool_created_at,
+                    datetime.now(timezone.utc).isoformat(),
+                    fdv_usd,
+                    liquidity_usd,
+                    volume_h1_usd,
+                ),
+            )
+            inserted = cur.rowcount > 0
+        return inserted
 
     async def _migrate_dex_instrumentation_v1(self) -> None:
         """Migration dex_instrumentation_v1, schema_version 20260629.
@@ -7958,17 +8053,18 @@ class Database:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        try:
-            await conn.execute("BEGIN EXCLUSIVE")
+        # F2: route the revival write through the shared transaction-lock
+        # discipline (manager owns BEGIN IMMEDIATE / COMMIT / ROLLBACK and holds
+        # _txn_lock). The pre-transaction cool-off SELECT above is a read and
+        # stays outside, matching the prior BEGIN-EXCLUSIVE placement.
+        async with self.transaction() as conn:
             cur = await conn.execute(
                 "SELECT enabled FROM signal_params WHERE signal_type = ?",
                 (signal_type,),
             )
             row = await cur.fetchone()
             if row is None:
-                # Roll back the empty txn before raising so the connection
-                # state is clean for the caller.
-                await conn.execute("ROLLBACK")
+                # The manager rolls the (empty) transaction back on this raise.
                 raise ValueError(f"unknown signal_type: {signal_type}")
             old_enabled = row[0]
 
@@ -8057,15 +8153,7 @@ class Database:
                     parole_at=now_iso,
                     parole_trades_remaining=retest,
                 )
-            await conn.commit()
-        except ValueError:
-            raise
-        except Exception:
-            try:
-                await conn.execute("ROLLBACK")
-            except Exception as rb_err:
-                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
-            raise
+        # Manager commits on clean exit; rolls back on any raise above.
 
     # ------------------------------------------------------------------
     # Candidates

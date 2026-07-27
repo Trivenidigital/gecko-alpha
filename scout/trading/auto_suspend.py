@@ -292,8 +292,10 @@ async def maybe_suspend_signals(
             max_drawdown <= hard_loss and net_pnl < pnl_threshold
         )
         if fires_hard_loss:
-            try:
-                await conn.execute("BEGIN EXCLUSIVE")
+            # F2: route the suspend write through the shared transaction-lock
+            # discipline (manager owns BEGIN IMMEDIATE / COMMIT / ROLLBACK and
+            # holds _txn_lock). Alert stays OUTSIDE the transaction.
+            async with db.transaction():
                 await _suspend(
                     conn,
                     signal_type,
@@ -303,13 +305,6 @@ async def maybe_suspend_signals(
                     ),
                     now_iso=now_iso,
                 )
-                await conn.commit()
-            except Exception:
-                try:
-                    await conn.execute("ROLLBACK")
-                except Exception as rb_err:
-                    log.exception("auto_suspend_rollback_failed", err=str(rb_err))
-                raise
             await _send_suspend_alert(
                 session=session,
                 settings=settings,
@@ -338,8 +333,10 @@ async def maybe_suspend_signals(
         if net_pnl >= pnl_threshold:
             continue
 
-        try:
-            await conn.execute("BEGIN EXCLUSIVE")
+        # F2: route the suspend write through the shared transaction-lock
+        # discipline (manager owns BEGIN IMMEDIATE / COMMIT / ROLLBACK). Alert
+        # stays OUTSIDE the transaction.
+        async with db.transaction():
             await _suspend(
                 conn,
                 signal_type,
@@ -347,13 +344,6 @@ async def maybe_suspend_signals(
                 detail=f"net_pnl ${net_pnl:.0f} (n={n})",
                 now_iso=now_iso,
             )
-            await conn.commit()
-        except Exception:
-            try:
-                await conn.execute("ROLLBACK")
-            except Exception as rb_err:
-                log.exception("auto_suspend_rollback_failed", err=str(rb_err))
-            raise
         await _send_suspend_alert(
             session=session,
             settings=settings,
