@@ -14,18 +14,26 @@ draft controls earlier draft) with the issued S1 and C1–C6 reviewer rulings
 of 2026-07-27 applied last (rulings control all drafts). Section-by-section
 provenance: §13.
 
-**I1 merge blockers:** reviewer sign-off + explicit product-owner
-authorization. Both document-level inputs are RESOLVED inline
-(gate_code_hash manifest list + rationale, §3.3; complete per-component
-persistence matrix with recovery contract, §7.4). **Product-owner
-authorization: NOT YET RECORDED** — the earlier entry citing the reviewer's
-return directive was invalid (a reviewer instruction about the return
-package is not owner authorization). The required form, to be recorded
-verbatim with its date (or by reference to its durable ruling record):
+**I1 merge blockers:** final reviewer approval on this head. Both
+document-level inputs are RESOLVED inline (gate_code_hash manifest list +
+rationale, §3.3; complete per-component persistence matrix with recovery
+contract, §7.4).
 
-> "As product owner, I authorize the I1 document merge of PR #476 after
-> reviewer approval. This authorizes documentation only and does not
-> authorize I2, I3, I4, deployment, production changes, or cohort accrual."
+**Product-owner authorization: RECORDED 2026-07-28.** The human product
+owner issued the authorization directly in the dev session ("I authorize
+and approve both Workstreams A and B"), adopting by reference the
+following authorization text transmitted by the owner in the same
+exchange, recorded here verbatim:
+
+> **Authorization 1 — PR #476 / Forward Cohort v0.6.**
+> I authorize the I1 documentation merge of PR #476 after final reviewer
+> approval. This authorization is limited to establishing the exact
+> Forward Cohort Pre-Registration v0.6 documentation in the repository
+> without semantic change. It does not authorize I2, I3, I4,
+> report-generator implementation, deployment, production changes, cohort
+> accrual, evidence evaluation, threshold changes, or Session 3 execution.
+> Any semantic change to the approved v0.6 content requires a new reviewer
+> ruling and a new product-owner decision.
 
 All former implementation-verification items are explicit I2/I3 gate
 obligations in §12 and do not block document merge.
@@ -1129,9 +1137,8 @@ failure.
     rationale; §7.4 persistence matrix. Implementation-verification items
     are I2/I3 obligations and do NOT gate document merge.
 [ ] Reviewer sign-off recorded
-[ ] Product-owner authorization recorded — awaiting the explicit statement
-    (verbatim template in the header; a reviewer return directive is not
-    owner authorization)
+[x] Product-owner authorization recorded (2026-07-28, direct human owner
+    statement adopting Authorization 1 — verbatim in the header)
 ```
 
 ### I2 — persistence-merge gate
