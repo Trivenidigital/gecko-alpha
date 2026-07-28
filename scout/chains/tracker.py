@@ -142,11 +142,18 @@ async def _check_chains_impl(
          completions;
       2. network phase (no txn, no lock) -> fetch DexScreener FDV for memecoin
          completions into a local map;
-      3. write phase (one ``db.transaction()``) -> persist chains, record
-         expirations + completions (chain_matches + a transaction-aware event
-         insert via ``emit_event(conn=...)``), prune; the manager commits;
-      4. alert phase (AFTER commit, no txn) -> deliver chain-completion alerts;
-         a delivery failure can never roll back committed chain state.
+      3. write phase (one ``db.transaction()``) -> persist NON-completed dirty
+         chains, record expirations, then PER COMPLETION: revalidate cooldown
+         and, only if it survives, persist THAT chain's active-chain state +
+         write its chain_matches + transaction-aware event via
+         ``emit_event(conn=...)`` + append it to ``committed_completions``. A
+         revalidation-skipped completion produces NONE of those side effects
+         (no persisted completed active_chains state, no chain_matches/event).
+         Prune; the manager commits;
+      4. alert phase (AFTER commit, no txn) -> deliver alerts for
+         ``committed_completions`` ONLY, so a revalidation-skipped completion is
+         never alerted; a delivery failure can never roll back committed chain
+         state.
     """
     patterns = await load_active_patterns(db)
     if not patterns:
@@ -239,25 +246,42 @@ async def _check_chains_impl(
 
     # ---- Phase 3: write phase — ONE atomic manager transaction, no network,
     # no callee commit. If any write (incl. the event insert) fails, the whole
-    # completion set rolls back (defect 2 / atomicity). ----
+    # completion set rolls back (defect 2 / atomicity).
+    #
+    # P0-3 per-completion ordering: a newly-completed chain is present in BOTH
+    # dirty_chains AND completions. Persisting all dirty chains first would
+    # write its completed active_chains state BEFORE the cooldown revalidation
+    # runs — so a completion that loses the revalidation still leaks completed
+    # state (and, via phase 4 iterating the raw completions, an alert). Instead
+    # we persist ONLY non-completed dirty chains here, and defer each completed
+    # chain's persist to its own revalidated step below; a skipped completion
+    # then produces none of its four side effects. ----
+    completed_ids = {id(chain) for chain, _pattern in completions}
+    committed_completions: list[tuple[ActiveChain, ChainPattern]] = []
     try:
         async with db.transaction() as conn:
             # _persist_active_chain is idempotent by construction: a chain with a
             # known id UPDATEs by id (a no-op if that row was concurrently
             # deleted — no stale write), a new chain uses INSERT OR IGNORE with
             # conflict re-resolution. So the persist step self-revalidates.
+            # Completed chains are skipped here and persisted only after their
+            # per-completion revalidation passes (P0-3).
             for chain in dirty_chains:
+                if id(chain) in completed_ids:
+                    continue
                 await _persist_active_chain(conn, chain)
             for chain, pattern in expirations:
                 await _record_expired_chain(conn, chain, pattern, now)
                 await _delete_active_chain(conn, chain)
             for chain, pattern in completions:
                 # P0-2a optimistic revalidation: re-check cooldown INSIDE the
-                # write transaction before inserting the completion. A completion
-                # for this (token,pipeline,pattern) that landed since the phase-1
+                # write transaction before ANY side effect. A completion for
+                # this (token,pipeline,pattern) that landed since the phase-1
                 # read (e.g. during the phase-2 fetch await, from another path)
                 # is visible on the shared conn here, so we skip the stale
-                # duplicate rather than writing it.
+                # duplicate ENTIRELY — no persisted completed active_chains
+                # state, no chain_matches/event write (P0-3), and phase 4 never
+                # alerts it because it is not appended to committed_completions.
                 if await _in_cooldown(
                     db, chain.token_id, chain.pipeline, pattern, settings
                 ):
@@ -268,18 +292,22 @@ async def _check_chains_impl(
                         reason="recent_completion_or_cooldown",
                     )
                     continue
+                await _persist_active_chain(conn, chain)
                 await _write_completion(
                     conn, db, chain, pattern, mcap_by_chain.get(id(chain))
                 )
+                committed_completions.append((chain, pattern))
             await _prune_stale(db, settings, conn=conn)
     except Exception:
         logger.exception("chain_check_failed")
         raise
 
-    # ---- Phase 4: alerts AFTER commit (no transaction). A send failure can
+    # ---- Phase 4: alerts AFTER commit (no transaction). Iterate ONLY the
+    # completions that survived revalidation and were actually committed (P0-3)
+    # — a revalidation-skipped completion must not alert. A send failure can
     # never roll back committed chain state (defect 3). ----
     if settings.CHAIN_ALERT_ON_COMPLETE:
-        for chain, pattern in completions:
+        for chain, pattern in committed_completions:
             if pattern.alert_priority in ("high", "medium"):
                 try:
                     from scout.chains.alerts import send_chain_alert  # lazy import

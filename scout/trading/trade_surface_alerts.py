@@ -283,17 +283,22 @@ async def _send_claimed_alert(
         "reasons": list(candidate.reasons),
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    # P0-2 ownership lease: stamped into the pending claim, then required by every
+    # subsequent transition so a stale sweep can never demote THIS dispatch.
+    lease = lifecycle.new_lease()
     pending_row_id: int | None = None
     async with db.transaction() as conn:
         if window_hours > 0:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(hours=window_hours)
             ).isoformat()
-            # Dedup treats RESERVED (sent + pending + attempted) as claimed.
+            # Dedup treats RESERVED (sent + pending + attempted + unknown) as
+            # claimed. The claim stamps the lease token + heartbeat.
             cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
-                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "SELECT NULL, ?, ?, ?, 'dispatch_pending', ? "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                " detail, dispatch_state_updated_at, dispatch_lease_token) "
+                "SELECT NULL, ?, ?, ?, 'dispatch_pending', ?, ?, ? "
                 "WHERE NOT EXISTS ("
                 "  SELECT 1 FROM tg_alert_log "
                 "  WHERE token_id = ? "
@@ -305,6 +310,8 @@ async def _send_claimed_alert(
                     candidate.token_id,
                     now_iso,
                     json.dumps(detail, sort_keys=True),
+                    now_iso,
+                    lease,
                     candidate.token_id,
                     cutoff,
                 ),
@@ -330,13 +337,16 @@ async def _send_claimed_alert(
         else:
             cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
-                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "VALUES (NULL, ?, ?, ?, 'dispatch_pending', ?) RETURNING id",
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                " detail, dispatch_state_updated_at, dispatch_lease_token) "
+                "VALUES (NULL, ?, ?, ?, 'dispatch_pending', ?, ?, ?) RETURNING id",
                 (
                     SIGNAL_TYPE,
                     candidate.token_id,
                     now_iso,
                     json.dumps(detail, sort_keys=True),
+                    now_iso,
+                    lease,
                 ),
             )
             row = await cur.fetchone()
@@ -355,7 +365,17 @@ async def _send_claimed_alert(
         )
         # Mark ATTEMPTED immediately before the provider call — a crash from here
         # on is reconciled to delivery_unknown_after_send, not a false 'sent'.
-        await lifecycle.mark_attempted(db, pending_row_id)
+        # P0-2: the send happens ONLY if the pending->attempted CAS applied FOR
+        # THIS lease. A False means a stale sweep reclaimed the row — abort the
+        # provider call rather than send under a lost lease.
+        if not await lifecycle.mark_attempted(db, pending_row_id, lease=lease):
+            log.warning(
+                "trade_surface_alert_lease_lost",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+                surface=candidate.surface,
+            )
+            return "dispatch_failed"
         await alerter.send_telegram_message(
             body,
             session,
@@ -364,8 +384,17 @@ async def _send_claimed_alert(
             raise_on_failure=True,
             source="trade_surface_alerts",
         )
-        # Provider accepted — promote attempted -> sent (delivered). Idempotent.
-        await lifecycle.promote_sent(db, pending_row_id)
+        # Provider accepted — promote attempted -> sent (delivered) under our lease.
+        # Check the CAS: a zero-row promote means a stale sweep reclaimed the row
+        # mid-send (a >lease-age send); the provider DID accept, so it is not a
+        # false 'sent', but the row is now delivery_unknown — surface it.
+        if not await lifecycle.promote_sent(db, pending_row_id, lease=lease):
+            log.warning(
+                "trade_surface_alert_promote_noop_after_send",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+                surface=candidate.surface,
+            )
         log.info(
             "trade_surface_alert_delivered",
             tg_alert_log_id=pending_row_id,
@@ -375,21 +404,33 @@ async def _send_claimed_alert(
         return "sent"
     except asyncio.CancelledError:
         # Interrupted after the send began — the provider result is unprovable.
-        await lifecycle.mark_delivery_unknown(
+        if not await lifecycle.mark_delivery_unknown(
             db,
             pending_row_id,
+            lease=lease,
             detail=lifecycle.merge_error_detail(
                 detail, "cancelled_during_telegram_send"
             ),
-        )
+        ):
+            log.warning(
+                "trade_surface_alert_unknown_cas_noop",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+            )
         raise
     except Exception as exc:
         # Confirmed failure (format error or provider error return).
-        await lifecycle.demote_failed(
+        if not await lifecycle.demote_failed(
             db,
             pending_row_id,
+            lease=lease,
             detail=lifecycle.merge_error_detail(detail, str(exc)[:200]),
-        )
+        ):
+            log.warning(
+                "trade_surface_alert_demote_cas_noop",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+            )
         log.warning(
             "trade_surface_alert_dispatch_failed",
             token_id=candidate.token_id,

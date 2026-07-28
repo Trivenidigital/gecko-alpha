@@ -69,6 +69,8 @@ number to appear in the table below.
 | 20260726 | detection_decision_receipts_v1 | #474 |
 | 20260727 | detection_receipt_archive_v1 | #475 |
 | 20260728 | bl_tg_alert_log_dispatch_pending_outcome | #477 | F2 P0-1: widen tg_alert_log.outcome CHECK for write-ahead dispatch-intent states |
+| 20260729 | bl_tg_alert_log_dispatch_lease_v1 | #477 | F2 P0-2: add tg_alert_log dispatch ownership-lease columns (dispatch_state_updated_at + dispatch_lease_token) + reconcile index |
+| 20260730 | bl_tg_alert_unknown_resolution_audit_v1 | #477 | F2 P0-1: durable audit table for operator resolution of delivery_unknown → unknown_resolved_retryable |
 
 ## Notes / gaps
 

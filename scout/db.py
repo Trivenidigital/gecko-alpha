@@ -140,6 +140,14 @@ class Database:
         # P0-1 (F2): admit 'dispatch_pending' + 'delivery_unknown_after_send'.
         # MUST run AFTER the dedup widening so it preserves 'blocked_dedup_24h'.
         await self._migrate_tg_alert_log_dispatch_pending_outcome()
+        # P0-2 (F2): add the dispatch ownership-lease columns
+        # (dispatch_state_updated_at + dispatch_lease_token). Additive ALTER;
+        # runs after the CHECK widening (same tg_alert_log target table).
+        await self._migrate_tg_alert_log_dispatch_lease_v1()
+        # P0-1 (F2): durable audit table for operator resolution of a
+        # delivery_unknown row into unknown_resolved_retryable (the sole write
+        # site of that state records who/when/why here).
+        await self._migrate_tg_alert_unknown_resolution_audit_v1()
         await self._migrate_tg_alert_operator_actions_v1()
         await self._migrate_narrative_scanner_v1()
         await self._migrate_minara_alert_emissions_v1()
@@ -5404,9 +5412,10 @@ class Database:
             raise
 
     async def _migrate_tg_alert_log_dispatch_pending_outcome(self) -> None:
-        """P0-1 (F2): extend tg_alert_log.outcome CHECK to admit the three
-        write-ahead intent states 'dispatch_pending', 'dispatch_attempted', and
-        'delivery_unknown_after_send' (the shared alert-dispatch lifecycle).
+        """P0-1 (F2): extend tg_alert_log.outcome CHECK to admit the write-ahead
+        intent states 'dispatch_pending', 'dispatch_attempted',
+        'delivery_unknown_after_send', and the operator-only terminal
+        'unknown_resolved_retryable' (the shared alert-dispatch lifecycle).
 
         Schema version 20260728. The reviewer's initial ruling assumed outcome
         was unconstrained TEXT, but it carries a CHECK — so the value-level state
@@ -5461,7 +5470,7 @@ class Database:
 
             # Idempotency guard UNIQUE to this migration: skip if the CHECK
             # already admits the last-added intent state.
-            if "dispatch_attempted" in table_sql:
+            if "unknown_resolved_retryable" in table_sql:
                 await conn.execute(
                     "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                     "VALUES (?, ?)",
@@ -5475,7 +5484,10 @@ class Database:
             col_names = [c[1] for c in cols]
             col_list = ", ".join(col_names)
 
-            # Preserve ALL existing values + the three write-ahead intent states.
+            # Preserve ALL existing values + the write-ahead intent states + the
+            # operator-only 'unknown_resolved_retryable' terminal state (P0-1;
+            # nothing automatic ever writes it — the CHECK must still admit it so
+            # a future operator resolution does not violate the constraint).
             new_check = (
                 "CHECK (outcome IN ("
                 "'sent','blocked_eligibility',"
@@ -5483,7 +5495,7 @@ class Database:
                 "'announcement_sent','m1_5c_announcement_sent',"
                 "'blocked_dedup_24h',"
                 "'dispatch_pending','dispatch_attempted',"
-                "'delivery_unknown_after_send'"
+                "'delivery_unknown_after_send','unknown_resolved_retryable'"
                 "))"
             )
 
@@ -5547,6 +5559,250 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
+
+    async def _migrate_tg_alert_log_dispatch_lease_v1(self) -> None:
+        """P0-2 (F2): add the ownership-lease columns to tg_alert_log.
+
+        Schema version 20260729. Two nullable columns support the dispatch
+        lease/heartbeat that makes stale-intent reconciliation ownership-safe:
+
+        * ``dispatch_state_updated_at`` TEXT — the lease heartbeat, refreshed on
+          every owner transition; reconcile_stale measures lease age from THIS
+          column (not ``alerted_at``), so an actively-sending dispatch is never
+          reclaimed.
+        * ``dispatch_lease_token`` TEXT — the unique per-attempt owner token; the
+          transition compare-and-sets guard on it so a stale sweep can never
+          demote (or a demote clobber) the wrong row.
+
+        Additive ALTER-based migration (mirrors
+        ``_migrate_entry_snapshot_liquidity_provenance_v1``): both columns
+        nullable with NO DEFAULT (absence semantics), idempotent via a
+        paper_migrations sentinel + a PRAGMA table_info guard. Legacy rows keep
+        NULL and reconcile_stale COALESCEs to ``alerted_at`` for them.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_tg_alert_log_dispatch_lease_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            expected_cols = {
+                "dispatch_state_updated_at": "TEXT",
+                "dispatch_lease_token": "TEXT",
+            }
+            cur_pragma = await conn.execute("PRAGMA table_info(tg_alert_log)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    continue
+                await conn.execute(
+                    f"ALTER TABLE tg_alert_log ADD COLUMN {col} {coltype}"
+                )
+            cur_pragma = await conn.execute("PRAGMA table_info(tg_alert_log)")
+            post_cols = {row[1] for row in await cur_pragma.fetchall()}
+            missing = sorted(set(expected_cols) - post_cols)
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: " + ", ".join(missing)
+                )
+            # Index the reconcile lookup path: reconcile_stale filters
+            # (signal_type, outcome, dispatch_state_updated_at) — this partial
+            # index serves the equality prefix + the heartbeat-age range. (The
+            # per-row CAS transitions are served by the id PRIMARY KEY.)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_alert_log_reconcile "
+                "ON tg_alert_log(signal_type, outcome, dispatch_state_updated_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260729, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("tg_alert_log_dispatch_lease_v1_migration_complete")
+        except BaseException as e:
+            _log.exception(
+                "tg_alert_log_dispatch_lease_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_tg_alert_unknown_resolution_audit_v1(self) -> None:
+        """P0-1 (F2): durable audit substrate for operator resolution of a
+        ``delivery_unknown_after_send`` row into ``unknown_resolved_retryable``.
+
+        Schema version 20260730. Additive table only — one immutable row per
+        operator resolution recording WHO (operator), WHEN (resolved_at), WHY
+        (reason), and the exact from/to outcomes. Written atomically with the
+        state transition by :meth:`resolve_delivery_unknown_as_retryable` (the
+        sole write site of ``unknown_resolved_retryable``). Idempotent via a
+        paper_migrations sentinel.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_tg_alert_unknown_resolution_audit_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            await conn.execute(
+                """CREATE TABLE IF NOT EXISTS tg_alert_unknown_resolutions (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_alert_log_id INTEGER NOT NULL,
+                    from_outcome    TEXT NOT NULL,
+                    to_outcome      TEXT NOT NULL,
+                    operator        TEXT NOT NULL,
+                    reason          TEXT NOT NULL,
+                    resolved_at     TEXT NOT NULL
+                )"""
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_alert_unknown_res_log "
+                "ON tg_alert_unknown_resolutions(tg_alert_log_id)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260730, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("tg_alert_unknown_resolution_audit_v1_migration_complete")
+        except BaseException as e:
+            _log.exception(
+                "tg_alert_unknown_resolution_audit_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def resolve_delivery_unknown_as_retryable(
+        self,
+        *,
+        tg_alert_log_id: int,
+        operator: str,
+        reason: str,
+    ) -> dict:
+        """Operator-only, audited resolution of a ``delivery_unknown_after_send``
+        row into ``unknown_resolved_retryable`` — the SOLE write site of that
+        state (P0-1). NOTHING automatic ever produces it; this is the only path.
+
+        Authorization gate: ``operator`` (identity) and ``reason`` (justification)
+        are REQUIRED and non-empty — the caller MUST present who + why. The
+        transition is a compare-and-set that applies ONLY to a row currently in
+        ``delivery_unknown_after_send``; a zero-row CAS raises (no silent
+        conversion of anything else, and no double-resolution).
+
+        Durable audit (who / when / why): one immutable row is written to
+        ``tg_alert_unknown_resolutions`` atomically with the transition, so the
+        provenance survives restart and is independently queryable. Held under
+        the shared ``_txn_lock`` (acquire pattern, like the other operator-audit
+        writers) so the two writes commit as one transaction.
+        """
+        if self._conn is None or self._txn_lock is None:
+            raise RuntimeError("Database not initialized.")
+        op = (operator or "").strip()
+        why = (reason or "").strip()
+        if not op:
+            raise ValueError(
+                "operator identity is required to resolve a delivery_unknown row"
+            )
+        if not why:
+            raise ValueError("reason is required to resolve a delivery_unknown row")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        txn_started = False
+        await self._txn_lock.acquire()
+        try:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            txn_started = True
+            cur = await self._conn.execute(
+                "UPDATE tg_alert_log SET outcome='unknown_resolved_retryable', "
+                "dispatch_state_updated_at=? "
+                "WHERE id=? AND outcome='delivery_unknown_after_send'",
+                (now_iso, tg_alert_log_id),
+            )
+            if (cur.rowcount or 0) != 1:
+                await self._conn.execute("ROLLBACK")
+                txn_started = False
+                raise KeyError(
+                    "no delivery_unknown_after_send row to resolve: "
+                    f"{tg_alert_log_id}"
+                )
+            await self._conn.execute(
+                "INSERT INTO tg_alert_unknown_resolutions "
+                "(tg_alert_log_id, from_outcome, to_outcome, operator, reason, "
+                " resolved_at) VALUES (?, 'delivery_unknown_after_send', "
+                "'unknown_resolved_retryable', ?, ?, ?)",
+                (tg_alert_log_id, op, why, now_iso),
+            )
+            await self._conn.commit()
+            txn_started = False
+        except BaseException:
+            if txn_started:
+                try:
+                    await self._conn.rollback()
+                except Exception as rb_err:
+                    _db_log.exception("connection_rollback_failed", err=str(rb_err))
+            raise
+        finally:
+            self._txn_lock.release()
+        _db_log.info(
+            "tg_alert_unknown_resolved_retryable",
+            tg_alert_log_id=tg_alert_log_id,
+            operator=op,
+            reason=why,
+        )
+        return {
+            "tg_alert_log_id": tg_alert_log_id,
+            "from_outcome": "delivery_unknown_after_send",
+            "to_outcome": "unknown_resolved_retryable",
+            "operator": op,
+            "reason": why,
+            "resolved_at": now_iso,
+        }
 
     async def _migrate_tg_alert_operator_actions_v1(self) -> None:
         """BL-NEW-TG-ALERT-OPERATOR-ACTION-TELEMETRY: operator labels.

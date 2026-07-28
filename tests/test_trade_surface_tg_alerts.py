@@ -735,3 +735,79 @@ async def test_p0_1_pending_counts_toward_cap_not_delivered(tmp_path, monkeypatc
     )
     assert (await cur.fetchone())[0] == 0  # pending is NEVER counted as delivered
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-2: ownership lease — a concurrent stale reconciliation can NEVER demote an
+# actively-sending dispatch, and the owner's promotion still succeeds.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p0_2_reconcile_cannot_demote_active_send(tmp_path, monkeypatch):
+    """Event-ordered: pause the provider send after the row is marked
+    dispatch_attempted (lease heartbeat fresh), run reconcile_stale concurrently,
+    prove the leased row is NOT demoted, then release the send and prove the owner
+    still promotes it to 'sent'."""
+    from scout.trading import alert_dispatch_lifecycle as lifecycle
+    from scout.trading.trade_surface_alerts import (
+        SIGNAL_TYPE,
+        TradeSurfaceAlertCandidate,
+        _send_claimed_alert,
+    )
+
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+
+    sending = asyncio.Event()
+    may_finish = asyncio.Event()
+
+    async def _blocking_send(*a, **k):
+        sending.set()
+        await may_finish.wait()
+
+    monkeypatch.setattr(_ALERTER, _blocking_send)
+    monkeypatch.setattr(
+        "scout.trading.trade_surface_alerts.format_trade_surface_alert",
+        lambda c: "body",
+    )
+
+    cand = TradeSurfaceAlertCandidate(
+        token_id="leasetok",
+        symbol="LEASE",
+        name="Lease",
+        surface="now_tradable",
+        verdict="candidate_review",
+        market_cap=1_000_000,
+        current_price=1.0,
+        move_pct=1.0,
+        source_corpus="paper",
+        surfaces=("now_tradable",),
+        reasons=(),
+    )
+
+    task = asyncio.create_task(
+        _send_claimed_alert(db, _settings(), object(), candidate=cand, window_hours=24)
+    )
+    await sending.wait()
+    # The row is now dispatch_attempted with a fresh lease heartbeat.
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='leasetok'"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_attempted"
+
+    # Reconcile runs WHILE the send is in flight — must be a no-op.
+    result = await lifecycle.reconcile_stale(db, SIGNAL_TYPE)
+    assert result == {"pending_failed": 0, "attempted_unknown": 0}
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='leasetok'"
+    )
+    assert (await cur.fetchone())[0] == "dispatch_attempted"  # NOT demoted
+
+    may_finish.set()
+    assert await task == "sent"
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='leasetok'"
+    )
+    assert (await cur.fetchone())[0] == "sent"
+    await db.close()

@@ -55,17 +55,22 @@ async def _demote_sent_row(
     db: Database,
     *,
     sent_row_id: int | None,
+    lease: str,
     detail: str,
     log_event: str,
 ) -> None:
     """Demote a pending/attempted dispatch row to dispatch_failed on a CONFIRMED
     non-delivery (preprocessing error, cancel before the send began, or a
-    provider error return) via the shared lifecycle contract. Swallows demote
-    errors so alert bookkeeping never propagates into the caller."""
+    provider error return) via the shared lifecycle contract, guarded on the
+    owner ``lease``. Swallows demote errors so alert bookkeeping never propagates
+    into the caller."""
     if sent_row_id is None:
         return
     try:
-        await lifecycle.demote_failed(db, sent_row_id, detail=detail)
+        if not await lifecycle.demote_failed(
+            db, sent_row_id, lease=lease, detail=detail
+        ):
+            log.warning("tg_alert_demote_cas_noop", sent_row_id=sent_row_id)
     except Exception:
         log.exception(log_event, sent_row_id=sent_row_id)
 
@@ -74,16 +79,20 @@ async def _mark_unknown_row(
     db: Database,
     *,
     sent_row_id: int | None,
+    lease: str,
     detail: str,
     log_event: str,
 ) -> None:
     """Mark an attempted dispatch row delivery_unknown_after_send when the send
     was interrupted after it began (e.g. cancelled mid-await) and the provider
-    result cannot be proven. Swallows errors."""
+    result cannot be proven, guarded on the owner ``lease``. Swallows errors."""
     if sent_row_id is None:
         return
     try:
-        await lifecycle.mark_delivery_unknown(db, sent_row_id, detail=detail)
+        if not await lifecycle.mark_delivery_unknown(
+            db, sent_row_id, lease=lease, detail=detail
+        ):
+            log.warning("tg_alert_unknown_cas_noop", sent_row_id=sent_row_id)
     except Exception:
         log.exception(log_event, sent_row_id=sent_row_id)
 
@@ -459,6 +468,10 @@ async def notify_paper_trade_opened(
             )
             return
         window_hours = settings.TG_ALERT_DEDUP_WINDOW_HOURS
+        # P0-2 ownership lease: stamped into the pending claim, then required by
+        # every subsequent transition so a stale sweep can never demote THIS
+        # dispatch while it is still preprocessing / sending.
+        lease = lifecycle.new_lease()
         async with db._txn_lock:
             now_iso = datetime.now(timezone.utc).isoformat()
             if window_hours > 0:
@@ -466,12 +479,13 @@ async def notify_paper_trade_opened(
                     datetime.now(timezone.utc) - timedelta(hours=window_hours)
                 ).isoformat()
                 # P0-1: claim a RESERVED slot as 'dispatch_pending' (NOT a
-                # pre-emptive 'sent'); dedup treats sent + pending + attempted
-                # as claimed.
+                # pre-emptive 'sent'); dedup treats sent + pending + attempted +
+                # unknown as claimed. The claim stamps the lease token + heartbeat.
                 cur = await db._conn.execute(
                     "INSERT INTO tg_alert_log "
-                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "SELECT ?, ?, ?, ?, 'dispatch_pending' "
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                    " dispatch_state_updated_at, dispatch_lease_token) "
+                    "SELECT ?, ?, ?, ?, 'dispatch_pending', ?, ? "
                     "WHERE NOT EXISTS ("
                     "  SELECT 1 FROM tg_alert_log "
                     f"  WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
@@ -483,6 +497,8 @@ async def notify_paper_trade_opened(
                         signal_type,
                         token_id,
                         now_iso,
+                        now_iso,
+                        lease,
                         token_id,
                         cutoff,
                     ),
@@ -528,16 +544,19 @@ async def notify_paper_trade_opened(
                 # dispatch_pending here; promoted to 'sent' only post-acceptance).
                 sent_row_id = claimed[0]
             else:
-                # Dedup disabled: direct claim as 'dispatch_pending'.
+                # Dedup disabled: direct claim as 'dispatch_pending' (with lease).
                 cur = await db._conn.execute(
                     "INSERT INTO tg_alert_log "
-                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "VALUES (?, ?, ?, ?, 'dispatch_pending') RETURNING id",
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                    " dispatch_state_updated_at, dispatch_lease_token) "
+                    "VALUES (?, ?, ?, ?, 'dispatch_pending', ?, ?) RETURNING id",
                     (
                         paper_trade_id,
                         signal_type,
                         token_id,
                         now_iso,
+                        now_iso,
+                        lease,
                     ),
                 )
                 claimed = await cur.fetchone()
@@ -571,6 +590,7 @@ async def notify_paper_trade_opened(
             await _demote_sent_row(
                 db,
                 sent_row_id=sent_row_id,
+                lease=lease,
                 detail="cancelled_during_minara_lookup",
                 log_event="tg_alert_log_demote_failed_on_cancel",
             )
@@ -616,8 +636,18 @@ async def notify_paper_trade_opened(
             )
             # P0-1: mark ATTEMPTED immediately before the provider call. A crash
             # from here on is reconciled to delivery_unknown_after_send, never a
-            # false 'sent'.
-            await lifecycle.mark_attempted(db, sent_row_id)
+            # false 'sent'. P0-2: send ONLY if the pending->attempted CAS applied
+            # for THIS lease — a False means a stale sweep reclaimed the row, so
+            # abort the provider call rather than send under a lost lease.
+            if not await lifecycle.mark_attempted(db, sent_row_id, lease=lease):
+                log.warning(
+                    "tg_alert_lease_lost",
+                    paper_trade_id=paper_trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    sent_row_id=sent_row_id,
+                )
+                return
             # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
             await alerter.send_telegram_message(
                 body,
@@ -627,9 +657,18 @@ async def notify_paper_trade_opened(
                 raise_on_failure=True,
                 source="tg_alert_dispatch",
             )
-            # P0-1: provider accepted — promote attempted -> sent (delivered).
-            # Idempotent (guarded on dispatch_attempted).
-            await lifecycle.promote_sent(db, sent_row_id)
+            # P0-1: provider accepted — promote attempted -> sent (delivered)
+            # under our lease. A zero-row CAS means a stale sweep reclaimed the
+            # row mid-send (a >lease-age send); surface it (the send DID land, so
+            # it is not a false 'sent', but the row is now delivery_unknown).
+            if not await lifecycle.promote_sent(db, sent_row_id, lease=lease):
+                log.warning(
+                    "tg_alert_promote_noop_after_send",
+                    paper_trade_id=paper_trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    sent_row_id=sent_row_id,
+                )
             # §12b: emit AFTER the send returns (delivery succeeded — the
             # call raises on failure). Together with tg_alert_dispatched this
             # makes "no logs" unambiguous between delivered vs skipped.
@@ -644,6 +683,7 @@ async def notify_paper_trade_opened(
             await _mark_unknown_row(
                 db,
                 sent_row_id=sent_row_id,
+                lease=lease,
                 detail="cancelled_during_telegram_send",
                 log_event="tg_alert_log_unknown_on_send_cancel",
             )
@@ -660,7 +700,10 @@ async def notify_paper_trade_opened(
             # (frees the dedup/cap slot for the next legitimate fire).
             if sent_row_id is not None:
                 try:
-                    await lifecycle.demote_failed(db, sent_row_id, detail=str(e)[:200])
+                    if not await lifecycle.demote_failed(
+                        db, sent_row_id, lease=lease, detail=str(e)[:200]
+                    ):
+                        log.warning("tg_alert_demote_cas_noop", sent_row_id=sent_row_id)
                 except Exception:
                     log.exception("tg_alert_log_demote_failed", sent_row_id=sent_row_id)
             return

@@ -426,3 +426,112 @@ async def test_p0_2a_single_flight_second_pass_does_not_interleave(
     may_resume.set()
     await first  # first pass finishes its own completions (fetch count may rise)
     await db.close()
+
+
+async def test_p0_3_revalidation_skipped_completion_has_no_side_effects(
+    db, settings_factory, monkeypatch
+):
+    """P0-3: a completion that loses the phase-3 optimistic revalidation must
+    produce NONE of its four side effects — (a) no persisted completed
+    active_chains state, (b) no chain_patterns.total_triggers increment, (c) no
+    chain_complete event row, (d) no chain-completion alert.
+
+    Mirrors the P0-2a interleave: pause the phase-2 fetch, land a competing
+    full_conviction (pattern_id=1) completion for the SAME token (so cooldown
+    trips at revalidation), resume, then assert all four effects are absent —
+    scoped to full_conviction, since narrative_momentum (pattern_id=2) also
+    completes from the same seed events and is unaffected by the competing row.
+    """
+    from scout.chains import tracker as _t
+    from scout.chains.mcap_fetcher import FetchResult, FetchStatus
+
+    _t._check_chains_inflight = False
+
+    # Promote full_conviction to high so the alert phase WOULD fire for it if the
+    # skipped completion were (wrongly) alerted — the spy proves it is not.
+    await db.execute_write(
+        "UPDATE chain_patterns SET alert_priority='high' WHERE name='full_conviction'"
+    )
+    await _emit_completing_events(db, "0xp03", "memecoin")
+
+    # (b) baseline: full_conviction total_triggers before the pass.
+    cur = await db._conn.execute(
+        "SELECT total_triggers FROM chain_patterns WHERE name='full_conviction'"
+    )
+    triggers_before = (await cur.fetchone())[0]
+
+    alert_calls: list[str] = []
+
+    async def _spy_alert(db_, chain, pattern, settings):
+        alert_calls.append(pattern.name)
+
+    monkeypatch.setattr("scout.chains.alerts.send_chain_alert", _spy_alert)
+
+    fetch_started = asyncio.Event()
+    may_resume = asyncio.Event()
+
+    async def _paused_fetcher(session, contract):
+        fetch_started.set()
+        await may_resume.wait()
+        return FetchResult(2_000_000.0, FetchStatus.OK)
+
+    settings = settings_factory(
+        **{**_CHAIN_SETTINGS_KW, "CHAIN_ALERT_ON_COMPLETE": True}
+    )
+    task = asyncio.create_task(
+        check_chains(db, settings, session=object(), mcap_fetcher=_paused_fetcher)
+    )
+    await fetch_started.wait()
+    # While the fetch is paused, land a competing full_conviction (pattern_id=1)
+    # completion for the SAME token, within cooldown — so phase-3 revalidation of
+    # the pass's own full_conviction completion trips _in_cooldown and skips it.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    await db.execute_write(
+        "INSERT INTO chain_matches "
+        "(token_id, pipeline, pattern_id, pattern_name, steps_matched, total_steps, "
+        " anchor_time, completed_at, chain_duration_hours, conviction_boost) "
+        "VALUES ('0xp03','memecoin',1,'full_conviction',3,4,?,?,0.0,25)",
+        (now_iso, now_iso),
+    )
+    may_resume.set()
+    await task
+
+    # (a) active_chains: the skipped completion's chain was NOT persisted as
+    # is_complete=1 (spec: absent or is_complete=0).
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM active_chains "
+        "WHERE token_id='0xp03' AND pattern_id=1 AND is_complete=1"
+    )
+    assert (await cur.fetchone())[
+        0
+    ] == 0, "skipped completion leaked completed active_chains state"
+
+    # (b) chain_matches: exactly ONE full_conviction row — the concurrently
+    # inserted one; the tracker did NOT add a second.
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM chain_matches WHERE token_id='0xp03' AND pattern_id=1"
+    )
+    assert (await cur.fetchone())[0] == 1, "tracker wrote a duplicate completion"
+
+    # (c) chain_patterns.total_triggers for full_conviction did NOT increment.
+    cur = await db._conn.execute(
+        "SELECT total_triggers FROM chain_patterns WHERE name='full_conviction'"
+    )
+    assert (await cur.fetchone())[
+        0
+    ] == triggers_before, "total_triggers incremented for skipped completion"
+
+    # (d) no chain_complete event row was written for the skipped full_conviction
+    # completion (narrative_momentum's own event is unrelated and scoped out).
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM signal_events "
+        "WHERE token_id='0xp03' AND event_type='chain_complete' "
+        "AND event_data LIKE '%full_conviction%'"
+    )
+    assert (await cur.fetchone())[
+        0
+    ] == 0, "chain_complete event written for skipped completion"
+
+    # ...and no alert was sent for the skipped completion.
+    assert "full_conviction" not in alert_calls, "alert sent for skipped completion"
+    await db.close()
