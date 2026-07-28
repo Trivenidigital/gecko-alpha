@@ -46,15 +46,34 @@ Workstreams A and B", adopting the transmitted text; recorded verbatim):**
 > All later Session 3 gates require their own explicit authorization and
 > evidence.
 
-**Materialization direction (2026-07-28, issued by the human product owner
-in the dev session; the dev session recorded its reading of the direction as
-issued-with-intent, open to owner/reviewer correction):** repository
-materialization only — placement of the byte-identical artifact, this
-record, hash verification, and a documentation-only PR for reviewer
-verification. Nothing further: no S3-G2, report-generator implementation,
-synthetic validation, production reads, deployment, dataset freeze, report
-publication, evidence evaluation, product recommendations, Session 3
-execution, cohort accrual, or GA-3–GA-6 unpark action.
+**Materialization and merge authorization (2026-07-28, issued DIRECTLY by
+the human product owner in the dev session; recorded verbatim — this
+supersedes and removes an earlier inferred-direction entry, which a
+reviewer ruling found invalid because reviewer-drafted wording cannot
+itself constitute owner authorization):**
+
+> As the human product owner, I directly authorize repository
+> materialization and documentation-only merge of the Session 3 Evidence
+> Evaluation and Product-Ruling Pre-Registration v1.0 candidate with
+> SHA-256:
+>
+> `5de1250afc967a35a7f10834d4c8f05927b2624279af87eeec3c6533badc70b4`
+>
+> I confirm that the repository artifact may retain its byte-identical
+> internal header reading "v0.4, final design round," with its v1.0
+> identity established by the authorized hash and companion authorization
+> record.
+>
+> This authorization is limited to the two-file documentation change in
+> PR #478.
+>
+> It does not authorize S3-G2, report-generator implementation, synthetic
+> validation, production reads, deployment, dataset freeze, report
+> publication, evidence evaluation, product recommendations, Session 3
+> execution, cohort accrual, or any GA-3–GA-6 unpark action.
+
+Merge remains held until final reviewer approval is issued on the
+corrected head.
 
 **Reviewer design approval:** granted 2026-07-28 on the frozen candidate
 (design portion of S3-G1). This merge remains held until the reviewer
