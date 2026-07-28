@@ -1,0 +1,1264 @@
+# Gecko-Alpha — Forward Cohort Pre-Registration (v0.6, consolidated)
+
+**New primitives introduced:** gate_evaluation + primary_assignment records; delivery-evidence spool; experiment-control journal (control_plane.db: cohort_status record, fencing token/status_version, admission ledger, failure episodes); measurement_gap_observation record; stratified sampling method (gecko-alpha-cohort-sampling-v1); isolated quote/outcome worker — all design-only at I1; no implementation in this document.
+
+> **Canonical protocol.** This is the governing Session 2 experimental
+> protocol (I1 document). `tasks/prereg_detection_gate_enrichment_cohort.md`
+> is a subordinate detection-receipt implementation and evidence annex; where
+> the two differ, THIS document controls.
+
+**Status: DRAFT v0.6, fully consolidated** — complete §§1–12, self-contained;
+no reliance on predecessor drafts or chat history. Consolidated from the
+product-owner-supplied source chain v0.2 → v0.3 → v0.4 → v0.5 → v0.6 (later
+draft controls earlier draft) with the issued S1 and C1–C6 reviewer rulings
+of 2026-07-27 applied last (rulings control all drafts). Section-by-section
+provenance: §13.
+
+**I1 merge blockers:** final reviewer approval on this head. Both
+document-level inputs are RESOLVED inline (gate_code_hash manifest list +
+rationale, §3.3; complete per-component persistence matrix with recovery
+contract, §7.4).
+
+**Product-owner authorization: RECORDED 2026-07-28.** The human product
+owner issued the authorization directly in the dev session ("I authorize
+and approve both Workstreams A and B"), adopting by reference the
+following authorization text transmitted by the owner in the same
+exchange, recorded here verbatim:
+
+> **Authorization 1 — PR #476 / Forward Cohort v0.6.**
+> I authorize the I1 documentation merge of PR #476 after final reviewer
+> approval. This authorization is limited to establishing the exact
+> Forward Cohort Pre-Registration v0.6 documentation in the repository
+> without semantic change. It does not authorize I2, I3, I4,
+> report-generator implementation, deployment, production changes, cohort
+> accrual, evidence evaluation, threshold changes, or Session 3 execution.
+> Any semantic change to the approved v0.6 content requires a new reviewer
+> ruling and a new product-owner decision.
+
+All former implementation-verification items are explicit I2/I3 gate
+obligations in §12 and do not block document merge.
+
+## Changelog (cumulative)
+
+```text
+v0.2→v0.3  S1 data-model recoherence (immutable gate_decision, append-only
+           events, derived reporting states); S2 secondary-crossover
+           treatment; S3 quote-scheduler isolation + capacity census +
+           sampling + 80% coverage floor; S4 two-phase delivery evidence;
+           S5 version identifiers, decision→acceptance latency definition,
+           on-chain token_dead path, direct gate_version format.
+v0.3→v0.4  T1 gate_evaluation/primary_assignment split + canonical identity;
+           T2 independent durable delivery spool w/ fail-open semantics;
+           T3 evidentiary CP2 = ≥30 determinate AND ≥80% coverage; IPW
+           aggregates; T4 latency ESTIMATOR pre-registered; T5 full-SHA
+           gate_version, measurable token_dead, 72h refresh workload in
+           census, four staged increments.
+v0.4→v0.5  U1 four independent gates I1–I4; U2 synthetic-only before I4;
+           U3 production-fails-open / experiment-fails-closed +
+           cohort_status machine; U4 frozen values (60s latency, $1.00
+           dust, Hájek estimator, exact workload formula).
+v0.5→v0.6  V1 measurement_gap_observation + operational/evidentiary
+           denominator separation + control-plane journal in F2 scope;
+           V2 sampling freeze split (I1 method / I3 values); V3 fenced
+           admission w/ fencing token + objective pause triggers + 3-part
+           I4 proof; V4 $500 = entry-capacity sensitivity only.
+Rulings    S1 topology (this canonical file + subordinate annex); C1
+2026-07-27 production fail-open statement (§11.5); C2 stale-reference
+           fixes (annex); C3 salt/K_s/probabilities freeze at I3; C4
+           sampling digest = SHA256(canonical_json({domain, chain,
+           canonical_contract, fixed_salt})), big-endian mod 1000; C5
+           fencing token increments on EVERY transition; C6 gap-observation
+           record carries control_status_version + failure-episode link.
+Rulings    (1) marker/gate contradiction fixed: I1 resolves only the two
+2026-07-27 document-level inputs; the five former VERIFY items are I2/I3
+(2nd)      gate obligations (§12); (2) crossover delivery linkage: provider
+           acceptance is an event on the producing gate_evaluation_id;
+           delivered_crossover derived state defined (§2.4-2.5); (3)
+           reporting maturity split: 24h evidentiary report + 72h
+           completion supplement (§10); (4) §4.3 supersession branch
+           CLOSED — 60s final for the initial gate version.
+```
+
+---
+
+## 1. Purpose and claims
+
+The detection-lane quality gate leaves no durable record of gate failures,
+so its value cannot be evaluated. This cohort restores identifiability.
+
+**Primary claim (gate quality):** candidates the quality gate passes
+outperform candidates it blocks on the co-primary endpoints, under identical
+pricing clocks.
+
+**Secondary claim (delivered-system value):** alerts that achieve
+provider-accepted delivery outperform quality-blocked candidates — this
+evaluates the whole alerting system (gate + ranking + cap + dedup +
+dispatch), and differences between the primary and secondary results
+attribute value/loss to the post-gate machinery.
+
+Engineering-evidence design, not a confirmatory trial: endpoints are
+pre-registered to prevent quiet redefinition; all results reported
+descriptively with counts, distributions, and coverage.
+
+## 2. Data model, identity, cohorts
+
+### 2.1 Canonical token identity
+
+```text
+identity = (chain, canonical_contract)
+chain               fixed enum (initially: SOLANA; extended only by amendment)
+canonical_contract  Solana: canonical base58 mint address, preserved exactly
+                    (case-sensitive; no re-encoding); other chains: checksummed
+                    canonical form defined at chain-enum extension time
+symbol              metadata only — never part of identity
+pools               one contract across multiple pools is ONE identity; the
+                    selected quote venue is recorded on each quote event,
+                    not in identity
+```
+
+### 2.2 gate_evaluation (append-only)
+
+Every quality-gate evaluation — first or subsequent — writes a complete,
+immutable `gate_evaluation` row:
+
+```text
+gate_evaluation_id
+identity (chain, canonical_contract)
+decision = quality_passed | quality_blocked
+decision_timestamp
+gate_version
+failed_gate_reason (blocked only, per-rule)
+quant_score
+signals_fired
+detection_reference_price
+feature_snapshot (full payload) + feature_snapshot_hash
+pricing_protocol_version / quote_model_version / outcome_evaluator_version
+```
+
+Reevaluations are not demoted to generic events: their features, scores, and
+decisions are evidence and are stored in full.
+
+### 2.3 primary_assignment (exactly one per identity per gate_version)
+
+```text
+primary_assignment
+identity
+gate_version
+assigned_cohort = quality_passed | quality_blocked
+bound_gate_evaluation_id     # the FIRST terminal evaluation for this
+                             # (identity, gate_version)
+assignment_timestamp
+```
+
+Immutable once written. All primary-contrast membership, clocks, and quoting
+derive from the bound evaluation. Later evaluations never alter an
+assignment; a later opposite decision sets a `crossover` flag on the
+assignment (analyzed per §2.5). Assignment admission at runtime is governed
+by the fenced admission protocol of §11.3.
+
+### 2.4 Downstream events and derived reporting states
+
+Ranking, dedup, cap, dispatch, delivery-evidence, quote, and outcome events
+each link to the specific `gate_evaluation_id` that produced them (not
+merely to the identity):
+
+```text
+disposition events:   ranked | deduplicated | cap_blocked | dispatch_attempted |
+                      dispatch_failed | reevaluation | crossover_marker
+delivery evidence:    separate linked records per §7 (intent, provider response,
+                      reconciliation results)
+quote events:         scheduled | quoted | quote_failed | quote_not_scheduled (§4)
+```
+
+No stored field ever encodes "not delivered" as a terminal state, because
+delivery evidence arrives after the decision and may arrive late
+(reconciliation). **Provider acceptance is a delivery EVENT linked to the
+actual producing `gate_evaluation_id`** — never inferred at the assignment
+level — because a first-blocked identity may later pass and be delivered
+from that later evaluation. Derived reporting states are computed at report
+time per assignment from the event streams of its identity's evaluations —
+never stored as stages — with the computation timestamp disclosed:
+
+```text
+provider_accepted_delivery        assigned_cohort=quality_passed AND a
+                                  provider-acceptance delivery event is
+                                  linked to the assignment's BOUND
+                                  gate_evaluation_id (or a same-cohort
+                                  reevaluation of it)
+quality_passed_but_not_delivered  assigned_cohort=quality_passed AND no
+                                  provider-acceptance evidence at report time
+                                  (with disposition breakdown)
+delivered_crossover               assigned_cohort=quality_blocked AND a
+                                  LATER quality_passed gate_evaluation exists
+                                  for the identity AND that later evaluation
+                                  has a linked provider-acceptance delivery
+                                  event
+delivery_unknown_after_send       per §7
+delivery_evidence_unavailable     per §7.3
+```
+
+**Clocks:** primary clocks stay bound to the FIRST assigned evaluation
+(§4.3 `quote_time` from the bound evaluation's `decision_timestamp`; CP1
+from the same). The secondary crossover delivery clock uses the LATER
+actual provider-acceptance event's timestamp (Analysis 2 anchor for
+`delivered_crossover` rows).
+
+### 2.5 Assignment rule and crossover treatment
+
+Primary assignment is ITT-style: the **first terminal quality-gate
+decision** for each identity under a gate_version determines its
+primary-cohort membership, permanently. A token first blocked and later
+passed/delivered **remains in the blocked primary cohort**; the later event
+is recorded as a `crossover_marker` and analyzed separately. No cohort entry
+is ever excluded from the primary contrast based on future behavior.
+Re-evaluations under the same gate version after a terminal decision do not
+create new primary rows; a gate_version change starts a new sub-cohort (§8).
+
+**Secondary-analysis crossover treatment:** in the delivered-vs-blocked
+contrast, `delivered_crossover` rows (§2.4 — blocked primary assignments
+whose identity was later passed and provider-accepted-delivered from the
+later evaluation) are reported separately, and the contrast is
+presented **both including and excluding** crossover deliveries. The
+secondary contrast is descriptive and non-independent: the same identity is
+never counted as two independent observations — where an identity appears on
+both sides, this is disclosed and the affected counts shown. No
+independence-based inference is drawn from the secondary analysis.
+
+### 2.6 Contrasts
+
+```text
+PRIMARY    quality_passed        vs quality_blocked      (gate quality)
+SECONDARY  provider_accepted_delivery vs quality_blocked (delivered-system value)
+SUPPORTING quality_passed_but_not_delivered breakdown by disposition
+           (what the cap/dedup/dispatch layer costs or saves)
+```
+
+### 2.7 Size and maturity
+
+First evidentiary evaluation at **≥30 quality_passed and ≥30
+quality_blocked primary assignments** with closed, coverage-resolved 24h
+windows, plus the §4.7 evidentiary CP2 requirements. Earlier runs are
+pipeline-health checks only, labeled as such.
+
+## 3. Feature snapshots, canonicalization, and version identifiers
+
+### 3.1 Payload
+
+The **full snapshot payload is persisted**, not only its hash: every raw
+feature value, derived score, signal state, and data-source availability
+flag the gate evaluation saw. Append-only; reprocessing writes new rows,
+never mutates.
+
+### 3.2 Canonical serialization and hash
+
+```text
+schema_version        integer, bumped on any field addition/removal
+encoding              UTF-8 canonical JSON
+key order             lexicographically sorted at every object level
+numbers               decimals serialized as strings with explicit scale;
+                      floats forbidden in the canonical form (the deployed
+                      float-feature → fixed-scale-decimal mapping is an I2
+                      implementation obligation, §12 I2 gate)
+timestamps            ISO-8601 UTC, millisecond precision, trailing 'Z'
+null                  explicit JSON null; absent ≠ null (absence is a schema
+                      violation for schema_version's field set)
+arrays                order-significant; producers must emit deterministic order
+                      (signals sorted by signal name)
+hash                  SHA-256 over the canonical byte stream
+```
+
+### 3.3 gate_version and gate_code_hash
+
+```text
+gate_version = full SHA-256 (64 hex chars, untruncated) over the canonical
+JSON pre-image {deployed_sha, gate_code_hash, runtime_gate_config,
+schema_version}; pre-image persisted alongside every use.
+
+gate_code_hash = SHA-256 over the canonical serialization (§3.2) of the manifest:
+[
+  {"path": "<normalized POSIX path, repo-root-relative>", "sha256": "<full file hash>"},
+  ...
+]
+sorted lexicographically by path.
+```
+
+**Manifest file list — RESOLVED (from the Session 1 drift-table
+reconciliation of the deployed decision path):**
+
+```text
+scout/token_ids.py                    # match_universe_exclude — the universe-
+                                      # filter matcher the gate's eligibility
+                                      # decision consumes
+scout/trading/detection_alert.py      # the quality gate itself: freshness
+                                      # gate, quality (quant-score) comparison,
+                                      # universe-filter application, early-vs-
+                                      # trending trigger, dedup + cap decisions,
+                                      # DETECTION_GATE_VERSION constant
+scout/trading/engine.py               # _compute_lead_time_vs_trending — the
+                                      # not_early trigger computation
+scout/trading/tg_alert_dispatch.py    # _check_universe — reused by the
+                                      # detection lane as GATE-DECISION code:
+                                      # it applies the enabled flag and
+                                      # exclusion patterns (before delegating
+                                      # to match_universe_exclude) to produce
+                                      # the terminal universe-block decision
+```
+
+**Selection rationale:** the manifest contains exactly the files whose code
+can alter a gate DECISION given identical inputs and identical runtime
+configuration. `tg_alert_dispatch.py` is **conservatively included**: most
+of that file is post-decision dispatch behavior, but its `_check_universe`
+helper is imported and executed by the detection lane as the terminal
+universe-block decision, so a change to it can alter a gate decision — a
+three-file manifest would miss that edit. Excluded, with reasons:
+`scout/config.py` (resolved runtime values are captured separately in
+`runtime_gate_config` within the same pre-image; Settings field definitions
+do not alter decisions); `scout/scorer.py` and ingestion (they produce the
+`quant_score` INPUT, which is recorded per evaluation — upstream changes
+alter inputs, not gate logic, and are visible in the recorded score
+fields); `scout/alerter.py`, `scout/db.py`,
+`scout/trading/receipt_archive.py` (post-decision dispatch/persistence
+machinery with no decision-reaching helpers). Known tradeoff, accepted:
+`engine.py` and `tg_alert_dispatch.py` host mostly non-gate code, so
+unrelated edits there will churn `gate_version` and open sub-cohorts
+conservatively — false sub-cohort splits are analytically safe (sub-cohorts
+can be pooled after verifying gate-relevant code was unchanged), whereas a
+missed gate change is not.
+
+## 4. Prices, costs, quoting
+
+### 4.1 detection_reference_price
+
+Pipeline-observed price at decision time, from the gate's own source.
+Recorded for all evaluations. Secondary/diagnostic only. **Never substitutes
+into any executable endpoint** — if an executable quote cannot be obtained,
+the entry is `quote_unavailable` (§6); a separate chart-price appendix may
+be reported but carries no primary evidentiary weight.
+
+### 4.2 Cost convention and notionals
+
+```text
+primary cash outlay  = exactly $100 all-in
+capacity outlay      = exactly $500 all-in
+all_in_entry_cost    = the fixed outlay ($100 or $500), by definition
+acquired_quantity    = token quantity obtainable for that outlay AFTER
+                       buy slippage, venue fees, and chain/priority fees
+```
+
+Costs reduce `acquired_quantity`; nothing is added on top of the fixed
+outlay. The term `base_order_notional` is not used anywhere in this
+protocol.
+
+**Notionals — clarified (V4):**
+
+```text
+$100  primary position. ALL outcome evaluation — CP2, the 72-hour
+      liquidation path, MFE/drawdown, token_dead determination — uses the
+      $100 position exclusively.
+$500  entry-capacity sensitivity measurement ONLY: one buy quote at
+      quote_time (Analysis 1) / delivery time (Analysis 2). It has no
+      outcome clock, no refresh quotes, and appears in no endpoint.
+```
+
+### 4.3 Analysis 1 clock — fixed latency, RESOLVED and FROZEN
+
+Both cohorts receive an executable buy quote at:
+
+```text
+quote_time = decision_timestamp + fixed_pre_registered_latency
+```
+
+Session 1 found provider message IDs were not persisted; the pre-registered
+estimator's eligibility rule (quality-gate `decision_timestamp` →
+provider-acceptance intervals with confirmed provider evidence; median per
+chain stratum; minimum n=10 per stratum; round up to whole seconds)
+therefore yields no provable historical intervals. Accordingly:
+
+```text
+fixed_pre_registered_latency = 60 seconds (fallback INVOKED and FROZEN)
+rationale: recorded operator estimate of the decision→dispatch→provider-
+           acceptance path; chosen before any cohort accrual; Session 1
+           evidence insufficient for the pre-registered estimator
+scope:     all chains/venues until a gate_version change; bound per §8
+```
+
+**Supersession branch CLOSED (reviewer correction 4, 2026-07-27):** the
+Session 1 narrow reconciliation is complete and did NOT meet the
+historical-interval requirement (≥10 provably provider-side-timestamped
+decision→acceptance intervals per stratum). The frozen 60-second latency is
+therefore **final for the initial gate version**; future changes require §9
+amendment only. Nothing about this remains pending at any gate.
+Implementation requirement: the
+quote scheduler must fire a live executable quote at `quote_time` for
+**every** scheduled assignment, both cohorts — quotes cannot be
+reconstructed retroactively.
+
+### 4.4 Analysis 2 — delivered-system actionability (secondary)
+
+`provider_accepted_delivery` candidates additionally receive an executable
+quote at the actual provider-acceptance timestamp:
+
+```text
+delivery_executable_entry_price   (quote at provider acceptance time, $100/$500)
+delivery_to_quote_latency         (recorded)
+```
+
+### 4.5 latency_tax (secondary, delivered candidates only)
+
+```text
+latency_tax = delivery_executable_entry_price / detection_reference_price − 1
+```
+
+Median and distribution, by chain and venue.
+
+### 4.6 Executable liquidation value
+
+At each evaluation tick: net proceeds of selling `acquired_quantity` —
+executable sell quote minus sell slippage, venue fees, chain fees. Candle
+data never determines an endpoint.
+
+### 4.7 Quote worker: isolation, capacity, sampling, evidentiary thresholds
+
+**Operational isolation — the quote worker is instrumentation and must be
+incapable of harming production:**
+
+```text
+- asynchronous bounded queue between the gate path and the quoter; enqueue is
+  non-blocking; queue overflow drops to a durable quote_not_scheduled record
+  (reason=queue_full) rather than back-pressuring detection or dispatch
+- independent HTTP client, timeout budget, and rate-limit budget from any
+  production quote/price consumer; never shares provider quota with dispatch
+- circuit breaker: on repeated quoter failures, open the breaker, write
+  quote_failed (reason=breaker_open) durably, never retry into the gate path
+- writes go through the measurement store but must not hold locks the
+  detection/dispatch path contends on (table/connection isolation per the
+  F2-selected architecture is demonstrated at the I2/I3 gates, §12)
+- a quoter outage can degrade coverage but can never delay a detection
+  decision, an alert dispatch, or a delivery-evidence write
+```
+
+**Capacity census — exact workload formula:**
+
+```text
+per new assignment (both cohorts, scheduled):
+  entry:    1 × $100 buy quote + 1 × $500 buy quote        (at quote_time)
+  refresh:  1 × $100-quantity liquidation quote per tick
+            for 72h  (= ticks_per_hour × 72)
+$500 analysis is ENTRY-ONLY by pre-registration: no $500 refresh quotes.
+retry multiplier: expected retries per quote from the worker's frozen
+  timeout/retry constants (stated in the I3 gate record), plus breaker-open
+  windows modeled as coverage loss, not extra calls
+workload/hour = new_scheduled_inflow_per_hour × 2 entry quotes
+              + rolling_active_inventory × ticks_per_hour × 1
+              , all × retry multiplier
+rolling_active_inventory = scheduled assignments whose 72h window is open
+  (steady state ≈ scheduled inflow/hour × 72)
+```
+
+**Split freeze (V2; C3 — I3 controls the values).** Session 1 could not
+durably reconstruct blocked-candidate inflow and therefore cannot source a
+definitive census. The freeze is split:
+
+**Frozen at I1 (the method):**
+
+```text
+strata            fixed quant-score bands: [0,20) [20,40) [40,60) [60,∞)
+                  — replaceable before I1 merge only if the reconciliation
+                  certifies score-distribution data supporting better cut
+                  points; frozen at I1 either way
+algorithm         symmetric hash inclusion via the domain-separated
+                  sampling digest (ruling C4):
+
+                  sampling_digest = SHA256(canonical_json({
+                    "domain": "gecko-alpha-cohort-sampling-v1",
+                    "chain": canonical_chain,
+                    "canonical_contract": canonical_contract,
+                    "fixed_salt": fixed_salt
+                  }))
+                  sampling_bucket =
+                    unsigned_big_endian_integer(sampling_digest) mod 1000
+                  included = sampling_bucket < K_s
+
+                  canonical_json per §3.2 (UTF-8, sorted keys, no
+                  insignificant whitespace). Identical strata definitions
+                  and identical K_s applied to quality_passed and
+                  quality_blocked within each stratum. Raw string
+                  concatenation pre-images are rejected. The persisted
+                  record carries the hash-version identifier, stratum, K_s,
+                  and inclusion probability p_s = K_s / 1000.
+call formula      the workload formula above (2 entry quotes + $100 refresh
+                  ticks × 72h rolling inventory, × retry multiplier)
+budget rule       max worker request budget = 50% of the quote provider's
+                  documented rate limit on the worker's DEDICATED
+                  credential (measured/confirmed at I3); headroom margin:
+                  projected workload must fit within 80% of that budget
+retry/breaker     assumptions per the worker's frozen timeout/retry
+                  constants (stated in the I3 gate record)
+K_s selection     for each stratum, the LARGEST K_s (step 1/1000) such
+                  that projected total workload fits the budget rule,
+                  subject to the minimum below; if unconstrained,
+                  K_s = 1000 (no sampling)
+minimum           expected determinate outcomes per primary cohort within
+                  a 30-day accrual horizon ≥ 30 at the selected K_s; if
+                  the budget cannot satisfy this, the conflict is escalated
+                  to a product-owner ruling rather than silently resolved
+estimator         normalized Hájek (below), unchanged
+```
+
+**Frozen at I3, before I4 (the values):**
+
+```text
+- bounded, NON-COHORT capacity census through the deployed inert worker:
+  observed real inflow rates (passed and blocked) and rolling 72h
+  inventory projection, using observation-only counters — no
+  gate_evaluation, no primary_assignment, no production-namespace write
+  of any kind during the census
+- census duration: minimum 72 hours of continuous observation
+- K_s selected mechanically by the I1-frozen rule from census numbers
+- fixed_salt, strata (as frozen at I1), K_s, and inclusion probabilities
+  recorded in the I3 gate record and frozen before I4 activation
+- I4 loads the already-frozen I3 values and activates; no sampling value
+  is frozen earlier than I3
+```
+
+No real cohort assignment may exist before I4 regardless of census state
+(§11).
+
+**Sampling estimator — named and defined:** full-cohort aggregate rates use
+the **normalized Hájek estimator**:
+
+```text
+weighted_rate = Σ(wᵢ · outcomeᵢ) / Σ(wᵢ),   wᵢ = 1 / pᵢ
+pᵢ = inclusion probability of assignment i's stratum (persisted per row)
+```
+
+Reported always alongside: unweighted sampled-only rates and raw per-stratum
+results. Sampled-in/sampled-out counts per stratum in every denominator
+table. Sampled-out entries → `quote_not_scheduled` (reason=sampled_out),
+retained in denominators.
+
+**Evidentiary CP2 requires BOTH, in each primary cohort:**
+
+```text
+≥ 30 determinate CP2 outcomes (covered or token_dead; not quote_unavailable,
+     quote_failed, quote_not_scheduled, or any indeterminate class)
+AND
+≥ 80% determinate coverage among quote-scheduled entries
+```
+
+Failing either → CP2 section published, labeled **coverage-degraded,
+non-evidentiary**; no gate-value conclusion may cite it.
+
+## 5. Endpoints
+
+Clock anchors: Analysis 1 endpoints anchor at `quote_time` (§4.3); Analysis
+2 endpoints anchor at provider-acceptance time. CP1 anchors at
+`decision_timestamp` for both cohorts (trending is pricing-independent).
+
+### 5.1 Co-primary endpoints (evaluated jointly, both always reported)
+
+```text
+CP1  CoinGecko trending within 24h of decision_timestamp
+CP2  +100% before −50% within 24h, executable definition:
+       +100%: net executable liquidation value ≥ 2.0 × all_in_entry_cost
+       −50%:  net executable liquidation value ≤ 0.5 × all_in_entry_cost
+     outcome = first threshold crossed | neither | crossing_order_indeterminate (§5.3)
+```
+
+The −50% arm intentionally measures tradeability; chart-flat tokens with
+poor round-trip liquidity may correctly register the loss outcome. Reports
+must not "correct" this.
+
+CP2 evaluation cadence: the deployed price-refresh cadence is measured and
+recorded in the I3 gate record ("evaluated each refresh tick, ≤N minutes
+apart") as a known granularity bound — an I3 implementation obligation
+(§12), not an I1 input.
+
+### 5.2 Secondary endpoints
+
+```text
+MFE (executable) at 6h / 24h / 72h
+maximum drawdown (executable) within 72h
+liquidity survival at 24h / 72h (quotes at ≥ primary outlay)
+gainers-surface appearance within 24h
+time to CP2 outcome
+latency_tax (delivered only)
+coverage status (§6)
+crossover_outcome analysis (§2.5)
+disposition-cost analysis (what cap/dedup suppressed, §2.6 SUPPORTING)
+```
+
+### 5.3 crossing_order_indeterminate
+
+If a quote gap spans observations such that **both** CP2 thresholds could
+have been crossed within the gap (interval arithmetic on the bracketing
+observed liquidation values admits both), the outcome is
+`crossing_order_indeterminate` — never resolved by whichever threshold is
+observed first after the gap. Reported as its own outcome class, in the
+denominator.
+
+### 5.4 Multiplicity
+
+Two co-primaries, interpreted jointly and descriptively. No claim may cite
+one co-primary while omitting an unfavorable result on the other.
+
+## 6. Coverage — classified, never excluded
+
+### 6.1 CP2 (quote) coverage taxonomy
+
+```text
+covered                       full quote availability through the window
+quote_gap                     intermittent; endpoint assigned only if crossings
+                              are unambiguous, else crossing_order_indeterminate
+quote_unavailable             no executable entry quote at quote_time → CP2 not
+                              evaluable; retained and reported; NO mid-price fallback
+quote_not_scheduled           sampled out under the §4.7 sampling rule
+                              (reason=sampled_out) or queue overflow
+                              (reason=queue_full)
+token_dead                    per the evidence rules below → CP2 = −50%, flagged
+venue_unreachable             our-side infrastructure failure → indeterminate,
+                              counted against coverage quality
+```
+
+**token_dead — precise criterion.** Definitive on-chain death requires
+either:
+
+```text
+(a) the pool/pair account is closed, burned, or non-existent on chain,
+    read directly from chain state (not via the quote provider); or
+(b) no valid executable route exists for the sell, or the maximum
+    mechanically obtainable net liquidation value for acquired_quantity —
+    computed from independently read on-chain reserves and pool fee
+    mechanics — is below the frozen dust threshold:
+
+        dead_dust_threshold = $1.00 net, after all fees
+
+    with reserve values and slot/block reference persisted.
+```
+
+Alternative path (either suffices): the two-tick four-leg rule — (a)
+repeated zero-liquidity or non-executable liquidation observations across
+≥2 refresh ticks; (b) pool removal or drained-liquidity state confirmed via
+a source independent of the primary quote provider (direct chain state);
+(c) no contemporaneous infrastructure outage recorded on our side; (d) a
+documented dead-state timestamp. Failing all paths → `venue_unreachable`,
+`quote_gap`, or indeterminate, not `token_dead`. The dust threshold freezes
+at I1 merge; changes only via §9 amendment.
+
+### 6.2 CP1 (trending) coverage taxonomy
+
+```text
+cg_covered            trending snapshots available across the full 24h window
+cg_snapshot_gap       gaps; endpoint assigned only if a trending appearance is
+                      positively observed; a negative with gaps = cg_indeterminate
+cg_indeterminate      window not adequately observed; in denominator
+cg_source_outage      CG API outage on record; in denominator, flagged
+```
+
+The trending-snapshot capture cadence of deployed ingestion is measured and
+recorded in the I3 gate record — an I3 implementation obligation (§12), not
+an I1 input.
+
+### 6.3 Reporting rule
+
+Denominators are always the full cohort (including `quote_not_scheduled`,
+`quote_unavailable`, all indeterminates). Every rate is reported with its
+coverage breakdown. Silent exclusion is a protocol violation.
+
+### 6.4 Known asymmetries (disclosed, not adjusted)
+
+- Analysis 1 places both cohorts on an identical synthetic clock; it
+  measures gate selectivity, not realized user experience. Analysis 2
+  measures realized delivery but has no symmetric control clock. Neither
+  substitutes for the other; reports present both.
+- CP1 trending is partially downstream of alerting ecosystems the delivered
+  cohort participates in; CP2 is the endpoint robust to this.
+- The secondary contrast is non-independent by construction; its
+  including/excluding-crossover presentations bound the crossover effect
+  rather than estimating it.
+
+The v0.5 `measurement_unavailable` CP2 coverage class is **removed** —
+superseded by §6.5. CP2 coverage classes apply only to admitted primary
+assignments.
+
+### 6.5 Measurement gaps — operational vs evidentiary separation (V1, C6)
+
+During `paused_measurement_failure` (and during `inactive`/`validating` if
+live candidates flow), no primary assignment is admitted; instead, where
+safely recordable, an append-only record is written:
+
+```text
+measurement_gap_observation
+    identity, if safely available
+    observed_at
+    gate_decision, if safely available
+    active_gate_version
+    failure_episode_id
+    control_status_version
+    missing_components
+```
+
+Reporting rules:
+
+```text
+- gap observations appear in OPERATIONAL funnel and measurement-
+  availability denominators (uptime, admission rate, gap counts)
+- they appear in NO CP1/CP2 cohort rate: without an admitted
+  primary_assignment there is no cohort membership and no valid
+  outcome clock
+- they are NEVER reconstructed into assignments after recovery
+- each is linked to the authoritative control-journal failure episode
+- every evidentiary report states the count of candidates excluded
+  from accrual due to measurement unavailability, per failure episode
+```
+
+If the failed component prevents even gap-observation writes, the episode's
+control-plane journal entry (§11.3) records that observation itself was
+unavailable, and the report says so.
+
+## 7. Delivery evidence
+
+Terminology: **provider-accepted delivery** — the provider (e.g., Telegram)
+accepted the message and returned an identifier. This does not assert human
+viewing, and no field in this protocol claims it does.
+
+### 7.1 Mechanism — independent durable spool
+
+Delivery evidence persists to a **durable spool independent of the primary
+database path** — no shared SQLite connection, transaction, or lock path
+with suppression, cohort, or any production write. **Mechanism SELECTED
+(F2-informed, §7.4 matrix): fsync-on-append, length+checksum-framed JSONL
+segments** — chosen over a separate SQLite file because the send path must
+never wait on any database lock and torn appends must be detectable by
+framing alone; this document constrains the properties, the I2 gate
+demonstrates them.
+
+### 7.2 Sequence (two-phase, spool-first)
+
+```text
+1. Durably append pre-send intent to the spool (fsynced before step 3):
+   internal alert ID, correlation ID, provider, destination identity,
+   intent timestamp, gate-evaluation link
+2. Best-effort mirror of the intent into measurement.db (failure tolerated)
+3. Send once
+4. Durably append provider response (provider message_id, acceptance
+   timestamp, response status, persistence_status, intent link) to the spool
+5. Reconcile measurement.db asynchronously from the spool
+```
+
+### 7.3 Behavior-neutral failure semantics
+
+```text
+intent measurement.db mirror fails,
+spool succeeds                              → send proceeds normally
+provider accepted, measurement.db
+persistence fails                           → delivery remains provable from
+                                              the spool; reconciliation
+                                              restores measurement.db state
+spool unavailable                           → send behavior UNCHANGED (alerts
+                                              are production; instrumentation
+                                              never blocks them); the
+                                              assignment is classified
+                                              delivery_evidence_unavailable —
+                                              excluded from the provider-
+                                              accepted derived state, never
+                                              fabricated into it; retained in
+                                              all denominators
+intent present, no response evidence,
+send may have occurred                      → delivery_unknown_after_send;
+                                              reconciliation MAY match
+                                              provider-side history against
+                                              intents but recovery is not
+                                              assumed; unreconciled cases
+                                              stay delivery_unknown_after_send,
+                                              in denominators, reported
+resend                                      → never automatic without proven
+                                              provider idempotency (documented
+                                              idempotency key or dedup
+                                              guarantee for the exact send
+                                              path); operator-initiated
+                                              resends are new intents.
+                                              Duplicate human-visible alerts
+                                              are a production harm this
+                                              instrumentation must not cause.
+```
+
+### 7.4 F2 persistence scope
+
+F2 selects or approves the persistence path for **all load-bearing cohort
+evidence**, not only delivery responses:
+
+```text
+gate evaluations · primary assignments · downstream dispositions ·
+delivery evidence · quote events · outcome events ·
+experiment-health transitions (§11.3)
+```
+
+plus (V1 extension):
+
+```text
+experiment-control journal (control plane): an independent persistence
+seam capable of durably recording cohort_status transitions, fencing-token
+changes, and failure episodes EVEN WHEN the primary measurement store is
+the failed component. It must not share a write path, connection, or lock
+with the measurement store.
+```
+
+The production SQLite database (`scout.db`) would have been acceptable for a
+measurement-store component **only if** F2 proved its transaction and lock
+path independent of, and safe against, the production detection/dispatch
+path. F2's findings (shared-connection transaction collisions;
+`classified_but_not_remediated`) mean it fails that test; the matrix below
+therefore isolates every Forward Cohort component from `scout.db`.
+
+**Per-component persistence matrix — RESOLVED (F2-informed selection,
+recorded per the reviewer's return directive of 2026-07-27).** Selection
+rule applied: no load-bearing cohort evidence may share a connection,
+transaction, or lock path with the production detection/dispatch path
+(scout.db's process-shared connection — F2's failure domain); the control
+plane must survive a measurement-store failure entirely.
+
+Each component below records: store · writer/connection · relationship to
+`scout.db` · recovery/reconciliation mechanism · failure isolation ·
+rationale.
+
+**1. gate_evaluations** — `measurement.db` (NEW separate SQLite file, WAL,
+dedicated writer connection). *scout.db relationship:* NONE — never written
+to or read from scout.db. *Recovery:* the recording seam is a bounded
+non-blocking queue; on measurement.db write failure the evaluation record
+is retried within the seam's bounded budget, and on exhaustion it is
+UNRECOVERABLE — no assignment may be admitted for it (ordering rule 6
+below) and a measurement-failure episode opens/joins (§11.3 store-write
+trigger). *Failure isolation:* an evaluation-write failure never blocks the
+production gate decision or dispatch (§11.5); it stops ADMISSION only.
+*Rationale:* high-volume evidence; a separate file gives lock-path
+independence BY CONSTRUCTION, not by discipline.
+
+**2. primary_assignments** — authoritative row in `control_plane.db`
+admission ledger (§11.3 fenced admission); supervisor-mediated admission
+transaction on the dedicated cp connection. *scout.db relationship:* NONE.
+*Recovery:* governed by the frozen cross-store ordering below; a failed
+measurement.db mirror is reconstructed FROM the authoritative ledger
+(rule 5). *Failure isolation:* ledger unwritable → admission fails closed
+(no assignment, gap observation per §6.5); production unaffected.
+*Rationale:* admission atomicity + fencing-token compare-and-commit must
+live in ONE store (annex §12b).
+
+**3. assignment mirrors** — `measurement.db`, written after ledger commit,
+carrying `admission ledger row id + fencing_token`. *scout.db relationship:*
+NONE. *Recovery:* reconstructed from the admission ledger by the
+reconciliation sweep (rule 5); a mirror without a ledger match is excluded
+and surfaced as a reconciliation failure. *Failure isolation:* mirror
+failure never invalidates the admission (the ledger is authoritative).
+*Rationale:* analysis queries read the measurement store; authority stays
+in the control plane.
+
+**4. downstream dispositions** — `measurement.db` event stream keyed by
+`gate_evaluation_id`, same dedicated measurement connection as #1.
+*scout.db relationship:* NONE (production dispatch state in scout.db is
+production's own; cohort disposition EVENTS are recorded independently).
+*Recovery:* none across stores — a failed disposition write follows the
+same bounded-retry-then-episode path as #1; the affected assignment's
+derived states are computed with the gap disclosed. *Failure isolation:*
+never blocks dispatch. *Rationale:* same failure domain as the evaluations
+they annotate; per-evaluation ordering preserved.
+
+**5. delivery evidence** — durable spool: fsync-on-append,
+length+checksum-framed JSONL segments (spool-first, §7.2); alerter-side
+appender with its own file handles; NO SQLite in the send path;
+asynchronously reconciled into `measurement.db` mirrors. *scout.db
+relationship:* NONE for cohort evidence (production's own tg_alert_log
+remains production machinery, not cohort evidence). *Recovery:* the spool
+IS the durable source — measurement.db delivery mirrors are rebuilt from
+the spool at any time; spool fsync failure is a §11.3 pause trigger; spool
+unavailability → `delivery_evidence_unavailable` (§7.3), never fabricated.
+*Failure isolation:* send behavior unchanged under every failure mode
+(§7.3). *Rationale:* the send path must never wait on any database lock;
+torn appends detectable by framing; provider message_id persisted (closes
+the Session-1 F9 gap for cohort evidence).
+
+**6. quote events** — `measurement.db`, written by the isolated quote
+worker over its OWN connection (separate process, §4.7). *scout.db
+relationship:* NONE. *Recovery:* NO durable worker outbox is provided, by
+design — on measurement.db write failure the worker retries within its
+frozen retry budget; on exhaustion the quote event is UNRECOVERABLE, is
+reported through the measurement-failure episode it opens/joins (§11.3
+store-write trigger), and the affected assignments' CP2 coverage is
+classified through that episode (quote_gap / indeterminate — never
+silently dropped). *Failure isolation:* worker failure degrades coverage
+only; breaker-open >10min is itself a pause trigger. *Rationale:* an
+outbox would let quoting continue against a failed evidence store,
+accruing unverifiable coverage; pausing admission is the pre-registered
+behavior.
+
+**7. outcome events** — `measurement.db`, outcome worker's OWN connection.
+*scout.db relationship:* NONE. *Recovery:* same contract as #6 (bounded
+retry → unrecoverable → episode; affected windows classified through the
+episode); additionally, outcome-worker staleness (> 3 × refresh cadence)
+is an independent §11.3 pause trigger. *Failure isolation:* never touches
+production. *Rationale:* as #6.
+
+**8. health transitions + control-plane journal** — `control_plane.db`:
+append-only, hash-chained rows; dedicated connections only; two writer
+classes (annex §12a); fencing token = status_version (§11.3). *scout.db
+relationship:* NONE. *Recovery:* the journal is the recovery ROOT for the
+experiment — it is reconstructed from nothing else; if it is unwritable,
+admission fails closed by construction (no readable active status = no
+admission) and the episode is recorded upon recovery, including the fact
+that observation itself was unavailable (§6.5). *Failure isolation:* must
+remain recordable when `measurement.db` is the failed component — separate
+file, separate connections, no shared lock. *Rationale:* the cohort's
+authority record; hash chain makes retro-editing evident; the SQLite file
+lock is the cross-process mutex for admission (annex §12b).
+
+**Frozen cross-store ordering (the recovery contract's spine):**
+
+```text
+1. gate_evaluation becomes durable in measurement.db
+2. only then may its primary_assignment be admitted in control_plane.db
+3. the admission row stores gate_evaluation_id + feature_snapshot_hash
+4. the measurement.db assignment mirror is written after admission
+5. a failed mirror is reconstructed from the authoritative admission ledger
+6. a failed gate_evaluation write admits no assignment and opens/joins a
+   measurement-failure episode
+```
+
+This ordering makes it impossible for an authoritative assignment to exist
+without its load-bearing evaluation evidence.
+
+Boundary statements: (1) production scout.db carries NO Forward Cohort
+measurement component — the only Forward Cohort touchpoint on the
+production path is the non-blocking enqueue to the recording seam; (2)
+`measurement.db` and `control_plane.db` never share a connection or lock
+with each other or with scout.db; (3) every cross-store reference
+(admission→mirror, spool→mirror, evaluation→admission) is governed by the
+ordering and reconciliation rules above — never transactionally assumed. Architecture
+details, writer model, and rejected alternatives: annex §12/§12a/§12b
+(`tasks/prereg_detection_gate_enrichment_cohort.md`).
+
+## 8. Versioning
+
+Independently versioned, each recorded on every gate_evaluation row and
+every quote/outcome event it governs:
+
+```text
+gate_version               §3.3 (gate code + runtime gate config)
+pricing_protocol_version   this document's §4 rules (outlays, clocks, latency)
+quote_model_version        quote source, venue routing, slippage/fee model
+outcome_evaluator_version  CP1/CP2 evaluator code + cadence
+```
+
+A change to any one bumps only itself. gate_version changes open new
+sub-cohorts; prior rows are never invalidated. Changes to the other three
+during accrual go through §9 amendment, are labeled in reports, and results
+are additionally broken out by the changed version where feasible.
+`fixed_pre_registered_latency` is bound per gate_version.
+
+## 9. Behavior-neutrality and change control
+
+- The Session 2 increments add recording, quote scheduling for cohort
+  pricing, delivery-evidence persistence, and experiment-control machinery
+  only. Gate logic, thresholds, caps, ranking, dedup, alert content, and
+  lane modes are unchanged. Any diff touching gate or dispatch behavior
+  fails review by definition.
+- After the first cohort row: no field of §2–§7 changes without (a) recorded
+  product-owner ruling, (b) version bump, (c) post-hoc labeling in all
+  subsequent reports, (d) pre-amendment data retained and reportable under
+  original definitions.
+- Any gate_version change (code or runtime config) opens a new sub-cohort,
+  reported separately; prior rows are never invalidated.
+- The frozen quantities under this change control include: the 60s latency
+  value and its estimator parameters (§4.3), the $1.00 dust threshold
+  (§6.1), the 30-determinate/80%-coverage evidentiary thresholds (§4.7),
+  the entry-only $500 rule (§4.2), the Hájek estimator definition (§4.7),
+  the sampling METHOD (§4.7, I1) and VALUES (§4.7, I3), the pause-trigger
+  definitions and thresholds (§11.3), and the spool mechanism selection
+  (§7.4) once recorded.
+
+## 10. Evaluation and reporting
+
+**Reporting maturity is split (reviewer correction 3, 2026-07-27):**
+
+1. **24-hour evidentiary report**, at §2.7 maturity: primary contrast
+   (Analysis 1) with CP1/CP2 rates and full coverage breakdowns; secondary
+   contrast (Analysis 2) with the §2.5 crossover presentations;
+   disposition-cost analysis; crossover outcomes; latency_tax distribution;
+   the MATURED 6h/24h secondary measures only; gate_version/sub-cohort
+   history; all §4.7 sampling-related reporting rules (Hájek + unweighted +
+   per-stratum; sampled-in/out counts per stratum in every denominator
+   table); resolution record of every former protocol marker. This report
+   MUST NOT claim or imply that any 72-hour endpoint is complete.
+2. **72-hour completion supplement**, published when the corresponding 72h
+   windows have closed coverage-resolved: 72h MFE, maximum drawdown within
+   72h, liquidity survival at 72h, tail-concentration outputs, and
+   time-to-outcome measures extending beyond 24h. The supplement carries
+   the same coverage and denominator disciplines as the 24-hour report.
+
+Reports state the evaluation timestamp at which derived states were
+computed. Neither report contains threshold/cap change recommendations;
+those go to a separate ruling request referencing the report.
+
+## 11. Implementation increments and experiment lifecycle
+
+### 11.1 Increments
+
+```text
+I1  Pre-registration document (this document), merged under the I1 gate
+I2  gate_evaluation / primary_assignment persistence + delivery spool +
+    reconciliation + control-plane journal
+I3  Isolated quote/outcome worker + capacity controls
+I4  Cohort activation
+```
+
+No cohort row accrues until the complete measurement path is proven.
+
+### 11.2 Synthetic-only before activation
+
+Before I4, I2 and I3 process **only synthetic validation identities**:
+
+```text
+- synthetic identities use a reserved namespace: canonical_contract prefixed
+  with the sentinel "VALIDATION-" (impossible as a base58 mint) AND stored
+  with is_synthetic = true AND written to a segregated validation store/
+  namespace (the concrete mechanism — separate DB file vs schema-enforced
+  partition, per F2's architecture — is selected and demonstrated at the I2
+  gate, §12)
+- every cohort query excludes synthetics BY CONSTRUCTION (query layer reads
+  only the production namespace; is_synthetic is defense-in-depth, not the
+  primary guard)
+- NO live candidate receives a gate_evaluation or primary_assignment row in
+  the production namespace before I4 — a feature flag does not make live
+  writes "inert"; live writes are accrual and are prohibited pre-activation
+```
+
+### 11.3 Experiment control: fenced admission and objective triggers (V3, C5)
+
+**Authoritative experiment-control record** (persisted in the control-plane
+journal, §7.4):
+
+```text
+cohort_status = inactive | validating | active | paused_measurement_failure
+activation_epoch
+status_version / fencing_token     (ONE monotonic counter; increments on
+                                    EVERY transition — ruling C5:
+                                    inactive→validating, validating→active,
+                                    active→paused (INCLUDING automatic
+                                    supervisor pauses), paused→validating,
+                                    active→inactive/closed. Authorization
+                                    governs whether a transition may occur;
+                                    it does not govern whether the version
+                                    increments.)
+transition_timestamp
+transition_reason
+failure_started_at / failure_ended_at
+affected_components
+first_complete_event_after_recovery
+```
+
+**Fenced admission protocol** — every production `primary_assignment`:
+
+```text
+1. read the control record: require cohort_status = active; capture the
+   current fencing_token
+2. write the assignment carrying that fencing_token
+3. commit fails if status or token changed between read and commit
+   (compare-and-commit against status_version); a failed admission is
+   re-evaluated against the new control state — if no longer admissible,
+   it becomes a measurement_gap_observation, never a retried assignment
+   under a stale token
+```
+
+**Objective pause triggers** (subsystem-level; any one transitions
+`cohort_status → paused_measurement_failure`):
+
+```text
+- control/measurement store write failure (any load-bearing evidence write)
+- delivery-spool fsync failure
+- snapshot canonicalization failure (serialization error or hash mismatch)
+- bounded-queue overflow: > 100 dropped enqueues within any 10-minute window
+- quoter circuit breaker open continuously > 10 minutes
+- outcome-worker freshness breach: no completed evaluation cycle for
+  > 3 × the stated refresh cadence
+- health-transition journal unavailable (control plane itself unwritable →
+  pause is enforced by the admission protocol failing closed: no readable
+  active status = no admission)
+```
+
+**Explicitly NOT pause triggers** (ordinary per-candidate coverage outcomes,
+classified and retained): individual `quote_failed`, `quote_unavailable`,
+`quote_not_scheduled`, single-candidate timeout/retry exhaustion,
+`cg_snapshot_gap`, per-token `venue_unreachable`. These degrade coverage;
+they do not transition `cohort_status`.
+
+Recovery: passing end-to-end synthetic health check (a synthetic candidate
+traverses the full path) before `cohort_status → active`;
+`first_complete_event_after_recovery` recorded; fencing token incremented on
+the resume transition.
+
+### 11.4 I4 activation — proof obligations (V3)
+
+At I4:
+
+```text
+- activation_epoch and initial fencing_token recorded in the control journal
+- production admission enabled solely via the control record (no separate
+  flags); cohort-start event = first admitted primary_assignment
+- proof, attached to the I4 gate record:
+    (a) zero production assignments with timestamp < activation_epoch
+    (b) every production assignment carries a fencing_token valid for an
+        ACTIVE interval per the control journal
+    (c) join of assignments × control-journal intervals shows no admission
+        during any non-active interval
+```
+
+### 11.5 Production fail-open guarantee (ruling C1)
+
+Failure or unavailability of the experiment control plane, measurement
+store, spool, quoter, or evidence machinery prevents cohort admission only.
+Production detection, gate evaluation, ranking, dispatch, and alert delivery
+continue unchanged and are never delayed or suppressed by measurement
+failure.
+
+## 12. Gates
+
+### I1 — document-merge gate (amended per V2)
+
+```text
+[x] Session 1 narrow reconciliation complete (§4.3 supersession branch
+    CLOSED — 60s final for the initial gate version; no strata-refinement
+    evidence produced, default bands stand)
+[x] F2 persistence selected for all §7.4 components INCLUDING the
+    control-plane journal (complete per-component matrix recorded, §7.4)
+[x] Frozen at I1: 60s latency (final), $1.00 dust threshold, 30/80%
+    thresholds, entry-only $500 rule, Hájek estimator, sampling METHOD
+    (strata, algorithm, formula, budget rule, selection rule, minimum
+    constraint), pause-trigger definitions and thresholds
+[x] Both document-level inputs resolved inline: §3.3 manifest list +
+    rationale; §7.4 persistence matrix. Implementation-verification items
+    are I2/I3 obligations and do NOT gate document merge.
+[ ] Reviewer sign-off recorded
+[x] Product-owner authorization recorded (2026-07-28, direct human owner
+    statement adopting Authorization 1 — verbatim in the header)
+```
+
+### I2 — persistence-merge gate
+
+```text
+[ ] Implements §2 model + §7 spool per F2's architecture
+[ ] Crash-window tests: DB-mirror failure, post-send crash, spool-
+    unavailable fail-open — all semantics of §7.3 demonstrated
+[ ] Synthetic-namespace segregation demonstrated (§11.2); zero production-
+    namespace writes under live traffic with activation off
+[ ] Validation-namespace mechanism selected and demonstrated (separate DB
+    file vs schema-enforced partition, per F2's architecture — §11.2)
+[ ] Float-feature → fixed-scale-decimal canonicalization mapping
+    implemented and test-asserted (§3.2)
+[ ] Measurement-store table/connection/lock isolation from the production
+    detection/dispatch path demonstrated (§4.7)
+[ ] Behavior-neutrality: no diff in gate/dispatch behavior (test-asserted)
+[ ] Control-plane journal implemented per F2 selection; fenced admission
+    protocol implemented; admission provably fails closed when the control
+    journal is unreadable
+```
+
+### I3 — quote-worker-merge gate (amended per V2)
+
+```text
+[ ] Isolation demonstrated (queue bound, quota separation, breaker,
+    lock isolation per §4.7); retry/timeout constants recorded
+[ ] CP2 price-refresh cadence measured and recorded in the I3 gate record
+    (§5.1 granularity bound)
+[ ] Trending-snapshot capture cadence measured and recorded in the I3 gate
+    record (§6.2)
+[ ] Dedicated-credential rate limit confirmed; worker budget instantiated
+    per the I1-frozen budget rule
+[ ] Bounded non-cohort capacity census executed (≥72h, observation-only,
+    zero production-namespace writes); inflow and inventory recorded
+[ ] K_s selected mechanically by the I1-frozen rule; fixed_salt, strata,
+    K_s, inclusion probabilities recorded and frozen; minimum-sample
+    constraint verified or escalated
+[ ] Synthetic end-to-end pass in the validation namespace
+```
+
+### I4 — cohort-activation gate (amended per V3)
+
+```text
+[ ] I2 and I3 deployed and green, synthetic-only
+[ ] Full-path synthetic health check passing
+[ ] Sampling values frozen (from I3) and loaded
+[ ] Control-journal transitions inactive → validating → active recorded
+    with fencing tokens
+[ ] §11.4 proof obligations (a)(b)(c) attached
+[ ] Product-owner activation ruling recorded
+```
+
+---
+
+## 13. Consolidation record
+
+### 13.1 Section-by-section source provenance
+
+| Section | Source(s), later-version-wins | Ruling overlays |
+|---|---|---|
+| §1 | v0.2 §1 (unchanged v0.3→v0.6) | — |
+| §2.1 | v0.4 §2.1 (T1) | — |
+| §2.2 | v0.4 §2.2 (T1; subsumes v0.2 §2.3 schema + v0.3 §2.5 version fields) | — |
+| §2.3 | v0.4 §2.3 (T1) | §11.3 admission cross-ref (V3) |
+| §2.4 | v0.3 §2.2–2.3 (S1) + v0.4 §2.4 (T1 evaluation-linking) + v0.4 §7.3 delivery_evidence_unavailable state | Ruling 2 (2nd): event-level provider-acceptance linkage; delivered_crossover state; clock binding |
+| §2.5 | v0.2 §2.4 (R2) + v0.3 §2.4 (S2) + v0.4 §2.5 | Ruling 2 (2nd): delivered_crossover terminology |
+| §2.6 | v0.2 §2.2 | — |
+| §2.7 | v0.4 §2.6 (assignments basis) + v0.2 §2.5 (health-check labeling) | — |
+| §3.1–3.2 | v0.2 §3.1–3.2 (R7; unchanged thereafter) | — |
+| §3.3 | v0.4 §3.3 (T5 full-SHA; supersedes v0.3 §3.3 truncated form) | — |
+| §4.1 | v0.2 §4.1 | — |
+| §4.2 | v0.2 §4.2 (R4) + v0.6 §4.2 (V4) | — |
+| §4.3 | v0.2 §4.3 clock + v0.4 §4.3 estimator (T4, summarized as the invoked-fallback's basis) + v0.5 §4.3 (U4 resolution: 60s frozen) | Ruling 4 (2nd): supersession branch closed; 60s final for initial gate version |
+| §4.4–4.6 | v0.2 §4.4–4.6 (unchanged thereafter) | — |
+| §4.7 | v0.3 §4.7 isolation (S3) + v0.4 §4.7 thresholds/IPW (T3) + v0.5 §4.7 formula + Hájek (U4) + v0.6 §4.7 split freeze (V2) | C3 (I3 freezes values), C4 (digest formulation replaces `\|\|` concatenation of v0.3/v0.4/v0.6) |
+| §5 | v0.2 §5 (R5 incl. crossing_order_indeterminate; unchanged thereafter) | — |
+| §6.1 | v0.2 §6.1 taxonomy (R5) + v0.4 §6.1 (T5) + v0.5 §6.1 ($1.00 dust, U4) | — |
+| §6.2–6.3 | v0.2 §6.2–6.3 | — |
+| §6.4 | v0.2 §6.4 + v0.3 §6.4 (S2) + v0.6 §6.1–6.4 note (measurement_unavailable removed) | — |
+| §6.5 | v0.6 §6.5 (V1) | C6 (control_status_version field + episode link) |
+| §7 intro | v0.2 §7 (R6 terminology) | — |
+| §7.1–7.3 | v0.3 §7 (S4 two-phase, unknown_after_send, no auto-resend) + v0.4 §7 (T2 spool, sequence, fail-open semantics) | — |
+| §7.4 | v0.5 §7.4 (U3 broadened scope) + v0.6 §7.4 (V1 control-plane seam) | Control-plane selection RESOLVED per C-rulings; annex §12 referenced |
+| §8 | v0.3 §8 (S5; unchanged thereafter) | — |
+| §9 | v0.2 §8 + v0.3 §9 + v0.4 §9 extensions + v0.5/v0.6 frozen-value list | C5 noted via §11.3 |
+| §10 | v0.2 §9 + v0.3 §2.3 (computation-timestamp disclosure) + v0.4 §10 (sampling reporting) | Ruling 3 (2nd): 24h evidentiary report / 72h completion supplement split |
+| §11.1 | v0.4 §11 (T5) + v0.5 §11.1 (U1 naming) + control-plane journal added to I2 (V1) | — |
+| §11.2 | v0.5 §11.2 (U2) | — |
+| §11.3 | v0.5 §11.3 (U3 state machine) + v0.6 §11.3 (V3 fencing/admission/triggers) | C5 (every-transition increment) |
+| §11.4 | v0.5 §11.4 + v0.6 §11.4 (V3 three-part proof) | — |
+| §11.5 | — (new) | C1 verbatim |
+| §12 | v0.5 §12 (U1 four gates) + v0.6 §12 (V2/V3 amendments); I2 gate = v0.5 list + v0.6 addition | Ruling 1 (2nd): five implementation obligations added to I2/I3 checklists; I1 marker line narrowed to the two document-level inputs |
+
+### 13.2 Document-level inputs vs implementation obligations
+
+**Both document-level I1 inputs are RESOLVED inline (2026-07-27):**
+
+```text
+§3.3  gate_code_hash manifest file list + selection rationale — RESOLVED
+      (scout/token_ids.py, scout/trading/detection_alert.py,
+       scout/trading/engine.py, scout/trading/tg_alert_dispatch.py)
+§7.4  complete per-component persistence matrix (evaluations, assignments,
+      dispositions, delivery evidence, quotes, outcomes, health
+      transitions, control-plane journal) — RESOLVED
+```
+
+No unresolved marker tokens remain anywhere in this document.
+
+**Implementation obligations (former verification markers), relocated to
+their gate checklists — these do NOT block document merge and require no
+I2/I3 implementation to exist at I1:**
+
+```text
+I2 gate  §3.2   float→decimal canonicalization mapping (test-asserted)
+I2 gate  §11.2  validation-namespace mechanism selection + demonstration
+I2 gate  §4.7   measurement-store table/connection/lock isolation
+I3 gate  §5.1   CP2 price-refresh cadence measured + recorded
+I3 gate  §6.2   trending-snapshot capture cadence measured + recorded
+```
+
+No source-chain consolidation placeholders or inherited-section stubs
+remain — every section above is fully stated.
