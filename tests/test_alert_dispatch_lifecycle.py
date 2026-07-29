@@ -791,3 +791,140 @@ async def test_reconcile_never_touches_resolved_or_unknown_terminal(tmp_path):
     assert await _outcome(db, rr) == "unknown_resolved_retryable"
     assert await _outcome(db, ru) == "delivery_unknown_after_send"
     await db.close()
+
+
+# --- B2: finalize_confirmed_sent + ownership-safe unknown->sent recovery ------
+
+
+@pytest.mark.asyncio
+async def test_finalize_promotes_attempted_to_sent(tmp_path):
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    rid = await _seed(
+        db, "t", "dispatch_attempted", lease=lease, updated_at=_fresh_iso()
+    )
+    assert await lc.finalize_confirmed_sent(db, rid, lease=lease) is True
+    assert await _outcome(db, rid) == "sent"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_recovers_unknown_to_sent_under_lease(tmp_path):
+    """A confirmed acceptance whose row was reconciled to delivery_unknown is
+    recovered unknown->sent under the owner lease, with a durable audit note."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    rid = await _seed(
+        db, "t", "delivery_unknown_after_send", lease=lease, updated_at=_fresh_iso()
+    )
+    assert await lc.finalize_confirmed_sent(db, rid, lease=lease) is True
+    assert await _outcome(db, rid) == "sent"
+    cur = await db._conn.execute("SELECT detail FROM tg_alert_log WHERE id=?", (rid,))
+    assert "recovered" in ((await cur.fetchone())[0] or "")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_is_lease_guarded(tmp_path):
+    """The unknown->sent recovery only applies under the owner lease — a wrong
+    lease cannot resurrect a delivery_unknown row to sent."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    owner = lc.new_lease()
+    rid = await _seed(
+        db, "t", "delivery_unknown_after_send", lease=owner, updated_at=_fresh_iso()
+    )
+    assert (
+        await lc.recover_sent_after_confirmed_acceptance(db, rid, lease="not-owner")
+        is False
+    )
+    assert await _outcome(db, rid) == "delivery_unknown_after_send"
+    assert (
+        await lc.recover_sent_after_confirmed_acceptance(db, rid, lease=owner) is True
+    )
+    assert await _outcome(db, rid) == "sent"
+    await db.close()
+
+
+# --- B2 proof-2: finalize vs reconcile contention (no torn outcome) ----------
+
+
+@pytest.mark.asyncio
+async def test_b2_finalize_vs_reconcile_race_is_consistent(tmp_path):
+    """Finalization-margin proof (design a): finalize's transition is itself a
+    lease-guarded CAS, and both finalize and reconcile serialize through the shared
+    _txn_lock (single connection). So no matter who wins the race, the outcome is a
+    durable, internally consistent 'sent' — a reconcile that wins simply routes the
+    finalizer into the ownership-safe unknown->sent recovery. Neither DB-lock
+    contention nor scheduler order can tear the outcome."""
+    for order in ("finalize_first", "reconcile_first"):
+        db = Database(tmp_path / f"race_{order}.db")
+        await db.initialize()
+        lease = lc.new_lease()
+        # heartbeat stale so reconcile WOULD sweep the attempted row if it wins.
+        rid = await _seed(
+            db,
+            "t",
+            "dispatch_attempted",
+            _old_iso(),
+            lease=lease,
+            updated_at=_old_iso(),
+        )
+        if order == "finalize_first":
+            f = asyncio.create_task(lc.finalize_confirmed_sent(db, rid, lease=lease))
+            r = asyncio.create_task(lc.reconcile_stale(db, ST))
+        else:
+            r = asyncio.create_task(lc.reconcile_stale(db, ST))
+            f = asyncio.create_task(lc.finalize_confirmed_sent(db, rid, lease=lease))
+        finalized, _reconciled = await asyncio.gather(f, r)
+        # Finalize ALWAYS ends in durable sent (promote-or-recover); DB agrees.
+        assert finalized is True, order
+        assert await _outcome(db, rid) == "sent", order
+        await db.close()
+
+
+# --- B2 proof-3: attempt-specific recovery (blocked on ownership change) ------
+
+
+@pytest.mark.asyncio
+async def test_recover_blocked_after_operator_resolution(tmp_path):
+    """If an operator already resolved the row (unknown_resolved_retryable), the
+    unknown->sent recovery fails SAFELY — it never overwrites the operator decision
+    and never claims sent."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    rid = await _seed(
+        db, "t", "unknown_resolved_retryable", lease=lease, updated_at=_fresh_iso()
+    )
+    assert (
+        await lc.recover_sent_after_confirmed_acceptance(db, rid, lease=lease) is False
+    )
+    assert await lc.finalize_confirmed_sent(db, rid, lease=lease) is False
+    assert await _outcome(db, rid) == "unknown_resolved_retryable"  # preserved
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_recover_blocked_after_new_attempt_token(tmp_path):
+    """If a NEWER attempt rotated the row's lease token, the OLD attempt's recovery
+    fails SAFELY (attempt-specific) — it cannot promote a generic unknown row that
+    now belongs to a different attempt; only the current owner can."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    old = lc.new_lease()
+    new = lc.new_lease()
+    rid = await _seed(
+        db, "t", "delivery_unknown_after_send", lease=old, updated_at=_fresh_iso()
+    )
+    await db.execute_write(
+        "UPDATE tg_alert_log SET dispatch_lease_token=? WHERE id=?", (new, rid)
+    )
+    assert await lc.finalize_confirmed_sent(db, rid, lease=old) is False
+    assert await _outcome(db, rid) == "delivery_unknown_after_send"
+    # the current owner (new token) can recover
+    assert await lc.recover_sent_after_confirmed_acceptance(db, rid, lease=new) is True
+    assert await _outcome(db, rid) == "sent"
+    await db.close()

@@ -36,6 +36,7 @@ import structlog
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.exceptions import TelegramTransportUnknown
 from scout.token_ids import match_universe_exclude
 from scout.trading import alert_dispatch_lifecycle as lifecycle
 
@@ -648,30 +649,36 @@ async def notify_paper_trade_opened(
                     sent_row_id=sent_row_id,
                 )
                 return
-            # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
-            await alerter.send_telegram_message(
-                body,
-                session,
-                settings,
-                parse_mode=None,
-                raise_on_failure=True,
-                source="tg_alert_dispatch",
+            # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail.
+            # B2: HARD end-to-end deadline (< stale threshold) over the WHOLE
+            # provider operation (pacing + 429 retry waits + HTTP) so an active
+            # send can never outlive the lease heartbeat and be reconciled.
+            await asyncio.wait_for(
+                alerter.send_telegram_message(
+                    body,
+                    session,
+                    settings,
+                    parse_mode=None,
+                    raise_on_failure=True,
+                    source="tg_alert_dispatch",
+                ),
+                timeout=lifecycle.SEND_OPERATION_DEADLINE_SECONDS,
             )
-            # P0-1: provider accepted — promote attempted -> sent (delivered)
-            # under our lease. A zero-row CAS means a stale sweep reclaimed the
-            # row mid-send (a >lease-age send); surface it (the send DID land, so
-            # it is not a false 'sent', but the row is now delivery_unknown).
-            if not await lifecycle.promote_sent(db, sent_row_id, lease=lease):
-                log.warning(
-                    "tg_alert_promote_noop_after_send",
+            # Provider ACCEPTED — persist durable 'sent' (recover unknown->sent
+            # under our lease if a race moved it). The 'delivered' log is DERIVED
+            # strictly from the persisted result, so state/log never disagree.
+            if not await lifecycle.finalize_confirmed_sent(
+                db, sent_row_id, lease=lease
+            ):
+                log.error(
+                    "tg_alert_promote_and_recover_failed",
                     paper_trade_id=paper_trade_id,
                     signal_type=signal_type,
                     token_id=token_id,
                     sent_row_id=sent_row_id,
                 )
-            # §12b: emit AFTER the send returns (delivery succeeded — the
-            # call raises on failure). Together with tg_alert_dispatched this
-            # makes "no logs" unambiguous between delivered vs skipped.
+                return  # not durably 'sent' — do NOT claim delivered / emit minara
+            # §12b: emit AFTER the send returns AND the row is durably 'sent'.
             log.info(
                 "tg_alert_delivered",
                 paper_trade_id=paper_trade_id,
@@ -688,6 +695,25 @@ async def notify_paper_trade_opened(
                 log_event="tg_alert_log_unknown_on_send_cancel",
             )
             raise
+        except (asyncio.TimeoutError, TelegramTransportUnknown) as e:
+            # B1: deadline exceeded OR transport uncertainty AFTER the attempt
+            # began — UNPROVABLE delivery -> delivery_unknown_after_send (cap+dedup
+            # stay reserved; NO automatic redispatch). Never freed to failed.
+            await _mark_unknown_row(
+                db,
+                sent_row_id=sent_row_id,
+                lease=lease,
+                detail=f"transport_unknown:{str(e)[:120]}",
+                log_event="tg_alert_log_unknown_on_transport",
+            )
+            log.warning(
+                "tg_alert_delivery_unknown",
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+                err=str(e),
+            )
+            return
         except Exception as e:
             log.warning(
                 "tg_alert_dispatch_failed",
@@ -696,8 +722,9 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
                 err=str(e),
             )
-            # Confirmed provider failure — demote attempted -> dispatch_failed
-            # (frees the dedup/cap slot for the next legitimate fire).
+            # B1: explicit provider rejection (TelegramRejected) OR a preprocessing
+            # / format failure — CONFIRMED non-delivery -> dispatch_failed (frees
+            # the dedup/cap slot for the next legitimate fire).
             if sent_row_id is not None:
                 try:
                     if not await lifecycle.demote_failed(

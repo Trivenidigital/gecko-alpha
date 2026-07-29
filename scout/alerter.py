@@ -7,7 +7,11 @@ import structlog
 import aiohttp
 
 from scout.config import Settings
-from scout.exceptions import AlertDeliveryError
+from scout.exceptions import (
+    AlertDeliveryError,
+    TelegramRejected,
+    TelegramTransportUnknown,
+)
 from scout.models import CandidateToken
 from scout.observability.tg_dispatch_counter import record_dispatch, record_429
 from scout.observability.tg_pacing import pacing_wait_seconds, register_429
@@ -201,82 +205,138 @@ async def send_telegram_message(
         except Exception:
             logger.exception("record_dispatch_failed")
 
+    # B1 delivery-certainty taxonomy: transport failures (timeout / disconnect /
+    # reset / read failure) AFTER the request begins are UNPROVABLE delivery and
+    # raise TelegramTransportUnknown; an explicit non-200 rejection is CONFIRMED
+    # non-acceptance and raises TelegramRejected. A generic transport exception
+    # must never be conflated with a confirmed rejection (the caller frees
+    # cap/dedup only on the latter).
     try:
-        status, body_bytes, retry_after = await _post_telegram_once(
-            session, url, payload
-        )
+        try:
+            status, body_bytes, retry_after = await _post_telegram_once(
+                session, url, payload
+            )
 
-        if status == 429:
-            # Fold 3: record EVERY actual 429 (measurement stays visible).
-            _record_429_safe(settings, chat, source, retry_after)
-            if settings.TG_PACING_ENABLED:
-                register_429(chat, retry_after)  # pace future sends to this chat
-                ra = float(retry_after) if retry_after and retry_after > 0 else 1.0
-                if ra <= settings.TG_PACING_MAX_WAIT_SECONDS:
-                    # In-budget: pace + retry once.
-                    logger.warning(
-                        "tg_send_retry_after_429",
-                        chat_id=chat,
-                        source=source,
-                        retry_after=retry_after,
-                        sleep_seconds=ra,
-                    )
-                    await asyncio.sleep(ra)
-                    # The retry is a real HTTP dispatch — count it for burst
-                    # pressure accounting (gate-2 review #2).
-                    if settings.TG_BURST_PROFILE_ENABLED:
-                        try:
-                            record_dispatch(chat, source=source)
-                        except Exception:
-                            logger.exception("record_dispatch_failed")
-                    status, body_bytes, retry_after = await _post_telegram_once(
-                        session, url, payload
-                    )
-                    if status == 200:
-                        logger.info(
-                            "tg_send_retry_succeeded", chat_id=chat, source=source
-                        )
-                    else:
+            if status == 429:
+                # Fold 3: record EVERY actual 429 (measurement stays visible).
+                _record_429_safe(settings, chat, source, retry_after)
+                if settings.TG_PACING_ENABLED:
+                    register_429(chat, retry_after)  # pace future sends to this chat
+                    ra = float(retry_after) if retry_after and retry_after > 0 else 1.0
+                    if ra <= settings.TG_PACING_MAX_WAIT_SECONDS:
+                        # In-budget: pace + retry once.
                         logger.warning(
-                            "tg_send_retry_failed",
+                            "tg_send_retry_after_429",
                             chat_id=chat,
                             source=source,
-                            status=status,
+                            retry_after=retry_after,
+                            sleep_seconds=ra,
                         )
-                        if status == 429:  # Fold 3: retry's 429 is real too
-                            _record_429_safe(settings, chat, source, retry_after)
-                            register_429(chat, retry_after)
-                else:
-                    # Fold 2: over budget — don't retry early; the paced deadline
-                    # is registered, the next send is pre-gated. Fall through.
-                    logger.warning(
-                        "tg_send_retry_skipped_over_budget",
-                        chat_id=chat,
-                        source=source,
-                        retry_after=ra,
-                        budget=settings.TG_PACING_MAX_WAIT_SECONDS,
-                    )
+                        await asyncio.sleep(ra)
+                        # The retry is a real HTTP dispatch — count it for burst
+                        # pressure accounting (gate-2 review #2).
+                        if settings.TG_BURST_PROFILE_ENABLED:
+                            try:
+                                record_dispatch(chat, source=source)
+                            except Exception:
+                                logger.exception("record_dispatch_failed")
+                        status, body_bytes, retry_after = await _post_telegram_once(
+                            session, url, payload
+                        )
+                        if status == 200:
+                            logger.info(
+                                "tg_send_retry_succeeded", chat_id=chat, source=source
+                            )
+                        else:
+                            logger.warning(
+                                "tg_send_retry_failed",
+                                chat_id=chat,
+                                source=source,
+                                status=status,
+                            )
+                            if status == 429:  # Fold 3: retry's 429 is real too
+                                _record_429_safe(settings, chat, source, retry_after)
+                                register_429(chat, retry_after)
+                    else:
+                        # Fold 2: over budget — don't retry early; the paced
+                        # deadline is registered, the next send is pre-gated.
+                        logger.warning(
+                            "tg_send_retry_skipped_over_budget",
+                            chat_id=chat,
+                            source=source,
+                            retry_after=ra,
+                            budget=settings.TG_PACING_MAX_WAIT_SECONDS,
+                        )
+        except (
+            asyncio.TimeoutError,
+            aiohttp.ClientError,
+            ConnectionError,
+            OSError,
+        ) as e:
+            # Transport uncertainty AFTER the request began — UNPROVABLE delivery.
+            logger.warning("telegram_transport_unknown", error=str(e), source=source)
+            if raise_on_failure:
+                raise TelegramTransportUnknown(
+                    f"telegram transport failure: {e}"
+                ) from e
+            return
 
-        if status != 200:
-            body = (
-                body_bytes.decode("utf-8", errors="replace")[:200] if body_bytes else ""
-            )
+        # Status/outcome decision (no transport await here). B1 certainty matrix:
+        #   200 + ok:true       -> confirmed acceptance (sent);
+        #   200 + ok:false      -> explicit provider non-acceptance (rejected);
+        #   200 + unparseable   -> acceptance UNPROVABLE (transport-unknown);
+        #   408 / 409           -> ambiguous (server may have processed) -> unknown;
+        #   5xx                 -> server-side error, fate unprovable -> unknown;
+        #   other 4xx (incl.429)-> explicit definitive rejection (rejected). A 429's
+        #                          retry_after was already recorded/propagated above.
+        # An HTTP 200 by itself NEVER proves acceptance — only ok:true does.
+        body = _decode_body(body_bytes)
+        if status == 200:
+            if _telegram_accepted(body_bytes):
+                # §12b systemic observability: log every confirmed acceptance so any
+                # caller's delivery is traceable without a per-site triplet.
+                logger.info("telegram_message_delivered", source=source)
+            elif _telegram_explicit_ok_false(body_bytes):
+                logger.warning("telegram_send_ok_false", body=body, source=source)
+                if raise_on_failure:
+                    raise TelegramRejected(f"telegram 200 ok:false body={body}")
+            else:
+                logger.warning("telegram_send_unverified_200", body=body, source=source)
+                if raise_on_failure:
+                    raise TelegramTransportUnknown(
+                        f"telegram 200 without ok:true body={body}"
+                    )
+        elif status in (408, 409):
             logger.warning(
-                "Telegram daily summary failed",
-                status=status,
-                body=body,
-                source=source,
+                "telegram_send_ambiguous", status=status, body=body, source=source
             )
             if raise_on_failure:
-                raise RuntimeError(f"telegram send failed status={status} body={body}")
+                raise TelegramTransportUnknown(
+                    f"telegram ambiguous status={status} body={body}"
+                )
+        elif status >= 500:
+            logger.warning(
+                "telegram_send_server_error", status=status, body=body, source=source
+            )
+            if raise_on_failure:
+                raise TelegramTransportUnknown(
+                    f"telegram server error status={status} body={body}"
+                )
         else:
-            # §12b systemic observability: the default alerter logged ONLY on
-            # failure, making "no logs" ambiguous between delivered-cleanly and
-            # never-called. Log every confirmed 200 with the callsite source so
-            # any caller's delivery is traceable without a per-site triplet.
-            logger.info("telegram_message_delivered", source=source)
+            logger.warning(
+                "telegram_send_rejected", status=status, body=body, source=source
+            )
+            if raise_on_failure:
+                raise TelegramRejected(
+                    f"telegram send rejected status={status} body={body}"
+                )
+    except (TelegramRejected, TelegramTransportUnknown):
+        # Already a typed delivery-certainty outcome — propagate as-is.
+        raise
     except Exception as e:
-        logger.warning("Telegram daily summary error", error=str(e), source=source)
+        # Unexpected non-transport error (e.g. an instrumentation bug before the
+        # request began). Back-compat: raise_on_failure=False never raises.
+        logger.warning("telegram_send_unexpected_error", error=str(e), source=source)
         if raise_on_failure:
             raise
 
@@ -286,15 +346,16 @@ async def _post_telegram_once(
 ) -> tuple[int, bytes | None, int | None]:
     """One POST to the Telegram sendMessage endpoint.
 
-    Returns ``(status, body_bytes, retry_after)``. ``body_bytes`` is None on 200
-    (not read). ``retry_after`` is coerced to ``int`` (None if absent / non-JSON /
-    non-numeric) so downstream ``retry_after > 0`` / ``float()`` / pacing never
-    TypeErrors on a malformed body — that would be mis-attributed by the caller's
-    try/except as a Telegram-side error (gate-2 failure-mode review). V15 M3 fold:
-    read the body ONCE — ``resp.json()`` + ``resp.text()`` double-consume the stream.
+    Returns ``(status, body_bytes, retry_after)``. B1: the body is ALWAYS read —
+    including on 200 — because an HTTP 200 does NOT by itself prove Telegram
+    accepted the message; only a JSON body with ``ok: true`` does. ``retry_after``
+    is coerced to ``int`` (None if absent / non-JSON / non-numeric) so downstream
+    ``retry_after > 0`` / ``float()`` / pacing never TypeErrors on a malformed
+    body. V15 M3 fold: read the body ONCE — ``resp.json()`` + ``resp.text()``
+    double-consume the stream.
     """
     async with session.post(url, json=payload) as resp:
-        body_bytes = await resp.read() if resp.status != 200 else None
+        body_bytes = await resp.read()
         retry_after = None
         if resp.status == 429 and body_bytes is not None:
             try:
@@ -303,6 +364,33 @@ async def _post_telegram_once(
             except (json.JSONDecodeError, ValueError, TypeError):
                 retry_after = None
         return resp.status, body_bytes, retry_after
+
+
+def _telegram_accepted(body_bytes: bytes | None) -> bool:
+    """True IFF the response body PROVES Telegram accepted the message (JSON
+    ``ok: true``). A missing/unparseable body or ``ok`` other than ``true`` does
+    NOT prove acceptance."""
+    if not body_bytes:
+        return False
+    try:
+        return json.loads(body_bytes).get("ok") is True
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+
+
+def _telegram_explicit_ok_false(body_bytes: bytes | None) -> bool:
+    """True IFF the body EXPLICITLY reports ``ok: false`` — a definitive provider
+    non-acceptance (distinct from an unparseable body, whose fate is unprovable)."""
+    if not body_bytes:
+        return False
+    try:
+        return json.loads(body_bytes).get("ok") is False
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+
+
+def _decode_body(body_bytes: bytes | None) -> str:
+    return body_bytes.decode("utf-8", errors="replace")[:200] if body_bytes else ""
 
 
 def _record_429_safe(settings, chat_id: str, source: str, retry_after) -> None:
@@ -366,8 +454,10 @@ async def send_alert(
     # P1 #2: route through the shared sender so the main candidate-alert path is
     # paced + instrumented (it previously did its own un-paced direct POST).
     # send_telegram_message truncates, applies the pacing gate + retry, and
-    # raises RuntimeError on a hard failure (raise_on_failure=True) — re-wrapped
-    # as AlertDeliveryError to preserve this function's contract.
+    # raises a typed AlertDeliveryError subclass on a hard failure
+    # (raise_on_failure=True) — TelegramRejected (confirmed non-200) or
+    # TelegramTransportUnknown (transport uncertainty). Both are re-wrapped as
+    # AlertDeliveryError below to preserve this function's contract.
     try:
         await send_telegram_message(
             message,

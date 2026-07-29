@@ -88,6 +88,20 @@ DEDUP_RESERVED_STATES = (SENT, DISPATCH_PENDING, DISPATCH_ATTEMPTED, DELIVERY_UN
 # NOT operator-tunable.
 STALE_RECONCILE_SECONDS = 300
 
+# B2 liveness: a HARD end-to-end deadline (frozen, code-level) for the ENTIRE
+# provider send operation — including its internal pacing wait + 429 retry waits +
+# the HTTP call. It is STRICTLY BELOW STALE_RECONCILE_SECONDS, so a send can never
+# outlive the lease-heartbeat set at mark_attempted: reconcile only reclaims leases
+# whose heartbeat is older than STALE_RECONCILE_SECONDS, and the send either
+# completes or times out (→ delivery_unknown) before that. An active provider call
+# therefore can NEVER be demoted by a concurrent reconciliation. Each lane wraps its
+# send in ``asyncio.wait_for(..., timeout=SEND_OPERATION_DEADLINE_SECONDS)``.
+SEND_OPERATION_DEADLINE_SECONDS = 240
+assert SEND_OPERATION_DEADLINE_SECONDS < STALE_RECONCILE_SECONDS, (
+    "the provider-operation deadline must be strictly below the stale-reconcile "
+    "threshold so an active send can never be reclaimed as stale"
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -142,6 +156,44 @@ async def promote_sent(db, row_id: int | None, *, lease: str) -> bool:
         (_now_iso(), row_id, lease),
     )
     return rc == 1
+
+
+async def recover_sent_after_confirmed_acceptance(
+    db, row_id: int | None, *, lease: str
+) -> bool:
+    """Ownership-safe recovery (B2 durable-success consistency): a CONFIRMED
+    provider acceptance whose row was moved to ``delivery_unknown_after_send`` by a
+    racing reconcile (which preserves the lease token) is promoted unknown -> sent,
+    guarded on the owner ``lease`` — so ONLY the acceptance owner can perform it.
+    Records the recovery in ``detail`` (a durable audit trail) so the reconciled
+    unknown is never silently overwritten. Returns True iff recovered.
+
+    Under the SEND_OPERATION_DEADLINE_SECONDS guarantee this path is unreachable
+    in practice (an active send cannot be reconciled); it exists so a confirmed
+    acceptance ALWAYS ends in durable ``sent`` instead of a warning + inconsistent
+    return."""
+    if row_id is None:
+        return False
+    rc = await db.execute_write(
+        f"UPDATE tg_alert_log SET outcome='{SENT}', dispatch_state_updated_at=?, "
+        f"detail=COALESCE(detail, '') || "
+        f"' [recovered: confirmed provider acceptance after reconcile]' "
+        f"WHERE id=? AND outcome='{DELIVERY_UNKNOWN}' AND dispatch_lease_token=?",
+        (_now_iso(), row_id, lease),
+    )
+    return rc == 1
+
+
+async def finalize_confirmed_sent(db, row_id: int | None, *, lease: str) -> bool:
+    """Persist a CONFIRMED provider acceptance as durable ``sent`` (B2). Tries the
+    normal attempted -> sent promotion; if a racing reconcile already moved the row
+    to ``delivery_unknown_after_send``, performs the ownership-safe unknown -> sent
+    recovery. Returns True IFF the row is now durably ``sent`` under this lease — the
+    caller MUST derive its returned/counted/logged outcome from this boolean so DB
+    state, return value, counters, and logs can never disagree."""
+    if await promote_sent(db, row_id, lease=lease):
+        return True
+    return await recover_sent_after_confirmed_acceptance(db, row_id, lease=lease)
 
 
 async def demote_failed(db, row_id: int | None, *, lease: str, detail: str) -> bool:

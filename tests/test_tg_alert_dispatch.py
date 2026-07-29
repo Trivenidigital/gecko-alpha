@@ -1274,3 +1274,90 @@ async def test_p0_1_paper_provider_failure_demotes_to_failed(tmp_path, monkeypat
     await _run_notify(db)  # notify never raises on a confirmed Exception failure
     assert await _last_outcome(db) == "dispatch_failed"
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# B1 delivery-certainty taxonomy (paper-trade lane): transport-uncertain failure
+# → delivery_unknown_after_send; explicit provider rejection → dispatch_failed.
+# ---------------------------------------------------------------------------
+
+
+# Exercised through the REAL provider-call path (aioresponses-mocked HTTP through
+# send_telegram_message), NOT by raising the typed exceptions directly.
+import aiohttp  # noqa: E402
+from aioresponses import aioresponses  # noqa: E402
+
+_PAPER_TG_URL = "https://api.telegram.org/botx/sendMessage"  # _REQUIRED token="x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "setup,expected",
+    [
+        (lambda m: m.post(_PAPER_TG_URL, status=200, payload={"ok": True}), "sent"),
+        (
+            lambda m: m.post(
+                _PAPER_TG_URL, status=200, payload={"ok": False, "description": "x"}
+            ),
+            "dispatch_failed",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=200, body="<not json>"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=400, payload={"ok": False}),
+            "dispatch_failed",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=408, body="request timeout"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=409, body="conflict"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=503, body="unavailable"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(
+                _PAPER_TG_URL, exception=aiohttp.ClientConnectionError("reset")
+            ),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, exception=asyncio.TimeoutError()),
+            "delivery_unknown_after_send",
+        ),
+    ],
+)
+async def test_b1_paper_real_http_maps_to_outcome(
+    tmp_path, monkeypatch, setup, expected
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    with aioresponses() as m:
+        setup(m)
+        async with aiohttp.ClientSession() as session:
+            await notify_paper_trade_opened(
+                db,
+                _settings(),
+                session=session,
+                paper_trade_id=42,
+                signal_type="gainers_early",
+                token_id="bonk",
+                symbol="BONK",
+                entry_price=0.0001,
+                amount_usd=10.0,
+                signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+            )
+    assert await _last_outcome(db) == expected
+    await db.close()

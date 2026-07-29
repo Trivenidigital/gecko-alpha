@@ -572,44 +572,65 @@ def test_log_processors_emit_exception_info():
 #   - resolves static f-string DML (JoinedStr with a constant leading fragment),
 #   - resolves SQL-stored-in-a-variable DML (str assignments in function scope),
 #   - tracks alias-of-alias chains (conn2 = conn; conn = db._conn),
+#   - classifies CTE-prefixed writes (WITH ... UPDATE/INSERT/DELETE/REPLACE) as
+#     DML while leaving pure `WITH ... SELECT` reads SAFE,
+#   - flags shared-connection executescript() (arbitrary multi-statement SQL),
+#   - scopes the allowlist by EXACT (repo path, qualified Class.method),
 #   - treats UNKNOWN / dynamic SQL on the shared connection outside a protective
 #     region as a violation unless the enclosing function is exactly allowlisted.
 # ---------------------------------------------------------------------------
 
 # Exact, reviewed allowlist of functions permitted to touch the shared
 # connection's transaction-control / DML WITHOUT an `async with transaction()` /
-# `_txn_lock` ancestor. Each is safe for the enumerated reason:
-#   - "transaction": IS the manager (owns BEGIN IMMEDIATE / commit / rollback).
-#   - _migrate_* / _create_*: init-time DDL migrations, serial before any
-#     create_task (no concurrency); use BEGIN EXCLUSIVE directly.
-#   - record_minara_alert_emission / record_tg_alert_operator_action: hold the
-#     lock via `await self._txn_lock.acquire()` + try/finally (not async-with),
-#     so ancestry cannot see it — enumerated here instead.
-_DML_ALLOWLIST_FUNCS = frozenset(
+# `_txn_lock` ancestor. Scoped by EXACT (repo-relative path, qualified
+# `Class.method`) — an unqualified name match in some other module, or a
+# `_migrate_*`/`_create_*` function anywhere outside db.py's Database class, is
+# NOT exempt. Each entry is safe for the enumerated reason:
+#   - Database.transaction: IS the manager (owns BEGIN IMMEDIATE / commit /
+#     rollback).
+#   - Database.record_minara_alert_emission /
+#     Database.record_tg_alert_operator_action: hold the lock via
+#     `await self._txn_lock.acquire()` + try/finally (not async-with), so
+#     ancestry cannot see it — enumerated here instead.
+#   - Database.resolve_delivery_unknown_as_retryable: operator-only, audited
+#     resolution of a delivery_unknown row into unknown_resolved_retryable —
+#     holds _txn_lock via acquire()+try/finally (not async-with).
+# The `_migrate_*` / `_create_*` init-time DDL migrations (serial before any
+# create_task, no concurrency; use BEGIN EXCLUSIVE directly) are exempt via a
+# path+class-scoped PREFIX rule (see `_SharedConnAudit._allowed`), applied ONLY
+# to db.py's Database methods — never to a like-named function elsewhere.
+_SCOPED_ALLOWLIST = frozenset(
     {
-        "transaction",
-        "record_minara_alert_emission",
-        "record_tg_alert_operator_action",
-        # Operator-only, audited resolution of a delivery_unknown row into
-        # unknown_resolved_retryable — holds _txn_lock via acquire()+try/finally
-        # (not async-with), so ancestry cannot see it; enumerated here.
-        "resolve_delivery_unknown_as_retryable",
+        ("scout/db.py", "Database.transaction"),
+        ("scout/db.py", "Database.record_minara_alert_emission"),
+        ("scout/db.py", "Database.record_tg_alert_operator_action"),
+        ("scout/db.py", "Database.resolve_delivery_unknown_as_retryable"),
     }
 )
 
 _DML_RE = re.compile(r"^\s*(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
 _TXNCTL_RE = re.compile(
-    r"^\s*(BEGIN|COMMIT|END\s+TRANSACTION|SAVEPOINT|RELEASE)\b", re.IGNORECASE
+    r"^\s*(BEGIN|COMMIT|ROLLBACK|END\s+TRANSACTION|SAVEPOINT|RELEASE)\b",
+    re.IGNORECASE,
 )
+# A CTE (`WITH ...`) statement is a read ONLY if it carries no DML keyword;
+# `WITH cte AS (...) UPDATE ...` is a write and must classify as DML.
+_CTE_PREFIX_RE = re.compile(r"^\s*WITH\b", re.IGNORECASE)
+_CTE_DML_RE = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
 
 
 def _classify_sql(text: str) -> str:
     """Classify a concrete SQL string: DML / TXNCTL (transaction control) / SAFE
-    (reads: SELECT / PRAGMA / WITH ... anything not a write or txn statement)."""
+    (reads: SELECT / PRAGMA / `WITH ... SELECT` — anything not a write or txn
+    statement). A `WITH`-prefixed statement carrying an INSERT/UPDATE/DELETE/
+    REPLACE keyword is a CTE-prefixed write and classifies DML; a pure
+    `WITH ... SELECT` stays SAFE."""
     if _DML_RE.match(text):
         return "DML"
     if _TXNCTL_RE.match(text):
         return "TXNCTL"
+    if _CTE_PREFIX_RE.match(text) and _CTE_DML_RE.search(text):
+        return "DML"
     return "SAFE"
 
 
@@ -621,8 +642,14 @@ class _SharedConnAudit(ast.NodeVisitor):
     `async with <root>.transaction()` / `<root>._txn_lock` region whose root
     matches the write's receiver root, and NOT in the exact allowlist."""
 
-    def __init__(self) -> None:
+    def __init__(self, path: str = "<fixture>") -> None:
+        # Repo-relative path of the audited file (e.g. "scout/db.py") — the
+        # allowlist is scoped by (path, qualified Class.method).
+        self.path = path
         self.func_stack: list[str] = []
+        # Enclosing-class names (visit_ClassDef push/pop) — used to qualify a
+        # method as "Class.method" for the exact scoped allowlist.
+        self.class_stack: list[str] = []
         # One set of protected receiver-roots per enclosing protective async-with.
         self.protect_stack: list[set] = []
         # name -> receiver-root string for shared-conn aliases (conn = db._conn
@@ -633,6 +660,12 @@ class _SharedConnAudit(ast.NodeVisitor):
         self.violations: list[tuple] = []
 
     # -- scopes --------------------------------------------------------------
+    def visit_ClassDef(self, node):
+        self.class_stack.append(node.name)
+        for child in ast.iter_child_nodes(node):
+            self.visit(child)
+        self.class_stack.pop()
+
     def visit_FunctionDef(self, node):
         self._fn(node)
 
@@ -730,17 +763,30 @@ class _SharedConnAudit(ast.NodeVisitor):
     def _protected(self, root: str) -> bool:
         return any(root in frame for frame in self.protect_stack)
 
+    def _qualified_fn(self) -> str:
+        """The enclosing function qualified as ``Class.method`` when inside a
+        class, else the bare function name (``<module>`` at module scope)."""
+        fn = self.func_stack[-1] if self.func_stack else "<module>"
+        if self.class_stack:
+            return "%s.%s" % (self.class_stack[-1], fn)
+        return fn
+
     def _allowed(self) -> bool:
         fn = self.func_stack[-1] if self.func_stack else "<module>"
+        if (self.path, self._qualified_fn()) in _SCOPED_ALLOWLIST:
+            return True
+        # The _migrate_*/_create_* prefix exemption is scoped to db.py's
+        # Database class methods, verified at audit time by path + enclosing
+        # class — never applied to a like-named function in another module/class.
         return (
-            fn in _DML_ALLOWLIST_FUNCS
-            or fn.startswith("_migrate")
-            or fn.startswith("_create")
+            self.path == "scout/db.py"
+            and bool(self.class_stack)
+            and self.class_stack[-1] == "Database"
+            and (fn.startswith("_migrate") or fn.startswith("_create"))
         )
 
     def _flag(self, node, kind: str) -> None:
-        fn = self.func_stack[-1] if self.func_stack else "<module>"
-        self.violations.append((fn, node.lineno, kind))
+        self.violations.append((self._qualified_fn(), node.lineno, kind))
 
     def visit_Call(self, node):
         fn = node.func
@@ -749,6 +795,11 @@ class _SharedConnAudit(ast.NodeVisitor):
             if root is not None and not self._protected(root) and not self._allowed():
                 if fn.attr in ("commit", "rollback"):
                     self._flag(node, "shared .%s()" % fn.attr)
+                elif fn.attr == "executescript":
+                    # executescript runs arbitrary multi-statement SQL; its
+                    # argument is never statically classifiable, so an
+                    # unprotected/unallowlisted shared-conn call always flags.
+                    self._flag(node, "shared executescript")
                 elif fn.attr in ("execute", "executemany"):
                     cls = self._classify_value(node.args[0]) if node.args else "UNKNOWN"
                     if cls in ("DML", "TXNCTL", "UNKNOWN"):
@@ -765,20 +816,21 @@ class _SharedConnAudit(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _audit_source(src: str) -> list:
-    audit = _SharedConnAudit()
+def _audit_source(src: str, path: str = "<fixture>") -> list:
+    audit = _SharedConnAudit(path=path)
     audit.visit(ast.parse(src))
     return audit.violations
 
 
-# Reviewed read-only dynamic-SQL sites: exact (module, function) pairs whose
-# shared-connection ``execute(<dynamic>)`` is verified to run ONLY SELECT reads
-# (dynamic in WHICH constant query runs, never in write-intent). This suppresses
-# ONLY the ``shared unknown`` classification at these exact sites — a constant
-# DML / TXNCTL / commit / rollback at the same site is STILL flagged, so the
-# allowlist can never blind-spot a real write.
-#   - build_prospective_watchlist iterates ``_SURFACE_SOURCES`` (a module-level
-#     tuple of constant per-surface SELECT ... MIN(detection) ... queries).
+# Reviewed read-only dynamic-SQL sites: exact (repo path, qualified
+# Class.method|func) pairs whose shared-connection ``execute(<dynamic>)`` is
+# verified to run ONLY SELECT reads (dynamic in WHICH constant query runs, never
+# in write-intent). This suppresses ONLY the ``shared unknown`` classification at
+# these exact sites — a constant DML / TXNCTL / commit / rollback at the same
+# site is STILL flagged, so the allowlist can never blind-spot a real write.
+#   - build_prospective_watchlist (module-level function, bare name) iterates
+#     ``_SURFACE_SOURCES`` (a module-level tuple of constant per-surface
+#     SELECT ... MIN(detection) ... queries).
 _DYNAMIC_READ_ALLOWLIST = frozenset(
     {
         ("scout/conviction/prospective.py", "build_prospective_watchlist"),
@@ -798,7 +850,9 @@ def test_ast_no_unmanaged_shared_conn_txnctl_dml_commit_or_rollback():
     all_violations = []
     for path in scout_root.rglob("*.py"):
         rel = path.relative_to(scout_root.parent).as_posix()
-        for fn, lineno, kind in _audit_source(path.read_text(encoding="utf-8")):
+        for fn, lineno, kind in _audit_source(
+            path.read_text(encoding="utf-8"), path=rel
+        ):
             # Reviewed read-only dynamic-SQL sites are exempt ONLY for the
             # dynamic-read ("shared unknown") kind — never for a real write.
             if kind == "shared unknown" and (rel, fn) in _DYNAMIC_READ_ALLOWLIST:
@@ -832,50 +886,160 @@ def test_dynamic_read_allowlist_does_not_exempt_real_dml():
     kind. A constant DML at an allowlisted-name function is still flagged — the
     allowlist can never blind-spot a real write."""
     src = "async def build_prospective_watchlist(db):\n conn = db._conn\n await conn.execute('DELETE FROM t')\n"
-    viol = _audit_source(src)
+    viol = _audit_source(src, path="scout/conviction/prospective.py")
     assert any(k == "shared dml" for _, _, k in viol), viol
 
 
 # Each forbidden snippet MUST be flagged; each disciplined snippet MUST NOT be.
+# Fixtures are ``{name: (audit_path, src)}`` so each can declare the repo path it
+# is audited under — the exact path+class-scoped allowlist depends on it.
 _BAD_FIXTURES = {
-    "module_dml": "async def f(db):\n await db._conn.execute('INSERT INTO t VALUES (1)')\n",
-    "alias_dml": "async def f(db):\n conn = db._conn\n await conn.execute('UPDATE t SET x=1')\n",
-    "self_conn_delete": "class C:\n async def m(self):\n  await self._conn.execute('DELETE FROM t')\n",
-    "bare_commit": "async def f(db):\n await db._conn.commit()\n",
-    "bare_rollback": "async def f(db):\n await db._conn.rollback()\n",
-    "alias_commit": "async def f(db):\n c = db._conn\n await c.commit()\n",
-    "conn_kwarg_misuse": "async def f(db):\n await emit_event(db, 'x', conn=db._conn)\n",
-    "self_db_conn": "class C:\n async def m(self):\n  await self._db._conn.execute('REPLACE INTO t VALUES (1)')\n",
-    "begin_on_shared": "async def f(db):\n await db._conn.execute('BEGIN IMMEDIATE')\n",
+    "module_dml": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    "alias_dml": (
+        "scout/x.py",
+        "async def f(db):\n conn = db._conn\n await conn.execute('UPDATE t SET x=1')\n",
+    ),
+    "self_conn_delete": (
+        "scout/x.py",
+        "class C:\n async def m(self):\n  await self._conn.execute('DELETE FROM t')\n",
+    ),
+    "bare_commit": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.commit()\n",
+    ),
+    "bare_rollback": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.rollback()\n",
+    ),
+    "alias_commit": (
+        "scout/x.py",
+        "async def f(db):\n c = db._conn\n await c.commit()\n",
+    ),
+    "conn_kwarg_misuse": (
+        "scout/x.py",
+        "async def f(db):\n await emit_event(db, 'x', conn=db._conn)\n",
+    ),
+    "self_db_conn": (
+        "scout/x.py",
+        "class C:\n async def m(self):\n  await self._db._conn.execute('REPLACE INTO t VALUES (1)')\n",
+    ),
+    "begin_on_shared": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('BEGIN IMMEDIATE')\n",
+    ),
     # P0-4 hardening — each closes a specific bypass:
-    "fstring_dml": "async def f(db, t):\n await db._conn.execute(f'INSERT INTO {t} VALUES (1)')\n",
-    "sqlvar_dml": "async def f(db):\n sql = 'DELETE FROM t'\n await db._conn.execute(sql)\n",
-    "alias_of_alias": "async def f(db):\n conn = db._conn\n conn2 = conn\n await conn2.execute('INSERT INTO t VALUES (1)')\n",
-    "unrelated_txn_ctx": "async def f(db, unrelated):\n async with unrelated.transaction():\n  await db._conn.execute('INSERT INTO t VALUES (1)')\n",
-    "mentions_txn_lock_only": "async def f(db):\n note = '_txn_lock'\n await db._conn.execute('INSERT INTO t VALUES (1)')\n",
-    "dynamic_unknown_sql": "async def f(db):\n await db._conn.execute(build_sql())\n",
+    "fstring_dml": (
+        "scout/x.py",
+        "async def f(db, t):\n await db._conn.execute(f'INSERT INTO {t} VALUES (1)')\n",
+    ),
+    "sqlvar_dml": (
+        "scout/x.py",
+        "async def f(db):\n sql = 'DELETE FROM t'\n await db._conn.execute(sql)\n",
+    ),
+    "alias_of_alias": (
+        "scout/x.py",
+        "async def f(db):\n conn = db._conn\n conn2 = conn\n await conn2.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    "unrelated_txn_ctx": (
+        "scout/x.py",
+        "async def f(db, unrelated):\n async with unrelated.transaction():\n  await db._conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    "mentions_txn_lock_only": (
+        "scout/x.py",
+        "async def f(db):\n note = '_txn_lock'\n await db._conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    "dynamic_unknown_sql": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute(build_sql())\n",
+    ),
+    # B3.1 — SQL-form ROLLBACK on the shared connection is txn control.
+    "rollback_sql": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('ROLLBACK')\n",
+    ),
+    # B3.2 — CTE-prefixed DML must classify DML, not SAFE.
+    "cte_update": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('WITH x AS (SELECT 1) UPDATE t SET a=1')\n",
+    ),
+    "cte_delete": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('WITH x AS (SELECT 1) DELETE FROM t')\n",
+    ),
+    # B3.4 — shared-conn executescript() runs arbitrary multi-statement SQL.
+    "executescript_shared": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.executescript('UPDATE t SET a=1')\n",
+    ),
+    # B3.3 — exact path+class scoping: the allowlisted NAME at the WRONG path is
+    # still flagged (Database.transaction is exempt ONLY in scout/db.py).
+    "allowlisted_name_wrong_path": (
+        "scout/other.py",
+        "class Database:\n async def transaction(self):\n  await self._conn.execute('BEGIN IMMEDIATE')\n  await self._conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    # B3.3 — a _create_*/_migrate_* prefix outside db.py's Database is NOT exempt.
+    "create_outside_reviewed": (
+        "scout/foo.py",
+        "class C:\n async def _create_thing(self):\n  await self._conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
 }
 
 _GOOD_FIXTURES = {
-    "in_transaction": "async def f(db):\n async with db.transaction() as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n",
-    "in_txn_lock": "async def f(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
-    "conn_kwarg_in_txn": "async def f(db):\n async with db.transaction() as conn:\n  await emit_event(db, 'x', conn=db._conn)\n",
-    "migration_ok": "class C:\n async def _migrate_x(self):\n  await self._conn.execute('INSERT INTO schema_version VALUES (1)')\n  await self._conn.commit()\n",
-    "separate_conn": "async def f(db_path):\n async with aiosqlite.connect(db_path) as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n  await conn.commit()\n",
+    "in_transaction": (
+        "scout/x.py",
+        "async def f(db):\n async with db.transaction() as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n",
+    ),
+    "in_txn_lock": (
+        "scout/x.py",
+        "async def f(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
+    ),
+    "conn_kwarg_in_txn": (
+        "scout/x.py",
+        "async def f(db):\n async with db.transaction() as conn:\n  await emit_event(db, 'x', conn=db._conn)\n",
+    ),
+    # migration_ok is exempt only under the path+class-scoped prefix rule, so it
+    # MUST be audited as a db.py Database method.
+    "migration_ok": (
+        "scout/db.py",
+        "class Database:\n async def _migrate_x(self):\n  await self._conn.execute('INSERT INTO schema_version VALUES (1)')\n  await self._conn.commit()\n",
+    ),
+    "separate_conn": (
+        "scout/x.py",
+        "async def f(db_path):\n async with aiosqlite.connect(db_path) as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n  await conn.commit()\n",
+    ),
     # P0-4 — dynamic READS on the shared conn are not writes and must NOT flag:
-    "fstring_select": "async def f(db, y):\n await db._conn.execute(f'SELECT * FROM t WHERE x={y}')\n",
-    "sqlvar_select": "async def f(db):\n sql = 'SELECT * FROM t'\n await db._conn.execute(sql)\n",
-    "self_db_txn_lock_root_match": "class C:\n async def m(self):\n  async with self._db._txn_lock:\n   await self._db._conn.execute('UPDATE t SET x=1')\n   await self._db._conn.commit()\n",
+    "fstring_select": (
+        "scout/x.py",
+        "async def f(db, y):\n await db._conn.execute(f'SELECT * FROM t WHERE x={y}')\n",
+    ),
+    "sqlvar_select": (
+        "scout/x.py",
+        "async def f(db):\n sql = 'SELECT * FROM t'\n await db._conn.execute(sql)\n",
+    ),
+    "self_db_txn_lock_root_match": (
+        "scout/x.py",
+        "class C:\n async def m(self):\n  async with self._db._txn_lock:\n   await self._db._conn.execute('UPDATE t SET x=1')\n   await self._db._conn.commit()\n",
+    ),
+    # B3.2 — a pure `WITH ... SELECT` CTE read carries no DML keyword: SAFE.
+    "cte_select": (
+        "scout/x.py",
+        "async def f(db):\n await db._conn.execute('WITH x AS (SELECT 1) SELECT * FROM x')\n",
+    ),
 }
 
 
 @pytest.mark.parametrize("name", sorted(_BAD_FIXTURES))
 def test_scanner_flags_forbidden_pattern(name):
     """Each forbidden snippet MUST be flagged — a broken scanner fails loudly."""
-    assert _audit_source(_BAD_FIXTURES[name]), "scanner missed %r" % name
+    path, src = _BAD_FIXTURES[name]
+    assert _audit_source(src, path=path), "scanner missed %r" % name
 
 
 @pytest.mark.parametrize("name", sorted(_GOOD_FIXTURES))
 def test_scanner_accepts_disciplined_pattern(name):
     """Each disciplined snippet MUST NOT be flagged (no false positives)."""
-    assert _audit_source(_GOOD_FIXTURES[name]) == [], "false-positive on %r" % name
+    path, src = _GOOD_FIXTURES[name]
+    assert _audit_source(src, path=path) == [], "false-positive on %r" % name

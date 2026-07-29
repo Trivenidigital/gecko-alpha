@@ -16,6 +16,7 @@ from dashboard import db as dashboard_db
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.exceptions import TelegramTransportUnknown
 from scout.trading import alert_dispatch_lifecycle as lifecycle
 from scout.trading.tg_alert_dispatch import _fmt_mcap, _fmt_price
 
@@ -376,32 +377,39 @@ async def _send_claimed_alert(
                 surface=candidate.surface,
             )
             return "dispatch_failed"
-        await alerter.send_telegram_message(
-            body,
-            session,
-            settings,
-            parse_mode=None,
-            raise_on_failure=True,
-            source="trade_surface_alerts",
+        # B2: HARD end-to-end deadline (< stale threshold) over the WHOLE provider
+        # operation — its internal pacing wait + 429 retry waits + the HTTP call —
+        # so an active send can never outlive the lease heartbeat and be reconciled.
+        await asyncio.wait_for(
+            alerter.send_telegram_message(
+                body,
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="trade_surface_alerts",
+            ),
+            timeout=lifecycle.SEND_OPERATION_DEADLINE_SECONDS,
         )
-        # Provider accepted — promote attempted -> sent (delivered) under our lease.
-        # Check the CAS: a zero-row promote means a stale sweep reclaimed the row
-        # mid-send (a >lease-age send); the provider DID accept, so it is not a
-        # false 'sent', but the row is now delivery_unknown — surface it.
-        if not await lifecycle.promote_sent(db, pending_row_id, lease=lease):
-            log.warning(
-                "trade_surface_alert_promote_noop_after_send",
+        # Provider ACCEPTED — persist durable 'sent' (recover unknown->sent under
+        # our lease if a race moved it). Return/count/log are DERIVED from the
+        # persisted result so DB state, return, counters, and logs never disagree.
+        if await lifecycle.finalize_confirmed_sent(db, pending_row_id, lease=lease):
+            log.info(
+                "trade_surface_alert_delivered",
                 tg_alert_log_id=pending_row_id,
                 token_id=candidate.token_id,
                 surface=candidate.surface,
             )
-        log.info(
-            "trade_surface_alert_delivered",
+            return "sent"
+        # Confirmed acceptance but could not persist 'sent' under our lease — do
+        # NOT claim sent; report the honest state (matches the DB truth).
+        log.error(
+            "trade_surface_alert_promote_and_recover_failed",
             tg_alert_log_id=pending_row_id,
             token_id=candidate.token_id,
-            surface=candidate.surface,
         )
-        return "sent"
+        return "delivery_unknown_after_send"
     except asyncio.CancelledError:
         # Interrupted after the send began — the provider result is unprovable.
         if not await lifecycle.mark_delivery_unknown(
@@ -418,8 +426,33 @@ async def _send_claimed_alert(
                 token_id=candidate.token_id,
             )
         raise
+    except (asyncio.TimeoutError, TelegramTransportUnknown) as exc:
+        # B1: deadline exceeded OR transport uncertainty AFTER the attempt began —
+        # UNPROVABLE delivery → delivery_unknown_after_send (cap+dedup stay
+        # reserved; NO automatic redispatch). Never freed to dispatch_failed.
+        if not await lifecycle.mark_delivery_unknown(
+            db,
+            pending_row_id,
+            lease=lease,
+            detail=lifecycle.merge_error_detail(
+                detail, f"transport_unknown:{str(exc)[:120]}"
+            ),
+        ):
+            log.warning(
+                "trade_surface_alert_unknown_cas_noop",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+            )
+        log.warning(
+            "trade_surface_alert_delivery_unknown",
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+            err=str(exc),
+        )
+        return "delivery_unknown_after_send"
     except Exception as exc:
-        # Confirmed failure (format error or provider error return).
+        # B1: explicit provider rejection (TelegramRejected) OR a preprocessing /
+        # format failure before the attempt — CONFIRMED non-delivery → failed.
         if not await lifecycle.demote_failed(
             db,
             pending_row_id,
@@ -450,7 +483,12 @@ async def send_trade_surface_alerts(
     Never raises to the pipeline loop. The code path is opt-in, capped, and
     uses the same `tg_alert_log` + parse-mode discipline as paper-trade alerts.
     """
-    counts = {"sent": 0, "blocked_dedup_24h": 0, "dispatch_failed": 0}
+    counts = {
+        "sent": 0,
+        "blocked_dedup_24h": 0,
+        "dispatch_failed": 0,
+        "delivery_unknown_after_send": 0,
+    }
     if not settings.TRADE_SURFACE_TG_ALERTS_ENABLED:
         return counts
     try:
@@ -513,9 +551,12 @@ async def send_trade_surface_alerts(
                 counts["sent"] += 1
             elif outcome == "dispatch_failed":
                 counts["dispatch_failed"] += 1
+            elif outcome == "delivery_unknown_after_send":
+                counts["delivery_unknown_after_send"] += 1
             if (
                 idx < len(candidates) - 1
-                and outcome in {"sent", "dispatch_failed"}
+                and outcome
+                in {"sent", "dispatch_failed", "delivery_unknown_after_send"}
                 and settings.TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS > 0
             ):
                 await asyncio.sleep(
