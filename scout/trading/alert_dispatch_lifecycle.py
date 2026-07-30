@@ -65,6 +65,10 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 # --- outcome values ---------------------------------------------------------
 DISPATCH_PENDING = "dispatch_pending"
 DISPATCH_ATTEMPTED = "dispatch_attempted"
@@ -158,6 +162,20 @@ async def promote_sent(db, row_id: int | None, *, lease: str) -> bool:
     return rc == 1
 
 
+async def _read_row_state(db, row_id: int) -> tuple[str | None, str | None]:
+    """Read the current ``(outcome, dispatch_lease_token)`` for a row — a plain
+    read on the shared connection (no transaction needed)."""
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return (None, None)
+    cur = await conn.execute(
+        "SELECT outcome, dispatch_lease_token FROM tg_alert_log WHERE id=?",
+        (row_id,),
+    )
+    row = await cur.fetchone()
+    return (row[0], row[1]) if row is not None else (None, None)
+
+
 async def recover_sent_after_confirmed_acceptance(
     db, row_id: int | None, *, lease: str
 ) -> bool:
@@ -165,8 +183,11 @@ async def recover_sent_after_confirmed_acceptance(
     provider acceptance whose row was moved to ``delivery_unknown_after_send`` by a
     racing reconcile (which preserves the lease token) is promoted unknown -> sent,
     guarded on the owner ``lease`` — so ONLY the acceptance owner can perform it.
-    Records the recovery in ``detail`` (a durable audit trail) so the reconciled
-    unknown is never silently overwritten. Returns True iff recovered.
+    Records the recovery in ``detail`` (a durable DB audit trail) AND emits a
+    structured ``alert_dispatch_recovery`` audit log capturing: the original lease,
+    the current row state at recovery time (outcome + lease), the acceptance
+    evidence, and whether the recovery actually changed the row. Returns True iff
+    recovered.
 
     Under the SEND_OPERATION_DEADLINE_SECONDS guarantee this path is unreachable
     in practice (an active send cannot be reconciled); it exists so a confirmed
@@ -174,6 +195,8 @@ async def recover_sent_after_confirmed_acceptance(
     return."""
     if row_id is None:
         return False
+    # Current row state at recovery time (audit input) — read BEFORE the CAS.
+    state_at_recovery, lease_at_recovery = await _read_row_state(db, row_id)
     rc = await db.execute_write(
         f"UPDATE tg_alert_log SET outcome='{SENT}', dispatch_state_updated_at=?, "
         f"detail=COALESCE(detail, '') || "
@@ -181,19 +204,47 @@ async def recover_sent_after_confirmed_acceptance(
         f"WHERE id=? AND outcome='{DELIVERY_UNKNOWN}' AND dispatch_lease_token=?",
         (_now_iso(), row_id, lease),
     )
-    return rc == 1
+    recovered = rc == 1
+    log.info(
+        "alert_dispatch_recovery",
+        tg_alert_log_id=row_id,
+        original_lease=lease,
+        state_at_recovery=state_at_recovery,
+        lease_at_recovery=lease_at_recovery,
+        acceptance_evidence="provider_confirmed_acceptance",
+        recovered=recovered,
+    )
+    return recovered
+
+
+async def _is_sent_under_lease(db, row_id: int, lease: str) -> bool:
+    outcome, row_lease = await _read_row_state(db, row_id)
+    return outcome == SENT and row_lease == lease
 
 
 async def finalize_confirmed_sent(db, row_id: int | None, *, lease: str) -> bool:
-    """Persist a CONFIRMED provider acceptance as durable ``sent`` (B2). Tries the
-    normal attempted -> sent promotion; if a racing reconcile already moved the row
-    to ``delivery_unknown_after_send``, performs the ownership-safe unknown -> sent
-    recovery. Returns True IFF the row is now durably ``sent`` under this lease — the
-    caller MUST derive its returned/counted/logged outcome from this boolean so DB
-    state, return value, counters, and logs can never disagree."""
+    """Persist a CONFIRMED provider acceptance as durable ``sent`` (B2). Contract:
+    returns True IFF the row is now durably ``sent`` UNDER THIS LEASE — the caller
+    MUST derive its returned/counted/logged outcome from this boolean so DB state,
+    return value, counters, and logs can never disagree.
+
+    Order: (1) the normal ``dispatch_attempted -> sent`` promotion; (2) if a racing
+    reconcile already moved the row to ``delivery_unknown_after_send``, the
+    ownership-safe unknown -> sent recovery; (3) idempotent short-circuit — if the
+    row is ALREADY ``sent`` under our lease (acceptance already proven durable),
+    return True without a further write. Returns False ONLY when ownership is lost
+    AND durable recovery cannot independently prove acceptance (e.g. an operator
+    resolved the row to ``unknown_resolved_retryable`` or a newer attempt rotated
+    the lease token)."""
+    if row_id is None:
+        return False
     if await promote_sent(db, row_id, lease=lease):
         return True
-    return await recover_sent_after_confirmed_acceptance(db, row_id, lease=lease)
+    if await recover_sent_after_confirmed_acceptance(db, row_id, lease=lease):
+        return True
+    # Neither transition applied — succeed ONLY if the row is already durably 'sent'
+    # under our lease (idempotent); otherwise ownership is lost -> False.
+    return await _is_sent_under_lease(db, row_id, lease)
 
 
 async def demote_failed(db, row_id: int | None, *, lease: str, detail: str) -> bool:

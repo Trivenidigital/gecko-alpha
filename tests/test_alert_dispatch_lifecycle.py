@@ -928,3 +928,91 @@ async def test_recover_blocked_after_new_attempt_token(tmp_path):
     assert await lc.recover_sent_after_confirmed_acceptance(db, rid, lease=new) is True
     assert await _outcome(db, rid) == "sent"
     await db.close()
+
+
+# --- B2 detail-2: finalize False-return contract + recovery audit fields ------
+
+
+@pytest.mark.asyncio
+async def test_finalize_returns_false_when_ownership_lost(tmp_path):
+    """finalize returns False ONLY when ownership is lost AND durable recovery
+    cannot independently prove acceptance: an operator-resolved row
+    (unknown_resolved_retryable) and a rotated-lease-token unknown row both yield
+    False, with the row unchanged."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    r1 = await _seed(
+        db, "op", "unknown_resolved_retryable", lease=lease, updated_at=_fresh_iso()
+    )
+    assert await lc.finalize_confirmed_sent(db, r1, lease=lease) is False
+    assert await _outcome(db, r1) == "unknown_resolved_retryable"
+    r2 = await _seed(
+        db, "rot", "delivery_unknown_after_send", lease="OLD", updated_at=_fresh_iso()
+    )
+    await db.execute_write(
+        "UPDATE tg_alert_log SET dispatch_lease_token='NEW' WHERE id=?", (r2,)
+    )
+    assert await lc.finalize_confirmed_sent(db, r2, lease="OLD") is False
+    assert await _outcome(db, r2) == "delivery_unknown_after_send"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_idempotent_when_already_sent_under_lease(tmp_path):
+    """If the row is ALREADY 'sent' under our lease, finalize returns True
+    (idempotent — acceptance already durable). A DIFFERENT lease never gets a false
+    success on someone else's 'sent' row."""
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    rid = await _seed(db, "s", "sent", lease=lease, updated_at=_fresh_iso())
+    assert await lc.finalize_confirmed_sent(db, rid, lease=lease) is True
+    assert await _outcome(db, rid) == "sent"
+    assert await lc.finalize_confirmed_sent(db, rid, lease="other") is False
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_audit_records_all_required_fields(tmp_path):
+    """The recovery audit log records the original lease, the current row state at
+    recovery time (outcome + lease), the acceptance evidence, and whether the
+    recovery actually changed the row — for BOTH a successful and a blocked
+    recovery."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "d.db")
+    await db.initialize()
+    lease = lc.new_lease()
+    rid = await _seed(
+        db, "u", "delivery_unknown_after_send", lease=lease, updated_at=_fresh_iso()
+    )
+    with capture_logs() as logs:
+        assert (
+            await lc.recover_sent_after_confirmed_acceptance(db, rid, lease=lease)
+            is True
+        )
+    rec = [e for e in logs if e["event"] == "alert_dispatch_recovery"]
+    assert len(rec) == 1
+    e = rec[0]
+    assert e["original_lease"] == lease
+    assert e["state_at_recovery"] == "delivery_unknown_after_send"
+    assert e["lease_at_recovery"] == lease
+    assert e["acceptance_evidence"] == "provider_confirmed_acceptance"
+    assert e["recovered"] is True
+
+    # blocked recovery (wrong lease) also audits with recovered=False + real state.
+    r2 = await _seed(
+        db, "u2", "delivery_unknown_after_send", lease=lease, updated_at=_fresh_iso()
+    )
+    with capture_logs() as logs2:
+        assert (
+            await lc.recover_sent_after_confirmed_acceptance(db, r2, lease="wrong")
+            is False
+        )
+    e2 = [x for x in logs2 if x["event"] == "alert_dispatch_recovery"][0]
+    assert e2["recovered"] is False
+    assert e2["original_lease"] == "wrong"
+    assert e2["state_at_recovery"] == "delivery_unknown_after_send"
+    assert e2["lease_at_recovery"] == lease
+    await db.close()

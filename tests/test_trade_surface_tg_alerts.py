@@ -1263,3 +1263,47 @@ async def test_b1_unknown_typed_path_never_demoted_reservations_intact(
     assert r2["blocked_dedup_24h"] == 1 and r2["sent"] == 0
     assert sent == []
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# B2 deadline-wrap scope: the lane's asyncio.wait_for wraps the ENTIRE
+# send_telegram_message coroutine (the exact wrap site is
+# `asyncio.wait_for(alerter.send_telegram_message(...), timeout=...)`), which
+# encloses the initial pacing sleep, the HTTP call + body read/parse, the 429
+# retry WAIT, and the retried HTTP call — NOT an individual HTTP call. A path
+# stalled inside ANY of those internal frames is cut at the deadline (< the 300s
+# stale threshold) and classified delivery_unknown_after_send, so no send path can
+# remain active once the stale threshold becomes eligible.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b2_deadline_cuts_stall_inside_retry_wait(tmp_path, monkeypatch):
+    from scout.trading import alert_dispatch_lifecycle as lifecycle
+
+    db = Database(tmp_path / "s.db")
+    await db.initialize()
+    monkeypatch.setattr(lifecycle, "SEND_OPERATION_DEADLINE_SECONDS", 0.05)
+    _patch_candidates(monkeypatch, "stalltok")
+    with aioresponses() as m:
+        # A 429 whose in-budget retry_after triggers the in-call retry WAIT
+        # (asyncio.sleep(retry_after) inside send_telegram_message) — a frame that
+        # is NOT the HTTP call. It exceeds the shrunk deadline and is cut.
+        m.post(
+            _TG_URL,
+            status=429,
+            payload={"ok": False, "parameters": {"retry_after": 2}},
+        )
+        async with aiohttp.ClientSession() as session:
+            result = await send_trade_surface_alerts(
+                db,
+                _settings(TG_PACING_ENABLED=True, TG_PACING_MAX_WAIT_SECONDS=30),
+                session,
+            )
+    assert result["delivery_unknown_after_send"] == 1
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id='stalltok' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert (await cur.fetchone())[0] == "delivery_unknown_after_send"
+    await db.close()
