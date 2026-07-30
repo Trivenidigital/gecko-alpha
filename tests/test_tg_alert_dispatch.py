@@ -1361,3 +1361,176 @@ async def test_b1_paper_real_http_maps_to_outcome(
             )
     assert await _last_outcome(db) == expected
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# FU-1 (rev7): the migrated claim block + _log_outcome now run through the common
+# transaction manager, so ANY failure (body write, commit, or inside _log_outcome)
+# rolls back cleanly — no partial row, the shared connection is NOT left in a
+# transaction, _txn_lock is released, the NEXT db.transaction() succeeds, and a
+# previously committed foreign write is never rolled back.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_foreign_row(db):
+    await db.execute_write(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+        "VALUES (NULL, 'other', 'foreign', ?, 'sent')",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+async def _assert_clean_after_failure(db, *, token):
+    # no partial row for the failed dispatch
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id=?", (token,)
+    )
+    assert (await cur.fetchone())[0] == 0, "partial row survived the rollback"
+    # connection is NOT left in a transaction; the lock is released
+    assert db._conn.in_transaction is False, "connection left mid-transaction"
+    assert not db._txn_lock.locked(), "_txn_lock was stranded"
+    # the NEXT manager transaction succeeds (lock + connection are usable)
+    async with db.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO tg_alert_log "
+            "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+            "VALUES (NULL, 's', 'after', ?, 'sent')",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id='after'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    # the previously committed foreign write is untouched
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id='foreign'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+
+async def _noop_reconcile(*a, **k):
+    return {"pending_failed": 0, "attempted_unknown": 0}
+
+
+@pytest.mark.asyncio
+async def test_fu1_claim_body_write_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(a): a claim-block body write that raises rolls back cleanly."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_foreign_row(db)
+    monkeypatch.setattr(
+        "scout.trading.alert_dispatch_lifecycle.reconcile_stale", _noop_reconcile
+    )
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    real_execute = db._conn.execute
+
+    async def _exec(sql, *a, **k):
+        if isinstance(sql, str) and "INSERT INTO tg_alert_log" in sql:
+            raise RuntimeError("injected claim body write failure")
+        return await real_execute(sql, *a, **k)
+
+    db._conn.execute = _exec
+    await _run_notify(db, token="bonk")  # notify swallows via its outer try/except
+    db._conn.execute = real_execute
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fu1_claim_commit_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(b): the claim write succeeds, then the manager COMMIT fails — the
+    written pending row is rolled back (no partial row) and the connection is clean."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_foreign_row(db)
+    monkeypatch.setattr(
+        "scout.trading.alert_dispatch_lifecycle.reconcile_stale", _noop_reconcile
+    )
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    real_execute = db._conn.execute
+    real_commit = db._conn.commit
+    armed = {"claim_written": False, "fired": False}
+
+    async def _exec(sql, *a, **k):
+        r = await real_execute(sql, *a, **k)
+        if isinstance(sql, str) and "INSERT INTO tg_alert_log" in sql:
+            armed["claim_written"] = True  # the pending row is now in the txn
+        return r
+
+    async def _commit():
+        if armed["claim_written"] and not armed["fired"]:
+            armed["fired"] = True
+            raise RuntimeError("injected commit failure")
+        return await real_commit()
+
+    db._conn.execute = _exec
+    db._conn.commit = _commit
+    await _run_notify(db, token="bonk")
+    db._conn.execute = real_execute
+    db._conn.commit = real_commit
+    assert armed["fired"], "commit injection did not fire on the claim txn"
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fu1_log_outcome_commit_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(c): a failure inside _log_outcome (now db.execute_write) rolls back
+    cleanly — the audit row is not partially written and the connection is clean."""
+    from scout.trading.tg_alert_dispatch import _log_outcome
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=1)  # FK target for _log_outcome
+    await _seed_foreign_row(db)
+    real_commit = db._conn.commit
+    fired = {"v": False}
+
+    async def _commit():
+        if not fired["v"]:
+            fired["v"] = True
+            raise RuntimeError("injected _log_outcome commit failure")
+        return await real_commit()
+
+    db._conn.commit = _commit
+    with pytest.raises(RuntimeError):
+        await _log_outcome(
+            db,
+            paper_trade_id=1,
+            signal_type="gainers_early",
+            token_id="bonk",
+            outcome="blocked_eligibility",
+        )
+    db._conn.commit = real_commit
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+def test_fu1_ruled_paths_use_manager_not_bare_lock():
+    """FU-1: the two ruled paths route through the transaction manager /
+    execute_write (never a bare `async with db._txn_lock` + direct `_conn` write),
+    so they inherit the manager's rollback/cleanup discipline."""
+    import inspect
+
+    from scout.trading import tg_alert_dispatch
+
+    notify_src = inspect.getsource(tg_alert_dispatch.notify_paper_trade_opened)
+    assert "db.transaction(" in notify_src
+    assert "async with db._txn_lock" not in notify_src
+    assert "db._conn.commit()" not in notify_src
+
+    log_src = inspect.getsource(tg_alert_dispatch._log_outcome)
+    assert "execute_write(" in log_src
+    assert "async with db._txn_lock" not in log_src
+    assert "db._conn.commit()" not in log_src

@@ -473,7 +473,17 @@ async def notify_paper_trade_opened(
         # every subsequent transition so a stale sweep can never demote THIS
         # dispatch while it is still preprocessing / sending.
         lease = lifecycle.new_lease()
-        async with db._txn_lock:
+        # FU-1 (rev7): the atomic dedup-claim runs entirely through the common
+        # transaction manager — BEGIN IMMEDIATE + every statement on the yielded
+        # ``conn`` + a single manager-owned COMMIT/ROLLBACK. No direct ``db._conn``
+        # writes and no bare ``commit()``: a failed later statement or COMMIT can
+        # never strand the shared connection mid-transaction (which would fail the
+        # NEXT ``BEGIN IMMEDIATE`` and foreign-rollback another writer — the F2
+        # failure class). The dedup-blocked branch commits the audit row via the
+        # manager and defers its structured log to AFTER the commit.
+        is_suppressed = False
+        suppressed_prior_alerted_at = None
+        async with db.transaction() as conn:
             now_iso = datetime.now(timezone.utc).isoformat()
             if window_hours > 0:
                 cutoff = (
@@ -482,7 +492,7 @@ async def notify_paper_trade_opened(
                 # P0-1: claim a RESERVED slot as 'dispatch_pending' (NOT a
                 # pre-emptive 'sent'); dedup treats sent + pending + attempted +
                 # unknown as claimed. The claim stamps the lease token + heartbeat.
-                cur = await db._conn.execute(
+                cur = await conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
                     " dispatch_state_updated_at, dispatch_lease_token) "
@@ -506,7 +516,7 @@ async def notify_paper_trade_opened(
                 )
                 claimed = await cur.fetchone()
                 if claimed is None:
-                    cur = await db._conn.execute(
+                    cur = await conn.execute(
                         "SELECT alerted_at FROM tg_alert_log "
                         f"WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
                         "AND alerted_at >= ? "
@@ -514,8 +524,10 @@ async def notify_paper_trade_opened(
                         (token_id, cutoff),
                     )
                     prior = await cur.fetchone()
-                    prior_alerted_at = prior[0] if prior is not None else None
-                    await db._conn.execute(
+                    suppressed_prior_alerted_at = (
+                        prior[0] if prior is not None else None
+                    )
+                    await conn.execute(
                         "INSERT INTO tg_alert_log "
                         "(paper_trade_id, signal_type, token_id, alerted_at, "
                         " outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
@@ -528,25 +540,14 @@ async def notify_paper_trade_opened(
                             f"window_h={window_hours}",
                         ),
                     )
-                    await db._conn.commit()
-                    # §12b: audit the suppression. No TG send happens; the
-                    # paper_trades row is unaffected (opened upstream).
-                    log.info(
-                        "tg_alert_suppressed",
-                        token_id=token_id,
-                        signal_type=signal_type,
-                        window_hours=window_hours,
-                        dedup_window_hours=window_hours,
-                        prior_alerted_at=prior_alerted_at,
-                        reason="dedup_24h",
-                    )
-                    return
-                # NOTE: sent_row_id holds the DISPATCH row id (state
-                # dispatch_pending here; promoted to 'sent' only post-acceptance).
-                sent_row_id = claimed[0]
+                    is_suppressed = True
+                else:
+                    # NOTE: sent_row_id holds the DISPATCH row id (state
+                    # dispatch_pending here; promoted to 'sent' only post-accept).
+                    sent_row_id = claimed[0]
             else:
                 # Dedup disabled: direct claim as 'dispatch_pending' (with lease).
-                cur = await db._conn.execute(
+                cur = await conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
                     " dispatch_state_updated_at, dispatch_lease_token) "
@@ -562,7 +563,20 @@ async def notify_paper_trade_opened(
                 )
                 claimed = await cur.fetchone()
                 sent_row_id = claimed[0]
-            await db._conn.commit()
+            # Manager commits the claim (and any blocked_dedup_24h row) on clean exit.
+        if is_suppressed:
+            # §12b: audit the suppression AFTER the commit. No TG send happens; the
+            # paper_trades row is unaffected (opened upstream).
+            log.info(
+                "tg_alert_suppressed",
+                token_id=token_id,
+                signal_type=signal_type,
+                window_hours=window_hours,
+                dedup_window_hours=window_hours,
+                prior_alerted_at=suppressed_prior_alerted_at,
+                reason="dedup_24h",
+            )
+            return
 
         # M1.5c BL-NEW-M1.5C: Minara DEX-eligibility check. After cooldown
         # claim (outside lock) so 100-500ms CG latency doesn't extend
@@ -775,18 +789,20 @@ async def _log_outcome(
 ) -> None:
     if db._conn is None:
         return
-    async with db._txn_lock:
-        await db._conn.execute(
-            "INSERT INTO tg_alert_log "
-            "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                paper_trade_id,
-                signal_type,
-                token_id,
-                datetime.now(timezone.utc).isoformat(),
-                outcome,
-                detail,
-            ),
-        )
-        await db._conn.commit()
+    # FU-1 (rev7): route the single-statement audit write through the common
+    # disciplined helper (BEGIN IMMEDIATE + one statement + manager-owned COMMIT/
+    # ROLLBACK) instead of a bare ``_txn_lock`` + direct ``db._conn`` write + bare
+    # ``commit()`` — no way to strand the shared connection mid-transaction.
+    await db.execute_write(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            paper_trade_id,
+            signal_type,
+            token_id,
+            datetime.now(timezone.utc).isoformat(),
+            outcome,
+            detail,
+        ),
+    )

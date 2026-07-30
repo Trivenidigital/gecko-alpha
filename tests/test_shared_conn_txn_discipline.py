@@ -595,16 +595,134 @@ def test_log_processors_emit_exception_info():
 #   - Database.resolve_delivery_unknown_as_retryable: operator-only, audited
 #     resolution of a delivery_unknown row into unknown_resolved_retryable —
 #     holds _txn_lock via acquire()+try/finally (not async-with).
-# The `_migrate_*` / `_create_*` init-time DDL migrations (serial before any
-# create_task, no concurrency; use BEGIN EXCLUSIVE directly) are exempt via a
-# path+class-scoped PREFIX rule (see `_SharedConnAudit._allowed`), applied ONLY
-# to db.py's Database methods — never to a like-named function elsewhere.
+# The init-time DDL migrations / table creators (serial before any create_task,
+# no concurrency; BEGIN EXCLUSIVE directly) are exempt via EXACT enumerated
+# entries in `_MIGRATION_ALLOWLIST` — there is NO prefix/wildcard/directory/
+# substring exemption anywhere (product-owner ruling); a new migration without an
+# exact entry FAILS the scan.
 _SCOPED_ALLOWLIST = frozenset(
     {
         ("scout/db.py", "Database.transaction"),
         ("scout/db.py", "Database.record_minara_alert_emission"),
         ("scout/db.py", "Database.record_tg_alert_operator_action"),
         ("scout/db.py", "Database.resolve_delivery_unknown_as_retryable"),
+    }
+)
+
+# RETAINED PRE-EXISTING MANUAL-LOCK PATTERN — ROLLBACK-PARITY DEBT.
+# Each entry is an ordinary runtime writer that serializes with a BARE
+# ``async with <db>._txn_lock:`` + direct ``_conn`` DML + bare ``commit()`` (no
+# transaction manager). After FU-1 (rev7) a bare lock is NOT protective, so these
+# would trip the structural guard. They are enumerated here — NOT migrated in this
+# narrow head — and surfaced for a reviewer disposition (migrate to
+# ``db.transaction()`` in a follow-up PR, vs accept the manual-lock pattern). The
+# TWO ruled FU-1 paths (tg_alert_dispatch.notify_paper_trade_opened's claim block
+# and tg_alert_dispatch._log_outcome) are deliberately ABSENT — they are migrated
+# to the manager in this head and must never be allowlisted.
+# Launch-criticality (rev7 product-owner ruling): entries marked
+# ``# LAUNCH-CRITICAL`` are directly on a live-money path (live order submission,
+# balance/fill reconciliation, kill-switch enforcement, duplicate prevention, or
+# exposure control). They are POTENTIALLY LAUNCH-CRITICAL rollback-parity debt and
+# may need migration to ``db.transaction()`` in a bounded follow-up BEFORE live
+# enablement (owner's supervised-live milestone: Kraken Aug 6). Classification
+# ONLY — none are migrated in rev7. Unmarked entries are off the live-money path.
+_MANUAL_LOCK_ALLOWLIST = frozenset(
+    {
+        ("scout/db.py", "Database.insert_conviction_watchlist_run"),
+        ("scout/db.py", "Database.insert_conviction_watchlist_snapshot"),
+        ("scout/db.py", "Database.insert_detection_decision_receipt"),
+        ("scout/db.py", "Database.run_incremental_vacuum"),
+        # LAUNCH-CRITICAL — live order submission / slippage record (Binance adapter)
+        ("scout/live/binance_adapter.py", "BinanceSpotAdapter._write_slippage_bps"),
+        ("scout/live/binance_adapter.py", "BinanceSpotAdapter.place_order_request"),
+        # LAUNCH-CRITICAL — consecutive-correction / exposure-control counters
+        ("scout/live/correction_counter.py", "increment_consecutive"),
+        ("scout/live/correction_counter.py", "reset_on_correction"),
+        # LAUNCH-CRITICAL — live dispatch / duplicate-prevention on paper->live open
+        ("scout/live/engine.py", "LiveEngine._dispatch_live"),
+        ("scout/live/engine.py", "LiveEngine.on_paper_trade_opened"),
+        # LAUNCH-CRITICAL — kill-switch enforcement (trigger/clear)
+        ("scout/live/kill_switch.py", "KillSwitch.clear"),
+        ("scout/live/kill_switch.py", "KillSwitch.trigger"),
+        # LAUNCH-CRITICAL — live position close / exposure control
+        ("scout/live/live_evaluator.py", "_close_live_trade"),
+        ("scout/live/live_evaluator.py", "_mark_exit_needs_review"),
+        ("scout/live/metrics.py", "inc"),
+        # LAUNCH-CRITICAL — balance/fill reconciliation (crossed rows / recovered fills)
+        ("scout/live/reconciliation.py", "_close_crossed_row"),
+        ("scout/live/reconciliation.py", "_flag_live_review"),
+        ("scout/live/reconciliation.py", "_persist_recovered_fill"),
+        ("scout/live/resolver.py", "VenueResolver._cache_put_negative"),
+        ("scout/live/resolver.py", "VenueResolver._cache_put_positive"),
+        ("scout/live/shadow_evaluator.py", "_bump_review"),
+        ("scout/live/shadow_evaluator.py", "_close_shadow_trade"),
+        ("scout/main.py", "_maybe_announce_m1_5c"),
+        ("scout/main.py", "_maybe_announce_tg_alerts"),
+        ("scout/outcome_ledger.py", "purge_expired_enrollments"),
+        ("scout/social/telegram/listener.py", "_persist_message_with_watermark"),
+        ("scout/trading/detection_alert.py", "_log_detection_outcome"),
+        ("scout/trading/receipt_archive.py", "ReceiptArchiver._delete_hot_rows"),
+        ("scout/trading/receipt_archive.py", "ReceiptArchiver._insert_manifest"),
+        ("scout/trading/receipt_archive.py", "ReceiptArchiver._mark_offhost_confirmed"),
+    }
+)
+
+# Init-time DDL migrations / table creators in db.py's Database class. They run
+# SERIALLY at initialize() before any create_task (no concurrency) and use
+# BEGIN EXCLUSIVE directly. EXACT (path, Class.method) enumeration — NO prefix /
+# wildcard / directory / substring exemption (product-owner ruling). A NEW
+# migration added without an entry here will FAIL the scan, forcing review.
+_MIGRATION_ALLOWLIST = frozenset(
+    {
+        ("scout/db.py", "Database._create_tables"),
+        ("scout/db.py", "Database._migrate_actionability_entry_snapshot_v1"),
+        ("scout/db.py", "Database._migrate_autosuspend_baseline_column"),
+        ("scout/db.py", "Database._migrate_bl_quote_pair_v1"),
+        ("scout/db.py", "Database._migrate_bl_slow_burn_v1"),
+        ("scout/db.py", "Database._migrate_chain_pattern_provenance_v1"),
+        ("scout/db.py", "Database._migrate_cohort_digest_state_v1"),
+        ("scout/db.py", "Database._migrate_detection_decision_receipts_v1"),
+        ("scout/db.py", "Database._migrate_detection_receipt_archive_v1"),
+        ("scout/db.py", "Database._migrate_dex_discovery_v1"),
+        ("scout/db.py", "Database._migrate_dex_instrumentation_v1"),
+        ("scout/db.py", "Database._migrate_entry_snapshot_liquidity_provenance_v1"),
+        ("scout/db.py", "Database._migrate_feedback_loop_schema"),
+        ("scout/db.py", "Database._migrate_gainer_acceleration_v1"),
+        ("scout/db.py", "Database._migrate_high_peak_fade_columns_and_audit_table"),
+        ("scout/db.py", "Database._migrate_ingest_watchdog_state_v1"),
+        ("scout/db.py", "Database._migrate_ledger_enrollment_evictions_v1"),
+        ("scout/db.py", "Database._migrate_liquidity_enrichment_v1"),
+        ("scout/db.py", "Database._migrate_live_client_order_id"),
+        ("scout/db.py", "Database._migrate_live_eligible_column"),
+        ("scout/db.py", "Database._migrate_live_trades_telemetry"),
+        ("scout/db.py", "Database._migrate_live_trading_schema"),
+        ("scout/db.py", "Database._migrate_minara_alert_emissions_v1"),
+        ("scout/db.py", "Database._migrate_moonshot_opt_out_column"),
+        ("scout/db.py", "Database._migrate_moved_already_postmortems_v1"),
+        ("scout/db.py", "Database._migrate_narrative_resolution_status_v1"),
+        ("scout/db.py", "Database._migrate_narrative_resolver_errors_v1"),
+        ("scout/db.py", "Database._migrate_narrative_scanner_v1"),
+        ("scout/db.py", "Database._migrate_per_venue_services"),
+        ("scout/db.py", "Database._migrate_predictions_coin_predicted_id_idx_v1"),
+        ("scout/db.py", "Database._migrate_price_provenance_v1"),
+        ("scout/db.py", "Database._migrate_reject_reason_extend"),
+        ("scout/db.py", "Database._migrate_reject_reason_extend_v2"),
+        ("scout/db.py", "Database._migrate_retire_dead_tables_v1"),
+        ("scout/db.py", "Database._migrate_scanned_at_index"),
+        ("scout/db.py", "Database._migrate_signal_outcome_ledger_v1"),
+        ("scout/db.py", "Database._migrate_signal_params_schema"),
+        ("scout/db.py", "Database._migrate_source_call_price_snapshot_runs_v1"),
+        ("scout/db.py", "Database._migrate_source_call_price_snapshots_v1"),
+        ("scout/db.py", "Database._migrate_source_calls_v1"),
+        ("scout/db.py", "Database._migrate_symbol_upper_indexes_v1"),
+        ("scout/db.py", "Database._migrate_tg_alert_eligible_v1"),
+        ("scout/db.py", "Database._migrate_tg_alert_log_dedup_outcome"),
+        ("scout/db.py", "Database._migrate_tg_alert_log_dispatch_lease_v1"),
+        ("scout/db.py", "Database._migrate_tg_alert_log_dispatch_pending_outcome"),
+        ("scout/db.py", "Database._migrate_tg_alert_log_m1_5c_outcome"),
+        ("scout/db.py", "Database._migrate_tg_alert_operator_actions_v1"),
+        ("scout/db.py", "Database._migrate_tg_alert_unknown_resolution_audit_v1"),
+        ("scout/db.py", "Database._migrate_trade_decision_events_v1"),
     }
 )
 
@@ -690,8 +808,13 @@ class _SharedConnAudit(ast.NodeVisitor):
     # -- protective regions --------------------------------------------------
     @staticmethod
     def _protective_root(item: ast.withitem) -> str | None:
-        """Root of a structurally-approved protective context, else None.
-        ``<root>.transaction()`` -> root; ``<root>._txn_lock`` -> root."""
+        """Root of a structurally-approved protective context, else None. ONLY the
+        manager ``<root>.transaction()`` protects ordinary runtime DML (it owns
+        BEGIN IMMEDIATE + COMMIT/ROLLBACK, so a failed statement can never strand
+        the shared connection). A BARE ``async with <root>._txn_lock`` is
+        deliberately NOT protective (FU-1 rev7): it serializes but has no
+        rollback/cleanup discipline, so ordinary DML under it must FAIL the scan
+        unless the function is on the exact reviewed manual-lock allowlist."""
         ctx = item.context_expr
         if (
             isinstance(ctx, ast.Call)
@@ -699,8 +822,6 @@ class _SharedConnAudit(ast.NodeVisitor):
             and ctx.func.attr == "transaction"
         ):
             return ast.unparse(ctx.func.value)
-        if isinstance(ctx, ast.Attribute) and ctx.attr == "_txn_lock":
-            return ast.unparse(ctx.value)
         return None
 
     def visit_AsyncWith(self, node):
@@ -772,17 +893,17 @@ class _SharedConnAudit(ast.NodeVisitor):
         return fn
 
     def _allowed(self) -> bool:
-        fn = self.func_stack[-1] if self.func_stack else "<module>"
-        if (self.path, self._qualified_fn()) in _SCOPED_ALLOWLIST:
-            return True
-        # The _migrate_*/_create_* prefix exemption is scoped to db.py's
-        # Database class methods, verified at audit time by path + enclosing
-        # class — never applied to a like-named function in another module/class.
+        # EXACT (path, qualified-function) allowlists ONLY — no prefix / wildcard /
+        # directory / substring exemption anywhere (product-owner ruling). A
+        # like-named function in another module/class, or a NEW migration without
+        # an entry, is NOT exempt and FAILS the scan.
+        key = (self.path, self._qualified_fn())
         return (
-            self.path == "scout/db.py"
-            and bool(self.class_stack)
-            and self.class_stack[-1] == "Database"
-            and (fn.startswith("_migrate") or fn.startswith("_create"))
+            key in _SCOPED_ALLOWLIST
+            or key in _MIGRATION_ALLOWLIST
+            # Retained pre-existing manual-lock writers (rollback-parity debt) —
+            # enumerated + surfaced for reviewer disposition, not migrated here.
+            or key in _MANUAL_LOCK_ALLOWLIST
         )
 
     def _flag(self, node, kind: str) -> None:
@@ -985,6 +1106,22 @@ _BAD_FIXTURES = {
         "scout/foo.py",
         "class C:\n async def _create_thing(self):\n  await self._conn.execute('INSERT INTO t VALUES (1)')\n",
     ),
+    # FU-1 (rev7) compliance: the prefix rule is GONE — a NEW _migrate_* method in
+    # db.py's Database that is NOT in the exact _MIGRATION_ALLOWLIST still FLAGS.
+    "unenumerated_migration_in_db_py": (
+        "scout/db.py",
+        "class Database:\n async def _migrate_not_enumerated(self):\n  await self._conn.execute('INSERT INTO t VALUES (1)')\n  await self._conn.commit()\n",
+    ),
+    # FU-1 (rev7): a BARE `async with db._txn_lock` is NOT protective — ordinary
+    # runtime DML under it (in a function NOT on the manual-lock allowlist) flags.
+    "bare_txn_lock_dml": (
+        "scout/x.py",
+        "async def f(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
+    ),
+    "bare_self_db_txn_lock_dml": (
+        "scout/x.py",
+        "class C:\n async def m(self):\n  async with self._db._txn_lock:\n   await self._db._conn.execute('UPDATE t SET x=1')\n   await self._db._conn.commit()\n",
+    ),
 }
 
 _GOOD_FIXTURES = {
@@ -992,19 +1129,16 @@ _GOOD_FIXTURES = {
         "scout/x.py",
         "async def f(db):\n async with db.transaction() as conn:\n  await conn.execute('INSERT INTO t VALUES (1)')\n",
     ),
-    "in_txn_lock": (
-        "scout/x.py",
-        "async def f(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
-    ),
     "conn_kwarg_in_txn": (
         "scout/x.py",
         "async def f(db):\n async with db.transaction() as conn:\n  await emit_event(db, 'x', conn=db._conn)\n",
     ),
-    # migration_ok is exempt only under the path+class-scoped prefix rule, so it
-    # MUST be audited as a db.py Database method.
+    # migration_ok is exempt only via an EXACT enumerated entry in
+    # _MIGRATION_ALLOWLIST (no prefix rule), so it must use a real enumerated
+    # migration name at scout/db.py.
     "migration_ok": (
         "scout/db.py",
-        "class Database:\n async def _migrate_x(self):\n  await self._conn.execute('INSERT INTO schema_version VALUES (1)')\n  await self._conn.commit()\n",
+        "class Database:\n async def _migrate_dex_discovery_v1(self):\n  await self._conn.execute('INSERT INTO schema_version VALUES (1)')\n  await self._conn.commit()\n",
     ),
     "separate_conn": (
         "scout/x.py",
@@ -1019,9 +1153,11 @@ _GOOD_FIXTURES = {
         "scout/x.py",
         "async def f(db):\n sql = 'SELECT * FROM t'\n await db._conn.execute(sql)\n",
     ),
-    "self_db_txn_lock_root_match": (
-        "scout/x.py",
-        "class C:\n async def m(self):\n  async with self._db._txn_lock:\n   await self._db._conn.execute('UPDATE t SET x=1')\n   await self._db._conn.commit()\n",
+    # FU-1 (rev7): a bare-lock DML in a function ON the reviewed manual-lock
+    # allowlist (retained rollback-parity debt) is exempt at its exact path+fn.
+    "allowlisted_manual_lock": (
+        "scout/live/metrics.py",
+        "async def inc(db):\n async with db._txn_lock:\n  await db._conn.execute('UPDATE t SET x=1')\n  await db._conn.commit()\n",
     ),
     # B3.2 — a pure `WITH ... SELECT` CTE read carries no DML keyword: SAFE.
     "cte_select": (
