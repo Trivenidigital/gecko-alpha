@@ -64,7 +64,7 @@ class HealthProbe(VenueService):
             auth_ok = 0
             error_text = f"{type(exc).__name__}: {exc}"
 
-        await db._conn.execute(
+        await db.execute_write(
             """INSERT INTO venue_health
                (venue, probe_at, rest_responsive, rest_latency_ms,
                 ws_connected, rate_limit_headroom_pct, auth_ok,
@@ -82,7 +82,6 @@ class HealthProbe(VenueService):
                 error_text,
             ),
         )
-        await db._conn.commit()
         log.info(
             "health_probe_completed",
             venue=venue,

@@ -195,93 +195,96 @@ async def evaluate_pending(
 
     now = datetime.now(timezone.utc)
 
-    for row in rows:
-        pred_id = row[0]
-        coin_id = row[1]
-        price_at_pred = float(row[2])
-        predicted_at = datetime.fromisoformat(str(row[3])).replace(tzinfo=timezone.utc)
-        cls_6h = row[4]
-        cls_24h = row[5]
-        cls_48h = row[6]
-        peak_price = float(row[7]) if row[7] is not None else None
-        peak_change_pct = float(row[8]) if row[8] is not None else None
-        peak_at_raw = row[9]
-        retry_count = int(row[10]) if row[10] is not None else 0
+    async with db.transaction() as conn:
+        for row in rows:
+            pred_id = row[0]
+            coin_id = row[1]
+            price_at_pred = float(row[2])
+            predicted_at = datetime.fromisoformat(str(row[3])).replace(
+                tzinfo=timezone.utc
+            )
+            cls_6h = row[4]
+            cls_24h = row[5]
+            cls_48h = row[6]
+            peak_price = float(row[7]) if row[7] is not None else None
+            peak_change_pct = float(row[8]) if row[8] is not None else None
+            peak_at_raw = row[9]
+            retry_count = int(row[10]) if row[10] is not None else 0
 
-        current_price = prices.get(coin_id)
+            current_price = prices.get(coin_id)
 
-        # --- Guard against division by zero ---
-        if price_at_pred <= 0:
-            continue
+            # --- Guard against division by zero ---
+            if price_at_pred <= 0:
+                continue
 
-        # --- Price unavailable handling ---
-        if current_price is None:
-            retry_count += 1
-            if retry_count >= 3:
+            # --- Price unavailable handling ---
+            if current_price is None:
+                retry_count += 1
+                if retry_count >= 3:
+                    await conn.execute(
+                        """UPDATE predictions
+                           SET outcome_class = 'UNRESOLVED',
+                               outcome_reason = 'price_unavailable',
+                               eval_retry_count = ?,
+                               evaluated_at = ?
+                           WHERE id = ?""",
+                        (retry_count, now.isoformat(), pred_id),
+                    )
+                else:
+                    await conn.execute(
+                        "UPDATE predictions SET eval_retry_count = ? WHERE id = ?",
+                        (retry_count, pred_id),
+                    )
+                continue
+
+            # --- Peak tracking ---
+            reference = peak_price if peak_price is not None else price_at_pred
+            if current_price > reference:
+                peak_price = current_price
+                peak_change_pct = (
+                    (current_price - price_at_pred) / price_at_pred
+                ) * 100
+                peak_at_raw = now.isoformat()
                 await conn.execute(
                     """UPDATE predictions
-                       SET outcome_class = 'UNRESOLVED',
-                           outcome_reason = 'price_unavailable',
-                           eval_retry_count = ?,
-                           evaluated_at = ?
+                       SET peak_price = ?, peak_change_pct = ?, peak_at = ?
                        WHERE id = ?""",
-                    (retry_count, now.isoformat(), pred_id),
+                    (peak_price, peak_change_pct, peak_at_raw, pred_id),
                 )
-            else:
+
+            # --- Checkpoint evaluation ---
+            elapsed = now - predicted_at
+            change_pct = ((current_price - price_at_pred) / price_at_pred) * 100
+
+            updates: dict[str, object] = {}
+
+            # 6h checkpoint
+            if cls_6h is None and elapsed >= timedelta(hours=6):
+                cls_6h = classify_checkpoint(change_pct, hit_pct, miss_pct)
+                updates["outcome_6h_price"] = current_price
+                updates["outcome_6h_change_pct"] = round(change_pct, 4)
+                updates["outcome_6h_class"] = cls_6h
+
+            # 24h checkpoint
+            if cls_24h is None and elapsed >= timedelta(hours=24):
+                cls_24h = classify_checkpoint(change_pct, hit_pct, miss_pct)
+                updates["outcome_24h_price"] = current_price
+                updates["outcome_24h_change_pct"] = round(change_pct, 4)
+                updates["outcome_24h_class"] = cls_24h
+
+            # 48h checkpoint (final)
+            if cls_48h is None and elapsed >= timedelta(hours=48):
+                cls_48h = classify_checkpoint(change_pct, hit_pct, miss_pct)
+                updates["outcome_48h_price"] = current_price
+                updates["outcome_48h_change_pct"] = round(change_pct, 4)
+                updates["outcome_48h_class"] = cls_48h
+                updates["outcome_class"] = pick_final_class(cls_6h, cls_24h, cls_48h)
+                updates["evaluated_at"] = now.isoformat()
+
+            if updates:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                values = list(updates.values()) + [pred_id]
                 await conn.execute(
-                    "UPDATE predictions SET eval_retry_count = ? WHERE id = ?",
-                    (retry_count, pred_id),
+                    f"UPDATE predictions SET {set_clause} WHERE id = ?",
+                    values,
                 )
-            continue
-
-        # --- Peak tracking ---
-        reference = peak_price if peak_price is not None else price_at_pred
-        if current_price > reference:
-            peak_price = current_price
-            peak_change_pct = ((current_price - price_at_pred) / price_at_pred) * 100
-            peak_at_raw = now.isoformat()
-            await conn.execute(
-                """UPDATE predictions
-                   SET peak_price = ?, peak_change_pct = ?, peak_at = ?
-                   WHERE id = ?""",
-                (peak_price, peak_change_pct, peak_at_raw, pred_id),
-            )
-
-        # --- Checkpoint evaluation ---
-        elapsed = now - predicted_at
-        change_pct = ((current_price - price_at_pred) / price_at_pred) * 100
-
-        updates: dict[str, object] = {}
-
-        # 6h checkpoint
-        if cls_6h is None and elapsed >= timedelta(hours=6):
-            cls_6h = classify_checkpoint(change_pct, hit_pct, miss_pct)
-            updates["outcome_6h_price"] = current_price
-            updates["outcome_6h_change_pct"] = round(change_pct, 4)
-            updates["outcome_6h_class"] = cls_6h
-
-        # 24h checkpoint
-        if cls_24h is None and elapsed >= timedelta(hours=24):
-            cls_24h = classify_checkpoint(change_pct, hit_pct, miss_pct)
-            updates["outcome_24h_price"] = current_price
-            updates["outcome_24h_change_pct"] = round(change_pct, 4)
-            updates["outcome_24h_class"] = cls_24h
-
-        # 48h checkpoint (final)
-        if cls_48h is None and elapsed >= timedelta(hours=48):
-            cls_48h = classify_checkpoint(change_pct, hit_pct, miss_pct)
-            updates["outcome_48h_price"] = current_price
-            updates["outcome_48h_change_pct"] = round(change_pct, 4)
-            updates["outcome_48h_class"] = cls_48h
-            updates["outcome_class"] = pick_final_class(cls_6h, cls_24h, cls_48h)
-            updates["evaluated_at"] = now.isoformat()
-
-        if updates:
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            values = list(updates.values()) + [pred_id]
-            await conn.execute(
-                f"UPDATE predictions SET {set_clause} WHERE id = ?",
-                values,
-            )
-
-    await conn.commit()

@@ -102,7 +102,7 @@ async def test_expired_chain_writes_null_not_expired(db):
     because the hydrator filters WHERE outcome_class IS NULL."""
     pattern = _stub_pattern()
     chain = _stub_chain("TOKEN_A")
-    await _record_expired_chain(db, chain, pattern, datetime.now(timezone.utc))
+    await _record_expired_chain(db._conn, chain, pattern, datetime.now(timezone.utc))
     await db._conn.commit()
     cur = await db._conn.execute(
         "SELECT outcome_class FROM chain_matches WHERE token_id='TOKEN_A'"
@@ -120,7 +120,8 @@ async def test_hydrator_picks_up_null_expired_chain(db):
     pattern = _stub_pattern()
     chain = _stub_chain("TOKEN_B", anchor_offset_hours=72.0)
     long_ago = datetime.now(timezone.utc) - timedelta(hours=72)
-    await _record_expired_chain(db, chain, pattern, long_ago)
+    await _record_expired_chain(db._conn, chain, pattern, long_ago)
+    await db._conn.commit()
     await db._conn.execute(
         """INSERT INTO predictions
            (category_id, category_name, coin_id, symbol, name,
@@ -455,112 +456,116 @@ def test_chain_match_model_has_mcap_at_completion_field():
 
 
 # ---------------------------------------------------------------------------
-# BL-071a' v3 tests: writer wiring + DexScreener-resolved hydrator
+# BL-071a' v3 completion-write tests (F2: fetch happens in check_chains'
+# network phase OUTSIDE the transaction; the write phase stores the pre-fetched
+# mcap). These drive the REAL check_chains flow end-to-end.
 # ---------------------------------------------------------------------------
 
+_CHAIN_SETTINGS_KW = dict(
+    CHAIN_CHECK_INTERVAL_SEC=300,
+    CHAIN_MAX_WINDOW_HOURS=24.0,
+    CHAIN_COOLDOWN_HOURS=12.0,
+    CHAIN_EVENT_RETENTION_DAYS=14,
+    CHAIN_ACTIVE_RETENTION_DAYS=7,
+    CHAIN_ALERT_ON_COMPLETE=False,
+    CHAIN_TOTAL_BOOST_CAP=30,
+    CHAINS_ENABLED=True,
+    CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
+)
 
-def _make_active_chain_for_completion(
-    token_id: str, pipeline: str = "memecoin"
-) -> ActiveChain:
-    """Build a chain that's at completion state (is_complete=True)."""
-    now = datetime.now(timezone.utc)
-    anchor = now - timedelta(hours=2)
-    return ActiveChain(
-        token_id=token_id,
-        pipeline=pipeline,
-        pattern_id=1,
-        pattern_name="test_pattern",
-        steps_matched=[1, 2],
-        step_events={1: 1, 2: 2},
-        anchor_time=anchor,
-        last_step_time=now - timedelta(hours=1),
-        is_complete=True,
-        completed_at=now,
-        created_at=anchor,
+
+async def _complete_chain_via_events(
+    db, settings, token_id, pipeline, *, session=None, mcap_fetcher=None
+):
+    """Emit the full_conviction step events for ``token_id``/``pipeline`` then run
+    one check_chains pass, so the completion flows through the real network +
+    write phases."""
+    from scout.chains.events import emit_event
+    from scout.chains.tracker import check_chains
+
+    await emit_event(
+        db,
+        token_id,
+        pipeline,
+        "category_heating",
+        {"acceleration": 8.0, "volume_growth_pct": 40.0, "market_regime": "BULL"},
+        "narrative.observer",
     )
+    await emit_event(
+        db,
+        token_id,
+        pipeline,
+        "laggard_picked",
+        {"narrative_fit_score": 80, "confidence": "High", "trigger_count": 2},
+        "narrative.predictor",
+    )
+    await emit_event(
+        db,
+        token_id,
+        pipeline,
+        "counter_scored",
+        {
+            "risk_score": 20,
+            "flag_count": 0,
+            "high_severity_count": 0,
+            "data_completeness": "full",
+        },
+        "counter.scorer",
+    )
+    await check_chains(db, settings, session=session, mcap_fetcher=mcap_fetcher)
 
 
 @pytest.mark.asyncio
-async def test_record_completion_populates_mcap_at_completion(db, settings_factory):
-    """BL-071a': _record_completion captures FDV at write time
-    via the injected fetcher, stores it in mcap_at_completion."""
+async def test_completion_populates_mcap_via_prefetch(db, settings_factory):
+    """F2: check_chains fetches FDV in the network phase (outside the txn) and
+    _write_completion stores it in mcap_at_completion."""
     from scout.chains.mcap_fetcher import FetchResult, FetchStatus
-    from scout.chains.tracker import _record_completion
-
-    pattern = _stub_pattern()
-    chain = _make_active_chain_for_completion("0xtoken1")
 
     async def _stub_fetcher(session, contract):
         assert contract == "0xtoken1"
         return FetchResult(2_500_000.0, FetchStatus.OK)
 
-    s = settings_factory(
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
-    )
-
-    await _record_completion(
+    await _complete_chain_via_events(
         db,
-        chain,
-        pattern,
-        s,
-        session=object(),  # any non-None — fetcher is stubbed
+        settings_factory(**_CHAIN_SETTINGS_KW),
+        "0xtoken1",
+        "memecoin",
+        session=object(),
         mcap_fetcher=_stub_fetcher,
     )
-    await db._conn.commit()
     cur = await db._conn.execute(
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id='0xtoken1'"
     )
     row = await cur.fetchone()
-    assert row[0] == 2_500_000.0
+    assert row is not None and row[0] == 2_500_000.0
 
 
 @pytest.mark.asyncio
-async def test_record_completion_leaves_mcap_null_when_fetcher_returns_no_data(
-    db, settings_factory
-):
-    """Graceful degradation: NO_DATA → row writes with mcap NULL."""
+async def test_completion_leaves_mcap_null_when_fetcher_no_data(db, settings_factory):
+    """Graceful degradation: NO_DATA → completion row written with mcap NULL."""
     from scout.chains.mcap_fetcher import FetchResult, FetchStatus
-    from scout.chains.tracker import _record_completion
-
-    pattern = _stub_pattern()
-    chain = _make_active_chain_for_completion("0xtoken2")
 
     async def _none_fetcher(session, contract):
         return FetchResult(None, FetchStatus.NO_DATA)
 
-    s = settings_factory(
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
-    )
-
-    await _record_completion(
+    await _complete_chain_via_events(
         db,
-        chain,
-        pattern,
-        s,
+        settings_factory(**_CHAIN_SETTINGS_KW),
+        "0xtoken2",
+        "memecoin",
         session=object(),
         mcap_fetcher=_none_fetcher,
     )
-    await db._conn.commit()
     cur = await db._conn.execute(
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id='0xtoken2'"
     )
-    row = await cur.fetchone()
-    assert row[0] is None
+    assert (await cur.fetchone())[0] is None
 
 
 @pytest.mark.asyncio
-async def test_record_completion_skips_fetcher_for_narrative_pipeline(
-    db, settings_factory
-):
-    """Narrative pipeline doesn't use FDV-based outcome — token_id is a
-    CoinGecko slug, not a contract address. Fetcher MUST NOT be called."""
-    from scout.chains.tracker import _record_completion
-
-    pattern = _stub_pattern()
-    chain = _make_active_chain_for_completion("boba-network", pipeline="narrative")
-
+async def test_completion_skips_fetcher_for_narrative_pipeline(db, settings_factory):
+    """Narrative completions must NOT call the DexScreener fetcher — the network
+    phase only fetches memecoin. token_id is a CoinGecko slug, not a contract."""
     fetcher_calls = []
 
     async def _spy_fetcher(session, contract):
@@ -569,58 +574,40 @@ async def test_record_completion_skips_fetcher_for_narrative_pipeline(
 
         return FetchResult(999_999.0, FetchStatus.OK)
 
-    s = settings_factory(
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
-    )
-
-    await _record_completion(
+    await _complete_chain_via_events(
         db,
-        chain,
-        pattern,
-        s,
+        settings_factory(**_CHAIN_SETTINGS_KW),
+        "boba-network",
+        "narrative",
         session=object(),
         mcap_fetcher=_spy_fetcher,
     )
-    await db._conn.commit()
     assert (
         fetcher_calls == []
     ), f"narrative pipeline must NOT call DS fetcher; got {fetcher_calls}"
     cur = await db._conn.execute(
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id='boba-network'"
     )
-    row = await cur.fetchone()
-    assert row[0] is None
+    assert (await cur.fetchone())[0] is None
 
 
 @pytest.mark.asyncio
-async def test_record_completion_enforces_mcap_floor(db, settings_factory):
-    """R1-M2: writer enforces CHAIN_OUTCOME_MIN_MCAP_USD floor.
-    Dust mcap (e.g. 0.5 USD from pump.fun) → write NULL, NOT the dust value
-    (which would compute fake +500,000% hits at hydration)."""
+async def test_completion_enforces_mcap_floor(db, settings_factory):
+    """R1-M2: dust mcap below CHAIN_OUTCOME_MIN_MCAP_USD → mcap_at_completion
+    NULL (a dust value would compute fake +500,000% hits at hydration)."""
     from scout.chains.mcap_fetcher import FetchResult, FetchStatus
-    from scout.chains.tracker import _record_completion
-
-    pattern = _stub_pattern()
-    chain = _make_active_chain_for_completion("0xpumpfundust")
 
     async def _dust_fetcher(session, contract):
         return FetchResult(0.5, FetchStatus.OK)  # below 1000 floor
 
-    s = settings_factory(
-        CHAIN_ALERT_ON_COMPLETE=False,
-        CHAIN_OUTCOME_MIN_MCAP_USD=1000.0,
-    )
-
-    await _record_completion(
+    await _complete_chain_via_events(
         db,
-        chain,
-        pattern,
-        s,
+        settings_factory(**_CHAIN_SETTINGS_KW),
+        "0xpumpfundust",
+        "memecoin",
         session=object(),
         mcap_fetcher=_dust_fetcher,
     )
-    await db._conn.commit()
     cur = await db._conn.execute(
         "SELECT mcap_at_completion FROM chain_matches WHERE token_id='0xpumpfundust'"
     )

@@ -26,11 +26,9 @@ async def prune_old_snapshots(db: "Database", retention_days: int = 7) -> int:
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cursor = await db._conn.execute(
+    deleted = await db.execute_write(
         "DELETE FROM gainers_snapshots WHERE snapshot_at < ?", (cutoff,)
     )
-    await db._conn.commit()
-    deleted = cursor.rowcount
     if deleted:
         logger.info(
             "gainers_snapshots_pruned", deleted=deleted, retention_days=retention_days
@@ -69,27 +67,27 @@ async def store_top_gainers(
     gainers.sort(key=lambda c: c.get("price_change_percentage_24h") or 0, reverse=True)
 
     # Take top 20
-    for coin in gainers[:20]:
-        await db._conn.execute(
-            """INSERT INTO gainers_snapshots
-               (coin_id, symbol, name, price_change_24h, market_cap,
-                volume_24h, price_at_snapshot, snapshot_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                coin["id"],
-                (coin.get("symbol") or "???").upper(),
-                coin.get("name") or "Unknown",
-                coin.get("price_change_percentage_24h") or 0,
-                coin.get("market_cap"),
-                coin.get("total_volume"),
-                coin.get("current_price"),
-                now,
-            ),
-        )
-        count += 1
-
-    if count:
-        await db._conn.commit()
+    top = gainers[:20]
+    if top:
+        async with db.transaction() as conn:
+            for coin in top:
+                await conn.execute(
+                    """INSERT INTO gainers_snapshots
+                       (coin_id, symbol, name, price_change_24h, market_cap,
+                        volume_24h, price_at_snapshot, snapshot_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        coin["id"],
+                        (coin.get("symbol") or "???").upper(),
+                        coin.get("name") or "Unknown",
+                        coin.get("price_change_percentage_24h") or 0,
+                        coin.get("market_cap"),
+                        coin.get("total_volume"),
+                        coin.get("current_price"),
+                        now,
+                    ),
+                )
+                count += 1
         logger.info("gainers_snapshots_stored", count=count)
 
     return count
@@ -311,55 +309,55 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             comp["peak_gain_pct"] = None
 
     # Store comparisons (delete old for same coin_id then insert)
-    for comp in comparisons:
-        await db._conn.execute(
-            "DELETE FROM gainers_comparisons WHERE coin_id = ?",
-            (comp["coin_id"],),
-        )
-        await db._conn.execute(
-            """INSERT INTO gainers_comparisons
-               (coin_id, symbol, name, price_change_24h,
-                appeared_on_gainers_at,
-                detected_by_narrative, narrative_lead_minutes,
-                detected_by_pipeline, pipeline_lead_minutes,
-                detected_by_chains, chains_lead_minutes,
-                detected_by_spikes, spikes_lead_minutes,
-                detected_by_acceleration, acceleration_lead_minutes,
-                detected_by_momentum, momentum_lead_minutes,
-                detected_by_slow_burn, slow_burn_lead_minutes,
-                detected_by_velocity, velocity_lead_minutes,
-                is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                comp["coin_id"],
-                comp["symbol"],
-                comp["name"],
-                comp["price_change_24h"],
-                comp["appeared_on_gainers_at"],
-                comp["detected_by_narrative"],
-                comp["narrative_lead_minutes"],
-                comp["detected_by_pipeline"],
-                comp["pipeline_lead_minutes"],
-                comp["detected_by_chains"],
-                comp["chains_lead_minutes"],
-                comp["detected_by_spikes"],
-                comp["spikes_lead_minutes"],
-                comp["detected_by_acceleration"],
-                comp["acceleration_lead_minutes"],
-                comp["detected_by_momentum"],
-                comp["momentum_lead_minutes"],
-                comp["detected_by_slow_burn"],
-                comp["slow_burn_lead_minutes"],
-                comp["detected_by_velocity"],
-                comp["velocity_lead_minutes"],
-                comp["is_gap"],
-                comp["detected_price"],
-                comp["peak_price"],
-                comp["peak_gain_pct"],
-            ),
-        )
-    await db._conn.commit()
+    async with db.transaction() as conn:
+        for comp in comparisons:
+            await conn.execute(
+                "DELETE FROM gainers_comparisons WHERE coin_id = ?",
+                (comp["coin_id"],),
+            )
+            await conn.execute(
+                """INSERT INTO gainers_comparisons
+                   (coin_id, symbol, name, price_change_24h,
+                    appeared_on_gainers_at,
+                    detected_by_narrative, narrative_lead_minutes,
+                    detected_by_pipeline, pipeline_lead_minutes,
+                    detected_by_chains, chains_lead_minutes,
+                    detected_by_spikes, spikes_lead_minutes,
+                    detected_by_acceleration, acceleration_lead_minutes,
+                    detected_by_momentum, momentum_lead_minutes,
+                    detected_by_slow_burn, slow_burn_lead_minutes,
+                    detected_by_velocity, velocity_lead_minutes,
+                    is_gap, detected_price, peak_price, peak_gain_pct)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    comp["coin_id"],
+                    comp["symbol"],
+                    comp["name"],
+                    comp["price_change_24h"],
+                    comp["appeared_on_gainers_at"],
+                    comp["detected_by_narrative"],
+                    comp["narrative_lead_minutes"],
+                    comp["detected_by_pipeline"],
+                    comp["pipeline_lead_minutes"],
+                    comp["detected_by_chains"],
+                    comp["chains_lead_minutes"],
+                    comp["detected_by_spikes"],
+                    comp["spikes_lead_minutes"],
+                    comp["detected_by_acceleration"],
+                    comp["acceleration_lead_minutes"],
+                    comp["detected_by_momentum"],
+                    comp["momentum_lead_minutes"],
+                    comp["detected_by_slow_burn"],
+                    comp["slow_burn_lead_minutes"],
+                    comp["detected_by_velocity"],
+                    comp["velocity_lead_minutes"],
+                    comp["is_gap"],
+                    comp["detected_price"],
+                    comp["peak_price"],
+                    comp["peak_gain_pct"],
+                ),
+            )
 
     caught = sum(1 for c in comparisons if not c["is_gap"])
     logger.info(
@@ -492,8 +490,8 @@ async def update_gainers_peaks(db: "Database") -> int:
              AND datetime(pc.updated_at) >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
-    updated = 0
 
+    updates: list[tuple] = []
     for row in rows:
         current_price = row["current_price"]
         old_peak = row["peak_price"] or row["detected_price"] or 0
@@ -502,14 +500,15 @@ async def update_gainers_peaks(db: "Database") -> int:
             peak_gain = (
                 (current_price - row["detected_price"]) / row["detected_price"]
             ) * 100
-            await conn.execute(
-                "UPDATE gainers_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
-                (current_price, peak_gain, row["id"]),
-            )
-            updated += 1
+            updates.append((current_price, peak_gain, row["id"]))
 
+    updated = len(updates)
     if updated:
-        await conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                "UPDATE gainers_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
+                updates,
+            )
         logger.info("gainers_tracker.peaks_updated", count=updated)
 
     return updated

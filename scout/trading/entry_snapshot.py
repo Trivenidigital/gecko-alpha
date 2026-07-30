@@ -460,8 +460,7 @@ async def stamp_entry_snapshot(
 
     placeholders = ", ".join("?" for _ in COLUMN_ORDER)
     columns = ", ".join(COLUMN_ORDER)
-    await db._conn.execute(
+    await db.execute_write(
         f"INSERT INTO paper_trade_entry_snapshots ({columns}) VALUES ({placeholders})",
         tuple(snapshot[col] for col in COLUMN_ORDER),
     )
-    await db._conn.commit()

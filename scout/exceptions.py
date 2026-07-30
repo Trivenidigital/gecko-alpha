@@ -29,6 +29,21 @@ class AlertDeliveryError(ScoutError):
     """Failed to deliver alert."""
 
 
+class TelegramRejected(AlertDeliveryError):
+    """CONFIRMED provider non-acceptance (B1): Telegram returned an explicit
+    non-200 rejection response. The message was definitively NOT accepted, so the
+    dispatch is a confirmed non-delivery → ``dispatch_failed`` (frees cap+dedup).
+    Distinct from a transport failure whose delivery is unprovable."""
+
+
+class TelegramTransportUnknown(AlertDeliveryError):
+    """UNPROVABLE delivery after the attempt began (B1): a timeout, disconnect,
+    connection reset, or read failure occurred AFTER the HTTP request was sent, so
+    the provider may or may not have accepted it. MUST map to
+    ``delivery_unknown_after_send`` (cap+dedup stay reserved) — NEVER
+    ``dispatch_failed``. A generic transport exception must never free cap/dedup."""
+
+
 class SafetyCheckError(ScoutError):
     """Error checking token safety."""
 

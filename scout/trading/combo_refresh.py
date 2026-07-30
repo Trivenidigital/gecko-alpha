@@ -19,197 +19,14 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
     """Recompute 7d + 30d rows for `combo_key`. Apply suppression rule to 30d.
     Returns True on success, False otherwise.
     """
-    # Acquire the shared asyncio.Lock so the multi-statement read→write
-    # sequence here cannot interleave with should_open's BEGIN...COMMIT block
-    # across asyncio suspend points within the same event loop.
-    if db._txn_lock is None:
-        raise RuntimeError(
-            "Database._txn_lock is None — Database.initialize() was not awaited "
-            "before refresh_combo(). A fresh ephemeral Lock here would silently "
-            "break mutual exclusion across concurrent callers."
-        )
-    async with db._txn_lock:
-        return await _refresh_combo_locked(db, combo_key, settings)
-
-
-async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
-    """Inner implementation — called with db._txn_lock already held."""
+    # F2: run the multi-statement read→write sequence inside the shared
+    # transaction-lock discipline (db.transaction() = BEGIN IMMEDIATE + the
+    # process-wide asyncio.Lock) so it cannot interleave with should_open's
+    # (or any other writer's) transaction on the one shared connection across
+    # asyncio suspend points within the same event loop.
     try:
-        now = datetime.now(timezone.utc)
-        now_iso = now.isoformat()
-
-        stats = {}
-        status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
-        for window, days in (("7d", 7), ("30d", 30)):
-            cur = await db._conn.execute(
-                f"""SELECT
-                     COUNT(*) AS trades,
-                     SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
-                     SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) AS losses,
-                     COALESCE(SUM(pnl_usd), 0) AS total_pnl_usd,
-                     COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
-                   FROM paper_trades
-                   WHERE signal_combo = ?
-                     AND status IN ({status_placeholders})
-                     -- GA-01 / Phase 6 slice 2: exclude fabricated $0
-                     -- closes (unpriceable token_id force-closed at
-                     -- entry_price) from combo rollups — they dilute
-                     -- total/avg PnL toward zero. Keyed on
-                     -- exit_provenance (durable label); the GA-01
-                     -- exit_reason predicate stays as OR-fallback.
-                     AND COALESCE(exit_provenance, '') != 'entry_fallback'
-                     AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
-                     AND closed_at >= ?""",
-                (
-                    combo_key,
-                    *CLOSED_COUNTABLE_STATUSES,
-                    (now - timedelta(days=days)).isoformat(),
-                ),
-            )
-            row = await cur.fetchone()
-            trades = row["trades"] or 0
-            wins = row["wins"] or 0
-            losses = row["losses"] or 0
-            total_pnl = float(row["total_pnl_usd"] or 0)
-            avg_pct = float(row["avg_pnl_pct"] or 0)
-            wr = (100.0 * wins / trades) if trades else 0.0
-            stats[window] = dict(
-                trades=trades,
-                wins=wins,
-                losses=losses,
-                total_pnl=total_pnl,
-                avg_pct=avg_pct,
-                wr=wr,
-            )
-
-        # 7d row: plain UPSERT.
-        w7 = stats["7d"]
-        await db._conn.execute(
-            "INSERT INTO combo_performance "
-            "(combo_key, window, trades, wins, losses, total_pnl_usd, "
-            " avg_pnl_pct, win_rate_pct, suppressed, last_refreshed) "
-            "VALUES (?, '7d', ?, ?, ?, ?, ?, ?, 0, ?) "
-            "ON CONFLICT(combo_key, window) DO UPDATE SET "
-            " trades=excluded.trades, wins=excluded.wins, losses=excluded.losses, "
-            " total_pnl_usd=excluded.total_pnl_usd, avg_pnl_pct=excluded.avg_pnl_pct, "
-            " win_rate_pct=excluded.win_rate_pct, last_refreshed=excluded.last_refreshed, "
-            " refresh_failures=0",
-            (
-                combo_key,
-                w7["trades"],
-                w7["wins"],
-                w7["losses"],
-                w7["total_pnl"],
-                w7["avg_pct"],
-                w7["wr"],
-                now_iso,
-            ),
-        )
-
-        # 30d row: apply suppression rule.
-        w30 = stats["30d"]
-        cur = await db._conn.execute(
-            "SELECT suppressed, parole_trades_remaining, suppressed_at "
-            "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
-            (combo_key,),
-        )
-        existing = await cur.fetchone()
-
-        min_trades = settings.FEEDBACK_SUPPRESSION_MIN_TRADES
-        wr_thresh = settings.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT
-        parole_days = settings.FEEDBACK_PAROLE_DAYS
-        retest = settings.FEEDBACK_PAROLE_RETEST_TRADES
-
-        new_suppressed = 0
-        new_suppressed_at = None
-        new_parole_at = None
-        new_parole_remaining = None
-
-        if existing is None:
-            # First write — maybe suppress immediately if bad enough.
-            if w30["trades"] >= min_trades and w30["wr"] < wr_thresh:
-                new_suppressed = 1
-                new_suppressed_at = now_iso
-                new_parole_at = (now + timedelta(days=parole_days)).isoformat()
-                new_parole_remaining = retest
-        else:
-            was_suppressed = bool(existing["suppressed"])
-            remaining = existing["parole_trades_remaining"]
-            if not was_suppressed:
-                if w30["trades"] >= min_trades and w30["wr"] < wr_thresh:
-                    new_suppressed = 1
-                    new_suppressed_at = now_iso
-                    new_parole_at = (now + timedelta(days=parole_days)).isoformat()
-                    new_parole_remaining = retest
-            else:
-                # Frozen-lock guard (fix/frozen-suppression-lock): a currently-
-                # suppressed combo with ZERO trades in the 30d window is being
-                # refreshed only to keep its state live/alertable (see the
-                # widened selection in refresh_all). Recomputing a re-suppression
-                # here would hand a permanently-locked combo a fresh parole
-                # window + retest allowance — auto-revival the operator never
-                # approved (constraint a). So zero-trade suppressed combos route
-                # to the preserve branch; only combos with REAL retest data
-                # (trades > 0) can clear or re-arm parole.
-                zero_trade = w30["trades"] == 0
-                exhausted = remaining is not None and remaining <= 0
-                if not zero_trade and exhausted and w30["wr"] >= wr_thresh:
-                    # Retest recovered on real data — clear suppression.
-                    new_suppressed = 0
-                    new_suppressed_at = None
-                    new_parole_at = None
-                    new_parole_remaining = None
-                elif not zero_trade and exhausted:
-                    # Retest failed on real data — re-suppress with fresh parole.
-                    new_suppressed = 1
-                    new_suppressed_at = now_iso
-                    new_parole_at = (now + timedelta(days=parole_days)).isoformat()
-                    new_parole_remaining = retest
-                else:
-                    # Preserve existing suppression state verbatim. Covers both
-                    # mid-parole (remaining > 0 — parole timing must not reset
-                    # every nightly refresh) and the frozen-lock zero-trade case
-                    # (keep the lock exactly as-is; no revival).
-                    new_suppressed = 1
-                    new_suppressed_at = existing["suppressed_at"]
-                    cur2 = await db._conn.execute(
-                        "SELECT parole_at FROM combo_performance "
-                        "WHERE combo_key = ? AND window = '30d'",
-                        (combo_key,),
-                    )
-                    new_parole_at = (await cur2.fetchone())[0]
-                    new_parole_remaining = remaining
-
-        await db._conn.execute(
-            "INSERT INTO combo_performance "
-            "(combo_key, window, trades, wins, losses, total_pnl_usd, "
-            " avg_pnl_pct, win_rate_pct, suppressed, suppressed_at, parole_at, "
-            " parole_trades_remaining, refresh_failures, last_refreshed) "
-            "VALUES (?, '30d', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
-            "ON CONFLICT(combo_key, window) DO UPDATE SET "
-            " trades=excluded.trades, wins=excluded.wins, losses=excluded.losses, "
-            " total_pnl_usd=excluded.total_pnl_usd, avg_pnl_pct=excluded.avg_pnl_pct, "
-            " win_rate_pct=excluded.win_rate_pct, "
-            " suppressed=excluded.suppressed, suppressed_at=excluded.suppressed_at, "
-            " parole_at=excluded.parole_at, "
-            " parole_trades_remaining=excluded.parole_trades_remaining, "
-            " refresh_failures=0, last_refreshed=excluded.last_refreshed",
-            (
-                combo_key,
-                w30["trades"],
-                w30["wins"],
-                w30["losses"],
-                w30["total_pnl"],
-                w30["avg_pct"],
-                w30["wr"],
-                new_suppressed,
-                new_suppressed_at,
-                new_parole_at,
-                new_parole_remaining,
-                now_iso,
-            ),
-        )
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            await _refresh_combo_body(conn, combo_key, settings)
         return True
     except (aiosqlite.Error, ValueError) as e:
         log.error(
@@ -224,12 +41,14 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
             # both windows caused the alert to fire at half the expected day count
             # (each single refresh failure would increment two rows, so the
             # chronic threshold appeared reached after threshold/2 days).
-            await db._conn.execute(
-                "UPDATE combo_performance SET refresh_failures = refresh_failures + 1 "
-                "WHERE combo_key = ? AND window = '30d'",
-                (combo_key,),
-            )
-            await db._conn.commit()
+            # Runs as its own short disciplined transaction — the failing main
+            # transaction has already been rolled back + its lock released.
+            async with db.transaction() as conn:
+                await conn.execute(
+                    "UPDATE combo_performance SET refresh_failures = refresh_failures + 1 "
+                    "WHERE combo_key = ? AND window = '30d'",
+                    (combo_key,),
+                )
         except Exception as counter_err:
             # The chronic-failure surfacing in weekly_digest depends on this
             # counter incrementing — if the counter write itself fails, log
@@ -241,6 +60,191 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                 err_id="COMBO_REFRESH_COUNTER",
             )
         return False
+
+
+async def _refresh_combo_body(conn, combo_key: str, settings) -> None:
+    """Recompute + upsert the 7d/30d rows on ``conn``.
+
+    Called with an open ``db.transaction()`` (BEGIN IMMEDIATE + lock held); the
+    enclosing context manager owns COMMIT/ROLLBACK, so this body performs no
+    transaction control of its own. Raises ``aiosqlite.Error`` / ``ValueError``
+    up to :func:`refresh_combo`, which classifies + increments the failure
+    counter.
+    """
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    stats = {}
+    status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
+    for window, days in (("7d", 7), ("30d", 30)):
+        cur = await conn.execute(
+            f"""SELECT
+                 COUNT(*) AS trades,
+                 SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
+                 SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) AS losses,
+                 COALESCE(SUM(pnl_usd), 0) AS total_pnl_usd,
+                 COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
+               FROM paper_trades
+               WHERE signal_combo = ?
+                 AND status IN ({status_placeholders})
+                 -- GA-01 / Phase 6 slice 2: exclude fabricated $0
+                 -- closes (unpriceable token_id force-closed at
+                 -- entry_price) from combo rollups — they dilute
+                 -- total/avg PnL toward zero. Keyed on
+                 -- exit_provenance (durable label); the GA-01
+                 -- exit_reason predicate stays as OR-fallback.
+                 AND COALESCE(exit_provenance, '') != 'entry_fallback'
+                 AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
+                 AND closed_at >= ?""",
+            (
+                combo_key,
+                *CLOSED_COUNTABLE_STATUSES,
+                (now - timedelta(days=days)).isoformat(),
+            ),
+        )
+        row = await cur.fetchone()
+        trades = row["trades"] or 0
+        wins = row["wins"] or 0
+        losses = row["losses"] or 0
+        total_pnl = float(row["total_pnl_usd"] or 0)
+        avg_pct = float(row["avg_pnl_pct"] or 0)
+        wr = (100.0 * wins / trades) if trades else 0.0
+        stats[window] = dict(
+            trades=trades,
+            wins=wins,
+            losses=losses,
+            total_pnl=total_pnl,
+            avg_pct=avg_pct,
+            wr=wr,
+        )
+
+    # 7d row: plain UPSERT.
+    w7 = stats["7d"]
+    await conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, last_refreshed) "
+        "VALUES (?, '7d', ?, ?, ?, ?, ?, ?, 0, ?) "
+        "ON CONFLICT(combo_key, window) DO UPDATE SET "
+        " trades=excluded.trades, wins=excluded.wins, losses=excluded.losses, "
+        " total_pnl_usd=excluded.total_pnl_usd, avg_pnl_pct=excluded.avg_pnl_pct, "
+        " win_rate_pct=excluded.win_rate_pct, last_refreshed=excluded.last_refreshed, "
+        " refresh_failures=0",
+        (
+            combo_key,
+            w7["trades"],
+            w7["wins"],
+            w7["losses"],
+            w7["total_pnl"],
+            w7["avg_pct"],
+            w7["wr"],
+            now_iso,
+        ),
+    )
+
+    # 30d row: apply suppression rule.
+    w30 = stats["30d"]
+    cur = await conn.execute(
+        "SELECT suppressed, parole_trades_remaining, suppressed_at "
+        "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
+        (combo_key,),
+    )
+    existing = await cur.fetchone()
+
+    min_trades = settings.FEEDBACK_SUPPRESSION_MIN_TRADES
+    wr_thresh = settings.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT
+    parole_days = settings.FEEDBACK_PAROLE_DAYS
+    retest = settings.FEEDBACK_PAROLE_RETEST_TRADES
+
+    new_suppressed = 0
+    new_suppressed_at = None
+    new_parole_at = None
+    new_parole_remaining = None
+
+    if existing is None:
+        # First write — maybe suppress immediately if bad enough.
+        if w30["trades"] >= min_trades and w30["wr"] < wr_thresh:
+            new_suppressed = 1
+            new_suppressed_at = now_iso
+            new_parole_at = (now + timedelta(days=parole_days)).isoformat()
+            new_parole_remaining = retest
+    else:
+        was_suppressed = bool(existing["suppressed"])
+        remaining = existing["parole_trades_remaining"]
+        if not was_suppressed:
+            if w30["trades"] >= min_trades and w30["wr"] < wr_thresh:
+                new_suppressed = 1
+                new_suppressed_at = now_iso
+                new_parole_at = (now + timedelta(days=parole_days)).isoformat()
+                new_parole_remaining = retest
+        else:
+            # Frozen-lock guard (fix/frozen-suppression-lock): a currently-
+            # suppressed combo with ZERO trades in the 30d window is being
+            # refreshed only to keep its state live/alertable (see the
+            # widened selection in refresh_all). Recomputing a re-suppression
+            # here would hand a permanently-locked combo a fresh parole
+            # window + retest allowance — auto-revival the operator never
+            # approved (constraint a). So zero-trade suppressed combos route
+            # to the preserve branch; only combos with REAL retest data
+            # (trades > 0) can clear or re-arm parole.
+            zero_trade = w30["trades"] == 0
+            exhausted = remaining is not None and remaining <= 0
+            if not zero_trade and exhausted and w30["wr"] >= wr_thresh:
+                # Retest recovered on real data — clear suppression.
+                new_suppressed = 0
+                new_suppressed_at = None
+                new_parole_at = None
+                new_parole_remaining = None
+            elif not zero_trade and exhausted:
+                # Retest failed on real data — re-suppress with fresh parole.
+                new_suppressed = 1
+                new_suppressed_at = now_iso
+                new_parole_at = (now + timedelta(days=parole_days)).isoformat()
+                new_parole_remaining = retest
+            else:
+                # Preserve existing suppression state verbatim. Covers both
+                # mid-parole (remaining > 0 — parole timing must not reset
+                # every nightly refresh) and the frozen-lock zero-trade case
+                # (keep the lock exactly as-is; no revival).
+                new_suppressed = 1
+                new_suppressed_at = existing["suppressed_at"]
+                cur2 = await conn.execute(
+                    "SELECT parole_at FROM combo_performance "
+                    "WHERE combo_key = ? AND window = '30d'",
+                    (combo_key,),
+                )
+                new_parole_at = (await cur2.fetchone())[0]
+                new_parole_remaining = remaining
+
+    await conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+        " avg_pnl_pct, win_rate_pct, suppressed, suppressed_at, parole_at, "
+        " parole_trades_remaining, refresh_failures, last_refreshed) "
+        "VALUES (?, '30d', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
+        "ON CONFLICT(combo_key, window) DO UPDATE SET "
+        " trades=excluded.trades, wins=excluded.wins, losses=excluded.losses, "
+        " total_pnl_usd=excluded.total_pnl_usd, avg_pnl_pct=excluded.avg_pnl_pct, "
+        " win_rate_pct=excluded.win_rate_pct, "
+        " suppressed=excluded.suppressed, suppressed_at=excluded.suppressed_at, "
+        " parole_at=excluded.parole_at, "
+        " parole_trades_remaining=excluded.parole_trades_remaining, "
+        " refresh_failures=0, last_refreshed=excluded.last_refreshed",
+        (
+            combo_key,
+            w30["trades"],
+            w30["wins"],
+            w30["losses"],
+            w30["total_pnl"],
+            w30["avg_pct"],
+            w30["wr"],
+            new_suppressed,
+            new_suppressed_at,
+            new_parole_at,
+            new_parole_remaining,
+            now_iso,
+        ),
+    )
 
 
 async def refresh_all(db: Database, settings) -> dict:
@@ -511,8 +515,8 @@ async def _process_permanent_suppression(
 
     # Re-arm: clear the dedup marker for any combo that has LEFT the
     # permanent-suppression state since it was last alerted, so a future
-    # re-entry alerts again.
-    await conn.execute(
+    # re-entry alerts again. F2: disciplined single write (self-committing).
+    await db.execute_write(
         "UPDATE combo_performance "
         "SET perm_suppression_alerted_at = NULL "
         "WHERE window = '30d' "
@@ -525,6 +529,7 @@ async def _process_permanent_suppression(
     )
 
     # Pending = suppressed, no recent trade, not yet alerted for this entry.
+    # Read (no transaction) — sees the just-committed re-arm.
     cur = await conn.execute(
         "SELECT combo_key FROM combo_performance cp "
         "WHERE cp.window = '30d' "
@@ -537,7 +542,6 @@ async def _process_permanent_suppression(
         (window_cutoff,),
     )
     pending = [r[0] for r in await cur.fetchall()]
-    await conn.commit()
 
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
     alerted: list[str] = []
@@ -567,14 +571,15 @@ async def _process_permanent_suppression(
             continue
         log.info("permanent_suppression_alert_delivered", combo_key=combo)
 
-        # Set the dedup marker only after a confirmed send.
+        # Set the dedup marker only after a confirmed send. F2: disciplined
+        # single write (self-committing) — the alert send above was OUTSIDE any
+        # transaction, so no network await ever held the lock.
         try:
-            await conn.execute(
+            await db.execute_write(
                 "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
                 "WHERE combo_key = ? AND window = '30d'",
                 (now_iso, combo),
             )
-            await conn.commit()
         except aiosqlite.Error as exc:
             log.exception(
                 "permanent_suppression_marker_update_failed",

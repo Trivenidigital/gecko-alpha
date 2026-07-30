@@ -36,7 +36,9 @@ import structlog
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.exceptions import TelegramTransportUnknown
 from scout.token_ids import match_universe_exclude
+from scout.trading import alert_dispatch_lifecycle as lifecycle
 
 log = structlog.get_logger(__name__)
 
@@ -54,20 +56,44 @@ async def _demote_sent_row(
     db: Database,
     *,
     sent_row_id: int | None,
+    lease: str,
     detail: str,
     log_event: str,
 ) -> None:
-    if sent_row_id is None or db._conn is None:
+    """Demote a pending/attempted dispatch row to dispatch_failed on a CONFIRMED
+    non-delivery (preprocessing error, cancel before the send began, or a
+    provider error return) via the shared lifecycle contract, guarded on the
+    owner ``lease``. Swallows demote errors so alert bookkeeping never propagates
+    into the caller."""
+    if sent_row_id is None:
         return
     try:
-        async with db._txn_lock:
-            await db._conn.execute(
-                "UPDATE tg_alert_log "
-                "SET outcome='dispatch_failed', detail=? "
-                "WHERE id=?",
-                (detail, sent_row_id),
-            )
-            await db._conn.commit()
+        if not await lifecycle.demote_failed(
+            db, sent_row_id, lease=lease, detail=detail
+        ):
+            log.warning("tg_alert_demote_cas_noop", sent_row_id=sent_row_id)
+    except Exception:
+        log.exception(log_event, sent_row_id=sent_row_id)
+
+
+async def _mark_unknown_row(
+    db: Database,
+    *,
+    sent_row_id: int | None,
+    lease: str,
+    detail: str,
+    log_event: str,
+) -> None:
+    """Mark an attempted dispatch row delivery_unknown_after_send when the send
+    was interrupted after it began (e.g. cancelled mid-await) and the provider
+    result cannot be proven, guarded on the owner ``lease``. Swallows errors."""
+    if sent_row_id is None:
+        return
+    try:
+        if not await lifecycle.mark_delivery_unknown(
+            db, sent_row_id, lease=lease, detail=detail
+        ):
+            log.warning("tg_alert_unknown_cas_noop", sent_row_id=sent_row_id)
     except Exception:
         log.exception(log_event, sent_row_id=sent_row_id)
 
@@ -374,13 +400,21 @@ async def notify_paper_trade_opened(
     an out-of-universe token_id (e.g. a tokenized equity) is suppressed.
 
     R2-C2 design-stage fold: atomic check-then-write under db._txn_lock.
-    Cooldown check + pre-emptive 'sent' row INSERT happen under a single
-    lock, so concurrent tasks for the same token serialize cleanly.
+    P0-1 shared lifecycle: the dedup claim commits a ``dispatch_pending`` row
+    (NOT a pre-emptive ``sent``); the row is marked ``dispatch_attempted``
+    immediately before the Telegram send and promoted to ``sent`` ONLY after the
+    provider accepts. A crash during Minara lookup/formatting stays
+    ``dispatch_pending``; a crash during/after the send is reconciled to
+    ``delivery_unknown_after_send``. Neither is ever a false ``sent``.
 
     Mid-flight task loss on shutdown is acceptable — paper_trades row is
     already committed; only the TG alert + tg_alert_log row is lost.
     """
     try:
+        # P0-1 deterministic, self-owned stale-intent reconciliation at dispatch
+        # entry (frozen STALE_RECONCILE_SECONDS): stale dispatch_pending ->
+        # dispatch_failed, stale dispatch_attempted -> delivery_unknown_after_send.
+        await lifecycle.reconcile_stale(db, signal_type)
         if not await _check_eligibility(db, signal_type):
             await _log_outcome(
                 db,
@@ -435,19 +469,37 @@ async def notify_paper_trade_opened(
             )
             return
         window_hours = settings.TG_ALERT_DEDUP_WINDOW_HOURS
-        async with db._txn_lock:
+        # P0-2 ownership lease: stamped into the pending claim, then required by
+        # every subsequent transition so a stale sweep can never demote THIS
+        # dispatch while it is still preprocessing / sending.
+        lease = lifecycle.new_lease()
+        # FU-1 (rev7): the atomic dedup-claim runs entirely through the common
+        # transaction manager — BEGIN IMMEDIATE + every statement on the yielded
+        # ``conn`` + a single manager-owned COMMIT/ROLLBACK. No direct ``db._conn``
+        # writes and no bare ``commit()``: a failed later statement or COMMIT can
+        # never strand the shared connection mid-transaction (which would fail the
+        # NEXT ``BEGIN IMMEDIATE`` and foreign-rollback another writer — the F2
+        # failure class). The dedup-blocked branch commits the audit row via the
+        # manager and defers its structured log to AFTER the commit.
+        is_suppressed = False
+        suppressed_prior_alerted_at = None
+        async with db.transaction() as conn:
             now_iso = datetime.now(timezone.utc).isoformat()
             if window_hours > 0:
                 cutoff = (
                     datetime.now(timezone.utc) - timedelta(hours=window_hours)
                 ).isoformat()
-                cur = await db._conn.execute(
+                # P0-1: claim a RESERVED slot as 'dispatch_pending' (NOT a
+                # pre-emptive 'sent'); dedup treats sent + pending + attempted +
+                # unknown as claimed. The claim stamps the lease token + heartbeat.
+                cur = await conn.execute(
                     "INSERT INTO tg_alert_log "
-                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "SELECT ?, ?, ?, ?, 'sent' "
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                    " dispatch_state_updated_at, dispatch_lease_token) "
+                    "SELECT ?, ?, ?, ?, 'dispatch_pending', ?, ? "
                     "WHERE NOT EXISTS ("
                     "  SELECT 1 FROM tg_alert_log "
-                    "  WHERE token_id = ? AND outcome = 'sent' "
+                    f"  WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
                     "  AND alerted_at >= ?"
                     ") "
                     "RETURNING id",
@@ -456,22 +508,26 @@ async def notify_paper_trade_opened(
                         signal_type,
                         token_id,
                         now_iso,
+                        now_iso,
+                        lease,
                         token_id,
                         cutoff,
                     ),
                 )
                 claimed = await cur.fetchone()
                 if claimed is None:
-                    cur = await db._conn.execute(
+                    cur = await conn.execute(
                         "SELECT alerted_at FROM tg_alert_log "
-                        "WHERE token_id = ? AND outcome = 'sent' "
+                        f"WHERE token_id = ? AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
                         "AND alerted_at >= ? "
                         "ORDER BY alerted_at DESC LIMIT 1",
                         (token_id, cutoff),
                     )
                     prior = await cur.fetchone()
-                    prior_alerted_at = prior[0] if prior is not None else None
-                    await db._conn.execute(
+                    suppressed_prior_alerted_at = (
+                        prior[0] if prior is not None else None
+                    )
+                    await conn.execute(
                         "INSERT INTO tg_alert_log "
                         "(paper_trade_id, signal_type, token_id, alerted_at, "
                         " outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
@@ -484,36 +540,43 @@ async def notify_paper_trade_opened(
                             f"window_h={window_hours}",
                         ),
                     )
-                    await db._conn.commit()
-                    # §12b: audit the suppression. No TG send happens; the
-                    # paper_trades row is unaffected (opened upstream).
-                    log.info(
-                        "tg_alert_suppressed",
-                        token_id=token_id,
-                        signal_type=signal_type,
-                        window_hours=window_hours,
-                        dedup_window_hours=window_hours,
-                        prior_alerted_at=prior_alerted_at,
-                        reason="dedup_24h",
-                    )
-                    return
-                sent_row_id = claimed[0]
+                    is_suppressed = True
+                else:
+                    # NOTE: sent_row_id holds the DISPATCH row id (state
+                    # dispatch_pending here; promoted to 'sent' only post-accept).
+                    sent_row_id = claimed[0]
             else:
-                # Dedup disabled: direct claim, preserving the clean revert path.
-                cur = await db._conn.execute(
+                # Dedup disabled: direct claim as 'dispatch_pending' (with lease).
+                cur = await conn.execute(
                     "INSERT INTO tg_alert_log "
-                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
-                    "VALUES (?, ?, ?, ?, 'sent') RETURNING id",
+                    "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                    " dispatch_state_updated_at, dispatch_lease_token) "
+                    "VALUES (?, ?, ?, ?, 'dispatch_pending', ?, ?) RETURNING id",
                     (
                         paper_trade_id,
                         signal_type,
                         token_id,
                         now_iso,
+                        now_iso,
+                        lease,
                     ),
                 )
                 claimed = await cur.fetchone()
                 sent_row_id = claimed[0]
-            await db._conn.commit()
+            # Manager commits the claim (and any blocked_dedup_24h row) on clean exit.
+        if is_suppressed:
+            # §12b: audit the suppression AFTER the commit. No TG send happens; the
+            # paper_trades row is unaffected (opened upstream).
+            log.info(
+                "tg_alert_suppressed",
+                token_id=token_id,
+                signal_type=signal_type,
+                window_hours=window_hours,
+                dedup_window_hours=window_hours,
+                prior_alerted_at=suppressed_prior_alerted_at,
+                reason="dedup_24h",
+            )
+            return
 
         # M1.5c BL-NEW-M1.5C: Minara DEX-eligibility check. After cooldown
         # claim (outside lock) so 100-500ms CG latency doesn't extend
@@ -542,6 +605,7 @@ async def notify_paper_trade_opened(
             await _demote_sent_row(
                 db,
                 sent_row_id=sent_row_id,
+                lease=lease,
                 detail="cancelled_during_minara_lookup",
                 log_event="tg_alert_log_demote_failed_on_cancel",
             )
@@ -585,18 +649,50 @@ async def notify_paper_trade_opened(
                 signal_type=signal_type,
                 token_id=token_id,
             )
-            # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail
-            await alerter.send_telegram_message(
-                body,
-                session,
-                settings,
-                parse_mode=None,
-                raise_on_failure=True,
-                source="tg_alert_dispatch",
+            # P0-1: mark ATTEMPTED immediately before the provider call. A crash
+            # from here on is reconciled to delivery_unknown_after_send, never a
+            # false 'sent'. P0-2: send ONLY if the pending->attempted CAS applied
+            # for THIS lease — a False means a stale sweep reclaimed the row, so
+            # abort the provider call rather than send under a lost lease.
+            if not await lifecycle.mark_attempted(db, sent_row_id, lease=lease):
+                log.warning(
+                    "tg_alert_lease_lost",
+                    paper_trade_id=paper_trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    sent_row_id=sent_row_id,
+                )
+                return
+            # R1-C1 fold: parse_mode=None to avoid Markdown 400 silent-fail.
+            # B2: HARD end-to-end deadline (< stale threshold) over the WHOLE
+            # provider operation (pacing + 429 retry waits + HTTP) so an active
+            # send can never outlive the lease heartbeat and be reconciled.
+            await asyncio.wait_for(
+                alerter.send_telegram_message(
+                    body,
+                    session,
+                    settings,
+                    parse_mode=None,
+                    raise_on_failure=True,
+                    source="tg_alert_dispatch",
+                ),
+                timeout=lifecycle.SEND_OPERATION_DEADLINE_SECONDS,
             )
-            # §12b: emit AFTER the send returns (delivery succeeded — the
-            # call raises on failure). Together with tg_alert_dispatched this
-            # makes "no logs" unambiguous between delivered vs skipped.
+            # Provider ACCEPTED — persist durable 'sent' (recover unknown->sent
+            # under our lease if a race moved it). The 'delivered' log is DERIVED
+            # strictly from the persisted result, so state/log never disagree.
+            if not await lifecycle.finalize_confirmed_sent(
+                db, sent_row_id, lease=lease
+            ):
+                log.error(
+                    "tg_alert_promote_and_recover_failed",
+                    paper_trade_id=paper_trade_id,
+                    signal_type=signal_type,
+                    token_id=token_id,
+                    sent_row_id=sent_row_id,
+                )
+                return  # not durably 'sent' — do NOT claim delivered / emit minara
+            # §12b: emit AFTER the send returns AND the row is durably 'sent'.
             log.info(
                 "tg_alert_delivered",
                 paper_trade_id=paper_trade_id,
@@ -604,13 +700,34 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
             )
         except asyncio.CancelledError:
-            await _demote_sent_row(
+            # Interrupted after the send began — result unprovable -> unknown.
+            await _mark_unknown_row(
                 db,
                 sent_row_id=sent_row_id,
+                lease=lease,
                 detail="cancelled_during_telegram_send",
-                log_event="tg_alert_log_demote_failed_on_send_cancel",
+                log_event="tg_alert_log_unknown_on_send_cancel",
             )
             raise
+        except (asyncio.TimeoutError, TelegramTransportUnknown) as e:
+            # B1: deadline exceeded OR transport uncertainty AFTER the attempt
+            # began — UNPROVABLE delivery -> delivery_unknown_after_send (cap+dedup
+            # stay reserved; NO automatic redispatch). Never freed to failed.
+            await _mark_unknown_row(
+                db,
+                sent_row_id=sent_row_id,
+                lease=lease,
+                detail=f"transport_unknown:{str(e)[:120]}",
+                log_event="tg_alert_log_unknown_on_transport",
+            )
+            log.warning(
+                "tg_alert_delivery_unknown",
+                paper_trade_id=paper_trade_id,
+                signal_type=signal_type,
+                token_id=token_id,
+                err=str(e),
+            )
+            return
         except Exception as e:
             log.warning(
                 "tg_alert_dispatch_failed",
@@ -619,24 +736,17 @@ async def notify_paper_trade_opened(
                 token_id=token_id,
                 err=str(e),
             )
-            # Demote pre-emptive 'sent' row to 'dispatch_failed'.
-            # Cooldown query filters on outcome='sent', so demotion clears
-            # the cooldown for the next legitimate fire.
-            if sent_row_id is not None and db._conn is not None:
+            # B1: explicit provider rejection (TelegramRejected) OR a preprocessing
+            # / format failure — CONFIRMED non-delivery -> dispatch_failed (frees
+            # the dedup/cap slot for the next legitimate fire).
+            if sent_row_id is not None:
                 try:
-                    async with db._txn_lock:
-                        await db._conn.execute(
-                            "UPDATE tg_alert_log "
-                            "SET outcome='dispatch_failed', detail=? "
-                            "WHERE id=?",
-                            (str(e)[:200], sent_row_id),
-                        )
-                        await db._conn.commit()
+                    if not await lifecycle.demote_failed(
+                        db, sent_row_id, lease=lease, detail=str(e)[:200]
+                    ):
+                        log.warning("tg_alert_demote_cas_noop", sent_row_id=sent_row_id)
                 except Exception:
-                    log.exception(
-                        "tg_alert_log_demote_failed",
-                        sent_row_id=sent_row_id,
-                    )
+                    log.exception("tg_alert_log_demote_failed", sent_row_id=sent_row_id)
             return
 
         if minara_cmd is not None:
@@ -679,18 +789,20 @@ async def _log_outcome(
 ) -> None:
     if db._conn is None:
         return
-    async with db._txn_lock:
-        await db._conn.execute(
-            "INSERT INTO tg_alert_log "
-            "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                paper_trade_id,
-                signal_type,
-                token_id,
-                datetime.now(timezone.utc).isoformat(),
-                outcome,
-                detail,
-            ),
-        )
-        await db._conn.commit()
+    # FU-1 (rev7): route the single-statement audit write through the common
+    # disciplined helper (BEGIN IMMEDIATE + one statement + manager-owned COMMIT/
+    # ROLLBACK) instead of a bare ``_txn_lock`` + direct ``db._conn`` write + bare
+    # ``commit()`` — no way to strand the shared connection mid-transaction.
+    await db.execute_write(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            paper_trade_id,
+            signal_type,
+            token_id,
+            datetime.now(timezone.utc).isoformat(),
+            outcome,
+            detail,
+        ),
+    )

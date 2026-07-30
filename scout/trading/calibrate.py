@@ -287,8 +287,10 @@ async def apply_diffs(
 ) -> int:
     """Write changes inside a single transaction. Returns number of rows touched.
 
-    Telegram is dispatched inside the transaction so the txn-boundary is
-    *one* unit. **Important caveat:** ``alerter.send_telegram_message``
+    F2: the params write commits in one ``db.transaction()``; the operator
+    Telegram summary is dispatched AFTER commit, OUTSIDE the transaction, so
+    ``_txn_lock`` is never held across a network send. **Important caveat:**
+    ``alerter.send_telegram_message``
     swallows aiohttp errors and only logs a warning — it does NOT raise.
     So a Telegram delivery failure (network, 401, wrong chat_id) will NOT
     roll back the params write. The ``_telegram_token_looks_real`` gate at
@@ -308,90 +310,87 @@ async def apply_diffs(
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # F2: route the calibration write through the shared transaction-lock
+    # discipline (manager owns BEGIN IMMEDIATE / COMMIT / ROLLBACK and holds
+    # _txn_lock). The Telegram send is deliberately kept OUTSIDE this block
+    # (below) so _txn_lock is never held across a network send (defect 4).
     try:
-        await conn.execute("BEGIN EXCLUSIVE")
-        for diff in actionable:
-            set_clauses = ", ".join(f"{c.field} = ?" for c in diff.changes)
-            values = [c.new for c in diff.changes]
-            values.extend(
-                [
-                    now_iso,
-                    "calibration",
-                    now_iso,
-                    diff.reason,
-                    diff.signal_type,
-                ]
-            )
-            await conn.execute(
-                f"""UPDATE signal_params
-                    SET {set_clauses},
-                        updated_at = ?,
-                        updated_by = ?,
-                        last_calibration_at = ?,
-                        last_calibration_reason = ?
-                    WHERE signal_type = ?""",
-                values,
-            )
-            for change in diff.changes:
-                await conn.execute(
-                    """INSERT INTO signal_params_audit
-                       (signal_type, field_name, old_value, new_value,
-                        reason, applied_by, applied_at)
-                       VALUES (?, ?, ?, ?, ?, 'calibration', ?)""",
-                    (
-                        diff.signal_type,
-                        change.field,
-                        f"{change.old:.1f}",
-                        f"{change.new:.1f}",
-                        diff.reason,
+        async with db.transaction() as conn:
+            for diff in actionable:
+                set_clauses = ", ".join(f"{c.field} = ?" for c in diff.changes)
+                values = [c.new for c in diff.changes]
+                values.extend(
+                    [
                         now_iso,
-                    ),
+                        "calibration",
+                        now_iso,
+                        diff.reason,
+                        diff.signal_type,
+                    ]
                 )
-
-        # Telegram inside the txn — failure aborts the writes.
-        if session is not None and not force_no_alert:
-            from scout import alerter  # local import — avoids aiohttp at collection
-
-            summary = "\n".join(
-                f"  {d.signal_type}: "
-                + ", ".join(f"{c.field} {c.old:.1f}→{c.new:.1f}" for c in d.changes)
-                + f" [{d.reason}]"
-                for d in actionable
-            )
-            # §12b: truthful dispatched/delivered/failed triplet around the
-            # operator alert for this automated param change. raise_on_failure
-            # makes a non-200/exception observable HERE; we log
-            # calibrate_alert_failed and SWALLOW it so the calibration still
-            # commits (operator visibility is best-effort — a Telegram outage
-            # must not lose a valid calibration). delivered is logged ONLY on a
-            # confirmed success, so the pair never falsely claims delivery.
-            log.info("calibrate_alert_dispatched", n_signals=len(actionable))
-            try:
-                await alerter.send_telegram_message(
-                    f"calibration applied:\n{summary}",
-                    session,
-                    settings,
-                    parse_mode=None,
-                    raise_on_failure=True,
-                    source="calibrate",
+                await conn.execute(
+                    f"""UPDATE signal_params
+                        SET {set_clauses},
+                            updated_at = ?,
+                            updated_by = ?,
+                            last_calibration_at = ?,
+                            last_calibration_reason = ?
+                        WHERE signal_type = ?""",
+                    values,
                 )
-                log.info("calibrate_alert_delivered", n_signals=len(actionable))
-            except Exception as exc:
-                log.warning(
-                    "calibrate_alert_failed",
-                    n_signals=len(actionable),
-                    err=str(exc),
-                    err_type=type(exc).__name__,
-                )
-
-        await conn.commit()
+                for change in diff.changes:
+                    await conn.execute(
+                        """INSERT INTO signal_params_audit
+                           (signal_type, field_name, old_value, new_value,
+                            reason, applied_by, applied_at)
+                           VALUES (?, ?, ?, ?, ?, 'calibration', ?)""",
+                        (
+                            diff.signal_type,
+                            change.field,
+                            f"{change.old:.1f}",
+                            f"{change.new:.1f}",
+                            diff.reason,
+                            now_iso,
+                        ),
+                    )
+        # Manager commits on clean exit; rolls back on any raise inside.
     except Exception:
-        try:
-            await conn.execute("ROLLBACK")
-        except Exception as rb_err:
-            log.exception("calibrate_apply_rollback_failed", err=str(rb_err))
         log.error("CALIBRATE_APPLY_FAILED")
         raise
+
+    # F2: the operator Telegram summary is sent AFTER commit, OUTSIDE the
+    # transaction — _txn_lock is never held across a network send. Delivery is
+    # best-effort: the calibration is already durably committed, so a Telegram
+    # outage must not lose it (this preserves the prior behavior, which already
+    # SWALLOWED send failures and committed regardless). §12b dispatched/
+    # delivered/failed triplet is preserved.
+    if session is not None and not force_no_alert:
+        from scout import alerter  # local import — avoids aiohttp at collection
+
+        summary = "\n".join(
+            f"  {d.signal_type}: "
+            + ", ".join(f"{c.field} {c.old:.1f}→{c.new:.1f}" for c in d.changes)
+            + f" [{d.reason}]"
+            for d in actionable
+        )
+        log.info("calibrate_alert_dispatched", n_signals=len(actionable))
+        try:
+            await alerter.send_telegram_message(
+                f"calibration applied:\n{summary}",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="calibrate",
+            )
+            log.info("calibrate_alert_delivered", n_signals=len(actionable))
+        except Exception as exc:
+            log.warning(
+                "calibrate_alert_failed",
+                n_signals=len(actionable),
+                err=str(exc),
+                err_type=type(exc).__name__,
+            )
 
     # AFTER commit only — bumping before commit would expose other readers
     # to uncommitted state if a rollback fired. The bump invalidates the

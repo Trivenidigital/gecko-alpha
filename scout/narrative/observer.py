@@ -153,24 +153,24 @@ async def store_snapshot(db: Database, snapshots: list[CategorySnapshot]) -> Non
     if db._conn is None:
         raise RuntimeError("Database not initialized. Call initialize() first.")
 
-    for snap in snapshots:
-        await db._conn.execute(
-            """INSERT INTO category_snapshots
-               (category_id, name, market_cap, market_cap_change_24h,
-                volume_24h, coin_count, market_regime, snapshot_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                snap.category_id,
-                snap.name,
-                snap.market_cap,
-                snap.market_cap_change_24h,
-                snap.volume_24h,
-                snap.coin_count,
-                snap.market_regime,
-                snap.snapshot_at.isoformat(),
-            ),
-        )
-    await db._conn.commit()
+    async with db.transaction() as conn:
+        for snap in snapshots:
+            await conn.execute(
+                """INSERT INTO category_snapshots
+                   (category_id, name, market_cap, market_cap_change_24h,
+                    volume_24h, coin_count, market_regime, snapshot_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snap.category_id,
+                    snap.name,
+                    snap.market_cap,
+                    snap.market_cap_change_24h,
+                    snap.volume_24h,
+                    snap.coin_count,
+                    snap.market_regime,
+                    snap.snapshot_at.isoformat(),
+                ),
+            )
     logger.info("stored_category_snapshots", count=len(snapshots))
 
 
@@ -222,12 +222,9 @@ async def prune_old_snapshots(db: Database, retention_days: int) -> int:
         raise RuntimeError("Database not initialized. Call initialize() first.")
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cursor = await db._conn.execute(
+    deleted = await db.execute_write(
         "DELETE FROM category_snapshots WHERE snapshot_at < ?",
         (cutoff,),
     )
-    await db._conn.commit()
-    logger.info(
-        "pruned_old_snapshots", deleted=cursor.rowcount, retention_days=retention_days
-    )
-    return cursor.rowcount
+    logger.info("pruned_old_snapshots", deleted=deleted, retention_days=retention_days)
+    return deleted

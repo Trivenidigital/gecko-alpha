@@ -793,6 +793,7 @@ async def test_send_telegram_message_can_raise_on_non_200(settings_factory):
     from aioresponses import aioresponses
 
     from scout.alerter import send_telegram_message
+    from scout.exceptions import AlertDeliveryError
 
     settings = settings_factory(
         TELEGRAM_BOT_TOKEN="test-token",
@@ -805,7 +806,11 @@ async def test_send_telegram_message_can_raise_on_non_200(settings_factory):
             body="telegram outage",
         )
         async with aiohttp.ClientSession() as session:
-            with pytest.raises(RuntimeError, match="telegram send failed"):
+            # B1: a 5xx is a server-side error → TelegramTransportUnknown (an
+            # AlertDeliveryError subclass) — unprovable delivery, not a confirmed
+            # rejection. Any non-200 raises a typed AlertDeliveryError under
+            # raise_on_failure=True.
+            with pytest.raises(AlertDeliveryError, match="telegram server error"):
                 await send_telegram_message(
                     "gainers_early alert",
                     session,

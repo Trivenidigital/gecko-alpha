@@ -313,36 +313,38 @@ INSERT INTO paper_trades
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         ?, 0, 0.0, ?, ?, ?, ?, ?)
 """
-        cursor = await conn.execute(
-            INSERT_SQL,
-            (
-                token_id,
-                symbol,
-                name,
-                chain,
-                signal_type,
-                json.dumps(signal_data),
-                effective_entry,
-                amount_usd,
-                quantity,
-                tp_pct,
-                sl_pct,
-                tp_price,
-                sl_price,
-                now,
-                signal_combo,
-                lead_time_vs_trending_min,
-                lead_time_vs_trending_status,
-                quantity,  # remaining_qty = full qty at open
-                would_be_live,
-                actionable_value,
-                actionability_reason,
-                actionability_version,
-                price_source,
-            ),
+        insert_params = (
+            token_id,
+            symbol,
+            name,
+            chain,
+            signal_type,
+            json.dumps(signal_data),
+            effective_entry,
+            amount_usd,
+            quantity,
+            tp_pct,
+            sl_pct,
+            tp_price,
+            sl_price,
+            now,
+            signal_combo,
+            lead_time_vs_trending_min,
+            lead_time_vs_trending_status,
+            quantity,  # remaining_qty = full qty at open
+            would_be_live,
+            actionable_value,
+            actionability_reason,
+            actionability_version,
+            price_source,
         )
-        trade_id = cursor.lastrowid
-        await conn.commit()
+        # F2: the trade-open INSERT commits under the shared transaction-lock
+        # discipline (BEGIN IMMEDIATE + _txn_lock). Post-commit work
+        # (entry-snapshot stamp, live handoff) stays OUTSIDE — the trade is
+        # durably committed at block exit.
+        async with db.transaction() as conn:
+            cursor = await conn.execute(INSERT_SQL, insert_params)
+            trade_id = cursor.lastrowid
 
         # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION: metadata-only stamp
         # of point-in-time entry facts. Wrapped so any failure degrades to a
@@ -462,19 +464,20 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             raise RuntimeError("Database not initialized.")
 
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await conn.execute(
-            "UPDATE paper_trades "
-            "SET moonshot_armed_at = ?, original_trail_drawdown_pct = ? "
-            "WHERE id = ? AND moonshot_armed_at IS NULL",
-            (now, original_trail_drawdown_pct, trade_id),
-        )
-        # Always close the implicit transaction the UPDATE may have opened,
-        # whether it changed a row or not. Symmetric on rowcount=0 and =1
-        # keeps connection-level transaction state predictable for the
-        # verify SELECT below and any caller that runs more queries after.
-        await conn.commit()
+        # F2: the arm UPDATE commits under the shared transaction-lock
+        # discipline. The manager commits on block exit whether the UPDATE
+        # changed a row or not, keeping connection-level transaction state
+        # predictable for the verify SELECT below and any later caller query.
+        async with db.transaction() as conn:
+            cursor = await conn.execute(
+                "UPDATE paper_trades "
+                "SET moonshot_armed_at = ?, original_trail_drawdown_pct = ? "
+                "WHERE id = ? AND moonshot_armed_at IS NULL",
+                (now, original_trail_drawdown_pct, trade_id),
+            )
+            arm_rowcount = cursor.rowcount
 
-        if cursor.rowcount == 1:
+        if arm_rowcount == 1:
             log.info(
                 "moonshot_armed",
                 trade_id=trade_id,
@@ -581,11 +584,15 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
         updates += f" WHERE id = ? AND leg_{leg}_filled_at IS NULL"
         params.append(trade_id)
 
-        cursor_upd = await conn.execute(updates, params)
-        if cursor_upd.rowcount == 0:
+        # F2: the leg-fill UPDATE commits under the shared transaction-lock
+        # discipline. A zero-row race loss commits a no-op (harmless) then
+        # returns False, matching the prior "nothing changed" outcome.
+        async with db.transaction() as conn:
+            cursor_upd = await conn.execute(updates, params)
+            partial_rowcount = cursor_upd.rowcount
+        if partial_rowcount == 0:
             log.warning("partial_sell_race_lost", trade_id=trade_id, leg=leg)
             return False
-        await conn.commit()
 
         peak_pct_rounded = round(float(peak_pct), 2) if peak_pct is not None else None
         log.info(
@@ -706,26 +713,30 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             else status_map.get(reason, "closed_manual")
         )
 
-        cursor_upd = await conn.execute(
-            """UPDATE paper_trades
-               SET status = ?, exit_price = ?, exit_reason = ?,
-                   exit_provenance = ?, pnl_usd = ?, pnl_pct = ?, closed_at = ?
-               WHERE id = ? AND status = 'open'""",
-            (
-                status,
-                effective_exit,
-                reason,
-                price_provenance,
-                pnl_usd,
-                round(pnl_pct, 4),
-                now,
-                trade_id,
-            ),
-        )
-        if cursor_upd.rowcount == 0:
+        # F2: the close UPDATE commits under the shared transaction-lock
+        # discipline. A zero-row result (already closed) commits a no-op then
+        # returns False, matching the prior outcome.
+        async with db.transaction() as conn:
+            cursor_upd = await conn.execute(
+                """UPDATE paper_trades
+                   SET status = ?, exit_price = ?, exit_reason = ?,
+                       exit_provenance = ?, pnl_usd = ?, pnl_pct = ?, closed_at = ?
+                   WHERE id = ? AND status = 'open'""",
+                (
+                    status,
+                    effective_exit,
+                    reason,
+                    price_provenance,
+                    pnl_usd,
+                    round(pnl_pct, 4),
+                    now,
+                    trade_id,
+                ),
+            )
+            sell_rowcount = cursor_upd.rowcount
+        if sell_rowcount == 0:
             log.warning("trade_already_closed", trade_id=trade_id)
             return False
-        await conn.commit()
 
         log.info(
             "paper_trade_closed",

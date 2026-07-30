@@ -658,7 +658,9 @@ async def test_notify_demotes_sent_row_on_cancelled_error_during_minara_lookup(
 async def test_notify_demotes_sent_row_on_cancelled_error_during_telegram_send(
     tmp_path, monkeypatch
 ):
-    """Cancellation during Telegram send must not leave pre-claimed row as sent."""
+    """Cancellation during the Telegram send (after dispatch_attempted) must
+    NEVER leave the row 'sent'. P0-1: the send began but its result is
+    unprovable, so the row becomes delivery_unknown_after_send."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     settings = _settings()
@@ -694,8 +696,9 @@ async def test_notify_demotes_sent_row_on_cancelled_error_during_telegram_send(
         "WHERE token_id='bonk' ORDER BY id DESC LIMIT 1"
     )
     outcome, detail = await cur.fetchone()
-    assert outcome == "dispatch_failed"
-    assert "telegram" in (detail or "").lower()
+    assert outcome == "delivery_unknown_after_send"
+    assert outcome != "sent"
+    assert "cancelled" in (detail or "").lower()
     cur = await db._conn.execute("SELECT COUNT(*) FROM minara_alert_emissions")
     assert (await cur.fetchone())[0] == 0
     await db.close()
@@ -1140,3 +1143,394 @@ async def test_dedup_audit_log_emitted_on_suppress(tmp_path, monkeypatch):
     assert ev["reason"] == "dedup_24h"
     assert ev["prior_alerted_at"] is not None
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# P0-1 paper-trade lane crash-window coverage (shared lifecycle contract).
+# ---------------------------------------------------------------------------
+
+
+async def _run_notify(db, token="bonk"):
+    await notify_paper_trade_opened(
+        db,
+        _settings(),
+        session=object(),
+        paper_trade_id=42,
+        signal_type="gainers_early",
+        token_id=token,
+        symbol="BONK",
+        entry_price=0.0001,
+        amount_usd=10.0,
+        signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+    )
+
+
+async def _last_outcome(db, token="bonk"):
+    cur = await db._conn.execute(
+        "SELECT outcome FROM tg_alert_log WHERE token_id=? ORDER BY id DESC LIMIT 1",
+        (token,),
+    )
+    return (await cur.fetchone())[0]
+
+
+class _Kill(BaseException):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_success_promotes_to_sent(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _ok)
+    await _run_notify(db)
+    cur = await db._conn.execute(
+        "SELECT outcome, COUNT(*) FROM tg_alert_log WHERE token_id='bonk' GROUP BY outcome"
+    )
+    rows = {r[0]: r[1] for r in await cur.fetchall()}
+    assert rows == {"sent": 1}  # promoted exactly once; no pending/attempted left
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_minara_stays_pending(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _kill(*a, **k):
+        raise _Kill("SIGKILL during minara lookup")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _kill)
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    assert await _last_outcome(db) == "dispatch_pending"  # send never started
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_format_stays_pending(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    def _kill_format(**k):
+        raise _Kill("SIGKILL during format")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr(
+        "scout.trading.tg_alert_dispatch.format_paper_trade_alert", _kill_format
+    )
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    assert await _last_outcome(db) == "dispatch_pending"  # crash before attempted
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_crash_during_send_stays_attempted(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    async def _kill_send(*a, **k):
+        raise _Kill("SIGKILL mid-send")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _kill_send)
+    with pytest.raises(_Kill):
+        await _run_notify(db)
+    # Crash AFTER dispatch_attempted → row stays attempted (reconciled later to
+    # delivery_unknown), never a false 'sent'.
+    assert await _last_outcome(db) == "dispatch_attempted"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_p0_1_paper_provider_failure_demotes_to_failed(tmp_path, monkeypatch):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    async def _fail(*a, **k):
+        raise RuntimeError("provider 500")
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    monkeypatch.setattr("scout.alerter.send_telegram_message", _fail)
+    await _run_notify(db)  # notify never raises on a confirmed Exception failure
+    assert await _last_outcome(db) == "dispatch_failed"
+    await db.close()
+
+
+# ---------------------------------------------------------------------------
+# B1 delivery-certainty taxonomy (paper-trade lane): transport-uncertain failure
+# → delivery_unknown_after_send; explicit provider rejection → dispatch_failed.
+# ---------------------------------------------------------------------------
+
+
+# Exercised through the REAL provider-call path (aioresponses-mocked HTTP through
+# send_telegram_message), NOT by raising the typed exceptions directly.
+import aiohttp  # noqa: E402
+from aioresponses import aioresponses  # noqa: E402
+
+_PAPER_TG_URL = "https://api.telegram.org/botx/sendMessage"  # _REQUIRED token="x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "setup,expected",
+    [
+        (lambda m: m.post(_PAPER_TG_URL, status=200, payload={"ok": True}), "sent"),
+        (
+            lambda m: m.post(
+                _PAPER_TG_URL, status=200, payload={"ok": False, "description": "x"}
+            ),
+            "dispatch_failed",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=200, body="<not json>"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=400, payload={"ok": False}),
+            "dispatch_failed",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=408, body="request timeout"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=409, body="conflict"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, status=503, body="unavailable"),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(
+                _PAPER_TG_URL, exception=aiohttp.ClientConnectionError("reset")
+            ),
+            "delivery_unknown_after_send",
+        ),
+        (
+            lambda m: m.post(_PAPER_TG_URL, exception=asyncio.TimeoutError()),
+            "delivery_unknown_after_send",
+        ),
+    ],
+)
+async def test_b1_paper_real_http_maps_to_outcome(
+    tmp_path, monkeypatch, setup, expected
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    with aioresponses() as m:
+        setup(m)
+        async with aiohttp.ClientSession() as session:
+            await notify_paper_trade_opened(
+                db,
+                _settings(),
+                session=session,
+                paper_trade_id=42,
+                signal_type="gainers_early",
+                token_id="bonk",
+                symbol="BONK",
+                entry_price=0.0001,
+                amount_usd=10.0,
+                signal_data={"price_change_24h": 50.0, "mcap": 2_000_000},
+            )
+    assert await _last_outcome(db) == expected
+    await db.close()
+
+
+# ---------------------------------------------------------------------------
+# FU-1 (rev7): the migrated claim block + _log_outcome now run through the common
+# transaction manager, so ANY failure (body write, commit, or inside _log_outcome)
+# rolls back cleanly — no partial row, the shared connection is NOT left in a
+# transaction, _txn_lock is released, the NEXT db.transaction() succeeds, and a
+# previously committed foreign write is never rolled back.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_foreign_row(db):
+    await db.execute_write(
+        "INSERT INTO tg_alert_log "
+        "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+        "VALUES (NULL, 'other', 'foreign', ?, 'sent')",
+        (datetime.now(timezone.utc).isoformat(),),
+    )
+
+
+async def _assert_clean_after_failure(db, *, token):
+    # no partial row for the failed dispatch
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id=?", (token,)
+    )
+    assert (await cur.fetchone())[0] == 0, "partial row survived the rollback"
+    # connection is NOT left in a transaction; the lock is released
+    assert db._conn.in_transaction is False, "connection left mid-transaction"
+    assert not db._txn_lock.locked(), "_txn_lock was stranded"
+    # the NEXT manager transaction succeeds (lock + connection are usable)
+    async with db.transaction() as conn:
+        await conn.execute(
+            "INSERT INTO tg_alert_log "
+            "(paper_trade_id, signal_type, token_id, alerted_at, outcome) "
+            "VALUES (NULL, 's', 'after', ?, 'sent')",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id='after'"
+    )
+    assert (await cur.fetchone())[0] == 1
+    # the previously committed foreign write is untouched
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_alert_log WHERE token_id='foreign'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+
+async def _noop_reconcile(*a, **k):
+    return {"pending_failed": 0, "attempted_unknown": 0}
+
+
+@pytest.mark.asyncio
+async def test_fu1_claim_body_write_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(a): a claim-block body write that raises rolls back cleanly."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_foreign_row(db)
+    monkeypatch.setattr(
+        "scout.trading.alert_dispatch_lifecycle.reconcile_stale", _noop_reconcile
+    )
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    real_execute = db._conn.execute
+
+    async def _exec(sql, *a, **k):
+        if isinstance(sql, str) and "INSERT INTO tg_alert_log" in sql:
+            raise RuntimeError("injected claim body write failure")
+        return await real_execute(sql, *a, **k)
+
+    db._conn.execute = _exec
+    await _run_notify(db, token="bonk")  # notify swallows via its outer try/except
+    db._conn.execute = real_execute
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fu1_claim_commit_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(b): the claim write succeeds, then the manager COMMIT fails — the
+    written pending row is rolled back (no partial row) and the connection is clean."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=42)
+    await _seed_foreign_row(db)
+    monkeypatch.setattr(
+        "scout.trading.alert_dispatch_lifecycle.reconcile_stale", _noop_reconcile
+    )
+
+    async def _ok(*a, **k):
+        return None
+
+    monkeypatch.setattr("scout.trading.minara_alert.maybe_minara_command", _ok)
+    real_execute = db._conn.execute
+    real_commit = db._conn.commit
+    armed = {"claim_written": False, "fired": False}
+
+    async def _exec(sql, *a, **k):
+        r = await real_execute(sql, *a, **k)
+        if isinstance(sql, str) and "INSERT INTO tg_alert_log" in sql:
+            armed["claim_written"] = True  # the pending row is now in the txn
+        return r
+
+    async def _commit():
+        if armed["claim_written"] and not armed["fired"]:
+            armed["fired"] = True
+            raise RuntimeError("injected commit failure")
+        return await real_commit()
+
+    db._conn.execute = _exec
+    db._conn.commit = _commit
+    await _run_notify(db, token="bonk")
+    db._conn.execute = real_execute
+    db._conn.commit = real_commit
+    assert armed["fired"], "commit injection did not fire on the claim txn"
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_fu1_log_outcome_commit_failure_rolls_back_clean(tmp_path, monkeypatch):
+    """FU-1(c): a failure inside _log_outcome (now db.execute_write) rolls back
+    cleanly — the audit row is not partially written and the connection is clean."""
+    from scout.trading.tg_alert_dispatch import _log_outcome
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _insert_paper_trade(db, trade_id=1)  # FK target for _log_outcome
+    await _seed_foreign_row(db)
+    real_commit = db._conn.commit
+    fired = {"v": False}
+
+    async def _commit():
+        if not fired["v"]:
+            fired["v"] = True
+            raise RuntimeError("injected _log_outcome commit failure")
+        return await real_commit()
+
+    db._conn.commit = _commit
+    with pytest.raises(RuntimeError):
+        await _log_outcome(
+            db,
+            paper_trade_id=1,
+            signal_type="gainers_early",
+            token_id="bonk",
+            outcome="blocked_eligibility",
+        )
+    db._conn.commit = real_commit
+    await _assert_clean_after_failure(db, token="bonk")
+    await db.close()
+
+
+def test_fu1_ruled_paths_use_manager_not_bare_lock():
+    """FU-1: the two ruled paths route through the transaction manager /
+    execute_write (never a bare `async with db._txn_lock` + direct `_conn` write),
+    so they inherit the manager's rollback/cleanup discipline."""
+    import inspect
+
+    from scout.trading import tg_alert_dispatch
+
+    notify_src = inspect.getsource(tg_alert_dispatch.notify_paper_trade_opened)
+    assert "db.transaction(" in notify_src
+    assert "async with db._txn_lock" not in notify_src
+    assert "db._conn.commit()" not in notify_src
+
+    log_src = inspect.getsource(tg_alert_dispatch._log_outcome)
+    assert "execute_write(" in log_src
+    assert "async with db._txn_lock" not in log_src
+    assert "db._conn.commit()" not in log_src

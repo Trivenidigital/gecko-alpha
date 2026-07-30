@@ -16,6 +16,8 @@ from dashboard import db as dashboard_db
 from scout import alerter
 from scout.config import Settings
 from scout.db import Database
+from scout.exceptions import TelegramTransportUnknown
+from scout.trading import alert_dispatch_lifecycle as lifecycle
 from scout.trading.tg_alert_dispatch import _fmt_mcap, _fmt_price
 
 log = structlog.get_logger(__name__)
@@ -227,7 +229,15 @@ async def _maybe_await(value):
     return value
 
 
-async def _count_sent_today(db: Database) -> int:
+async def _count_reserved_today(db: Database) -> int:
+    """Count RESERVED daily send slots (P0-1 cap arithmetic) using the shared
+    lifecycle's cap-reservation set: ``sent`` + ``dispatch_pending`` +
+    ``dispatch_attempted`` + ``delivery_unknown_after_send`` (a confirmed
+    ``dispatch_failed`` frees its slot). Cap-reservation ONLY — delivered
+    reporting still keys strictly on ``outcome='sent'`` (alerts_scoreboard /
+    operator-action consumers), so a pending/attempted/unknown row is NEVER
+    counted as delivered.
+    """
     if db._conn is None:
         return 0
     start = datetime.now(timezone.utc).replace(
@@ -235,7 +245,9 @@ async def _count_sent_today(db: Database) -> int:
     )
     cur = await db._conn.execute(
         "SELECT COUNT(*) FROM tg_alert_log "
-        "WHERE signal_type = ? AND outcome = 'sent' AND alerted_at >= ?",
+        "WHERE signal_type = ? "
+        f"  AND outcome IN {lifecycle.cap_reserved_in_clause()} "
+        "  AND alerted_at >= ?",
         (SIGNAL_TYPE, start.isoformat()),
     )
     row = await cur.fetchone()
@@ -250,11 +262,18 @@ async def _send_claimed_alert(
     candidate: TradeSurfaceAlertCandidate,
     window_hours: int,
 ) -> str:
-    """Claim, send, and commit under one DB lock.
+    """Claim a RESERVED slot as ``dispatch_pending`` in one disciplined
+    transaction, do preprocessing (format) while pending, mark
+    ``dispatch_attempted`` IMMEDIATELY before the provider call, send OUTSIDE the
+    lock, then promote to ``sent`` only after provider acceptance — the shared
+    :mod:`scout.trading.alert_dispatch_lifecycle` contract.
 
-    This prevents a failed surface alert from briefly looking like a durable
-    `sent` row to concurrent paper-trade dispatch. The lock is held across a
-    Telegram call, but this opt-in lane is capped to 5/day.
+    Crash distinguishability (P0-1): a crash during formatting leaves the row
+    ``dispatch_pending`` (send never started); a crash during/after the send
+    leaves it ``dispatch_attempted`` (reconciled to
+    ``delivery_unknown_after_send``). Neither is ever a false ``sent``. Dedup
+    treats ``sent`` + ``dispatch_pending`` + ``dispatch_attempted`` as claimed.
+    Opt-in lane, 5/day.
     """
     if db._conn is None:
         return "dispatch_failed"
@@ -264,34 +283,43 @@ async def _send_claimed_alert(
         "verdict": candidate.verdict,
         "reasons": list(candidate.reasons),
     }
-    async with db._txn_lock:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        sent_row_id: int | None = None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # P0-2 ownership lease: stamped into the pending claim, then required by every
+    # subsequent transition so a stale sweep can never demote THIS dispatch.
+    lease = lifecycle.new_lease()
+    pending_row_id: int | None = None
+    async with db.transaction() as conn:
         if window_hours > 0:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(hours=window_hours)
             ).isoformat()
-            cur = await db._conn.execute(
+            # Dedup treats RESERVED (sent + pending + attempted + unknown) as
+            # claimed. The claim stamps the lease token + heartbeat.
+            cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
-                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "SELECT NULL, ?, ?, ?, 'sent', ? "
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                " detail, dispatch_state_updated_at, dispatch_lease_token) "
+                "SELECT NULL, ?, ?, ?, 'dispatch_pending', ?, ?, ? "
                 "WHERE NOT EXISTS ("
                 "  SELECT 1 FROM tg_alert_log "
-                "  WHERE token_id = ? AND outcome = 'sent' "
-                "  AND alerted_at >= ?"
+                "  WHERE token_id = ? "
+                f"    AND outcome IN {lifecycle.dedup_reserved_in_clause()} "
+                "    AND alerted_at >= ?"
                 ") RETURNING id",
                 (
                     SIGNAL_TYPE,
                     candidate.token_id,
                     now_iso,
                     json.dumps(detail, sort_keys=True),
+                    now_iso,
+                    lease,
                     candidate.token_id,
                     cutoff,
                 ),
             )
             row = await cur.fetchone()
             if row is None:
-                await db._conn.execute(
+                await conn.execute(
                     "INSERT INTO tg_alert_log "
                     "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
                     "VALUES (NULL, ?, ?, ?, 'blocked_dedup_24h', ?)",
@@ -305,84 +333,144 @@ async def _send_claimed_alert(
                         ),
                     ),
                 )
-                await db._conn.commit()
                 return "blocked_dedup_24h"
-            sent_row_id = int(row[0])
+            pending_row_id = int(row[0])
         else:
-            cur = await db._conn.execute(
+            cur = await conn.execute(
                 "INSERT INTO tg_alert_log "
-                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, detail) "
-                "VALUES (NULL, ?, ?, ?, 'sent', ?) RETURNING id",
+                "(paper_trade_id, signal_type, token_id, alerted_at, outcome, "
+                " detail, dispatch_state_updated_at, dispatch_lease_token) "
+                "VALUES (NULL, ?, ?, ?, 'dispatch_pending', ?, ?, ?) RETURNING id",
                 (
                     SIGNAL_TYPE,
                     candidate.token_id,
                     now_iso,
                     json.dumps(detail, sort_keys=True),
+                    now_iso,
+                    lease,
                 ),
             )
             row = await cur.fetchone()
-            sent_row_id = int(row[0]) if row else None
+            pending_row_id = int(row[0]) if row else None
+    # Claim committed as dispatch_pending — a crash before mark_attempted below
+    # leaves it pending (send never started), NEVER a false 'sent'.
 
-        try:
-            body = format_trade_surface_alert(candidate)
-            log.info(
-                "trade_surface_alert_dispatched",
-                tg_alert_log_id=sent_row_id,
+    try:
+        # Preprocessing (formatting) happens while the row is still pending.
+        body = format_trade_surface_alert(candidate)
+        log.info(
+            "trade_surface_alert_dispatched",
+            tg_alert_log_id=pending_row_id,
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+        )
+        # Mark ATTEMPTED immediately before the provider call — a crash from here
+        # on is reconciled to delivery_unknown_after_send, not a false 'sent'.
+        # P0-2: the send happens ONLY if the pending->attempted CAS applied FOR
+        # THIS lease. A False means a stale sweep reclaimed the row — abort the
+        # provider call rather than send under a lost lease.
+        if not await lifecycle.mark_attempted(db, pending_row_id, lease=lease):
+            log.warning(
+                "trade_surface_alert_lease_lost",
+                tg_alert_log_id=pending_row_id,
                 token_id=candidate.token_id,
                 surface=candidate.surface,
             )
-            await alerter.send_telegram_message(
+            return "dispatch_failed"
+        # B2: HARD end-to-end deadline (< stale threshold) over the WHOLE provider
+        # operation — its internal pacing wait + 429 retry waits + the HTTP call —
+        # so an active send can never outlive the lease heartbeat and be reconciled.
+        await asyncio.wait_for(
+            alerter.send_telegram_message(
                 body,
                 session,
                 settings,
                 parse_mode=None,
                 raise_on_failure=True,
                 source="trade_surface_alerts",
-            )
-            await db._conn.commit()
+            ),
+            timeout=lifecycle.SEND_OPERATION_DEADLINE_SECONDS,
+        )
+        # Provider ACCEPTED — persist durable 'sent' (recover unknown->sent under
+        # our lease if a race moved it). Return/count/log are DERIVED from the
+        # persisted result so DB state, return, counters, and logs never disagree.
+        if await lifecycle.finalize_confirmed_sent(db, pending_row_id, lease=lease):
             log.info(
                 "trade_surface_alert_delivered",
-                tg_alert_log_id=sent_row_id,
+                tg_alert_log_id=pending_row_id,
                 token_id=candidate.token_id,
                 surface=candidate.surface,
             )
             return "sent"
-        except asyncio.CancelledError:
-            if sent_row_id is not None:
-                await db._conn.execute(
-                    "UPDATE tg_alert_log "
-                    "SET outcome='dispatch_failed', detail=? WHERE id=?",
-                    (
-                        json.dumps(
-                            {**detail, "error": "cancelled_during_telegram_send"},
-                            sort_keys=True,
-                        ),
-                        sent_row_id,
-                    ),
-                )
-                await db._conn.commit()
-            raise
-        except Exception as exc:
-            if sent_row_id is not None:
-                await db._conn.execute(
-                    "UPDATE tg_alert_log "
-                    "SET outcome='dispatch_failed', detail=? WHERE id=?",
-                    (
-                        json.dumps(
-                            {**detail, "error": str(exc)[:200]},
-                            sort_keys=True,
-                        ),
-                        sent_row_id,
-                    ),
-                )
-            await db._conn.commit()
+        # Confirmed acceptance but could not persist 'sent' under our lease — do
+        # NOT claim sent; report the honest state (matches the DB truth).
+        log.error(
+            "trade_surface_alert_promote_and_recover_failed",
+            tg_alert_log_id=pending_row_id,
+            token_id=candidate.token_id,
+        )
+        return "delivery_unknown_after_send"
+    except asyncio.CancelledError:
+        # Interrupted after the send began — the provider result is unprovable.
+        if not await lifecycle.mark_delivery_unknown(
+            db,
+            pending_row_id,
+            lease=lease,
+            detail=lifecycle.merge_error_detail(
+                detail, "cancelled_during_telegram_send"
+            ),
+        ):
             log.warning(
-                "trade_surface_alert_dispatch_failed",
+                "trade_surface_alert_unknown_cas_noop",
+                tg_alert_log_id=pending_row_id,
                 token_id=candidate.token_id,
-                surface=candidate.surface,
-                err=str(exc),
             )
-            return "dispatch_failed"
+        raise
+    except (asyncio.TimeoutError, TelegramTransportUnknown) as exc:
+        # B1: deadline exceeded OR transport uncertainty AFTER the attempt began —
+        # UNPROVABLE delivery → delivery_unknown_after_send (cap+dedup stay
+        # reserved; NO automatic redispatch). Never freed to dispatch_failed.
+        if not await lifecycle.mark_delivery_unknown(
+            db,
+            pending_row_id,
+            lease=lease,
+            detail=lifecycle.merge_error_detail(
+                detail, f"transport_unknown:{str(exc)[:120]}"
+            ),
+        ):
+            log.warning(
+                "trade_surface_alert_unknown_cas_noop",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+            )
+        log.warning(
+            "trade_surface_alert_delivery_unknown",
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+            err=str(exc),
+        )
+        return "delivery_unknown_after_send"
+    except Exception as exc:
+        # B1: explicit provider rejection (TelegramRejected) OR a preprocessing /
+        # format failure before the attempt — CONFIRMED non-delivery → failed.
+        if not await lifecycle.demote_failed(
+            db,
+            pending_row_id,
+            lease=lease,
+            detail=lifecycle.merge_error_detail(detail, str(exc)[:200]),
+        ):
+            log.warning(
+                "trade_surface_alert_demote_cas_noop",
+                tg_alert_log_id=pending_row_id,
+                token_id=candidate.token_id,
+            )
+        log.warning(
+            "trade_surface_alert_dispatch_failed",
+            token_id=candidate.token_id,
+            surface=candidate.surface,
+            err=str(exc),
+        )
+        return "dispatch_failed"
 
 
 async def send_trade_surface_alerts(
@@ -395,14 +483,32 @@ async def send_trade_surface_alerts(
     Never raises to the pipeline loop. The code path is opt-in, capped, and
     uses the same `tg_alert_log` + parse-mode discipline as paper-trade alerts.
     """
-    counts = {"sent": 0, "blocked_dedup_24h": 0, "dispatch_failed": 0}
+    counts = {
+        "sent": 0,
+        "blocked_dedup_24h": 0,
+        "dispatch_failed": 0,
+        "delivery_unknown_after_send": 0,
+    }
     if not settings.TRADE_SURFACE_TG_ALERTS_ENABLED:
         return counts
     try:
-        sent_today = await _count_sent_today(db)
-        remaining = max(0, settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY - sent_today)
+        # P0-1 claim-time stale-intent reconciliation via the shared lifecycle
+        # (frozen STALE_RECONCILE_SECONDS). A prior crashed run's rows are swept
+        # BEFORE counting reserved slots: stale dispatch_pending ->
+        # dispatch_failed (send never started), stale dispatch_attempted ->
+        # delivery_unknown_after_send (unprovable). Deterministic + self-owned.
+        reconciled = await lifecycle.reconcile_stale(db, SIGNAL_TYPE)
+        if reconciled["pending_failed"] or reconciled["attempted_unknown"]:
+            log.info("trade_surface_pending_reconciled", **reconciled)
+        # Cap arithmetic counts RESERVED slots (sent + pending + attempted + unknown).
+        reserved_today = await _count_reserved_today(db)
+        remaining = max(
+            0, settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_DAY - reserved_today
+        )
         if remaining <= 0:
-            log.info("trade_surface_alert_daily_cap_reached", sent_today=sent_today)
+            log.info(
+                "trade_surface_alert_daily_cap_reached", reserved_today=reserved_today
+            )
             return counts
 
         max_candidates = min(settings.TRADE_SURFACE_TG_ALERTS_MAX_PER_RUN, remaining)
@@ -445,9 +551,12 @@ async def send_trade_surface_alerts(
                 counts["sent"] += 1
             elif outcome == "dispatch_failed":
                 counts["dispatch_failed"] += 1
+            elif outcome == "delivery_unknown_after_send":
+                counts["delivery_unknown_after_send"] += 1
             if (
                 idx < len(candidates) - 1
-                and outcome in {"sent", "dispatch_failed"}
+                and outcome
+                in {"sent", "dispatch_failed", "delivery_unknown_after_send"}
                 and settings.TRADE_SURFACE_TG_ALERTS_SEND_SPACING_SECONDS > 0
             ):
                 await asyncio.sleep(

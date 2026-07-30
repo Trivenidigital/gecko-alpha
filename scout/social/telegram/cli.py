@@ -138,7 +138,7 @@ async def cmd_add(args, settings: Settings) -> int:
     trade_eligible = 0 if args.no_trade else 1
     safety_required = 0 if args.no_safety else 1
     try:
-        await db._conn.execute(
+        await db.execute_write(
             """INSERT OR REPLACE INTO tg_social_channels
                (channel_handle, display_name, trade_eligible, safety_required,
                 added_at, removed_at)
@@ -151,7 +151,6 @@ async def cmd_add(args, settings: Settings) -> int:
                 now_iso,
             ),
         )
-        await db._conn.commit()
         print(
             f"✅ Added {args.handle} "
             f"(trade_eligible={trade_eligible}, safety_required={safety_required})"
@@ -166,13 +165,12 @@ async def cmd_remove(args, settings: Settings) -> int:
     await db.initialize()
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        cur = await db._conn.execute(
+        rowcount = await db.execute_write(
             "UPDATE tg_social_channels SET removed_at = ? "
             "WHERE channel_handle = ? AND removed_at IS NULL",
             (now_iso, args.handle),
         )
-        await db._conn.commit()
-        if cur.rowcount == 0:
+        if rowcount == 0:
             print(f"⚠️  {args.handle} not found or already removed.")
             return 1
         print(f"✅ Removed {args.handle}")
@@ -186,13 +184,12 @@ async def cmd_set_trade(args, settings: Settings) -> int:
     await db.initialize()
     eligible = 1 if args.value.lower() in ("true", "1", "yes", "on") else 0
     try:
-        cur = await db._conn.execute(
+        rowcount = await db.execute_write(
             "UPDATE tg_social_channels SET trade_eligible = ? "
             "WHERE channel_handle = ? AND removed_at IS NULL",
             (eligible, args.handle),
         )
-        await db._conn.commit()
-        if cur.rowcount == 0:
+        if rowcount == 0:
             print(f"⚠️  {args.handle} not found.")
             return 1
         print(f"✅ {args.handle}.trade_eligible = {bool(eligible)}")
@@ -208,13 +205,12 @@ async def cmd_set_safety(args, settings: Settings) -> int:
     await db.initialize()
     required = 1 if args.value.lower() in ("true", "1", "yes", "on") else 0
     try:
-        cur = await db._conn.execute(
+        rowcount = await db.execute_write(
             "UPDATE tg_social_channels SET safety_required = ? "
             "WHERE channel_handle = ? AND removed_at IS NULL",
             (required, args.handle),
         )
-        await db._conn.commit()
-        if cur.rowcount == 0:
+        if rowcount == 0:
             print(f"⚠️  {args.handle} not found.")
             return 1
         print(f"✅ {args.handle}.safety_required = {bool(required)}")
@@ -242,51 +238,51 @@ async def cmd_sync_channels(args, settings: Settings) -> int:
         now_iso = datetime.now(timezone.utc).isoformat()
         added = 0
         updated = 0
-        for entry in yml_channels:
-            handle = entry.get("handle")
-            display = entry.get("display_name") or handle
-            trade_eligible = 1 if entry.get("trade_eligible", True) else 0
-            # Default strict (safety_required=True) when the key is absent —
-            # opt-in to lenient is explicit, never implicit.
-            safety_required = 1 if entry.get("safety_required", True) else 0
-            cur = await db._conn.execute(
-                "SELECT id, safety_required FROM tg_social_channels "
-                "WHERE channel_handle = ?",
-                (handle,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                await db._conn.execute(
-                    """INSERT INTO tg_social_channels
-                       (channel_handle, display_name, trade_eligible,
-                        safety_required, added_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (handle, display, trade_eligible, safety_required, now_iso),
+        async with db.transaction() as conn:
+            for entry in yml_channels:
+                handle = entry.get("handle")
+                display = entry.get("display_name") or handle
+                trade_eligible = 1 if entry.get("trade_eligible", True) else 0
+                # Default strict (safety_required=True) when the key is absent —
+                # opt-in to lenient is explicit, never implicit.
+                safety_required = 1 if entry.get("safety_required", True) else 0
+                cur = await conn.execute(
+                    "SELECT id, safety_required FROM tg_social_channels "
+                    "WHERE channel_handle = ?",
+                    (handle,),
                 )
-                added += 1
-            else:
-                # Reactivate via clearing removed_at. ALSO sync safety_required
-                # from yml so operators can flip the strict/lenient flag by
-                # editing yml + re-running sync — that's the documented
-                # operator workflow, and silently ignoring yml changes here
-                # would surprise them. trade_eligible still stays sticky
-                # because operators sometimes flip it via `set-trade` for
-                # incident response without intending to revert via yml.
-                if row[1] != safety_required:
-                    await db._conn.execute(
-                        "UPDATE tg_social_channels "
-                        "SET removed_at = NULL, safety_required = ? "
-                        "WHERE channel_handle = ?",
-                        (safety_required, handle),
+                row = await cur.fetchone()
+                if row is None:
+                    await conn.execute(
+                        """INSERT INTO tg_social_channels
+                           (channel_handle, display_name, trade_eligible,
+                            safety_required, added_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (handle, display, trade_eligible, safety_required, now_iso),
                     )
-                    updated += 1
+                    added += 1
                 else:
-                    await db._conn.execute(
-                        "UPDATE tg_social_channels SET removed_at = NULL "
-                        "WHERE channel_handle = ?",
-                        (handle,),
-                    )
-        await db._conn.commit()
+                    # Reactivate via clearing removed_at. ALSO sync safety_required
+                    # from yml so operators can flip the strict/lenient flag by
+                    # editing yml + re-running sync — that's the documented
+                    # operator workflow, and silently ignoring yml changes here
+                    # would surprise them. trade_eligible still stays sticky
+                    # because operators sometimes flip it via `set-trade` for
+                    # incident response without intending to revert via yml.
+                    if row[1] != safety_required:
+                        await conn.execute(
+                            "UPDATE tg_social_channels "
+                            "SET removed_at = NULL, safety_required = ? "
+                            "WHERE channel_handle = ?",
+                            (safety_required, handle),
+                        )
+                        updated += 1
+                    else:
+                        await conn.execute(
+                            "UPDATE tg_social_channels SET removed_at = NULL "
+                            "WHERE channel_handle = ?",
+                            (handle,),
+                        )
         unchanged = len(yml_channels) - added - updated
         print(
             f"✅ Sync complete: {added} added, "
@@ -351,11 +347,10 @@ async def cmd_replay_dlq(args, settings: Settings) -> int:
             print("\n(no PENDING rows to mark)")
             return 1
         placeholders = ",".join("?" * len(ids_to_mark))
-        await db._conn.execute(
+        await db.execute_write(
             f"UPDATE tg_social_dlq SET retried_at = ? WHERE id IN ({placeholders})",
             (now_iso, *ids_to_mark),
         )
-        await db._conn.commit()
         print(f"\n✅ Marked {len(ids_to_mark)} rows as retried_at={now_iso}")
         return 1
     finally:

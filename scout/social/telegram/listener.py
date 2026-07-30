@@ -561,9 +561,7 @@ async def _persist_message_with_watermark(
                 # Don't mask the outer write-failure via `raise` below,
                 # but emit a structured log so disk/lock/WAL failures
                 # during cleanup are observable. PR Round 4 sweep.
-                log.exception(
-                    "tg_social_message_rollback_failed", err=str(rb_err)
-                )
+                log.exception("tg_social_message_rollback_failed", err=str(rb_err))
             raise
 
 
@@ -581,7 +579,7 @@ async def _persist_signal_row(
     paper_trade_id: int | None,
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db._conn.execute(
+    await db.execute_write(
         """INSERT INTO tg_social_signals
            (message_pk, token_id, symbol, contract_address, chain,
             mcap_at_sighting, resolution_state, source_channel_handle,
@@ -601,7 +599,6 @@ async def _persist_signal_row(
             now_iso,
         ),
     )
-    await db._conn.commit()
 
 
 async def _append_dlq(
@@ -613,7 +610,7 @@ async def _append_dlq(
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        await db._conn.execute(
+        await db.execute_write(
             """INSERT INTO tg_social_dlq
                (channel_handle, msg_id, raw_text, error_class, error_text, failed_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -626,7 +623,6 @@ async def _append_dlq(
                 now_iso,
             ),
         )
-        await db._conn.commit()
         log.warning(
             "tg_social_dlq_appended",
             channel_handle=channel_handle,
@@ -847,11 +843,10 @@ async def _mark_channel_removed_and_alert(
         error=type(exc).__name__,
         error_text=str(exc)[:200],
     )
-    await db._conn.execute(
+    await db.execute_write(
         "UPDATE tg_social_channels SET removed_at = ? WHERE channel_handle = ?",
         (datetime.now(timezone.utc).isoformat(), channel_handle),
     )
-    await db._conn.commit()
     try:
         await send_telegram(
             http_session,
@@ -868,7 +863,7 @@ async def _set_listener_state(
     db: Database, state: ListenerState, detail: str | None = None
 ) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db._conn.execute(
+    await db.execute_write(
         """INSERT INTO tg_social_health (component, listener_state, updated_at, detail)
            VALUES ('listener', ?, ?, ?)
            ON CONFLICT(component) DO UPDATE SET
@@ -877,7 +872,6 @@ async def _set_listener_state(
              detail = excluded.detail""",
         (state, now_iso, detail),
     )
-    await db._conn.commit()
 
 
 async def _catchup_channel(
@@ -1499,8 +1493,7 @@ async def _emit_silence_alerts(
         except Exception:
             log.warning("tg_social_silence_alert_send_failed", channel=channel)
             continue
-        await db._conn.execute(
+        await db.execute_write(
             "UPDATE tg_social_health SET detail = ? WHERE component = ?",
             (f"silence_alert_at:{round(elapsed_hours, 1)}", component),
         )
-        await db._conn.commit()

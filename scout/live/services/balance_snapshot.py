@@ -31,24 +31,24 @@ class BalanceSnapshot(VenueService):
         if db._conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        for asset in self.assets:
-            try:
-                balance = await adapter.fetch_account_balance(asset=asset)
-                # USDT balance is its own USD value at par.
-                balance_usd = balance if asset.upper() in {"USDT", "USDC"} else None
-                await db._conn.execute(
-                    """INSERT INTO wallet_snapshots
-                       (venue, asset, balance, balance_usd, snapshot_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (venue, asset, float(balance), balance_usd, now_iso),
-                )
-            except NotImplementedError:
-                log.info(
-                    "balance_snapshot_adapter_not_wired",
-                    venue=venue,
-                    asset=asset,
-                )
-                return  # Don't keep iterating if the adapter isn't wired
-            except Exception:
-                log.exception("balance_snapshot_failed", venue=venue, asset=asset)
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            for asset in self.assets:
+                try:
+                    balance = await adapter.fetch_account_balance(asset=asset)
+                    # USDT balance is its own USD value at par.
+                    balance_usd = balance if asset.upper() in {"USDT", "USDC"} else None
+                    await conn.execute(
+                        """INSERT INTO wallet_snapshots
+                           (venue, asset, balance, balance_usd, snapshot_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (venue, asset, float(balance), balance_usd, now_iso),
+                    )
+                except NotImplementedError:
+                    log.info(
+                        "balance_snapshot_adapter_not_wired",
+                        venue=venue,
+                        asset=asset,
+                    )
+                    return  # Don't keep iterating if the adapter isn't wired
+                except Exception:
+                    log.exception("balance_snapshot_failed", venue=venue, asset=asset)

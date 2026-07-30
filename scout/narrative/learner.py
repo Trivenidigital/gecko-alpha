@@ -287,7 +287,7 @@ async def daily_learn(
         )
 
         # Insert learn_log row
-        await conn.execute(
+        await db.execute_write(
             """INSERT INTO learn_logs
                (cycle_number, cycle_type, reflection_text, changes_made,
                 hit_rate_before, hit_rate_after)
@@ -301,7 +301,6 @@ async def daily_learn(
                 None,
             ),
         )
-        await conn.commit()
 
         log.info(
             "learn.daily_complete",
@@ -432,7 +431,7 @@ async def weekly_consolidate(
         )
 
         # Insert learn_log
-        await conn.execute(
+        await db.execute_write(
             """INSERT INTO learn_logs
                (cycle_number, cycle_type, reflection_text, changes_made,
                 hit_rate_before, hit_rate_after)
@@ -446,7 +445,6 @@ async def weekly_consolidate(
                 None,
             ),
         )
-        await conn.commit()
 
         log.info(
             "learn.weekly_complete",

@@ -107,29 +107,29 @@ async def detect_velocity(
         return []
 
     now = datetime.now(timezone.utc).isoformat()
-    for det in fresh:
-        # GA-21: thread the claim timestamp into the detection dict so a
-        # failed send can demote (delete) exactly this claimed row.
-        det["detected_at"] = now
-        await db._conn.execute(
-            """INSERT INTO velocity_alerts
-               (coin_id, symbol, name, price_change_1h, price_change_24h,
-                market_cap, volume_24h, vol_mcap_ratio, current_price, detected_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                det["coin_id"],
-                det["symbol"],
-                det["name"],
-                det["price_change_1h"],
-                det["price_change_24h"],
-                det["market_cap"],
-                det["volume_24h"],
-                det["vol_mcap_ratio"],
-                det["current_price"],
-                now,
-            ),
-        )
-    await db._conn.commit()
+    async with db.transaction() as conn:
+        for det in fresh:
+            # GA-21: thread the claim timestamp into the detection dict so a
+            # failed send can demote (delete) exactly this claimed row.
+            det["detected_at"] = now
+            await conn.execute(
+                """INSERT INTO velocity_alerts
+                   (coin_id, symbol, name, price_change_1h, price_change_24h,
+                    market_cap, volume_24h, vol_mcap_ratio, current_price, detected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    det["coin_id"],
+                    det["symbol"],
+                    det["name"],
+                    det["price_change_1h"],
+                    det["price_change_24h"],
+                    det["market_cap"],
+                    det["volume_24h"],
+                    det["vol_mcap_ratio"],
+                    det["current_price"],
+                    now,
+                ),
+            )
 
     log.info(
         "velocity_detected",
@@ -214,11 +214,10 @@ async def demote_failed_velocity_detections(
     if not keys:
         return
     try:
-        await db._conn.executemany(
+        await db.executemany_write(
             "DELETE FROM velocity_alerts WHERE coin_id = ? AND detected_at = ?",
             keys,
         )
-        await db._conn.commit()
         log.info(
             "velocity_alert_claim_demoted",
             count=len(keys),

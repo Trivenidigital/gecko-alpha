@@ -296,3 +296,375 @@ async def test_send_alert_telegram_and_discord(
 
     async with aiohttp.ClientSession() as session:
         await send_alert(token, signals, session, settings)
+
+
+# ---------------------------------------------------------------------------
+# B1 delivery-certainty taxonomy at the alerter seam: an explicit non-200 is a
+# CONFIRMED rejection (TelegramRejected); a transport failure after the request
+# begins is UNPROVABLE (TelegramTransportUnknown). A generic transport exception
+# must never be conflated with a confirmed rejection.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_explicit_non200_raises_rejected(
+    mock_aiohttp, settings_factory
+):
+    from scout.exceptions import TelegramRejected
+
+    telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(
+        telegram_url, status=400, payload={"ok": False, "description": "bad"}
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramRejected):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_transport_error_raises_transport_unknown(
+    mock_aiohttp, settings_factory
+):
+    from scout.exceptions import TelegramTransportUnknown
+
+    telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    # aiohttp raises a client connection error AFTER the request begins → unprovable.
+    mock_aiohttp.post(
+        telegram_url, exception=aiohttp.ClientConnectionError("connection reset")
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramTransportUnknown):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_timeout_raises_transport_unknown(
+    mock_aiohttp, settings_factory
+):
+    import asyncio as _asyncio
+
+    from scout.exceptions import TelegramTransportUnknown
+
+    telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(telegram_url, exception=_asyncio.TimeoutError())
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramTransportUnknown):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_5xx_raises_transport_unknown(
+    mock_aiohttp, settings_factory
+):
+    """B1 certainty split: a 5xx server error is UNPROVABLE (the request reached
+    Telegram but the server erred) → TelegramTransportUnknown, NOT a confirmed
+    rejection. (A 4xx maps to TelegramRejected — see the non200 test above.)"""
+    from scout.exceptions import TelegramRejected, TelegramTransportUnknown
+
+    telegram_url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(telegram_url, status=503, body="service unavailable")
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramTransportUnknown):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+        assert not issubclass(TelegramTransportUnknown, TelegramRejected)
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_200_ok_false_is_rejected(mock_aiohttp, settings_factory):
+    """B1: HTTP 200 with an explicit ok:false body is a definitive non-acceptance
+    → TelegramRejected. An HTTP 200 by itself NEVER proves delivery."""
+    from scout.exceptions import TelegramRejected
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(url, status=200, payload={"ok": False, "description": "blocked"})
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramRejected):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_200_unparseable_is_transport_unknown(
+    mock_aiohttp, settings_factory
+):
+    """B1: HTTP 200 whose body does NOT prove acceptance (unparseable / no ok:true)
+    → TelegramTransportUnknown (delivery unprovable) — NEVER sent."""
+    from scout.exceptions import TelegramTransportUnknown
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(url, status=200, body="<html>not json</html>")
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramTransportUnknown):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 409])
+async def test_send_telegram_ambiguous_4xx_is_transport_unknown(
+    mock_aiohttp, settings_factory, status
+):
+    """B1: 408 (request timeout — server may have processed) and 409 (conflict) do
+    NOT prove non-acceptance → TelegramTransportUnknown, not a confirmed rejection."""
+    from scout.exceptions import TelegramTransportUnknown
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(url, status=status, body="ambiguous")
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramTransportUnknown):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="unit_test",
+            )
+
+
+@pytest.mark.asyncio
+async def test_send_telegram_429_rejects_and_preserves_retry_after(
+    mock_aiohttp, settings_factory
+):
+    """B1: a 429 is a definitive rate-limit rejection → TelegramRejected (never
+    counted as delivered), and its retry_after metadata is preserved (logged) as it
+    flows today."""
+    from structlog.testing import capture_logs
+
+    from scout.exceptions import TelegramRejected
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    # over-budget retry_after → no in-band retry; falls through to the rejection.
+    mock_aiohttp.post(
+        url, status=429, payload={"ok": False, "parameters": {"retry_after": 5}}
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+        TG_PACING_ENABLED=True,
+        TG_PACING_MAX_WAIT_SECONDS=1,
+    )
+    async with aiohttp.ClientSession() as session:
+        with capture_logs() as logs:
+            with pytest.raises(TelegramRejected):
+                await send_telegram_message(
+                    "hi",
+                    session,
+                    settings,
+                    parse_mode=None,
+                    raise_on_failure=True,
+                    source="unit_test",
+                )
+    assert any("retry_after" in e for e in logs)  # retry_after preserved in logs
+
+
+# ---------------------------------------------------------------------------
+# B1 proof-1: the response body is consumed + classified EXACTLY ONCE through the
+# real provider path (_post_telegram_once -> typed outcome). No second read, no
+# downstream re-interpretation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b1_response_consumed_and_classified_exactly_once(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    import scout.alerter as alerter_mod
+
+    calls = {"post": 0, "classify": 0}
+    real_post = alerter_mod._post_telegram_once
+    real_classify = alerter_mod._telegram_accepted
+
+    async def _counting_post(*a, **k):
+        calls["post"] += 1
+        return await real_post(*a, **k)
+
+    def _counting_classify(b):
+        calls["classify"] += 1
+        return real_classify(b)
+
+    monkeypatch.setattr(alerter_mod, "_post_telegram_once", _counting_post)
+    monkeypatch.setattr(alerter_mod, "_telegram_accepted", _counting_classify)
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(url, status=200, payload={"ok": True})
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+    )
+    async with aiohttp.ClientSession() as session:
+        await send_telegram_message(
+            "hi",
+            session,
+            settings,
+            parse_mode=None,
+            raise_on_failure=True,
+            source="t",
+        )
+    assert calls["post"] == 1  # single HTTP fetch + single body read
+    assert calls["classify"] == 1  # classified exactly once, no re-interpretation
+
+
+# ---------------------------------------------------------------------------
+# B1 proof-3: retry_after is CONTAINED — it drives only logs/metrics + the
+# existing bounded in-call retry (ONE retry, inside the deadline). It NEVER
+# schedules a new dispatch. Over budget -> zero in-band retries (1 POST); in
+# budget -> at most one bounded retry (2 POSTs), then classification stops.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_b1_429_over_budget_no_inband_retry(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    import scout.alerter as alerter_mod
+
+    posts = {"n": 0}
+    real_post = alerter_mod._post_telegram_once
+
+    async def _counting_post(*a, **k):
+        posts["n"] += 1
+        return await real_post(*a, **k)
+
+    monkeypatch.setattr(alerter_mod, "_post_telegram_once", _counting_post)
+    from scout.exceptions import TelegramRejected
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    mock_aiohttp.post(
+        url, status=429, payload={"ok": False, "parameters": {"retry_after": 5}}
+    )
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+        TG_PACING_ENABLED=True,
+        TG_PACING_MAX_WAIT_SECONDS=1,  # retry_after=5 is OVER budget
+    )
+    async with aiohttp.ClientSession() as session:
+        with pytest.raises(TelegramRejected):
+            await send_telegram_message(
+                "hi",
+                session,
+                settings,
+                parse_mode=None,
+                raise_on_failure=True,
+                source="t",
+            )
+    assert posts["n"] == 1  # retry_after over budget -> NO in-band resend
+
+
+@pytest.mark.asyncio
+async def test_b1_429_in_budget_bounded_single_retry(
+    mock_aiohttp, settings_factory, monkeypatch
+):
+    import scout.alerter as alerter_mod
+
+    posts = {"n": 0}
+    real_post = alerter_mod._post_telegram_once
+
+    async def _counting_post(*a, **k):
+        posts["n"] += 1
+        return await real_post(*a, **k)
+
+    monkeypatch.setattr(alerter_mod, "_post_telegram_once", _counting_post)
+
+    url = "https://api.telegram.org/bottest-bot-token/sendMessage"
+    # first a 429 (in budget), then the ONE bounded retry gets a clean 200 ok:true.
+    mock_aiohttp.post(
+        url, status=429, payload={"ok": False, "parameters": {"retry_after": 0}}
+    )
+    mock_aiohttp.post(url, status=200, payload={"ok": True})
+    settings = settings_factory(
+        TELEGRAM_BOT_TOKEN="test-bot-token",
+        TELEGRAM_CHAT_ID="test-chat-id",
+        DISCORD_WEBHOOK_URL="",
+        TG_PACING_ENABLED=True,
+        TG_PACING_MAX_WAIT_SECONDS=5,  # retry_after=0 is IN budget
+    )
+    async with aiohttp.ClientSession() as session:
+        await send_telegram_message(
+            "hi",
+            session,
+            settings,
+            parse_mode=None,
+            raise_on_failure=True,
+            source="t",
+        )
+    assert posts["n"] == 2  # exactly ONE bounded in-call retry; never unbounded

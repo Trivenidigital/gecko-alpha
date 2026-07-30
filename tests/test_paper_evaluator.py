@@ -388,12 +388,22 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
     # already_filled=None, another writer stamps leg_1_filled_at before our
     # UPDATE runs. The UPDATE's WHERE clause then filters it out.
     #
+    # F2: the racer writes via a SEPARATE aiosqlite connection to the same DB
+    # file (NOT the shared db._conn). Under the shared-connection transaction-
+    # lock discipline a second writer on db._conn mid-transaction is
+    # structurally impossible ("cannot start a transaction within a
+    # transaction"); a genuine cross-connection race is exactly what the
+    # WHERE ... IS NULL guard defends against, and it matches the reviewer's
+    # separate-connection isolation model.
+    #
     # Sentinel "SELECT entry_price" matches the first SELECT in
     # execute_partial_sell (scout/trading/paper.py — the one that reads
     # entry_price, quantity, remaining_qty, realized_pnl_usd, leg_N_filled_at,
     # peak_pct). If that SELECT's leading column changes or gets split across
     # subqueries, this match stops firing and the race never gets injected —
     # update the sentinel in lockstep with the paper.py SELECT.
+    import aiosqlite
+
     orig_execute = db._conn.execute
     state = {"select_seen": False}
 
@@ -401,10 +411,15 @@ async def test_partial_sell_race_lost_when_another_writer_fills_first(
         result = await orig_execute(sql, *args, **kwargs)
         if (not state["select_seen"]) and "SELECT entry_price" in str(sql):
             state["select_seen"] = True
-            await orig_execute(
-                "UPDATE paper_trades SET leg_1_filled_at = ? WHERE id = ?",
-                (datetime.now(timezone.utc).isoformat(), trade_id),
-            )
+            # Separate connection commits leg_1 first — the shared connection
+            # holds no write transaction at this point (the match fired on a
+            # SELECT), so the racer acquires + releases the write lock cleanly.
+            async with aiosqlite.connect(str(tmp_path / "t.db")) as other:
+                await other.execute(
+                    "UPDATE paper_trades SET leg_1_filled_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), trade_id),
+                )
+                await other.commit()
         return result
 
     db._conn.execute = racing_execute  # type: ignore[assignment]

@@ -56,20 +56,22 @@ async def set_operator_override(
         raise RuntimeError("Database not initialized.")
     now = datetime.now(timezone.utc)
     expires = now + timedelta(hours=OVERRIDE_TTL_HOURS)
-    cur = await db._conn.execute(
-        """INSERT INTO live_operator_overrides
-           (override_type, venue, canonical, set_at, expires_at, set_by)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            override_type,
-            venue,
-            canonical,
-            now.isoformat(),
-            expires.isoformat(),
-            set_by,
-        ),
-    )
-    await db._conn.commit()
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            """INSERT INTO live_operator_overrides
+               (override_type, venue, canonical, set_at, expires_at, set_by)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                override_type,
+                venue,
+                canonical,
+                now.isoformat(),
+                expires.isoformat(),
+                set_by,
+            ),
+        )
+        # Best-effort fetch of the inserted rowid (lastrowid on aiosqlite cursor)
+        inserted_id = cur.lastrowid or 0
     log.info(
         "operator_override_set",
         override_type=override_type,
@@ -78,8 +80,7 @@ async def set_operator_override(
         set_by=set_by,
         expires_at=expires.isoformat(),
     )
-    # Best-effort fetch of the inserted rowid (lastrowid on aiosqlite cursor)
-    return cur.lastrowid or 0
+    return inserted_id
 
 
 async def has_active_override(

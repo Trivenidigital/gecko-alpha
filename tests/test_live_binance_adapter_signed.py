@@ -211,14 +211,19 @@ async def test_fetch_account_balance_raises_when_signed_disabled():
 
 
 async def _seed_paper(db):
-    cur = await db._conn.execute("""INSERT INTO paper_trades
-           (token_id, symbol, name, chain, signal_type, signal_data,
-            entry_price, amount_usd, quantity, tp_price, sl_price,
-            status, opened_at)
-           VALUES ('btc-tok', 'BTC', 'btc', 'ethereum', 'first_signal', '{}',
-                   100, 50, 0.5, 120, 80, 'open',
-                   '2026-05-09T00:00:00+00:00')""")
-    return cur.lastrowid
+    # F2: seed through the disciplined transaction manager so it commits and
+    # leaves NO dangling implicit transaction on the shared connection (which
+    # would collide with record_pending_order's BEGIN IMMEDIATE). transaction()
+    # rather than execute_write() because we need lastrowid.
+    async with db.transaction() as conn:
+        cur = await conn.execute("""INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_price, sl_price,
+                status, opened_at)
+               VALUES ('btc-tok', 'BTC', 'btc', 'ethereum', 'first_signal', '{}',
+                       100, 50, 0.5, 120, 80, 'open',
+                       '2026-05-09T00:00:00+00:00')""")
+        return cur.lastrowid
 
 
 @pytest.mark.asyncio

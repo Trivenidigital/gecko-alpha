@@ -331,16 +331,15 @@ async def record_signal(
     row = await cursor.fetchone()
     if row:
         new_count = row[1] + 1
-        await conn.execute(
+        await db.execute_write(
             "UPDATE narrative_signals SET trigger_count = ? WHERE id = ?",
             (new_count, row[0]),
         )
-        await conn.commit()
         return new_count
 
     # Insert new signal
     cooldown_until = now + timedelta(hours=cooldown_hours)
-    await conn.execute(
+    await db.execute_write(
         """INSERT INTO narrative_signals
            (category_id, category_name, acceleration, volume_growth_pct,
             coin_count_change, trigger_count, detected_at, cooling_down_until)
@@ -355,7 +354,6 @@ async def record_signal(
             cooldown_until.isoformat(),
         ),
     )
-    await conn.commit()
     return 1
 
 
@@ -373,49 +371,49 @@ async def store_predictions(db: Database, predictions: list[dict]) -> None:
     if conn is None:
         raise RuntimeError("Database not initialized.")
 
-    for p in predictions:
-        strategy_snap = json.dumps(p.get("strategy_snapshot", {}))
-        strategy_snap_ab = (
-            json.dumps(p["strategy_snapshot_ab"])
-            if p.get("strategy_snapshot_ab") is not None
-            else None
-        )
-        await conn.execute(
-            """INSERT OR IGNORE INTO predictions
-               (category_id, category_name, coin_id, symbol, name,
-                market_cap_at_prediction, price_at_prediction,
-                narrative_fit_score, staying_power, confidence, reasoning,
-                market_regime, trigger_count, is_control, is_holdout,
-                strategy_snapshot, strategy_snapshot_ab, predicted_at,
-                counter_risk_score, counter_flags, counter_argument,
-                counter_data_completeness, counter_scored_at, watchlist_users)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)""",
-            (
-                p["category_id"],
-                p["category_name"],
-                p["coin_id"],
-                p["symbol"],
-                p["name"],
-                p["market_cap_at_prediction"],
-                p["price_at_prediction"],
-                p["narrative_fit_score"],
-                p["staying_power"],
-                p["confidence"],
-                p["reasoning"],
-                p.get("market_regime"),
-                p.get("trigger_count"),
-                1 if p.get("is_control") else 0,
-                1 if p.get("is_holdout") else 0,
-                strategy_snap,
-                strategy_snap_ab,
-                p["predicted_at"],
-                p.get("counter_risk_score"),
-                p.get("counter_flags"),
-                p.get("counter_argument"),
-                p.get("counter_data_completeness"),
-                p.get("counter_scored_at"),
-                p.get("watchlist_users"),
-            ),
-        )
-    await conn.commit()
+    async with db.transaction() as conn:
+        for p in predictions:
+            strategy_snap = json.dumps(p.get("strategy_snapshot", {}))
+            strategy_snap_ab = (
+                json.dumps(p["strategy_snapshot_ab"])
+                if p.get("strategy_snapshot_ab") is not None
+                else None
+            )
+            await conn.execute(
+                """INSERT OR IGNORE INTO predictions
+                   (category_id, category_name, coin_id, symbol, name,
+                    market_cap_at_prediction, price_at_prediction,
+                    narrative_fit_score, staying_power, confidence, reasoning,
+                    market_regime, trigger_count, is_control, is_holdout,
+                    strategy_snapshot, strategy_snapshot_ab, predicted_at,
+                    counter_risk_score, counter_flags, counter_argument,
+                    counter_data_completeness, counter_scored_at, watchlist_users)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?)""",
+                (
+                    p["category_id"],
+                    p["category_name"],
+                    p["coin_id"],
+                    p["symbol"],
+                    p["name"],
+                    p["market_cap_at_prediction"],
+                    p["price_at_prediction"],
+                    p["narrative_fit_score"],
+                    p["staying_power"],
+                    p["confidence"],
+                    p["reasoning"],
+                    p.get("market_regime"),
+                    p.get("trigger_count"),
+                    1 if p.get("is_control") else 0,
+                    1 if p.get("is_holdout") else 0,
+                    strategy_snap,
+                    strategy_snap_ab,
+                    p["predicted_at"],
+                    p.get("counter_risk_score"),
+                    p.get("counter_flags"),
+                    p.get("counter_argument"),
+                    p.get("counter_data_completeness"),
+                    p.get("counter_scored_at"),
+                    p.get("watchlist_users"),
+                ),
+            )

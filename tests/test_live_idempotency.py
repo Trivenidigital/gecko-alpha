@@ -69,17 +69,22 @@ async def test_unique_index_on_client_order_id(tmp_path):
 
 
 async def _seed_paper(db: Database, token_id: str = "tok") -> int:
-    cur = await db._conn.execute(
-        """INSERT INTO paper_trades
-           (token_id, symbol, name, chain, signal_type, signal_data,
-            entry_price, amount_usd, quantity, tp_price, sl_price,
-            status, opened_at)
-           VALUES (?, 'X', 'x', 'ethereum', 'first_signal', '{}',
-                   100, 50, 0.5, 120, 80, 'open',
-                   '2026-05-08T00:00:00+00:00')""",
-        (token_id,),
-    )
-    return cur.lastrowid
+    # F2: seed through the disciplined transaction manager so it commits and
+    # leaves NO dangling implicit transaction on the shared connection (which
+    # would collide with record_pending_order's BEGIN IMMEDIATE). Uses
+    # transaction() rather than execute_write() because we need lastrowid.
+    async with db.transaction() as conn:
+        cur = await conn.execute(
+            """INSERT INTO paper_trades
+               (token_id, symbol, name, chain, signal_type, signal_data,
+                entry_price, amount_usd, quantity, tp_price, sl_price,
+                status, opened_at)
+               VALUES (?, 'X', 'x', 'ethereum', 'first_signal', '{}',
+                       100, 50, 0.5, 120, 80, 'open',
+                       '2026-05-08T00:00:00+00:00')""",
+            (token_id,),
+        )
+        return cur.lastrowid
 
 
 @pytest.mark.asyncio

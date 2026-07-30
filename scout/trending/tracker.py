@@ -120,21 +120,21 @@ async def fetch_and_store_trending(
 
     # Persist
     if snapshots and db._conn is not None:
-        for snap in snapshots:
-            await db._conn.execute(
-                """INSERT INTO trending_snapshots
-                   (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    snap.coin_id,
-                    snap.symbol,
-                    snap.name,
-                    snap.market_cap_rank,
-                    snap.trending_score,
-                    snap.snapshot_at.isoformat(),
-                ),
-            )
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            for snap in snapshots:
+                await conn.execute(
+                    """INSERT INTO trending_snapshots
+                       (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        snap.coin_id,
+                        snap.symbol,
+                        snap.name,
+                        snap.market_cap_rank,
+                        snap.trending_score,
+                        snap.snapshot_at.isoformat(),
+                    ),
+                )
         logger.info("trending_tracker.stored_snapshots", count=len(snapshots))
 
     return snapshots
@@ -169,21 +169,21 @@ async def store_trending_from_candidates(
         snapshots.append(snap)
 
     if snapshots and db._conn is not None:
-        for snap in snapshots:
-            await db._conn.execute(
-                """INSERT INTO trending_snapshots
-                   (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    snap.coin_id,
-                    snap.symbol,
-                    snap.name,
-                    snap.market_cap_rank,
-                    snap.trending_score,
-                    snap.snapshot_at.isoformat(),
-                ),
-            )
-        await db._conn.commit()
+        async with db.transaction() as conn:
+            for snap in snapshots:
+                await conn.execute(
+                    """INSERT INTO trending_snapshots
+                       (coin_id, symbol, name, market_cap_rank, trending_score, snapshot_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        snap.coin_id,
+                        snap.symbol,
+                        snap.name,
+                        snap.market_cap_rank,
+                        snap.trending_score,
+                        snap.snapshot_at.isoformat(),
+                    ),
+                )
         logger.info("trending_tracker.stored_from_candidates", count=len(snapshots))
 
     return snapshots
@@ -339,63 +339,63 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
             existing_peaks[comp.coin_id] = (None, None)
 
     # 4. Store comparisons (INSERT OR REPLACE by coin_id)
-    for comp in comparisons:
-        # Delete old comparison for this coin_id to avoid duplicates
-        await db._conn.execute(
-            "DELETE FROM trending_comparisons WHERE coin_id = ?",
-            (comp.coin_id,),
-        )
-        det_price = detected_prices.get(comp.coin_id)
-        old_peak, old_peak_pct = existing_peaks.get(comp.coin_id, (None, None))
-        await db._conn.execute(
-            """INSERT INTO trending_comparisons
-               (coin_id, symbol, name, appeared_on_trending_at,
-                detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
-                detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
-                detected_by_chains, chains_detected_at, chains_lead_minutes,
-                detected_by_social, social_detected_at, social_lead_minutes,
-                is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                comp.coin_id,
-                comp.symbol,
-                comp.name,
-                comp.appeared_on_trending_at.isoformat(),
-                1 if comp.detected_by_narrative else 0,
+    async with db.transaction() as conn:
+        for comp in comparisons:
+            # Delete old comparison for this coin_id to avoid duplicates
+            await conn.execute(
+                "DELETE FROM trending_comparisons WHERE coin_id = ?",
+                (comp.coin_id,),
+            )
+            det_price = detected_prices.get(comp.coin_id)
+            old_peak, old_peak_pct = existing_peaks.get(comp.coin_id, (None, None))
+            await conn.execute(
+                """INSERT INTO trending_comparisons
+                   (coin_id, symbol, name, appeared_on_trending_at,
+                    detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
+                    detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
+                    detected_by_chains, chains_detected_at, chains_lead_minutes,
+                    detected_by_social, social_detected_at, social_lead_minutes,
+                    is_gap, detected_price, peak_price, peak_gain_pct)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    comp.narrative_detected_at.isoformat()
-                    if comp.narrative_detected_at
-                    else None
+                    comp.coin_id,
+                    comp.symbol,
+                    comp.name,
+                    comp.appeared_on_trending_at.isoformat(),
+                    1 if comp.detected_by_narrative else 0,
+                    (
+                        comp.narrative_detected_at.isoformat()
+                        if comp.narrative_detected_at
+                        else None
+                    ),
+                    comp.narrative_lead_minutes,
+                    1 if comp.detected_by_pipeline else 0,
+                    (
+                        comp.pipeline_detected_at.isoformat()
+                        if comp.pipeline_detected_at
+                        else None
+                    ),
+                    comp.pipeline_lead_minutes,
+                    1 if comp.detected_by_chains else 0,
+                    (
+                        comp.chains_detected_at.isoformat()
+                        if comp.chains_detected_at
+                        else None
+                    ),
+                    comp.chains_lead_minutes,
+                    1 if comp.detected_by_social else 0,
+                    (
+                        comp.social_detected_at.isoformat()
+                        if comp.social_detected_at
+                        else None
+                    ),
+                    comp.social_lead_minutes,
+                    1 if comp.is_gap else 0,
+                    det_price,
+                    old_peak,
+                    old_peak_pct,
                 ),
-                comp.narrative_lead_minutes,
-                1 if comp.detected_by_pipeline else 0,
-                (
-                    comp.pipeline_detected_at.isoformat()
-                    if comp.pipeline_detected_at
-                    else None
-                ),
-                comp.pipeline_lead_minutes,
-                1 if comp.detected_by_chains else 0,
-                (
-                    comp.chains_detected_at.isoformat()
-                    if comp.chains_detected_at
-                    else None
-                ),
-                comp.chains_lead_minutes,
-                1 if comp.detected_by_social else 0,
-                (
-                    comp.social_detected_at.isoformat()
-                    if comp.social_detected_at
-                    else None
-                ),
-                comp.social_lead_minutes,
-                1 if comp.is_gap else 0,
-                det_price,
-                old_peak,
-                old_peak_pct,
-            ),
-        )
-    await db._conn.commit()
+            )
     logger.info(
         "trending_tracker.comparisons_stored",
         total=len(comparisons),
@@ -539,8 +539,8 @@ async def update_trending_peaks(db: "Database") -> int:
              AND datetime(pc.updated_at) >= datetime('now', '-1 hour')"""
     )
     rows = await cursor.fetchall()
-    updated = 0
 
+    updates: list[tuple] = []
     for row in rows:
         current_price = row["current_price"]
         old_peak = row["peak_price"] or row["detected_price"] or 0
@@ -549,14 +549,15 @@ async def update_trending_peaks(db: "Database") -> int:
             peak_gain = (
                 (current_price - row["detected_price"]) / row["detected_price"]
             ) * 100
-            await conn.execute(
-                "UPDATE trending_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
-                (current_price, peak_gain, row["id"]),
-            )
-            updated += 1
+            updates.append((current_price, peak_gain, row["id"]))
 
+    updated = len(updates)
     if updated:
-        await conn.commit()
+        async with db.transaction() as conn:
+            await conn.executemany(
+                "UPDATE trending_comparisons SET peak_price = ?, peak_gain_pct = ? WHERE id = ?",
+                updates,
+            )
         logger.info("trending_tracker.peaks_updated", count=updated)
 
     return updated

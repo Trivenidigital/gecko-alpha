@@ -51,7 +51,7 @@ async def build_paper_digest(db: Database, date_str: str) -> str:
         # freshness watchdog sees a heartbeat, and emit an explicit one-liner
         # so silence is never ambiguous (datetime off-by-one #5 — see
         # tasks/lessons.md).
-        await conn.execute(
+        await db.execute_write(
             """INSERT OR REPLACE INTO paper_daily_summary
                (date, trades_opened, trades_closed, wins, losses,
                 total_pnl_usd, best_trade_pnl, worst_trade_pnl,
@@ -59,7 +59,6 @@ async def build_paper_digest(db: Database, date_str: str) -> str:
                VALUES (?, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, NULL)""",
             (date_str,),
         )
-        await conn.commit()
         log.info(
             "paper_digest_built",
             date=date_str,
@@ -127,7 +126,7 @@ async def build_paper_digest(db: Database, date_str: str) -> str:
     open_exposure = float(row[1] or 0)
 
     # Store in paper_daily_summary
-    await conn.execute(
+    await db.execute_write(
         """INSERT OR REPLACE INTO paper_daily_summary
            (date, trades_opened, trades_closed, wins, losses,
             total_pnl_usd, best_trade_pnl, worst_trade_pnl,
@@ -147,7 +146,6 @@ async def build_paper_digest(db: Database, date_str: str) -> str:
             json.dumps(by_signal_with_wr) if by_signal_with_wr else None,
         ),
     )
-    await conn.commit()
 
     # Format message
     pnl_sign = "+" if total_pnl >= 0 else ""

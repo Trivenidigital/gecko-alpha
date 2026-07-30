@@ -114,6 +114,20 @@ from scout.live.resolver import OverrideStore, VenueResolver
 
 logger = structlog.get_logger()
 
+# Shared structlog processor chain for the pipeline's JSON log output.
+# F2: `format_exc_info` is placed before the JSONRenderer so `log.exception(...)`
+# calls carry the formatted exception text/traceback into the JSON line's
+# `exception` key. Without it, the chain silently dropped every traceback —
+# which hid the SUPP_DB_OP / chain_check_failed exception detail behind the
+# F2 shared-connection collision. It is a no-op for log calls without
+# `exc_info`, so the JSON shape of ordinary log lines is unchanged.
+LOG_PROCESSORS = [
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.add_log_level,
+    structlog.processors.format_exc_info,
+    structlog.processors.JSONRenderer(),
+]
+
 # Track counter-score follow-up tasks fired from run_cycle. The
 # add_done_callback that swallows the exception only fires AFTER the task
 # completes — without a stored reference, the task can be GC'd mid-flight
@@ -2010,11 +2024,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     # Configure structlog
     structlog.configure(
-        processors=[
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.add_log_level,
-            structlog.processors.JSONRenderer(),
-        ],
+        processors=LOG_PROCESSORS,
         wrapper_class=structlog.BoundLogger,
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
