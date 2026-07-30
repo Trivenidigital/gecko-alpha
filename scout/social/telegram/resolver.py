@@ -19,6 +19,7 @@ from typing import Iterable
 import aiohttp
 import structlog
 
+from scout import cg_api
 from scout.config import Settings
 from scout.ratelimit import coingecko_limiter
 from scout.safety import is_safe_strict
@@ -31,8 +32,18 @@ from scout.social.telegram.models import (
 
 log = structlog.get_logger()
 
-CG_BASE = "https://api.coingecko.com/api/v3"
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex/tokens"
+
+
+def _cg_base(settings: Settings) -> str:
+    """Tier-correct CoinGecko API base (demo vs pro host) for this deployment.
+
+    Never hardcode a CG base here — a paid key against the demo host returns
+    error 10011 and a demo key against the pro host returns 10010. See
+    scout/cg_api.py.
+    """
+    return cg_api.base_url(settings.COINGECKO_API_TIER)
+
 
 # CG asset_platform_id values keyed by our chain tag.
 _CG_PLATFORM = {
@@ -60,14 +71,27 @@ class _Outcome:
 
 
 async def _get_json(
-    session: aiohttp.ClientSession, url: str, params: dict | None = None
+    session: aiohttp.ClientSession,
+    url: str,
+    settings: Settings,
+    params: dict | None = None,
 ) -> tuple[str, dict | list | None]:
     """Single GET returning (outcome, body). Caller decides retry semantics
-    based on the outcome rather than guessing from None."""
+    based on the outcome rather than guessing from None.
+
+    CoinGecko URLs — recognised by the tier-resolved base, not a fixed
+    constant, so pro-host calls stay gated too — acquire the shared limiter
+    and carry the configured key. DexScreener stays keyless and un-gated.
+    """
     try:
-        is_coingecko = url.startswith(CG_BASE)
+        is_coingecko = url.startswith(_cg_base(settings))
         if is_coingecko:
             await coingecko_limiter.acquire()
+            auth = cg_api.auth_query(
+                settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER
+            )
+            if auth:
+                params = {**(params or {}), **auth}
         async with session.get(
             url, params=params, timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
@@ -93,14 +117,16 @@ async def _get_json(
 
 
 async def _resolve_ca_via_cg(
-    session: aiohttp.ClientSession, ref: ContractRef
+    session: aiohttp.ClientSession, ref: ContractRef, settings: Settings
 ) -> tuple[str, ResolvedToken | None]:
     """CG by-contract lookup. Returns (outcome, token-or-None)."""
     platform = _CG_PLATFORM.get(ref.chain)
     if platform is None:
         return (_Outcome.NOT_FOUND, None)
     outcome, data = await _get_json(
-        session, f"{CG_BASE}/coins/{platform}/contract/{ref.address}"
+        session,
+        f"{_cg_base(settings)}/coins/{platform}/contract/{ref.address}",
+        settings,
     )
     if outcome != _Outcome.OK or not isinstance(data, dict) or not data.get("id"):
         return (outcome, None)
@@ -121,7 +147,7 @@ async def _resolve_ca_via_cg(
 
 
 async def _resolve_ca_via_dexscreener(
-    session: aiohttp.ClientSession, ref: ContractRef
+    session: aiohttp.ClientSession, ref: ContractRef, settings: Settings
 ) -> tuple[str, ResolvedToken | None]:
     """DexScreener fallback when CG misses (brand-new pools). Returns (outcome, token).
 
@@ -131,7 +157,9 @@ async def _resolve_ca_via_dexscreener(
     (Optimism/BSC/Avalanche CAs were silently going to is_safe_strict with
     chain="ethereum", returning wrong verdicts).
     """
-    outcome, data = await _get_json(session, f"{DEXSCREENER_BASE}/{ref.address}")
+    outcome, data = await _get_json(
+        session, f"{DEXSCREENER_BASE}/{ref.address}", settings
+    )
     if outcome != _Outcome.OK or not isinstance(data, dict):
         return (outcome, None)
     pairs = data.get("pairs") or []
@@ -158,12 +186,12 @@ async def _resolve_ca_via_dexscreener(
 
 
 async def _resolve_ticker_top3(
-    session: aiohttp.ClientSession, ticker: str
+    session: aiohttp.ClientSession, ticker: str, settings: Settings
 ) -> tuple[str, list[ResolvedToken]]:
     """CG search by ticker, return (outcome, top-3 by mcap). Cashtag-only
     resolution NEVER triggers a paper trade (gate 2 in dispatcher)."""
     outcome, data = await _get_json(
-        session, f"{CG_BASE}/search", params={"query": ticker}
+        session, f"{_cg_base(settings)}/search", settings, params={"query": ticker}
     )
     if outcome != _Outcome.OK or not isinstance(data, dict):
         return (outcome, [])
@@ -175,7 +203,8 @@ async def _resolve_ticker_top3(
         return (_Outcome.NOT_FOUND, [])
     outcome2, market = await _get_json(
         session,
-        f"{CG_BASE}/coins/markets",
+        f"{_cg_base(settings)}/coins/markets",
+        settings,
         params={"vs_currency": "usd", "ids": ids, "per_page": "10"},
     )
     if outcome2 != _Outcome.OK or not isinstance(market, list):
@@ -261,11 +290,13 @@ async def resolve_and_enrich(
         resolved: list[ResolvedToken] = []
         any_transient = False
         for ref in contracts:
-            outcome, tok = await _resolve_ca_via_cg(session, ref)
+            outcome, tok = await _resolve_ca_via_cg(session, ref, settings)
             if outcome == _Outcome.TRANSIENT:
                 any_transient = True
             if tok is None:
-                outcome2, tok = await _resolve_ca_via_dexscreener(session, ref)
+                outcome2, tok = await _resolve_ca_via_dexscreener(
+                    session, ref, settings
+                )
                 if outcome2 == _Outcome.TRANSIENT:
                     any_transient = True
             if tok is not None:
@@ -288,7 +319,7 @@ async def resolve_and_enrich(
 
     if cashtags:
         first = cashtags[0]
-        outcome, candidates = await _resolve_ticker_top3(session, first)
+        outcome, candidates = await _resolve_ticker_top3(session, first, settings)
         if candidates:
             for c in candidates:
                 await _check_safety(session, c)
