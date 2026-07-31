@@ -131,7 +131,12 @@ class SolanaRpcClient:
         self._request_id = 0
 
     async def _rpc(
-        self, method: str, params: list[Any] | None = None, *, retry: bool = True
+        self,
+        method: str,
+        params: list[Any] | None = None,
+        *,
+        retry: bool = True,
+        allow_null_result: bool = False,
     ) -> Any:
         """One JSON-RPC call. Returns the ``result`` member.
 
@@ -140,6 +145,14 @@ class SolanaRpcClient:
         ``transport.request_json`` — with ``four_xx_is_definitive=False``,
         because this is a JSON-RPC upstream whose real refusals arrive as
         HTTP 200.
+
+        Args:
+            allow_null_result: treat ``"result": null`` as a legitimate
+                answer rather than a malformed payload. True only for methods
+                that use null to mean "no such record" — ``getTransaction``
+                answers that way for an unknown signature, and reading it as a
+                protocol violation would make a missing transaction
+                indistinguishable from a broken node.
         """
         self._request_id += 1
         body = {
@@ -164,6 +177,8 @@ class SolanaRpcClient:
             )
         if "error" in payload and payload["error"] is not None:
             raise SolanaAPIError(f"solana_rpc.{method}: {payload['error']}")
+        if allow_null_result and payload.get("result", "__absent__") is None:
+            return None
         return require_field(payload, "result", label=f"solana_rpc.{method}")
 
     async def get_latest_blockhash(
@@ -355,7 +370,12 @@ class SolanaRpcClient:
     async def get_transaction(
         self, signature: str, *, commitment: str = "confirmed"
     ) -> dict[str, Any] | None:
-        """Full transaction record for final reconciliation, or None if absent."""
+        """Full transaction record for final reconciliation, or None if absent.
+
+        ``maxSupportedTransactionVersion=0`` is required: without it the node
+        refuses to return v0 transactions, and every transaction this lane
+        builds is v0.
+        """
         result = await self._rpc(
             "getTransaction",
             [
@@ -366,6 +386,8 @@ class SolanaRpcClient:
                     "maxSupportedTransactionVersion": 0,
                 },
             ],
+            # A null result means "no such transaction", not a broken node.
+            allow_null_result=True,
         )
         if result is None:
             return None

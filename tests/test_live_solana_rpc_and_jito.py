@@ -267,6 +267,74 @@ async def test_get_token_balance_zero_when_no_account(settings_factory):
             assert await client.get_token_balance(PAYER_PUBKEY, USDC_MINT) == 0
 
 
+async def test_get_latest_blockhash(settings_factory):
+    async with aiohttp.ClientSession() as session:
+        client = SolanaRpcClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(
+                _RPC_URL,
+                payload=_rpc_result(
+                    {
+                        "context": {"slot": 283_000_100},
+                        "value": {
+                            "blockhash": "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k",
+                            "lastValidBlockHeight": 283_000_500,
+                        },
+                    }
+                ),
+            )
+            blockhash, last_valid = await client.get_latest_blockhash()
+
+    assert blockhash == "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k"
+    assert last_valid == 283_000_500
+
+
+async def test_get_block_height_is_height_not_slot(settings_factory):
+    """lastValidBlockHeight is denominated in HEIGHT; comparing a slot to it
+    would expire transactions early (skipped slots do not advance height)."""
+    async with aiohttp.ClientSession() as session:
+        client = SolanaRpcClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(_RPC_URL, payload=_rpc_result(282_999_990))
+            height = await client.get_block_height()
+            key = next(iter(mock.requests))
+            body = mock.requests[key][0].kwargs["json"]
+
+    assert height == 282_999_990
+    assert body["method"] == "getBlockHeight"
+
+
+async def test_get_transaction_returns_none_when_absent(settings_factory):
+    async with aiohttp.ClientSession() as session:
+        client = SolanaRpcClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(_RPC_URL, payload=_rpc_result(None))
+            assert await client.get_transaction(_SIGNATURE) is None
+
+
+async def test_get_transaction_returns_record(settings_factory):
+    async with aiohttp.ClientSession() as session:
+        client = SolanaRpcClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(
+                _RPC_URL,
+                payload=_rpc_result(
+                    {
+                        "slot": 283_000_455,
+                        "meta": {"err": None, "fee": 105_200},
+                        "blockTime": 1_785_000_000,
+                    }
+                ),
+            )
+            record = await client.get_transaction(_SIGNATURE)
+            key = next(iter(mock.requests))
+            body = mock.requests[key][0].kwargs["json"]
+
+    assert record["meta"]["fee"] == 105_200
+    # v0 transactions are invisible without this, and the lane only builds v0.
+    assert body["params"][1]["maxSupportedTransactionVersion"] == 0
+
+
 async def test_rpc_json_rpc_error_is_definitive(settings_factory):
     async with aiohttp.ClientSession() as session:
         client = SolanaRpcClient(settings_factory(), session)
