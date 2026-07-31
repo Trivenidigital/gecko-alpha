@@ -1423,6 +1423,41 @@ class Settings(BaseSettings):
     # as an absence.
     SOLANA_SUBMISSION_SETTLE_SEC: float = 5.0
 
+    # -------- Solana supervised pilot runner (PR-S2, 2026-07-31) --------
+    # The mechanical envelope around the ONE operator-invoked supervised swap
+    # (scout.live.solana_pilot). Same posture as the Kraken pilot block above:
+    # every default is the refusing one, and none of these gate the
+    # signal-driven live engine.
+    SOLANA_PILOT_ENABLED: bool = False
+    # Tip REQUESTED from Jupiter via prioritizationFeeLamports.jitoTipLamports.
+    # A request, not a guarantee: tx_inspector re-derives the tip actually
+    # compiled into the transaction and enforces
+    # SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS against that. Jito's documented
+    # minimum is 1000 lamports and warns it "might not be sufficient" under
+    # load; 100_000 buys a realistic chance of landing on a $7 swap while
+    # staying two orders of magnitude under the ceiling.
+    SOLANA_PILOT_JITO_TIP_LAMPORTS: int = 100_000
+    # Ceiling on the quote's own priceImpactPct, expressed in PERCENT.
+    # Jupiter reports the field as a decimal FRACTION ("0.0025" = 0.25%), so
+    # the runner multiplies by 100 before comparing — see
+    # scout.live.solana_pilot._quote_price_impact_pct.
+    SOLANA_PILOT_MAX_PRICE_IMPACT_PCT: float = 1.0
+    # Safety margin, in blocks, subtracted from lastValidBlockHeight when the
+    # runner re-checks blockhash validity immediately after the operator
+    # authorizes. A transaction whose blockhash expires between authorization
+    # and landing is not dangerous, but it burns the authorization: the margin
+    # means the runner refuses a build that is about to expire rather than
+    # submitting one that almost certainly cannot land.
+    SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS: int = 15
+    SOLANA_PILOT_EVIDENCE_DIR: str = "pilot_evidence"
+    SOLANA_PILOT_CONFIRM_TIMEOUT_SEC: float = 90.0
+    SOLANA_PILOT_FINALIZE_TIMEOUT_SEC: float = 90.0
+    # Poll interval for the confirm / finalize waits. Mirrors
+    # KRAKEN_FILL_POLL_INTERVAL_SEC; kept separate from
+    # SOLANA_SUBMISSION_SETTLE_SEC because that value is the resolver's
+    # between-sweeps delay and the two are tuned against different questions.
+    SOLANA_PILOT_POLL_INTERVAL_SEC: float = 2.0
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
@@ -2028,6 +2063,57 @@ class Settings(BaseSettings):
                 f"required>={floor}. A transaction at both component ceilings "
                 "would breach the combined ceiling and never be signable."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_solana_pilot_runner(self) -> "Settings":
+        """PR-S2: the runner's envelope must be able to produce a live trade.
+
+        Every clause here fails at config load rather than as "the lane never
+        trades" on pilot day — the same failure shape
+        ``_validate_solana_pilot_caps`` above exists to prevent. The tip clause
+        is the sharpest: ``jupiter_client.build_swap_transaction`` raises on a
+        requested tip above ``SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS`` BEFORE it
+        calls Jupiter, so an inverted pair means every build attempt dies.
+        """
+        tip = self.SOLANA_PILOT_JITO_TIP_LAMPORTS
+        if tip > self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS:
+            raise ValueError(
+                "SOLANA_PILOT_JITO_TIP_LAMPORTS must be <= "
+                "SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS; got "
+                f"tip={tip}, ceiling={self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS}. "
+                "The build refuses a tip over the ceiling before it is even "
+                "requested, so no swap could ever be constructed."
+            )
+        # 1000 lamports = Jito's documented minimum tip
+        # (scout.live.solana.constants.JITO_MIN_TIP_LAMPORTS). Below it the
+        # auction will not pick the transaction up, so the lane would build,
+        # inspect, sign and submit something that cannot land.
+        if tip < 1_000:
+            raise ValueError(
+                f"SOLANA_PILOT_JITO_TIP_LAMPORTS must be >= 1000; got {tip}. "
+                "Jito's minimum tip is 1000 lamports and a transaction below "
+                "it will not be picked up by the auction."
+            )
+        if not 0 < self.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT <= 100:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_PRICE_IMPACT_PCT must be in (0, 100]; got "
+                f"{self.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT}. Zero admits no "
+                "route and >100% is not a bound."
+            )
+        if self.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS < 0:
+            raise ValueError(
+                "SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS must be >= 0; got "
+                f"{self.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS}. A negative "
+                "margin would extend the authorization past blockhash expiry."
+            )
+        for name in (
+            "SOLANA_PILOT_CONFIRM_TIMEOUT_SEC",
+            "SOLANA_PILOT_FINALIZE_TIMEOUT_SEC",
+            "SOLANA_PILOT_POLL_INTERVAL_SEC",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
         return self
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")

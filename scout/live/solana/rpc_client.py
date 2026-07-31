@@ -332,6 +332,23 @@ class SolanaRpcClient:
         result = await self._rpc("getBalance", [pubkey, {"commitment": commitment}])
         return int(require_field(result, "value", label="getBalance"))
 
+    async def get_minimum_balance_for_rent_exemption(self, data_length: int) -> int:
+        """Lamports needed to make an account of ``data_length`` rent-exempt.
+
+        Read-only, like everything else here. The pilot's balance gate needs it
+        for the 165-byte SPL token account Jupiter may have to create for the
+        output mint: that rent leaves the wallet as part of the swap, so a
+        balance check that ignores it can pass a transaction the chain then
+        refuses for insufficient funds.
+
+        Queried rather than hardcoded because rent parameters are a cluster
+        setting, not a protocol constant. The caller supplies the documented
+        fallback when the call fails.
+        """
+        if data_length < 0:
+            raise ValueError(f"data_length must be >= 0; got {data_length}")
+        return int(await self._rpc("getMinimumBalanceForRentExemption", [data_length]))
+
     async def get_token_balance(
         self, owner: str, mint: str, *, commitment: str = "confirmed"
     ) -> int:

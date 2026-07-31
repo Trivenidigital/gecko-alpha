@@ -114,3 +114,18 @@ SYSTEM_TRANSFER_INSTRUCTION: Final[int] = 2
 # constant, used to price the total-fee ceiling alongside the priority fee
 # and the tip.
 LAMPORTS_PER_SIGNATURE: Final[int] = 5_000
+
+# ----------------------------------------------------------------------
+# Associated token account rent (PR-S2 balance gate)
+# ----------------------------------------------------------------------
+# An SPL token account is 165 bytes. If the wallet has never held the output
+# mint, the swap transaction creates its ATA and the rent-exempt minimum for
+# those 165 bytes leaves the wallet alongside the swap and the fees.
+TOKEN_ACCOUNT_DATA_LENGTH: Final[int] = 165
+
+# Rent-exempt minimum for a 165-byte account under mainnet's current rent
+# parameters. A FALLBACK only: rent is a cluster setting rather than a
+# protocol constant, so the pilot asks
+# ``rpc_client.get_minimum_balance_for_rent_exemption(165)`` first and records
+# in the evidence which of the two figures it used.
+ATA_RENT_LAMPORTS_FALLBACK: Final[int] = 2_039_280
