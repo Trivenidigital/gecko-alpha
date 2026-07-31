@@ -943,8 +943,22 @@ class PilotRunner:
                 "evidence_file" if intent is not None else "unavailable"
             )
             if report.verdict == "definitively_not_submitted":
+                if not resolver_endpoint(self._settings)[1]:
+                    # The verdict itself is not trustworthy from a
+                    # load-balanced endpoint, so it neither retires the row nor
+                    # unblocks the lane. `place` refuses at the envelope before
+                    # reaching this, which makes it defence in depth rather
+                    # than a live path — and that is exactly why it must not
+                    # quietly clear the row if that gate is ever moved.
+                    row["blocking"] = True
+                    row["auto_retired"] = False
+                    row["resolution"][
+                        "not_actionable"
+                    ] = "verdict read from a load-balanced endpoint"
+                    blockers += 1
+                    continue
                 row["blocking"] = False
-                if auto_retire and resolver_endpoint(self._settings)[1]:
+                if auto_retire:
                     await retire_row(
                         self._db,
                         row["live_trade_id"],
