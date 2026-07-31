@@ -308,6 +308,11 @@ async def test_total_fee_ceiling_catches_stacked_components(settings_factory):
         settings=settings_factory(
             SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=500_000,
             SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS=500_000,
+            # This fixture creates no ATA, so the config floor must not
+            # reserve rent room the transaction cannot spend — otherwise
+            # the 1_005_000 ceiling this test is built around is rejected
+            # before the inspector ever runs.
+            SOLANA_PILOT_MAX_ATA_CREATES=0,
             SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=1_005_000,
         ),
     )
@@ -448,11 +453,30 @@ async def _verify(settings_factory, *, settings_overrides=None, **build_kwargs):
 
 
 # Any fixture that adds an ATA create on top of the baseline's own crosses
-# the default total-fee ceiling once rent is counted (see
+# a TIGHT total-fee ceiling once rent is counted (see
 # test_two_ata_creations_need_a_raised_ceiling). Tests that are about
 # something OTHER than the ceiling raise it so the intended check is what
 # they actually exercise.
 _ROOMY = {"SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS": 20_000_000}
+
+# ...and the mirror image, for tests that ARE about the ceiling. These set
+# the ceiling they exercise rather than leaning on the shipped default:
+# SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS is a product decision that moved once
+# already (2.5M -> 8.5M, so a legitimate first swap creating wSOL + USDC is
+# not blocked), and a test that silently depends on its value asserts policy
+# instead of behaviour.
+#
+# The component ceilings are lowered alongside it because config requires
+# total >= priority + tip + base + (MAX_ATA_CREATES x rent); this set gives
+# a floor of 200_000 + 200_000 + 5_000 + 2_039_280 = 2_444_280, just under
+# the 2_500_000 total. The baseline fixture (one ATA create, 2_144_480)
+# still passes; anything that adds a second create does not.
+_TIGHT = {
+    "SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS": 200_000,
+    "SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS": 200_000,
+    "SOLANA_PILOT_MAX_ATA_CREATES": 1,
+    "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS": 2_500_000,
+}
 
 
 async def test_smuggled_approve_is_caught(settings_factory):
@@ -657,7 +681,11 @@ async def test_ata_rent_is_surfaced_on_the_report(settings_factory):
 
 async def test_stranger_ata_creation_is_bounded_by_the_fee_ceiling(settings_factory):
     """The C4 case: rent for somebody else's account is counted and blocked."""
-    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create())
+    report = await _verify(
+        settings_factory,
+        settings_overrides=_TIGHT,
+        extra_instructions=_stranger_ata_create(),
+    )
 
     assert report.ata_create_count == 2
     assert report.ata_rent_lamports == 2 * ATA_RENT_LAMPORTS_FALLBACK
@@ -666,7 +694,11 @@ async def test_stranger_ata_creation_is_bounded_by_the_fee_ceiling(settings_fact
 
 
 async def test_many_stranger_ata_creations_scale_the_counted_rent(settings_factory):
-    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create(5))
+    report = await _verify(
+        settings_factory,
+        settings_overrides=_TIGHT,
+        extra_instructions=_stranger_ata_create(5),
+    )
 
     assert report.ata_create_count == 6
     assert report.ata_rent_lamports == 6 * ATA_RENT_LAMPORTS_FALLBACK
@@ -687,34 +719,48 @@ async def test_live_rent_figure_overrides_the_fallback(settings_factory):
     report = await verify_swap_transaction(
         tx_b64=built.tx_b64,
         expected_signer=PAYER_PUBKEY,
-        settings=settings_factory(),
+        settings=settings_factory(**_TIGHT),
         ata_rent_lamports=3_000_000,
     )
 
     assert report.ata_rent_lamports == 3_000_000
-    assert not report.passed  # 3_000_000 alone exceeds the default ceiling
+    # A cluster whose rent is higher than the fallback pushes one single
+    # legitimate ATA create past the ceiling — which is why the figure has
+    # to be the live one rather than a constant.
+    assert not report.passed
     assert "total_fee_within_ceiling" in _failed_names(report)
 
 
 async def test_two_ata_creations_need_a_raised_ceiling(settings_factory):
     """*** Pins a real operational consequence of counting ATA rent. ***
 
-    A first-ever SOL->USDC swap plausibly creates TWO accounts (the WSOL
-    account and the USDC account) = 4,078,560 lamports of rent, which exceeds
-    the 2,500,000 default SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS. Fail-closed is
-    correct, but it means the default ceiling must be raised before the pilot
-    or a legitimate first swap is blocked. This test documents the number so
-    the interaction cannot be quietly lost.
-    """
-    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create())
-    assert not report.passed
+    A first-ever SOL->USDC swap plausibly creates TWO accounts (the wSOL
+    account and the USDC account) = 4,078,560 lamports of rent. Under the
+    2,500,000 ceiling this lane originally shipped, that legitimate build
+    was refused — fail-closed and correct, but it would have stopped the
+    pilot's very first swap.
 
-    raised = await _verify(
+    The resolution was to raise the default to 8,500,000, sized to cover
+    three creates at the maximum component ceilings. Both halves are pinned
+    here: the tight ceiling still refuses, and the SHIPPED DEFAULT admits
+    the build it exists to admit. Neither number can be changed without one
+    of these failing.
+    """
+    tight = await _verify(
         settings_factory,
-        settings_overrides={"SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS": 6_000_000},
+        settings_overrides=_TIGHT,
         extra_instructions=_stranger_ata_create(),
     )
-    assert raised.passed, f"unexpected failures: {_failed_names(raised)}"
+    assert tight.ata_create_count == 2
+    assert tight.ata_rent_lamports == 2 * ATA_RENT_LAMPORTS_FALLBACK
+    assert not tight.passed
+    assert "total_fee_within_ceiling" in _failed_names(tight)
+
+    at_default = await _verify(
+        settings_factory, extra_instructions=_stranger_ata_create()
+    )
+    assert at_default.total_fee_lamports == 4_183_760
+    assert at_default.passed, f"unexpected failures: {_failed_names(at_default)}"
 
 
 # ----------------------------------------------------------------------

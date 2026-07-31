@@ -67,7 +67,12 @@ _PLANTED_KEY_BYTES = json.dumps(list(bytes(PAYER)))
 
 _QUOTE_RE = re.compile(r"https://api\.jup\.ag/swap/v1/quote.*")
 _SWAP_URL = "https://api.jup.ag/swap/v1/swap"
-_RPC_URL = "https://api.mainnet-beta.solana.com"
+# A DEDICATED node, not the public round-robin. The runner refuses to place
+# anything while the resolver would read from a load-balanced endpoint (see
+# test_place_refuses_a_load_balanced_resolver_endpoint), so every fixture
+# that is meant to get past the envelope has to name a pinned one.
+_RPC_URL = "https://pilot-node.example-rpc.net/rpc"
+_ROUND_ROBIN_RPC_URL = "https://api.mainnet-beta.solana.com"
 _SUBMIT_RE = re.compile(
     r"https://mainnet\.block-engine\.jito\.wtf/api/v1/transactions.*"
 )
@@ -83,10 +88,21 @@ _LAST_VALID = 283_000_500
 _HEIGHT_FRESH = 283_000_100
 _ATA_RENT = 2_039_280
 
-# Balances chosen so the happy path reconciles: the wallet spends the swap
-# plus the transaction's fees and receives exactly the quoted USDC.
+# What the inspector prices for the baseline fixture. The rent term is the
+# one that matters: the fixture emits ONE ATA create, and tx_inspector folds
+# its rent into total_fee_lamports, so the balance gate must require it
+# exactly once.
+_BASE_FEE = 5_000  # one required signature
+_PRIORITY_FEE = 200  # 1000 micro-lamports/CU x 200_000 CU
+_TIP = 100_000
+_TOTAL_FEE = _BASE_FEE + _PRIORITY_FEE + _TIP + _ATA_RENT  # 2_144_480
+
+# Balances chosen so the happy path reconciles. The wallet actually spends
+# only the fees — the wSOL account's rent is returned when it is closed
+# inside the same transaction — which is why the reconciliation band spans
+# "swap alone" to "swap + everything the bytes can charge".
 _SOL_BEFORE = 500_000_000
-_TX_FEES = 105_000  # base 5000 + priority 200 + tip 100_000, per the fixture
+_TX_FEES = _BASE_FEE + _PRIORITY_FEE + _TIP  # what leaves and does not return
 _SOL_AFTER = _SOL_BEFORE - _LAMPORTS - _TX_FEES
 
 
@@ -97,6 +113,7 @@ def _settings(tmp_path, **overrides) -> Settings:
     base = dict(
         SOLANA_PILOT_ENABLED=True,
         SOLANA_PILOT_KEYPAIR_PATH=_PLANTED_KEYPAIR_PATH,
+        SOLANA_RPC_URL=_RPC_URL,
         SOLANA_PILOT_EVIDENCE_DIR=str(tmp_path / "evidence"),
         SOLANA_SUBMISSION_SETTLE_SEC=0.0,
         SOLANA_PILOT_POLL_INTERVAL_SEC=0.0,
@@ -600,7 +617,10 @@ async def test_place_refuses_a_tip_over_the_ceiling(tmp_path):
         tmp_path,
         SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=50_000,
         SOLANA_PILOT_JITO_TIP_LAMPORTS=50_000,
-        SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=1_100_000,
+        # Left roomy on purpose so the TIP check is the only thing that can
+        # fail. A total-fee ceiling tight enough to trip on its own would make
+        # the test pass for the wrong reason.
+        SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=7_200_000,
     )
     # Jupiter builds a 100_000-lamport tip regardless of what we asked for.
     with aioresponses() as m:
@@ -616,7 +636,7 @@ async def test_place_refuses_when_sol_does_not_cover_swap_fees_and_ata_rent(tmp_
     """The ATA rent is real money: a gate that ignores it passes a doomed tx."""
     tx = build_swap_tx().tx_b64
     runner, db, session = await _make_runner(tmp_path)
-    # Enough for the swap and the fees, but not for the rent plus headroom.
+    # Enough for the swap and the FEES, but not for the rent plus headroom.
     barely = _LAMPORTS + _TX_FEES + 1_000
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -627,10 +647,62 @@ async def test_place_refuses_when_sol_does_not_cover_swap_fees_and_ata_rent(tmp_
         assert _submissions(m) == []
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "balance"
-    assert "ATA rent" in abort["reason"]
+    assert "ATA create(s)" in abort["reason"]
     assert _step(_steps(tmp_path), "balance") is None  # never recorded a pass
     await session.close()
     await db.close()
+
+
+async def test_required_balance_counts_the_ata_rent_exactly_once(tmp_path):
+    """*** The double-count regression test. ***
+
+    tx_inspector folds ATA rent into total_fee_lamports. A balance gate that
+    also added its own rent figure would demand ~0.002 SOL more than the
+    transaction can possibly cost — conservative, so it fails safe, but it
+    refuses wallets that are in fact funded. Both cases are pinned: a build
+    that creates an account, and one that does not.
+    """
+    creates = build_swap_tx().tx_b64  # emits one ATA create
+    exists = build_swap_tx(include_wrap_primitives=False).tx_b64
+
+    async def _required(tx_b64, sol_balance):
+        runner, db, session = await _make_runner(tmp_path)
+        with aioresponses() as m:
+            _mock_quote_and_build(m, tx_b64)
+            m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
+            m.post(
+                _RPC_URL,
+                payload=_rpc({"context": {"slot": 1}, "value": sol_balance}),
+            )
+            m.post(_RPC_URL, payload=_token_accounts(0))
+            m.post(_RPC_URL, payload=_simulation_ok())
+            m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+            await runner.place(sol=_SOL)
+        step = _step(_steps(tmp_path), "balance")
+        await session.close()
+        await db.close()
+        for stale in (tmp_path / "evidence").glob("*.json"):
+            stale.unlink()
+        return step
+
+    with_ata = await _required(creates, _SOL_BEFORE)
+    assert with_ata["ata_create_count"] == 1
+    assert with_ata["ata_rent_lamports"] == _ATA_RENT
+    assert with_ata["total_fee_lamports"] == _TOTAL_FEE
+    # Exactly the swap plus the priced cost — the rent appears once.
+    assert with_ata["required_lamports"] == _LAMPORTS + _TOTAL_FEE
+    assert with_ata["required_with_headroom_lamports"] == int(
+        (_LAMPORTS + _TOTAL_FEE) * Decimal("1.10")
+    )
+
+    without_ata = await _required(exists, _SOL_BEFORE)
+    assert without_ata["ata_create_count"] == 0
+    assert without_ata["ata_rent_lamports"] == 0
+    # A wallet that already holds the mint is not charged for an account it
+    # does not need.
+    assert (
+        without_ata["required_lamports"] == _LAMPORTS + _BASE_FEE + _PRIORITY_FEE + _TIP
+    )
 
 
 async def test_ata_rent_falls_back_and_says_so(tmp_path, monkeypatch):
@@ -651,7 +723,11 @@ async def test_ata_rent_falls_back_and_says_so(tmp_path, monkeypatch):
         m.post(_RPC_URL, payload=_token_accounts(0))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
-    assert "documented_fallback" in _step(_steps(tmp_path), "aborted")["reason"]
+    # The fallback is a DEGRADED reading, so the evidence has to say which
+    # figure priced the ceiling and the balance gate.
+    inspection = _step(_steps(tmp_path), "tx_inspection")
+    assert inspection["ata_rent_source"] == "documented_fallback"
+    assert inspection["ata_rent_per_account_lamports"] == _ATA_RENT
     await session.close()
     await db.close()
 
@@ -673,6 +749,310 @@ async def test_place_refuses_before_approval_when_simulation_fails(tmp_path, cap
     assert await _count(db, "live_trades") == 0
     await session.close()
     await db.close()
+
+
+# ======================================================================
+# S1-review requirement 1: the runner IS the inspect-then-sign coupling
+# ======================================================================
+async def test_a_failing_inspection_means_no_signature_is_ever_derived(tmp_path):
+    """*** The coupling S1 structurally cannot enforce. ***
+
+    ``sign_transaction`` does not require a passing VerificationReport and its
+    ``expected_signer`` defaults to None, so on its own it will sign a message
+    whose fee payer is a different key. Nothing in the venue layer stops that —
+    the runner is the only place the two can be bound together. This test
+    proves the binding holds in the direction that matters: a report that fails
+    means the key is never asked to sign anything at all.
+    """
+    hostile = build_swap_tx(extra_transfer_dest=STRANGER).tx_b64
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, hostile)
+        m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    names = _step_names(steps)
+    # No signature was derived...
+    assert "signed_in_memory" not in names
+    # ...the simulation gate was never even reached...
+    assert "simulation" not in names
+    # ...no row asserts a transaction...
+    assert await _count(db, "live_trades") == 0
+    # ...and no signature string appears anywhere in the evidence.
+    raw = _only_evidence_file(tmp_path).read_text(encoding="utf-8")
+    assert "expected_signature" not in raw
+    await session.close()
+    await db.close()
+
+
+def test_the_runner_never_calls_the_signer_without_an_expected_signer():
+    """Static guarantee, checked over the AST rather than by running a path.
+
+    ``sign_transaction(tx, keypair)`` is a valid call — ``expected_signer``
+    defaults to None, and with it the cheap guard against signing a
+    transaction built for a DIFFERENT key silently disappears. A runtime test
+    can only show that the call sites reached by that test pass it. This walks
+    every call in the module.
+    """
+    import ast
+    import inspect
+
+    from scout.live import solana_pilot as module
+
+    tree = ast.parse(inspect.getsource(module))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None))
+        == "sign_transaction"
+    ]
+    assert calls, "expected to find the signing call site"
+    for call in calls:
+        assert "expected_signer" in {
+            kw.arg for kw in call.keywords
+        }, f"sign_transaction called without expected_signer at line {call.lineno}"
+
+
+async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
+    tmp_path, monkeypatch
+):
+    """The digest the approval screen shows must be the digest that got signed.
+
+    Without this, the inspection could describe one transaction while the
+    signature committed to another — the report would be true and irrelevant.
+    """
+    tx = build_swap_tx().tx_b64
+    runner, db, session = await _make_runner(tmp_path)
+    real_sign = solana_pilot.sign_transaction
+
+    def _sign_something_else(tx_b64, keypair, **kwargs):
+        signed = real_sign(build_swap_tx(tip_lamports=99_999).tx_b64, keypair)
+        return signed
+
+    monkeypatch.setattr(solana_pilot, "sign_transaction", _sign_something_else)
+    _authorize(monkeypatch, "whatever")
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "signed_in_memory"
+    assert "does not match the inspected digest" in abort["reason"]
+    assert await _count(db, "live_trades") == 0
+    await session.close()
+    await db.close()
+
+
+# ======================================================================
+# S1-review requirements 4 + 5: the inspector gets live inputs, not defaults
+# ======================================================================
+async def test_the_live_jito_tip_list_is_used_and_its_provenance_recorded(
+    tmp_path, monkeypatch
+):
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_happy_path(m, tx)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+    inspection = _step(_steps(tmp_path), "tx_inspection")
+    assert inspection["tip_accounts_source"] == "live_block_engine"
+    assert inspection["tip_accounts_checked"] == 1  # the mocked live list
+    await session.close()
+    await db.close()
+
+
+async def test_a_static_tip_list_is_recorded_as_the_degraded_mode(tmp_path):
+    """Falling back is allowed; failing to SAY so is not.
+
+    Jito rotates its tip accounts. A run that silently checked the tip against
+    a stale constant would look identical in the evidence to one that checked
+    it against the live list.
+    """
+    tx = build_swap_tx().tx_b64
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        m.get(_QUOTE_RE, payload=_quote_payload())
+        m.post(
+            _SWAP_URL,
+            payload={
+                "swapTransaction": tx,
+                "lastValidBlockHeight": _LAST_VALID,
+                "prioritizationFeeLamports": 200,
+            },
+        )
+        # The block engine cannot be read, so the client falls back.
+        m.post(_TIP_ACCOUNTS_URL, exception=TimeoutError(), repeat=True)
+        m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": 1_000}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        await runner.place(sol=_SOL)
+        assert _submissions(m) == []
+    inspection = _step(_steps(tmp_path), "tx_inspection")
+    assert inspection["tip_accounts_source"] == "static_fallback"
+    # The tip still verified against the fallback list, so the run got as far
+    # as the balance gate rather than failing inspection.
+    assert inspection["passed"] is True
+    await session.close()
+    await db.close()
+
+
+async def test_a_lookup_table_route_is_approvable_because_a_real_rpc_is_passed(
+    tmp_path, monkeypatch
+):
+    """Without an rpc_client the inspector fails ALT routes by construction.
+
+    ``lookup_tables_resolved`` fails, and with it the program-allowlist and
+    mint-presence checks that read the resolved keys — so a runner that did not
+    pass one could never approve a route using address lookup tables, which
+    Jupiter routes commonly do.
+    """
+    import base64 as _b64
+
+    from solders.pubkey import Pubkey
+
+    from scout.live.solana.rpc_client import LOOKUP_TABLE_META_SIZE
+    from solana_tx_builder import ALT
+
+    # The ALT holds both mints, so compiling against it moves them OUT of the
+    # static account keys — the mint-presence check can only pass once the
+    # table has actually been fetched and decoded.
+    built = build_swap_tx(lookup_tables=[ALT])
+    table_bytes = bytes(LOOKUP_TABLE_META_SIZE) + b"".join(
+        bytes(Pubkey.from_string(m)) for m in (SOL_MINT, USDC_MINT)
+    )
+    _authorize(monkeypatch, _expected_signature(built.tx_b64)[:8])
+
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, built.tx_b64)
+        m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
+        # The inspector resolves the table before it can judge the route.
+        m.post(
+            _RPC_URL,
+            payload=_rpc(
+                {
+                    "context": {},
+                    "value": [
+                        {"data": [_b64.b64encode(table_bytes).decode(), "base64"]}
+                    ],
+                }
+            ),
+        )
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        m.post(_RPC_URL, payload=_simulation_ok())
+        m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(built.tx_b64)))
+        _mock_settlement_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+
+    inspection = _step(_steps(tmp_path), "tx_inspection")
+    assert inspection["rpc_client_supplied"] is True
+    assert inspection["unresolved_lookup_tables"] == []
+    assert "lookup_tables_resolved" not in inspection["failed_checks"]
+    assert inspection["passed"] is True
+    await session.close()
+    await db.close()
+
+
+# ======================================================================
+# S1-review requirement 6: the resolver reads from ONE pinned node
+# ======================================================================
+async def test_place_refuses_a_load_balanced_resolver_endpoint(tmp_path):
+    """*** The only way to manufacture a false definitively_not_submitted. ***
+
+    The verdict combines two facts read in two calls: the signature is absent,
+    AND the block height has passed lastValidBlockHeight. Behind a load
+    balancer those can come from different nodes, and one that is ahead on
+    height while missing the signature produces a verdict that retires a live
+    row and invites a rerun — two swaps for one authorization.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
+    )
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "envelope_gate"
+    assert "load-balanced" in abort["reason"]
+    assert "SOLANA_RESOLVER_RPC_URL" in abort["reason"]
+    await session.close()
+    await db.close()
+
+
+async def test_an_explicit_resolver_url_satisfies_the_pin(tmp_path):
+    """A round-robin general RPC is fine as long as resolution is pinned."""
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL,
+        SOLANA_RESOLVER_RPC_URL=_RPC_URL,
+    )
+    with aioresponses() as m:
+        m.get(_QUOTE_RE, payload=_quote_payload(out_amount=4_990_000))
+        # Gets past the envelope and refuses on the band instead.
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+    envelope = _step(_steps(tmp_path), "envelope_gate")
+    assert envelope["resolver_endpoint_pinned"] is True
+    assert envelope["resolver_rpc_url"] == _RPC_URL
+    await session.close()
+    await db.close()
+
+
+async def test_resolve_reports_but_will_not_retire_on_an_unpinned_verdict(
+    tmp_path, capsys
+):
+    """Reporting a verdict is always allowed; ACTING on this one is not."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688a"
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
+    )
+    await _seed_solana_row(db, decision_id=decision_id, signature=signature)
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+    with aioresponses() as m:
+        for _ in range(2):
+            m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
+            m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+
+    steps = _steps(tmp_path)
+    assert _step(steps, "resolution")["verdict"] == "definitively_not_submitted"
+    assert _step(steps, "resolution")["resolver_endpoint_pinned"] is False
+    assert _step(steps, "auto_retire_withheld") is not None
+    assert _step(steps, "row_auto_retired") is None
+    # The row survives — that is the whole point.
+    assert (await _row(db, decision_id))["status"] == "open"
+    assert "NOT PINNED" in capsys.readouterr().out
+    await session.close()
+    await db.close()
+
+
+def test_resolver_endpoint_prefers_the_explicit_url_and_flags_round_robins(
+    tmp_path,
+):
+    from scout.live.solana_pilot import resolver_endpoint
+
+    pinned = _settings(tmp_path, SOLANA_RPC_URL=_RPC_URL)
+    assert resolver_endpoint(pinned) == (_RPC_URL, True)
+
+    loose = _settings(tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL)
+    assert resolver_endpoint(loose) == (_ROUND_ROBIN_RPC_URL, False)
+
+    override = _settings(
+        tmp_path,
+        SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL,
+        SOLANA_RESOLVER_RPC_URL=_RPC_URL,
+    )
+    assert resolver_endpoint(override) == (_RPC_URL, True)
 
 
 # ======================================================================
@@ -966,6 +1346,37 @@ async def test_the_expected_signature_is_persisted_before_the_submission_step(
     await db.close()
 
 
+async def test_reconciliation_records_the_minimum_output_comparison(
+    tmp_path, monkeypatch
+):
+    """*** The post-trade check IS the slippage guarantee. ***
+
+    tx_inspector cannot verify the minimum-output bound — the route and its
+    otherAmountThreshold are encoded inside Jupiter's instruction data,
+    which is opaque to a static inspector. What protects the trade is
+    Jupiter's on-chain program enforcing that threshold plus this
+    reconciliation confirming it held. So the comparison is recorded as an
+    explicit boolean rather than left to be inferred from the absence of a
+    complaint.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_happy_path(m, tx)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+
+    balance = _step(_steps(tmp_path), "reconciliation")["balance"]
+    assert balance["meets_minimum_output"] is True
+    assert balance["usdc_minimum_raw"] == _MIN_OUT_RAW
+    assert balance["usdc_received_raw"] == _OUT_RAW
+    # Received more than the floor and no more than the quote: the bound
+    # held, and the comparison that says so is in the evidence.
+    assert _MIN_OUT_RAW <= balance["usdc_received_raw"] <= balance["usdc_quoted_raw"]
+    await session.close()
+    await db.close()
+
+
 async def test_reconciliation_reviews_an_unexplained_balance_move(
     tmp_path, monkeypatch
 ):
@@ -983,7 +1394,10 @@ async def test_reconciliation_reviews_an_unexplained_balance_move(
 
     reconciliation = _step(_steps(tmp_path), "reconciliation")
     assert reconciliation["verdict"] == "review"
-    assert any("below the on-chain minimum" in m for m in reconciliation["mismatches"])
+    assert reconciliation["balance"]["meets_minimum_output"] is False
+    assert any(
+        "the slippage bound did not hold" in m for m in reconciliation["mismatches"]
+    )
     await session.close()
     await db.close()
 
@@ -1659,10 +2073,61 @@ async def test_operator_lines_are_ascii(tmp_path, monkeypatch, capsys):
 # ======================================================================
 # Config
 # ======================================================================
+def test_the_total_fee_ceiling_admits_a_first_ever_swap():
+    """The ruling this default exists to encode.
+
+    A first SOL->USDC swap creates the wSOL account and the USDC account.
+    At 2,039,280 lamports of rent each that is 4,078,560 before a single
+    fee — so a ceiling set for fees alone refuses the legitimate build.
+    """
+    s = Settings(_env_file=None, **_REQUIRED)
+    assert s.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS == 8_500_000
+    assert s.SOLANA_PILOT_MAX_ATA_CREATES == 3
+    worst_case = (
+        3 * 2_039_280
+        + s.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS
+        + s.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS
+        + 5_000
+    )
+    assert worst_case == 8_122_840
+    assert s.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS >= worst_case
+
+
+def test_config_rejects_a_ceiling_no_build_could_ever_satisfy():
+    """A ceiling below the computable floor is a lane that never trades.
+
+    The old floor knew nothing about ATA rent, so it accepted ceilings that
+    tx_inspector then refused on every single transaction — a config error
+    that only showed up as "the pilot does not work" on trade day.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        Settings(
+            _env_file=None,
+            **_REQUIRED,
+            SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=2_500_000,
+        )
+    message = str(excinfo.value)
+    # The arithmetic is named, so an operator who tightened the ceiling can
+    # see exactly which term made it impossible.
+    assert "required>=8122840" in message
+    assert "ATA rent 6117840" in message
+    assert "3 accounts x 2039280" in message
+
+    # Lowering the ATA allowance lowers the floor with it.
+    tighter = Settings(
+        _env_file=None,
+        **_REQUIRED,
+        SOLANA_PILOT_MAX_ATA_CREATES=0,
+        SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=2_005_000,
+    )
+    assert tighter.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS == 2_005_000
+
+
 def test_solana_pilot_defaults_are_safe():
     s = Settings(_env_file=None, **_REQUIRED)
     assert s.SOLANA_PILOT_ENABLED is False
     assert s.SOLANA_PILOT_KEYPAIR_PATH == ""
+    assert s.SOLANA_RESOLVER_RPC_URL == ""
     assert s.SOLANA_PILOT_MIN_ORDER_USD == 5.0
     assert s.SOLANA_PILOT_MAX_ORDER_USD == 10.0
     assert s.SOLANA_PILOT_JITO_TIP_LAMPORTS == 100_000

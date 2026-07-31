@@ -1389,6 +1389,22 @@ class Settings(BaseSettings):
     # simulation through this URL are expected and safe; a public RPC is fine
     # for both. If you are adding a broadcast method here, stop.
     SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    # *** THE RESOLVER'S ENDPOINT MUST BE A SINGLE CONSISTENT NODE. ***
+    # scout.live.solana.resolver reaches `definitively_not_submitted` — the one
+    # verdict that licenses clearing the lane and rebuilding — by combining two
+    # facts: the signature is absent, AND the current block height has passed
+    # lastValidBlockHeight. Read from a LOAD-BALANCED endpoint those two facts
+    # can come from different nodes, and a node that is simultaneously ahead on
+    # height and behind on (or missing) the signature status produces a FALSE
+    # definitively_not_submitted. The runner would then retire a live row and
+    # invite a rerun: two swaps where the operator authorised one.
+    #
+    # api.mainnet-beta.solana.com is exactly such a round-robin. Point this at
+    # a single dedicated node (Helius, Triton, QuickNode, your own validator).
+    # Empty means "use SOLANA_RPC_URL", which the runner accepts only when that
+    # URL is not itself a known round-robin — see
+    # scout.live.solana_pilot.resolver_endpoint.
+    SOLANA_RESOLVER_RPC_URL: str = ""
     # Path to a Solana CLI id.json (a 64-byte secret-key array). The RUNNER
     # loads it at call time; the key itself is NEVER config, never an env var,
     # never in argv. scout.live.solana.signer refuses the file unless its mode
@@ -1409,10 +1425,28 @@ class Settings(BaseSettings):
     SOLANA_PILOT_SLIPPAGE_BPS: int = 100
     SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS: int = 1_000_000
     SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS: int = 1_000_000
-    # Ceiling on base signature fee + priority fee + Jito tip combined. Caps
-    # the total cost of the transaction independently of how it is split, so a
-    # build that respects both component ceilings but stacks them still fails.
-    SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS: int = 2_500_000
+    # Ceiling on base signature fee + priority fee + Jito tip + ATA RENT
+    # combined. Caps every lamport the transaction moves out of the wallet
+    # independently of how it is split, so a build that respects each
+    # component ceiling but stacks them still fails.
+    #
+    # 8_500_000 covers the worst case the inspector can price — 3 ATA creates
+    # at the maximum component ceilings: 3 x 2,039,280 + priority 1,000,000 +
+    # tip 1,000,000 + base 5,000 = 8,122,840 — with headroom. That is ~0.0085
+    # SOL (~$1.30 at $150/SOL), trivial absolute exposure against a $5-10
+    # trade, and loosening the aggregate loosens no individual lever: the
+    # priority and tip ceilings still bind on their own.
+    #
+    # Most of the rent comes back. It is a rent-exempt DEPOSIT rather than a
+    # fee, and the temporary wSOL account Jupiter opens is closed to the owner
+    # at the end of the swap — but the lamports must be available while the
+    # transaction runs, so the ceiling and the balance gate both count them.
+    SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS: int = 8_500_000
+    # How many associated-token-account creations a single build may pay for.
+    # Used by the config floor below; a first-ever SOL->USDC swap plausibly
+    # creates two (wSOL + USDC), and 3 leaves room for a route that opens an
+    # intermediate.
+    SOLANA_PILOT_MAX_ATA_CREATES: int = 3
     SOLANA_PILOT_MIN_ORDER_USD: float = 5.0
     SOLANA_PILOT_MAX_ORDER_USD: float = 10.0
     # Settle delay between the two sweeps that resolve an ambiguous
@@ -2049,19 +2083,43 @@ class Settings(BaseSettings):
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "
+                f"got={self.SOLANA_PILOT_MAX_ATA_CREATES}"
+            )
+        # The total-fee ceiling now bounds every lamport the transaction moves
+        # out of the wallet, not just the fees: tx_inspector counts ATA rent
+        # against it. So the floor has to include the rent a legitimate build
+        # can charge, or the ceiling is set below what any real swap produces
+        # and the lane refuses everything.
+        #
         # 5000 lamports = the protocol's base fee for the pilot's single
         # required signature (scout.live.solana.constants.LAMPORTS_PER_SIGNATURE).
+        # 2039280 = the rent-exempt minimum for a 165-byte SPL token account
+        # (scout.live.solana.constants.ATA_RENT_LAMPORTS_FALLBACK). Both are
+        # inlined rather than imported to keep config free of a scout.live
+        # dependency; the constants module is the source of truth.
+        base_fee = 5_000
+        ata_rent_floor = self.SOLANA_PILOT_MAX_ATA_CREATES * 2_039_280
         floor = (
             self.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS
             + self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS
-            + 5_000
+            + base_fee
+            + ata_rent_floor
         )
         if self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS < floor:
             raise ValueError(
-                "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS must be >= priority + tip + "
-                f"base signature fee; got total={self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS}, "
-                f"required>={floor}. A transaction at both component ceilings "
-                "would breach the combined ceiling and never be signable."
+                "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS is below what a legitimate "
+                "build can cost, so no swap could ever pass inspection. "
+                f"got total={self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS}, "
+                f"required>={floor} = priority "
+                f"{self.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS} + tip "
+                f"{self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS} + base signature fee "
+                f"{base_fee} + ATA rent {ata_rent_floor} "
+                f"({self.SOLANA_PILOT_MAX_ATA_CREATES} accounts x 2039280). "
+                "Lower SOLANA_PILOT_MAX_ATA_CREATES or the component ceilings "
+                "if you want a tighter total."
             )
         return self
 

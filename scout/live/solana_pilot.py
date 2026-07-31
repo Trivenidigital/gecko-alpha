@@ -155,6 +155,7 @@ from scout.db import Database
 from scout.live.kill_switch import KillSwitch
 from scout.live.solana.constants import (
     ATA_RENT_LAMPORTS_FALLBACK,
+    JITO_TIP_ACCOUNTS_FALLBACK,
     LAMPORTS_PER_SIGNATURE,
     LAMPORTS_PER_SOL,
     SOL_MINT,
@@ -216,6 +217,17 @@ _BLOCKING_STATUSES = ("open", "needs_manual_review")
 # the envelope is "mainnet only" and a typo in .env is the realistic way to
 # leave it.
 _NON_MAINNET_MARKERS = ("devnet", "testnet", "localhost", "127.0.0.1")
+
+# Public RPC hosts known to sit behind a load balancer. The resolver must not
+# read from one — see ``resolver_endpoint``. Matched as a substring against a
+# lowercased URL, so a provider path or port does not defeat the check.
+_ROUND_ROBIN_RPC_HOSTS = (
+    "api.mainnet-beta.solana.com",
+    "api.devnet.solana.com",
+    "api.testnet.solana.com",
+    "solana-api.projectserum.com",
+    "rpc.ankr.com/solana",
+)
 
 # Redacted before anything reaches the evidence file or the log. The runner
 # never handles key material itself — ``signer`` loads, uses and drops it — so
@@ -355,6 +367,34 @@ class EvidenceLog:
             os.fsync(handle.fileno())
         log.info("solana_pilot_step", step=step, **_scrub(fields))
         return entry
+
+
+def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
+    """The URL the §7 resolver reads from, and whether it is safely PINNED.
+
+    The resolver reaches ``definitively_not_submitted`` — the one verdict that
+    licenses clearing the lane — by combining two facts read in separate RPC
+    calls: the signature is absent, AND the chain's block height has passed
+    ``lastValidBlockHeight``. Behind a load balancer those two calls can land
+    on different nodes, and a node that is simultaneously AHEAD on height and
+    missing the signature from its status cache manufactures a false
+    ``definitively_not_submitted``. The runner would retire a row describing a
+    transaction that is still in flight, and the operator would rerun: two
+    swaps against one authorization.
+
+    So the endpoint has to be one consistent node. ``SOLANA_RESOLVER_RPC_URL``
+    names it; when unset the main RPC URL is used, but only if that is not
+    itself a known round-robin.
+
+    Returns ``(url, pinned)``. Callers that are about to act irreversibly on a
+    verdict must refuse when ``pinned`` is False; callers that only REPORT a
+    verdict may proceed and say the reading is degraded.
+    """
+    configured = (settings.SOLANA_RESOLVER_RPC_URL or "").strip()
+    url = configured or settings.SOLANA_RPC_URL
+    lowered = url.lower()
+    pinned = not any(host in lowered for host in _ROUND_ROBIN_RPC_HOSTS)
+    return url, pinned
 
 
 def evidence_path_for(evidence_dir: str | Path, decision_id: str) -> Path:
@@ -731,6 +771,7 @@ class PilotRunner:
         jito: JitoClient,
         kill_switch: KillSwitch,
         keypair_loader: Callable[[], Keypair] | None = None,
+        resolver_rpc: SolanaRpcClient | None = None,
     ) -> None:
         self._settings = settings
         self._db = db
@@ -739,6 +780,11 @@ class PilotRunner:
         self._jito = jito
         self._ks = kill_switch
         self._load_keypair = keypair_loader or (lambda: load_keypair(settings))
+        # Both sweeps of every resolution read from THIS client, which must be
+        # bound to one consistent node — see ``resolver_endpoint``. Defaults to
+        # the main client so a test (or a deployment whose single RPC is
+        # already dedicated) needs no second wiring.
+        self._resolver_rpc = resolver_rpc or rpc
 
     # ---------------- shared gates ----------------
     def _evidence_for(self, decision_id: str) -> EvidenceLog:
@@ -771,12 +817,29 @@ class PilotRunner:
                     f"{field} points at a non-mainnet host (contains {hit!r}). "
                     "The approved envelope is mainnet only.",
                 )
+        # The resolver's endpoint is an envelope property, not an operational
+        # detail: a placement that cannot be RESOLVED afterwards is a placement
+        # whose recovery path is broken before it starts.
+        resolver_url, pinned = resolver_endpoint(self._settings)
+        if not pinned:
+            raise PilotAbort(
+                "envelope_gate",
+                f"the resolver would read from {resolver_url}, which is a "
+                "load-balanced public endpoint. Two calls can land on two "
+                "nodes, and a node that is ahead on block height while missing "
+                "the signature manufactures a false "
+                "'definitively_not_submitted' — which clears the lane and "
+                "invites a rerun of a swap that is still in flight. Set "
+                "SOLANA_RESOLVER_RPC_URL to a single dedicated node.",
+            )
         return {
             "pilot_enabled": True,
             "keypair_path_configured": True,
             "input_mint": SOL_MINT,
             "output_mint": USDC_MINT,
             "rpc_url": self._settings.SOLANA_RPC_URL,
+            "resolver_rpc_url": resolver_url,
+            "resolver_endpoint_pinned": True,
             "block_engine_url": self._settings.JITO_BLOCK_ENGINE_URL,
             "simulate_only": simulate_only,
         }
@@ -863,7 +926,7 @@ class PilotRunner:
                 report = await resolve_submission(
                     expected_signature=signature,
                     last_valid_block_height=last_valid,
-                    rpc_client=self._rpc,
+                    rpc_client=self._resolver_rpc,
                     settings=self._settings,
                 )
             except Exception as exc:  # pragma: no cover - resolver swallows its own
@@ -881,7 +944,7 @@ class PilotRunner:
             )
             if report.verdict == "definitively_not_submitted":
                 row["blocking"] = False
-                if auto_retire:
+                if auto_retire and resolver_endpoint(self._settings)[1]:
                     await retire_row(
                         self._db,
                         row["live_trade_id"],
@@ -974,22 +1037,52 @@ class PilotRunner:
         return quote, detail
 
     async def _inspect(
-        self, *, build: SwapBuild, signer_pubkey: str
+        self,
+        *,
+        build: SwapBuild,
+        signer_pubkey: str,
+        ata_rent_lamports: int,
+        ata_rent_source: str,
     ) -> tuple[VerificationReport, dict[str, Any]]:
         """Step 8 — the inspector's verdict on the bytes Jupiter sent back.
 
-        The live Jito tip-account list is fetched first: the inspector's tip
-        check is an exact-address comparison, and Jito rotates the accounts, so
-        a stale allowlist would reject a legitimately-tipped transaction. The
-        client already falls back to the static list on failure.
+        Three things are handed in rather than left to defaults, and each
+        one would silently degrade a check if it were not:
+
+        **The LIVE Jito tip-account list.** The tip check is an exact-address
+        comparison and Jito rotates the accounts, so a stale allowlist
+        rejects a legitimately-tipped transaction. ``fetch_tip_accounts``
+        falls back to the static list on failure, which is a DEGRADED mode —
+        the evidence records which list was actually used.
+
+        **A real ``rpc_client``.** Without one, any route that uses address
+        lookup tables fails ``lookup_tables_resolved`` by construction, and
+        with it the program-allowlist and mint-presence checks that read the
+        resolved keys. Jupiter routes commonly use ALTs, so a runner that
+        omitted this could never approve one.
+
+        **The live rent figure.** The inspector counts ATA rent against the
+        total-fee ceiling. Left to its fallback constant it would price the
+        ceiling off a number that is not this cluster's.
         """
         tip_accounts = await self._jito.fetch_tip_accounts()
+        # `fetch_tip_accounts` returns the module-level fallback OBJECT when
+        # the block engine could not be read, and a fresh frozenset
+        # otherwise — so identity, not equality, distinguishes the two.
+        tip_source = (
+            "static_fallback"
+            if tip_accounts is JITO_TIP_ACCOUNTS_FALLBACK
+            else "live_block_engine"
+        )
+        if tip_source == "static_fallback":
+            log.warning("solana_pilot_tip_accounts_degraded", count=len(tip_accounts))
         report = await verify_swap_transaction(
             tx_b64=build.swap_transaction_b64,
             expected_signer=signer_pubkey,
             settings=self._settings,
             rpc_client=self._rpc,
             tip_accounts=tip_accounts,
+            ata_rent_lamports=ata_rent_lamports,
         )
         detail = {
             "passed": report.passed,
@@ -1013,6 +1106,12 @@ class PilotRunner:
             "program_ids": list(report.program_ids),
             "unresolved_lookup_tables": list(report.unresolved_lookup_tables),
             "tip_accounts_checked": len(tip_accounts),
+            "tip_accounts_source": tip_source,
+            "ata_create_count": report.ata_create_count,
+            "ata_rent_lamports": report.ata_rent_lamports,
+            "ata_rent_per_account_lamports": ata_rent_lamports,
+            "ata_rent_source": ata_rent_source,
+            "rpc_client_supplied": True,
         }
         return report, detail
 
@@ -1045,21 +1144,23 @@ class PilotRunner:
         amount_lamports: int,
         report: VerificationReport,
     ) -> dict[str, Any]:
-        """Step 9 — SOL covers the swap, every fee, the ATA rent and headroom.
+        """Step 9 — SOL covers the swap, every cost the bytes carry, and headroom.
 
-        The ATA rent is in the requirement because it is real money leaving the
-        wallet: if this key has never held USDC, the swap transaction creates
-        the associated token account and funds its rent-exempt minimum. A gate
-        that counted only the swap and the fees would pass a transaction the
-        chain then refuses for insufficient funds — after the operator had
-        authorized it.
+        ``report.total_fee_lamports`` is the whole outgoing side: base
+        signature fee + priority fee + Jito tip + ATA RENT, every term
+        re-derived from the transaction's own bytes rather than from what we
+        asked Jupiter for. The rent is in there because it is real money
+        leaving the wallet — a key that has never held USDC pays the
+        rent-exempt minimum for the account the swap creates, and a gate that
+        ignored it would pass a transaction the chain then refuses for
+        insufficient funds, after the operator had authorized it.
 
-        ``report.total_fee_lamports`` is base signature fee + priority fee +
-        Jito tip, all three re-derived from the transaction's own bytes rather
-        than from what we asked Jupiter for.
+        The rent is therefore NOT added again here. It is counted once, by
+        the inspector, from the actual number of ATA-create instructions in
+        the transaction — which is also why a wallet that already holds USDC
+        is not charged for an account it does not need.
         """
-        ata_rent, rent_source = await self._ata_rent_lamports()
-        required = amount_lamports + report.total_fee_lamports + ata_rent
+        required = amount_lamports + report.total_fee_lamports
         # 10% headroom over the whole requirement, so a priority-fee market
         # that moves between the build and the block cannot turn a
         # just-affordable swap into an on-chain failure.
@@ -1075,8 +1176,8 @@ class PilotRunner:
             "usdc_balance": _fmt(usdc_from_raw(usdc_raw)),
             "swap_lamports": amount_lamports,
             "total_fee_lamports": report.total_fee_lamports,
-            "ata_rent_lamports": ata_rent,
-            "ata_rent_source": rent_source,
+            "ata_rent_lamports": report.ata_rent_lamports,
+            "ata_create_count": report.ata_create_count,
             "required_lamports": required,
             "required_with_headroom_lamports": required_with_headroom,
             "headroom_pct": 10,
@@ -1086,9 +1187,10 @@ class PilotRunner:
                 "balance",
                 f"SOL balance {_fmt(sol_from_lamports(sol_lamports))} does not "
                 f"cover the required {_fmt(sol_from_lamports(required_with_headroom))} "
-                f"(swap {_fmt(sol_from_lamports(amount_lamports))} + fees "
-                f"{report.total_fee_lamports} lamports + ATA rent {ata_rent} "
-                f"lamports [{rent_source}] + 10% headroom)",
+                f"(swap {_fmt(sol_from_lamports(amount_lamports))} + "
+                f"{report.total_fee_lamports} lamports of fees and rent "
+                f"[{report.ata_create_count} ATA create(s) = "
+                f"{report.ata_rent_lamports} lamports] + 10% headroom)",
             )
         return detail
 
@@ -1174,8 +1276,16 @@ class PilotRunner:
                     f"{build.simulation_error}",
                 )
 
+            # The rent figure is read BEFORE inspection because the
+            # inspector prices it into the total-fee ceiling. Asking
+            # afterwards would leave the ceiling evaluated against a
+            # constant rather than this cluster's actual rent parameters.
+            ata_rent, ata_rent_source = await self._ata_rent_lamports()
             report, inspect_detail = await self._inspect(
-                build=build, signer_pubkey=signer_pubkey
+                build=build,
+                signer_pubkey=signer_pubkey,
+                ata_rent_lamports=ata_rent,
+                ata_rent_source=ata_rent_source,
             )
             evidence.record("tx_inspection", **inspect_detail)
             if not report.passed:
@@ -1677,7 +1787,7 @@ class PilotRunner:
         resolution = await resolve_submission(
             expected_signature=signed.signature,
             last_valid_block_height=build.last_valid_block_height,
-            rpc_client=self._rpc,
+            rpc_client=self._resolver_rpc,
             settings=self._settings,
             owner_pubkey=signer_pubkey,
         )
@@ -2040,13 +2150,26 @@ class PilotRunner:
 
         mismatches: list[str] = list(probe_errors)
 
+        # *** This comparison IS the slippage guarantee. ***
+        # tx_inspector does not and cannot check the minimum-output bound:
+        # the route and its otherAmountThreshold are encoded inside
+        # Jupiter's instruction data, which is an opaque blob to a static
+        # inspector. What protects the trade is Jupiter's on-chain program
+        # enforcing that threshold, and THIS check confirming after the fact
+        # that it did. Recorded as an explicit boolean rather than inferred
+        # from the absence of a mismatch, so an evidence reader can see the
+        # guarantee was tested rather than assumed.
+        meets_minimum_output: bool | None = None
         if usdc_received is None:
             mismatches.append("no post-trade USDC balance to compare against")
-        elif usdc_received < quote.min_out_amount:
-            mismatches.append(
-                f"received {usdc_received} raw USDC, below the on-chain minimum "
-                f"{quote.min_out_amount} (otherAmountThreshold)"
-            )
+        else:
+            meets_minimum_output = usdc_received >= quote.min_out_amount
+            if not meets_minimum_output:
+                mismatches.append(
+                    f"received {usdc_received} raw USDC, below the on-chain "
+                    f"minimum {quote.min_out_amount} (otherAmountThreshold) — "
+                    "the slippage bound did not hold"
+                )
 
         # Tolerance of one base signature fee absorbs dust from the
         # wrap/unwrap round trip without widening the band enough to hide a
@@ -2055,15 +2178,26 @@ class PilotRunner:
         # would widen the band exactly when the transaction got expensive,
         # which is when an unexplained move matters most.
         slack = LAMPORTS_PER_SIGNATURE
+        # The band spans "the swap alone" to "the swap plus everything the
+        # inspected bytes can charge". Its width is the rent, and that is not
+        # slop: rent is a rent-exempt DEPOSIT, and the temporary wSOL account
+        # Jupiter opens is closed back to the owner inside the same
+        # transaction — so whether a given account's rent comes back is a
+        # property of the route, not something knowable here. Both ends are
+        # explained; anything outside is not.
+        #
+        # ``report.total_fee_lamports`` ALREADY includes the ATA rent, so it is
+        # not added a second time.
         low = amount_lamports - slack
-        high = amount_lamports + report.total_fee_lamports + ata_rent + slack
+        high = amount_lamports + report.total_fee_lamports + slack
         if sol_spent is None:
             mismatches.append("no post-trade SOL balance to compare against")
         elif not (low <= sol_spent <= high):
             mismatches.append(
                 f"SOL spent {sol_spent} lamports is outside the explained range "
-                f"[{low}, {high}] (swap {amount_lamports} + fees "
-                f"{report.total_fee_lamports} + conditional ATA rent {ata_rent})"
+                f"[{low}, {high}] (swap {amount_lamports} + fees and rent "
+                f"{report.total_fee_lamports}, of which {ata_rent} is "
+                f"recoverable ATA rent)"
             )
 
         on_chain_err = ((transaction or {}).get("meta") or {}).get("err")
@@ -2120,6 +2254,10 @@ class PilotRunner:
                 "usdc_received_raw": usdc_received,
                 "usdc_received": _fmt(usdc_from_raw(usdc_received)),
                 "usdc_minimum_raw": quote.min_out_amount,
+                "usdc_minimum": _fmt(usdc_from_raw(quote.min_out_amount)),
+                "usdc_quoted_raw": quote.out_amount,
+                # The slippage guarantee, stated rather than implied.
+                "meets_minimum_output": meets_minimum_output,
             },
         }
         evidence.record("reconciliation", **summary)
@@ -2167,10 +2305,11 @@ class PilotRunner:
             last_valid = (
                 None if intent is None else intent.get("last_valid_block_height")
             )
+            resolver_url, pinned = resolver_endpoint(self._settings)
             resolution = await resolve_submission(
                 expected_signature=str(signature),
                 last_valid_block_height=last_valid,
-                rpc_client=self._rpc,
+                rpc_client=self._resolver_rpc,
                 settings=self._settings,
             )
             evidence.record(
@@ -2179,6 +2318,8 @@ class PilotRunner:
                 last_valid_block_height_source=(
                     "evidence_file" if intent is not None else "unavailable"
                 ),
+                resolver_rpc_url=resolver_url,
+                resolver_endpoint_pinned=pinned,
             )
 
             retired = False
@@ -2186,19 +2327,31 @@ class PilotRunner:
                 resolution.verdict == "definitively_not_submitted"
                 and row["status"] in _BLOCKING_STATUSES
             ):
-                await retire_row(
-                    self._db,
-                    row["live_trade_id"],
-                    reject_reason="venue_unavailable",
-                )
-                retired = True
-                evidence.record(
-                    "row_auto_retired",
-                    live_trade_id=row["live_trade_id"],
-                    ledger_status="rejected",
-                    note="the transaction can never land, so the row asserts "
-                    "nothing that is still true",
-                )
+                if pinned:
+                    await retire_row(
+                        self._db,
+                        row["live_trade_id"],
+                        reject_reason="venue_unavailable",
+                    )
+                    retired = True
+                    evidence.record(
+                        "row_auto_retired",
+                        live_trade_id=row["live_trade_id"],
+                        ledger_status="rejected",
+                        note="the transaction can never land, so the row asserts "
+                        "nothing that is still true",
+                    )
+                else:
+                    # Reporting a verdict is always allowed; ACTING on this one
+                    # is not, because a load-balanced read is exactly how a
+                    # false 'never submitted' is manufactured. The row stays.
+                    evidence.record(
+                        "auto_retire_withheld",
+                        live_trade_id=row["live_trade_id"],
+                        resolver_rpc_url=resolver_url,
+                        note="verdict read from a load-balanced endpoint; the "
+                        "row is NOT retired on it",
+                    )
 
             lines = [
                 f"  decision ID : {decision_id}",
@@ -2211,9 +2364,22 @@ class PilotRunner:
                 f"  lastValidBH : {last_valid}"
                 + ("" if intent is not None else "  (evidence file unreadable)"),
                 f"  sweeps      : {len(resolution.probes)}",
+                f"  resolver RPC: {resolver_url}"
+                + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
                 f"  evidence    : {evidence.path}",
             ]
             lines.extend(_verdict_guidance(resolution.verdict, retired))
+            if resolution.verdict == "definitively_not_submitted" and not pinned:
+                lines.extend(
+                    [
+                        "",
+                        "  The row was NOT retired. This verdict came from a",
+                        "  load-balanced endpoint, where one node ahead on block",
+                        "  height and missing the signature is enough to invent",
+                        "  it. Set SOLANA_RESOLVER_RPC_URL to a dedicated node",
+                        "  and run this again before acting.",
+                    ]
+                )
             _print_block("SOLANA PILOT RESOLUTION", lines)
             if resolution.verdict == "landed":
                 return EXIT_BLOCKED
@@ -2260,6 +2426,12 @@ class PilotRunner:
             f"  jito tip requested       : "
             f"{settings.SOLANA_PILOT_JITO_TIP_LAMPORTS} lamports",
             f"  rpc (read-only)          : {settings.SOLANA_RPC_URL}",
+            f"  resolver rpc             : {resolver_endpoint(settings)[0]}"
+            + (
+                ""
+                if resolver_endpoint(settings)[1]
+                else "   ** NOT PINNED - place will refuse **"
+            ),
             f"  block engine (submit)    : {settings.JITO_BLOCK_ENGINE_URL}",
             f"  database                 : {Path(settings.DB_PATH).resolve()}",
         ]
@@ -2633,6 +2805,17 @@ async def main(argv: list[str] | None = None) -> int:
             timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
         )
         try:
+            # Two RPC clients on one session. The resolver reads from a
+            # SINGLE pinned node (see `resolver_endpoint`) because its
+            # definitive verdict combines two facts that must come from the
+            # same view of the chain; everything else can use the general
+            # endpoint. When the two URLs are equal this is the same target
+            # twice, which is exactly what a deployment with one dedicated
+            # node wants.
+            resolver_url, _pinned = resolver_endpoint(settings)
+            resolver_settings = settings.model_copy(
+                update={"SOLANA_RPC_URL": resolver_url}
+            )
             runner = PilotRunner(
                 settings=settings,
                 db=db,
@@ -2640,6 +2823,7 @@ async def main(argv: list[str] | None = None) -> int:
                 rpc=SolanaRpcClient(settings, session),
                 jito=JitoClient(settings, session),
                 kill_switch=KillSwitch(db),
+                resolver_rpc=SolanaRpcClient(resolver_settings, session),
             )
             if args.command == "place":
                 return await runner.place(
