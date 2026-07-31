@@ -1883,9 +1883,7 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 client_order_id=client_order_id, sweep=sweep_index
             )
             sweeps.append(probes)
-            txids.extend(
-                str(p["txid"]) for p in probes if p["outcome"] == "found" if p["txid"]
-            )
+            txids.extend(str(p["txid"]) for p in probes if p["outcome"] == "found")
             if any(p["outcome"] == "found" for p in probes):
                 verdict = "accepted"
                 break
