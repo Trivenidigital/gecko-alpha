@@ -494,7 +494,21 @@ async def verify_swap_transaction(
     )
 
     # ---- transfer destinations + tip ---------------------------------
-    own = _own_accounts(expected_signer, (input_mint, output_mint))
+    try:
+        own = _own_accounts(expected_signer, (input_mint, output_mint))
+    except Exception as exc:
+        # A malformed pubkey or mint makes the destination allowlist
+        # underivable. Recorded as a failed check rather than raised: the
+        # caller gets a report naming the problem, and — because the
+        # allowlist is now empty — every transfer is treated as unknown
+        # instead of being waved through.
+        add(
+            "own_accounts_derivable",
+            False,
+            f"could not derive own accounts for {expected_signer}: "
+            f"{type(exc).__name__}: {exc}",
+        )
+        own = set()
     known_destinations = own | allowed_tips
     unknown_transfers = [
         (dest, lamports)

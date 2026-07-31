@@ -218,6 +218,25 @@ async def test_tip_to_non_jito_account_is_not_counted_as_a_tip(settings_factory)
     assert report.jito_tip_destination is None
 
 
+async def test_unparseable_expected_signer_fails_closed(settings_factory):
+    """A malformed signer must fail the report, not raise out of the inspector.
+
+    With the own-account allowlist underivable, every transfer must also be
+    treated as unknown rather than waved through.
+    """
+    built = build_swap_tx()
+    report = await verify_swap_transaction(
+        tx_b64=built.tx_b64,
+        expected_signer="not-a-real-pubkey",
+        settings=settings_factory(),
+    )
+
+    assert not report.passed
+    failed = _failed_names(report)
+    assert "own_accounts_derivable" in failed
+    assert "transfer_destinations_known" in failed
+
+
 async def test_garbage_input_fails_closed(settings_factory):
     report = await verify_swap_transaction(
         tx_b64="not-valid-base64!!!",
