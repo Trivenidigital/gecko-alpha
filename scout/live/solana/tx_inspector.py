@@ -46,6 +46,62 @@ Verified facts (2026-07-31)
    followed by a u64 LE lamport amount (12 bytes), with accounts
    ``[from, to]``. This is the shape a Jito tip arrives as.
 
+5. **SPL Token instruction discriminators.** Verified against the token
+   program's own ``TokenInstruction::unpack`` match arms
+   (https://raw.githubusercontent.com/solana-program/token/main/interface/src/instruction.rs),
+   cross-checked against the enum declaration order at
+   https://docs.rs/spl-token/latest/spl_token/instruction/enum.TokenInstruction.html.
+   The leading data byte is the tag::
+
+       0 InitializeMint       9 CloseAccount       18 InitializeAccount3
+       1 InitializeAccount   10 FreezeAccount      19 InitializeMultisig2
+       2 InitializeMultisig  11 ThawAccount        20 InitializeMint2
+       3 Transfer            12 TransferChecked    21 GetAccountDataSize
+       4 Approve             13 ApproveChecked     22 InitializeImmutableOwner
+       5 Revoke              14 MintToChecked      23 AmountToUiAmount
+       6 SetAuthority        15 BurnChecked        24 UiAmountToAmount
+       7 MintTo              16 InitializeAccount2
+       8 Burn                17 SyncNative
+
+   EMPTY data is an error, not a default: ``unpack`` opens with
+   ``let (&tag, rest) = input.split_first().ok_or(InvalidInstruction)?;``, so
+   a zero-length token instruction can never be valid.
+
+   Account order, same source: ``CloseAccount`` is ``[account_to_close,
+   destination, owner]`` — released lamports go to index **1**. ``Approve``
+   is ``[source, delegate, owner]``.
+
+   Token-2022 shares this base layout and places its extension instructions
+   at higher discriminators, so they fail closed here without being
+   enumerated.
+
+6. **Associated-token-account discriminators.** ``Create = 0``,
+   ``CreateIdempotent = 1``, ``RecoverNested = 2``. *** Unlike the token
+   program, EMPTY data is LEGITIMATE here. *** The processor reads
+   ``let instruction = if input.is_empty() {
+   AssociatedTokenAccountInstruction::Create } else {
+   ...try_from_slice(input)... };``
+   (https://raw.githubusercontent.com/solana-program/associated-token-account/main/program/src/processor.rs),
+   for backwards compatibility with legacy zero-data Create calls. A blanket
+   "empty data fails" rule would reject legitimate swaps.
+
+7. **Why allowlisting the PROGRAM is not enough.** An instruction's meaning
+   lives in its DATA. Before the discriminator allowlists below existed this
+   module decoded data only for ComputeBudget and System-transfer, so every
+   other instruction from an allowlisted program contributed nothing but its
+   program id. Four real compiled transactions, each carrying a legitimate
+   swap PLUS one extra top-level SPL instruction — ``Approve(delegate=
+   stranger, u64::MAX)``, ``Transfer(->stranger)``,
+   ``CloseAccount(->stranger)``, ``SetAuthority(->stranger)`` — all returned
+   ``passed=True`` with zero failed checks, directly contradicting this
+   module's stated invariant that unknown is a failure.
+
+   ``Approve`` is the worst case and the reason simulation is not a
+   substitute for inspection: it moves no balance, so simulating the
+   transaction shows a clean successful swap, while the unlimited delegation
+   it grants outlives the pilot entirely. Loss would NOT be bounded by trade
+   size. Hence the permitted sets are deliberately minimal.
+
 What this module CANNOT verify statically
 ------------------------------------------
 These are real gaps, not oversights. They are why independent simulation
@@ -80,7 +136,7 @@ import base64
 import hashlib
 import math
 from dataclasses import dataclass, field
-from typing import Any, Collection, Iterable
+from typing import Any, Collection, Final, Iterable
 
 import structlog
 from solders.message import to_bytes_versioned
@@ -116,6 +172,57 @@ MAX_COMPUTE_UNIT_LIMIT = 1_400_000
 # A blockhash of all zeros is solders' default — it means "unset", not "an
 # unusual blockhash", and such a transaction can never land.
 _DEFAULT_BLOCKHASH = "11111111111111111111111111111111"
+
+# ----------------------------------------------------------------------
+# Per-instruction discriminator allowlists (module docstring facts 5-7).
+#
+# Allowlisting a PROGRAM is not enough. An instruction's meaning lives in its
+# data, so "the SPL Token program" covers SyncNative (harmless) and Approve
+# (hands a stranger unlimited delegated authority over our token account)
+# alike. These sets are what make the program allowlist mean something.
+#
+# Deliberately minimal: exactly what a Jupiter SOL->USDC swap needs. A
+# legitimate build that uses anything else FAILS CLOSED and names the
+# refused discriminator, which is a blocked pilot the operator can reason
+# about — the opposite failure is a signed transaction nobody inspected.
+# ----------------------------------------------------------------------
+
+# SPL Token / Token-2022. Both share the base instruction layout; Token-2022's
+# extension instructions occupy higher discriminators and therefore fail
+# closed here automatically, which is the desired behaviour.
+TOKEN_IX_CLOSE_ACCOUNT: Final = 9  # unwrap WSOL back to SOL
+TOKEN_IX_SYNC_NATIVE: Final = 17  # after depositing SOL into the WSOL account
+
+# Value is the EXACT expected data length, so a truncated instruction whose
+# leading byte happens to be permitted still fails. Both are single-byte.
+PERMITTED_TOKEN_INSTRUCTIONS: Final[dict[int, int]] = {
+    TOKEN_IX_CLOSE_ACCOUNT: 1,
+    TOKEN_IX_SYNC_NATIVE: 1,
+}
+
+# CloseAccount account order is [account_to_close, destination, owner], so the
+# lamports released by closing the WSOL account go to index 1. That index must
+# be us — otherwise closing our own wrapped-SOL account pays a stranger.
+TOKEN_CLOSE_ACCOUNT_DESTINATION_INDEX: Final = 1
+
+# Associated Token Account program. NOTE the empty-data case: the ATA program
+# treats zero-length data as the legacy Create, so unlike the token programs
+# an empty ATA instruction is legitimate and must be permitted.
+ATA_IX_CREATE: Final = 0
+ATA_IX_CREATE_IDEMPOTENT: Final = 1
+PERMITTED_ATA_INSTRUCTIONS: Final[frozenset[int]] = frozenset(
+    {ATA_IX_CREATE, ATA_IX_CREATE_IDEMPOTENT}
+)
+# RecoverNested (2) is NOT permitted: it transfers out of and closes a nested
+# account, which is a fund movement a swap has no reason to make.
+
+# System program. Only Transfer, at its exact 12-byte length. The same
+# data-opacity argument as the token programs applies here and the
+# consequences are worse — Assign(1) would hand our wallet's ownership to
+# another program, and TransferWithSeed(11) moves lamports by a path the
+# transfer-destination check never sees.
+SYSTEM_IX_TRANSFER: Final = 2
+PERMITTED_SYSTEM_INSTRUCTIONS: Final[dict[int, int]] = {SYSTEM_IX_TRANSFER: 12}
 
 
 @dataclass(frozen=True)
@@ -430,6 +537,17 @@ async def verify_swap_transaction(
     transfers: list[tuple[str | None, int]] = []
     unit_limit: int | None = None
     unit_price: int | None = None
+    unit_limit_count = 0
+    unit_price_count = 0
+    token_violations: list[str] = []
+    ata_violations: list[str] = []
+    system_violations: list[str] = []
+
+    def _account_at(ix_accounts: list[int], position: int) -> str | None:
+        if len(ix_accounts) <= position:
+            return None
+        key_index = int(ix_accounts[position])
+        return keys[key_index] if 0 <= key_index < len(keys) else None
 
     for ix in message.instructions:
         idx = int(ix.program_id_index)
@@ -442,24 +560,112 @@ async def verify_swap_transaction(
             unknown_programs.append(program_id)
 
         data = bytes(ix.data)
+        accounts = [int(a) for a in ix.accounts]
 
         parsed = _parse_compute_budget(program_id, data)
         if parsed is not None:
             kind, value = parsed
             if kind == "limit":
                 unit_limit = value
+                unit_limit_count += 1
             else:
                 unit_price = value
+                unit_price_count += 1
+
+        # ---- SPL Token / Token-2022 --------------------------------
+        if program_id in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID):
+            if not data:
+                # The token program rejects empty data outright, so this is
+                # malformed rather than a legacy form (unlike the ATA program).
+                token_violations.append("empty instruction data")
+            elif data[0] not in PERMITTED_TOKEN_INSTRUCTIONS:
+                token_violations.append(f"discriminator {data[0]} not permitted")
+            elif len(data) != PERMITTED_TOKEN_INSTRUCTIONS[data[0]]:
+                token_violations.append(
+                    f"discriminator {data[0]} has {len(data)} data byte(s), "
+                    f"expected {PERMITTED_TOKEN_INSTRUCTIONS[data[0]]}"
+                )
+            elif data[0] == TOKEN_IX_CLOSE_ACCOUNT:
+                destination = _account_at(
+                    accounts, TOKEN_CLOSE_ACCOUNT_DESTINATION_INDEX
+                )
+                if destination != expected_signer:
+                    token_violations.append(
+                        f"CloseAccount releases lamports to {destination}, "
+                        f"not to {expected_signer}"
+                    )
+
+        # ---- Associated Token Account ------------------------------
+        elif program_id == ASSOCIATED_TOKEN_PROGRAM_ID:
+            # Empty data IS the legacy Create — permitted deliberately.
+            if data and data[0] not in PERMITTED_ATA_INSTRUCTIONS:
+                ata_violations.append(f"discriminator {data[0]} not permitted")
+
+        # ---- System ------------------------------------------------
+        elif program_id == SYSTEM_PROGRAM_ID:
+            if len(data) < 4:
+                system_violations.append(
+                    f"instruction data too short ({len(data)} bytes)"
+                )
+            else:
+                discriminator = int.from_bytes(data[:4], "little")
+                expected_len = PERMITTED_SYSTEM_INSTRUCTIONS.get(discriminator)
+                if expected_len is None:
+                    system_violations.append(
+                        f"discriminator {discriminator} not permitted"
+                    )
+                elif len(data) != expected_len:
+                    system_violations.append(
+                        f"discriminator {discriminator} has {len(data)} data "
+                        f"byte(s), expected {expected_len}"
+                    )
 
         lamports = _parse_system_transfer(program_id, data)
         if lamports is not None:
-            accounts = list(ix.accounts)
-            dest = (
-                keys[int(accounts[1])]
-                if len(accounts) >= 2 and 0 <= int(accounts[1]) < len(keys)
-                else None
-            )
-            transfers.append((dest, lamports))
+            transfers.append((_account_at(accounts, 1), lamports))
+
+    add(
+        "spl_token_instructions_recognised",
+        not token_violations,
+        (
+            "every SPL Token instruction is a permitted swap primitive"
+            if not token_violations
+            else f"refused token instruction(s): {token_violations}"
+        ),
+    )
+    add(
+        "ata_instructions_recognised",
+        not ata_violations,
+        (
+            "every associated-token-account instruction is a permitted creation"
+            if not ata_violations
+            else f"refused ATA instruction(s): {ata_violations}"
+        ),
+    )
+    add(
+        "system_instructions_recognised",
+        not system_violations,
+        (
+            "every System instruction is a well-formed transfer"
+            if not system_violations
+            else f"refused system instruction(s): {system_violations}"
+        ),
+    )
+    add(
+        "compute_budget_instructions_unique",
+        unit_limit_count <= 1 and unit_price_count <= 1,
+        (
+            f"{unit_limit_count} unit-limit + {unit_price_count} unit-price "
+            "instruction(s)"
+        )
+        + (
+            ""
+            if unit_limit_count <= 1 and unit_price_count <= 1
+            else " — duplicates make the priced fee depend on which one the "
+            "inspector read; the runtime rejects the transaction with "
+            "DuplicateInstruction, so no build like this is legitimate"
+        ),
+    )
 
     add(
         "program_ids_resolvable",

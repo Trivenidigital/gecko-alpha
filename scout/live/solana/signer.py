@@ -23,6 +23,32 @@ it. Persisting it pre-submission is what turns an ambiguous submission from
 
 Key-file format: a Solana CLI ``id.json`` — a JSON array of 64 integers, the
 ed25519 secret key followed by the public key.
+
+Known, accepted limitations
+---------------------------
+Neither is a defect to be rediscovered later; both are deliberate, and both
+are recorded here because the reasoning is not visible from the code.
+
+1. **stat-then-read is a TOCTOU window.** ``load_keypair`` stats the file to
+   check mode and owner, then opens it — so in principle the path could be
+   swapped between the two calls and the permission check would apply to a
+   file we did not read. Not closed, because closing it properly (open first,
+   then ``fstat`` the descriptor) buys nothing here: an attacker able to win
+   that race already has local write access to the key's directory, and at
+   that point the key must be treated as compromised and rotated rather than
+   defended by a narrower check. The check's real job is catching an
+   OPERATOR mistake — a key left group- or world-readable — and it does that
+   whether or not the race exists.
+
+2. **Legacy (non-versioned) transactions are accepted and signed correctly.**
+   ``sign_transaction`` does not require a v0 transaction.
+   ``to_bytes_versioned`` handles both forms — it prefixes ``0x80`` for v0 and
+   emits the bare message for a legacy one — so a legacy transaction gets the
+   right payload and a valid signature. This is intentional and safe, but it
+   does mean the SIGNER is not where a "must be v0" policy would live. If
+   the lane ever needs to refuse legacy transactions, that belongs in
+   ``tx_inspector`` alongside the other content checks, where a refusal
+   becomes a named check on the approval screen instead of an exception.
 """
 
 from __future__ import annotations

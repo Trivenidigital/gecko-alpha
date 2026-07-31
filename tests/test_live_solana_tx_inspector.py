@@ -29,7 +29,16 @@ from solana_tx_builder import (
     PAYER_PUBKEY,
     STRANGER,
     TIP_ACCOUNT,
+    ata_create_ix,
     build_swap_tx,
+    compute_unit_limit_ix,
+    compute_unit_price_ix,
+    system_raw_ix,
+    token_approve_ix,
+    token_close_account_ix,
+    token_raw_ix,
+    token_set_authority_ix,
+    token_transfer_ix,
 )
 
 
@@ -400,6 +409,248 @@ async def test_unresolved_lookup_table_is_reported_and_fails_closed(settings_fac
     failed = _failed_names(report)
     assert "lookup_tables_resolved" in failed
     assert report.unresolved_lookup_tables == (str(ALT.key),)
+
+
+# ----------------------------------------------------------------------
+# S1-1: instruction-level allowlists.
+#
+# Every fixture below is a REAL compiled transaction carrying a legitimate
+# swap PLUS one extra well-formed instruction from an ALLOWLISTED program.
+# Before the discriminator allowlists existed, all four returned passed=True
+# with zero failed checks — program-level allowlisting cannot see instruction
+# data, and instruction data is where the meaning is.
+# ----------------------------------------------------------------------
+_USDC_ATA = derive_associated_token_address(PAYER_PUBKEY, USDC_MINT)
+_STRANGER_USDC_ATA = derive_associated_token_address(STRANGER, USDC_MINT)
+
+
+async def _verify(settings_factory, **build_kwargs):
+    built = build_swap_tx(**build_kwargs)
+    return await verify_swap_transaction(
+        tx_b64=built.tx_b64,
+        expected_signer=PAYER_PUBKEY,
+        settings=settings_factory(),
+    )
+
+
+async def test_smuggled_approve_is_caught(settings_factory):
+    """The worst case: Approve moves no balance.
+
+    A simulation of this transaction shows a clean successful swap, and the
+    unlimited delegation survives the pilot — so the loss it enables is NOT
+    bounded by trade size. Only static inspection can catch it.
+    """
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            token_approve_ix(_USDC_ATA, STRANGER, PAYER_PUBKEY, 2**64 - 1)
+        ],
+    )
+
+    assert not report.passed
+    assert "spl_token_instructions_recognised" in _failed_names(report)
+    assert (
+        "discriminator 4" in _check(report, "spl_token_instructions_recognised").detail
+    )
+
+
+async def test_smuggled_transfer_is_caught(settings_factory):
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            token_transfer_ix(_USDC_ATA, _STRANGER_USDC_ATA, PAYER_PUBKEY, 10_000_000)
+        ],
+    )
+
+    assert not report.passed
+    assert (
+        "discriminator 3" in _check(report, "spl_token_instructions_recognised").detail
+    )
+
+
+async def test_smuggled_set_authority_is_caught(settings_factory):
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[token_set_authority_ix(_USDC_ATA, STRANGER, PAYER_PUBKEY)],
+    )
+
+    assert not report.passed
+    assert (
+        "discriminator 6" in _check(report, "spl_token_instructions_recognised").detail
+    )
+
+
+async def test_close_account_to_stranger_is_caught(settings_factory):
+    """CloseAccount is PERMITTED — but only when it pays us.
+
+    Destination is account index 1 per the token program's documented
+    ordering, so this is a discriminator that passes the allowlist and is
+    then rejected on its accounts.
+    """
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[token_close_account_ix(_USDC_ATA, STRANGER, PAYER_PUBKEY)],
+    )
+
+    assert not report.passed
+    detail = _check(report, "spl_token_instructions_recognised").detail
+    assert "CloseAccount releases lamports to" in detail
+    assert STRANGER in detail
+
+
+async def test_close_account_to_expected_signer_passes(settings_factory):
+    """The legitimate unwrap. Must not be collateral damage of the fix."""
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            token_close_account_ix(_USDC_ATA, PAYER_PUBKEY, PAYER_PUBKEY)
+        ],
+    )
+
+    assert report.passed, f"unexpected failures: {_failed_names(report)}"
+
+
+async def test_empty_token_instruction_data_is_caught(settings_factory):
+    """The token program rejects empty data outright, so it is never valid."""
+    report = await _verify(settings_factory, extra_instructions=[token_raw_ix(b"")])
+
+    assert not report.passed
+    assert (
+        "empty instruction data"
+        in _check(report, "spl_token_instructions_recognised").detail
+    )
+
+
+async def test_truncated_token_instruction_is_caught(settings_factory):
+    """A permitted leading byte is not enough — the length must match too."""
+    report = await _verify(
+        settings_factory, extra_instructions=[token_raw_ix(bytes([17, 0, 0]))]
+    )
+
+    assert not report.passed
+    assert "expected 1" in _check(report, "spl_token_instructions_recognised").detail
+
+
+@pytest.mark.parametrize("discriminator", [5, 7, 8, 10, 11, 12, 13, 22, 200])
+async def test_unlisted_token_discriminators_all_fail(settings_factory, discriminator):
+    """Revoke/MintTo/Burn/Freeze/Thaw/*Checked and anything unknown.
+
+    Token-2022 extension instructions live at high discriminators and are
+    covered by the same rule, which is why they need no enumeration.
+    """
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[token_raw_ix(bytes([discriminator]) + bytes(8))],
+    )
+
+    assert not report.passed
+    assert "spl_token_instructions_recognised" in _failed_names(report)
+
+
+async def test_ata_legacy_empty_data_create_is_permitted(settings_factory):
+    """Empty data IS the legacy Create for the ATA program.
+
+    The inverse of the token-program rule, and the reason "empty data always
+    fails" would have rejected legitimate swaps.
+    """
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            ata_create_ix(PAYER_PUBKEY, _USDC_ATA, PAYER_PUBKEY, USDC_MINT, b"")
+        ],
+    )
+
+    assert report.passed, f"unexpected failures: {_failed_names(report)}"
+
+
+async def test_ata_recover_nested_is_caught(settings_factory):
+    """RecoverNested transfers out of and closes an account — not a swap need."""
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            ata_create_ix(PAYER_PUBKEY, _USDC_ATA, PAYER_PUBKEY, USDC_MINT, b"\x02")
+        ],
+    )
+
+    assert not report.passed
+    assert "discriminator 2" in _check(report, "ata_instructions_recognised").detail
+
+
+async def test_system_assign_is_caught(settings_factory):
+    """Assign(1) would hand our wallet's ownership to another program.
+
+    Same data-opacity hole as the token programs, worse consequences.
+    """
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            system_raw_ix((1).to_bytes(4, "little") + bytes(32), PAYER_PUBKEY, STRANGER)
+        ],
+    )
+
+    assert not report.passed
+    assert "discriminator 1" in _check(report, "system_instructions_recognised").detail
+
+
+async def test_malformed_system_transfer_length_is_caught(settings_factory):
+    """Right discriminator, wrong length — previously parsed as nothing."""
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            system_raw_ix((2).to_bytes(4, "little") + bytes(4), PAYER_PUBKEY, STRANGER)
+        ],
+    )
+
+    assert not report.passed
+    assert "system_instructions_recognised" in _failed_names(report)
+
+
+# ----------------------------------------------------------------------
+# S1-2: duplicate compute-budget instructions
+# ----------------------------------------------------------------------
+async def test_duplicate_unit_price_high_first_is_caught(settings_factory):
+    """The dangerous ordering: expensive first, cheap decoy last.
+
+    Last-wins made the inspector price this at 200 lamports and PASS. The
+    runtime would reject it (DuplicateInstruction) so no money moves — but
+    the approval screen and evidence would state a fee that is not in the
+    bytes, and the inspector is the authority on exactly that.
+    """
+    report = await _verify(
+        settings_factory,
+        compute_unit_price=50_000_000,
+        extra_instructions=[compute_unit_price_ix(1_000)],
+    )
+
+    assert not report.passed
+    assert "compute_budget_instructions_unique" in _failed_names(report)
+
+
+async def test_duplicate_unit_price_low_first_is_caught(settings_factory):
+    report = await _verify(
+        settings_factory,
+        compute_unit_price=1_000,
+        extra_instructions=[compute_unit_price_ix(50_000_000)],
+    )
+
+    assert not report.passed
+    assert "compute_budget_instructions_unique" in _failed_names(report)
+
+
+async def test_duplicate_unit_limit_is_caught(settings_factory):
+    report = await _verify(
+        settings_factory, extra_instructions=[compute_unit_limit_ix(1_400_000)]
+    )
+
+    assert not report.passed
+    assert "compute_budget_instructions_unique" in _failed_names(report)
+
+
+async def test_single_compute_budget_pair_passes(settings_factory):
+    report = await _verify(settings_factory)
+
+    assert _check(report, "compute_budget_instructions_unique").passed
+    assert report.passed, f"unexpected failures: {_failed_names(report)}"
 
 
 def test_derive_associated_token_address_is_deterministic():

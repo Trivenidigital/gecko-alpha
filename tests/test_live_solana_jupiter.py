@@ -273,8 +273,13 @@ async def test_build_swap_tolerates_absent_optional_fields(settings_factory):
 
 async def test_build_swap_refuses_tip_over_ceiling_before_any_request(settings_factory):
     """No point asking Jupiter to build what we have decided not to sign."""
+    # The configured runner tip must also sit under the ceiling, else PR-S2's
+    # envelope validator rejects the Settings before the client is built.
     client, session = await _client(
-        settings_factory(SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=50_000)
+        settings_factory(
+            SOLANA_PILOT_JITO_TIP_LAMPORTS=40_000,
+            SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=50_000,
+        )
     )
     async with session:
         with aioresponses() as mock:
