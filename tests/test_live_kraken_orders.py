@@ -29,6 +29,7 @@ from scout.live.kraken_adapter import (
     KrakenAPIError,
     KrakenAuthError,
     KrakenClientOrderIdError,
+    KrakenPermissionError,
     KrakenSpotAdapter,
     _format_decimal,
     _validate_cl_ord_id,
@@ -1659,3 +1660,87 @@ async def test_ambiguous_submission_is_not_a_transient_error():
     an AddOrder that may have landed is the one thing they must not retry."""
     assert not issubclass(KrakenAmbiguousSubmissionError, VenueTransientError)
     assert not issubclass(KrakenAmbiguousSubmissionError, KrakenAPIError)
+
+
+# ======================================================================
+# account-wide open orders (PR-K3 C2)
+# ======================================================================
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_orders_normalizes_every_resting_order():
+    """Unfiltered OpenOrders — the account-wide view a one-order-at-a-time
+    pilot needs, including orders it did not place."""
+    adapter = _adapter()
+    stranger = {
+        "status": "open",
+        "descr": {"pair": "ETHUSD", "type": "sell", "price": "4000.0"},
+        "vol": "1.00000000",
+        "vol_exec": "0.25000000",
+    }
+    with aioresponses() as m:
+        _mock_probe(
+            m,
+            _OPEN_ORDERS_URL,
+            {_TXID: _order_row(), "OTHER-TXID-0001": stranger},
+            "open",
+            repeat=False,
+        )
+        orders = await adapter.fetch_open_orders()
+
+    assert len(orders) == 2
+    mine = next(o for o in orders if o["txid"] == _TXID)
+    assert mine["client_order_id"] == _CID
+    assert mine["pair"] == "XBTUSD"
+    assert mine["status"] == "open"
+
+    # An order placed elsewhere still comes back, with no client id to match.
+    theirs = next(o for o in orders if o["txid"] == "OTHER-TXID-0001")
+    assert theirs["client_order_id"] is None
+    assert theirs["pair"] == "ETHUSD"
+    assert theirs["vol"] == "1.00000000"
+    assert theirs["vol_exec"] == "0.25000000"
+    # descr.price is the limit price; the top-level price is 0 while resting.
+    assert theirs["price"] == "4000.0"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_orders_returns_empty_list_on_an_empty_book():
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_probe(m, _OPEN_ORDERS_URL, {}, "open", repeat=False)
+        assert await adapter.fetch_open_orders() == []
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_orders_raises_rather_than_claiming_none():
+    """FAIL CLOSED: the caller reads an empty list as "safe to place one", so
+    an unreadable payload must never render as an empty book."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _OPEN_ORDERS_URL,
+            status=200,
+            payload={"error": [], "result": {"count": 0}},  # no 'open' container
+            repeat=True,
+        )
+        with pytest.raises(KrakenAPIError):
+            await adapter.fetch_open_orders()
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_orders_surfaces_permission_denied():
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _OPEN_ORDERS_URL,
+            status=200,
+            payload={"error": ["EGeneral:Permission denied"]},
+            repeat=True,
+        )
+        with pytest.raises(KrakenPermissionError):
+            await adapter.fetch_open_orders()
+    await adapter.close()

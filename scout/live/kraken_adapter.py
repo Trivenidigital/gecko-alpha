@@ -1871,6 +1871,68 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 )
         return None
 
+    async def fetch_open_orders(self) -> list[dict[str, Any]]:
+        """EVERY resting order on the account — unfiltered ``OpenOrders``.
+
+        The account-wide counterpart to ``fetch_order_by_client_id``. That
+        method can only answer "is MY order there?"; this one answers "what is
+        there?", which is the question a one-order-at-a-time pilot actually
+        needs — an order placed from the Kraken web UI, or left behind by a
+        run whose ledger row was lost, is invisible to a client-id lookup and
+        would let the pilot add a second live order believing it was the
+        first.
+
+        Read-only, so it is neither gated by ``LIVE_USE_REAL_SIGNED_REQUESTS``
+        nor barred from retrying: unlike AddOrder there is nothing
+        non-idempotent to duplicate, and this read is most needed exactly when
+        the flag has been flipped off mid-incident.
+
+        Fails CLOSED. An unreadable payload raises rather than returning an
+        empty list, because the caller uses "no open orders" as a licence to
+        place one, and "we could not look" must never render as "there are
+        none" (same reasoning as ``_find_order_by_cl_ord_id``'s INDETERMINATE).
+
+        Returns:
+            One normalized dict per resting order: ``txid`` /
+            ``client_order_id`` (``None`` when the venue does not echo one) /
+            ``pair`` / ``status`` / ``vol`` / ``vol_exec`` / ``price``.
+            Numeric fields stay strings, as Kraken sends them.
+        """
+        body = await self._private_post("/0/private/OpenOrders")
+        orders = body.get("open")
+        if not isinstance(orders, dict):
+            raise KrakenAPIError(
+                "kraken /0/private/OpenOrders: payload has no readable 'open' "
+                f"container (got {type(orders).__name__}) — cannot conclude the "
+                "account has no resting orders"
+            )
+
+        open_orders: list[dict[str, Any]] = []
+        for txid, row in orders.items():
+            if not isinstance(row, dict):
+                raise KrakenAPIError(
+                    f"kraken /0/private/OpenOrders: entry {txid!r} is "
+                    f"{type(row).__name__}, not an order row"
+                )
+            descr = row.get("descr") if isinstance(row.get("descr"), dict) else {}
+            cl_ord_id = row.get("cl_ord_id")
+            open_orders.append(
+                {
+                    "txid": str(txid),
+                    "client_order_id": str(cl_ord_id) if cl_ord_id else None,
+                    "pair": str(descr.get("pair") or "") or None,
+                    "status": str(row.get("status") or "") or None,
+                    "vol": _decimal_str(row.get("vol")),
+                    "vol_exec": _decimal_str(row.get("vol_exec")),
+                    # descr.price is the LIMIT price; the top-level `price` is
+                    # the average executed price, which is 0 on a resting order.
+                    "price": _decimal_str(descr.get("price"))
+                    or _decimal_str(row.get("price")),
+                }
+            )
+        log.info("kraken_open_orders", count=len(open_orders))
+        return open_orders
+
     # ---------------- ambiguous-submission resolution ----------------
     async def resolve_order_submission_detail(
         self, *, client_order_id: str
