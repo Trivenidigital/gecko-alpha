@@ -1,7 +1,7 @@
 """Forward-only price-snapshot writer for CA-keyed source calls (design #392 C2).
 
-Selects active contract-identity (``eligible_contract``) X source_calls within
-the forward horizon, dedupes by priceable identity, fetches a *current* price
+Selects contract-identity source_calls of ANY source_type within the forward
+horizon, dedupes by priceable identity, fetches a *current* price
 from GeckoTerminal by contract address (via the injected C0 resolver/fetcher),
 and records one source-tagged snapshot per identity per cycle into
 ``source_call_price_snapshots``. Over successive cycles these accumulate the
@@ -59,11 +59,20 @@ async def write_price_snapshots(
     now_dt = now.astimezone(timezone.utc)
     cutoff = now_dt - timedelta(hours=horizon_hours)
 
+    # Select on PRICEABLE IDENTITY, not on source_type/resolved_state. The
+    # original scope (source_type='x' AND resolved_state='eligible_contract')
+    # matched zero rows in production: the X lane is dead, while the live TG
+    # lane — the one the ranking gate actually spans — was excluded by design.
+    # `resolved_state` is also mixed-case and inconsistent in prod
+    # (RESOLVED/resolved/unresolved/UNRESOLVED_*), so it is not a safe filter.
+    # What a row genuinely needs to be priced here is a contract address, a
+    # chain, and a still-open outcome window; `_priceable_identity` below is the
+    # single authority on the first two.
     cur = await conn.execute(
         "SELECT id, token_id, contract_address, chain, call_ts "
         "FROM source_calls "
-        "WHERE source_type='x' AND resolved_state='eligible_contract' "
-        "AND contract_address IS NOT NULL "
+        "WHERE contract_address IS NOT NULL AND contract_address != '' "
+        "AND chain IS NOT NULL AND chain != '' "
         "AND outcome_status IN ('pending','partial')"
     )
     rows = await cur.fetchall()
