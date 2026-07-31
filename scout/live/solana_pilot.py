@@ -2624,7 +2624,14 @@ async def main(argv: list[str] | None = None) -> int:
     try:
         db = Database(db_path, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
         await db.initialize()
-        session = aiohttp.ClientSession()
+        # Explicit per-request timeout. aiohttp's default total is five
+        # minutes, which on this lane means a hung Jito POST stalls past the
+        # blockhash expiry the run is racing — and every client here passes
+        # its own timeout anyway, so this only ever binds a call site that
+        # forgot to.
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
+        )
         try:
             runner = PilotRunner(
                 settings=settings,
