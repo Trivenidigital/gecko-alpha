@@ -15,6 +15,7 @@ QueryTrades schemas as tests/test_live_kraken_orders.py.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -31,9 +32,12 @@ from scout.live.kill_switch import KillSwitch
 from scout.live.kraken_adapter import KrakenSpotAdapter
 from scout.live.kraken_pilot import (
     EXIT_BLOCKED,
+    build_parser,
     EXIT_ESCALATE,
     EXIT_OK,
     EXIT_REFUSED,
+    EXIT_REVIEW,
+    PilotLockHeld,
     PilotRunner,
 )
 from scout.live.kraken_signing import reset_nonce_sources_for_tests
@@ -409,6 +413,7 @@ async def test_place_refuses_when_daily_gross_would_exceed_cap(tmp_path, monkeyp
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
+        _mock_empty_order_lookups(m)
         code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
         assert code == EXIT_REFUSED
         assert _posts_to(m, _ADD_ORDER_URL) == []
@@ -442,6 +447,7 @@ async def test_place_refuses_when_price_violates_tick(tmp_path, monkeypatch):
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
+        _mock_empty_order_lookups(m)
         # 100.05 is not a multiple of the 0.1 tick.
         code = await runner.place(
             side="buy", price=Decimal("100.05"), volume=Decimal("0.15")
@@ -462,6 +468,7 @@ async def test_place_refuses_when_balance_does_not_cover(tmp_path, monkeypatch):
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
+        _mock_empty_order_lookups(m)
         m.post(_BALANCE_EX_URL, payload=_balance_payload("5.0"), repeat=True)
         code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
         assert code == EXIT_REFUSED
@@ -780,7 +787,10 @@ async def test_place_reports_review_when_balance_delta_is_unexplained(
             payload={"error": [], "result": {"txid": [_TXID], "descr": {}}},
         )
         _mock_happy_fill(m)
-        assert await runner.place(side="buy", price=_PRICE, volume=_VOLUME) == EXIT_OK
+        # Exit 4, not 0: the order completed but the money move is unexplained.
+        assert (
+            await runner.place(side="buy", price=_PRICE, volume=_VOLUME) == EXIT_REVIEW
+        )
 
     reconciliation = _step(_evidence_steps(tmp_path), "reconciliation")
     assert reconciliation["verdict"] == "review"
@@ -845,6 +855,10 @@ async def test_ambiguous_submission_resolved_accepted_is_adopted(tmp_path, monke
         m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("984.961"))
         m.post(_ADD_ORDER_URL, exception=TimeoutError("connection dropped"))
+        # Step 4 runs BEFORE the order exists, so the first OpenOrders read is
+        # an empty book; every later read (resolver probes, adoption lookup,
+        # post-trade listing) finds the order that landed.
+        m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}})
         m.post(
             _OPEN_ORDERS_URL,
             payload={"error": [], "result": {"open": {_TXID: _filled_order_row()}}},
@@ -912,8 +926,11 @@ async def test_unresolved_submission_escalates_and_blocks_the_next_run(
         _mock_market(m)
         m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
         m.post(_ADD_ORDER_URL, exception=TimeoutError("connection dropped"))
-        # A probe that FAILED is not evidence of absence, so no number of
-        # sweeps can reach the not_accepted verdict that licenses a resend.
+        # Step 4's venue listing succeeds (empty book, lane clear); it is the
+        # resolver's probes that fail. A probe that FAILED is not evidence of
+        # absence, so no number of sweeps reaches the not_accepted verdict
+        # that would license a resend.
+        m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}})
         m.post(
             _OPEN_ORDERS_URL,
             payload={"error": ["EGeneral:Invalid arguments"], "result": {}},
@@ -1245,3 +1262,538 @@ def test_pilot_caps_reject_order_cap_above_daily_gross():
             KRAKEN_PILOT_MAX_ORDER_USD=150.0,
             KRAKEN_PILOT_MAX_DAILY_GROSS_USD=100.0,
         )
+
+
+# ======================================================================
+# F1 — a limit price bounds the price, not the size
+# ======================================================================
+def _mock_venue_open(m: aioresponses, orders: dict, *, repeat: bool = True) -> None:
+    """Register the account-wide OpenOrders listing step 4 reads."""
+    m.post(
+        _OPEN_ORDERS_URL,
+        payload={"error": [], "result": {"open": orders}},
+        repeat=repeat,
+    )
+
+
+def _resting_order(**overrides) -> dict:
+    row = {
+        "status": "open",
+        "descr": {"pair": "XBTUSD", "type": "buy", "price": "95.0"},
+        "vol": "0.20000000",
+        "vol_exec": "0.00000000",
+    }
+    row.update(overrides)
+    return row
+
+
+async def test_marketable_sell_is_capped_on_what_it_transacts_not_its_limit(
+    tmp_path, monkeypatch
+):
+    """A sell priced far below the mid does not sell for its limit — it sells
+    into the book at ~mid. Bounding price*volume bounds nothing here: 1.5 units
+    at a $10 limit reads as $15 while disposing of $150 at a $100 mid."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)  # mid = 100.0
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="10.0"), repeat=True)
+        code = await runner.place(
+            side="sell", price=Decimal("10.0"), volume=Decimal("1.5")
+        )
+        assert code == EXIT_REFUSED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    abort = _step(_evidence_steps(tmp_path), "aborted")
+    assert abort["stage"] == "caps"
+    assert "150" in abort["reason"]
+    assert "bounds the price, not the size" in abort["reason"]
+    await adapter.close()
+    await db.close()
+
+
+async def test_marketable_buy_is_capped_on_what_it_transacts(tmp_path, monkeypatch):
+    """The same cap applies on the buy side — the check does not assume the
+    fill price is the one field of an order that cannot surprise us."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)  # mid = 100.0
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("100000.0"), repeat=True)
+        # 0.30 units at limit 60 = 18.0 (inside the band) but 30.0 at the mid,
+        # which is over the 25.0 per-order cap.
+        code = await runner.place(
+            side="buy", price=Decimal("60.0"), volume=Decimal("0.30")
+        )
+        assert code == EXIT_REFUSED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    abort = _step(_evidence_steps(tmp_path), "aborted")
+    assert abort["stage"] == "caps"
+    assert "30.00" in abort["reason"]
+    await adapter.close()
+    await db.close()
+
+
+async def test_ledger_records_exposure_taken_not_exposure_requested(
+    tmp_path, monkeypatch
+):
+    """size_usd is the larger of the limit and market notionals, so the daily
+    gross counts what the order can actually transact."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)  # mid = 100.0
+        _mock_empty_order_lookups(m)
+        # A resting limit BUY holds price*volume (18.0), not the mid-priced
+        # figure — the hold follows the order, the cap follows the risk.
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("982.0"))
+        m.post(
+            _ADD_ORDER_URL,
+            payload={"error": [], "result": {"txid": [_TXID], "descr": {}}},
+        )
+        m.post(
+            _QUERY_ORDERS_URL,
+            payload={
+                "error": [],
+                "result": {
+                    _TXID: _filled_order_row(
+                        status="open",
+                        vol="0.20000000",
+                        vol_exec="0.00000000",
+                        trades=[],
+                    )
+                },
+            },
+            repeat=True,
+        )
+        # limit 90 * 0.2 = 18.0 requested; 100 * 0.2 = 20.0 at the mid.
+        code = await runner.place(
+            side="buy", price=Decimal("90.0"), volume=Decimal("0.20")
+        )
+        assert code == EXIT_OK
+
+    caps = _step(_evidence_steps(tmp_path), "caps")
+    assert Decimal(caps["notional"]) == Decimal("18.0")
+    assert Decimal(caps["market_notional"]) == Decimal("20.0")
+    assert Decimal(caps["effective_notional"]) == Decimal("20.0")
+    row = await _row_by_cid(db, _DECISION)
+    assert Decimal(row["size_usd"]) == Decimal("20.00")
+    # And that larger figure is what the day's cap accounting sees.
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert await kraken_pilot.daily_gross_usd(db, today) == Decimal("20.00")
+    await adapter.close()
+    await db.close()
+
+
+async def test_sell_checks_the_base_asset_balance(tmp_path, monkeypatch):
+    """A sell is funded in BASE units, not quote — a full USD balance does not
+    make an unfunded sell affordable."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)
+        _mock_empty_order_lookups(m)
+        # Plenty of USD, almost no BTC.
+        m.post(
+            _BALANCE_EX_URL,
+            payload=_balance_payload("1000000.0", xbt="0.01"),
+            repeat=True,
+        )
+        code = await runner.place(
+            side="sell", price=Decimal("100.0"), volume=Decimal("0.15")
+        )
+        assert code == EXIT_REFUSED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    steps = _evidence_steps(tmp_path)
+    abort = _step(steps, "aborted")
+    assert abort["stage"] == "balance"
+    assert "BTC" in abort["reason"]
+    await adapter.close()
+    await db.close()
+
+
+async def test_sell_below_the_mid_warns_that_it_crosses(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)  # mid = 100.0
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="10.0"), repeat=True)
+        # 0.2 units at 99 = 19.8 limit, 20.0 at the mid: both inside the band,
+        # so the run reaches the approval block and the crossing is a warning.
+        _authorize(monkeypatch, "nope")
+        await runner.place(side="sell", price=Decimal("99.0"), volume=Decimal("0.20"))
+
+    caps = _step(_evidence_steps(tmp_path), "caps")
+    assert caps["crossing"] is True
+    assert any("CROSSES" in w for w in caps["warnings"])
+    await adapter.close()
+    await db.close()
+
+
+async def test_sell_reconciliation_measures_the_base_asset(tmp_path, monkeypatch):
+    """The expected balance move on a sell is in BASE units — the tolerance
+    band must be scaled to the sold quantity, not to a quote notional."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)
+        _mock_empty_order_lookups(m)
+        # BTC balance before / after: 10.0 -> 9.85 (the 0.15 sold).
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="10.0"))
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="9.85"))
+        m.post(
+            _ADD_ORDER_URL,
+            payload={"error": [], "result": {"txid": [_TXID], "descr": {}}},
+        )
+        m.post(
+            _QUERY_ORDERS_URL,
+            payload={"error": [], "result": {_TXID: _filled_order_row()}},
+            repeat=True,
+        )
+        m.post(
+            _QUERY_TRADES_URL,
+            payload={
+                "error": [],
+                "result": {
+                    "TRADE-1": {
+                        "ordertxid": _TXID,
+                        "pair": "XXBTZUSD",
+                        "type": "sell",
+                        "price": "100.0",
+                        "cost": "15.00000",
+                        "fee": "0.03900",
+                        "vol": "0.15000000",
+                    }
+                },
+            },
+            repeat=True,
+        )
+        code = await runner.place(side="sell", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_OK
+
+    reconciliation = _step(_evidence_steps(tmp_path), "reconciliation")
+    assert reconciliation["verdict"] == "pass"
+    assert reconciliation["balance"]["asset"] == "BTC"
+    assert Decimal(reconciliation["balance"]["expected_delta"]) == Decimal("-0.15")
+    assert Decimal(reconciliation["balance"]["observed_delta"]) == Decimal("-0.15")
+    await adapter.close()
+    await db.close()
+
+
+# ======================================================================
+# C2 — the venue's own open-order listing
+# ======================================================================
+async def test_resting_order_the_ledger_cannot_name_blocks_the_lane(
+    tmp_path, monkeypatch
+):
+    """The direction a client-id lookup cannot cover: an order placed from the
+    web UI has no cl_ord_id we would think to ask about, so a ledger-driven
+    check reports a clear lane while the account holds a live order."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_venue_open(m, {"MANUAL-TXID-01": _resting_order()})
+        m.post(
+            _CLOSED_ORDERS_URL,
+            payload={"error": [], "result": {"closed": {}}},
+            repeat=True,
+        )
+        code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_BLOCKED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    recon = _step(_evidence_steps(tmp_path), "startup_reconciliation")
+    assert recon["blocking_rows"] == []  # the ledger is clean
+    assert recon["venue_open_count"] == 1
+    assert len(recon["unknown_orders"]) == 1
+    assert recon["unknown_orders"][0]["txid"] == "MANUAL-TXID-01"
+    await adapter.close()
+    await db.close()
+
+
+async def test_venue_order_matching_a_blocking_row_is_not_counted_twice(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id="known-cid-0001",
+        entry_order_id=_TXID,
+    )
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_venue_open(m, {_TXID: _resting_order(cl_ord_id="known-cid-0001")})
+        m.post(
+            _CLOSED_ORDERS_URL,
+            payload={"error": [], "result": {"closed": {}}},
+            repeat=True,
+        )
+        assert await runner.place(side="buy", price=_PRICE, volume=_VOLUME) == (
+            EXIT_BLOCKED
+        )
+
+    recon = _step(_evidence_steps(tmp_path), "startup_reconciliation")
+    assert len(recon["blocking_rows"]) == 1
+    assert recon["unknown_orders"] == []
+    assert recon["blocker_count"] == 1  # the row, not the row + its own order
+    await adapter.close()
+    await db.close()
+
+
+async def test_unreadable_open_order_listing_blocks_rather_than_reads_as_empty(
+    tmp_path, monkeypatch
+):
+    """FAIL CLOSED: "no open orders" is what licenses a placement, so an
+    unreadable listing must never stand in for an empty one."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        m.post(
+            _OPEN_ORDERS_URL,
+            payload={"error": ["EGeneral:Invalid arguments"], "result": {}},
+            repeat=True,
+        )
+        code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_BLOCKED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    recon = _step(_evidence_steps(tmp_path), "startup_reconciliation")
+    assert recon["listing_error"]["error_type"] == "KrakenAPIError"
+    assert recon["blocker_count"] == 1
+    await adapter.close()
+    await db.close()
+
+
+async def test_post_trade_evidence_carries_the_venue_open_order_listing(
+    tmp_path, monkeypatch, capsys
+):
+    """One-order-at-a-time is checkable from the evidence pack alone, without
+    trusting the same ledger the run was writing."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_full_happy_path(m)
+        assert await runner.place(side="buy", price=_PRICE, volume=_VOLUME) == EXIT_OK
+
+    reconciliation = _step(_evidence_steps(tmp_path), "reconciliation")
+    assert reconciliation["venue"]["open_orders_after"] == []
+    # C1: the approval block's count is venue-derived, not a ledger fact
+    # printed as if it were one.
+    out = capsys.readouterr().out
+    assert "open kraken orders  : 0 (from the venue's own OpenOrders listing)" in out
+    await adapter.close()
+    await db.close()
+
+
+# ======================================================================
+# C3 — the window between the check and the write
+# ======================================================================
+async def test_row_appearing_during_the_approval_prompt_blocks_the_write(
+    tmp_path, monkeypatch
+):
+    """Step 4 runs before an unbounded operator pause. A row that lands while
+    the prompt is open must stop the write, not be overwritten by it."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _DECISION[:8])
+    runner, db, adapter = await _make_runner(tmp_path)
+
+    real_fetch = kraken_pilot.fetch_blocking_rows
+    seen = {"n": 0}
+
+    async def late_arrival(db_arg):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return []  # step 4: lane clear
+        return await real_fetch(db_arg)  # pre-write: whatever is really there
+
+    monkeypatch.setattr(kraken_pilot, "fetch_blocking_rows", late_arrival)
+    await _seed_kraken_row(
+        db, size_usd="12.0", status="open", client_order_id="raced-cid-0001"
+    )
+
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_BLOCKED
+        assert _posts_to(m, _ADD_ORDER_URL) == []
+
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "pre_write_recheck")["outcome"] == "blocked"
+    assert _step(steps, "intent_persisted") is None
+    assert await _row_by_cid(db, _DECISION) is None
+    await adapter.close()
+    await db.close()
+
+
+# ======================================================================
+# J1 — one pilot process at a time
+# ======================================================================
+def test_pilot_lock_is_exclusive(tmp_path):
+    db_path = tmp_path / "pilot.db"
+    fd, lock_path = kraken_pilot.acquire_pilot_lock(db_path)
+    try:
+        assert lock_path.exists()
+        with pytest.raises(PilotLockHeld) as excinfo:
+            kraken_pilot.acquire_pilot_lock(db_path)
+        assert str(os.getpid()) in excinfo.value.holder
+    finally:
+        kraken_pilot.release_pilot_lock(fd, lock_path)
+    assert not lock_path.exists()
+    # Released cleanly, so the next run takes it.
+    fd2, lock_path2 = kraken_pilot.acquire_pilot_lock(db_path)
+    kraken_pilot.release_pilot_lock(fd2, lock_path2)
+
+
+def test_pilot_lock_is_never_broken_automatically(tmp_path):
+    """A stale lock means an earlier run did not reach its cleanup — exactly
+    the state where an order may be resting unrecorded."""
+    db_path = tmp_path / "pilot.db"
+    kraken_pilot.pilot_lock_path(db_path).write_text("pid=999999 (long gone)\n")
+    with pytest.raises(PilotLockHeld):
+        kraken_pilot.acquire_pilot_lock(db_path)
+
+
+# ======================================================================
+# F2 / J1 — main() wiring
+# ======================================================================
+def _patch_settings(monkeypatch, settings) -> None:
+    monkeypatch.setattr(kraken_pilot, "load_settings", lambda: settings)
+
+
+async def test_main_refuses_when_the_database_does_not_exist(
+    tmp_path, monkeypatch, capsys
+):
+    """sqlite3 creates a DB for any path it is handed, so the wrong working
+    directory silently yields an empty one: no kill switch, no rows to
+    reconcile, zero daily gross."""
+    missing = tmp_path / "nowhere" / "scout.db"
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=missing))
+    code = await kraken_pilot.main(["status"])
+    assert code == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert str(missing.resolve()) in out
+    assert not missing.exists()  # and it did NOT create one
+
+
+async def test_main_refuses_while_another_run_holds_the_lock(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    kraken_pilot.pilot_lock_path(db_path).write_text("pid=4242 acquired_at=now\n")
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+
+    code = await kraken_pilot.main(["status"])
+    assert code == EXIT_BLOCKED
+    out = capsys.readouterr().out
+    assert "4242" in out
+    assert "Two runs are two live orders" in out
+
+
+async def test_main_releases_the_lock_after_a_run(tmp_path, monkeypatch):
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+    reset_nonce_sources_for_tests()
+
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        assert await kraken_pilot.main(["status"]) == EXIT_OK
+
+    assert not kraken_pilot.pilot_lock_path(db_path).exists()
+
+
+# ======================================================================
+# F3 / F4 / J4 — operator-facing input and output
+# ======================================================================
+async def test_numeric_operator_lines_are_ascii(tmp_path, monkeypatch, capsys):
+    """Money figures are read on whatever console the operator has; a cp1252
+    terminal renders a stray arrow as mojibake between two numbers."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, "nope")  # stop at the approval boundary
+    runner, db, adapter = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_market(m)
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+
+    out = capsys.readouterr().out
+    assert "→" not in out  # no rightwards arrow anywhere
+    numeric = [
+        line
+        for line in out.splitlines()
+        if any(
+            token in line
+            for token in ("notional", "daily gross", "available balance", "current mid")
+        )
+    ]
+    assert numeric
+    for line in numeric:
+        assert line.isascii(), f"non-ascii in a numeric line: {line!r}"
+    assert "daily gross now     : 0 -> 15.000 of 100.0" in out
+    await adapter.close()
+    await db.close()
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-1", "0", "nan", "-Infinity"])
+@pytest.mark.parametrize("flag", ["--price", "--volume"])
+def test_place_rejects_non_finite_and_non_positive_numbers(flag, bad):
+    """NaN and Infinity PARSE as Decimals. NaN then compares False against
+    every cap it is tested against, so it must die at the boundary."""
+    other = "--volume" if flag == "--price" else "--price"
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["place", "--side", "buy", flag, bad, other, "0.15"])
+    assert excinfo.value.code == 2
+
+
+def test_place_accepts_ordinary_decimals():
+    args = build_parser().parse_args(
+        ["place", "--side", "buy", "--price", "100.0", "--volume", "0.15"]
+    )
+    assert args.price == Decimal("100.0")
+    assert args.volume == Decimal("0.15")
+
+
+def test_decision_id_is_stripped_and_shape_checked():
+    args = build_parser().parse_args(["cancel", "--decision-id", f"  {_DECISION}  "])
+    assert args.decision_id == _DECISION
+    for bad in ("not-a-uuid", "", _DECISION[:-1], _DECISION.replace("-", "")):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["cancel", "--decision-id", bad])

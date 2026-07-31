@@ -32,6 +32,35 @@ appended to the evidence file before the next one starts:
 
 Design decisions this module had to make, and why
 -------------------------------------------------
+**A limit price bounds the price, not the size.** Every notional cap is
+checked against BOTH ``price * volume`` and ``mid * volume``, because a
+marketable order does not transact at its limit — a sell priced below the mid
+sells into the book from the top down, so bounding the limit notional bounds
+nothing on that side. The larger figure is what the daily gross counts and
+what ``size_usd`` records, so the ledger holds exposure taken rather than
+exposure requested.
+
+**One pilot process at a time, enforced by the filesystem.** Two runs in two
+terminals are two live orders: each clears its own one-order-at-a-time check
+before either writes a row, and each reads a daily-gross total the other is
+about to invalidate. ``O_CREAT | O_EXCL`` on a lock file beside the database
+is the atomic test-and-set that closes both windows at the only point the two
+processes share. A held lock is never broken automatically.
+
+**The database must already exist.** SQLite creates one for any path it is
+handed, so running from the wrong directory does not fail — it silently
+succeeds against an empty file where the kill switch is clear, no prior orders
+need reconciling and the daily gross is zero. Every safety mechanism reads as
+"all clear" precisely because it is reading the wrong database.
+
+**Both directions of reconciliation, ledger↔venue.** Ledger rows are looked up
+at the venue by client id, AND the venue's full resting-order list is checked
+against the ledger. The second direction is the one a client-id lookup
+structurally cannot cover: an order placed from the web UI has no cl_ord_id we
+would know to ask about, so a ledger-driven check reports a clear lane while
+the account holds a live order. An unreadable listing is a blocker, because
+"no open orders" is what licenses a placement.
+
 **The ledger row is written immediately before the POST, never earlier.**
 ``live_trades.status='open'`` means "an order may exist at the venue", which
 is exactly what is true from the instant the POST leaves. Writing it earlier
@@ -118,10 +147,24 @@ log = structlog.get_logger(__name__)
 # Exit codes. Distinct rather than a blanket 1 because the operator's next
 # action differs per class, and a wrapper script should be able to tell them
 # apart without parsing stdout.
+#
+#   0  EXIT_OK        nothing outstanding, or a limit order left resting
+#                     (which is a normal outcome, not a problem)
+#   1  EXIT_REFUSED   a gate said no, the operator did not authorize, or the
+#                     venue definitively refused. No order exists.
+#   2  EXIT_BLOCKED   the lane is blocked — an unresolved prior ledger row, a
+#                     resting order the ledger does not know about, or another
+#                     pilot process holding the lock. Nothing was attempted.
+#   3  EXIT_ESCALATE  a submission could not be resolved, or the run failed
+#                     unexpectedly. State is UNKNOWN; a human must look.
+#   4  EXIT_REVIEW    the order completed but the post-trade reconciliation
+#                     could not explain the balance move. Money moved in a way
+#                     the runner cannot account for — check before the next run.
 EXIT_OK = 0
-EXIT_REFUSED = 1  # a gate said no, or the operator did not authorize
-EXIT_BLOCKED = 2  # the lane is blocked by an unresolved prior order
-EXIT_ESCALATE = 3  # a submission could not be resolved — human required
+EXIT_REFUSED = 1
+EXIT_BLOCKED = 2
+EXIT_ESCALATE = 3
+EXIT_REVIEW = 4
 
 VENUE = "kraken"
 
@@ -158,6 +201,67 @@ class PilotAbort(Exception):
         self.stage = stage
         self.reason = reason
         self.exit_code = exit_code
+
+
+class PilotLockHeld(Exception):
+    """Another pilot process holds the lock. Carries the holder's record."""
+
+    def __init__(self, lock_path: Path, holder: str) -> None:
+        super().__init__(f"pilot lock held: {lock_path}")
+        self.lock_path = lock_path
+        self.holder = holder
+
+
+# ----------------------------------------------------------------------
+# Single-process lock
+# ----------------------------------------------------------------------
+def pilot_lock_path(db_path: str | Path) -> Path:
+    """Lock file for the pilot lane, beside the database it guards."""
+    return Path(f"{db_path}.pilot.lock")
+
+
+def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
+    """Take the pilot lane's exclusive lock, or raise ``PilotLockHeld``.
+
+    Two pilot runs in two terminals are two live orders: each passes its own
+    one-order-at-a-time check before either writes a ledger row, so the
+    in-process check cannot see the other, and the daily-gross total each
+    reads is stale by the time the other commits. ``O_CREAT | O_EXCL`` is the
+    filesystem's atomic test-and-set, which closes both windows at the only
+    point they share — the machine.
+
+    A held lock is NEVER broken automatically, even if the recorded PID is
+    long gone. A stale lock means some earlier run did not reach its cleanup,
+    which is exactly the state where an order may be resting unrecorded; an
+    auto-break would step straight past that. The operator is told the PID and
+    the file to delete.
+    """
+    lock_path = pilot_lock_path(db_path)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        try:
+            holder = lock_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            holder = "(unreadable)"
+        raise PilotLockHeld(lock_path, holder or "(empty)") from exc
+    os.write(
+        fd,
+        f"pid={os.getpid()} acquired_at={datetime.now(timezone.utc).isoformat()}\n".encode(),
+    )
+    return fd, lock_path
+
+
+def release_pilot_lock(fd: int, lock_path: Path) -> None:
+    """Close and remove the lock. Safe to call on a partially-taken lock."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink()
+    except OSError:
+        log.warning("kraken_pilot_lock_not_removed", lock_path=str(lock_path))
 
 
 # ----------------------------------------------------------------------
@@ -394,9 +498,15 @@ async def daily_gross_usd(db: Database, day: str) -> Decimal:
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
+    # (status IS NULL OR status != 'rejected') rather than the bare inequality:
+    # SQL three-valued logic drops NULL-status rows from `status != 'rejected'`
+    # entirely, which would silently exclude a row from the day's exposure.
+    # The column is NOT NULL today; this keeps the accounting correct if that
+    # ever changes rather than under-counting the cap.
     cur = await db._conn.execute(
         "SELECT size_usd FROM live_trades "
-        "WHERE venue = ? AND status != 'rejected' AND substr(created_at, 1, 10) = ?",
+        "WHERE venue = ? AND (status IS NULL OR status != 'rejected') "
+        "AND substr(created_at, 1, 10) = ?",
         (VENUE, day),
     )
     total = Decimal("0")
@@ -554,14 +664,25 @@ class PilotRunner:
             f"{state.reason}",
         )
 
-    async def _reconcile_open_rows(self) -> tuple[list[dict[str, Any]], int]:
-        """Step 4 — what does the venue say about every non-terminal row?
+    async def _reconcile_open_rows(self) -> dict[str, Any]:
+        """Step 4 — reconcile the ledger and the venue, in BOTH directions.
 
-        Returns ``(rows, blocker_count)``. Every returned row carries the
-        venue's current view under ``venue``. A ``needs_manual_review`` row
-        always blocks; an ``open`` row always blocks too (one live order at a
-        time), and the lookup is there to tell the operator WHAT it is rather
-        than to decide whether it counts.
+        Ledger → venue: every non-terminal row is looked up by client id. A
+        ``needs_manual_review`` row always blocks; an ``open`` row always
+        blocks too (one live order at a time), and the lookup is there to tell
+        the operator WHAT it is rather than to decide whether it counts.
+
+        Venue → ledger: the account's full resting-order list is fetched, and
+        any order the ledger cannot account for is its own blocker. This is
+        the direction a client-id lookup structurally cannot cover — an order
+        placed from the Kraken web UI, or left by a run whose ledger row never
+        landed, has no cl_ord_id we would think to ask about, so a
+        ledger-driven check reports a clear lane while the account holds a
+        live order. Fails CLOSED: if the listing cannot be read, that is a
+        blocker too, because "no open orders" is what licenses a placement.
+
+        Returns a dict with ``rows`` / ``venue_open_orders`` / ``unknown_orders``
+        / ``blockers`` (the total the caller gates on) / ``venue_open_count``.
 
         Nothing is auto-mutated here. A filled entry order leaves a real
         position, and 'closed_*' in this ledger means the trade is closed —
@@ -597,7 +718,48 @@ class PilotRunner:
                     "filled_qty": conf.filled_qty,
                     "fill_price": conf.fill_price,
                 }
-        return rows, len(rows)
+
+        # Known = the identities of the rows we are already blocking on. An
+        # order matching one of those is accounted for by its row; anything
+        # else resting at the venue is not accounted for at all — including an
+        # order whose ledger row says it is terminal, which is its own alarm.
+        known_ids = {row["client_order_id"] for row in rows if row["client_order_id"]}
+        known_ids |= {row["entry_order_id"] for row in rows if row["entry_order_id"]}
+
+        venue_open_orders: list[dict[str, Any]] = []
+        unknown_orders: list[dict[str, Any]] = []
+        listing_error: dict[str, Any] | None = None
+        try:
+            venue_open_orders = await self._adapter.fetch_open_orders()
+        except Exception as exc:
+            listing_error = {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "detail": "could not read the account's resting orders; refusing "
+                "to treat an unreadable listing as an empty one",
+            }
+            log.warning(
+                "kraken_pilot_open_orders_unreadable",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        else:
+            unknown_orders = [
+                order
+                for order in venue_open_orders
+                if order.get("client_order_id") not in known_ids
+                and order.get("txid") not in known_ids
+            ]
+
+        blockers = len(rows) + len(unknown_orders) + (1 if listing_error else 0)
+        return {
+            "rows": rows,
+            "venue_open_orders": venue_open_orders,
+            "venue_open_count": len(venue_open_orders),
+            "unknown_orders": unknown_orders,
+            "listing_error": listing_error,
+            "blockers": blockers,
+        }
 
     async def _resolve_market_rules(self, canonical: str) -> tuple[Any, dict[str, Any]]:
         """Step 5 — venue metadata plus the raw AssetPairs row (for fees)."""
@@ -653,27 +815,68 @@ class PilotRunner:
         return problems
 
     async def _check_caps(
-        self, *, notional: Decimal, price: Decimal, side: str, venue_pair: str
+        self,
+        *,
+        notional: Decimal,
+        price: Decimal,
+        volume: Decimal,
+        side: str,
+        venue_pair: str,
     ) -> dict[str, Any]:
-        """Step 6 — per-order bounds, daily gross, and price sanity."""
+        """Step 6 — per-order bounds, daily gross, and price sanity.
+
+        Two notionals, because the limit price alone does not bound what an
+        order can transact. A limit is a WORST-price instruction, not a size
+        one: a sell priced below the mid does not sell for its limit, it sells
+        into the book from the top down, so ``volume`` base units leave the
+        account at roughly the mid. Bounding only ``price * volume`` therefore
+        bounds nothing on the marketable side — a sell of 1.5 BTC priced at
+        $10 reads as a $15 order and disposes of $150 at a $100 mid.
+
+        So both are computed and both must clear the per-order ceiling:
+        ``limit_notional = price * volume`` and
+        ``market_notional = mid * volume``. Checked on BOTH sides rather than
+        just the sell: a buy is bounded by its limit in principle, but that
+        assumes the fill price is the one field of the order that cannot
+        surprise us, and this cap exists precisely for the case where an
+        assumption about price is wrong.
+
+        The larger of the two is what gets counted against the daily gross and
+        persisted as ``size_usd``, so the ledger records exposure actually
+        taken rather than exposure nominally requested.
+        """
         min_usd = _dec(self._settings.KRAKEN_PILOT_MIN_ORDER_USD)
         max_usd = _dec(self._settings.KRAKEN_PILOT_MAX_ORDER_USD)
         if notional < min_usd or notional > max_usd:
             raise PilotAbort(
                 "caps",
-                f"notional {_fmt(notional)} is outside the approved per-order "
-                f"band [{_fmt(min_usd)}, {_fmt(max_usd)}]",
+                f"limit notional {_fmt(notional)} is outside the approved "
+                f"per-order band [{_fmt(min_usd)}, {_fmt(max_usd)}]",
             )
+
+        mid = await self._adapter.fetch_price(venue_pair)
+        market_notional = mid * volume if mid > 0 else Decimal("0")
+        if mid > 0 and market_notional > max_usd:
+            raise PilotAbort(
+                "caps",
+                f"at the current mid {_fmt(mid)} this order transacts "
+                f"{_fmt(market_notional)} ({_fmt(volume)} units), over "
+                f"KRAKEN_PILOT_MAX_ORDER_USD={_fmt(max_usd)}. A limit price "
+                f"bounds the price, not the size — the {_fmt(notional)} limit "
+                "notional is not what this order is worth.",
+            )
+        effective_notional = max(notional, market_notional)
 
         day = datetime.now(timezone.utc).date().isoformat()
         gross_before = await daily_gross_usd(self._db, day)
-        gross_after = gross_before + notional
+        gross_after = gross_before + effective_notional
         max_gross = _dec(self._settings.KRAKEN_PILOT_MAX_DAILY_GROSS_USD)
         if gross_after > max_gross:
             raise PilotAbort(
                 "caps",
                 f"daily gross would reach {_fmt(gross_after)} "
-                f"({_fmt(gross_before)} already today + {_fmt(notional)}), over "
+                f"({_fmt(gross_before)} already today + "
+                f"{_fmt(effective_notional)}), over "
                 f"KRAKEN_PILOT_MAX_DAILY_GROSS_USD={_fmt(max_gross)}",
             )
 
@@ -681,7 +884,6 @@ class PilotRunner:
         # legitimate supervised choice. It has to be a deliberate one, so it
         # gets surfaced in the approval block instead of being swallowed.
         warnings: list[str] = []
-        mid = await self._adapter.fetch_price(venue_pair)
         deviation_pct = Decimal("0")
         if mid > 0:
             deviation_pct = abs(price - mid) / mid * Decimal("100")
@@ -701,6 +903,8 @@ class PilotRunner:
             log.warning("kraken_pilot_price_warning", detail=warning)
         return {
             "notional": _fmt(notional),
+            "market_notional": _fmt(market_notional),
+            "effective_notional": _fmt(effective_notional),
             "per_order_band": [_fmt(min_usd), _fmt(max_usd)],
             "daily_gross_before": _fmt(gross_before),
             "daily_gross_after": _fmt(gross_after),
@@ -761,6 +965,10 @@ class PilotRunner:
             volume=_fmt(volume),
             validate_only=validate_only,
             evidence_path=str(evidence.path),
+            # Which database this run read its safety state from. Without it,
+            # an evidence pack cannot distinguish "the kill switch was clear"
+            # from "we were looking at the wrong database".
+            db_path=str(Path(self._settings.DB_PATH).resolve()),
         )
 
         live_trade_id: int | None = None
@@ -780,15 +988,24 @@ class PilotRunner:
                 ) from exc
             evidence.record("preflight", **preflight)
 
-            rows, blockers = await self._reconcile_open_rows()
+            reconciliation = await self._reconcile_open_rows()
             evidence.record(
-                "startup_reconciliation", blocking_rows=rows, blocker_count=blockers
+                "startup_reconciliation",
+                blocking_rows=reconciliation["rows"],
+                venue_open_orders=reconciliation["venue_open_orders"],
+                venue_open_count=reconciliation["venue_open_count"],
+                unknown_orders=reconciliation["unknown_orders"],
+                listing_error=reconciliation["listing_error"],
+                blocker_count=reconciliation["blockers"],
             )
-            if blockers:
-                self._print_blocked(rows)
+            if reconciliation["blockers"]:
+                self._print_blocked(reconciliation)
                 raise PilotAbort(
                     "startup_reconciliation",
-                    f"{blockers} unresolved kraken ledger row(s) block the lane",
+                    f"{reconciliation['blockers']} unresolved item(s) block the "
+                    f"lane ({len(reconciliation['rows'])} ledger row(s), "
+                    f"{len(reconciliation['unknown_orders'])} unknown venue "
+                    f"order(s))",
                     exit_code=EXIT_BLOCKED,
                 )
 
@@ -813,10 +1030,14 @@ class PilotRunner:
             caps = await self._check_caps(
                 notional=notional,
                 price=price,
+                volume=volume,
                 side=side,
                 venue_pair=meta.venue_pair,
             )
             evidence.record("caps", **caps)
+            # What the ledger records is exposure TAKEN, not exposure asked
+            # for: on the marketable side those differ (see _check_caps).
+            effective_notional = _dec_or_none(caps["effective_notional"]) or notional
 
             balance = await self._check_balance(
                 side=side, meta=meta, notional=notional, volume=volume
@@ -854,6 +1075,7 @@ class PilotRunner:
                 estimated_fee=estimated_fee,
                 balance=balance,
                 caps=caps,
+                venue_open_count=reconciliation["venue_open_count"],
                 validate_only=validate_only,
             )
             evidence.record(
@@ -869,6 +1091,27 @@ class PilotRunner:
                 )
 
             if not validate_only:
+                # Re-check immediately before the write. The step-4 scan ran
+                # before the approval prompt, which is unbounded operator
+                # time — long enough for another run to have written a row.
+                # The lock in main() makes a second pilot process impossible,
+                # so this closes the same window against anything else that
+                # writes the ledger (the live engine, a manual fix mid-run).
+                late_rows = await fetch_blocking_rows(self._db)
+                if late_rows:
+                    evidence.record(
+                        "pre_write_recheck",
+                        outcome="blocked",
+                        blocking_rows=late_rows,
+                    )
+                    raise PilotAbort(
+                        "pre_write_recheck",
+                        f"{len(late_rows)} kraken ledger row(s) appeared while the "
+                        "approval was pending — nothing was sent",
+                        exit_code=EXIT_BLOCKED,
+                    )
+                evidence.record("pre_write_recheck", outcome="clear")
+
                 live_trade_id = await record_pending_order(
                     self._db,
                     client_order_id=client_order_id,
@@ -878,7 +1121,7 @@ class PilotRunner:
                     venue=VENUE,
                     pair=meta.venue_pair,
                     signal_type=_ANCHOR_SIGNAL_TYPE,
-                    size_usd=_fmt(notional),
+                    size_usd=_fmt(effective_notional),
                     mid_at_entry=caps.get("mid"),
                 )
                 evidence.record(
@@ -996,27 +1239,49 @@ class PilotRunner:
         estimated_fee: Decimal,
         balance: dict[str, Any],
         caps: dict[str, Any],
+        venue_open_count: int,
         validate_only: bool,
     ) -> tuple[bool, str]:
-        """Step 9 — print the decision block and require the typed prefix."""
-        fee_label = " (ESTIMATE — AssetPairs published no fee schedule)"
+        """Step 9 — print the decision block and require the typed prefix.
+
+        Every figure here is one the operator is being asked to accept, so
+        each is a value read this run, not a constant. In particular the
+        open-order count comes from the venue's own listing rather than from
+        our ledger: a ledger fact printed as if it were a venue fact is
+        exactly the sort of reassurance that survives being wrong.
+
+        The numeric lines use ASCII operators (``->``) rather than typographic
+        ones. This block is read on whatever console the operator has, and a
+        cp1252 terminal renders a stray arrow as a mojibake glyph sitting
+        between two money figures.
+        """
+        fee_label = " (ESTIMATE - AssetPairs published no fee schedule)"
         maker_line = f"{_fmt(maker_pct)}%" if maker_pct is not None else "unpublished"
+        market_notional = caps.get("market_notional")
+        effective_notional = caps.get("effective_notional")
         lines = [
             f"  pair                : {meta.canonical} "
             f"(venue altname {meta.venue_pair}, quote {meta.quote})",
             f"  side                : {side.upper()}",
             f"  limit price         : {_fmt(price)} {meta.quote}",
             f"  quantity            : {_fmt(volume)} {meta.canonical}",
-            f"  max notional        : {_fmt(notional)} {meta.quote}",
+            f"  limit notional      : {_fmt(notional)} {meta.quote} "
+            f"(price x quantity)",
+            f"  at current mid      : {market_notional} {meta.quote} "
+            f"(what this transacts if it fills at the mid)",
+            f"  exposure counted    : {effective_notional} {meta.quote} "
+            f"(the larger of the two; this is what the ledger records)",
             f"  estimated fee       : {_fmt(estimated_fee)} {meta.quote} "
             f"(taker {_fmt(taker_pct)}%, maker {maker_line})"
             f"{fee_label if fee_estimated else ''}",
             f"  decision ID         : {decision_id}",
             f"  client order ID     : {client_order_id}",
+            f"  database            : {Path(self._settings.DB_PATH).resolve()}",
             f"  available balance   : {balance['available']} {balance['asset']}",
             f"  daily gross now     : {caps['daily_gross_before']} "
-            f"→ {caps['daily_gross_after']} of {caps['daily_gross_cap']}",
-            "  open kraken orders  : 0 (startup reconciliation found none)",
+            f"-> {caps['daily_gross_after']} of {caps['daily_gross_cap']}",
+            f"  open kraken orders  : {venue_open_count} "
+            f"(from the venue's own OpenOrders listing)",
             f"  current mid         : {caps['mid']} "
             f"(limit deviates {caps['deviation_pct']}%)",
         ]
@@ -1257,10 +1522,18 @@ class PilotRunner:
         balance_asset: str,
     ) -> int:
         """Step 13a — wait for the fill, persist it, then reconcile."""
+        timeout_sec = float(self._settings.KRAKEN_PILOT_FILL_TIMEOUT_SEC)
+        # Say so before going quiet. Without this the operator watches a
+        # blank terminal for up to two minutes immediately after authorizing
+        # a live order, which is the exact moment to wonder whether it hung.
+        print(
+            f"order submitted; waiting for fill, up to {timeout_sec:g}s "
+            f"(polling every {self._settings.KRAKEN_FILL_POLL_INTERVAL_SEC:g}s) ..."
+        )
         conf = await self._adapter.await_fill_confirmation(
             venue_order_id=txid or "",
             client_order_id=client_order_id,
-            timeout_sec=float(self._settings.KRAKEN_PILOT_FILL_TIMEOUT_SEC),
+            timeout_sec=timeout_sec,
         )
         evidence.record(
             "fill_confirmation",
@@ -1325,19 +1598,28 @@ class PilotRunner:
             balance_asset=balance_asset,
         )
 
-        _print_block(
-            f"PILOT ORDER {conf.status.upper()}",
-            [
-                f"  decision ID  : {decision_id}",
-                f"  txid         : {txid or conf.venue_order_id}",
-                f"  venue status : {conf.status}",
-                f"  filled       : {conf.filled_qty} @ {conf.fill_price}",
-                f"  fills        : {len(fills)}",
-                f"  reconcile    : {summary['verdict']}",
-                f"  evidence     : {evidence.path}",
-            ],
-        )
-        return EXIT_OK
+        lines = [
+            f"  decision ID  : {decision_id}",
+            f"  txid         : {txid or conf.venue_order_id}",
+            f"  venue status : {conf.status}",
+            f"  filled       : {conf.filled_qty} @ {conf.fill_price}",
+            f"  fills        : {len(fills)}",
+            f"  reconcile    : {summary['verdict']}",
+            f"  evidence     : {evidence.path}",
+        ]
+        if summary["verdict"] == "review":
+            lines.extend(
+                ["", "  RECONCILIATION COULD NOT EXPLAIN THE BALANCE MOVE:"]
+                + [f"   - {m}" for m in summary["mismatches"]]
+                + ["  Check the account before running the pilot again."]
+            )
+        _print_block(f"PILOT ORDER {conf.status.upper()}", lines)
+        # An unexplained balance move exits non-zero even though the order
+        # itself completed: money moved in a way the runner cannot account
+        # for, and a 0 here would tell a wrapper script everything is fine.
+        # A resting limit order is NOT this — that is a normal outcome and
+        # keeps EXIT_OK.
+        return EXIT_REVIEW if summary["verdict"] == "review" else EXIT_OK
 
     async def _reconcile(
         self,
@@ -1425,6 +1707,23 @@ class PilotRunner:
                 f"match venue txid {conf.venue_order_id!r}"
             )
 
+        # The account's resting orders AFTER the trade, from the venue rather
+        # than from our ledger. This is what makes "one order at a time"
+        # checkable from the evidence pack alone: a reader can see the account
+        # held exactly the orders this run accounts for, without trusting the
+        # same ledger the run was writing.
+        try:
+            venue_open_orders: Any = await self._adapter.fetch_open_orders()
+        except Exception as exc:
+            venue_open_orders = {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            mismatches.append(
+                f"could not read the venue's open orders after the trade "
+                f"({type(exc).__name__})"
+            )
+
         summary = {
             "verdict": "review" if mismatches else "pass",
             "mismatches": mismatches,
@@ -1436,6 +1735,7 @@ class PilotRunner:
                 "fill_count": len(fills),
                 "fees_paid": _fmt(fee_total),
                 "cost": _fmt(cost_total),
+                "open_orders_after": venue_open_orders,
             },
             "ledger": ledger,
             "balance": {
@@ -1576,7 +1876,7 @@ class PilotRunner:
                     f"  ledger row  : {row['live_trade_id']} "
                     f"({'open (position exists)' if partial else 'rejected'})",
                     f"  filled qty  : {_fmt(filled_qty) if partial else '0'}",
-                    f"  balance     : {_fmt(balance_before)} → "
+                    f"  balance     : {_fmt(balance_before)} -> "
                     f"{_fmt(balance_after)} {balance_asset}",
                     f"  evidence    : {evidence.path}",
                 ],
@@ -1639,12 +1939,13 @@ class PilotRunner:
         )
         lines.append(
             f"  per-order band           : "
-            f"{settings.KRAKEN_PILOT_MIN_ORDER_USD} – "
+            f"{settings.KRAKEN_PILOT_MIN_ORDER_USD} - "
             f"{settings.KRAKEN_PILOT_MAX_ORDER_USD} USD"
         )
         lines.append(
             f"  real signed requests     : {settings.LIVE_USE_REAL_SIGNED_REQUESTS}"
         )
+        lines.append(f"  database                 : {Path(settings.DB_PATH).resolve()}")
 
         kill_state = await self._ks.is_active()
         lines.append(
@@ -1684,8 +1985,9 @@ class PilotRunner:
             f"{settings.KRAKEN_PILOT_MAX_DAILY_GROSS_USD} USD"
         )
 
-        rows, blockers = await self._reconcile_open_rows()
-        lines.append(f"  blocking ledger rows     : {blockers}")
+        reconciliation = await self._reconcile_open_rows()
+        rows = reconciliation["rows"]
+        lines.append(f"  blocking ledger rows     : {len(rows)}")
         for row in rows:
             venue = row.get("venue", {})
             lines.append(
@@ -1695,22 +1997,44 @@ class PilotRunner:
                 f"venue={venue.get('outcome')}"
                 + (f"/{venue.get('status')}" if venue.get("status") else "")
             )
+        if reconciliation["listing_error"]:
+            lines.append(
+                "  venue open orders        : UNREADABLE "
+                f"({reconciliation['listing_error']['error_type']})"
+            )
+        else:
+            lines.append(
+                f"  venue open orders        : {reconciliation['venue_open_count']}"
+            )
+            for order in reconciliation["venue_open_orders"]:
+                lines.append(
+                    f"    {order['txid']} {order['pair']} {order['status']} "
+                    f"vol={order['vol']} exec={order['vol_exec']} "
+                    f"price={order['price']} cid={order['client_order_id']}"
+                )
+        if reconciliation["unknown_orders"]:
+            lines.append(
+                f"  UNKNOWN venue orders     : "
+                f"{len(reconciliation['unknown_orders'])} "
+                "(resting, not accounted for by any ledger row)"
+            )
 
         _print_block("KRAKEN PILOT STATUS", lines)
-        if blockers:
+        if reconciliation["blockers"]:
             print(
-                "The lane is BLOCKED: `place` will refuse until every row above "
+                "The lane is BLOCKED: `place` will refuse until everything above "
                 "is resolved."
             )
         return EXIT_OK
 
-    def _print_blocked(self, rows: list[dict[str, Any]]) -> None:
+    def _print_blocked(self, reconciliation: dict[str, Any]) -> None:
         lines = [
-            "  A restart must not forget an order. These kraken ledger rows are",
-            "  not terminal, so the lane refuses to place anything new:",
+            "  A restart must not forget an order, and the account must not hold",
+            "  one the ledger cannot name. The lane refuses to place anything new",
+            "  until each item below is resolved.",
             "",
         ]
-        for row in rows:
+        for row in reconciliation["rows"]:
             venue = row.get("venue", {})
             lines.append(
                 f"    live_trades #{row['live_trade_id']}  status={row['status']}"
@@ -1720,6 +2044,28 @@ class PilotRunner:
             lines.append(f"      pair / size     : {row['pair']} / {row['size_usd']}")
             lines.append(f"      created_at      : {row['created_at']}")
             lines.append(f"      venue says      : {venue}")
+        for order in reconciliation["unknown_orders"]:
+            lines.append(
+                f"    UNKNOWN venue order  txid={order['txid']} "
+                f"pair={order['pair']}"
+            )
+            lines.append(f"      client_order_id : {order['client_order_id']}")
+            lines.append(
+                f"      vol / executed  : {order['vol']} / {order['vol_exec']}"
+            )
+            lines.append(f"      limit price     : {order['price']}")
+            lines.append("      No ledger row accounts for this order — it was placed")
+            lines.append("      outside the pilot, or by a run whose row never landed.")
+        if reconciliation["listing_error"]:
+            lines.append(
+                f"    COULD NOT READ the venue's open orders: "
+                f"{reconciliation['listing_error']['error_type']}: "
+                f"{reconciliation['listing_error']['error']}"
+            )
+            lines.append("      An unreadable listing is treated as a blocker, because")
+            lines.append(
+                "      'no open orders' is what would license a new placement."
+            )
         lines.extend(
             [
                 "",
@@ -1730,6 +2076,8 @@ class PilotRunner:
                 "     by hand to record how it ended.",
                 "   - needs_manual_review: confirm the venue state first (Kraken",
                 "     web UI), then resolve the row. NEVER resend the order.",
+                "   - unknown venue order: cancel it in the Kraken web UI, or",
+                "     record it in live_trades if it was a pilot order.",
             ]
         )
         _print_block("PILOT LANE BLOCKED", lines)
@@ -1753,13 +2101,55 @@ def _reject_reason_for_error(message: str) -> str | None:
 # CLI
 # ----------------------------------------------------------------------
 def _decimal_arg(raw: str) -> Decimal:
-    """argparse converter — ``Decimal('x')`` raises InvalidOperation, which is
-    an ArithmeticError and NOT one of the exceptions argparse turns into a
-    usage error, so a typo'd price would surface as a traceback."""
+    """argparse converter for a price or a quantity.
+
+    Three rejections, all of which would otherwise reach the trading logic:
+
+    - ``Decimal('x')`` raises InvalidOperation, an ArithmeticError, which is
+      NOT one of the exceptions argparse converts into a usage error — a
+      typo'd price would surface as a traceback rather than a usage message.
+    - ``Decimal('NaN')`` and ``Decimal('Infinity')`` PARSE. NaN then makes
+      every comparison in the cap checks False, so a NaN order size passes
+      every bound it is tested against; Infinity poisons the arithmetic
+      instead. Both must die at the boundary.
+    - Zero and negatives are not orders. The adapter rejects them too, but by
+      then the operator has already been shown an approval block.
+    """
     try:
-        return Decimal(raw)
+        value = Decimal(raw)
     except InvalidOperation as exc:
         raise argparse.ArgumentTypeError(f"{raw!r} is not a decimal number") from exc
+    if not value.is_finite():
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a finite number — NaN and Infinity parse as Decimals "
+            "but compare false against every cap"
+        )
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{raw!r} must be greater than zero")
+    return value
+
+
+_DECISION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _decision_id_arg(raw: str) -> str:
+    """argparse converter for ``--decision-id``.
+
+    Strips surrounding whitespace (these get copied out of a terminal or an
+    evidence file, and a trailing space silently turns a lookup into "no such
+    row") and requires the dashed-UUID shape the runner mints, so a mangled
+    paste fails as a usage error rather than as a ledger miss during an
+    incident.
+    """
+    value = raw.strip()
+    if not _DECISION_ID_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a pilot decision id (expected a dashed UUID, e.g. "
+            "6d1b345e-2821-40e2-ad83-4ecb18a06876)"
+        )
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1787,13 +2177,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     cancel = sub.add_parser("cancel", help="cancel a resting pilot order")
-    cancel.add_argument("--decision-id", required=True)
+    cancel.add_argument("--decision-id", type=_decision_id_arg, required=True)
 
     sub.add_parser("status", help="read-only lane report")
     return parser
 
 
 async def main(argv: list[str] | None = None) -> int:
+    # The approval block carries money figures, and a console that cannot
+    # encode a character raises UnicodeEncodeError mid-print — losing the rest
+    # of the block, including the line the operator is about to act on. Replace
+    # is the right failure here: a mangled glyph is survivable, a truncated
+    # decision block is not. The numeric lines use ASCII operators regardless.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(errors="replace")
+        except (ValueError, OSError):  # pragma: no cover - exotic stdout
+            pass
+
     args = build_parser().parse_args(argv)
 
     if args.command == "place":
@@ -1814,7 +2215,42 @@ async def main(argv: list[str] | None = None) -> int:
             return EXIT_REFUSED
 
     settings = load_settings()
-    db = Database(settings.DB_PATH)
+
+    # The DB must already exist. sqlite3 CREATES a database for any path it is
+    # handed, so running this from the wrong directory does not fail — it
+    # silently succeeds against an empty file, and every safety mechanism that
+    # reads state finds nothing to object to: no kill switch, no prior rows to
+    # reconcile, zero daily gross. The lane would be wide open precisely
+    # because it is looking at the wrong database.
+    db_path = Path(settings.DB_PATH)
+    if not db_path.exists():
+        print(
+            f"REFUSED [database]: no database at {db_path.resolve()}\n"
+            "  DB_PATH resolves relative to the current directory, so this is "
+            "almost always\n"
+            "  the wrong working directory. Run the pilot from the deployment "
+            "root.\n"
+            "  Creating one here would disable the kill switch, the startup "
+            "reconciliation\n"
+            "  and the daily-gross cap all at once, silently."
+        )
+        return EXIT_REFUSED
+
+    # One pilot process at a time, machine-wide (see acquire_pilot_lock).
+    try:
+        lock_fd, lock_path = acquire_pilot_lock(db_path)
+    except PilotLockHeld as held:
+        print(
+            f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
+            f"  holder: {held.holder}\n"
+            "  Two runs are two live orders. If that process is gone, confirm "
+            "the venue\n"
+            "  state (`status`, or the Kraken web UI) and then delete the lock "
+            "file by hand."
+        )
+        return EXIT_BLOCKED
+
+    db = Database(db_path, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
     await db.initialize()
     adapter = KrakenSpotAdapter(settings, db=db)
     runner = PilotRunner(
@@ -1834,6 +2270,7 @@ async def main(argv: list[str] | None = None) -> int:
     finally:
         await adapter.close()
         await db.close()
+        release_pilot_lock(lock_fd, lock_path)
 
 
 if __name__ == "__main__":
