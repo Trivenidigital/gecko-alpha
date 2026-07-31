@@ -155,6 +155,7 @@ from scout.db import Database
 from scout.live.kill_switch import KillSwitch
 from scout.live.solana.constants import (
     ATA_RENT_LAMPORTS_FALLBACK,
+    LAMPORTS_PER_SIGNATURE,
     LAMPORTS_PER_SOL,
     SOL_MINT,
     TOKEN_ACCOUNT_DATA_LENGTH,
@@ -1802,6 +1803,7 @@ class PilotRunner:
         polls = 0
         last_status: Any = None
         errors: list[str] = []
+        seen_known = False
         outcome = "confirm_timeout"
 
         while True:
@@ -1814,6 +1816,7 @@ class PilotRunner:
                 last_status = None
             else:
                 if last_status is not None and last_status.known:
+                    seen_known = True
                     if last_status.err is not None:
                         outcome = "failed_on_chain"
                         break
@@ -1832,6 +1835,14 @@ class PilotRunner:
                 outcome = "confirm_timeout"
                 break
             await asyncio.sleep(poll)
+
+        if outcome == "confirm_timeout" and seen_known:
+            # We DID see the cluster acknowledge this signature; only the
+            # later polls stopped answering. Calling that a confirmation
+            # timeout would send the caller off to resolve a transaction we
+            # already know landed, and would read in the evidence as "never
+            # seen" when the opposite was observed.
+            outcome = "finalize_timeout"
 
         return {
             "outcome": outcome,
@@ -2039,8 +2050,11 @@ class PilotRunner:
 
         # Tolerance of one base signature fee absorbs dust from the
         # wrap/unwrap round trip without widening the band enough to hide a
-        # real discrepancy.
-        slack = report.total_fee_lamports - report.priority_fee_lamports
+        # real discrepancy. Deliberately a fixed protocol constant rather than
+        # anything derived from the fees: a slack that scaled with the tip
+        # would widen the band exactly when the transaction got expensive,
+        # which is when an unexplained move matters most.
+        slack = LAMPORTS_PER_SIGNATURE
         low = amount_lamports - slack
         high = amount_lamports + report.total_fee_lamports + ata_rent + slack
         if sol_spent is None:

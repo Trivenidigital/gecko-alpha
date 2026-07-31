@@ -1006,6 +1006,52 @@ async def test_reconciliation_reviews_an_unexplained_balance_move(
 
 
 # ======================================================================
+# Confirmation classification
+# ======================================================================
+async def test_a_transaction_seen_landed_is_never_reported_as_never_seen(tmp_path):
+    """Once the cluster acknowledges the signature, silence is not absence.
+
+    Calling a later run of failed polls a "confirmation timeout" would send
+    the caller off to resolve a transaction we already watched land, and would
+    read in the evidence as "never seen" when the opposite was observed.
+    """
+    from scout.live.solana.rpc_client import SignatureStatus
+
+    runner, db, session = await _make_runner(tmp_path)
+    answers = [
+        [SignatureStatus(known=True, slot=7, err=None, confirmation_status="confirmed")]
+    ]
+
+    async def _statuses(_sigs, **_kw):
+        if answers:
+            return answers.pop(0)
+        raise TimeoutError("node stopped answering")
+
+    runner._rpc.get_signature_statuses = _statuses
+    result = await runner._await_confirmation("5sig")
+    assert result["outcome"] == "finalize_timeout"
+    assert result["known"] is False  # the LAST poll failed...
+    assert result["poll_errors"]  # ...and that is recorded, not hidden
+    await session.close()
+    await db.close()
+
+
+async def test_a_signature_the_cluster_never_knew_is_a_confirm_timeout(tmp_path):
+    from scout.live.solana.rpc_client import SignatureStatus
+
+    runner, db, session = await _make_runner(tmp_path)
+
+    async def _statuses(_sigs, **_kw):
+        return [SignatureStatus(known=False)]
+
+    runner._rpc.get_signature_statuses = _statuses
+    result = await runner._await_confirmation("5sig")
+    assert result["outcome"] == "confirm_timeout"
+    await session.close()
+    await db.close()
+
+
+# ======================================================================
 # Ambiguous submission — all four verdicts
 # ======================================================================
 async def _run_ambiguous(tmp_path, monkeypatch, *, resolver_payloads):
