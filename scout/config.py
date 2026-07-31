@@ -1320,6 +1320,18 @@ class Settings(BaseSettings):
     BINANCE_API_KEY: SecretStr | None = None
     BINANCE_API_SECRET: SecretStr | None = None
 
+    # -------- Kraken spot pilot (PR-K1, 2026-07-31) --------
+    # Credentials for KrakenSpotAdapter. Same posture as BINANCE_* above:
+    # live mode only, never in .env.example. The key MUST be issued without
+    # "Funds permissions - Withdraw" — KrakenSpotAdapter.preflight_credentials_check
+    # fails closed if the withdrawal-scoped probe does anything other than
+    # return EGeneral:Permission denied.
+    KRAKEN_API_KEY: SecretStr | None = None
+    KRAKEN_API_SECRET: SecretStr | None = None
+    # Overridable so tests / a staging proxy can retarget the host.
+    KRAKEN_API_BASE_URL: str = "https://api.kraken.com"
+    KRAKEN_HTTP_TIMEOUT_SEC: float = 10.0
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
