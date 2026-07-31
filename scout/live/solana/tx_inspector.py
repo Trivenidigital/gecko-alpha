@@ -77,13 +77,42 @@ Verified facts (2026-07-31)
 
 6. **Associated-token-account discriminators.** ``Create = 0``,
    ``CreateIdempotent = 1``, ``RecoverNested = 2``. *** Unlike the token
-   program, EMPTY data is LEGITIMATE here. *** The processor reads
-   ``let instruction = if input.is_empty() {
-   AssociatedTokenAccountInstruction::Create } else {
-   ...try_from_slice(input)... };``
-   (https://raw.githubusercontent.com/solana-program/associated-token-account/main/program/src/processor.rs),
-   for backwards compatibility with legacy zero-data Create calls. A blanket
-   "empty data fails" rule would reject legitimate swaps.
+   program, EMPTY data is LEGITIMATE here. ***
+
+   This carve-out was RETRIEVED, not inferred. Source fetched successfully on
+   2026-07-31:
+   https://raw.githubusercontent.com/solana-program/associated-token-account/main/program/src/processor.rs
+   ``process_instruction`` dispatches, quoted verbatim::
+
+       let instruction = if input.is_empty() {
+           AssociatedTokenAccountInstruction::Create
+       } else {
+           AssociatedTokenAccountInstruction::try_from_slice(input)
+               .map_err(|_| ProgramError::InvalidInstructionData)?
+       };
+
+   i.e. zero-length input is treated as ``Create`` for backwards
+   compatibility with legacy no-data calls. A blanket "empty data fails" rule
+   would therefore reject legitimate swaps. (Some networks intercept TLS to
+   raw.githubusercontent.com and cannot reach this file; if re-verification
+   is blocked, the live-build capture on the pilot host settles it.)
+
+8. **ATA rent is real money and the fee ceiling must see it.** Creating an
+   associated token account funds it to the rent-exempt minimum for a
+   165-byte SPL token account — currently 2,039,280 lamports (~0.00204 SOL),
+   an order of magnitude more than base+priority+tip combined at the pilot's
+   defaults. An ATA-create instruction naming a STRANGER as owner is a
+   perfectly well-formed instruction from an allowlisted program that moves
+   our lamports to fund somebody else's account, bounded only by the
+   1232-byte transaction limit (a few dozen per transaction).
+
+   The fix is NOT "owner must be us" — a route can legitimately create a
+   PDA-owned intermediate account, and that rule would block real swaps.
+   Instead the rent is COUNTED and folded into the total-fee ceiling, so the
+   ceiling bounds every lamport that actually leaves the wallet rather than
+   just the fees. The count is an upper bound: ``CreateIdempotent`` on an
+   existing account creates nothing and costs no rent, but assuming it does
+   is the conservative direction for a ceiling.
 
 7. **Why allowlisting the PROGRAM is not enough.** An instruction's meaning
    lives in its DATA. Before the discriminator allowlists below existed this
@@ -147,6 +176,7 @@ from scout.config import Settings
 from scout.live.solana.constants import (
     ALLOWED_PROGRAM_IDS,
     ASSOCIATED_TOKEN_PROGRAM_ID,
+    ATA_RENT_LAMPORTS_FALLBACK as _ATA_RENT_LAMPORTS_FALLBACK,
     COMPUTE_BUDGET_PROGRAM_ID,
     COMPUTE_BUDGET_SET_UNIT_LIMIT,
     COMPUTE_BUDGET_SET_UNIT_PRICE,
@@ -213,6 +243,18 @@ ATA_IX_CREATE_IDEMPOTENT: Final = 1
 PERMITTED_ATA_INSTRUCTIONS: Final[frozenset[int]] = frozenset(
     {ATA_IX_CREATE, ATA_IX_CREATE_IDEMPOTENT}
 )
+# Both are single-byte; empty (legacy Create) is also permitted. Anything
+# longer is a malformed instruction, and the exact-length discipline here
+# matches the token and system branches.
+MAX_ATA_INSTRUCTION_DATA_LEN: Final = 1
+
+# Rent-exempt minimum for a 165-byte SPL token account (module docstring
+# fact 8), re-exported from constants so callers of this module do not need
+# both imports. A FALLBACK: rent is a cluster parameter, not a protocol
+# constant, so a runner that has queried
+# ``getMinimumBalanceForRentExemption`` should pass the live figure to
+# ``verify_swap_transaction`` instead.
+ATA_RENT_LAMPORTS_FALLBACK: Final = _ATA_RENT_LAMPORTS_FALLBACK
 # RecoverNested (2) is NOT permitted: it transfers out of and closes a nested
 # account, which is a fund movement a swap has no reason to make.
 
@@ -253,6 +295,11 @@ class VerificationReport:
     priority_fee_lamports: int
     compute_unit_limit: int | None
     compute_unit_price_micro_lamports: int | None
+    # Lamports this transaction spends funding new associated token accounts.
+    # Not a "fee" in the protocol sense, but money that leaves the wallet, so
+    # it is bounded by the same ceiling — see module docstring fact 8.
+    ata_rent_lamports: int
+    ata_create_count: int
     total_fee_lamports: int
     program_ids: tuple[str, ...] = ()
     unresolved_lookup_tables: tuple[str, ...] = ()
@@ -368,6 +415,7 @@ async def verify_swap_transaction(
     tip_accounts: Collection[str] | None = None,
     input_mint: str = SOL_MINT,
     output_mint: str = USDC_MINT,
+    ata_rent_lamports: int = ATA_RENT_LAMPORTS_FALLBACK,
 ) -> VerificationReport:
     """Verify a Jupiter-built transaction against intent. Never raises on a
     failed CHECK — it returns a report whose ``passed`` is False so the
@@ -382,6 +430,11 @@ async def verify_swap_transaction(
         tip_accounts: allowed Jito tip destinations. Defaults to the static
             fallback list; the caller should pass the live
             ``jito_client.fetch_tip_accounts`` result when available.
+        ata_rent_lamports: rent-exempt minimum charged per associated token
+            account this transaction creates, folded into the total-fee
+            ceiling. Defaults to the static fallback; a runner that has
+            queried ``getMinimumBalanceForRentExemption`` should pass the
+            live cluster figure.
     """
     checks: list[Check] = []
     allowed_tips = (
@@ -410,6 +463,8 @@ async def verify_swap_transaction(
             compute_unit_price_micro_lamports=kw.get(
                 "compute_unit_price_micro_lamports"
             ),
+            ata_rent_lamports=kw.get("ata_rent_lamports", 0),
+            ata_create_count=kw.get("ata_create_count", 0),
             total_fee_lamports=kw.get("total_fee_lamports", 0),
             program_ids=tuple(kw.get("program_ids", ())),
             unresolved_lookup_tables=tuple(kw.get("unresolved_lookup_tables", ())),
@@ -542,6 +597,7 @@ async def verify_swap_transaction(
     token_violations: list[str] = []
     ata_violations: list[str] = []
     system_violations: list[str] = []
+    ata_create_count = 0
 
     def _account_at(ix_accounts: list[int], position: int) -> str | None:
         if len(ix_accounts) <= position:
@@ -565,11 +621,17 @@ async def verify_swap_transaction(
         parsed = _parse_compute_budget(program_id, data)
         if parsed is not None:
             kind, value = parsed
+            # max(), not last-wins. The uniqueness check below already fails
+            # a duplicated transaction, but with last-wins the REPORT would
+            # still quote the trailing decoy (e.g. 200 lamports) while the
+            # bytes carry 50,000,000 — and the report is what the approval
+            # screen and the evidence record show. Taking the maximum keeps
+            # the report from ever understating what is in the transaction.
             if kind == "limit":
-                unit_limit = value
+                unit_limit = value if unit_limit is None else max(unit_limit, value)
                 unit_limit_count += 1
             else:
-                unit_price = value
+                unit_price = value if unit_price is None else max(unit_price, value)
                 unit_price_count += 1
 
         # ---- SPL Token / Token-2022 --------------------------------
@@ -598,8 +660,19 @@ async def verify_swap_transaction(
         # ---- Associated Token Account ------------------------------
         elif program_id == ASSOCIATED_TOKEN_PROGRAM_ID:
             # Empty data IS the legacy Create — permitted deliberately.
-            if data and data[0] not in PERMITTED_ATA_INSTRUCTIONS:
+            if len(data) > MAX_ATA_INSTRUCTION_DATA_LEN:
+                ata_violations.append(
+                    f"instruction carries {len(data)} data byte(s), expected at "
+                    f"most {MAX_ATA_INSTRUCTION_DATA_LEN}"
+                )
+            elif data and data[0] not in PERMITTED_ATA_INSTRUCTIONS:
                 ata_violations.append(f"discriminator {data[0]} not permitted")
+            else:
+                # A permitted create. Counted whatever the owner is: the
+                # rent leaves OUR wallet regardless of who ends up owning
+                # the account, and an owner==signer rule would block
+                # legitimate PDA-owned intermediates (docstring fact 8).
+                ata_create_count += 1
 
         # ---- System ------------------------------------------------
         elif program_id == SYSTEM_PROGRAM_ID:
@@ -765,13 +838,18 @@ async def verify_swap_transaction(
     )
 
     base_fee = LAMPORTS_PER_SIGNATURE * max(num_required, 1)
-    total_fee = base_fee + priority_fee + jito_tip_lamports
+    ata_rent = ata_create_count * ata_rent_lamports
+    # ATA rent is included deliberately: it is not a fee, but it is money
+    # leaving the wallet, and a ceiling that ignored it would not bound the
+    # transaction's actual cost (module docstring fact 8).
+    total_fee = base_fee + priority_fee + jito_tip_lamports + ata_rent
     total_ceiling = int(settings.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS)
     add(
         "total_fee_within_ceiling",
         total_fee <= total_ceiling,
         f"total={total_fee} lamports (base {base_fee} + priority {priority_fee} "
-        f"+ tip {jito_tip_lamports}; ceiling {total_ceiling})",
+        f"+ tip {jito_tip_lamports} + ata_rent {ata_rent} "
+        f"[{ata_create_count} x {ata_rent_lamports}]; ceiling {total_ceiling})",
     )
 
     report = VerificationReport(
@@ -786,6 +864,8 @@ async def verify_swap_transaction(
         priority_fee_lamports=priority_fee,
         compute_unit_limit=unit_limit,
         compute_unit_price_micro_lamports=unit_price,
+        ata_rent_lamports=ata_rent,
+        ata_create_count=ata_create_count,
         total_fee_lamports=total_fee,
         program_ids=tuple(dict.fromkeys(program_ids)),
         unresolved_lookup_tables=tuple(unresolved_tables),
@@ -800,6 +880,8 @@ async def verify_swap_transaction(
         fee_payer=report.fee_payer,
         jito_tip_lamports=report.jito_tip_lamports,
         priority_fee_lamports=report.priority_fee_lamports,
+        ata_rent_lamports=report.ata_rent_lamports,
+        ata_create_count=report.ata_create_count,
         total_fee_lamports=report.total_fee_lamports,
         failed_checks=[c.name for c in report.failures],
     )

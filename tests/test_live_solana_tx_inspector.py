@@ -15,6 +15,7 @@ from solders.keypair import Keypair
 from scout.live.solana.constants import SOL_MINT, USDC_MINT
 from scout.live.solana.exceptions import SolanaVerificationError
 from scout.live.solana.tx_inspector import (
+    ATA_RENT_LAMPORTS_FALLBACK,
     derive_associated_token_address,
     verify_swap_transaction,
 )
@@ -67,7 +68,13 @@ async def test_happy_path_passes_every_check(settings_factory):
     assert report.jito_tip_destination == TIP_ACCOUNT
     # 1000 micro-lamports/CU * 200_000 CU / 1e6 = 200 lamports.
     assert report.priority_fee_lamports == 200
-    assert report.total_fee_lamports == 5_000 + 200 + 100_000
+    # The baseline creates one ATA (the output-mint account), whose rent is
+    # money leaving the wallet and therefore part of the bounded total.
+    assert report.ata_create_count == 1
+    assert report.ata_rent_lamports == ATA_RENT_LAMPORTS_FALLBACK
+    assert (
+        report.total_fee_lamports == 5_000 + 200 + 100_000 + ATA_RENT_LAMPORTS_FALLBACK
+    )
     assert len(report.message_sha256) == 64
     report.raise_if_failed()  # must not raise
 
@@ -284,9 +291,16 @@ async def test_degenerate_transaction_fails_closed(settings_factory):
 
 
 async def test_total_fee_ceiling_catches_stacked_components(settings_factory):
-    """Both components individually under ceiling, combined over it."""
+    """Both components individually under ceiling, combined over it.
+
+    ``include_wrap_primitives=False`` isolates the fee arithmetic from ATA
+    rent, which is exercised separately below.
+    """
     built = build_swap_tx(
-        tip_lamports=400_000, compute_unit_price=2_000, compute_unit_limit=200_000
+        tip_lamports=400_000,
+        compute_unit_price=2_000,
+        compute_unit_limit=200_000,
+        include_wrap_primitives=False,
     )
     report = await verify_swap_transaction(
         tx_b64=built.tx_b64,
@@ -424,13 +438,21 @@ _USDC_ATA = derive_associated_token_address(PAYER_PUBKEY, USDC_MINT)
 _STRANGER_USDC_ATA = derive_associated_token_address(STRANGER, USDC_MINT)
 
 
-async def _verify(settings_factory, **build_kwargs):
+async def _verify(settings_factory, *, settings_overrides=None, **build_kwargs):
     built = build_swap_tx(**build_kwargs)
     return await verify_swap_transaction(
         tx_b64=built.tx_b64,
         expected_signer=PAYER_PUBKEY,
-        settings=settings_factory(),
+        settings=settings_factory(**(settings_overrides or {})),
     )
+
+
+# Any fixture that adds an ATA create on top of the baseline's own crosses
+# the default total-fee ceiling once rent is counted (see
+# test_two_ata_creations_need_a_raised_ceiling). Tests that are about
+# something OTHER than the ceiling raise it so the intended check is what
+# they actually exercise.
+_ROOMY = {"SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS": 20_000_000}
 
 
 async def test_smuggled_approve_is_caught(settings_factory):
@@ -555,6 +577,7 @@ async def test_ata_legacy_empty_data_create_is_permitted(settings_factory):
     """
     report = await _verify(
         settings_factory,
+        settings_overrides=_ROOMY,
         extra_instructions=[
             ata_create_ix(PAYER_PUBKEY, _USDC_ATA, PAYER_PUBKEY, USDC_MINT, b"")
         ],
@@ -606,8 +629,150 @@ async def test_malformed_system_transfer_length_is_caught(settings_factory):
 
 
 # ----------------------------------------------------------------------
+# C4: ATA rent is money leaving the wallet, so the fee ceiling must see it.
+#
+# The attack is an ATA CreateIdempotent naming a STRANGER as owner: a
+# well-formed instruction from an allowlisted program that funds someone
+# else's token account with ~0.00204 SOL of our lamports, bounded only by the
+# 1232-byte transaction limit. The defence is deliberately NOT "owner must be
+# us" — a route may legitimately create a PDA-owned intermediate — but
+# counting the rent and bounding it with the total-fee ceiling.
+# ----------------------------------------------------------------------
+def _stranger_ata_create(n: int = 1):
+    return [
+        ata_create_ix(PAYER_PUBKEY, _STRANGER_USDC_ATA, STRANGER, USDC_MINT, b"\x01")
+    ] * n
+
+
+async def test_ata_rent_is_surfaced_on_the_report(settings_factory):
+    report = await _verify(settings_factory)
+
+    assert report.ata_create_count == 1
+    assert report.ata_rent_lamports == ATA_RENT_LAMPORTS_FALLBACK
+    # The approval screen must be able to show the breakdown honestly.
+    detail = _check(report, "total_fee_within_ceiling").detail
+    assert "ata_rent" in detail
+    assert str(ATA_RENT_LAMPORTS_FALLBACK) in detail
+
+
+async def test_stranger_ata_creation_is_bounded_by_the_fee_ceiling(settings_factory):
+    """The C4 case: rent for somebody else's account is counted and blocked."""
+    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create())
+
+    assert report.ata_create_count == 2
+    assert report.ata_rent_lamports == 2 * ATA_RENT_LAMPORTS_FALLBACK
+    assert not report.passed
+    assert "total_fee_within_ceiling" in _failed_names(report)
+
+
+async def test_many_stranger_ata_creations_scale_the_counted_rent(settings_factory):
+    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create(5))
+
+    assert report.ata_create_count == 6
+    assert report.ata_rent_lamports == 6 * ATA_RENT_LAMPORTS_FALLBACK
+    assert not report.passed
+
+
+async def test_ata_rent_is_excluded_when_nothing_is_created(settings_factory):
+    report = await _verify(settings_factory, include_wrap_primitives=False)
+
+    assert report.ata_create_count == 0
+    assert report.ata_rent_lamports == 0
+    assert report.total_fee_lamports == 5_000 + 200 + 100_000
+
+
+async def test_live_rent_figure_overrides_the_fallback(settings_factory):
+    """Rent is a cluster parameter, so the runner can pass the live figure."""
+    built = build_swap_tx()
+    report = await verify_swap_transaction(
+        tx_b64=built.tx_b64,
+        expected_signer=PAYER_PUBKEY,
+        settings=settings_factory(),
+        ata_rent_lamports=3_000_000,
+    )
+
+    assert report.ata_rent_lamports == 3_000_000
+    assert not report.passed  # 3_000_000 alone exceeds the default ceiling
+    assert "total_fee_within_ceiling" in _failed_names(report)
+
+
+async def test_two_ata_creations_need_a_raised_ceiling(settings_factory):
+    """*** Pins a real operational consequence of counting ATA rent. ***
+
+    A first-ever SOL->USDC swap plausibly creates TWO accounts (the WSOL
+    account and the USDC account) = 4,078,560 lamports of rent, which exceeds
+    the 2,500,000 default SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS. Fail-closed is
+    correct, but it means the default ceiling must be raised before the pilot
+    or a legitimate first swap is blocked. This test documents the number so
+    the interaction cannot be quietly lost.
+    """
+    report = await _verify(settings_factory, extra_instructions=_stranger_ata_create())
+    assert not report.passed
+
+    raised = await _verify(
+        settings_factory,
+        settings_overrides={"SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS": 6_000_000},
+        extra_instructions=_stranger_ata_create(),
+    )
+    assert raised.passed, f"unexpected failures: {_failed_names(raised)}"
+
+
+# ----------------------------------------------------------------------
+# C5: exact-length discipline for the ATA branch
+# ----------------------------------------------------------------------
+async def test_ata_instruction_with_trailing_junk_is_caught(settings_factory):
+    """CreateIdempotent(1) + 64 junk bytes was previously accepted."""
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            ata_create_ix(
+                PAYER_PUBKEY,
+                _STRANGER_USDC_ATA,
+                STRANGER,
+                USDC_MINT,
+                b"\x01" + bytes(64),
+            )
+        ],
+    )
+
+    assert not report.passed
+    assert "65 data byte(s)" in _check(report, "ata_instructions_recognised").detail
+
+
+async def test_ata_two_byte_instruction_is_caught(settings_factory):
+    report = await _verify(
+        settings_factory,
+        extra_instructions=[
+            ata_create_ix(
+                PAYER_PUBKEY, _STRANGER_USDC_ATA, STRANGER, USDC_MINT, b"\x00\x00"
+            )
+        ],
+    )
+
+    assert not report.passed
+    assert "ata_instructions_recognised" in _failed_names(report)
+
+
+# ----------------------------------------------------------------------
 # S1-2: duplicate compute-budget instructions
 # ----------------------------------------------------------------------
+async def test_report_never_understates_a_duplicated_price(settings_factory):
+    """The report must not disagree with the bytes.
+
+    Last-wins recorded the trailing decoy (200) while the transaction carried
+    50,000,000; the uniqueness check already fails such a build, but the
+    report is what the approval screen and evidence show, so it takes max().
+    """
+    report = await _verify(
+        settings_factory,
+        compute_unit_price=50_000_000,
+        extra_instructions=[compute_unit_price_ix(1_000)],
+    )
+
+    assert report.compute_unit_price_micro_lamports == 50_000_000
+    assert not report.passed
+
+
 async def test_duplicate_unit_price_high_first_is_caught(settings_factory):
     """The dangerous ordering: expensive first, cheap decoy last.
 

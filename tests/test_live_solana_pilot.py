@@ -143,26 +143,6 @@ def _authorize(monkeypatch, typed: str | None = None) -> None:
     monkeypatch.setattr("builtins.input", _fake_input)
 
 
-def _authorize_with_signature(monkeypatch) -> None:
-    """Type the correct prefix, whatever signature this run produces.
-
-    The phrase binds to the transaction, so a test cannot hardcode it without
-    also hardcoding the exact bytes Jupiter returned. This reads the prompt's
-    expectation the same way an operator reads the screen.
-    """
-    holder: dict[str, str] = {}
-
-    real_sign = solana_pilot.sign_transaction
-
-    def _capture(tx_b64, keypair, **kwargs):
-        signed = real_sign(tx_b64, keypair, **kwargs)
-        holder["signature"] = signed.signature
-        return signed
-
-    monkeypatch.setattr(solana_pilot, "sign_transaction", _capture)
-    monkeypatch.setattr("builtins.input", lambda _p="": holder["signature"][:8])
-
-
 def _expected_signature(tx_b64: str) -> str:
     """The signature the runner will derive for this transaction."""
     return sign_transaction(tx_b64, PAYER).signature
@@ -1529,22 +1509,20 @@ async def test_the_intent_insert_writes_the_signature_atomically(tmp_path):
 # Lock + main() wiring
 # ======================================================================
 def test_pilot_lock_is_exclusive_and_never_broken_automatically(tmp_path):
+    import os
+
     db_path = tmp_path / "pilot.db"
     fd, path = solana_pilot.acquire_pilot_lock(db_path)
     try:
         with pytest.raises(PilotLockHeld) as excinfo:
             solana_pilot.acquire_pilot_lock(db_path)
-        assert str(os_pid()) in excinfo.value.holder
+        # The holder's PID is named so the operator knows what to look for;
+        # the lock is never broken for them.
+        assert str(os.getpid()) in excinfo.value.holder
         assert path.exists()
     finally:
         solana_pilot.release_pilot_lock(fd, path)
     assert not path.exists()
-
-
-def os_pid() -> int:
-    import os
-
-    return os.getpid()
 
 
 def test_the_solana_lock_is_not_the_kraken_lock(tmp_path):
