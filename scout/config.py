@@ -1331,6 +1331,12 @@ class Settings(BaseSettings):
     # Overridable so tests / a staging proxy can retarget the host.
     KRAKEN_API_BASE_URL: str = "https://api.kraken.com"
     KRAKEN_HTTP_TIMEOUT_SEC: float = 10.0
+    # PR-K2: how long KrakenSpotAdapter.await_fill_confirmation waits between
+    # order-state polls. 2s is a deliberate compromise for a supervised
+    # single-order pilot — fast enough that an operator watching a limit order
+    # sees the fill promptly, slow enough that a long wait cannot approach
+    # Kraken's private-endpoint rate-limit counter.
+    KRAKEN_FILL_POLL_INTERVAL_SEC: float = 2.0
 
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20

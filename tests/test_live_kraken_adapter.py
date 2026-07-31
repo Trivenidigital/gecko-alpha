@@ -760,11 +760,13 @@ async def test_preflight_surfaces_auth_failure_from_balance_step():
     await adapter.close()
 
 
-# ---------- order lifecycle is PR-K2 ----------
+# ---------- the market-order surface stays closed (PR-K2) ----------
 
 
 @pytest.mark.asyncio
-async def test_order_lifecycle_methods_raise_pr_k2():
+async def test_market_order_entry_points_stay_closed():
+    """PR-K2 opened a LIMIT path only. Every ABC method that implies a market
+    order must still refuse — and refuse without touching the network."""
     adapter = _adapter()
     request = OrderRequest(
         paper_trade_id=1,
@@ -774,23 +776,20 @@ async def test_order_lifecycle_methods_raise_pr_k2():
         size_usd=10.0,
         intent_uuid="abcd1234-ef56-7890-abcd-ef0123456789",
     )
-    with pytest.raises(NotImplementedError, match="PR-K2"):
-        await adapter.send_order(pair="XBTUSD", side="buy", size_usd=Decimal("10"))
-    with pytest.raises(NotImplementedError, match="PR-K2"):
-        await adapter.place_order_request(request)
-    with pytest.raises(NotImplementedError, match="PR-K2"):
-        await adapter.await_fill_confirmation(
-            venue_order_id="x", client_order_id="y", timeout_sec=1.0
-        )
-    with pytest.raises(NotImplementedError, match="PR-K2"):
-        await adapter.place_exit_order(
-            pair="XBTUSD",
-            base_qty=Decimal("1"),
-            client_order_id="y",
-            timeout_sec=1.0,
-        )
-    with pytest.raises(NotImplementedError, match="PR-K2"):
-        await adapter.fetch_order_by_client_id(pair="XBTUSD", client_order_id="y")
+    with aioresponses() as m:
+        with pytest.raises(NotImplementedError, match="limit-only"):
+            await adapter.send_order(pair="XBTUSD", side="buy", size_usd=Decimal("10"))
+        # OrderRequest carries no price, so it cannot express a limit order.
+        with pytest.raises(KrakenAPIError, match="limit-only"):
+            await adapter.place_order_request(request)
+        with pytest.raises(NotImplementedError, match="manual supervision"):
+            await adapter.place_exit_order(
+                pair="XBTUSD",
+                base_qty=Decimal("1"),
+                client_order_id="y",
+                timeout_sec=1.0,
+            )
+        assert len(_calls(m)) == 0
     await adapter.close()
 
 

@@ -1,10 +1,12 @@
-"""Kraken spot adapter — PR-K1 core (auth, preflight, balances, market rules).
+"""Kraken spot adapter — PR-K1 core + PR-K2 order lifecycle.
 
-Read-only surface for the supervised Kraken spot pilot. Order placement,
-cancellation and fill reconciliation are deliberately NOT here — every
-order-lifecycle method raises ``NotImplementedError("PR-K2 ...")`` so the
-ABC stays satisfied without any codepath that can reach a Kraken order
-endpoint.
+Surface for the supervised Kraken spot pilot: auth, preflight, balances and
+market rules (PR-K1) plus limit-order placement, cancellation, lookup, fill
+reconciliation and ambiguous-submission resolution (PR-K2).
+
+The pilot lane is LIMIT-ONLY. There is deliberately no market-order path:
+``send_order`` / ``place_order_request`` / ``place_exit_order`` all raise, and
+``place_limit_order`` is the one method that can reach ``AddOrder``.
 
 Endpoints used
 --------------
@@ -16,6 +18,12 @@ Endpoints used
 - ``POST /0/private/WithdrawMethods`` + ``POST /0/private/WithdrawStatus``
   — withdrawal-capability probes (preflight step 2; a SUCCESS on either is
   a hard reject)
+- ``POST /0/private/AddOrder``     — limit-order placement (PR-K2)
+- ``POST /0/private/CancelOrder``  — cancel by txid or cl_ord_id (PR-K2)
+- ``POST /0/private/OpenOrders`` + ``POST /0/private/ClosedOrders``
+  — cl_ord_id lookup + ambiguous-submission resolution (PR-K2)
+- ``POST /0/private/QueryOrders``  — order state by txid (PR-K2)
+- ``POST /0/private/QueryTrades``  — per-fill price/qty/fee (PR-K2)
 
 Kraken API facts verified against current docs on 2026-07-31
 ------------------------------------------------------------
@@ -69,6 +77,76 @@ Kraken API facts verified against current docs on 2026-07-31
    entries" — the two withdrawal probes are NOT gated identically. See
    ``preflight_credentials_check`` for the false-reject this can cause.
 
+PR-K2 order-lifecycle facts, verified against current docs on 2026-07-31
+--------------------------------------------------------------------------
+9.  AddOrder (https://docs.kraken.com/api/docs/rest-api/add-order) request
+    params are ``pair`` / ``type`` (buy|sell) / ``ordertype`` (limit) /
+    ``price`` / ``volume``, all sent as **strings** in the form-encoded
+    body. Response is ``result.descr`` (``{order, close}``) plus
+    ``result.txid`` (an ARRAY of transaction ids).
+10. ``cl_ord_id`` is the client-order-id field: "alphanumeric client order
+    identifier which uniquely identifies an open order for each client". It
+    is **mutually exclusive with ``userref``** and the docs accept exactly
+    three forms — long UUID (``6d1b345e-2821-40e2-ad83-4ecb18a06876``),
+    short UUID (32 hex, no dashes), or **free text of at most 18 ASCII
+    characters** (``arb-20240509-00010``). ``_validate_cl_ord_id`` enforces
+    that set locally, BEFORE any HTTP, because a rejected order id is a
+    round trip we can avoid.
+
+    *** CONSEQUENCE FOR CALLERS: ``scout.live.idempotency.make_client_order_id``
+    emits up to 28 characters (Binance's limit), which does NOT fit Kraken's
+    18-character free-text form. The Kraken pilot runner must mint its own
+    Kraken-shaped client order id. ``_validate_cl_ord_id`` rejects an
+    over-long id rather than letting Kraken decide. ***
+11. **NOT VERIFIABLE — duplicate ``cl_ord_id`` semantics.** The AddOrder docs
+    describe the field as uniquely identifying an open order but say NOTHING
+    about whether a duplicate is rejected, deduplicated, or silently
+    accepted as a second order, and no ``EOrder:*`` entry in the published
+    error table (https://support.kraken.com/articles/360001491786-api-error-messages)
+    covers it. **The safety story therefore does NOT rest on Kraken
+    deduplicating a resent cl_ord_id.** A resend must never be attempted on
+    an ambiguous submission — ``place_limit_order`` raises
+    ``KrakenAmbiguousSubmissionError`` and the caller resolves via
+    ``resolve_order_submission``. ``_raise_for_errors`` maps any error
+    string mentioning ``cl_ord_id`` to ``KrakenClientOrderIdError`` as a
+    best-effort classification; since malformed ids are already rejected
+    locally, such an error in practice means "duplicate".
+12. ``validate``: "If set to ``true`` the order will be validated only, it
+    will not trade" (default false). This is a Kraken-side dry run — the
+    order is parsed and checked but never placed, and the reply carries
+    ``result.descr`` with NO ``result.txid``. It is the mechanism behind
+    ``place_limit_order(validate_only=True)`` and is therefore allowed to
+    run with ``LIVE_USE_REAL_SIGNED_REQUESTS=False`` (see that method).
+13. Lookup asymmetry — this one shapes the whole reconciliation design:
+    - ``OpenOrders`` (https://docs.kraken.com/api/docs/rest-api/get-open-orders)
+      and ``ClosedOrders`` (.../get-closed-orders) BOTH accept ``cl_ord_id``
+      as a filter ("Restrict results to given client order id") and return
+      ``result.open`` / ``result.closed`` as maps keyed by txid, with
+      ``cl_ord_id`` echoed on each order row.
+    - ``QueryOrders`` (.../get-orders-info) does **NOT**. Its required
+      params are ``nonce`` and ``txid``; ``cl_ord_id`` appears only in the
+      RESPONSE. An order can therefore only be found by client id through
+      OpenOrders/ClosedOrders, which is why ``resolve_order_submission``
+      probes exactly those two and not three.
+    Order ``status`` is one of ``pending`` / ``open`` / ``closed`` /
+    ``canceled`` / ``expired``, alongside ``vol`` / ``vol_exec`` / ``price``
+    / ``cost`` / ``fee`` / ``reason`` / ``trades``.
+14. ``CancelOrder`` (.../cancel-order) documents ``txid`` as "Kraken order
+    identifier (txid) or user reference (userref)" and carries ``cl_ord_id``
+    as a SEPARATE optional param — so a cancel keyed by client id must send
+    ``cl_ord_id=``, not ``txid=``. Response is ``result.count`` (orders
+    cancelled) + ``result.pending``. **NOT VERIFIABLE:** the docs specify no
+    error for an unknown or already-closed order, so
+    ``_CANCEL_ALREADY_GONE_ERROR_PREFIXES`` is a best-effort mapping of the
+    observed strings; anything unmatched still raises.
+15. ``QueryTrades`` (.../get-trades-info) takes a comma-delimited ``txid``
+    list of **at most 20** trade ids and returns a map keyed by trade id
+    with ``ordertxid`` / ``pair`` / ``time`` / ``type`` / ``ordertype`` /
+    ``price`` ("Average price order was executed at") / ``cost`` / ``fee``
+    ("Total fee (quote currency)") / ``vol`` / ``maker``. Fill evidence is
+    assembled by reading the order's ``trades`` id array from
+    ``QueryOrders(trades=true)`` and then querying those ids in chunks.
+
 Empirical checks run against the live public API on 2026-07-31 (all 1428
 tradable pairs): ``tick_size`` equalled ``10**-pair_decimals`` for every
 pair, and only ``online`` / ``post_only`` statuses were present. The
@@ -82,9 +160,10 @@ below is the exact closed set from ``GET /0/public/Assets``.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Any
+from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 import aiohttp
@@ -146,6 +225,36 @@ class KrakenRateLimitError(RateLimitError):
     retry it, because Kraken's counter decays on a timer and an in-loop
     retry just deepens the penalty.
     """
+
+
+class KrakenClientOrderIdError(KrakenAPIError):
+    """Kraken refused the ``cl_ord_id`` we sent.
+
+    Terminal. Because ``_validate_cl_ord_id`` rejects malformed ids locally
+    before any HTTP, a server-side cl_ord_id error in practice means the id
+    is already in use — but the docs publish no error string for either
+    case (module docstring, fact 11), so the class is named for what is
+    actually known rather than for the inference.
+    """
+
+
+class KrakenAmbiguousSubmissionError(Exception):
+    """An ``AddOrder`` POST may or may not have reached the matching engine.
+
+    Raised when the submission fails in a way that does NOT prove the order
+    was refused: a network drop, a timeout, an HTTP 5xx, a CDN interstitial.
+    All of those can occur AFTER Kraken accepted the order — a 502 from an
+    edge node says nothing about what the origin did with the POST.
+
+    **Never resend on this.** Kraken publishes no duplicate-``cl_ord_id``
+    contract (module docstring, fact 11), so a resend is a live double-order
+    risk. Resolve with ``resolve_order_submission`` instead; the
+    ``client_order_id`` needed to do that is carried on the exception.
+    """
+
+    def __init__(self, message: str, *, client_order_id: str) -> None:
+        super().__init__(message)
+        self.client_order_id = client_order_id
 
 
 class KrakenWithdrawalCapabilityError(Exception):
@@ -272,6 +381,83 @@ _BACKOFFS: tuple[float, ...] = (1.0, 2.0, 4.0)
 
 # Kraken caps Depth's `count` at 500.
 _MAX_DEPTH_COUNT = 500
+
+# QueryTrades takes "a comma delimited list of transaction IDs to query info
+# about (20 maximum)" — fill reads are chunked to this.
+_MAX_QUERY_TRADES_IDS = 20
+
+# CancelOrder outcomes that mean "the order is already gone", which is the
+# SUCCESS case for a cancel, not a failure. NOT in Kraken's published error
+# table (module docstring, fact 14) — a best-effort mapping of the observed
+# strings. Anything unmatched still raises.
+_CANCEL_ALREADY_GONE_ERROR_PREFIXES: tuple[str, ...] = (
+    "EOrder:Unknown order",
+    "EOrder:Invalid order",
+)
+
+# The two endpoints that accept a cl_ord_id filter, as (path, result key).
+# QueryOrders is deliberately absent: it requires txid and cannot be queried
+# by client id at all (module docstring, fact 13).
+_CL_ORD_ID_LOOKUPS: tuple[tuple[str, str], ...] = (
+    ("/0/private/OpenOrders", "open"),
+    ("/0/private/ClosedOrders", "closed"),
+)
+
+# Kraken's three documented cl_ord_id forms (module docstring, fact 10).
+_CL_ORD_ID_LONG_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_CL_ORD_ID_SHORT_UUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+_CL_ORD_ID_FREE_TEXT_MAX_LEN = 18
+# Printable ASCII excluding space. The docs say "ascii text"; whitespace and
+# control bytes are excluded here because they survive form-encoding as
+# escapes and would make the id we send differ visibly from the id we logged.
+_CL_ORD_ID_FREE_TEXT_RE = re.compile(r"^[\x21-\x7e]+$")
+
+
+def _validate_cl_ord_id(client_order_id: str) -> None:
+    """Raise unless ``client_order_id`` matches a form Kraken documents.
+
+    Checked locally, before any HTTP: a malformed id is a guaranteed reject,
+    and spending a signed round trip (and a nonce) to learn that is waste.
+
+    The 18-character free-text ceiling is the sharp edge —
+    ``scout.live.idempotency.make_client_order_id`` targets Binance's 28 and
+    does NOT fit here (module docstring, fact 10).
+    """
+    if not isinstance(client_order_id, str) or not client_order_id:
+        raise KrakenClientOrderIdError("cl_ord_id must be a non-empty string")
+    if _CL_ORD_ID_LONG_UUID_RE.match(client_order_id):
+        return
+    if _CL_ORD_ID_SHORT_UUID_RE.match(client_order_id):
+        return
+    if not _CL_ORD_ID_FREE_TEXT_RE.match(client_order_id):
+        raise KrakenClientOrderIdError(
+            f"cl_ord_id {client_order_id!r} contains characters outside printable "
+            "ASCII; Kraken accepts a UUID (long or short form) or free ASCII text"
+        )
+    if len(client_order_id) > _CL_ORD_ID_FREE_TEXT_MAX_LEN:
+        raise KrakenClientOrderIdError(
+            f"cl_ord_id {client_order_id!r} is {len(client_order_id)} chars; Kraken "
+            f"free-text ids are capped at {_CL_ORD_ID_FREE_TEXT_MAX_LEN} (a 32-hex "
+            "or dashed-UUID id is the alternative). Note make_client_order_id() "
+            "targets Binance's 28-char limit and does not fit Kraken."
+        )
+
+
+def _format_decimal(
+    value: Decimal, decimals: int, *, rounding: str = ROUND_DOWN
+) -> str:
+    """Quantize ``value`` to ``decimals`` places as a FIXED-POINT string.
+
+    Every number that reaches an order body goes through here. ``urlencode``
+    renders values with ``str()``, and ``str()`` of a small quantity yields
+    scientific notation — ``str(0.00001)`` is ``'1e-05'`` and even
+    ``str(Decimal('1E-5'))`` is ``'1E-5'`` — which Kraken rejects. The ``f``
+    format spec is what forces ``'0.00001'``.
+    """
+    quantum = Decimal(1).scaleb(-int(decimals))
+    return format(value.quantize(quantum, rounding=rounding), "f")
 
 
 def _select_error(errors: list[str], prefixes: tuple[str, ...]) -> str | None:
@@ -528,6 +714,13 @@ class KrakenSpotAdapter(ExchangeAdapter):
         rate_limited = _select_error(errors, _RATE_LIMIT_ERROR_PREFIXES)
         if rate_limited is not None:
             raise KrakenRateLimitError(f"kraken {path}: {rate_limited}")
+
+        # Substring, not prefix: Kraken publishes no error code for a
+        # rejected client order id (module docstring, fact 11), so the field
+        # name in the message body is the only signal available.
+        cl_ord_id_error = next((e for e in errors if "cl_ord_id" in e.lower()), None)
+        if cl_ord_id_error is not None:
+            raise KrakenClientOrderIdError(f"kraken {path}: {cl_ord_id_error}")
 
         raise KrakenAPIError(f"kraken {path}: {'; '.join(errors)}")
 
@@ -951,30 +1144,36 @@ class KrakenSpotAdapter(ExchangeAdapter):
         )
 
     # ------------------------------------------------------------------
-    # Order lifecycle — PR-K2. Concrete raising overrides keep the ABC
-    # satisfied without creating any path that can reach a Kraken order
-    # endpoint from this PR.
+    # Order lifecycle — PR-K2.
     #
-    # Two traps for whoever writes K2:
+    # Two traps that shaped this section:
     #  - Format every numeric order param as a pre-formatted Decimal string.
     #    urlencode() renders a float via str(), and str(0.00001) is '1e-05',
-    #    which Kraken rejects. Volume/price must be built with Decimal and
-    #    an explicit quantize/format, never passed as float.
+    #    which Kraken rejects. Everything numeric goes through
+    #    _format_decimal; nothing here passes a float to a body.
     #  - NEVER log repr(exc) or exc.request_info for a signed call.
     #    aiohttp's ClientResponseError repr embeds request_info, which
     #    carries the API-Key and API-Sign headers — that would write live
     #    credentials into the log. Log type(exc).__name__ and str(exc).
+    #
+    # The market-order surface stays closed. The three ABC entry points that
+    # imply a market order raise; place_limit_order is the only path to
+    # AddOrder.
     # ------------------------------------------------------------------
     async def send_order(self, *, pair: str, side: str, size_usd: Decimal) -> dict:
-        raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
+        raise NotImplementedError("kraken lane is limit-only; use place_limit_order")
 
     async def place_order_request(self, request: OrderRequest) -> str:
-        raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
+        """Not the Kraken entry point — ``OrderRequest`` carries no price.
 
-    async def await_fill_confirmation(
-        self, *, venue_order_id: str, client_order_id: str, timeout_sec: float
-    ) -> OrderConfirmation:
-        raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
+        The ABC's request shape is quote-sized and market-shaped
+        (``size_usd``, no limit price), which cannot express the only order
+        this lane places. The supervised pilot runner calls
+        ``place_limit_order`` directly; this override exists so a generic
+        routing caller fails loudly instead of silently reaching a venue it
+        was never wired for.
+        """
+        raise KrakenAPIError("kraken lane is limit-only; use place_limit_order")
 
     async def place_exit_order(
         self,
@@ -984,12 +1183,744 @@ class KrakenSpotAdapter(ExchangeAdapter):
         client_order_id: str,
         timeout_sec: float,
     ) -> OrderConfirmation:
-        raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
+        raise NotImplementedError(
+            "kraken pilot exits via place_limit_order/cancel + manual supervision"
+        )
+
+    # ---------------- placement ----------------
+    def _prepare_order_amounts(
+        self,
+        *,
+        row: dict[str, Any],
+        pair: str,
+        side: str,
+        price: Decimal,
+        volume: Decimal,
+    ) -> tuple[str, str]:
+        """Quantize price/volume to the pair's precision and enforce Kraken's
+        minimums LOCALLY, returning the exact strings to put on the wire.
+
+        Rounding is conservative per field rather than nearest, so a
+        quantization can never enlarge the caller's exposure:
+        - volume always rounds DOWN — never trade more than asked;
+        - price rounds DOWN on a buy (never bid above the asked price) and
+          UP on a sell (never offer below it). Both directions move the
+          order at most one tick away from filling, which is the safe
+          direction to be wrong in.
+
+        Validation runs AFTER quantization, because quantization is what can
+        push a marginal order under ``ordermin``/``costmin``. Rejecting here
+        rather than round-tripping a doomed order also keeps a guaranteed
+        failure from consuming a nonce and an AddOrder rate-limit slot.
+        """
+        pair_decimals = row.get("pair_decimals")
+        lot_decimals = row.get("lot_decimals")
+        if pair_decimals is None or lot_decimals is None:
+            raise KrakenAPIError(
+                f"kraken AddOrder: pair {pair!r} is missing precision metadata "
+                f"(pair_decimals={pair_decimals!r} lot_decimals={lot_decimals!r})"
+            )
+
+        try:
+            price_str = _format_decimal(
+                price,
+                int(pair_decimals),
+                rounding=ROUND_DOWN if side == "buy" else ROUND_UP,
+            )
+            volume_str = _format_decimal(volume, int(lot_decimals))
+        except (TypeError, ValueError, InvalidOperation) as exc:
+            raise KrakenAPIError(
+                f"kraken AddOrder: cannot format price/volume for {pair!r}: {exc}"
+            ) from exc
+
+        price_q = Decimal(price_str)
+        volume_q = Decimal(volume_str)
+        if price_q != price or volume_q != volume:
+            log.info(
+                "kraken_order_precision_adjusted",
+                pair=pair,
+                price_requested=format(price, "f"),
+                price_sent=price_str,
+                volume_requested=format(volume, "f"),
+                volume_sent=volume_str,
+            )
+        if price_q <= 0 or volume_q <= 0:
+            raise KrakenAPIError(
+                f"kraken AddOrder: price/volume quantized to zero for {pair!r} "
+                f"(price={price_str} volume={volume_str}) — the request is below "
+                "the pair's published precision"
+            )
+
+        tick = _to_decimal(row.get("tick_size"))
+        if tick is not None and tick > 0 and price_q % tick != 0:
+            raise KrakenAPIError(
+                f"kraken AddOrder: price {price_str} is not a multiple of the "
+                f"{pair!r} tick_size {format(tick, 'f')}"
+            )
+
+        ordermin = _to_decimal(row.get("ordermin"))
+        if ordermin is not None and volume_q < ordermin:
+            raise KrakenAPIError(
+                f"kraken AddOrder: volume {volume_str} is below {pair!r} ordermin "
+                f"{format(ordermin, 'f')}"
+            )
+
+        costmin = _to_decimal(row.get("costmin"))
+        if costmin is not None and price_q * volume_q < costmin:
+            raise KrakenAPIError(
+                f"kraken AddOrder: cost {format(price_q * volume_q, 'f')} is below "
+                f"{pair!r} costmin {format(costmin, 'f')} — Kraken enforces costmin "
+                "independently of ordermin"
+            )
+
+        return price_str, volume_str
+
+    async def place_limit_order(
+        self,
+        *,
+        pair: str,
+        side: str,
+        price: Decimal,
+        volume: Decimal,
+        client_order_id: str,
+        validate_only: bool = False,
+    ) -> dict[str, Any]:
+        """Place ONE spot LIMIT order via ``POST /0/private/AddOrder``.
+
+        The only method in this adapter that can reach an order endpoint.
+
+        Args:
+            pair: Kraken altname (``XBTUSD``) — what AddOrder documents.
+            side: ``buy`` or ``sell``.
+            price: Limit price, quantized to the pair's ``pair_decimals``.
+            volume: Base-asset quantity, quantized to ``lot_decimals``.
+            client_order_id: Sent as ``cl_ord_id``; validated locally against
+                Kraken's documented forms first (see ``_validate_cl_ord_id``).
+            validate_only: Send ``validate=true`` — Kraken parses and checks
+                the order but never places it.
+
+        Gating: a REAL order requires ``LIVE_USE_REAL_SIGNED_REQUESTS``, the
+        same emergency-revert lever the Binance order path uses.
+        ``validate_only=True`` is exempt: it is a venue-side dry run that
+        cannot trade, and it is how the pre-trade rehearsal exercises this
+        exact code path (signing, encoding, precision, minimums) without an
+        order existing. Gating the dry run would leave the rehearsal testing
+        a different codepath than the live run, which is the failure the
+        rehearsal exists to prevent.
+
+        NOT retried. ``retry_transient=False`` is load-bearing: AddOrder is
+        not idempotent, the nonce is regenerated per attempt so Kraken cannot
+        dedup a replay, and Kraken publishes no duplicate-cl_ord_id contract.
+        A retry here is a double-order.
+
+        Returns:
+            ``{"txid": [...], "descr": {...}, "client_order_id", "pair",
+            "side", "price", "volume", "validate_only", "raw"}``.
+            ``txid`` is empty on a ``validate_only`` run — Kraken returns
+            ``descr`` alone when nothing was placed.
+
+        Raises:
+            KrakenClientOrderIdError: id malformed (local) or refused (venue).
+            KrakenAPIError: unknown/untradable pair, or a local precision /
+                ordermin / costmin / tick rejection — no HTTP POST is sent.
+            KrakenAmbiguousSubmissionError: the POST may have landed. Resolve
+                with ``resolve_order_submission``; never resend.
+        """
+        normalized_side = side.strip().lower()
+        if normalized_side not in ("buy", "sell"):
+            raise KrakenAPIError(
+                f"kraken AddOrder: side must be 'buy' or 'sell', got {side!r}"
+            )
+        _validate_cl_ord_id(client_order_id)
+        if not validate_only and not getattr(
+            self._settings, "LIVE_USE_REAL_SIGNED_REQUESTS", False
+        ):
+            raise NotImplementedError(
+                "LIVE_USE_REAL_SIGNED_REQUESTS=False — emergency-revert posture"
+            )
+        if price <= 0 or volume <= 0:
+            raise KrakenAPIError(
+                f"kraken AddOrder: price and volume must be positive, got "
+                f"price={format(price, 'f')} volume={format(volume, 'f')}"
+            )
+
+        row = await self.fetch_exchange_info_row(pair)
+        if row is None:
+            raise KrakenAPIError(f"kraken AddOrder: unknown pair {pair!r}")
+        if row.get("status") != _TRADABLE_STATUS:
+            # Fail closed, matching resolve_pair_for_symbol: cancel_only and
+            # reduce_only cannot take a new order at all, and post_only would
+            # reject this plain limit order at the matching engine.
+            raise KrakenAPIError(
+                f"kraken AddOrder: pair {pair!r} status is {row.get('status')!r}, "
+                f"not {_TRADABLE_STATUS!r}"
+            )
+        price_str, volume_str = self._prepare_order_amounts(
+            row=row,
+            pair=pair,
+            side=normalized_side,
+            price=price,
+            volume=volume,
+        )
+
+        data: dict[str, Any] = {
+            "pair": pair,
+            "type": normalized_side,
+            "ordertype": "limit",
+            "price": price_str,
+            "volume": volume_str,
+            "cl_ord_id": client_order_id,
+        }
+        if validate_only:
+            data["validate"] = "true"
+
+        log.info(
+            "kraken_order_submitting",
+            pair=pair,
+            side=normalized_side,
+            price=price_str,
+            volume=volume_str,
+            client_order_id=client_order_id,
+            validate_only=validate_only,
+        )
+        try:
+            body = await self._private_post(
+                "/0/private/AddOrder", data, retry_transient=False
+            )
+        except VenueTransientError as exc:
+            # The POST failed in a way that does NOT prove Kraken refused it:
+            # a timeout, a dropped connection, a 5xx or an HTML interstitial
+            # can all arrive after the matching engine accepted the order.
+            log.warning(
+                "kraken_order_submission_ambiguous",
+                pair=pair,
+                client_order_id=client_order_id,
+                validate_only=validate_only,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise KrakenAmbiguousSubmissionError(
+                f"kraken AddOrder for cl_ord_id={client_order_id} did not return a "
+                f"verdict ({type(exc).__name__}: {exc}) — the order may exist. "
+                "Resolve with resolve_order_submission; do NOT resend.",
+                client_order_id=client_order_id,
+            ) from exc
+
+        txids = [str(t) for t in (body.get("txid") or []) if str(t)]
+        descr = body.get("descr") if isinstance(body.get("descr"), dict) else {}
+        if validate_only:
+            if not descr:
+                raise KrakenAPIError(
+                    f"kraken AddOrder validate=true returned no descr: {body!r}"
+                )
+        elif not txids:
+            # A clean envelope with no txid violates the documented response
+            # shape, and we cannot tell whether the order exists. Treat it as
+            # ambiguous rather than as a failure a caller might retry.
+            log.warning(
+                "kraken_order_missing_txid",
+                pair=pair,
+                client_order_id=client_order_id,
+            )
+            raise KrakenAmbiguousSubmissionError(
+                f"kraken AddOrder for cl_ord_id={client_order_id} returned no error "
+                "and no txid — the order may exist. Resolve with "
+                "resolve_order_submission; do NOT resend.",
+                client_order_id=client_order_id,
+            )
+
+        log.info(
+            "kraken_order_submitted",
+            pair=pair,
+            side=normalized_side,
+            price=price_str,
+            volume=volume_str,
+            client_order_id=client_order_id,
+            validate_only=validate_only,
+            txid=txids,
+        )
+        return {
+            "txid": txids,
+            "descr": descr,
+            "client_order_id": client_order_id,
+            "pair": pair,
+            "side": normalized_side,
+            "price": price_str,
+            "volume": volume_str,
+            "validate_only": validate_only,
+            "raw": body,
+        }
+
+    # ---------------- cancel ----------------
+    async def cancel_order(
+        self,
+        *,
+        txid: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Cancel one resting order via ``POST /0/private/CancelOrder``.
+
+        Exactly one identity is required; ``txid`` wins when both are given
+        because it names a single order unambiguously, whereas ``cl_ord_id``
+        is only unique across a client's OPEN orders.
+
+        NOT gated by ``LIVE_USE_REAL_SIGNED_REQUESTS``. Cancel is the lever
+        that REDUCES exposure — a flag flip that leaves a resting live order
+        uncancellable disables the safety mechanism, which is the same
+        reasoning that keeps the withdrawal preflight ungated.
+
+        Not retried on a transient failure either, but for a different reason
+        than AddOrder: a cancel keyed by a fixed identity is safe to repeat,
+        so the transient error is surfaced to the caller (who can simply call
+        again) rather than being absorbed by a loop that hides how many
+        attempts happened during a supervised run.
+
+        An unknown or already-closed order is a SUCCESS, not a failure — the
+        post-condition ("this order is not resting") holds either way. It
+        comes back as ``already_gone=True`` with ``count=0``. The error
+        strings for that case are not in Kraken's published table (module
+        docstring, fact 14), so anything unmatched still raises.
+
+        Returns:
+            ``{"count": int, "pending": bool, "already_gone": bool,
+            "txid", "client_order_id", "raw"}``.
+        """
+        if not txid and not client_order_id:
+            raise KrakenAPIError("kraken CancelOrder: pass txid or client_order_id")
+
+        if txid:
+            data: dict[str, Any] = {"txid": txid}
+        else:
+            # CancelOrder's `txid` param accepts a txid or a userref — NOT a
+            # client order id, which is its own separate field.
+            assert client_order_id is not None
+            _validate_cl_ord_id(client_order_id)
+            data = {"cl_ord_id": client_order_id}
+
+        body = await self._private_post(
+            "/0/private/CancelOrder",
+            data,
+            tolerate_errors=_CANCEL_ALREADY_GONE_ERROR_PREFIXES,
+            retry_transient=False,
+        )
+
+        already_gone = _TOLERATED_KEY in body
+        if already_gone:
+            log.info(
+                "kraken_cancel_already_gone",
+                txid=txid,
+                client_order_id=client_order_id,
+                error=body[_TOLERATED_KEY],
+            )
+            return {
+                "count": 0,
+                "pending": False,
+                "already_gone": True,
+                "txid": txid,
+                "client_order_id": client_order_id,
+                "raw": body,
+            }
+
+        count = int(_to_float(body.get("count")) or 0)
+        log.info(
+            "kraken_cancel_ok",
+            txid=txid,
+            client_order_id=client_order_id,
+            count=count,
+            pending=bool(body.get("pending")),
+        )
+        return {
+            "count": count,
+            "pending": bool(body.get("pending")),
+            "already_gone": False,
+            "txid": txid,
+            "client_order_id": client_order_id,
+            "raw": body,
+        }
+
+    # ---------------- lookup ----------------
+    @staticmethod
+    def _map_order_status(
+        kraken_status: str, *, volume: Decimal | None, filled: Decimal | None
+    ) -> str:
+        """Kraken order status → the ``OrderConfirmation`` vocabulary.
+
+        Kraken's states are ``pending`` / ``open`` / ``closed`` / ``canceled``
+        / ``expired``. The mapping that matters is the terminal one: a
+        canceled or expired order that PARTIALLY FILLED left real inventory
+        behind, so it must surface as ``partial`` carrying the filled
+        quantity — calling it ``rejected`` (Binance's mapping for CANCELED,
+        which only ever cancels unfilled remainders after reporting the fill)
+        would tell the reconciler nothing happened while the account holds a
+        position.
+        """
+        filled_qty = filled if filled is not None else Decimal(0)
+        if kraken_status == "closed":
+            if volume is not None and 0 < filled_qty < volume:
+                return "partial"
+            return "filled" if filled_qty > 0 else "rejected"
+        if kraken_status in ("canceled", "expired"):
+            return "partial" if filled_qty > 0 else "rejected"
+        # pending / open — and anything unrecognised, which must not be
+        # mistaken for terminal.
+        return "pending"
+
+    @staticmethod
+    def _avg_fill_price(row: dict[str, Any]) -> float | None:
+        """Volume-weighted fill price for an order row.
+
+        ``cost / vol_exec`` is the definitive VWAP (both are execution
+        fields). The top-level ``price`` — Kraken's own average executed
+        price, distinct from ``descr.price``, the limit price — is the
+        fallback for rows where cost is absent.
+        """
+        cost = _to_decimal(row.get("cost"))
+        filled = _to_decimal(row.get("vol_exec"))
+        if cost is not None and filled is not None and cost > 0 and filled > 0:
+            return float(cost / filled)
+        price = _to_decimal(row.get("price"))
+        if price is not None and price > 0:
+            return float(price)
+        return None
+
+    def _confirmation_from_order(
+        self, txid: str | None, row: dict[str, Any], *, client_order_id: str
+    ) -> OrderConfirmation:
+        """Build an ``OrderConfirmation`` from a Kraken order row."""
+        volume = _to_decimal(row.get("vol"))
+        filled = _to_decimal(row.get("vol_exec"))
+        status = self._map_order_status(
+            str(row.get("status", "")), volume=volume, filled=filled
+        )
+        fill_price = (
+            self._avg_fill_price(row) if status in ("filled", "partial") else None
+        )
+        return OrderConfirmation(
+            venue=self.venue_name,
+            venue_order_id=str(txid) if txid else None,
+            client_order_id=client_order_id,
+            status=status,
+            filled_qty=float(filled) if filled is not None else None,
+            fill_price=fill_price,
+            raw_response=row,
+        )
+
+    @staticmethod
+    def _find_order_by_cl_ord_id(
+        body: dict[str, Any], container: str, client_order_id: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Find ``client_order_id`` in an OpenOrders/ClosedOrders payload.
+
+        The server-side ``cl_ord_id`` filter is re-checked client-side ON
+        PURPOSE. Kraken ignores unrecognised parameters rather than erroring,
+        so if the filter were ever dropped the reply would be the account's
+        FULL order list — and trusting the filter would hand back a stranger's
+        order as ours, which on a reconciliation path means confirming a fill
+        that never happened.
+        """
+        orders = body.get(container)
+        if not isinstance(orders, dict):
+            return None
+        for txid, row in orders.items():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("cl_ord_id", "")) != client_order_id:
+                continue
+            return str(txid), row
+        return None
 
     async def fetch_order_by_client_id(
         self, *, pair: str, client_order_id: str
     ) -> OrderConfirmation | None:
-        raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
+        """Find an order by ``cl_ord_id``, or ``None`` if Kraken has no such order.
+
+        Checks OpenOrders then ClosedOrders — the only two endpoints that
+        accept a client-id filter (module docstring, fact 13). ``pair`` is
+        accepted for ABC compatibility and is NOT used to filter: Kraken's
+        lookup is account-wide by client id, and narrowing on the pair string
+        could only turn a real match into a false ``None``.
+
+        NOT gated by ``LIVE_USE_REAL_SIGNED_REQUESTS`` (unlike the Binance
+        implementation). This is a read, and it is the read a supervised
+        operator needs most precisely when the flag has been flipped off
+        mid-incident to stop new orders.
+        """
+        for path, container in _CL_ORD_ID_LOOKUPS:
+            body = await self._private_post(path, {"cl_ord_id": client_order_id})
+            found = self._find_order_by_cl_ord_id(body, container, client_order_id)
+            if found is not None:
+                txid, row = found
+                return self._confirmation_from_order(
+                    txid, row, client_order_id=client_order_id
+                )
+        return None
+
+    # ---------------- ambiguous-submission resolution ----------------
+    async def resolve_order_submission_detail(
+        self, *, client_order_id: str
+    ) -> dict[str, Any]:
+        """Probe every client-id-addressable endpoint and record what each said.
+
+        The structured companion to ``resolve_order_submission``: same probes,
+        but returns the full evidence record for the pilot's authorization log
+        rather than just the verdict.
+
+        Verdict rules:
+        - found in ANY probe            → ``accepted``
+        - EVERY probe answered, none found → ``not_accepted``
+        - ANY probe failed              → ``unresolved``
+
+        ``not_accepted`` requires every probe to have SUCCEEDED and come back
+        empty. A failed probe can never contribute to it — "we could not look"
+        and "we looked and it is not there" are different facts, and only the
+        second one makes a resend safe.
+
+        Both probes run even after a hit, so the record shows what each
+        endpoint said. An order found in OpenOrders being absent from
+        ClosedOrders is the normal, expected shape.
+        """
+        probes: list[dict[str, Any]] = []
+        txids: list[str] = []
+        any_found = False
+        any_failed = False
+
+        for path, container in _CL_ORD_ID_LOOKUPS:
+            try:
+                body = await self._private_post(path, {"cl_ord_id": client_order_id})
+            except Exception as exc:
+                any_failed = True
+                probes.append(
+                    {
+                        "probe": path,
+                        "outcome": "error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                log.warning(
+                    "kraken_submission_probe",
+                    probe=path,
+                    client_order_id=client_order_id,
+                    outcome="error",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                continue
+
+            found = self._find_order_by_cl_ord_id(body, container, client_order_id)
+            if found is None:
+                probes.append({"probe": path, "outcome": "absent"})
+                log.info(
+                    "kraken_submission_probe",
+                    probe=path,
+                    client_order_id=client_order_id,
+                    outcome="absent",
+                )
+                continue
+
+            any_found = True
+            txids.append(found[0])
+            probes.append({"probe": path, "outcome": "found", "txid": found[0]})
+            log.info(
+                "kraken_submission_probe",
+                probe=path,
+                client_order_id=client_order_id,
+                outcome="found",
+                txid=found[0],
+            )
+
+        if any_found:
+            verdict = "accepted"
+        elif any_failed:
+            verdict = "unresolved"
+        else:
+            verdict = "not_accepted"
+
+        detail = {
+            "verdict": verdict,
+            "client_order_id": client_order_id,
+            "txid": txids,
+            "probes": probes,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        log.info(
+            "kraken_submission_resolved",
+            client_order_id=client_order_id,
+            verdict=verdict,
+            txid=txids,
+        )
+        return detail
+
+    async def resolve_order_submission(
+        self, *, client_order_id: str
+    ) -> Literal["accepted", "not_accepted", "unresolved"]:
+        """Decide whether an ambiguous ``AddOrder`` actually landed.
+
+        The mandatory follow-up to ``KrakenAmbiguousSubmissionError``.
+
+        The verdict is derived ONLY from what Kraken reports now — the
+        original send's failure is never evidence. A timeout, a 502 and a
+        dropped connection are all compatible with the order having been
+        accepted, so inferring ``not_accepted`` from the send failure is
+        exactly the reasoning that produces a duplicate live order.
+
+        See ``resolve_order_submission_detail`` for the per-probe record.
+        """
+        detail = await self.resolve_order_submission_detail(
+            client_order_id=client_order_id
+        )
+        verdict: Literal["accepted", "not_accepted", "unresolved"] = detail["verdict"]
+        return verdict
+
+    # ---------------- fills ----------------
+    async def fetch_order_fills(self, *, txid: str) -> list[dict[str, Any]]:
+        """Per-fill price / quantity / fee for one order, for the evidence pack.
+
+        Two hops, because Kraken splits them: ``QueryOrders(trades=true)``
+        returns the order's trade-id array, then ``QueryTrades`` resolves
+        those ids into executions. Trade ids are chunked to Kraken's
+        documented 20-per-call ceiling.
+
+        Every numeric is returned as a fixed-point Decimal STRING, not a
+        float — these rows are the fee/price record for a real trade, and
+        binary floats round them.
+
+        Returns ``[]`` when the order has no executions. Fills come back in
+        the order Kraken listed them on the order row.
+        """
+        body = await self._private_post(
+            "/0/private/QueryOrders", {"txid": txid, "trades": "true"}
+        )
+        row = body.get(txid)
+        if not isinstance(row, dict):
+            row = next((v for v in body.values() if isinstance(v, dict)), None)
+        if row is None:
+            log.info("kraken_order_fills_no_order", txid=txid)
+            return []
+
+        trade_ids = [str(t) for t in (row.get("trades") or []) if str(t)]
+        if not trade_ids:
+            return []
+
+        by_id: dict[str, Any] = {}
+        for start in range(0, len(trade_ids), _MAX_QUERY_TRADES_IDS):
+            chunk = trade_ids[start : start + _MAX_QUERY_TRADES_IDS]
+            chunk_body = await self._private_post(
+                "/0/private/QueryTrades", {"txid": ",".join(chunk)}
+            )
+            by_id.update(chunk_body)
+
+        fills: list[dict[str, Any]] = []
+        for trade_id in trade_ids:
+            trade = by_id.get(trade_id)
+            if not isinstance(trade, dict):
+                log.warning("kraken_order_fill_missing", txid=txid, trade_id=trade_id)
+                continue
+            fills.append(
+                {
+                    "trade_id": trade_id,
+                    "ordertxid": str(trade.get("ordertxid") or "") or None,
+                    "pair": str(trade.get("pair") or "") or None,
+                    "time": trade.get("time"),
+                    "type": str(trade.get("type") or "") or None,
+                    "ordertype": str(trade.get("ordertype") or "") or None,
+                    "price": _decimal_str(trade.get("price")),
+                    "cost": _decimal_str(trade.get("cost")),
+                    "fee": _decimal_str(trade.get("fee")),
+                    "vol": _decimal_str(trade.get("vol")),
+                    "maker": trade.get("maker"),
+                }
+            )
+        log.info("kraken_order_fills", txid=txid, fill_count=len(fills))
+        return fills
+
+    # ---------------- fill confirmation ----------------
+    async def await_fill_confirmation(
+        self, *, venue_order_id: str, client_order_id: str, timeout_sec: float
+    ) -> OrderConfirmation:
+        """Poll until the order is terminal or ``timeout_sec`` elapses.
+
+        Never raises on timeout — returns ``status='timeout'``, matching the
+        Binance implementation, so the caller writes a needs-manual-review
+        row rather than handling an exception on a path where the money has
+        already moved.
+
+        Polls ``QueryOrders`` by txid when ``venue_order_id`` is known (the
+        precise, single-order lookup) and falls back to the OpenOrders /
+        ClosedOrders client-id path when it is not — which is the state after
+        an ambiguous submission that ``resolve_order_submission`` has not yet
+        turned into a txid.
+
+        Poll interval is ``KRAKEN_FILL_POLL_INTERVAL_SEC``. A failed poll ends
+        the loop rather than burning the remaining window on an endpoint that
+        just refused us; the result is ``timeout``, i.e. unresolved, which is
+        the honest answer.
+        """
+        interval = float(getattr(self._settings, "KRAKEN_FILL_POLL_INTERVAL_SEC", 2.0))
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + float(timeout_sec)
+        last_row: dict[str, Any] | None = None
+
+        while loop.time() < deadline:
+            try:
+                conf = await self._poll_order_state(
+                    venue_order_id=venue_order_id, client_order_id=client_order_id
+                )
+            except (KrakenAPIError, KrakenRateLimitError, VenueTransientError) as exc:
+                log.warning(
+                    "kraken_await_fill_poll_failed",
+                    client_order_id=client_order_id,
+                    venue_order_id=venue_order_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                break
+
+            if conf is not None:
+                last_row = conf.raw_response
+                if conf.status in ("filled", "partial", "rejected"):
+                    return conf
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+
+        log.warning(
+            "kraken_await_fill_timeout",
+            client_order_id=client_order_id,
+            venue_order_id=venue_order_id,
+            timeout_sec=timeout_sec,
+        )
+        return OrderConfirmation(
+            venue=self.venue_name,
+            venue_order_id=venue_order_id or None,
+            client_order_id=client_order_id,
+            status="timeout",
+            filled_qty=None,
+            fill_price=None,
+            raw_response=last_row,
+        )
+
+    async def _poll_order_state(
+        self, *, venue_order_id: str, client_order_id: str
+    ) -> OrderConfirmation | None:
+        """One order-state read, by txid when available else by client id."""
+        if not venue_order_id:
+            return await self.fetch_order_by_client_id(
+                pair="", client_order_id=client_order_id
+            )
+        body = await self._private_post(
+            "/0/private/QueryOrders", {"txid": venue_order_id, "trades": "true"}
+        )
+        row = body.get(venue_order_id)
+        if not isinstance(row, dict):
+            row = next((v for v in body.values() if isinstance(v, dict)), None)
+        if not isinstance(row, dict):
+            return None
+        return self._confirmation_from_order(
+            venue_order_id, row, client_order_id=client_order_id
+        )
 
     async def close(self) -> None:
         """Close the underlying aiohttp session, if one was created."""
@@ -1008,6 +1939,27 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    """Best-effort Decimal; ``None`` on missing or malformed input.
+
+    The exact-arithmetic counterpart to ``_to_float`` — used wherever a
+    Kraken number feeds an order decision (minimums, tick multiples, VWAP)
+    rather than a display or gate threshold.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+
+
+def _decimal_str(value: Any) -> str | None:
+    """Kraken number → fixed-point string, or ``None`` if unparseable."""
+    parsed = _to_decimal(value)
+    return format(parsed, "f") if parsed is not None else None
 
 
 def _decimals_to_step(decimals: Any) -> float | None:
