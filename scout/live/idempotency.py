@@ -103,30 +103,39 @@ async def record_pending_order(
     level dedup query will still fail with IntegrityError on the
     constraint.
 
+    The INSERT + commit run under ``db._txn_lock``, the project-wide
+    transaction-serialization discipline: the connection is shared, so an
+    unlocked ``commit()`` here also commits whatever half-built transaction
+    another coroutine has open on the same connection. ``_txn_lock`` is NOT
+    reentrant — every caller must therefore invoke this WITHOUT already
+    holding it (the only in-tree caller, ``binance_adapter.place_order_request``,
+    takes the lock separately for its later UPDATE).
+
     Returns the inserted live_trades.id.
     """
-    if db._conn is None:
+    if db._conn is None or db._txn_lock is None:
         raise RuntimeError("Database not initialized.")
     from datetime import datetime, timezone
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    cur = await db._conn.execute(
-        """INSERT INTO live_trades
-           (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
-            size_usd, mid_at_entry, status, client_order_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-        (
-            paper_trade_id,
-            coin_id,
-            symbol,
-            venue,
-            pair,
-            signal_type,
-            size_usd,
-            mid_at_entry,
-            client_order_id,
-            now_iso,
-        ),
-    )
-    await db._conn.commit()
-    return cur.lastrowid or 0
+    async with db._txn_lock:
+        cur = await db._conn.execute(
+            """INSERT INTO live_trades
+               (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
+                size_usd, mid_at_entry, status, client_order_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+            (
+                paper_trade_id,
+                coin_id,
+                symbol,
+                venue,
+                pair,
+                signal_type,
+                size_usd,
+                mid_at_entry,
+                client_order_id,
+                now_iso,
+            ),
+        )
+        await db._conn.commit()
+        return cur.lastrowid or 0
