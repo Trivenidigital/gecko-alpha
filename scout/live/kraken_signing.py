@@ -33,11 +33,11 @@ never leave the call stack.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
+import threading
 import time
 
 
@@ -78,7 +78,11 @@ def sign_kraken_request(
         KrakenSigningError: ``api_secret_b64`` is not valid base64.
     """
     try:
-        secret_bytes = base64.b64decode(api_secret_b64, validate=True)
+        # .strip() first: a secret pasted into .env commonly carries a
+        # trailing newline or space, which validate=True would reject as
+        # malformed. Stripping means we only fail loud on a genuinely bad
+        # secret, never on invisible whitespace.
+        secret_bytes = base64.b64decode(api_secret_b64.strip(), validate=True)
     except (binascii.Error, ValueError) as exc:
         raise KrakenSigningError(
             "KRAKEN_API_SECRET is not valid base64 — re-copy the private key "
@@ -102,8 +106,15 @@ class KrakenNonce:
     including when the clock moves BACKWARDS (NTP step), which is the failure
     mode that otherwise locks a key out until real time catches up.
 
-    Serialized by an ``asyncio.Lock`` so concurrent coroutines can never
-    observe the same counter value.
+    Serialized by a ``threading.Lock``, NOT an ``asyncio.Lock``. Two reasons:
+    an instance is shared process-wide across every adapter using the same
+    API key (see ``get_nonce_source``), so it may legitimately be reached
+    from more than one event loop — and an ``asyncio.Lock`` binds to the
+    first loop that awaits it, which would raise on the second. The critical
+    section is a clock read, a compare and an assignment with no ``await``
+    inside it, so it cannot block the loop; on a single loop it is already
+    atomic and the lock only matters for genuine cross-thread access, which
+    is exactly what ``threading.Lock`` covers and ``asyncio.Lock`` does not.
     """
 
     def __init__(self, *, start: int | None = None) -> None:
@@ -113,7 +124,7 @@ class KrakenNonce:
             an explicit seed to exercise the clock-not-advanced path.
         """
         self._last: int = start if start is not None else 0
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
 
     async def next(self) -> str:
         """Return the next nonce as a decimal string.
@@ -121,9 +132,59 @@ class KrakenNonce:
         Strictly greater than every value previously returned by this
         instance, for any interleaving of concurrent callers.
         """
-        async with self._lock:
+        with self._lock:
             candidate = int(time.time() * 1000)
             if candidate <= self._last:
                 candidate = self._last + 1
             self._last = candidate
             return str(candidate)
+
+
+# ----------------------------------------------------------------------
+# Process-wide nonce registry.
+#
+# Kraken counts nonces PER API KEY, requires them ever-increasing, and
+# cannot reset them. A per-adapter-instance counter therefore breaks the
+# moment two adapters share a key: both seed from the same wall clock and
+# emit colliding values, and the loser gets EAPI:Invalid nonce (or, after
+# enough of them, EGeneral:Temporary lockout on the whole key).
+#
+# Keyed by a fingerprint of the API key rather than the key itself so the
+# registry is safe to inspect and log.
+# ----------------------------------------------------------------------
+_NONCE_SOURCES: dict[str, KrakenNonce] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+
+def key_fingerprint(api_key: str) -> str:
+    """Stable, non-reversible id for an API key — safe to log.
+
+    Truncated SHA-256. Only ever used to partition nonce counters, so
+    collision resistance at 64 bits is far beyond what's needed.
+    """
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+
+
+def get_nonce_source(fingerprint: str) -> KrakenNonce:
+    """Return THE process-wide nonce source for ``fingerprint``.
+
+    Every adapter instance authenticating with the same API key draws from
+    one monotonic counter, so nonces are globally increasing per key no
+    matter how many adapters, engines or loops exist in the process.
+    """
+    with _REGISTRY_LOCK:
+        source = _NONCE_SOURCES.get(fingerprint)
+        if source is None:
+            source = KrakenNonce()
+            _NONCE_SOURCES[fingerprint] = source
+        return source
+
+
+def reset_nonce_sources_for_tests() -> None:
+    """Drop every registered nonce source. Tests only.
+
+    The registry is deliberately process-global, which would otherwise leak
+    counter state between tests.
+    """
+    with _REGISTRY_LOCK:
+        _NONCE_SOURCES.clear()

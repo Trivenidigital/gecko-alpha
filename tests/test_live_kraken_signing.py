@@ -13,6 +13,9 @@ import pytest
 from scout.live.kraken_signing import (
     KrakenNonce,
     KrakenSigningError,
+    get_nonce_source,
+    key_fingerprint,
+    reset_nonce_sources_for_tests,
     sign_kraken_request,
 )
 
@@ -120,3 +123,60 @@ async def test_nonce_returns_decimal_strings():
     value = await KrakenNonce().next()
     assert value.isdigit()
     assert int(value) > 0
+
+
+def test_secret_with_surrounding_whitespace_signs_identically():
+    """A secret pasted into .env commonly carries a trailing newline.
+    validate=True would reject it as malformed, so we strip first — the
+    signature must be byte-identical to the clean secret's."""
+    clean = sign_kraken_request(_DOC_URI_PATH, _DOC_POST_DATA, _DOC_NONCE, _DOC_SECRET)
+    for dirty in (f"{_DOC_SECRET}\n", f"  {_DOC_SECRET}", f"\t{_DOC_SECRET}\r\n"):
+        assert (
+            sign_kraken_request(_DOC_URI_PATH, _DOC_POST_DATA, _DOC_NONCE, dirty)
+            == clean
+        )
+    assert clean == _DOC_EXPECTED_SIGN
+
+
+def test_genuinely_malformed_secret_still_raises_after_strip():
+    """Stripping must not soften the validation — only whitespace is forgiven."""
+    with pytest.raises(KrakenSigningError):
+        sign_kraken_request(
+            _DOC_URI_PATH, _DOC_POST_DATA, _DOC_NONCE, "  not@base64!  "
+        )
+
+
+# ---------- process-wide nonce registry ----------
+
+
+def test_get_nonce_source_returns_same_instance_per_fingerprint():
+    reset_nonce_sources_for_tests()
+    assert get_nonce_source("fp-a") is get_nonce_source("fp-a")
+    assert get_nonce_source("fp-a") is not get_nonce_source("fp-b")
+
+
+@pytest.mark.asyncio
+async def test_shared_source_is_monotonic_across_independent_holders():
+    """Two callers that each looked the source up separately still draw from
+    one counter — this is what stops two adapters colliding on one API key."""
+    reset_nonce_sources_for_tests()
+    fp = key_fingerprint("shared-key")
+    a, b = get_nonce_source(fp), get_nonce_source(fp)
+    values = []
+    for _ in range(50):
+        values.append(int(await a.next()))
+        values.append(int(await b.next()))
+    assert len(set(values)) == len(values)
+    assert values == sorted(values)
+
+
+@pytest.mark.asyncio
+async def test_separate_instances_would_collide_regression_guard():
+    """Demonstrates the defect the registry exists to prevent: two
+    INDEPENDENT KrakenNonce objects seed from the same wall clock and emit
+    duplicates. If this ever stops colliding the registry is still correct,
+    but the shared-source tests above are what actually protect the key."""
+    a, b = KrakenNonce(), KrakenNonce()
+    values = [int(await a.next()) for _ in range(25)]
+    values += [int(await b.next()) for _ in range(25)]
+    assert len(set(values)) < len(values), "expected independent counters to collide"
