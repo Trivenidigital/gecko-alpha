@@ -22,6 +22,7 @@ import pytest
 from aioresponses import aioresponses
 
 from scout.config import Settings
+from scout.live import kraken_adapter
 from scout.live.exceptions import VenueTransientError
 from scout.live.kraken_adapter import (
     KrakenAmbiguousSubmissionError,
@@ -699,7 +700,7 @@ async def test_http_4xx_error_does_not_carry_signed_headers():
     with aioresponses() as m:
         _mock_assetpairs(m)
         m.post(_ADD_ORDER_URL, status=403, body="forbidden", repeat=True)
-        with pytest.raises(Exception) as excinfo:
+        with pytest.raises(KrakenAmbiguousSubmissionError) as excinfo:
             await adapter.place_limit_order(
                 pair="XBTUSD",
                 side="buy",
@@ -711,6 +712,80 @@ async def test_http_4xx_error_does_not_carry_signed_headers():
         assert not isinstance(excinfo.value, aiohttp.ClientResponseError)
         assert "LIVEKEY123" not in rendered
         assert "API-Sign" not in rendered
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403, 408])
+async def test_post_add_order_4xx_is_ambiguous_not_definitive(status):
+    """K2-1. A 4xx status line is NOT Kraken refusing the order — Kraken
+    signals refusal as HTTP 200 + a non-empty `error` list. A proxy 400, a
+    408 or a 499 is compatible with the POST having been relayed onward, so
+    it cannot meet the definitive-refusal contract."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(_ADD_ORDER_URL, status=status, body="nope", repeat=True)
+        with pytest.raises(KrakenAmbiguousSubmissionError) as excinfo:
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+            )
+        assert excinfo.value.client_order_id == _CID
+        assert len(_calls_to(m, _ADD_ORDER_URL)) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [[], [{"txid": ["X"]}], "a string", 42])
+async def test_post_add_order_non_object_json_is_ambiguous(payload):
+    """K2-1. Every Kraken reply is the object {"error":[...],"result":{...}}.
+    A bare array or scalar on a 200 is an injected or rewritten body, not the
+    matching engine deciding anything."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(_ADD_ORDER_URL, status=200, payload=payload, repeat=True)
+        with pytest.raises(KrakenAmbiguousSubmissionError) as excinfo:
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+            )
+        assert excinfo.value.client_order_id == _CID
+        assert len(_calls_to(m, _ADD_ORDER_URL)) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_read_path_4xx_raises_transient_without_retrying():
+    """The same reclassification on a read path: a 4xx now surfaces as
+    VenueTransientError rather than KrakenAPIError. Raised immediately, not
+    through the backoff loop — a 4xx is deterministic, and the branch is
+    shared with the signed non-idempotent POST where a retry is a
+    double-order."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(_ASSETPAIRS_RE, status=400, body="bad request", repeat=True)
+        with pytest.raises(VenueTransientError):
+            await adapter.fetch_exchange_info_row("XBTUSD")
+        assert len(_calls(m)) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_read_path_non_object_json_raises_transient_without_retrying():
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(_ASSETPAIRS_RE, status=200, payload=["not", "an", "object"], repeat=True)
+        with pytest.raises(VenueTransientError):
+            await adapter.fetch_exchange_info_row("XBTUSD")
+        assert len(_calls(m)) == 1
     await adapter.close()
 
 
@@ -956,6 +1031,21 @@ async def test_lookup_raises_rather_than_returning_none_on_unsearchable_payload(
         )
         with pytest.raises(KrakenAPIError, match="could not be searched"):
             await adapter.fetch_order_by_client_id(pair="XBTUSD", client_order_id=_CID)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_with_zero_probes_is_unresolved(monkeypatch):
+    """A sweep that asked nothing proves nothing. Only reachable by emptying
+    _CL_ORD_ID_LOOKUPS, but zero evidence must never reach not_accepted —
+    the verdict that licenses a resend."""
+    monkeypatch.setattr(kraken_adapter, "_CL_ORD_ID_LOOKUPS", ())
+    adapter = _adapter()
+    with aioresponses() as m:
+        detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
+        assert len(_calls(m)) == 0
+    assert detail["verdict"] == "unresolved"
+    assert detail["probes"] == []
     await adapter.close()
 
 

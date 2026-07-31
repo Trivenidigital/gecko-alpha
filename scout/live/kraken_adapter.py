@@ -686,12 +686,26 @@ class KrakenSpotAdapter(ExchangeAdapter):
                         raise last_exc
 
                     if resp.status >= 400:
-                        # NOT resp.raise_for_status(). Its ClientResponseError
-                        # carries request_info, whose repr renders the request
-                        # headers — including this call's live API-Key and
-                        # API-Sign. Any caller that logs repr(exc) would write
-                        # credentials to disk. Raise a string we control.
-                        raise KrakenAPIError(f"kraken {path}: HTTP {resp.status}")
+                        # Non-429 4xx. NOT a Kraken refusal: Kraken signals
+                        # application-level rejection as HTTP 200 + a non-empty
+                        # `error` list, so a 4xx status line did not come from
+                        # the matching engine deciding anything. A proxy 400,
+                        # a 408 Request Timeout or a 499 is fully compatible
+                        # with the POST having been relayed onward, which is
+                        # why this is transient (hence AMBIGUOUS on the order
+                        # path) rather than definitive.
+                        #
+                        # Raised immediately, never retried: re-sending a
+                        # signed non-idempotent POST at something answering
+                        # 4xx is the double-order shape.
+                        #
+                        # Also NOT resp.raise_for_status(): its
+                        # ClientResponseError carries request_info, whose repr
+                        # renders the request headers — including this call's
+                        # live API-Key and API-Sign. Any caller logging
+                        # repr(exc) would write credentials to disk. The
+                        # message here is a string we control.
+                        raise VenueTransientError(f"kraken {path}: HTTP {resp.status}")
 
                     ctype = resp.headers.get("Content-Type", "")
                     if "html" in ctype.lower():
@@ -708,7 +722,15 @@ class KrakenSpotAdapter(ExchangeAdapter):
                     payload = await resp.json(content_type=None)
 
                 if not isinstance(payload, dict):
-                    raise KrakenAPIError(
+                    # Well-formed JSON that is not an object. EVERY Kraken
+                    # reply, success or failure, is the object
+                    # {"error": [...], "result": {...}} — so a bare array or
+                    # scalar is not Kraken deciding anything, it is an
+                    # injected or rewritten body. Transient (hence AMBIGUOUS
+                    # on the order path) rather than definitive, and raised
+                    # immediately rather than retried, for the same reason as
+                    # the 4xx branch above.
+                    raise VenueTransientError(
                         f"kraken {path}: unexpected response type "
                         f"{type(payload).__name__}"
                     )
@@ -1883,6 +1905,12 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 client_order_id=client_order_id, sweep=sweep_index
             )
             sweeps.append(probes)
+            if not probes:
+                # A sweep that asked nothing proves nothing. Only reachable if
+                # _CL_ORD_ID_LOOKUPS is emptied, but zero evidence must never
+                # reach the verdict that licenses a resend.
+                verdict = "unresolved"
+                break
             txids.extend(str(p["txid"]) for p in probes if p["outcome"] == "found")
             if any(p["outcome"] == "found" for p in probes):
                 verdict = "accepted"
