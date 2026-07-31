@@ -601,15 +601,29 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 non-idempotent POST is a double-order risk, and the nonce is
                 regenerated per attempt so Kraken cannot dedup it.
 
-        Retry taxonomy:
+        Retry taxonomy. The split that matters is DEFINITIVE vs AMBIGUOUS,
+        because ``place_limit_order`` treats a ``KrakenAPIError`` as proof the
+        order was refused and anything else as "it may exist". Only Kraken's
+        own error envelope (HTTP 200 + a non-empty ``error`` list) is a venue
+        decision; every other anomaly is transport of unknown provenance and
+        must be transient so the order path can classify it ambiguous.
+
         - network error / timeout      → retry, then ``VenueTransientError``
         - HTTP 5xx (incl. Cloudflare 520-529) → retry, then ``VenueTransientError``
         - HTTP 429                     → ``KrakenRateLimitError`` (no retry)
+        - HTTP 3xx (signed POST only)  → ``VenueTransientError``, raised
+          immediately (never followed — see the signed-POST branch)
+        - other HTTP 4xx               → ``VenueTransientError``, raised
+          immediately. NOT a Kraken refusal: refusals arrive as HTTP 200.
+        - HTML body on a 200           → retry, then ``VenueTransientError``
+        - non-object JSON on a 200     → ``VenueTransientError``, raised
+          immediately. Every Kraken reply is an object.
         - HTTP 200 + empty error list  → return ``result``
         - ``EService:*`` / internal    → retry, then ``VenueTransientError``
         - auth-class errors            → ``KrakenAuthError`` (NEVER retried)
         - ``EGeneral:Permission denied``→ ``KrakenPermissionError`` (no retry)
         - rate-limit errors            → ``KrakenRateLimitError`` (no retry)
+        - errors naming ``cl_ord_id``  → ``KrakenClientOrderIdError`` (no retry)
         - any other non-empty error    → ``KrakenAPIError`` (no retry)
 
         Return-shape caveat: a few Kraken endpoints send ``result`` as a JSON
