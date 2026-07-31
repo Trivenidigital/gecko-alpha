@@ -586,6 +586,9 @@ async def test_place_refuses_a_transaction_that_pays_a_stranger(tmp_path):
     assert inspection["passed"] is False
     # Every check is recorded, passed or failed — the evidence shows what was
     # proved, not just what broke.
+    # A floor, not the exact count: the inspector gains checks over time and
+    # this test is about the evidence carrying all of them, not about how
+    # many there are today.
     assert len(inspection["checks"]) >= 15
     await session.close()
     await db.close()

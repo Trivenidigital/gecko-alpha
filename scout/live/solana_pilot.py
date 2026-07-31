@@ -23,7 +23,7 @@ to the evidence file before the next one starts:
 5.  Jupiter quote
 6.  quote envelope (USD band on the USDC out, price impact, slippage, mints)
 7.  Jupiter build (unsigned) with the Jito tip requested
-8.  tx_inspector — 15 checks against the transaction's own bytes
+8.  tx_inspector — every check it can make against the transaction's own bytes
 9.  balance cover (swap + fees + ATA rent + headroom)
 10. independent RPC simulation
 11. LOCAL SIGNING, in memory — this derives the expected signature
