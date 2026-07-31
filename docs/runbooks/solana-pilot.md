@@ -147,6 +147,8 @@ rehearsal until you know where each field is; on the real run, expect to have
 
 ## Exit codes
 
+For `place`:
+
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | The swap landed and reconciled, or nothing was outstanding | Nothing. The USDC is yours to dispose of; the ledger row stays `open` until you do. |
@@ -154,6 +156,16 @@ rehearsal until you know where each field is; on the real run, expect to have
 | 2 | Lane blocked — an unresolved prior signature, or another run holds the lock | Resolve what it names. Do not place anything. |
 | 3 | **Unresolved submission**, or an unexpected failure | State is UNKNOWN. See rule 1 below. |
 | 4 | The swap executed but the balance move could not be explained | Check the wallet before the next run. Read the `reconciliation` record. |
+
+`resolve` reuses the same codes for its own verdict, so read them differently:
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| 0 | `definitively_not_submitted` | Can never land. Row retired, lane clear, a fresh `place` is safe. |
+| 2 | `landed` or `failed_on_chain` | Terminal but needs your disposition — a position to close, or a paid fee to record. The row stays. |
+| 3 | `unresolved` | Still unknown. Run it again later. Do not rebuild. |
+
+`status` exits 0 whatever it finds; read its output, not its code.
 
 ## The three rules for trade day
 
