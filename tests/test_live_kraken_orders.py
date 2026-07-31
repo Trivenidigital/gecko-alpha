@@ -17,6 +17,7 @@ import re
 from decimal import Decimal
 from urllib.parse import parse_qs
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
 
@@ -69,6 +70,10 @@ def _settings(**overrides):
         KRAKEN_API_SECRET=_TEST_SECRET,
         LIVE_USE_REAL_SIGNED_REQUESTS=True,
         KRAKEN_FILL_POLL_INTERVAL_SEC=0.01,
+        # Real settle delay would add 3s to every resolver test; the two-sweep
+        # requirement itself is asserted in
+        # test_resolve_requires_two_clean_sweeps_before_not_accepted.
+        KRAKEN_SUBMISSION_SETTLE_SEC=0.0,
     )
     base.update(overrides)
     return Settings(_env_file=None, **_REQUIRED, **base)
@@ -598,6 +603,94 @@ async def test_service_unavailable_on_add_order_is_ambiguous_and_not_retried():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        # None of these inherit from ClientConnectorError — the connect-phase
+        # error that is the ONLY provably-nothing-was-sent case. Every one of
+        # them can occur after the POST reached Kraken.
+        lambda: aiohttp.ServerDisconnectedError(),
+        lambda: aiohttp.ClientOSError(104, "Connection reset by peer"),
+        lambda: aiohttp.ClientConnectionResetError("cannot write to closing"),
+        lambda: aiohttp.ClientPayloadError("response payload is not completed"),
+    ],
+)
+async def test_midflight_transport_failures_are_ambiguous(exc_factory):
+    """ClientPayloadError is the clearest of these: the headers already
+    arrived, so the request PROVABLY reached Kraken and only the body read
+    failed. Narrow exception handling let all of these escape unclassified."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(_ADD_ORDER_URL, exception=exc_factory(), repeat=True)
+        with pytest.raises(KrakenAmbiguousSubmissionError) as excinfo:
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+            )
+        assert excinfo.value.client_order_id == _CID
+        assert len(_calls_to(m, _ADD_ORDER_URL)) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_signed_post_does_not_follow_redirects():
+    """aiohttp follows 307/308 by re-sending the same method AND body — a
+    second AddOrder transmission inside one attempt, invisible to
+    retry_transient=False — and forwards every header it did not strip, which
+    does not include API-Key/API-Sign."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(
+            _ADD_ORDER_URL,
+            status=307,
+            headers={"Location": "https://evil.example/0/private/AddOrder"},
+            body="",
+            repeat=True,
+        )
+        with pytest.raises(KrakenAmbiguousSubmissionError):
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+            )
+        add_order_calls = _calls_to(m, _ADD_ORDER_URL)
+        assert len(add_order_calls) == 1
+        assert add_order_calls[0].kwargs.get("allow_redirects") is False
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_http_4xx_error_does_not_carry_signed_headers():
+    """aiohttp's ClientResponseError repr embeds request_info.headers, i.e.
+    the live API-Key and API-Sign. _request raises a string it controls
+    instead, so a caller logging repr(exc) cannot leak credentials."""
+    adapter = _adapter(KRAKEN_API_KEY="LIVEKEY123")
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(_ADD_ORDER_URL, status=403, body="forbidden", repeat=True)
+        with pytest.raises(Exception) as excinfo:
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+            )
+        rendered = f"{excinfo.value!r} {excinfo.value!s}"
+        assert not isinstance(excinfo.value, aiohttp.ClientResponseError)
+        assert "LIVEKEY123" not in rendered
+        assert "API-Sign" not in rendered
+    await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_clean_envelope_without_txid_is_ambiguous():
     """No error and no txid violates the documented shape — the order may
     exist, so it must not come back as a plain failure a caller would retry."""
@@ -625,8 +718,17 @@ async def test_clean_envelope_without_txid_is_ambiguous():
 # ======================================================================
 
 
-def _mock_probe(m: aioresponses, url: str, orders: dict, key: str) -> None:
-    m.post(url, status=200, payload={"error": [], "result": {key: orders, "count": 0}})
+def _mock_probe(
+    m: aioresponses, url: str, orders: dict, key: str, *, repeat: bool = True
+) -> None:
+    """Register a probe reply. repeat=True by default because
+    resolve_order_submission sweeps every endpoint twice."""
+    m.post(
+        url,
+        status=200,
+        payload={"error": [], "result": {key: orders, "count": 0}},
+        repeat=repeat,
+    )
 
 
 @pytest.mark.asyncio
@@ -731,6 +833,105 @@ async def test_resolve_ignores_orders_with_a_different_client_id():
         _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed")
         detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
     assert detail["verdict"] == "not_accepted"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_requires_two_clean_sweeps_before_not_accepted():
+    """A just-accepted order is briefly in NEITHER container (Kraken's
+    `pending` state, plus the OpenOrders propagation window). One clean-empty
+    sweep cannot tell that apart from a genuine reject, so not_accepted — the
+    verdict that licenses a resend — needs a second sweep after a settle
+    delay. Here the order appears on the second sweep."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        # Sweep 0: nothing anywhere.
+        _mock_probe(m, _OPEN_ORDERS_URL, {}, "open", repeat=False)
+        _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed", repeat=False)
+        # Sweep 1: the order has become visible.
+        _mock_probe(m, _OPEN_ORDERS_URL, {_TXID: _order_row()}, "open", repeat=False)
+        _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed", repeat=False)
+        detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
+
+    assert detail["verdict"] == "accepted"
+    assert detail["txid"] == [_TXID]
+    assert len(detail["sweeps"]) == 2
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_not_accepted_records_both_sweeps():
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_probe(m, _OPEN_ORDERS_URL, {}, "open")
+        _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed")
+        detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
+    assert detail["verdict"] == "not_accepted"
+    assert len(detail["sweeps"]) == 2
+    assert all(p["outcome"] == "absent" for p in detail["probes"])
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_stops_at_the_first_sweep_once_found():
+    """No reason to spend a settle delay and four more signed calls proving
+    something already proven."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_probe(m, _OPEN_ORDERS_URL, {_TXID: _order_row()}, "open")
+        _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed")
+        detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
+        assert len(_calls_to(m, _OPEN_ORDERS_URL)) == 1
+    assert detail["verdict"] == "accepted"
+    assert len(detail["sweeps"]) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,  # {"error": [], "result": null}
+        {"open": None},  # container present but null
+        {"open": {"SOME-TXID": {"status": "open", "vol": "1.0"}}},  # no cl_ord_id echo
+    ],
+)
+async def test_unsearchable_payload_is_never_read_as_absence(result):
+    """The sharpest fail-open in the resolver: a payload that cannot answer
+    the question must not contribute to not_accepted. The third case is the
+    dangerous one — the server-side filter MATCHED (so the order exists) but
+    the row omits the optional cl_ord_id echo."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _OPEN_ORDERS_URL,
+            status=200,
+            payload={"error": [], "result": result},
+            repeat=True,
+        )
+        _mock_probe(m, _CLOSED_ORDERS_URL, {}, "closed")
+        detail = await adapter.resolve_order_submission_detail(client_order_id=_CID)
+
+    assert detail["verdict"] == "unresolved"
+    outcomes = {p["probe"]: p["outcome"] for p in detail["probes"]}
+    assert outcomes["/0/private/OpenOrders"] == "indeterminate"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_raises_rather_than_returning_none_on_unsearchable_payload():
+    """fetch_order_by_client_id's None means 'Kraken has no such order'. An
+    unreadable payload must not be laundered into that claim."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _OPEN_ORDERS_URL,
+            status=200,
+            payload={"error": [], "result": {"open": None}},
+            repeat=True,
+        )
+        with pytest.raises(KrakenAPIError, match="could not be searched"):
+            await adapter.fetch_order_by_client_id(pair="XBTUSD", client_order_id=_CID)
     await adapter.close()
 
 
@@ -971,6 +1172,61 @@ async def test_expired_with_partial_fill_maps_to_partial():
         )
     assert conf is not None
     assert conf.status == "partial"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vol_exec", [None, "", "not-a-number"])
+async def test_terminal_status_with_unreadable_fill_is_not_called_rejected(vol_exec):
+    """'rejected' asserts NO POSITION EXISTS. Defaulting an unreadable
+    vol_exec to zero would make the adapter assert that about an order it
+    cannot actually read — and Kraken only reaches 'closed' via execution, so
+    closed-with-no-readable-fill is self-contradictory. Stay non-terminal so
+    the caller keeps looking."""
+    row = _order_row(status="closed", vol="0.00050000")
+    if vol_exec is None:
+        row.pop("vol_exec")
+    else:
+        row["vol_exec"] = vol_exec
+    adapter = _adapter()
+    with aioresponses() as m:
+        _mock_probe(m, _OPEN_ORDERS_URL, {}, "open")
+        _mock_probe(m, _CLOSED_ORDERS_URL, {_TXID: row}, "closed")
+        conf = await adapter.fetch_order_by_client_id(
+            pair="XBTUSD", client_order_id=_CID
+        )
+    assert conf is not None
+    assert conf.status == "pending"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_await_fill_keeps_polling_when_the_fill_is_unreadable():
+    """The consequence of the mapping above: an unreadable terminal row must
+    not stop the poll loop, or polling ends while the account may hold a
+    position."""
+    adapter = _adapter()
+    unreadable = _order_row(status="closed", vol="0.00050000")
+    unreadable.pop("vol_exec")
+    with aioresponses() as m:
+        m.post(_QUERY_ORDERS_URL, status=200, payload=_query_orders_payload(unreadable))
+        m.post(
+            _QUERY_ORDERS_URL,
+            status=200,
+            payload=_query_orders_payload(
+                _order_row(
+                    status="closed",
+                    vol_exec="0.00050000",
+                    cost="15.00000",
+                    price="30000.0",
+                )
+            ),
+        )
+        conf = await adapter.await_fill_confirmation(
+            venue_order_id=_TXID, client_order_id=_CID, timeout_sec=5.0
+        )
+        assert len(_calls_to(m, _QUERY_ORDERS_URL)) == 2
+    assert conf.status == "filled"
     await adapter.close()
 
 

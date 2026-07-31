@@ -1337,6 +1337,13 @@ class Settings(BaseSettings):
     # sees the fill promptly, slow enough that a long wait cannot approach
     # Kraken's private-endpoint rate-limit counter.
     KRAKEN_FILL_POLL_INTERVAL_SEC: float = 2.0
+    # PR-K2: settle delay between the two sweeps that
+    # KrakenSpotAdapter.resolve_order_submission requires before it will
+    # report not_accepted. A just-accepted order is briefly visible in
+    # neither OpenOrders nor ClosedOrders, and not_accepted is the verdict
+    # that tells a caller a resend is safe — so the delay exists to stop a
+    # propagation window from being read as a rejection.
+    KRAKEN_SUBMISSION_SETTLE_SEC: float = 3.0
 
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20

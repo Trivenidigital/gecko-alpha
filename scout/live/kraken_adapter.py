@@ -179,6 +179,7 @@ from scout.live.adapter_base import (
 from scout.live.exceptions import RateLimitError, VenueTransientError
 from scout.live.kraken_signing import (
     KrakenNonce,
+    KrakenSigningError,
     get_nonce_source,
     key_fingerprint,
     sign_kraken_request,
@@ -403,6 +404,11 @@ _CL_ORD_ID_LOOKUPS: tuple[tuple[str, str], ...] = (
     ("/0/private/ClosedOrders", "closed"),
 )
 
+# Consecutive clean-empty sweeps required before resolve_order_submission
+# will say not_accepted. Two, because a just-accepted order is briefly in
+# neither container and a single sweep cannot tell that apart from a reject.
+_SUBMISSION_CONFIRM_SWEEPS = 2
+
 # Kraken's three documented cl_ord_id forms (module docstring, fact 10).
 _CL_ORD_ID_LONG_UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -413,6 +419,23 @@ _CL_ORD_ID_FREE_TEXT_MAX_LEN = 18
 # control bytes are excluded here because they survive form-encoding as
 # escapes and would make the id we send differ visibly from the id we logged.
 _CL_ORD_ID_FREE_TEXT_RE = re.compile(r"^[\x21-\x7e]+$")
+
+
+class _Indeterminate:
+    """Sentinel type: "the payload could not answer the question".
+
+    Distinct from ``None`` (a real, well-formed absence) because only a real
+    absence may contribute to a ``not_accepted`` verdict — the one verdict
+    that tells a caller a resend is safe.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "INDETERMINATE"
+
+
+INDETERMINATE = _Indeterminate()
 
 
 def _validate_cl_ord_id(client_order_id: str) -> None:
@@ -617,13 +640,40 @@ class KrakenSpotAdapter(ExchangeAdapter):
                         ),
                         "Content-Type": "application/x-www-form-urlencoded",
                     }
-                    cm = session.post(url, data=post_data, headers=headers)
+                    # allow_redirects=False is load-bearing on a SIGNED POST.
+                    # aiohttp follows 307/308 by re-sending the same method
+                    # AND body — a second AddOrder transmission inside one
+                    # attempt, invisible to retry_transient=False. It also
+                    # forwards every header it did not explicitly strip, and
+                    # it strips only Authorization, so API-Key / API-Sign
+                    # would be handed to the redirect target.
+                    cm = session.post(
+                        url, data=post_data, headers=headers, allow_redirects=False
+                    )
                 else:
                     cm = session.get(url, params=params)
 
                 async with cm as resp:
                     if resp.status == 429:
                         raise KrakenRateLimitError(f"kraken 429 on {path}")
+
+                    if 300 <= resp.status < 400:
+                        # Only reachable on the signed POST, which no longer
+                        # follows redirects. api.kraken.com never redirects a
+                        # private endpoint, so this is a hijack or a
+                        # misconfigured base URL — never something to follow.
+                        #
+                        # Raised as transient, not as a Kraken error, so the
+                        # order path classifies it AMBIGUOUS: a redirect reply
+                        # is not an order rejection, and whatever produced it
+                        # may have relayed the POST onward. Raised immediately
+                        # rather than retried — re-sending a signed POST into
+                        # something that redirects is the double-order shape
+                        # this whole branch exists to avoid.
+                        raise VenueTransientError(
+                            f"kraken {path}: unexpected redirect (HTTP "
+                            f"{resp.status}) on a signed request"
+                        )
 
                     if 500 <= resp.status < 600:
                         # Includes Cloudflare's 520-529 origin-error range.
@@ -636,7 +686,12 @@ class KrakenSpotAdapter(ExchangeAdapter):
                         raise last_exc
 
                     if resp.status >= 400:
-                        resp.raise_for_status()
+                        # NOT resp.raise_for_status(). Its ClientResponseError
+                        # carries request_info, whose repr renders the request
+                        # headers — including this call's live API-Key and
+                        # API-Sign. Any caller that logs repr(exc) would write
+                        # credentials to disk. Raise a string we control.
+                        raise KrakenAPIError(f"kraken {path}: HTTP {resp.status}")
 
                     ctype = resp.headers.get("Content-Type", "")
                     if "html" in ctype.lower():
@@ -682,7 +737,26 @@ class KrakenSpotAdapter(ExchangeAdapter):
 
                 self._raise_for_errors(path, errors)
 
-            except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                # Deliberately the WHOLE aiohttp.ClientError tree, not just
+                # ClientConnectorError. ClientConnectorError is the
+                # connect-phase failure — the one case that PROVES nothing was
+                # sent. Its siblings are the ambiguous ones and none of them
+                # inherit from it: ServerDisconnectedError and
+                # ClientConnectionResetError are peers under
+                # ClientConnectionError, ClientOSError is a PARENT, and
+                # ClientPayloadError means the headers already arrived (so the
+                # request definitely reached Kraken) and only the body read
+                # failed. Catching the narrow class let every genuinely
+                # ambiguous transport failure escape _request unclassified,
+                # which on the order path meant it never became a
+                # KrakenAmbiguousSubmissionError.
+                #
+                # ValueError covers json.JSONDecodeError from a non-JSON,
+                # non-HTML 200 body. KrakenSigningError is NOT in this tree
+                # (it derives from Exception) and still fails fast without a
+                # retry, which is what keeps a mis-pasted secret from burning
+                # nonces.
                 last_exc = VenueTransientError(f"network error: {type(exc).__name__}")
                 if retry_transient and attempt < len(_BACKOFFS):
                     await self._retry_sleep(_BACKOFFS[attempt])
@@ -1251,12 +1325,30 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 "the pair's published precision"
             )
 
+        # Tick check is separate from quantization on purpose. Quantizing to
+        # pair_decimals satisfies the tick for every pair Kraken currently
+        # lists (PR-K1 measured tick_size == 10**-pair_decimals across all
+        # 1428), but the two fields are independent, and a pair whose tick is
+        # coarser than its price precision would otherwise let an off-grid
+        # price through. Rejecting rather than re-quantizing to the tick keeps
+        # the price the caller chose intact — a supervised operator should be
+        # told their price is off-grid, not have it silently moved.
         tick = _to_decimal(row.get("tick_size"))
-        if tick is not None and tick > 0 and price_q % tick != 0:
-            raise KrakenAPIError(
-                f"kraken AddOrder: price {price_str} is not a multiple of the "
-                f"{pair!r} tick_size {format(tick, 'f')}"
-            )
+        if tick is not None and tick > 0:
+            try:
+                off_grid = price_q % tick != 0
+            except (InvalidOperation, ArithmeticError) as exc:
+                # Decimal.__mod__ raises past 28 quotient digits, e.g.
+                # Decimal('1E30') % Decimal('0.00000001').
+                raise KrakenAPIError(
+                    f"kraken AddOrder: cannot check price {price_str} against "
+                    f"{pair!r} tick_size {format(tick, 'f')}: {exc}"
+                ) from exc
+            if off_grid:
+                raise KrakenAPIError(
+                    f"kraken AddOrder: price {price_str} is not a multiple of the "
+                    f"{pair!r} tick_size {format(tick, 'f')}"
+                )
 
         ordermin = _to_decimal(row.get("ordermin"))
         if ordermin is not None and volume_q < ordermin:
@@ -1387,10 +1479,40 @@ class KrakenSpotAdapter(ExchangeAdapter):
             body = await self._private_post(
                 "/0/private/AddOrder", data, retry_transient=False
             )
-        except VenueTransientError as exc:
-            # The POST failed in a way that does NOT prove Kraken refused it:
-            # a timeout, a dropped connection, a 5xx or an HTML interstitial
-            # can all arrive after the matching engine accepted the order.
+        except (KrakenAPIError, KrakenSigningError):
+            # DEFINITIVE. Kraken parsed the request and refused it (its error
+            # envelope is a decision, so the order does not exist), or signing
+            # failed before anything was sent. Propagate unchanged — wrapping
+            # these as ambiguous would send the caller off to resolve an order
+            # we know was never created.
+            raise
+        except asyncio.CancelledError:
+            # Cancellation must keep propagating — swallowing it would break
+            # task teardown — but the order may still have been placed, so
+            # leave a record an operator can find.
+            log.warning(
+                "kraken_order_submission_cancelled",
+                pair=pair,
+                client_order_id=client_order_id,
+                note="AddOrder was cancelled mid-flight; the order may exist. "
+                "Resolve with resolve_order_submission before any resend.",
+            )
+            raise
+        except Exception as exc:
+            # AMBIGUOUS — everything else, deliberately including exception
+            # types not anticipated here. The POST may have reached the
+            # matching engine: timeouts, mid-flight disconnects, payload
+            # errors, 5xx, HTML interstitials and rate-limit refusals are all
+            # compatible with the order existing. Kraken publishes no
+            # duplicate-cl_ord_id contract (module docstring, fact 11), so
+            # "unknown" must fail closed to "may exist" — the alternative is a
+            # caller that resends and double-orders.
+            #
+            # KrakenRateLimitError lands here rather than in the definitive
+            # branch, which is a deliberate over-caution: a rate limiter
+            # almost certainly refuses before placing, but that is not
+            # documented, and the cost of being wrong the safe way is two
+            # extra read probes.
             log.warning(
                 "kraken_order_submission_ambiguous",
                 pair=pair,
@@ -1553,17 +1675,30 @@ class KrakenSpotAdapter(ExchangeAdapter):
         which only ever cancels unfilled remainders after reporting the fill)
         would tell the reconciler nothing happened while the account holds a
         position.
+
+        An unreadable ``vol_exec`` on a terminal status is NOT treated as a
+        zero fill. ``rejected`` asserts "no position exists", and defaulting a
+        missing or non-numeric field to zero would make the adapter assert
+        that about an order it cannot actually read — the dangerous direction.
+        Such a row stays ``pending`` so the caller keeps looking rather than
+        stopping on a fabricated terminal verdict.
         """
-        filled_qty = filled if filled is not None else Decimal(0)
+        if kraken_status not in ("closed", "canceled", "expired"):
+            # pending / open — and anything unrecognised, which must not be
+            # mistaken for terminal.
+            return "pending"
+        if filled is None:
+            log.warning(
+                "kraken_order_unreadable_fill",
+                kraken_status=kraken_status,
+                note="terminal status with no parseable vol_exec",
+            )
+            return "pending"
         if kraken_status == "closed":
-            if volume is not None and 0 < filled_qty < volume:
+            if volume is not None and 0 < filled < volume:
                 return "partial"
-            return "filled" if filled_qty > 0 else "rejected"
-        if kraken_status in ("canceled", "expired"):
-            return "partial" if filled_qty > 0 else "rejected"
-        # pending / open — and anything unrecognised, which must not be
-        # mistaken for terminal.
-        return "pending"
+            return "filled" if filled > 0 else "rejected"
+        return "partial" if filled > 0 else "rejected"
 
     @staticmethod
     def _avg_fill_price(row: dict[str, Any]) -> float | None:
@@ -1608,8 +1743,15 @@ class KrakenSpotAdapter(ExchangeAdapter):
     @staticmethod
     def _find_order_by_cl_ord_id(
         body: dict[str, Any], container: str, client_order_id: str
-    ) -> tuple[str, dict[str, Any]] | None:
+    ) -> tuple[str, dict[str, Any]] | None | _Indeterminate:
         """Find ``client_order_id`` in an OpenOrders/ClosedOrders payload.
+
+        THREE outcomes, not two — the distinction is the whole point:
+
+        - ``(txid, row)``  the order is there;
+        - ``None``         the container was present, well-formed, and held no
+                           order carrying our client id — a real absence;
+        - ``INDETERMINATE`` the payload could not answer the question.
 
         The server-side ``cl_ord_id`` filter is re-checked client-side ON
         PURPOSE. Kraken ignores unrecognised parameters rather than erroring,
@@ -1617,16 +1759,35 @@ class KrakenSpotAdapter(ExchangeAdapter):
         FULL order list — and trusting the filter would hand back a stranger's
         order as ours, which on a reconciliation path means confirming a fill
         that never happened.
+
+        But that re-check has a fail-open edge, which is why INDETERMINATE
+        exists. ``cl_ord_id`` is an OPTIONAL response field: if the filter
+        MATCHED (so the order does exist) yet the row omits the echo, a
+        two-valued function reports "absent" — and absent-from-every-probe is
+        the verdict that licenses a resend. Same for a ``result`` of ``null``
+        or a non-dict container, which ``_request`` flattens to ``{}``.
+        A non-empty container in which NOTHING carries a readable client id is
+        therefore treated as unanswerable, never as absence.
         """
         orders = body.get(container)
         if not isinstance(orders, dict):
-            return None
+            # Container missing or malformed — includes the `result: null`
+            # shape that _request returns as {}. We did not get to look.
+            return INDETERMINATE
+        saw_readable_id = False
         for txid, row in orders.items():
             if not isinstance(row, dict):
                 continue
-            if str(row.get("cl_ord_id", "")) != client_order_id:
+            row_cid = row.get("cl_ord_id")
+            if row_cid is not None and str(row_cid) != "":
+                saw_readable_id = True
+            if str(row_cid or "") != client_order_id:
                 continue
             return str(txid), row
+        if orders and not saw_readable_id:
+            # Rows came back but none carried a client id to match against —
+            # the filter may well have matched ours. Cannot claim absence.
+            return INDETERMINATE
         return None
 
     async def fetch_order_by_client_id(
@@ -1648,6 +1809,13 @@ class KrakenSpotAdapter(ExchangeAdapter):
         for path, container in _CL_ORD_ID_LOOKUPS:
             body = await self._private_post(path, {"cl_ord_id": client_order_id})
             found = self._find_order_by_cl_ord_id(body, container, client_order_id)
+            if isinstance(found, _Indeterminate):
+                # An unanswerable payload is not an absence. Raising keeps a
+                # poller looking instead of concluding the order is gone.
+                raise KrakenAPIError(
+                    f"kraken {path}: payload could not be searched for "
+                    f"cl_ord_id={client_order_id}"
+                )
             if found is not None:
                 txid, row = found
                 return self._confirmation_from_order(
@@ -1666,33 +1834,94 @@ class KrakenSpotAdapter(ExchangeAdapter):
         rather than just the verdict.
 
         Verdict rules:
-        - found in ANY probe            → ``accepted``
-        - EVERY probe answered, none found → ``not_accepted``
-        - ANY probe failed              → ``unresolved``
+        - found in ANY probe of ANY sweep      → ``accepted``
+        - TWO consecutive sweeps in which every probe answered cleanly and
+          none found it                        → ``not_accepted``
+        - anything else                        → ``unresolved``
 
-        ``not_accepted`` requires every probe to have SUCCEEDED and come back
-        empty. A failed probe can never contribute to it — "we could not look"
-        and "we looked and it is not there" are different facts, and only the
-        second one makes a resend safe.
+        ``not_accepted`` is the only verdict that tells a caller a resend is
+        safe, so it is the one deliberately made hard to reach. It requires
+        every probe to have SUCCEEDED and returned a searchable payload that
+        did not contain the order — a failed probe and an unsearchable
+        payload both count as "we could not look", which is a different fact
+        from "we looked and it is not there".
 
-        Both probes run even after a hit, so the record shows what each
+        It also requires that to hold TWICE, separated by
+        ``KRAKEN_SUBMISSION_SETTLE_SEC``. A freshly-accepted order is briefly
+        in neither container — Kraken's ``pending`` state and the OpenOrders
+        propagation window both produce a clean-empty sweep for an order that
+        does exist. One sweep cannot distinguish that from a genuine reject;
+        two sweeps either side of a settle delay can.
+
+        Every probe runs even after a hit, so the record shows what each
         endpoint said. An order found in OpenOrders being absent from
         ClosedOrders is the normal, expected shape.
         """
-        probes: list[dict[str, Any]] = []
+        sweeps: list[list[dict[str, Any]]] = []
         txids: list[str] = []
-        any_found = False
-        any_failed = False
 
+        for sweep_index in range(_SUBMISSION_CONFIRM_SWEEPS):
+            if sweep_index:
+                # Settle delay before the confirming sweep — its whole job is
+                # to give a just-accepted order time to become visible.
+                await asyncio.sleep(
+                    float(getattr(self._settings, "KRAKEN_SUBMISSION_SETTLE_SEC", 3.0))
+                )
+            probes = await self._submission_sweep(
+                client_order_id=client_order_id, sweep=sweep_index
+            )
+            sweeps.append(probes)
+            txids.extend(
+                str(p["txid"]) for p in probes if p["outcome"] == "found" if p["txid"]
+            )
+            if any(p["outcome"] == "found" for p in probes):
+                verdict = "accepted"
+                break
+            if any(p["outcome"] != "absent" for p in probes):
+                # A probe errored or came back unsearchable. A later sweep
+                # cannot repair that into an absence claim.
+                verdict = "unresolved"
+                break
+        else:
+            # Every sweep completed with every probe cleanly absent.
+            verdict = "not_accepted"
+
+        detail = {
+            "verdict": verdict,
+            "client_order_id": client_order_id,
+            "txid": list(dict.fromkeys(txids)),
+            "probes": [p for sweep in sweeps for p in sweep],
+            "sweeps": sweeps,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        log.info(
+            "kraken_submission_resolved",
+            client_order_id=client_order_id,
+            verdict=verdict,
+            txid=detail["txid"],
+            sweep_count=len(sweeps),
+        )
+        return detail
+
+    async def _submission_sweep(
+        self, *, client_order_id: str, sweep: int
+    ) -> list[dict[str, Any]]:
+        """One pass over every client-id-addressable endpoint.
+
+        Outcomes per probe: ``found`` / ``absent`` / ``indeterminate`` /
+        ``error``. Only ``absent`` is evidence the order does not exist.
+        """
+        probes: list[dict[str, Any]] = []
         for path, container in _CL_ORD_ID_LOOKUPS:
             try:
                 body = await self._private_post(path, {"cl_ord_id": client_order_id})
             except Exception as exc:
-                any_failed = True
                 probes.append(
                     {
                         "probe": path,
+                        "sweep": sweep,
                         "outcome": "error",
+                        "txid": None,
                         "error_type": type(exc).__name__,
                         "error": str(exc),
                     }
@@ -1700,6 +1929,7 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 log.warning(
                     "kraken_submission_probe",
                     probe=path,
+                    sweep=sweep,
                     client_order_id=client_order_id,
                     outcome="error",
                     error_type=type(exc).__name__,
@@ -1708,48 +1938,25 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 continue
 
             found = self._find_order_by_cl_ord_id(body, container, client_order_id)
-            if found is None:
-                probes.append({"probe": path, "outcome": "absent"})
-                log.info(
-                    "kraken_submission_probe",
-                    probe=path,
-                    client_order_id=client_order_id,
-                    outcome="absent",
-                )
-                continue
+            if isinstance(found, _Indeterminate):
+                outcome, txid = "indeterminate", None
+            elif found is None:
+                outcome, txid = "absent", None
+            else:
+                outcome, txid = "found", found[0]
 
-            any_found = True
-            txids.append(found[0])
-            probes.append({"probe": path, "outcome": "found", "txid": found[0]})
+            probes.append(
+                {"probe": path, "sweep": sweep, "outcome": outcome, "txid": txid}
+            )
             log.info(
                 "kraken_submission_probe",
                 probe=path,
+                sweep=sweep,
                 client_order_id=client_order_id,
-                outcome="found",
-                txid=found[0],
+                outcome=outcome,
+                txid=txid,
             )
-
-        if any_found:
-            verdict = "accepted"
-        elif any_failed:
-            verdict = "unresolved"
-        else:
-            verdict = "not_accepted"
-
-        detail = {
-            "verdict": verdict,
-            "client_order_id": client_order_id,
-            "txid": txids,
-            "probes": probes,
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
-        log.info(
-            "kraken_submission_resolved",
-            client_order_id=client_order_id,
-            verdict=verdict,
-            txid=txids,
-        )
-        return detail
+        return probes
 
     async def resolve_order_submission(
         self, *, client_order_id: str
