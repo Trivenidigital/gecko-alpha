@@ -100,6 +100,7 @@ async def _add_suppressed_row(
     reason="suppressed",
     source_layer="dispatcher",
     price=1.0,
+    anchor=None,
 ):
     verdicts = json.dumps(
         {
@@ -110,7 +111,7 @@ async def _add_suppressed_row(
         },
         sort_keys=True,
     )
-    emitted = (NOW - timedelta(days=days_ago)).isoformat()
+    emitted = ((anchor or NOW) - timedelta(days=days_ago)).isoformat()
     await conn.execute(
         """INSERT INTO signal_outcome_ledger
            (kind, token_id, surface, price_at_emission, gate_verdicts,
@@ -120,8 +121,8 @@ async def _add_suppressed_row(
     )
 
 
-async def _add_suppressed_block(conn, *, token_id="blk", days_ago=1):
-    created = (NOW - timedelta(days=days_ago)).isoformat()
+async def _add_suppressed_block(conn, *, token_id="blk", days_ago=1, anchor=None):
+    created = ((anchor or NOW) - timedelta(days=days_ago)).isoformat()
     await conn.execute(
         """INSERT INTO trade_decision_events
            (token_id, signal_type, decision, reason, source_module,
@@ -284,8 +285,18 @@ async def test_zero_sampled_with_blocks_flags_sampling_dead(tmp_path):
 # (d) CLI dry-run: no --send default prints the summary and never sends
 # --------------------------------------------------------------------------
 async def test_cli_no_send_default_prints_summary(tmp_path):
+    # This test drives the CLI as a SUBPROCESS, so the script resolves its own
+    # `now` from the real clock (suppression_cost_rollup:136) and cannot be
+    # given the module-level NOW the in-process tests inject. Fixtures must
+    # therefore be anchored to the real clock too — anchoring them to NOW made
+    # the window boundary drift with the calendar, and the run happened to
+    # depend on a SINGLE 8-day-old row still falling inside the 7-day sampling
+    # window. That margin was consumed on 2026-07-31, tripping the
+    # `sampling_dead` gate (exit 5) and turning CI red on an unchanged tree.
+    anchor = datetime.now(timezone.utc)
     dbp = tmp_path / "s.db"
     conn = await _build_db(dbp)
+    # Matured rows: old enough to carry r7d, feeding the COST section.
     for i in range(12):
         await _add_suppressed_row(
             conn,
@@ -294,9 +305,23 @@ async def test_cli_no_send_default_prints_summary(tmp_path):
             r24h=0.5,
             r7d=1.0,
             label_status="complete",
+            anchor=anchor,
+        )
+    # Recent sampled rows, comfortably inside the 7-day window, so
+    # `sampling_dead` (blocks_in_window > 0 AND sampled_in_window == 0) is
+    # deterministically False instead of resting on a boundary coincidence.
+    for i in range(3):
+        await _add_suppressed_row(
+            conn,
+            token_id=f"fresh-{i}",
+            days_ago=1 + i,
+            label_status="pending",
+            anchor=anchor,
         )
     for i in range(10):
-        await _add_suppressed_block(conn, token_id=f"b{i}", days_ago=1 + (i % 6))
+        await _add_suppressed_block(
+            conn, token_id=f"b{i}", days_ago=1 + (i % 6), anchor=anchor
+        )
     await conn.commit()
     await conn.close()
 
