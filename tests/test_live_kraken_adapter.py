@@ -26,6 +26,7 @@ from scout.live.kraken_adapter import (
     KrakenWithdrawalCapabilityError,
     normalize_kraken_asset,
 )
+from scout.live.kraken_signing import KrakenSigningError
 
 _ASSETPAIRS_RE = re.compile(r"https://api\.kraken\.com/0/public/AssetPairs.*")
 _TICKER_RE = re.compile(r"https://api\.kraken\.com/0/public/Ticker.*")
@@ -708,4 +709,18 @@ async def test_order_lifecycle_methods_raise_pr_k2():
         )
     with pytest.raises(NotImplementedError, match="PR-K2"):
         await adapter.fetch_order_by_client_id(pair="XBTUSD", client_order_id="y")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_secret_raises_signing_error_without_retry():
+    """A mis-pasted secret must fail loudly on the first attempt rather than
+    being retried (which would burn nonces), and the exception must not echo
+    the secret."""
+    adapter = _adapter(KRAKEN_API_SECRET="not-valid-base64-!!!")
+    with aioresponses() as m:
+        with pytest.raises(KrakenSigningError) as excinfo:
+            await adapter.fetch_account_balance(asset="USD")
+        assert "not-valid-base64" not in str(excinfo.value)
+        assert len(_calls(m)) == 0
     await adapter.close()
