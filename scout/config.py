@@ -1377,6 +1377,52 @@ class Settings(BaseSettings):
     # band for the post-trade balance reconciliation.
     KRAKEN_PILOT_FEE_HEADROOM_PCT: float = 1.0
 
+    # -------- Solana execution lane (PR-S1, 2026-07-31) --------
+    # Venue-client layer for the supervised SOL->USDC swap
+    # (scout.live.solana). Every default is the refusing or the read-only one.
+    #
+    # *** SOLANA_RPC_URL IS READ-ONLY. ***
+    # The lane NEVER broadcasts through it. scout.live.solana.rpc_client
+    # deliberately implements no send_transaction method at all — the only
+    # submission path is the Jito block engine, and that is a structural
+    # guarantee (there is no code to call) rather than a policy one. Reads and
+    # simulation through this URL are expected and safe; a public RPC is fine
+    # for both. If you are adding a broadcast method here, stop.
+    SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    # Path to a Solana CLI id.json (a 64-byte secret-key array). The RUNNER
+    # loads it at call time; the key itself is NEVER config, never an env var,
+    # never in argv. scout.live.solana.signer refuses the file unless its mode
+    # is 0600 and its owner is the current uid.
+    SOLANA_PILOT_KEYPAIR_PATH: str = ""
+    # Jupiter Swap API. Overridable so tests / a staging proxy can retarget it.
+    JUPITER_API_BASE: str = "https://api.jup.ag/swap/v1"
+    # Optional. Jupiter serves a keyless tier at 0.5 req/sec; a free portal key
+    # raises that and is sent as the `x-api-key` header when set.
+    JUPITER_API_KEY: SecretStr | None = None
+    JITO_BLOCK_ENGINE_URL: str = "https://mainnet.block-engine.jito.wtf"
+    SOLANA_HTTP_TIMEOUT_SEC: float = 15.0
+
+    # Ceilings enforced by tx_inspector against the transaction Jupiter built.
+    # These are not requests to Jupiter — they are the limits above which we
+    # refuse to SIGN what came back, which is what makes them meaningful: a
+    # remotely-built transaction is only as safe as the checks we run on it.
+    SOLANA_PILOT_SLIPPAGE_BPS: int = 100
+    SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS: int = 1_000_000
+    SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS: int = 1_000_000
+    # Ceiling on base signature fee + priority fee + Jito tip combined. Caps
+    # the total cost of the transaction independently of how it is split, so a
+    # build that respects both component ceilings but stacks them still fails.
+    SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS: int = 2_500_000
+    SOLANA_PILOT_MIN_ORDER_USD: float = 5.0
+    SOLANA_PILOT_MAX_ORDER_USD: float = 10.0
+    # Settle delay between the two sweeps that resolve an ambiguous
+    # submission. Same rationale as KRAKEN_SUBMISSION_SETTLE_SEC above: a
+    # just-forwarded transaction is briefly unknown to the RPC's signature
+    # cache, and "definitively not submitted" is the verdict that tells an
+    # operator a rebuild is safe — so a propagation window must never be read
+    # as an absence.
+    SOLANA_SUBMISSION_SETTLE_SEC: float = 5.0
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
@@ -1934,6 +1980,53 @@ class Settings(BaseSettings):
                 f"max={self.KRAKEN_PILOT_MAX_ORDER_USD}, "
                 f"daily_gross={self.KRAKEN_PILOT_MAX_DAILY_GROSS_USD}. A single "
                 "max-sized order would breach the daily ceiling."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_solana_pilot_caps(self) -> "Settings":
+        """PR-S1: the Solana lane's notional and fee ceilings must be coherent.
+
+        Same shape as ``_validate_kraken_pilot_caps`` above. The fee clause is
+        the one that matters most: if the combined ceiling is below what the
+        component ceilings plus the protocol's own base signature fee can
+        produce, ``tx_inspector`` rejects every transaction Jupiter builds and
+        the failure shows up as "the lane never trades" on pilot day rather
+        than as a config error now.
+        """
+        if self.SOLANA_PILOT_MIN_ORDER_USD > self.SOLANA_PILOT_MAX_ORDER_USD:
+            raise ValueError(
+                "SOLANA_PILOT_MIN_ORDER_USD must be <= SOLANA_PILOT_MAX_ORDER_USD; "
+                f"got min={self.SOLANA_PILOT_MIN_ORDER_USD}, "
+                f"max={self.SOLANA_PILOT_MAX_ORDER_USD}. No order size satisfies "
+                "both bounds."
+            )
+        if not 0 < self.SOLANA_PILOT_SLIPPAGE_BPS <= 10_000:
+            raise ValueError(
+                "SOLANA_PILOT_SLIPPAGE_BPS must be in (0, 10000]; "
+                f"got={self.SOLANA_PILOT_SLIPPAGE_BPS}. Zero slippage cannot "
+                "route and >100% is not a bound."
+            )
+        for name in (
+            "SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS",
+            "SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS",
+            "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        # 5000 lamports = the protocol's base fee for the pilot's single
+        # required signature (scout.live.solana.constants.LAMPORTS_PER_SIGNATURE).
+        floor = (
+            self.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS
+            + self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS
+            + 5_000
+        )
+        if self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS < floor:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS must be >= priority + tip + "
+                f"base signature fee; got total={self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS}, "
+                f"required>={floor}. A transaction at both component ceilings "
+                "would breach the combined ceiling and never be signable."
             )
         return self
 
