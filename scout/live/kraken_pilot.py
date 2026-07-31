@@ -40,12 +40,18 @@ nothing on that side. The larger figure is what the daily gross counts and
 what ``size_usd`` records, so the ledger holds exposure taken rather than
 exposure requested.
 
-**One pilot process at a time, enforced by the filesystem.** Two runs in two
-terminals are two live orders: each clears its own one-order-at-a-time check
-before either writes a row, and each reads a daily-gross total the other is
-about to invalidate. ``O_CREAT | O_EXCL`` on a lock file beside the database
+**One PLACEMENT at a time, enforced by the filesystem.** Two ``place`` runs in
+two terminals are two live orders: each clears its own one-order-at-a-time
+check before either writes a row, and each reads a daily-gross total the other
+is about to invalidate. ``O_CREAT | O_EXCL`` on a lock file beside the database
 is the atomic test-and-set that closes both windows at the only point the two
 processes share. A held lock is never broken automatically.
+
+The lock covers ``place`` and nothing else. ``status`` is read-only and
+``cancel`` reduces exposure, so neither can create the second order the lock
+exists to prevent — and locking them would be actively harmful, because a
+stale lock arises exactly when a run died with an order possibly resting,
+which is the moment those two commands are most needed.
 
 **The database must already exist.** SQLite creates one for any path it is
 handed, so running from the wrong directory does not fail — it silently
@@ -844,6 +850,16 @@ class PilotRunner:
         The larger of the two is what gets counted against the daily gross and
         persisted as ``size_usd``, so the ledger records exposure actually
         taken rather than exposure nominally requested.
+
+        Note the asymmetry, which is deliberate: the MAXIMUM is checked
+        against both notionals, the MINIMUM against the limit notional only.
+        The floor is an economic "is this trade worth doing" bound on what the
+        operator asked for, not a safety bound — nothing dangerous happens
+        when an order turns out smaller than intended, and the venue's own
+        ``costmin`` is enforced separately in ``_check_against_rules``.
+        Applying the floor to the market notional too would refuse orders for
+        being too small at the current mid, which is a refusal footgun with no
+        safety payoff. Do not "fix" the asymmetry.
         """
         min_usd = _dec(self._settings.KRAKEN_PILOT_MIN_ORDER_USD)
         max_usd = _dec(self._settings.KRAKEN_PILOT_MAX_ORDER_USD)
@@ -1112,6 +1128,14 @@ class PilotRunner:
                     )
                 evidence.record("pre_write_recheck", outcome="clear")
 
+                # size_usd here is the AUTHORIZED CEILING — the larger of the
+                # limit and market notionals, i.e. the most this order was
+                # approved to transact. It is NOT executed notional, and it is
+                # written before the order exists, so nothing has executed yet.
+                # What actually happened lives in entry_fill_price /
+                # entry_fill_qty, the per-fill rows, and the evidence file. Any
+                # reader totalling size_usd is measuring authorized exposure
+                # (which is what the daily cap governs), not realised volume.
                 live_trade_id = await record_pending_order(
                     self._db,
                     client_order_id=client_order_id,
@@ -2236,41 +2260,61 @@ async def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_REFUSED
 
-    # One pilot process at a time, machine-wide (see acquire_pilot_lock).
-    try:
-        lock_fd, lock_path = acquire_pilot_lock(db_path)
-    except PilotLockHeld as held:
-        print(
-            f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
-            f"  holder: {held.holder}\n"
-            "  Two runs are two live orders. If that process is gone, confirm "
-            "the venue\n"
-            "  state (`status`, or the Kraken web UI) and then delete the lock "
-            "file by hand."
-        )
-        return EXIT_BLOCKED
-
-    db = Database(db_path, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
-    await db.initialize()
-    adapter = KrakenSpotAdapter(settings, db=db)
-    runner = PilotRunner(
-        settings=settings, db=db, adapter=adapter, kill_switch=KillSwitch(db)
-    )
-    try:
-        if args.command == "place":
-            return await runner.place(
-                side=args.side,
-                price=args.price,
-                volume=args.volume,
-                validate_only=args.validate_only,
+    # The lock guards PLACEMENT only, and is taken for `place` alone.
+    #
+    # It exists to stop two processes creating two live orders. `status` is
+    # read-only and `cancel` reduces exposure, so neither can do the thing the
+    # lock prevents — and gating them would be actively harmful: a stale lock
+    # arises exactly when an earlier run died with an order possibly resting,
+    # which is the moment the operator most needs to look and to pull it. A
+    # lock that blocks its own recovery path is worse than no lock.
+    lock_fd: int | None = None
+    lock_path: Path | None = None
+    if args.command == "place":
+        try:
+            lock_fd, lock_path = acquire_pilot_lock(db_path)
+        except PilotLockHeld as held:
+            print(
+                f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
+                f"  holder: {held.holder}\n"
+                "  Two runs are two live orders, so only `place` is blocked.\n"
+                "  `status` and `cancel` still work — use them to see what is "
+                "resting\n"
+                "  and to pull it. Once the venue state is confirmed and that "
+                "process\n"
+                "  is gone, delete the lock file by hand."
             )
-        if args.command == "cancel":
-            return await runner.cancel(decision_id=args.decision_id)
-        return await runner.status()
+            return EXIT_BLOCKED
+
+    # Everything past the acquire is inside the finally that releases it.
+    # Database construction and initialize() can BOTH raise — a migration can
+    # exceed busy_timeout, and a slow one invites Ctrl+C — and a lock leaked
+    # there is permanent, blocking every later placement on a machine where
+    # nothing is actually resting.
+    try:
+        db = Database(db_path, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
+        await db.initialize()
+        adapter = KrakenSpotAdapter(settings, db=db)
+        runner = PilotRunner(
+            settings=settings, db=db, adapter=adapter, kill_switch=KillSwitch(db)
+        )
+        try:
+            if args.command == "place":
+                return await runner.place(
+                    side=args.side,
+                    price=args.price,
+                    volume=args.volume,
+                    validate_only=args.validate_only,
+                )
+            if args.command == "cancel":
+                return await runner.cancel(decision_id=args.decision_id)
+            return await runner.status()
+        finally:
+            await adapter.close()
+            await db.close()
     finally:
-        await adapter.close()
-        await db.close()
-        release_pilot_lock(lock_fd, lock_path)
+        if lock_fd is not None and lock_path is not None:
+            release_pilot_lock(lock_fd, lock_path)
 
 
 if __name__ == "__main__":

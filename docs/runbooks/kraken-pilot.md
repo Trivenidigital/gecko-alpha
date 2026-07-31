@@ -75,13 +75,25 @@ completes at 00:01 has its cap checked against one day and its ledger row
 recorded on the next, so the cap silently under-counts. Start well clear of the
 boundary.
 
-### One process at a time
+### One placement at a time
 
-The runner takes an exclusive lock (`<db>.pilot.lock`) before any gate. A second
-terminal refuses with `EXIT_BLOCKED` and prints the holder's PID. The lock is
-never broken automatically: a stale lock means an earlier run did not reach its
-cleanup, which is exactly the state where an order may be resting unrecorded.
-Confirm the venue state before deleting it by hand.
+`place` takes an exclusive lock (`<db>.pilot.lock`) before any gate. A second
+`place` refuses with `EXIT_BLOCKED` and prints the holder's PID.
+
+**`status` and `cancel` are never locked.** They do not take the lock and are
+not blocked by one, so both remain available while a lock is held — which is
+the point: a stale lock arises exactly when an earlier run died with an order
+possibly resting, and that is the moment you most need to look at the account
+and pull the order. Only new placements are blocked.
+
+The lock is never broken automatically. A stale lock means an earlier run did
+not reach its cleanup, so before deleting it:
+
+```bash
+python -m scout.live.kraken_pilot status                       # what is resting?
+python -m scout.live.kraken_pilot cancel --decision-id <uuid>  # pull it if so
+rm <db>.pilot.lock                                             # only then
+```
 
 ## The run
 

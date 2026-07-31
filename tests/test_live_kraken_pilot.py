@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs
@@ -1704,7 +1705,7 @@ async def test_main_refuses_when_the_database_does_not_exist(
     assert not missing.exists()  # and it did NOT create one
 
 
-async def test_main_refuses_while_another_run_holds_the_lock(
+async def test_main_refuses_a_placement_while_another_run_holds_the_lock(
     tmp_path, monkeypatch, capsys
 ):
     db_path = tmp_path / "pilot.db"
@@ -1714,8 +1715,13 @@ async def test_main_refuses_while_another_run_holds_the_lock(
     kraken_pilot.pilot_lock_path(db_path).write_text("pid=4242 acquired_at=now\n")
     _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
 
-    code = await kraken_pilot.main(["status"])
-    assert code == EXIT_BLOCKED
+    with aioresponses() as m:
+        code = await kraken_pilot.main(
+            ["place", "--side", "buy", "--price", "100.0", "--volume", "0.15"]
+        )
+        assert code == EXIT_BLOCKED
+        # Refused before the venue was touched at all.
+        assert _calls(m) == []
     out = capsys.readouterr().out
     assert "4242" in out
     assert "Two runs are two live orders" in out
@@ -1797,3 +1803,147 @@ def test_decision_id_is_stripped_and_shape_checked():
     for bad in ("not-a-uuid", "", _DECISION[:-1], _DECISION.replace("-", "")):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["cancel", "--decision-id", bad])
+
+
+# ======================================================================
+# L1 — the lock is released on every startup path
+# ======================================================================
+async def test_lock_is_released_when_database_initialize_raises(tmp_path, monkeypatch):
+    """A migration can exceed busy_timeout. A lock leaked there is permanent,
+    and blocks every later placement on a machine where nothing is resting."""
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+
+    async def _boom(self, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Database, "initialize", _boom)
+
+    with pytest.raises(sqlite3.OperationalError):
+        await kraken_pilot.main(
+            ["place", "--side", "buy", "--price", "100.0", "--volume", "0.15"]
+        )
+
+    assert not kraken_pilot.pilot_lock_path(db_path).exists()
+
+
+async def test_lock_is_released_on_keyboard_interrupt(tmp_path, monkeypatch):
+    """Ctrl+C during a slow migration must not strand the lock."""
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+
+    async def _interrupted(self, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Database, "initialize", _interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        await kraken_pilot.main(
+            ["place", "--side", "buy", "--price", "100.0", "--volume", "0.15"]
+        )
+
+    assert not kraken_pilot.pilot_lock_path(db_path).exists()
+
+
+# ======================================================================
+# L2 — the lock guards placement, never recovery
+# ======================================================================
+async def test_held_lock_blocks_place_but_not_status_or_cancel(
+    tmp_path, monkeypatch, capsys
+):
+    """A stale lock arises exactly when an order may be resting — the moment
+    the operator most needs to look and to pull it. A lock that blocks its own
+    recovery path is worse than no lock."""
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db.close()
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+    kraken_pilot.pilot_lock_path(db_path).write_text("pid=4242 acquired_at=now\n")
+
+    # place: refused, and the message points at the recovery commands.
+    reset_nonce_sources_for_tests()
+    with aioresponses() as m:
+        code = await kraken_pilot.main(
+            ["place", "--side", "buy", "--price", "100.0", "--volume", "0.15"]
+        )
+        assert code == EXIT_BLOCKED
+        assert _calls(m) == []
+    out = capsys.readouterr().out
+    assert "only `place` is blocked" in out
+    assert "`status` and `cancel` still work" in out
+
+    # status: runs under the held lock.
+    reset_nonce_sources_for_tests()
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        assert await kraken_pilot.main(["status"]) == EXIT_OK
+
+    # cancel: runs under the held lock, and pulls the resting order.
+    reset_nonce_sources_for_tests()
+    with aioresponses() as m:
+        m.post(_CANCEL_URL, payload={"error": [], "result": {"count": 1}})
+        m.post(
+            _OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}}, repeat=True
+        )
+        m.post(
+            _CLOSED_ORDERS_URL,
+            payload={
+                "error": [],
+                "result": {
+                    "closed": {
+                        _TXID: _filled_order_row(
+                            status="canceled", vol_exec="0.00000000", cost="0.00000"
+                        )
+                    }
+                },
+            },
+            repeat=True,
+        )
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        assert (
+            await kraken_pilot.main(["cancel", "--decision-id", _DECISION]) == EXIT_OK
+        )
+
+    # The recovery actually landed, and the lock is untouched by either.
+    db = Database(db_path)
+    await db.initialize()
+    row = await _row_by_cid(db, _DECISION)
+    assert row["live_trade_id"] == live_id
+    assert row["status"] == "rejected"
+    await db.close()
+    assert kraken_pilot.pilot_lock_path(db_path).exists()
+
+
+async def test_status_and_cancel_do_not_take_the_lock(tmp_path, monkeypatch):
+    """Neither can create a second order, which is all the lock prevents."""
+    db_path = tmp_path / "pilot.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    _patch_settings(monkeypatch, _settings(tmp_path, DB_PATH=db_path))
+    reset_nonce_sources_for_tests()
+
+    with aioresponses() as m:
+        _mock_preflight(m)
+        _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+        assert await kraken_pilot.main(["status"]) == EXIT_OK
+
+    # No lock file was ever created — not created-and-removed, never taken.
+    assert not kraken_pilot.pilot_lock_path(db_path).exists()
