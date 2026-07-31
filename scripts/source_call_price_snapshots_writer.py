@@ -47,7 +47,13 @@ def _is_enabled(value: str) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
-async def _run(db_path: str, *, horizon_hours: int) -> dict:
+async def _run(
+    db_path: str,
+    *,
+    horizon_hours: int,
+    max_identities_per_run: int,
+    max_requests_per_day: int,
+) -> dict:
     """Enabled path: wire the real C0 GT client and run one snapshot cycle.
 
     aiohttp + the C0 client are imported LAZILY here so the disabled path (and
@@ -78,6 +84,8 @@ async def _run(db_path: str, *, horizon_hours: int) -> dict:
                 resolve_pool=resolve_pool,
                 fetch_ohlcv=fetch_ohlcv,
                 horizon_hours=horizon_hours,
+                max_identities_per_run=max_identities_per_run,
+                max_requests_per_day=max_requests_per_day,
             )
             # C4: persist this cycle's counters so the coverage watchdogs can
             # read output rows (writer freshness + provider-error rate).
@@ -139,6 +147,26 @@ def main() -> int:
         ),
     )
     parser.add_argument("--horizon-hours", type=int, default=28)
+    parser.add_argument(
+        "--max-identities-per-run",
+        type=int,
+        default=25,
+        help=(
+            "Hard per-run provider-request ceiling (identities x2 calls). "
+            "Excess identities are deferred to the next run, not dropped. "
+            "Wired from SOURCE_CALL_SNAPSHOT_MAX_IDENTITIES_PER_RUN."
+        ),
+    )
+    parser.add_argument(
+        "--max-requests-per-day",
+        type=int,
+        default=2000,
+        help=(
+            "Hard rolling-UTC-day provider-request ceiling, measured from the "
+            "persisted run counters. Wired from "
+            "SOURCE_CALL_SNAPSHOT_MAX_REQUESTS_PER_DAY."
+        ),
+    )
     parser.add_argument("--heartbeat-file", default=None)
     args = parser.parse_args()
 
@@ -158,7 +186,14 @@ def main() -> int:
         return 1
 
     try:
-        result = asyncio.run(_run(str(db_path), horizon_hours=args.horizon_hours))
+        result = asyncio.run(
+            _run(
+                str(db_path),
+                horizon_hours=args.horizon_hours,
+                max_identities_per_run=args.max_identities_per_run,
+                max_requests_per_day=args.max_requests_per_day,
+            )
+        )
     except Exception as exc:
         print(
             json.dumps(

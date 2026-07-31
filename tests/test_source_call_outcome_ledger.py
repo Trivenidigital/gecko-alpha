@@ -811,3 +811,91 @@ async def test_d3_unpriceable_pseudo_id_without_contract_is_none():
         )
         is None
     )
+
+
+# --------------------------------------------------------------------------
+# Dual coverage denominators (2026-07-31 ruling).
+#   coverage_rate            = eligible / ALL clusters      (diagnostic)
+#   priceable_coverage_rate  = eligible / PRICEABLE clusters (primary + gate)
+# Unpriceable traffic stays visible; it just no longer makes a functioning
+# writer look unhealthy.
+# --------------------------------------------------------------------------
+
+
+async def test_dual_coverage_denominators_are_both_reported(db):
+    from scout.source_quality.ledger import compute_source_quality_summary
+
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    # 2 priceable calls (contract address), 1 of them with forward data;
+    # 2 cashtag-only calls that can NEVER be priced.
+    await _insert_inbound(
+        db._conn, event_id="p1", ca="0xAAA", chain="base", coin_id=None
+    )
+    await _insert_inbound(
+        db._conn, event_id="p2", ca="0xBBB", chain="base", coin_id=None
+    )
+    await _insert_inbound(
+        db._conn, event_id="s1", ca=None, chain=None, coin_id=None, cashtag="MEME"
+    )
+    await _insert_inbound(
+        db._conn, event_id="s2", ca=None, chain=None, coin_id=None, cashtag="PEPE"
+    )
+    await db._conn.commit()
+    await backfill_source_calls(db._conn)
+    await refresh_source_call_outcomes(db._conn, now=now)
+
+    rows = await compute_source_quality_summary(db._conn)
+    assert rows, "expected at least one source summary"
+    row = rows[0]
+
+    # All-call denominator counts the unpriceable cashtag calls...
+    assert row.unpriceable_clusters >= 2
+    assert row.priceable_clusters >= 2
+    # ...and the two rates differ precisely because of them.
+    assert row.priceable_coverage_rate >= row.coverage_rate
+    assert row.unpriceable_reason_counts, "unpriceable traffic must stay visible"
+
+
+async def test_gate_uses_priceable_denominator_not_all_calls(db):
+    """A source posting mostly cashtags must not be permanently ungradeable:
+    the gate measures our pricing, not the channel's posting style."""
+    from scout.source_quality.ledger import compute_source_quality_summary
+
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(2):
+        await _insert_inbound(
+            db._conn, event_id=f"ca{i}", ca=f"0xC{i}", chain="base", coin_id=None
+        )
+    for i in range(20):  # overwhelming unpriceable majority
+        await _insert_inbound(
+            db._conn,
+            event_id=f"tag{i}",
+            ca=None,
+            chain=None,
+            coin_id=None,
+            cashtag=f"T{i}",
+        )
+    await db._conn.commit()
+    await backfill_source_calls(db._conn)
+    await refresh_source_call_outcomes(db._conn, now=now)
+    # Give the two priceable calls forward data, so they count as eligible.
+    # Without this every rate is 0/0 and the two denominators are
+    # indistinguishable — the difference only shows once something is priced.
+    await db._conn.execute(
+        "UPDATE source_calls SET forward_30m_pct = 1.0 "
+        "WHERE contract_address IS NOT NULL AND duplicate_rank_in_cluster = 1"
+    )
+    await db._conn.commit()
+
+    rows = await compute_source_quality_summary(db._conn, min_sample=1)
+    row = rows[0]
+
+    assert row.priceable_clusters == 2
+    assert row.unpriceable_clusters == 20
+    # All-call coverage is dragged down by traffic we could never price...
+    assert row.coverage_rate == pytest.approx(2 / 22, abs=1e-6)
+    # ...while the priceable view shows the writer did everything it could.
+    assert row.priceable_coverage_rate == pytest.approx(1.0)
+    # The gate follows the priceable view: under the all-call denominator this
+    # source would be permanently 'biased_low_coverage' (0.09 < 0.5).
+    assert row.rank_status == "rankable_resolvable_cg_board_cohort"

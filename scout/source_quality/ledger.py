@@ -65,7 +65,13 @@ class SourceQualityRow:
     distinct_clusters: int
     eligible_distinct_clusters: int
     duplicate_rate: float
+    # All-call denominator — diagnostic; keeps unpriceable traffic visible.
     coverage_rate: float
+    # Priceable denominator — primary writer-health metric and the rank gate.
+    priceable_coverage_rate: float
+    priceable_clusters: int
+    unpriceable_clusters: int
+    unpriceable_reason_counts: dict[str, int]
     unresolvable_rate: float
     avg_forward_30m_pct: float | None
     avg_strategy_pnl_usd: float | None
@@ -718,9 +724,46 @@ async def compute_source_quality_summary(
         duplicate_rate = (
             0.0 if raw_calls == 0 else 1.0 - (len(cluster_keys) / raw_calls)
         )
+        # TWO coverage denominators, reported side by side.
+        #
+        # `coverage_rate` (all-call) answers "what fraction of everything this
+        # source said did we end up with forward data for". It is the honest
+        # diagnostic, and it deliberately still counts calls we can never price
+        # — cashtag-only mentions with no contract address and no CG coin id —
+        # so unpriceable traffic is never hidden.
+        #
+        # `priceable_coverage_rate` answers "of the calls we COULD price, how
+        # many did we". That is the writer-health question, and it is what the
+        # rank gate uses: a channel that mostly posts tickers rather than
+        # contract addresses would otherwise be permanently ungradeable however
+        # perfectly the writer performed, which measures the channel's posting
+        # style, not our pipeline.
+        priceable_clusters = {
+            row["duplicate_cluster_key"]
+            for row in rows
+            if _priceable_identity(row) is not None
+        }
+        unpriceable_clusters = cluster_keys - priceable_clusters
         coverage_rate = (
             0.0 if not cluster_keys else len(eligible_clusters) / len(cluster_keys)
         )
+        priceable_coverage_rate = (
+            0.0
+            if not priceable_clusters
+            else len(eligible_clusters) / len(priceable_clusters)
+        )
+        unpriceable_reason_counts: dict[str, int] = {}
+        for row in rows:
+            if _priceable_identity(row) is not None:
+                continue
+            reason = (
+                "symbol_only"
+                if _normal_symbol(_row_get(row, "symbol"))
+                else "no_identity"
+            )
+            unpriceable_reason_counts[reason] = (
+                unpriceable_reason_counts.get(reason, 0) + 1
+            )
         first_cluster_rows = [
             row for row in rows if row["duplicate_rank_in_cluster"] == 1
         ]
@@ -742,7 +785,10 @@ async def compute_source_quality_summary(
         }
         if len(eligible_clusters) < min_sample:
             rank_status = "insufficient_sample"
-        elif coverage_rate < min_coverage_rate:
+        elif priceable_coverage_rate < min_coverage_rate:
+            # Gate on the PRICEABLE denominator: coverage is a statement about
+            # whether our forward data is biased, and a call we could never
+            # price contributes no bias — it is simply out of scope.
             rank_status = "biased_low_coverage"
         else:
             rank_status = "rankable_resolvable_cg_board_cohort"
@@ -755,6 +801,10 @@ async def compute_source_quality_summary(
                 eligible_distinct_clusters=len(eligible_clusters),
                 duplicate_rate=duplicate_rate,
                 coverage_rate=coverage_rate,
+                priceable_coverage_rate=priceable_coverage_rate,
+                priceable_clusters=len(priceable_clusters),
+                unpriceable_clusters=len(unpriceable_clusters),
+                unpriceable_reason_counts=unpriceable_reason_counts,
                 unresolvable_rate=0.0 if raw_calls == 0 else unresolvable / raw_calls,
                 avg_forward_30m_pct=avg_forward,
                 avg_strategy_pnl_usd=_avg(pnl_rows),

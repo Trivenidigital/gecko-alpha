@@ -586,3 +586,146 @@ async def test_writer_still_excludes_terminal_outcome_status(db):
     )
 
     assert stats["identities_seen"] == 0
+
+
+# --------------------------------------------------------------------------
+# Activation controls (2026-07-31): hard per-run and per-day provider-request
+# ceilings, plus the counters an operator needs to judge a live writer.
+# Both ceilings fail CLOSED — over-cap work is DEFERRED (still inside the
+# forward horizon), never silently dropped.
+# --------------------------------------------------------------------------
+
+
+async def _seed_identities(db, n, *, now=NOW, hours_ago=1):
+    for i in range(n):
+        await _insert_source_call(
+            db._conn,
+            event_id=f"cap-{i}",
+            source_type="tg",
+            resolved_state="RESOLVED",
+            token_id=f"dex:solana:Cap{i}",
+            contract_address=f"Cap{i}",
+            chain="solana",
+            call_ts=_iso(now - timedelta(hours=hours_ago)),
+        )
+
+
+async def test_per_run_cap_defers_excess_and_reports_it(db):
+    await _seed_identities(db, 8)
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn,
+        now=NOW,
+        resolve_pool=resolver,
+        fetch_ohlcv=fetcher,
+        max_identities_per_run=3,
+    )
+
+    assert stats["identities_selected"] == 8
+    assert stats["identities_seen"] == 3
+    assert stats["skipped_over_cap"] == 5
+    assert stats["snapshots_written"] == 3
+    assert len(resolver.calls) == 3  # hard ceiling actually bounds provider calls
+
+
+async def test_daily_ceiling_blocks_run_before_any_provider_call(db):
+    await _seed_identities(db, 4)
+    # 2 requests/identity, so a 10-request budget is exhausted by 5 identities.
+    await db._conn.execute(
+        "INSERT INTO source_call_price_snapshot_runs "
+        "(ran_at, identities_seen, snapshots_written, provider_errors, "
+        " pools_unresolved, empty_ohlcv) VALUES (?, 5, 5, 0, 0, 0)",
+        (NOW.isoformat(),),
+    )
+    await db._conn.commit()
+
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn,
+        now=NOW,
+        resolve_pool=resolver,
+        fetch_ohlcv=fetcher,
+        max_requests_per_day=10,
+    )
+
+    assert stats["daily_cap_reached"] == 1
+    assert stats["requests_attempted"] == 0
+    assert resolver.calls == []  # breach costs ZERO provider requests
+    assert await _snapshots(db._conn) == []
+
+
+async def test_daily_ceiling_allows_partial_budget(db):
+    await _seed_identities(db, 5)
+    await db._conn.execute(
+        "INSERT INTO source_call_price_snapshot_runs "
+        "(ran_at, identities_seen, snapshots_written, provider_errors, "
+        " pools_unresolved, empty_ohlcv) VALUES (?, 3, 3, 0, 0, 0)",
+        (NOW.isoformat(),),
+    )
+    await db._conn.commit()
+
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    # 10-request budget, 6 already spent -> 4 remaining -> 2 identities affordable.
+    stats = await write_price_snapshots(
+        db._conn,
+        now=NOW,
+        resolve_pool=resolver,
+        fetch_ohlcv=fetcher,
+        max_requests_per_day=10,
+    )
+
+    assert stats["identities_seen"] == 2
+    assert stats["skipped_over_cap"] == 3
+    assert stats["requests_used_today_before"] == 6
+
+
+async def test_rate_limited_counter_separates_429_from_other_errors(db):
+    await _seed_identities(db, 1)
+    resolver = RecordingResolver(raises=PriceProviderError("geckoterminal", "http_429"))
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["rate_limited"] == 1
+    assert stats["provider_errors"] == 1
+
+
+async def test_non_429_error_is_not_counted_as_rate_limited(db):
+    await _seed_identities(db, 1)
+    resolver = RecordingResolver(raises=PriceProviderError("geckoterminal", "http_500"))
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["rate_limited"] == 0
+    assert stats["provider_errors"] == 1
+
+
+async def test_cycle_reports_latency_error_rate_and_remaining_budget(db):
+    await _seed_identities(db, 2)
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn,
+        now=NOW,
+        resolve_pool=resolver,
+        fetch_ohlcv=fetcher,
+        max_requests_per_day=100,
+    )
+
+    assert "duration_ms" in stats and stats["duration_ms"] >= 0
+    assert stats["error_rate"] == 0.0
+    assert stats["requests_attempted"] == 4  # 2 identities x (resolve + ohlcv)
+    assert stats["requests_remaining_today_before"] == 100
+    assert stats["requests_remaining_today_after"] == 96

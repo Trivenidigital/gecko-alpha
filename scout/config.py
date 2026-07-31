@@ -242,6 +242,15 @@ class Settings(BaseSettings):
     # a call older than this can gain no new in-window snapshot.
     SOURCE_CALL_SNAPSHOT_WRITER_ENABLED: bool = False
     SOURCE_CALL_SNAPSHOT_HORIZON_HOURS: int = Field(default=28, ge=1, le=168)
+    # Activation ceilings (both fail-closed; consumed by the .sh wrapper).
+    # The writer prices via the KEYLESS GeckoTerminal public API — NOT the paid
+    # CoinGecko plan — so these bound GT requests, which are shared per-IP with
+    # the DEX-discovery lane. 25 identities/run = 50 provider calls against GT's
+    # ~30 req/min tier; measured steady-state load is 1-2 identities/run.
+    SOURCE_CALL_SNAPSHOT_MAX_IDENTITIES_PER_RUN: int = Field(default=25, ge=1, le=500)
+    SOURCE_CALL_SNAPSHOT_MAX_REQUESTS_PER_DAY: int = Field(
+        default=2000, ge=1, le=100_000
+    )
 
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and

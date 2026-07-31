@@ -39,6 +39,8 @@ fi
 DB_PATH="${REPO_ROOT}/scout.db"
 ENABLED="${SOURCE_CALL_SNAPSHOT_WRITER_ENABLED:-false}"
 HORIZON_HOURS="${SOURCE_CALL_SNAPSHOT_HORIZON_HOURS:-28}"
+MAX_IDENTITIES_PER_RUN="${SOURCE_CALL_SNAPSHOT_MAX_IDENTITIES_PER_RUN:-25}"
+MAX_REQUESTS_PER_DAY="${SOURCE_CALL_SNAPSHOT_MAX_REQUESTS_PER_DAY:-2000}"
 HEARTBEAT_FILE="${SCPS_WRITER_HEARTBEAT_FILE:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -60,7 +62,13 @@ done
 
 cd "$REPO_ROOT"
 
-py_args=(--db "${DB_PATH}" --enabled "${ENABLED}" --horizon-hours "${HORIZON_HOURS}")
+py_args=(
+  --db "${DB_PATH}"
+  --enabled "${ENABLED}"
+  --horizon-hours "${HORIZON_HOURS}"
+  --max-identities-per-run "${MAX_IDENTITIES_PER_RUN}"
+  --max-requests-per-day "${MAX_REQUESTS_PER_DAY}"
+)
 if [[ -n "$HEARTBEAT_FILE" ]]; then
     py_args+=(--heartbeat-file "$HEARTBEAT_FILE")
 fi
