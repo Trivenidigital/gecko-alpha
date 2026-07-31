@@ -15,6 +15,8 @@ from typing import Any, Iterable
 import aiosqlite
 import structlog
 
+from scout.token_ids import is_cg_coin_id
+
 log = structlog.get_logger(__name__)
 
 FORWARD_FIELDS = (
@@ -146,8 +148,14 @@ def _priceable_identity(row: Any) -> tuple[str, str] | None:
     resolver) and returns None. Distinct from :func:`_identity`, which also
     returns symbol / source_event kinds for clustering.
     """
+    # Only a REAL CoinGecko coin id makes the token_id path priceable. The TG
+    # resolver and the GT new-pools lane mint synthetic `dex:{chain}:{address}`
+    # pseudo-ids; treating those as coin ids routed every CA-bearing TG call to
+    # a structurally dead lookup (no `dex:`-prefixed coin_id exists in the CG
+    # snapshot tables) and starved the contract path that could actually price
+    # them. Fall through to the contract identity instead.
     token_id = _row_get(row, "token_id")
-    if token_id:
+    if token_id and is_cg_coin_id(str(token_id)):
         return "token_id", str(token_id)
     contract = _row_get(row, "contract_address")
     if contract:
@@ -176,12 +184,19 @@ def _status_from_missing(
     values: dict[str, float | None],
     missing: list[dict[str, str]],
 ) -> str:
-    if not price_rows:
-        return "unresolvable"
+    # An empty price series is a BOOTSTRAP state, not a terminal one, while any
+    # forward window is still open: the snapshot writer only selects
+    # outcome_status IN ('pending','partial'), so terminalising here before the
+    # windows close would make the call permanently invisible to the writer —
+    # no snapshot, so price_rows stays empty, so every later call repeats the
+    # cycle and the table can never bootstrap. Only once every window has closed
+    # with no data is "unresolvable" the truthful answer.
     if any(
         m["reason"] == "pending_window" for m in missing if m["field"] in FORWARD_FIELDS
     ):
         return "pending"
+    if not price_rows:
+        return "unresolvable"
     if all(values.get(field) is not None for field in FORWARD_FIELDS):
         return "complete"
     # Keep age in the signature explicit: "partial" means all required windows

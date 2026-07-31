@@ -674,3 +674,140 @@ async def test_lag_watchdog_script_refuses_missing_db(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["ok"] is False
     assert payload["error"] == "db_not_found"
+
+
+# --------------------------------------------------------------------------
+# D1 — bootstrap deadlock: "no snapshots yet" is TRANSIENT while a forward
+# window is still open, TERMINAL only once every window has closed.
+#
+# Prod signature of the bug: 0 of 3,686 rows in 'pending' — rows only 19.6h old
+# with open windows were already 'unresolvable', so the writer (which selects
+# outcome_status IN ('pending','partial')) could never see them, so no snapshot
+# was ever written, so price_rows stayed empty forever.
+# --------------------------------------------------------------------------
+
+
+def _status(*, age_hours, price_rows, missing_reasons=(), values=None):
+    from scout.source_quality.ledger import FORWARD_FIELDS, _status_from_missing
+
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    call_ts = now - timedelta(hours=age_hours)
+    missing = [
+        {"field": f, "reason": r} for f, r in zip(FORWARD_FIELDS, missing_reasons or [])
+    ]
+    return _status_from_missing(
+        now=now,
+        call_ts=call_ts,
+        price_rows=list(price_rows),
+        values=values or {},
+        missing=missing,
+    )
+
+
+async def test_d1_fresh_call_without_snapshots_is_pending_not_unresolvable():
+    """The deadlock. A 1h-old call with no snapshot rows and an open 30m window
+    must stay 'pending' so the snapshot writer can still select it."""
+    assert (
+        _status(age_hours=1, price_rows=[], missing_reasons=["pending_window"])
+        == "pending"
+    )
+
+
+async def test_d1_mature_call_without_snapshots_is_still_unresolvable():
+    """No regression on genuine terminal state: once every forward window has
+    closed with no price data, the call is correctly unresolvable."""
+    assert (
+        _status(
+            age_hours=72,
+            price_rows=[],
+            missing_reasons=["no_time_series"] * 4,
+        )
+        == "unresolvable"
+    )
+
+
+async def test_d1_existing_transitions_unchanged_with_price_rows():
+    from scout.source_quality.ledger import FORWARD_FIELDS
+
+    rows = [{"price": 1.0}]
+    assert (
+        _status(age_hours=1, price_rows=rows, missing_reasons=["pending_window"])
+        == "pending"
+    )
+    assert (
+        _status(
+            age_hours=72,
+            price_rows=rows,
+            values={f: 1.0 for f in FORWARD_FIELDS},
+        )
+        == "complete"
+    )
+    assert (
+        _status(
+            age_hours=72,
+            price_rows=rows,
+            missing_reasons=["stale_at_call"],
+        )
+        == "partial"
+    )
+
+
+# --------------------------------------------------------------------------
+# D3 — _priceable_identity must not treat a synthetic `dex:{chain}:{address}`
+# pseudo-id as a CG-priceable coin id. 377 of 404 CA-bearing TG rows in prod
+# carry one, and the token_id path is structurally dead for them (zero
+# dex:-prefixed coin_ids exist in gainers_/losers_snapshots).
+# --------------------------------------------------------------------------
+
+
+async def test_d3_dex_pseudo_token_id_falls_through_to_contract():
+    from scout.source_quality.ledger import _priceable_identity
+
+    assert _priceable_identity(
+        {
+            "token_id": "dex:solana:BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump",
+            "contract_address": "BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump",
+            "chain": "solana",
+        }
+    ) == (
+        "contract",
+        "solana|" + "BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump".lower(),
+    )
+
+
+async def test_d3_real_cg_coin_id_still_wins():
+    from scout.source_quality.ledger import _priceable_identity
+
+    assert _priceable_identity(
+        {
+            "token_id": "rocket-pool",
+            "contract_address": "0xD33526068D116cE69F19A9ee46F0bd304F21A51f",
+            "chain": "ethereum",
+        }
+    ) == ("token_id", "rocket-pool")
+
+
+async def test_d3_bare_contract_address_as_token_id_falls_through():
+    """Raw EVM/base58 addresses stored in token_id are not CG coin ids either."""
+    from scout.source_quality.ledger import _priceable_identity
+
+    assert _priceable_identity(
+        {
+            "token_id": "0xD33526068D116cE69F19A9ee46F0bd304F21A51f",
+            "contract_address": "0xD33526068D116cE69F19A9ee46F0bd304F21A51f",
+            "chain": "ethereum",
+        }
+    ) == ("contract", "ethereum|0xd33526068d116ce69f19a9ee46f0bd304f21a51f")
+
+
+async def test_d3_unpriceable_pseudo_id_without_contract_is_none():
+    """A dex: pseudo-id with no contract address is not priceable at all —
+    it must NOT fall back to the dead token_id path."""
+    from scout.source_quality.ledger import _priceable_identity
+
+    assert (
+        _priceable_identity(
+            {"token_id": "dex:solana:Addr", "contract_address": None, "chain": None}
+        )
+        is None
+    )

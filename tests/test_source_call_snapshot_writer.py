@@ -412,3 +412,177 @@ async def test_writer_does_not_touch_source_calls_performance_fields(db):
     assert row["max_favorable_pct_24h"] is None
     assert row["outcome_status"] == "pending"  # unchanged
     assert row["resolved_state"] == "eligible_contract"  # unchanged
+
+
+# --------------------------------------------------------------------------
+# Bootstrap deadlock regression (D1 + D2 + D3, 2026-07-31)
+#
+# Production had 0 rows in source_call_price_snapshots and 0 source_calls in
+# 'pending', because three defects compounded:
+#   D1 ledger._status_from_missing terminalised a call to 'unresolvable' before
+#      checking whether its forward windows were still open, so a brand-new call
+#      was excluded from the writer's outcome_status IN ('pending','partial').
+#   D2 the writer's SQL was hard-scoped to source_type='x' AND
+#      resolved_state='eligible_contract' — the live lane is 'tg'.
+#   D3 _priceable_identity returned ("token_id", …) for ANY truthy token_id, and
+#      the writer skips non-"contract" identities. Every TG row carries a
+#      synthetic `dex:{chain}:{address}` token_id, so all 404 CA-bearing TG rows
+#      were skipped even after D1+D2.
+# Each fix alone still writes zero snapshots; these lock in all three.
+# --------------------------------------------------------------------------
+
+
+async def test_writer_prices_tg_row_with_dex_pseudo_token_id(db):
+    """The full-chain regression: a TG call carrying BOTH a synthetic `dex:`
+    token_id AND a real contract address must be priced via the contract path.
+
+    Fails on D1-only, D2-only and D1+D2 — the row is skipped by
+    `identity[0] != "contract"` because the dex: pseudo-id wins in
+    _priceable_identity."""
+    await _insert_source_call(
+        db._conn,
+        event_id="tg1",
+        source_type="tg",
+        resolved_state="RESOLVED",  # prod value; NOT 'eligible_contract'
+        token_id="dex:solana:BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump",
+        contract_address="BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump",
+        chain="solana",
+        call_ts=_iso(NOW - timedelta(hours=2)),
+        outcome_status="pending",
+    )
+    resolver = RecordingResolver(result=_pool(network="solana", pool_address="POOLTG"))
+    fetcher = RecordingFetcher(result=[_candle(close=0.00035)])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    rows = await _snapshots(db._conn)
+    assert len(rows) == 1, "TG row with dex: token_id must be priced by contract"
+    assert rows[0]["identity_kind"] == "contract"
+    assert rows[0]["identity_key"] == (
+        "solana|" + "BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump".lower()
+    )
+    assert stats["snapshots_written"] == 1
+    # original-case CA reaches the provider (Solana is case-sensitive)
+    assert resolver.calls == [
+        {
+            "chain": "solana",
+            "contract_address": "BX8np2NYESCYThnWhRMXZytPyybKsbnVEYMPGgWVpump",
+        }
+    ]
+
+
+async def test_writer_still_skips_row_with_real_cg_coin_id(db):
+    """No regression on the working path: a real CG slug still routes to the
+    token_id identity, which this contract-keyed writer does not price."""
+    await _insert_source_call(
+        db._conn,
+        event_id="tg2",
+        source_type="tg",
+        resolved_state="RESOLVED",
+        token_id="rocket-pool",  # genuine CG coin id
+        contract_address="0xD33526068D116cE69F19A9ee46F0bd304F21A51f",
+        chain="ethereum",
+        call_ts=_iso(NOW - timedelta(hours=2)),
+    )
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert await _snapshots(db._conn) == []
+    assert stats["identities_seen"] == 0
+    assert resolver.calls == []
+
+
+async def test_writer_selects_tg_row_regardless_of_resolved_state_case(db):
+    """D2: resolved_state is mixed-case and inconsistent in prod
+    (RESOLVED/resolved/unresolved/UNRESOLVED_*). Selection must not depend on it."""
+    for ev, state in (("a", "resolved"), ("b", "UNRESOLVED_TRANSIENT")):
+        await _insert_source_call(
+            db._conn,
+            event_id=f"tg-{ev}",
+            source_type="tg",
+            resolved_state=state,
+            token_id=f"dex:solana:Addr{ev}",
+            contract_address=f"Addr{ev}",
+            chain="solana",
+            call_ts=_iso(NOW - timedelta(hours=1)),
+        )
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["identities_seen"] == 2
+    assert stats["snapshots_written"] == 2
+
+
+async def test_writer_still_excludes_row_without_contract_address(db):
+    await _insert_source_call(
+        db._conn,
+        event_id="tg3",
+        source_type="tg",
+        resolved_state="RESOLVED",
+        symbol="PEPE",
+        call_ts=_iso(NOW - timedelta(hours=1)),
+    )
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["identities_seen"] == 0
+    assert await _snapshots(db._conn) == []
+
+
+async def test_writer_still_excludes_tg_row_outside_horizon(db):
+    await _insert_source_call(
+        db._conn,
+        event_id="tg4",
+        source_type="tg",
+        resolved_state="RESOLVED",
+        token_id="dex:solana:OldAddr",
+        contract_address="OldAddr",
+        chain="solana",
+        call_ts=_iso(NOW - timedelta(hours=40)),  # > 28h horizon
+    )
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["identities_seen"] == 0
+    assert await _snapshots(db._conn) == []
+
+
+async def test_writer_still_excludes_terminal_outcome_status(db):
+    """outcome_status gating is retained — it is meaningful once D1 is fixed."""
+    await _insert_source_call(
+        db._conn,
+        event_id="tg5",
+        source_type="tg",
+        resolved_state="RESOLVED",
+        token_id="dex:solana:TermAddr",
+        contract_address="TermAddr",
+        chain="solana",
+        call_ts=_iso(NOW - timedelta(hours=1)),
+        outcome_status="unresolvable",
+    )
+    resolver = RecordingResolver(result=_pool())
+    fetcher = RecordingFetcher(result=[_candle()])
+
+    stats = await write_price_snapshots(
+        db._conn, now=NOW, resolve_pool=resolver, fetch_ohlcv=fetcher
+    )
+
+    assert stats["identities_seen"] == 0
