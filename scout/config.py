@@ -1345,6 +1345,38 @@ class Settings(BaseSettings):
     # propagation window from being read as a rejection.
     KRAKEN_SUBMISSION_SETTLE_SEC: float = 3.0
 
+    # -------- Kraken supervised pilot envelope (PR-K3, 2026-07-31) --------
+    # The mechanical caps around the ONE operator-invoked supervised trade
+    # (scout.live.kraken_pilot). Every default is the refusing one: the runner
+    # will not place an order until the operator has deliberately set the
+    # master gate AND named the single approved pair.
+    #
+    # These are the pilot lane's caps only. They do NOT gate the signal-driven
+    # live engine, which has its own LIVE_* envelope above.
+    KRAKEN_PILOT_ENABLED: bool = False
+    # Canonical BASE symbol of the ONE approved pair, e.g. "BTC". Empty (the
+    # default) means no pair is approved and the runner refuses — a pilot that
+    # can trade "whatever was passed on the command line" is not a pilot.
+    KRAKEN_PILOT_PAIR: str = ""
+    KRAKEN_PILOT_QUOTE: str = "USD"
+    KRAKEN_PILOT_MIN_ORDER_USD: float = 10.0
+    KRAKEN_PILOT_MAX_ORDER_USD: float = 25.0
+    # Cumulative notional ceiling across ALL pilot orders in one UTC day,
+    # counted over every non-rejected kraken live_trades row. Backstops the
+    # per-order cap against "one more small order" repetition.
+    KRAKEN_PILOT_MAX_DAILY_GROSS_USD: float = 100.0
+    KRAKEN_PILOT_FILL_TIMEOUT_SEC: float = 120.0
+    KRAKEN_PILOT_EVIDENCE_DIR: str = "pilot_evidence"
+    # Warn-only: how far the operator's limit price may sit from the current
+    # mid before the runner flags it in the approval block. NOT a block — a
+    # marketable limit is a legitimate supervised choice, it just has to be a
+    # deliberate one.
+    KRAKEN_PILOT_PRICE_DEVIATION_WARN_PCT: float = 5.0
+    # Headroom added to the required balance so a fee cannot turn a
+    # just-affordable order into a venue rejection. Doubles as the tolerance
+    # band for the post-trade balance reconciliation.
+    KRAKEN_PILOT_FEE_HEADROOM_PCT: float = 1.0
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
@@ -1875,6 +1907,33 @@ class Settings(BaseSettings):
                 f"got exposure={self.LIVE_MAX_EXPOSURE_USD}, "
                 f"trade={self.LIVE_TRADE_AMOUNT_USD}. A single trade cannot "
                 "exceed the aggregate cap or no trades will ever pass Gate 8."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_kraken_pilot_caps(self) -> "Settings":
+        """PR-K3: the pilot's three notional caps must nest.
+
+        MIN <= MAX <= MAX_DAILY_GROSS. An inverted pair is a silent
+        no-trade footgun in the same shape as ``_validate_live_caps_relation``
+        above: MIN > MAX rejects every order the operator can size, and
+        MAX > MAX_DAILY_GROSS means the very first order breaches the daily
+        ceiling. Both fail at config load rather than at 06:00 on trade day.
+        """
+        if self.KRAKEN_PILOT_MIN_ORDER_USD > self.KRAKEN_PILOT_MAX_ORDER_USD:
+            raise ValueError(
+                "KRAKEN_PILOT_MIN_ORDER_USD must be <= KRAKEN_PILOT_MAX_ORDER_USD; "
+                f"got min={self.KRAKEN_PILOT_MIN_ORDER_USD}, "
+                f"max={self.KRAKEN_PILOT_MAX_ORDER_USD}. No order size satisfies "
+                "both bounds."
+            )
+        if self.KRAKEN_PILOT_MAX_ORDER_USD > self.KRAKEN_PILOT_MAX_DAILY_GROSS_USD:
+            raise ValueError(
+                "KRAKEN_PILOT_MAX_ORDER_USD must be <= "
+                "KRAKEN_PILOT_MAX_DAILY_GROSS_USD; got "
+                f"max={self.KRAKEN_PILOT_MAX_ORDER_USD}, "
+                f"daily_gross={self.KRAKEN_PILOT_MAX_DAILY_GROSS_USD}. A single "
+                "max-sized order would breach the daily ceiling."
             )
         return self
 
