@@ -25,6 +25,12 @@ class VenueMetadata:
     min_size: float | None
     tick_size: float | None
     lot_size: float | None
+    # Minimum order COST in quote currency, distinct from min_size (minimum
+    # order size in base units). Kraken publishes both (`ordermin` /
+    # `costmin`) and rejects an order that clears ordermin but not costmin.
+    # Optional + trailing so Binance/CCXT constructions are unaffected —
+    # they leave it None, meaning "venue publishes no separate cost floor".
+    min_cost: float | None = None
 
 
 @dataclass(frozen=True)
