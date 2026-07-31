@@ -363,6 +363,13 @@ class KrakenSpotAdapter(ExchangeAdapter):
         - ``EGeneral:Permission denied``→ ``KrakenPermissionError`` (no retry)
         - rate-limit errors            → ``KrakenRateLimitError`` (no retry)
         - any other non-empty error    → ``KrakenAPIError`` (no retry)
+
+        Return-shape caveat: a few Kraken endpoints send ``result`` as a JSON
+        ARRAY rather than an object (``WithdrawMethods`` is one). Those return
+        ``{}`` here — PR-K1 only needs the raise/don't-raise signal from them,
+        and the declared ``dict`` return type is what every current caller
+        consumes. PR-K2 must widen this return type before it can read an
+        array payload, rather than assuming ``{}`` means "empty result".
         """
         url = f"{self._base_url}{path}"
         session = self._get_session()
