@@ -26,13 +26,19 @@ from scout.live.kraken_adapter import (
     KrakenWithdrawalCapabilityError,
     normalize_kraken_asset,
 )
-from scout.live.kraken_signing import KrakenSigningError
+from scout.live.kraken_signing import (
+    KrakenSigningError,
+    key_fingerprint,
+    reset_nonce_sources_for_tests,
+)
 
 _ASSETPAIRS_RE = re.compile(r"https://api\.kraken\.com/0/public/AssetPairs.*")
 _TICKER_RE = re.compile(r"https://api\.kraken\.com/0/public/Ticker.*")
 _DEPTH_RE = re.compile(r"https://api\.kraken\.com/0/public/Depth.*")
 _BALANCE_URL = "https://api.kraken.com/0/private/Balance"
-_WITHDRAW_URL = "https://api.kraken.com/0/private/WithdrawMethods"
+_BALANCEEX_URL = "https://api.kraken.com/0/private/BalanceEx"
+_WITHDRAW_METHODS_URL = "https://api.kraken.com/0/private/WithdrawMethods"
+_WITHDRAW_STATUS_URL = "https://api.kraken.com/0/private/WithdrawStatus"
 
 _REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
 
@@ -375,7 +381,13 @@ async def test_fetch_depth_caps_count_at_kraken_maximum():
 async def test_private_post_sends_signed_headers_and_form_body():
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "100.0"}})
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {"ZUSD": {"balance": 100.0, "hold_trade": 0.0}},
+            },
+        )
         await adapter.fetch_account_balance(asset="USD")
         recorded = _calls(m)[0]
         headers = recorded.kwargs["headers"]
@@ -395,13 +407,13 @@ async def test_fetch_account_balance_normalizes_kraken_asset_codes():
     adapter = _adapter()
     with aioresponses() as m:
         m.post(
-            _BALANCE_URL,
+            _BALANCEEX_URL,
             payload={
                 "error": [],
                 "result": {
-                    "ZUSD": "171288.6158",
-                    "XXBT": "1011.19088779",
-                    "USDT": "500000.0",
+                    "ZUSD": {"balance": 171288.6158, "hold_trade": 0.0},
+                    "XXBT": {"balance": 1011.19088779, "hold_trade": 0.0},
+                    "USDT": {"balance": 500000.0, "hold_trade": 0.0},
                 },
             },
         )
@@ -417,7 +429,13 @@ async def test_fetch_account_balance_defaults_to_usd():
     pilot trades a USD-quoted book."""
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "42.5"}})
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {"ZUSD": {"balance": 42.5, "hold_trade": 0.0}},
+            },
+        )
         assert await adapter.fetch_account_balance() == pytest.approx(42.5)
     await adapter.close()
 
@@ -429,8 +447,14 @@ async def test_fetch_account_balance_skips_staked_variants():
     adapter = _adapter()
     with aioresponses() as m:
         m.post(
-            _BALANCE_URL,
-            payload={"error": [], "result": {"XXBT.S": "5.0", "XXBT": "0.25"}},
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {
+                    "XXBT.S": {"balance": 5.0, "hold_trade": 0.0},
+                    "XXBT": {"balance": 0.25, "hold_trade": 0.0},
+                },
+            },
         )
         assert await adapter.fetch_account_balance(asset="BTC") == pytest.approx(0.25)
     await adapter.close()
@@ -440,7 +464,13 @@ async def test_fetch_account_balance_skips_staked_variants():
 async def test_fetch_account_balance_returns_zero_when_asset_absent():
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZEUR": "10.0"}})
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {"ZEUR": {"balance": 10.0, "hold_trade": 0.0}},
+            },
+        )
         assert await adapter.fetch_account_balance(asset="USD") == 0.0
     await adapter.close()
 
@@ -477,7 +507,7 @@ async def test_http_200_with_error_list_is_a_failure():
     adapter = _adapter()
     with aioresponses() as m:
         m.post(
-            _BALANCE_URL,
+            _BALANCEEX_URL,
             status=200,
             payload={"error": ["EGeneral:Invalid arguments"]},
             repeat=True,
@@ -497,7 +527,7 @@ async def test_auth_class_errors_raise_and_are_never_retried(error_code):
     lockout — exactly one request must leave the box."""
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, status=200, payload={"error": [error_code]}, repeat=True)
+        m.post(_BALANCEEX_URL, status=200, payload={"error": [error_code]}, repeat=True)
         with pytest.raises(KrakenAuthError, match=re.escape(error_code)):
             await adapter.fetch_account_balance(asset="USD")
         assert len(_calls(m)) == 1
@@ -509,7 +539,7 @@ async def test_permission_denied_raises_permission_error_without_retry():
     adapter = _adapter()
     with aioresponses() as m:
         m.post(
-            _BALANCE_URL,
+            _BALANCEEX_URL,
             status=200,
             payload={"error": ["EGeneral:Permission denied"]},
             repeat=True,
@@ -525,7 +555,7 @@ async def test_rate_limit_error_raises_without_retry():
     adapter = _adapter()
     with aioresponses() as m:
         m.post(
-            _BALANCE_URL,
+            _BALANCEEX_URL,
             status=200,
             payload={"error": ["EAPI:Rate limit exceeded"]},
             repeat=True,
@@ -612,12 +642,17 @@ async def test_cloudflare_html_body_is_treated_as_transient():
 # ---------- preflight ----------
 
 
+_AUTH_OK = {"error": [], "result": {"ZUSD": "100.0"}}
+_DENIED = {"error": ["EGeneral:Permission denied"]}
+
+
 @pytest.mark.asyncio
-async def test_preflight_passes_when_withdrawal_is_permission_denied():
+async def test_preflight_passes_only_when_both_probes_are_denied():
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "100.0"}})
-        m.post(_WITHDRAW_URL, payload={"error": ["EGeneral:Permission denied"]})
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload=_DENIED)
+        m.post(_WITHDRAW_STATUS_URL, payload=_DENIED)
         result = await adapter.preflight_credentials_check()
     assert result["auth_ok"] is True
     assert result["withdrawal_excluded"] is True
@@ -626,39 +661,86 @@ async def test_preflight_passes_when_withdrawal_is_permission_denied():
 
 
 @pytest.mark.asyncio
-async def test_preflight_hard_rejects_when_withdrawal_probe_succeeds():
-    """The key CAN reach a withdrawal-scoped endpoint — hard reject."""
+async def test_preflight_probes_withdraw_status_with_asset_filter():
+    """WithdrawStatus's asset filter is optional; we send ZUSD so the probe
+    is a well-formed query rather than an unfiltered account-wide one."""
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "100.0"}})
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload=_DENIED)
+        m.post(_WITHDRAW_STATUS_URL, payload=_DENIED)
+        await adapter.preflight_credentials_check()
+        status_body = _calls(m)[2].kwargs["data"]
+        assert "asset=ZUSD" in status_body
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_preflight_hard_rejects_when_first_probe_succeeds():
+    """The key reached a withdrawal-scoped endpoint — hard reject, and the
+    second probe is never attempted."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
         m.post(
-            _WITHDRAW_URL,
+            _WITHDRAW_METHODS_URL,
             payload={"error": [], "result": [{"asset": "XBT", "method": "Bitcoin"}]},
         )
-        with pytest.raises(KrakenWithdrawalCapabilityError, match="CAN reach"):
+        with pytest.raises(KrakenWithdrawalCapabilityError, match="reached"):
+            await adapter.preflight_credentials_check()
+        assert len(_calls(m)) == 2
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_preflight_hard_rejects_when_second_probe_succeeds():
+    """The whole point of two probes: WithdrawMethods denying is NOT enough
+    if WithdrawStatus answers. Guards against the two endpoints being gated
+    by different permission bits."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload=_DENIED)
+        m.post(
+            _WITHDRAW_STATUS_URL, payload={"error": [], "result": {"withdrawals": []}}
+        )
+        with pytest.raises(KrakenWithdrawalCapabilityError, match="WithdrawStatus"):
             await adapter.preflight_credentials_check()
     await adapter.close()
 
 
 @pytest.mark.asyncio
-async def test_preflight_fails_closed_on_unrelated_withdrawal_error():
+async def test_preflight_fails_closed_on_unrelated_error_from_second_probe():
     """Anything that isn't an explicit permission denial leaves withdrawal
-    exclusion UNPROVEN — refuse to proceed."""
+    exclusion UNPROVEN — refuse to proceed, on either probe."""
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "100.0"}})
-        m.post(_WITHDRAW_URL, payload={"error": ["EFunding:No funding method"]})
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload=_DENIED)
+        m.post(_WITHDRAW_STATUS_URL, payload={"error": ["EFunding:No funding method"]})
         with pytest.raises(KrakenWithdrawalCapabilityError, match="inconclusive"):
             await adapter.preflight_credentials_check()
     await adapter.close()
 
 
 @pytest.mark.asyncio
-async def test_preflight_fails_closed_when_withdrawal_probe_is_transient():
+async def test_preflight_fails_closed_on_unrelated_error_from_first_probe():
     adapter = _adapter()
     with aioresponses() as m:
-        m.post(_BALANCE_URL, payload={"error": [], "result": {"ZUSD": "100.0"}})
-        m.post(_WITHDRAW_URL, status=503, body="", repeat=True)
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload={"error": ["EFunding:No funding method"]})
+        with pytest.raises(KrakenWithdrawalCapabilityError, match="inconclusive"):
+            await adapter.preflight_credentials_check()
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_closed_when_second_probe_is_transient():
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_BALANCE_URL, payload=_AUTH_OK)
+        m.post(_WITHDRAW_METHODS_URL, payload=_DENIED)
+        m.post(_WITHDRAW_STATUS_URL, status=503, body="", repeat=True)
         with pytest.raises(KrakenWithdrawalCapabilityError, match="inconclusive"):
             await adapter.preflight_credentials_check()
     await adapter.close()
@@ -723,4 +805,188 @@ async def test_malformed_secret_raises_signing_error_without_retry():
             await adapter.fetch_account_balance(asset="USD")
         assert "not-valid-base64" not in str(excinfo.value)
         assert len(_calls(m)) == 0
+    await adapter.close()
+
+
+# ---------- review fixes ----------
+
+
+@pytest.mark.asyncio
+async def test_nonce_is_shared_process_wide_across_adapter_instances():
+    """Kraken counts nonces PER KEY and cannot reset them. Two adapters on
+    one key must draw from ONE monotonic counter — a per-instance counter
+    makes both seed from the same clock and collide, and the loser gets
+    EAPI:Invalid nonce (then EGeneral:Temporary lockout on the whole key)."""
+    reset_nonce_sources_for_tests()
+    a, b = _adapter(), _adapter()
+    drawn: list[int] = []
+    for _ in range(50):
+        drawn.append(int(await a._nonce_source(a._api_key()).next()))
+        drawn.append(int(await b._nonce_source(b._api_key()).next()))
+    assert len(set(drawn)) == len(drawn), "duplicate nonce across instances"
+    assert drawn == sorted(drawn), "nonces not globally increasing"
+    await a.close()
+    await b.close()
+
+
+@pytest.mark.asyncio
+async def test_distinct_keys_get_distinct_nonce_sources():
+    """The counter is partitioned per key — an unrelated key must not be
+    dragged forward by another key's traffic."""
+    reset_nonce_sources_for_tests()
+    a = _adapter()
+    b = _adapter(KRAKEN_API_KEY="a-different-key")
+    assert a._nonce_source(a._api_key()) is not b._nonce_source(b._api_key())
+    assert a._nonce_source(a._api_key()) is a._nonce_source(a._api_key())
+    await a.close()
+    await b.close()
+
+
+def test_key_fingerprint_does_not_leak_the_key():
+    fp = key_fingerprint("super-secret-api-key")
+    assert "super-secret-api-key" not in fp
+    assert fp == key_fingerprint("super-secret-api-key")
+    assert fp != key_fingerprint("another-key")
+
+
+@pytest.mark.asyncio
+async def test_fetch_account_balance_subtracts_order_holds():
+    """/0/private/Balance is NOT net of open-order holds; balance_gate reads
+    this as 'available'. BalanceEx + hold_trade is what makes it true."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {"ZUSD": {"balance": 50.0, "hold_trade": 45.0}},
+            },
+        )
+        assert await adapter.fetch_account_balance(asset="USD") == pytest.approx(5.0)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_account_balance_applies_credit_terms():
+    """Kraken documents available = balance + credit - credit_used - hold_trade."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {
+                    "ZUSD": {
+                        "balance": 100.0,
+                        "hold_trade": 10.0,
+                        "credit": 50.0,
+                        "credit_used": 20.0,
+                    }
+                },
+            },
+        )
+        assert await adapter.fetch_account_balance(asset="USD") == pytest.approx(120.0)
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_account_balance_clamps_negative_available_to_zero():
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _BALANCEEX_URL,
+            payload={
+                "error": [],
+                "result": {"ZUSD": {"balance": 10.0, "hold_trade": 99.0}},
+            },
+        )
+        assert await adapter.fetch_account_balance(asset="USD") == 0.0
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_price_rejects_crossed_book_and_uses_last_trade():
+    """bid > ask is a stale/corrupt ticker. Averaging gives a plausible
+    number arbitrarily far from the real price, which mis-sizes orders."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(
+            _TICKER_RE,
+            payload={
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "a": ["100.0", "1", "1.0"],
+                        "b": ["50000.0", "1", "1.0"],
+                        "c": ["49999.0", "0.01"],
+                    }
+                },
+            },
+        )
+        assert await adapter.fetch_price("XBTUSD") == Decimal("49999.0")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_price_accepts_touching_book():
+    """bid == ask is a locked, not crossed, book — still a valid mid."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(
+            _TICKER_RE,
+            payload={
+                "error": [],
+                "result": {
+                    "XXBTZUSD": {
+                        "a": ["100.0", "1", "1.0"],
+                        "b": ["100.0", "1", "1.0"],
+                        "c": ["99.0", "0.01"],
+                    }
+                },
+            },
+        )
+        assert await adapter.fetch_price("XBTUSD") == Decimal("100.0")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_pair_rejects_base_mismatch():
+    """Kraken alias-resolves the pair query server-side, so we get an answer
+    about a different string than we sent. If the resolved base isn't the
+    symbol we asked for, that's an order for the wrong asset."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(
+            _ASSETPAIRS_RE,
+            payload={"error": [], "result": {"XXBTZUSD": _XBTUSD_ROW}},
+            repeat=True,
+        )
+        assert await adapter.resolve_pair_for_symbol("PEPE") is None
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_venue_metadata_rejects_base_mismatch():
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(
+            _ASSETPAIRS_RE,
+            payload={"error": [], "result": {"XXBTZUSD": _XBTUSD_ROW}},
+            repeat=True,
+        )
+        assert await adapter.fetch_venue_metadata("PEPE") is None
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_base_validation_still_accepts_kraken_alias_naming():
+    """The check must not break the legitimate BTC→XXBT alias path."""
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.get(
+            _ASSETPAIRS_RE,
+            payload={"error": [], "result": {"XXBTZUSD": _XBTUSD_ROW}},
+            repeat=True,
+        )
+        assert await adapter.resolve_pair_for_symbol("BTC") == "XBTUSD"
     await adapter.close()

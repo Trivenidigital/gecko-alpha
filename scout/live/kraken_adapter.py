@@ -11,9 +11,11 @@ Endpoints used
 - ``GET  /0/public/AssetPairs`` — market rules + pair resolution
 - ``GET  /0/public/Ticker``     — spot mid
 - ``GET  /0/public/Depth``      — L2 orderbook snapshot
-- ``POST /0/private/Balance``   — account balances (preflight step 1)
-- ``POST /0/private/WithdrawMethods`` — withdrawal-capability probe
-  (preflight step 2; a SUCCESS here is a hard reject)
+- ``POST /0/private/BalanceEx`` — available balance, net of order holds
+- ``POST /0/private/Balance``   — auth liveness check (preflight step 1)
+- ``POST /0/private/WithdrawMethods`` + ``POST /0/private/WithdrawStatus``
+  — withdrawal-capability probes (preflight step 2; a SUCCESS on either is
+  a hard reject)
 
 Kraken API facts verified against current docs on 2026-07-31
 ------------------------------------------------------------
@@ -52,8 +54,20 @@ Kraken API facts verified against current docs on 2026-07-31
 6. NOT VERIFIABLE: no Kraken REST endpoint reports the permission scopes
    granted to an API key — the docs index, the auth guide and the private
    endpoint list contain no key-introspection method. That absence is why
-   ``preflight_credentials_check`` probes a withdrawal-scoped endpoint and
+   ``preflight_credentials_check`` probes withdrawal-scoped endpoints and
    requires an explicit permission denial, rather than reading a scope list.
+7. BalanceEx (https://docs.kraken.com/api/docs/rest-api/get-extended-balance)
+   returns per asset ``balance`` / ``hold_trade`` (+ ``credit`` /
+   ``credit_used`` on credit-line accounts) and documents
+   ``available = balance + credit - credit_used - hold_trade``. Plain
+   ``Balance`` is NOT net of open-order holds, so ``fetch_account_balance``
+   uses BalanceEx. Note BalanceEx sends these as JSON numbers whereas most
+   Kraken endpoints send numeric strings; ``_to_float`` accepts both.
+8. WithdrawStatus
+   (https://docs.kraken.com/api/docs/rest-api/get-status-recent-withdrawals)
+   requires "Funds permissions - Withdraw" **OR** "Data - Query ledger
+   entries" — the two withdrawal probes are NOT gated identically. See
+   ``preflight_credentials_check`` for the false-reject this can cause.
 
 Empirical checks run against the live public API on 2026-07-31 (all 1428
 tradable pairs): ``tick_size`` equalled ``10**-pair_decimals`` for every
@@ -84,7 +98,12 @@ from scout.live.adapter_base import (
     VenueMetadata,
 )
 from scout.live.exceptions import RateLimitError, VenueTransientError
-from scout.live.kraken_signing import KrakenNonce, sign_kraken_request
+from scout.live.kraken_signing import (
+    KrakenNonce,
+    get_nonce_source,
+    key_fingerprint,
+    sign_kraken_request,
+)
 from scout.live.types import Depth, DepthLevel
 
 log = structlog.get_logger(__name__)
@@ -238,6 +257,17 @@ _TRANSIENT_ERROR_PREFIXES: tuple[str, ...] = (
 # adapter's ``{"__code": -1121}`` unknown-symbol sentinel.
 _TOLERATED_KEY = "__kraken_error"
 
+# Withdrawal-scoped endpoints probed by preflight_credentials_check, as
+# (path, post_data). EVERY one must answer EGeneral:Permission denied for
+# the key to count as withdrawal-excluded — one endpoint is not enough
+# because Kraken need not gate them all on the same permission bit.
+# WithdrawStatus's `asset` filter is optional; ZUSD is passed so the probe
+# is a well-formed query rather than an unfiltered account-wide one.
+_WITHDRAWAL_PROBES: tuple[tuple[str, dict[str, Any] | None], ...] = (
+    ("/0/private/WithdrawMethods", None),
+    ("/0/private/WithdrawStatus", {"asset": "ZUSD"}),
+)
+
 _BACKOFFS: tuple[float, ...] = (1.0, 2.0, 4.0)
 
 # Kraken caps Depth's `count` at 500.
@@ -282,7 +312,6 @@ class KrakenSpotAdapter(ExchangeAdapter):
         self._db = db
         self._base_url = settings.KRAKEN_API_BASE_URL.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
-        self._nonce = KrakenNonce()
 
         # Swappable in tests to skip real backoff delays.
         self._retry_sleep = asyncio.sleep
@@ -293,6 +322,16 @@ class KrakenSpotAdapter(ExchangeAdapter):
     def _api_key(self) -> str:
         """Extract the API key from SecretStr; raise if unconfigured."""
         return self._secret_value("KRAKEN_API_KEY")
+
+    def _nonce_source(self, api_key: str) -> KrakenNonce:
+        """The process-wide nonce counter for this adapter's API key.
+
+        Resolved per request rather than cached on the instance: Kraken
+        counts nonces per KEY, so every adapter sharing a key must draw
+        from one counter. Looking it up lazily also means a public-only
+        adapter (no credentials) never touches the registry.
+        """
+        return get_nonce_source(key_fingerprint(api_key))
 
     def _api_secret(self) -> str:
         """Extract the API secret from SecretStr; raise if unconfigured."""
@@ -379,13 +418,14 @@ class KrakenSpotAdapter(ExchangeAdapter):
             try:
                 if signed:
                     body = dict(data or {})
+                    api_key = self._api_key()
                     # Fresh nonce per attempt: Kraken requires strictly
                     # increasing nonces, so a replayed one is rejected.
-                    nonce = await self._nonce.next()
+                    nonce = await self._nonce_source(api_key).next()
                     body["nonce"] = nonce
                     post_data = urlencode(body)
                     headers = {
-                        "API-Key": self._api_key(),
+                        "API-Key": api_key,
                         "API-Sign": sign_kraken_request(
                             path, post_data, nonce, self._api_secret()
                         ),
@@ -556,6 +596,30 @@ class KrakenSpotAdapter(ExchangeAdapter):
         # dict.fromkeys: dedupe while preserving preference order.
         return list(dict.fromkeys(candidates))
 
+    def _base_matches(self, row: dict, symbol: str) -> bool:
+        """Verify the returned pair's BASE really is ``symbol``.
+
+        Kraken does curated alias resolution server-side on the ``pair``
+        query — ``BTCUSD`` answers with ``XXBTZUSD``, which is what we want,
+        but it means we asked a question and got an answer about a
+        *different string than we sent*. Without checking the base we would
+        trust whatever Kraken decided our ticker meant, and a wrong-but-
+        online pair resolves silently into an order for the wrong asset.
+        Validating the quote alone does not catch this: a mis-resolved pair
+        is still USD-quoted.
+        """
+        expected = symbol.upper()
+        actual = normalize_kraken_asset(str(row.get("base", "")))
+        if actual == expected:
+            return True
+        log.warning(
+            "kraken_pair_base_mismatch",
+            symbol=expected,
+            resolved_base=actual,
+            altname=row.get("altname"),
+        )
+        return False
+
     async def resolve_pair_for_symbol(self, symbol: str) -> str | None:
         """Resolve a canonical ticker to a tradable Kraken altname.
 
@@ -582,6 +646,8 @@ class KrakenSpotAdapter(ExchangeAdapter):
                     )
                     continue
                 if normalize_kraken_asset(str(row.get("quote", ""))) != quote:
+                    continue
+                if not self._base_matches(row, symbol):
                     continue
                 altname = row.get("altname")
                 if not altname:
@@ -615,6 +681,11 @@ class KrakenSpotAdapter(ExchangeAdapter):
             return None
         row = await self.fetch_exchange_info_row(pair)
         if row is None:
+            return None
+        # Re-validate on this row too: resolve_pair_for_symbol checked a
+        # different response, and a metadata row that disagrees about the
+        # base would hand the sizing layer another asset's tick and minimums.
+        if not self._base_matches(row, canonical):
             return None
 
         tick_size = _to_float(row.get("tick_size"))
@@ -652,7 +723,18 @@ class KrakenSpotAdapter(ExchangeAdapter):
         bid = _first_decimal(row.get("b"))
         ask = _first_decimal(row.get("a"))
         if bid is not None and ask is not None:
-            return (bid + ask) / Decimal(2)
+            if bid <= ask:
+                return (bid + ask) / Decimal(2)
+            # Crossed book (bid > ask) — a stale or corrupt ticker. Averaging
+            # the two produces a plausible-looking number that is arbitrarily
+            # far from the real price, which would silently mis-size an order.
+            # Fall through to the last trade instead.
+            log.warning(
+                "kraken_ticker_crossed_book",
+                pair=pair,
+                bid=str(bid),
+                ask=str(ask),
+            )
 
         last = _first_decimal(row.get("c"))
         if last is not None:
@@ -697,47 +779,95 @@ class KrakenSpotAdapter(ExchangeAdapter):
     # Account
     # ------------------------------------------------------------------
     async def fetch_account_balance(self, asset: str = "USD") -> float:
-        """Free spot balance in ``asset`` via ``POST /0/private/Balance``.
+        """AVAILABLE spot balance in ``asset`` via ``POST /0/private/BalanceEx``.
+
+        Uses BalanceEx, not Balance. ``/0/private/Balance`` reports a total
+        that is net of pending withdrawals but NOT of funds held by open
+        orders, so on an account with resting orders it overstates what can
+        actually be spent — and ``balance_gate`` consumes this number as
+        "available". BalanceEx breaks the total out and lets us subtract the
+        hold.
+
+        Computed with Kraken's documented formula
+        (https://docs.kraken.com/api/docs/rest-api/get-extended-balance):
+        ``available = balance + credit - credit_used - hold_trade``.
+        ``credit``/``credit_used`` appear only on accounts with a credit
+        line and default to 0 — including them costs nothing and keeps the
+        result correct if the pilot account ever gets one.
 
         Defaults to USD, not the ABC's USDT: this is a USD-quoted Kraken
         pilot. Every caller in-tree passes the asset by keyword, so the
         narrowed default cannot silently change a Binance call.
 
-        Balance keys are normalized (``ZUSD``→USD, ``XXBT``→BTC). Suffixed
-        keys (``XBT.S`` staked, ``.F``/``.B``/``.M``/``.T`` earn and
-        tokenized variants) are SKIPPED — they are not spot-tradable, and
-        counting them would let a balance gate approve an order the account
-        cannot actually fund. Returns ``0.0`` when the asset is absent.
+        Keys are normalized (``ZUSD``→USD, ``XXBT``→BTC). Suffixed keys
+        (``XBT.S`` staked, ``.F``/``.B``/``.M``/``.T`` earn and tokenized
+        variants) are SKIPPED — they are not spot-tradable, and counting
+        them would let a balance gate approve an order the account cannot
+        fund. Returns ``0.0`` when the asset is absent.
         """
-        body = await self._private_post("/0/private/Balance")
+        body = await self._private_post("/0/private/BalanceEx")
         target = asset.upper()
-        for code, amount in body.items():
+        for code, entry in body.items():
             if "." in code:
                 continue
             if normalize_kraken_asset(code) != target:
                 continue
-            value = _to_float(amount)
-            return value if value is not None else 0.0
+            if not isinstance(entry, dict):
+                log.warning(
+                    "kraken_balance_unexpected_entry_shape",
+                    asset=target,
+                    entry_type=type(entry).__name__,
+                )
+                return 0.0
+            balance = _to_float(entry.get("balance")) or 0.0
+            hold_trade = _to_float(entry.get("hold_trade")) or 0.0
+            credit = _to_float(entry.get("credit")) or 0.0
+            credit_used = _to_float(entry.get("credit_used")) or 0.0
+            available = balance + credit - credit_used - hold_trade
+            if available < 0.0:
+                # Nonsensical; treat as unfundable rather than pass a
+                # negative into a gate that may only test an upper bound.
+                log.warning(
+                    "kraken_balance_negative_available",
+                    asset=target,
+                    balance=balance,
+                    hold_trade=hold_trade,
+                )
+                return 0.0
+            return available
         return 0.0
 
     async def preflight_credentials_check(self) -> dict[str, Any]:
         """Verify the API key authenticates AND cannot withdraw funds.
 
-        Two checks, both of which must pass before the adapter is considered
+        Checks, ALL of which must pass before the adapter is considered
         usable for the supervised pilot:
 
         1. ``POST /0/private/Balance`` succeeds → the key/secret/nonce chain
            works and has query permission.
-        2. ``POST /0/private/WithdrawMethods`` is REFUSED with
+        2. BOTH withdrawal-scoped probes — ``/0/private/WithdrawMethods``
+           and ``/0/private/WithdrawStatus`` — are REFUSED with
            ``EGeneral:Permission denied`` → the key demonstrably lacks
-           withdrawal scope.
+           withdrawal scope. Two endpoints rather than one because they need
+           not be gated by the same permission bit.
 
         Check 2 fails closed. Kraken exposes no endpoint that reports a
         key's permission scopes (see module docstring, fact 6), so an
         explicit denial is the only positive evidence available. A success
-        means the key CAN withdraw; any other outcome — a different error, a
-        transient failure, a network drop — means we did not PROVE it
-        cannot. Both raise ``KrakenWithdrawalCapabilityError``.
+        means the key reached a withdrawal-scoped endpoint; any other
+        outcome — a different error, a transient failure, a network drop —
+        means we did not PROVE it cannot withdraw. Both raise
+        ``KrakenWithdrawalCapabilityError``.
+
+        CAVEAT for the operator, verified in the docs 2026-07-31:
+        ``WithdrawStatus`` is documented as requiring "Funds permissions -
+        Withdraw" **OR** "Data - Query ledger entries". A key that lacks
+        withdraw but HAS ledger-query will therefore SUCCEED on this probe
+        and be rejected here even though it is genuinely safe. That is the
+        fail-closed direction, but it is a false reject: if preflight fails
+        with ``probe=/0/private/WithdrawStatus outcome=permitted`` while
+        ``WithdrawMethods`` denied, reissue the key without ledger-query
+        rather than assuming it can withdraw.
 
         Returns:
             ``{"auth_ok": True, "withdrawal_excluded": True,
@@ -759,34 +889,9 @@ class KrakenSpotAdapter(ExchangeAdapter):
             )
             raise
 
-        try:
-            await self._private_post("/0/private/WithdrawMethods")
-        except KrakenPermissionError:
-            # The one passing outcome: the key is refused withdrawal scope.
-            withdrawal_excluded = True
-        except Exception as exc:
-            log.warning(
-                "kraken_preflight_failed",
-                stage="withdrawal_probe",
-                outcome="inconclusive",
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            raise KrakenWithdrawalCapabilityError(
-                "withdrawal-capability probe was inconclusive "
-                f"({type(exc).__name__}: {exc}) — refusing to proceed; only an "
-                "explicit EGeneral:Permission denied proves the key cannot withdraw"
-            ) from exc
-        else:
-            log.warning(
-                "kraken_preflight_failed",
-                stage="withdrawal_probe",
-                outcome="permitted",
-            )
-            raise KrakenWithdrawalCapabilityError(
-                "API key CAN reach withdrawal-scoped endpoints — reissue the key "
-                "without 'Funds permissions - Withdraw' before running the pilot"
-            )
+        for probe_path, probe_data in _WITHDRAWAL_PROBES:
+            await self._probe_withdrawal_denied(probe_path, probe_data)
+        withdrawal_excluded = True
 
         checked_at = datetime.now(timezone.utc).isoformat()
         log.info(
@@ -802,10 +907,63 @@ class KrakenSpotAdapter(ExchangeAdapter):
             "checked_at": checked_at,
         }
 
+    async def _probe_withdrawal_denied(
+        self, path: str, data: dict[str, Any] | None
+    ) -> None:
+        """Assert ``path`` refuses this key with ``EGeneral:Permission denied``.
+
+        Returns normally ONLY on that exact denial. Success (the key reached
+        a withdrawal-scoped endpoint) and every other outcome (different
+        error, transient failure, network drop) raise
+        ``KrakenWithdrawalCapabilityError`` — "we did not prove it cannot
+        withdraw" and "it can withdraw" are both disqualifying.
+        """
+        try:
+            await self._private_post(path, data)
+        except KrakenPermissionError:
+            return
+        except Exception as exc:
+            log.warning(
+                "kraken_preflight_failed",
+                stage="withdrawal_probe",
+                probe=path,
+                outcome="inconclusive",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise KrakenWithdrawalCapabilityError(
+                f"withdrawal-capability probe {path} was inconclusive "
+                f"({type(exc).__name__}: {exc}) — refusing to proceed; only an "
+                "explicit EGeneral:Permission denied proves the key cannot withdraw"
+            ) from exc
+
+        log.warning(
+            "kraken_preflight_failed",
+            stage="withdrawal_probe",
+            probe=path,
+            outcome="permitted",
+        )
+        raise KrakenWithdrawalCapabilityError(
+            f"API key reached withdrawal-scoped endpoint {path} — reissue the key "
+            "without 'Funds permissions - Withdraw' before running the pilot. "
+            "Note: WithdrawStatus also accepts 'Data - Query ledger entries', so a "
+            "success there alone may mean ledger-query, not withdraw, is enabled."
+        )
+
     # ------------------------------------------------------------------
     # Order lifecycle — PR-K2. Concrete raising overrides keep the ABC
     # satisfied without creating any path that can reach a Kraken order
     # endpoint from this PR.
+    #
+    # Two traps for whoever writes K2:
+    #  - Format every numeric order param as a pre-formatted Decimal string.
+    #    urlencode() renders a float via str(), and str(0.00001) is '1e-05',
+    #    which Kraken rejects. Volume/price must be built with Decimal and
+    #    an explicit quantize/format, never passed as float.
+    #  - NEVER log repr(exc) or exc.request_info for a signed call.
+    #    aiohttp's ClientResponseError repr embeds request_info, which
+    #    carries the API-Key and API-Sign headers — that would write live
+    #    credentials into the log. Log type(exc).__name__ and str(exc).
     # ------------------------------------------------------------------
     async def send_order(self, *, pair: str, side: str, size_usd: Decimal) -> dict:
         raise NotImplementedError("PR-K2 — Kraken order lifecycle not wired in PR-K1")
