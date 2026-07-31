@@ -8,8 +8,6 @@ that reaches ``unresolved`` is a test that the resolver refused to guess.
 
 from __future__ import annotations
 
-import pytest
-
 from scout.live.solana.resolver import resolve_submission
 from scout.live.solana.rpc_client import SignatureStatus
 

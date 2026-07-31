@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 
 import aiohttp
 import pytest
 from aioresponses import aioresponses
 
-from scout.live.exceptions import VenueTransientError
 from scout.live.solana.constants import JITO_TIP_ACCOUNTS_FALLBACK, USDC_MINT
 from scout.live.solana.exceptions import (
     SolanaAmbiguousSubmissionError,
@@ -33,7 +33,7 @@ from solana_tx_builder import PAYER_PUBKEY, TIP_ACCOUNT, build_swap_tx
 
 _RPC_URL = "https://api.mainnet-beta.solana.com"
 _JITO = "https://mainnet.block-engine.jito.wtf"
-_SUBMIT_RE = __import__("re").compile(
+_SUBMIT_RE = re.compile(
     r"https://mainnet\.block-engine\.jito\.wtf/api/v1/transactions.*"
 )
 
