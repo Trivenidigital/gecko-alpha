@@ -637,6 +637,30 @@ async def test_midflight_transport_failures_are_ambiguous(exc_factory):
 
 
 @pytest.mark.asyncio
+async def test_validate_only_failure_is_never_ambiguous():
+    """validate=true cannot trade, so however it failed, no order exists.
+    Calling the rehearsal ambiguous would send an operator hunting for an
+    order that cannot have been created."""
+    import asyncio
+
+    adapter = _adapter(LIVE_USE_REAL_SIGNED_REQUESTS=False)
+    with aioresponses() as m:
+        _mock_assetpairs(m)
+        m.post(_ADD_ORDER_URL, exception=asyncio.TimeoutError(), repeat=True)
+        with pytest.raises(VenueTransientError):
+            await adapter.place_limit_order(
+                pair="XBTUSD",
+                side="buy",
+                price=Decimal("30000.0"),
+                volume=Decimal("0.0005"),
+                client_order_id=_CID,
+                validate_only=True,
+            )
+        assert len(_calls_to(m, _ADD_ORDER_URL)) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_signed_post_does_not_follow_redirects():
     """aiohttp follows 307/308 by re-sending the same method AND body — a
     second AddOrder transmission inside one attempt, invisible to

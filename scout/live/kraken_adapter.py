@@ -1513,6 +1513,18 @@ class KrakenSpotAdapter(ExchangeAdapter):
             # almost certainly refuses before placing, but that is not
             # documented, and the cost of being wrong the safe way is two
             # extra read probes.
+            if validate_only:
+                # validate=true cannot trade, so however this failed, no order
+                # exists. Reporting the rehearsal as ambiguous would send an
+                # operator hunting for an order that cannot have been created.
+                log.warning(
+                    "kraken_order_validate_failed",
+                    pair=pair,
+                    client_order_id=client_order_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                raise
             log.warning(
                 "kraken_order_submission_ambiguous",
                 pair=pair,
