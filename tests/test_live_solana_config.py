@@ -68,14 +68,32 @@ def test_negative_fee_ceiling_rejected(settings_factory):
 
 
 def test_coherent_overrides_accepted(settings_factory):
+    """A total exactly on the floor is accepted; below it is not.
+
+    The floor is priority + tip + base signature fee + ATA rent, and the rent
+    term is why ``SOLANA_PILOT_MAX_ATA_CREATES=0`` is set here: this case is
+    about the FEE arithmetic, and leaving the default of 3 would reserve
+    6,117,840 lamports of rent room that a build with no ATA create cannot
+    spend.
+    """
     s = settings_factory(
         SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS=200_000,
         SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=300_000,
+        SOLANA_PILOT_MAX_ATA_CREATES=0,
         SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=505_000,
         SOLANA_PILOT_SLIPPAGE_BPS=50,
     )
     assert s.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS == 505_000
     assert s.SOLANA_PILOT_SLIPPAGE_BPS == 50
+
+    # One lamport of rent room, and the same total no longer reaches the floor.
+    with pytest.raises(ValidationError, match="ATA rent"):
+        settings_factory(
+            SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS=200_000,
+            SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS=300_000,
+            SOLANA_PILOT_MAX_ATA_CREATES=1,
+            SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS=505_000,
+        )
 
 
 def test_unknown_solana_key_is_rejected(settings_factory):
