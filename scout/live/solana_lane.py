@@ -1417,6 +1417,45 @@ async def count_supervised_reconciled(db: Database) -> int:
     return int((await cur.fetchone())[0])
 
 
+async def find_incoherent_executions(db: Database) -> list[dict[str, Any]]:
+    """Executions whose two axes disagree: lifecycle live, money finished.
+
+    *** THE INVARIANT THIS EXISTS TO CATCH. ***
+    ``solana_executions.state`` says where in the pipeline a transaction is;
+    ``live_trades.status`` says what happened to the money. An execution left
+    NON-TERMINAL while its ledger row is TERMINAL is the disagreement that
+    stops the lane dead: ``execution_recovery`` keys off the execution row and
+    refuses, while every message the operator saw came from the ledger row and
+    said the lane was clear.
+
+    ``COHERENT_STATUSES`` has always declared this rule and ``assert_coherent``
+    has always been able to check it — but nothing called it on a write path,
+    so it was a documented invariant with no enforcement. This is the query
+    that makes a violation visible instead of latent.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    terminal_states = ", ".join("?" for _ in TERMINAL_STATES)
+    cur = await db._conn.execute(
+        f"""SELECT e.decision_id, e.state, t.status, e.live_trade_id
+            FROM solana_executions e
+            JOIN live_trades t ON t.client_order_id = e.decision_id
+            WHERE e.state NOT IN ({terminal_states})
+              AND t.status IN ('rejected', 'closed_tp', 'closed_sl',
+                               'closed_duration', 'closed_via_reconciliation')""",
+        TERMINAL_STATES,
+    )
+    return [
+        {
+            "decision_id": row[0],
+            "execution_state": row[1],
+            "ledger_status": row[2],
+            "live_trade_id": row[3],
+        }
+        for row in await cur.fetchall()
+    ]
+
+
 async def fetch_lane_exposure(
     db: Database, settings: Settings, *, now: datetime | None = None
 ) -> LaneExposure:
@@ -1922,6 +1961,69 @@ class LaneRunner:
             "proceeds because it never submits."
         )
         return detail
+
+    async def _terminalize_execution(
+        self, decision_id: str, *, reason: str, target: str = STATE_FAILED
+    ) -> str | None:
+        """Advance an execution to ``target``, idempotently and without raising.
+
+        *** REACHING A DEFINITIVE VERDICT MUST END THE EXECUTION ROW. ***
+        Before this existed, a definitive verdict retired the LEDGER row and
+        left the EXECUTION row at ``submission_attempted`` forever. The next
+        ``place`` then refused at ``execution_recovery`` — while the message
+        the operator had just read said the lane was clear. That is not a
+        cosmetic mismatch: it is a lane that cannot be restarted, reported as
+        one that can.
+
+        Deliberately NOT conditional on the ledger row's status. The ledger
+        being already-rejected is the NORMAL case here — the in-run handler
+        retires it moments earlier — so gating on "is the ledger still
+        blocking" is exactly the bug.
+
+        Never raises, because both call sites are recovery paths. A row that is
+        already terminal, or whose current state cannot legally reach
+        ``target``, is left alone and reported rather than crashing the command
+        an operator is running to get unstuck.
+
+        Returns the state the row ended in, or None when there is no row (a
+        rehearsal writes none).
+        """
+        execution = await load_execution(self._db, decision_id)
+        if execution is None:
+            return None
+        current = execution["state"]
+        if current in TERMINAL_STATES:
+            return current
+        try:
+            assert_legal_transition(current, target)
+        except IllegalStateTransition as exc:
+            # Reported, not raised. The row stays where it is and the operator
+            # is told, which beats a traceback from `resolve`.
+            log.warning(
+                "solana_lane_terminalize_refused",
+                decision_id=decision_id,
+                current_state=current,
+                target=target,
+                error=str(exc),
+            )
+            return current
+        # The row carries the mode it ran under. Reading SOLANA_MODE here would
+        # attribute an old execution to whatever the config says today.
+        await record_execution_state(
+            self._db,
+            decision_id,
+            target,
+            mode=execution["mode"] or self._settings.SOLANA_MODE,
+            detail={"reason": reason, "terminalized_from": current},
+        )
+        log.info(
+            "solana_lane_execution_terminalized",
+            decision_id=decision_id,
+            from_state=current,
+            to_state=target,
+            reason=reason,
+        )
+        return target
 
     async def _resolve(
         self,
@@ -3313,11 +3415,18 @@ class LaneRunner:
             return None, resolution
 
         if resolution.verdict == "failed_on_chain":
+            # Ledger first, then the execution row: at the instant the state is
+            # written the two axes have to agree, and STATE_FAILED is coherent
+            # only with a 'rejected' ledger row.
             await retire_row(self._db, live_trade_id)
+            ended = await self._terminalize_execution(
+                decision_id, reason="failed_on_chain"
+            )
             evidence.record(
                 "ambiguity_failed_on_chain",
                 live_trade_id=live_trade_id,
                 ledger_status="rejected",
+                execution_state=ended,
                 on_chain_err=resolution.on_chain_err,
                 note="the transaction ran and failed; the fee was paid and the "
                 "outcome is final. Nothing to resubmit.",
@@ -3337,26 +3446,44 @@ class LaneRunner:
 
         if resolution.verdict == "definitively_not_submitted":
             await retire_row(self._db, live_trade_id, reject_reason="venue_unavailable")
+            ended = await self._terminalize_execution(
+                decision_id, reason="definitively_not_submitted"
+            )
             evidence.record(
                 "ambiguity_not_submitted",
                 live_trade_id=live_trade_id,
                 ledger_status="rejected",
+                execution_state=ended,
                 note="signature absent from the cluster AND its blockhash has "
                 "expired, so it can never land",
             )
-            _print_block(
-                "SUBMISSION DID NOT LAND — no transaction exists",
-                [
-                    f"  signature : {signed.signature}",
-                    "  The signature is absent from the cluster and its blockhash",
-                    "  has expired, so it can never land. The ledger row is",
-                    "  rejected and the lane is clear.",
-                    "",
-                    "  Rerunning is safe. It will build a NEW transaction with a",
-                    "  new signature and ask for a new authorization.",
-                    f"  evidence  : {evidence.path}",
-                ],
-            )
+            # The "rerunning is safe" claim is only made when BOTH axes are
+            # actually clear. It used to be printed unconditionally while the
+            # execution row still blocked, so the operator was told to rerun a
+            # command that would refuse.
+            cleared = ended is None or ended in TERMINAL_STATES
+            lines = [
+                f"  signature : {signed.signature}",
+                "  The signature is absent from the cluster and its blockhash",
+                "  has expired, so it can never land. The ledger row is",
+                "  rejected.",
+                "",
+            ]
+            if cleared:
+                lines += [
+                    "  The lane is clear. Rerunning is safe: it will build a NEW",
+                    "  transaction with a new signature and ask for a new",
+                    "  authorization.",
+                ]
+            else:
+                lines += [
+                    f"  *** THE LANE IS NOT CLEAR: the execution row is {ended}. ***",
+                    "  Do NOT rerun — `place` will refuse at execution recovery.",
+                    "  Report this: a definitive verdict should have ended the",
+                    "  execution row and did not.",
+                ]
+            lines.append(f"  evidence  : {evidence.path}")
+            _print_block("SUBMISSION DID NOT LAND — no transaction exists", lines)
             return EXIT_REFUSED, resolution
 
         # unresolved — the dangerous one. STOP. Never rebuild.
@@ -3929,33 +4056,82 @@ class LaneRunner:
                 row_age_seconds=lane.age_seconds,
             )
 
+            # A DEFINITIVE verdict ends the run on BOTH axes.
+            #
+            # This used to be gated on `row["status"] in _BLOCKING_STATUSES`,
+            # which skipped the whole branch whenever the in-run handler had
+            # already retired the ledger row — i.e. in the normal case. The
+            # execution row was then never advanced, and `place` refused at
+            # recovery while `resolve` reported the lane clear.
+            #
+            # The pin guard applies to `definitively_not_submitted` ONLY. That
+            # verdict is built from an ABSENCE, which is what a load-balanced
+            # read can manufacture. `failed_on_chain` is built from the node
+            # HAVING the signature with an error — presence cannot be
+            # manufactured by a split read, and withholding on it would leave a
+            # genuinely final outcome unresolvable, which is a new way to wedge
+            # the lane rather than a protection against one.
             retired = False
-            if lane.clears_the_lane and row["status"] in _BLOCKING_STATUSES:
-                if pinned:
+            withheld = False
+            execution_state = None
+            definitive = lane.verdict in (
+                "definitively_not_submitted",
+                "failed_on_chain",
+            )
+            actionable = pinned or lane.verdict == "failed_on_chain"
+
+            if definitive and actionable:
+                if row["status"] in _BLOCKING_STATUSES:
                     await retire_row(
                         self._db,
                         row["live_trade_id"],
-                        reject_reason="venue_unavailable",
+                        reject_reason=(
+                            "venue_unavailable" if lane.clears_the_lane else None
+                        ),
                     )
                     retired = True
                     evidence.record(
                         "row_auto_retired",
                         live_trade_id=row["live_trade_id"],
                         ledger_status="rejected",
-                        note="the transaction can never land, so the row asserts "
-                        "nothing that is still true",
+                        verdict=lane.verdict,
+                        note="the outcome is final, so the row asserts nothing "
+                        "that is still true",
                     )
-                else:
-                    # Reporting a verdict is always allowed; ACTING on this one
-                    # is not, because a load-balanced read is exactly how a
-                    # false 'never submitted' is manufactured. The row stays.
-                    evidence.record(
-                        "auto_retire_withheld",
-                        live_trade_id=row["live_trade_id"],
-                        resolver_rpc_url=redact_endpoint(resolver_url),
-                        note="verdict read from a load-balanced endpoint; the "
-                        "row is NOT retired on it",
-                    )
+                # ALWAYS, regardless of what the ledger row already said.
+                execution_state = await self._terminalize_execution(
+                    decision_id, reason=f"resolve:{lane.verdict}"
+                )
+                evidence.record(
+                    "execution_terminalized",
+                    decision_id=decision_id,
+                    execution_state=execution_state,
+                    verdict=lane.verdict,
+                    note="a definitive verdict ends the execution row; leaving it "
+                    "non-terminal would block `place` while this command "
+                    "reported the lane clear",
+                )
+            elif definitive and not actionable:
+                withheld = True
+                # Reporting a verdict is always allowed; ACTING on this one is
+                # not, because a load-balanced read is exactly how a false
+                # 'never submitted' is manufactured. BOTH rows stay.
+                evidence.record(
+                    "auto_retire_withheld",
+                    live_trade_id=row["live_trade_id"],
+                    resolver_rpc_url=redact_endpoint(resolver_url),
+                    note="verdict read from a load-balanced endpoint; neither the "
+                    "ledger row nor the execution row is advanced on it",
+                )
+            elif lane.verdict == "landed":
+                # Not terminal — a position exists and the lane SHOULD keep
+                # blocking. Advancing off `submission_attempted` is still worth
+                # doing: it is what actually happened, and it moves the row onto
+                # the watchdog's post-submission threshold instead of the
+                # three-minute submission one.
+                execution_state = await self._terminalize_execution(
+                    decision_id, reason="resolve:landed", target=STATE_LANDED
+                )
 
             lines = [
                 f"  decision ID : {decision_id}",
@@ -3985,9 +4161,23 @@ class LaneRunner:
                 f"({self._pool.size} endpoint(s) configured)"
                 + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
                 f"  corroborated: {_corroboration_line(pooled)}",
+                f"  execution   : {execution_state or 'unchanged'}",
                 f"  evidence    : {evidence.path}",
             ]
-            lines.extend(_verdict_guidance(lane.verdict, retired))
+            # "Rerunning is safe" is licensed by BOTH axes actually being
+            # clear, computed after the writes — not by the verdict, and not by
+            # the ledger row alone. `place` refuses on either one.
+            #
+            #   execution: no row at all, or a terminal one. `None` means the
+            #             run predates the executions table or was a rehearsal;
+            #             either way execution_recovery has nothing to block on.
+            #   ledger:    retired just now, or already not blocking.
+            lane_is_clear = (
+                execution_state is None or execution_state in TERMINAL_STATES
+            ) and (retired or row["status"] not in _BLOCKING_STATUSES)
+            lines.extend(
+                _verdict_guidance(lane.verdict, retired, lane_is_clear=lane_is_clear)
+            )
             if lane.reason == "history_window_exceeded":
                 lines.extend(
                     [
@@ -4000,7 +4190,7 @@ class LaneRunner:
                         "  row by hand.",
                     ]
                 )
-            if lane.clears_the_lane and not pinned:
+            if withheld:
                 lines.extend(
                     [
                         "",
@@ -4015,7 +4205,12 @@ class LaneRunner:
             if lane.verdict == "landed":
                 return EXIT_BLOCKED
             if lane.verdict == "definitively_not_submitted":
-                return EXIT_OK
+                # EXIT_OK means "the lane is clear, go again", so it is owed to
+                # exactly the fact the printed guidance is owed to. A withheld
+                # verdict, or one that could not end the execution row, still
+                # BLOCKS — and a 0 there would tell a wrapper script the
+                # opposite of what the next `place` will do.
+                return EXIT_OK if lane_is_clear else EXIT_BLOCKED
             if lane.verdict == "failed_on_chain":
                 return EXIT_BLOCKED
             return EXIT_ESCALATE
@@ -4290,6 +4485,24 @@ class LaneRunner:
             )
         lines.append(f"  blocking                 : {reconciliation['blockers']}")
 
+        # The two axes, checked against each other. A stranded execution is
+        # invisible from either table alone — the ledger says finished, the
+        # execution says in flight — and it is what stops `place` while every
+        # other line here reads clear.
+        incoherent = await find_incoherent_executions(self._db)
+        if incoherent:
+            lines.append(
+                f"  ** AXES DISAGREE         : {len(incoherent)} execution(s) "
+                "still open against a finished ledger row — `place` WILL refuse"
+            )
+            for entry in incoherent:
+                lines.append(
+                    f"     {entry['decision_id']} execution="
+                    f"{entry['execution_state']} ledger={entry['ledger_status']}"
+                )
+        else:
+            lines.append("  lifecycle/money axes     : coherent")
+
         # Current exposure against the envelope, so "how much room is left
         # today" is answerable without running a placement to find out.
         exposure = await fetch_lane_exposure(self._db, self._settings)
@@ -4449,7 +4662,19 @@ def _corroboration_line(pooled: PoolResolution) -> str:
     return f"DISAGREED — {corroboration.endpoint}: {corroboration.detail}"
 
 
-def _verdict_guidance(verdict: str, retired: bool) -> list[str]:
+def _verdict_guidance(
+    verdict: str, retired: bool, *, lane_is_clear: bool = False
+) -> list[str]:
+    """What the operator should do next.
+
+    ``lane_is_clear`` is the ONLY thing that licenses "rerunning is safe", and
+    it is computed from what `place` will actually find — not from the verdict
+    and not from whether the ledger row was retired. Those came apart in
+    production: a definitive verdict retired the ledger row, printed "rerunning
+    `place` is safe", and left the execution row blocking, so the very next
+    `place` refused. A message about the lane being clear must be true of the
+    command it is telling the operator to run.
+    """
     if verdict == "landed":
         return [
             "",
@@ -4460,17 +4685,36 @@ def _verdict_guidance(verdict: str, retired: bool) -> list[str]:
         return [
             "",
             "  The transaction ran and FAILED. The fee was paid and no position",
-            "  exists. Record the cost, then retire the row by hand.",
+            "  exists. Record the cost."
+            + (
+                " The row is retired and the lane is clear."
+                if lane_is_clear
+                else " The row stays until it is retired by hand."
+            ),
         ]
     if verdict == "definitively_not_submitted":
-        return [
+        lines = [
             "",
             "  The transaction can NEVER land: absent from the cluster and its",
-            "  blockhash has expired."
-            + (" The row has been retired and the lane is clear." if retired else ""),
-            "  Rerunning `place` is safe — it builds a new transaction and asks",
-            "  for a new authorization.",
+            "  blockhash has expired.",
         ]
+        if lane_is_clear:
+            lines += [
+                "  Both the ledger row and the execution row are closed, so the",
+                "  lane is clear. Rerunning `place` is safe — it builds a new",
+                "  transaction and asks for a new authorization.",
+            ]
+        elif retired:
+            lines += [
+                "  The ledger row is retired, but the EXECUTION row is still open,",
+                "  so `place` will refuse at execution recovery. Do NOT rerun yet.",
+            ]
+        else:
+            lines += [
+                "  Nothing was changed — see the note above for why. `place` will",
+                "  still refuse, so do NOT rerun yet.",
+            ]
+        return lines
     return [
         "",
         "  UNRESOLVED — we could not tell what happened. *** DO NOT REBUILD. ***",

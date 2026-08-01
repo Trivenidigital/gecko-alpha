@@ -506,6 +506,31 @@ async def _seed_supervised_history(db, count: int) -> None:
         await db._conn.commit()
 
 
+async def _seed_execution(
+    db,
+    decision_id: str,
+    state: str,
+    *,
+    signature: str | None = None,
+    mode: str = "SUPERVISED_LIVE",
+) -> None:
+    """Insert one ``solana_executions`` row directly, in a given state.
+
+    Direct insert rather than walking the state machine: these stand in for
+    rows an earlier process left behind, which is exactly the situation the
+    terminal-state fix is about.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with db._txn_lock:
+        await db._conn.execute(
+            "INSERT INTO solana_executions "
+            "(decision_id, state, mode, expected_signature, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (decision_id, state, mode, signature, now, now),
+        )
+        await db._conn.commit()
+
+
 async def _seed_solana_row(
     db: Database,
     *,
@@ -927,6 +952,74 @@ async def test_the_state_check_constraint_rejects_an_unknown_state(tmp_path):
 # ======================================================================
 # Lifecycle <-> money coherence
 # ======================================================================
+async def test_the_coherence_query_catches_a_stranded_execution(tmp_path):
+    """*** The invariant, as a query rather than a docstring. ***
+
+    ``COHERENT_STATUSES`` declared this rule from the start and
+    ``assert_coherent`` could always check it — but nothing called it on a
+    write path, so it was documented and unenforced. The production defect is
+    exactly the pair it describes: ledger terminal, execution non-terminal.
+    """
+    db = await _fresh_db(tmp_path)
+    decision_id = "8a3c0f5a-4d21-4d0e-bb2c-9f31d0f4c001"
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature="sig", status="rejected"
+    )
+    await _seed_execution(db, decision_id, "submission_attempted", signature="sig")
+
+    incoherent = await solana_lane.find_incoherent_executions(db)
+    assert len(incoherent) == 1
+    assert incoherent[0]["execution_state"] == "submission_attempted"
+    assert incoherent[0]["ledger_status"] == "rejected"
+
+    async with db._txn_lock:
+        await db._conn.execute(
+            "UPDATE solana_executions SET state = 'failed' WHERE decision_id = ?",
+            (decision_id,),
+        )
+        await db._conn.commit()
+    assert await solana_lane.find_incoherent_executions(db) == []
+    await db.close()
+
+
+async def test_a_live_position_is_not_incoherent(tmp_path):
+    """The complement: an open position is SUPPOSED to keep blocking.
+
+    A checker that flagged it would train an operator to ignore the real thing.
+    """
+    db = await _fresh_db(tmp_path)
+    decision_id = "8a3c0f5a-4d21-4d0e-bb2c-9f31d0f4c002"
+    await _seed_solana_row(db, decision_id=decision_id, signature="sig", status="open")
+    await _seed_execution(db, decision_id, "finalized", signature="sig")
+    assert await solana_lane.find_incoherent_executions(db) == []
+    await db.close()
+
+
+async def test_no_definitive_path_leaves_the_axes_disagreeing(tmp_path, monkeypatch):
+    """End-to-end: after the in-run definitive path, the invariant holds."""
+    expired = _rpc(_LAST_VALID + 50)
+    code, db, session, _tx, _subs = await _run_ambiguous(
+        tmp_path,
+        monkeypatch,
+        resolver_payloads=[
+            _sig_status(known=False),
+            expired,
+            _sig_status(known=False),
+            expired,
+            _rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}),
+            _token_accounts(0),
+            _token_accounts(0),
+        ],
+    )
+    assert code == EXIT_REFUSED
+    decision_id = _step(_steps(tmp_path), "run_started")["decision_id"]
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "failed"
+    assert await solana_lane.find_incoherent_executions(db) == []
+    await session.close()
+    await db.close()
+
+
 def test_every_state_declares_its_coherent_statuses():
     from scout.live import solana_lane as lane
 
@@ -2050,13 +2143,18 @@ async def test_resolve_reports_but_will_not_retire_on_an_unpinned_verdict(
         for _ in range(2):
             m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
             m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_LAST_VALID + 50))
-        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+        # EXIT_BLOCKED, not EXIT_OK: nothing was retired, so the lane is NOT
+        # clear and the next `place` will refuse. A 0 here would tell a wrapper
+        # script the opposite of what the lane will actually do.
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
 
     steps = _steps(tmp_path)
     assert _step(steps, "resolution")["verdict"] == "definitively_not_submitted"
     assert _step(steps, "resolution")["resolver_endpoint_pinned"] is False
     assert _step(steps, "auto_retire_withheld") is not None
     assert _step(steps, "row_auto_retired") is None
+    # And the guidance must not tell the operator to rerun.
+    assert _step(steps, "execution_terminalized") is None
     # The row survives — that is the whole point.
     assert (await _row(db, decision_id))["status"] == "open"
     assert "NOT PINNED" in capsys.readouterr().out
@@ -3214,8 +3312,66 @@ async def test_ambiguous_then_definitively_not_submitted_clears_the_lane(
     assert resolution["verdict"] == "definitively_not_submitted"
     assert resolution["rebuild_is_safe"] is True
     assert (await _live_rows(db))[0][0] == "rejected"
-    assert "SUBMISSION DID NOT LAND" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "SUBMISSION DID NOT LAND" in out
+
+    # *** THE LIVE DEFECT. ***
+    # The ledger row was retired and the operator was told the lane was clear,
+    # while the EXECUTION row sat at submission_attempted forever — so the very
+    # next `place` refused at execution recovery. BOTH axes must end.
+    decision_id = _step(steps, "run_started")["decision_id"]
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "failed", execution["state"]
+    assert await solana_lane.find_incoherent_executions(db) == []
+    assert "Rerunning is safe" in out
     await session.close()
+    await db.close()
+
+
+async def test_after_an_in_run_definitive_verdict_a_fresh_place_reaches_the_quote(
+    tmp_path, monkeypatch
+):
+    """*** The claim the message makes, tested against what `place` does. ***
+
+    "Rerunning is safe" is only true if a fresh `place` gets past execution
+    recovery. In production it did not: it refused with "1 interrupted
+    execution(s) may have reached the block engine". This test is the one that
+    would have caught that, because it runs the next `place` rather than
+    inspecting a row.
+    """
+    expired = _rpc(_LAST_VALID + 50)
+    code, db, session, tx, _submissions = await _run_ambiguous(
+        tmp_path,
+        monkeypatch,
+        resolver_payloads=[
+            _sig_status(known=False),
+            expired,
+            _sig_status(known=False),
+            expired,
+            _rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}),
+            _token_accounts(0),
+            _token_accounts(0),
+        ],
+    )
+    assert code == EXIT_REFUSED
+    await session.close()
+
+    # A FRESH runner against the same database, exactly as the operator would.
+    runner2, db2, session2 = await _make_runner(tmp_path)
+    _authorize(monkeypatch, None)  # stop at the prompt; getting there is the point
+    with aioresponses() as m:
+        _mock_quote_and_build(m, build_swap_tx().tx_b64)
+        _mock_pre_approval_rpc(m)
+        assert await runner2.place(sol=_SOL) == EXIT_REFUSED
+
+    steps = _steps_for(tmp_path, runner2)
+    # Reached the QUOTE — i.e. got past execution recovery and startup
+    # reconciliation — rather than refusing at the gate.
+    assert _step(steps, "quote") is not None, _step(steps, "aborted")
+    recovery = _step(steps, "execution_recovery")
+    assert recovery["blockers"] == 0
+    await session2.close()
+    await db2.close()
     await db.close()
 
 
@@ -3623,7 +3779,9 @@ async def test_age_derived_expiry_still_requires_a_pinned_endpoint(tmp_path):
         _mock_resolver_pool_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
         m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
         m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
-        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+        # Blocked, not clear: age established expiry but the unpinned endpoint
+        # means the verdict is advisory, so neither row was advanced.
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
 
     steps = _steps(tmp_path)
     assert _step(steps, "resolution")["lane_verdict"] == "definitively_not_submitted"
@@ -3697,6 +3855,108 @@ async def test_resolve_reports_and_auto_retires_only_when_it_can_never_land(
     await db.close()
 
 
+async def test_resolve_ends_the_execution_row_even_when_the_ledger_is_already_rejected(
+    tmp_path,
+):
+    """*** THE ROOT CAUSE, isolated. ***
+
+    The retire branch used to be gated on the ledger row still being blocking.
+    The in-run handler retires it moments earlier, so in the NORMAL case the
+    branch was skipped entirely and the execution row was never advanced —
+    which is how `resolve` came to report a clear lane that `place` refused.
+    """
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "7f2b0f5a-4d21-4d0e-bb2c-9f31d0f4b001"
+    runner, db, session = await _make_runner(tmp_path)
+    # The exact production shape: ledger ALREADY rejected, execution stranded.
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, status="rejected"
+    )
+    await _seed_execution(db, decision_id, "submission_attempted", signature=signature)
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        for _ in range(2):
+            m.post(_RPC_URL, payload=_sig_status(known=False))
+            m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "failed"
+    assert await solana_lane.find_incoherent_executions(db) == []
+    await session.close()
+    await db.close()
+
+
+async def test_after_resolve_says_rerunning_is_safe_a_fresh_place_reaches_the_quote(
+    tmp_path, monkeypatch, capsys
+):
+    """The `resolve` half of the message-must-match-reality requirement."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "7f2b0f5a-4d21-4d0e-bb2c-9f31d0f4b002"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, status="rejected"
+    )
+    await _seed_execution(db, decision_id, "submission_attempted", signature=signature)
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        for _ in range(2):
+            m.post(_RPC_URL, payload=_sig_status(known=False))
+            m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+    assert "Rerunning `place` is safe" in capsys.readouterr().out
+    await session.close()
+
+    _authorize(monkeypatch, None)
+    runner2, db2, session2 = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, build_swap_tx().tx_b64)
+        _mock_pre_approval_rpc(m)
+        assert await runner2.place(sol=_SOL) == EXIT_REFUSED
+    steps = _steps_for(tmp_path, runner2)
+    assert _step(steps, "quote") is not None, _step(steps, "aborted")
+    await session2.close()
+    await db2.close()
+    await db.close()
+
+
+async def test_a_withheld_verdict_never_claims_the_lane_is_clear(tmp_path, capsys):
+    """The contrapositive: when nothing was advanced, say so and exit blocked."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "7f2b0f5a-4d21-4d0e-bb2c-9f31d0f4b003"
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
+    )
+    await _seed_solana_row(db, decision_id=decision_id, signature=signature)
+    await _seed_execution(db, decision_id, "submission_attempted", signature=signature)
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
+        for _ in range(2):
+            m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
+            m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
+
+    out = capsys.readouterr().out
+    assert "Rerunning `place` is safe" not in out
+    assert "do NOT rerun yet" in out
+    # Neither axis moved.
+    execution = await solana_lane.load_execution(db, decision_id)
+    assert execution["state"] == "submission_attempted"
+    assert (await _row(db, decision_id))["status"] == "open"
+    await session.close()
+    await db.close()
+
+
 async def test_resolve_leaves_a_landed_row_alone(tmp_path):
     signature = _expected_signature(build_swap_tx().tx_b64)
     decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0687b"
@@ -3763,6 +4023,33 @@ async def test_status_reports_a_refused_keypair_without_crashing(tmp_path, capsy
     assert "keypair custody          : REFUSED" in out
     # Custody was judged from stat, so the key file was never opened.
     assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_status_surfaces_a_stranded_execution(tmp_path, capsys):
+    """A stranded row is invisible from either table alone.
+
+    The ledger says finished, the execution says in flight, and every other
+    line of `status` reads clear — which is precisely how the operator ended up
+    running `place` and being refused with no idea why.
+    """
+    decision_id = "8a3c0f5a-4d21-4d0e-bb2c-9f31d0f4c003"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature="sig", status="rejected"
+    )
+    await _seed_execution(db, decision_id, "submission_attempted", signature="sig")
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        assert await runner.status() == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "AXES DISAGREE" in out
+    assert "`place` WILL refuse" in out
+    assert decision_id in out
     await session.close()
     await db.close()
 

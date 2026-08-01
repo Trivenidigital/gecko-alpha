@@ -477,6 +477,34 @@ its verdict, the simulation result, the expected signature (before submission),
 the authorization, and the post-trade reconciliation including the
 `meets_minimum_output` comparison that is the slippage guarantee.
 
+### "The lane is clear" but `place` refuses
+
+There are **two** axes and `place` checks both. `solana_executions.state` is
+where in the pipeline a transaction is; `live_trades.status` is what happened
+to the money. `execution_recovery` runs first and keys off the execution row,
+so an execution left non-terminal blocks the lane no matter what the ledger
+row says.
+
+`status` reports this directly:
+
+```
+  lifecycle/money axes     : coherent
+  ** AXES DISAGREE         : 1 execution(s) still open against a finished
+                             ledger row — `place` WILL refuse
+```
+
+If you ever see the disagreement line, the fix is to end the execution row —
+`resolve --decision-id <id>` does it on a definitive verdict. This was a real
+production defect (2026-08): a definitive `not_submitted` retired the ledger
+row, printed "rerunning is safe", and left the execution row at
+`submission_attempted`, so the next `place` refused with "1 interrupted
+execution(s) may have reached the block engine". Zero cost, no SOL moved, but
+the lane was stuck and the message said otherwise.
+
+Any message that says the lane is clear is now computed from what `place` will
+actually find on both axes, and `resolve` exits non-zero whenever it is not
+clear — including when it withheld action on an unpinned endpoint.
+
 ## The stuck-execution watchdog
 
 ```bash
