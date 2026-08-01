@@ -87,14 +87,26 @@ def _system_transfer_ix(source: str, dest: str, lamports: int) -> Instruction:
 
 
 def _swap_ix(
-    payer: str, mints: tuple[str, ...], program_id: str, extra_signer: str | None
+    payer: str,
+    mints: tuple[str, ...],
+    program_id: str,
+    extra_signer: str | None,
+    route_amount_lamports: int = 50_000_000,
+    route_slippage_bps: int = 100,
 ) -> Instruction:
     """A stand-in for Jupiter's route instruction.
 
-    Its data is opaque to the inspector by design (see tx_inspector's
-    "cannot verify statically" section); what matters for the fixture is the
-    ACCOUNT list, since that is what the mint-presence and program-allowlist
-    checks read.
+    Its data is opaque to the INSPECTOR by design (see tx_inspector's
+    "cannot verify statically" section); what matters there is the ACCOUNT
+    list, since that is what the mint-presence and program-allowlist checks
+    read.
+
+    The route amount and slippage ARE encoded into the data, the way Jupiter
+    encodes them into its real instruction blob. Nothing parses them back —
+    they exist so that changing the amount or the slippage changes the
+    transaction MESSAGE and therefore its hash. Without that, a test claiming
+    "changing the amount invalidates the authorization" would be asserting
+    against a fixture where the amount is not in the message at all.
     """
     accounts = [AccountMeta(_P(payer), is_signer=True, is_writable=True)]
     if extra_signer is not None:
@@ -106,7 +118,12 @@ def _swap_ix(
     )
     for mint in mints:
         accounts.append(AccountMeta(_P(mint), is_signer=False, is_writable=False))
-    return Instruction(_P(program_id), b"\xe5\x17\xcb\x97\x7a\xe3\xad\x2a", accounts)
+    data = (
+        b"\xe5\x17\xcb\x97\x7a\xe3\xad\x2a"
+        + route_amount_lamports.to_bytes(8, "little")
+        + route_slippage_bps.to_bytes(2, "little")
+    )
+    return Instruction(_P(program_id), data, accounts)
 
 
 # ----------------------------------------------------------------------
@@ -264,6 +281,8 @@ def build_swap_tx(
     sign: bool = False,
     lookup_tables: list | None = None,
     extra_instructions: list[Instruction] | None = None,
+    route_amount_lamports: int = 50_000_000,
+    route_slippage_bps: int = 100,
 ) -> BuiltTx:
     """Compile a realistic SOL->USDC swap transaction.
 
@@ -314,7 +333,16 @@ def build_swap_tx(
             )
         )
 
-    instructions.append(_swap_ix(payer_pubkey, mints, swap_program_id, extra_signer))
+    instructions.append(
+        _swap_ix(
+            payer_pubkey,
+            mints,
+            swap_program_id,
+            extra_signer,
+            route_amount_lamports=route_amount_lamports,
+            route_slippage_bps=route_slippage_bps,
+        )
+    )
 
     if include_wrap_primitives:
         # Unwrap: closing the WSOL account releases its lamports to US.

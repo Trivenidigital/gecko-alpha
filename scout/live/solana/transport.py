@@ -43,6 +43,16 @@ log = structlog.get_logger(__name__)
 # opted into retries — the submit path never does.
 _BACKOFFS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
+# Indirection so a test can walk the ladder without waiting for it. Mirrors
+# `KrakenSpotAdapter._retry_sleep`, which exists for the same reason.
+#
+# Patch THIS, never `_BACKOFFS`: the schedule's LENGTH decides how many
+# attempts a transient failure gets, so shortening the tuple would quietly
+# change the retry semantics the tests are there to pin. Replacing the sleep
+# leaves attempt counts, ordering and exhaustion behaviour exactly as they are
+# in production and removes only the wall-clock.
+_retry_sleep = asyncio.sleep
+
 # Upstream bodies are echoed into exception messages so an operator can see
 # WHY a build was refused, but truncated: a Jupiter error can carry a full
 # route dump, and an unbounded string ends up in logs and evidence files.
@@ -129,7 +139,7 @@ async def request_json(
                         f"{label}: HTTP {resp.status} attempt={attempt + 1}"
                     )
                     if retry_transient and attempt < len(_BACKOFFS):
-                        await asyncio.sleep(_BACKOFFS[attempt])
+                        await _retry_sleep(_BACKOFFS[attempt])
                         continue
                     raise last_exc
 
@@ -147,7 +157,7 @@ async def request_json(
                 if "html" in ctype.lower():
                     last_exc = VenueTransientError(f"{label}: non-JSON (HTML) response")
                     if retry_transient and attempt < len(_BACKOFFS):
-                        await asyncio.sleep(_BACKOFFS[attempt])
+                        await _retry_sleep(_BACKOFFS[attempt])
                         continue
                     raise last_exc
 
@@ -176,7 +186,7 @@ async def request_json(
                     attempt=attempt + 1,
                     error_type=type(exc).__name__,
                 )
-                await asyncio.sleep(_BACKOFFS[attempt])
+                await _retry_sleep(_BACKOFFS[attempt])
                 continue
             raise last_exc from None
 

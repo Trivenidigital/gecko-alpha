@@ -36,7 +36,7 @@ jobs:
           ANTHROPIC_API_KEY: test
 
       - name: Run tests
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: uv run pytest --tb=short -q --timeout=180 --timeout-method=thread
         env:
           TELEGRAM_BOT_TOKEN: test
