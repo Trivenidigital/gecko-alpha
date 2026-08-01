@@ -1169,7 +1169,12 @@ async def test_place_refuses_when_the_quoted_usdc_is_outside_the_band(
         assert _posts_to(m, _SWAP_URL) == []  # refused before Jupiter built anything
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "quote_envelope"
-    assert "outside the approved per-swap band" in abort["reason"]
+    assert "per_trade_notional_within_band" in abort["reason"]
+    # The quote step is written BEFORE the limits are enforced, so the refused
+    # run leaves the same structured record a passing one would.
+    limits = _step(_steps(tmp_path), "quote")["limits"]
+    assert limits["passed"] is False
+    assert limits["failed_checks"] == ["per_trade_notional_within_band"]
     await session.close()
     await db.close()
 
@@ -1210,7 +1215,7 @@ async def test_place_refuses_a_quote_that_is_not_exact_in(tmp_path):
         m.get(_QUOTE_RE, payload=_quote_payload(swapMode="ExactOut"))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
-    assert "ExactIn" in _step(_steps(tmp_path), "aborted")["reason"]
+    assert "swap_mode_is_exact_in" in _step(_steps(tmp_path), "aborted")["reason"]
     await session.close()
     await db.close()
 
@@ -1222,6 +1227,7 @@ async def test_place_refuses_a_quote_with_looser_slippage_than_approved(tmp_path
         m.get(_QUOTE_RE, payload=_quote_payload(slippageBps=500))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
+    assert "slippage_within_ceiling" in _step(_steps(tmp_path), "aborted")["reason"]
     assert "slippageBps 500" in _step(_steps(tmp_path), "aborted")["reason"]
     await session.close()
     await db.close()
@@ -1292,8 +1298,12 @@ async def test_place_refuses_when_sol_does_not_cover_swap_fees_and_ata_rent(tmp_
         assert _submissions(m) == []
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "balance"
-    assert "ATA create(s)" in abort["reason"]
-    assert _step(_steps(tmp_path), "balance") is None  # never recorded a pass
+    assert "sol_covers_swap_fees_and_headroom" in abort["reason"]
+    # The rent is inside the required figure, which is what the gate refused on.
+    assert "fees and rent" in abort["reason"]
+    balance = _step(_steps(tmp_path), "balance")
+    assert balance["limits"]["passed"] is False  # recorded, and recorded FAILING
+    assert balance["ata_create_count"] == 1
     await session.close()
     await db.close()
 
@@ -2012,6 +2022,155 @@ async def test_a_runner_built_without_a_pool_labels_the_client_it_actually_reads
         )
         assert runner._pool.size == 1
         assert runner._pool.labels == (redact_endpoint(_RPC_URL),)
+    await db.close()
+
+
+# ======================================================================
+# Limits engine, enforced end to end
+# ======================================================================
+async def test_place_refuses_when_the_daily_cap_is_already_spent(tmp_path):
+    """*** The limit that bounds a runaway rather than one bad trade. ***
+
+    Per-trade caps bound one mistake; the daily cap is what bounds a loop. It
+    counts AUTHORIZED notional, so an earlier trade that has already closed
+    still consumes the day's budget.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_MAX_DAILY_NOTIONAL_USD=25.0
+    )
+    # 20 USD authorized earlier today and since closed. It does not block the
+    # lane, but it has spent the budget.
+    await _seed_solana_row(
+        db,
+        decision_id="8f0e0f5a-4d21-4d0e-bb2c-9f31d0f4a001",
+        signature=None,
+        status="closed_tp",
+        size_usd="20.00",
+    )
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        m.get(_QUOTE_RE, payload=_quote_payload())
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+        assert _posts_to(m, _SWAP_URL) == []  # never built anything
+
+    steps = _steps(tmp_path)
+    abort = _step(steps, "aborted")
+    assert abort["stage"] == "quote_envelope"
+    assert "daily_notional_within_cap" in abort["reason"]
+    quote = _step(steps, "quote")
+    assert quote["exposure"]["notional_usd_today"] == "20.00"
+    assert quote["limits"]["failed_checks"] == ["daily_notional_within_cap"]
+    await session.close()
+    await db.close()
+
+
+async def test_the_quote_evidence_records_every_limit_that_was_evaluated(tmp_path):
+    """A limit that silently does not apply looks the same in a log as one
+    that passed. The evidence records what was PROVED, not only what broke."""
+    tx = build_swap_tx().tx_b64
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        await runner.place(sol=_SOL)  # stops at the prompt on closed stdin
+
+    limits = _step(_steps(tmp_path), "quote")["limits"]
+    assert limits["passed"] is True
+    names = {c["name"] for c in limits["checks"]}
+    assert {
+        "per_trade_notional_within_band",
+        "daily_notional_within_cap",
+        "open_positions_within_limit",
+        "concurrent_executions_within_limit",
+        "input_mint_allowed",
+        "output_mint_allowed",
+        "route_labels_allowed",
+        "slippage_within_ceiling",
+        "price_impact_within_ceiling",
+    } <= names
+    await session.close()
+    await db.close()
+
+
+async def test_a_limit_the_inspector_does_not_enforce_still_refuses(tmp_path):
+    """The inspector answers "are these the bytes we asked for"; the limits
+    answer "are we allowed to spend this". Both are enforced, separately.
+
+    The account-create cap is the clean demonstration: the inspector counts ATA
+    rent into the fee total but has no opinion on how many accounts a build may
+    open, so a build that passes inspection completely is still refused here.
+    """
+    runner, db, session = await _make_runner(tmp_path, SOLANA_PILOT_MAX_ATA_CREATES=0)
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        _mock_quote_and_build(m, build_swap_tx().tx_b64)  # emits one ATA create
+        m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    abort = _step(steps, "aborted")
+    assert abort["stage"] == "tx_limits"
+    assert "ata_creates_within_limit" in abort["reason"]
+    # The inspection itself passed — this is a spend limit, not a bad build.
+    inspection = _step(steps, "tx_inspection")
+    assert inspection["passed"] is True
+    assert inspection["limits"]["failed_checks"] == ["ata_creates_within_limit"]
+    await session.close()
+    await db.close()
+
+
+async def test_a_stale_quote_invalidates_the_authorization(tmp_path, monkeypatch):
+    """*** What the blockhash check alone does not cover. ***
+
+    The approval prompt is unbounded operator time. An expired blockhash cannot
+    land at all; a stale quote lands at a price the operator never saw. The
+    on-chain minimum-output bound protects the trade — nothing but this
+    protects the intent.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MAX_QUOTE_AGE_SEC=0.001)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    freshness = _step(steps, "blockhash_recheck")
+    assert freshness["valid"] is False
+    assert freshness["limits"]["failed_checks"] == ["quote_age_within_limit"]
+    # The blockhash itself was fine — it is the quote that went stale.
+    assert freshness["blocks_remaining"] > 0
+    # Nothing was signed, and the row asserting an intent is retired.
+    assert _step(steps, "signed_in_memory") is None
+    assert runner.loader_spy.calls == 0
+    assert (await _live_rows(db)) == [("rejected", None)]
+    await session.close()
+    await db.close()
+
+
+async def test_the_approval_screen_shows_the_envelope_it_was_judged_against(
+    tmp_path, monkeypatch, capsys
+):
+    """An operator authorizing a number should not have to reconstruct the
+    bounds it cleared from a config file."""
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, None)
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        await runner.place(sol=_SOL)
+
+    out = capsys.readouterr().out
+    assert "envelope" in out
+    assert "per-trade 5.0-10.0 USD" in out
+    assert "daily cap 25.0 USD" in out
+    await session.close()
     await db.close()
 
 

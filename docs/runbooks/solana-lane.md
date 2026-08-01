@@ -139,6 +139,45 @@ recovery path. A `--simulate-only` rehearsal prints a NOTICE and proceeds,
 because it provably never submits and therefore can never need the resolver.
 One bad endpoint out of several is excluded rather than fatal.
 
+### The execution envelope
+
+Every limit the lane enforces lives in one object,
+`scout.live.solana.limits.LimitsEngine`, and is evaluated in four stages. Each
+stage writes its named checks into the evidence file — passing ones too, so a
+reviewer can see a limit was evaluated rather than inferring it from silence.
+
+| Stage | Checks | Config |
+|---|---|---|
+| `quote` | per-trade band, daily cap, open positions, executions in flight, input/output mint, route labels, slippage, price impact, ExactIn, amount match | `SOLANA_PILOT_MIN/MAX_ORDER_USD`, `SOLANA_MAX_DAILY_NOTIONAL_USD`, `SOLANA_MAX_OPEN_POSITIONS`, `SOLANA_MAX_CONCURRENT_EXECUTIONS`, `SOLANA_ALLOWED_*` |
+| `transaction` | priority fee, Jito tip, total fee, account creates, program allowlist | `SOLANA_PILOT_MAX_*_LAMPORTS`, `SOLANA_PILOT_MAX_ATA_CREATES` |
+| `balance` | SOL covers swap + everything the bytes charge + headroom | `SOLANA_BALANCE_HEADROOM_PCT` |
+| `freshness` | quote age, blockhash safety margin — **re-asked after the approval prompt** | `SOLANA_MAX_QUOTE_AGE_SEC`, `SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS` |
+
+Points worth knowing before you tune any of these:
+
+* **The daily cap counts AUTHORIZED notional**, summed per UTC day over the
+  lane's `live_trades` rows, and a closed trade still counts. A cap that
+  waited for settlement would let a burst of in-flight trades straight
+  through, which is the shape of a runaway.
+* **The freshness stage is the reason the approval prompt is safe to leave
+  open.** An expired blockhash cannot land at all; a stale quote lands at a
+  price the operator never saw. The on-chain minimum-output bound protects the
+  trade — nothing but the quote-age limit protects the intent.
+* **The mint allowlists must not be empty.** Unlike the route allowlist, an
+  empty mint list is refused at config time: reading it as "unrestricted"
+  would turn a typo into an any-token lane. The route allowlist ships empty
+  and *is* unrestricted, and its evidence line says so.
+* **`tx_inspector` still enforces the three fee ceilings itself.** It is the
+  gate between remotely-built bytes and the signing key and has to be safe
+  standalone. Both it and the engine read the numbers through
+  `FeeCeilings.from_settings`, so they cannot drift.
+
+**`BOUNDED_AUTONOMOUS` inherits this envelope exactly.** The engine is built
+from `Settings` and never sees `SOLANA_MODE` — there is no per-mode multiplier
+and no autonomous-only ceiling. Tests assert the reports are identical under
+both modes for the same inputs; if that ever stops being true, "the transition
+is policy and configuration only" has stopped being true with it.
+
 ### Endpoint URLs are secret
 
 Alchemy and Helius carry the API key in the **path**; some providers use the

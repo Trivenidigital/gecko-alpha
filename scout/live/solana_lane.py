@@ -158,7 +158,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -187,9 +187,16 @@ from scout.live.solana.exceptions import (
     SolanaAmbiguousSubmissionError,
     SolanaAPIError,
     SolanaKeypairError,
+    SolanaLimitBreached,
 )
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient, SolanaQuote, SwapBuild
+from scout.live.solana.limits import (
+    LaneExposure,
+    LimitsEngine,
+    LimitsReport,
+    notional_usd_today,
+)
 from scout.live.solana.resolver import ResolutionReport
 from scout.live.solana.resolver_pool import (
     PoolResolution,
@@ -1391,6 +1398,57 @@ async def fetch_blocking_rows(db: Database) -> list[dict[str, Any]]:
     return [_row_dict(r) for r in await cur.fetchall()]
 
 
+async def fetch_lane_exposure(
+    db: Database, *, now: datetime | None = None
+) -> LaneExposure:
+    """What the lane already has on, for the concurrency and daily limits.
+
+    Three numbers, all read from the two tables that already exist:
+
+    * open positions — ``live_trades.status='open'`` for this venue;
+    * executions in flight — non-terminal ``solana_executions`` rows;
+    * notional authorized today — summed from the same ledger rows.
+
+    The notional query is bounded to the last two days rather than scanning
+    the table: every writer in this lane stamps ``created_at`` with
+    ``datetime.now(timezone.utc).isoformat()``, so a lexicographic bound on
+    that column is a real time bound. Two days rather than one because the
+    boundary is a UTC date and the string bound is a timestamp — the extra day
+    is slack, and ``notional_usd_today`` does the actual date filtering.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    reference = now or datetime.now(timezone.utc)
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM live_trades WHERE venue = ? AND status = 'open'",
+        (VENUE,),
+    )
+    open_positions = int((await cur.fetchone())[0])
+
+    placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    cur = await db._conn.execute(
+        f"SELECT COUNT(*) FROM solana_executions WHERE state NOT IN ({placeholders})",
+        TERMINAL_STATES,
+    )
+    active_executions = int((await cur.fetchone())[0])
+
+    since = (reference - timedelta(days=2)).isoformat()
+    cur = await db._conn.execute(
+        "SELECT size_usd, created_at FROM live_trades "
+        "WHERE venue = ? AND status != 'rejected' AND created_at >= ?",
+        (VENUE, since),
+    )
+    rows = await cur.fetchall()
+    return LaneExposure(
+        open_positions=open_positions,
+        active_executions=active_executions,
+        notional_usd_today=notional_usd_today(
+            [(r[0], r[1]) for r in rows], now=reference
+        ),
+    )
+
+
 async def fetch_row_by_decision_id(
     db: Database, decision_id: str
 ) -> dict[str, Any] | None:
@@ -1626,6 +1684,10 @@ class LaneRunner:
         self._probe_custody = custody_prober or (
             lambda: probe_keyfile_custody(settings)
         )
+        # ONE envelope, built from Settings and never from the mode. Every
+        # limit the lane enforces is in here, which is what makes
+        # BOUNDED_AUTONOMOUS a policy change rather than a second envelope.
+        self._limits = LimitsEngine(settings)
         # Both sweeps of every resolution read from ONE endpoint, which must be
         # a single consistent node — see ``resolver_endpoint``. Defaults to
         # the main client so a test (or a deployment whose single RPC is
@@ -2114,56 +2176,36 @@ class LaneRunner:
 
     # ---------------- quote / build / inspect ----------------
     async def _quote_and_check(
-        self, *, amount_lamports: int
-    ) -> tuple[SolanaQuote, dict[str, Any]]:
-        """Steps 5-6 — quote, then the envelope checks that read the quote.
+        self, *, amount_lamports: int, evidence: EvidenceLog
+    ) -> tuple[SolanaQuote, datetime]:
+        """Steps 5-6 — quote, then the limits engine's verdict on it.
 
-        The USD band is enforced on the QUOTE's USDC output, not on the SOL
-        input: USDC is the dollar-denominated leg (1 USDC ~ 1 USD), so what
-        the operator's $5-$10 envelope actually bounds is what comes back. A
-        band applied to the SOL side would need a price feed of its own and
-        would drift out of the envelope every time SOL moved.
+        Every check here belongs to ``LimitsEngine.check_quote``; this method
+        fetches the quote, reads the lane's current exposure out of the ledger
+        and records the result. It deliberately owns no threshold of its own —
+        the point of the engine is that "what is this lane allowed to do" has
+        exactly one answer.
+
+        The fetch time is returned alongside the quote because the freshness
+        stage re-asks how old it is AFTER the approval prompt, and the prompt
+        is unbounded operator time.
+
+        The evidence step is written BEFORE the limits are enforced, so a
+        refusal leaves the same structured record a pass would — the run that
+        gets refused is the one whose numbers an operator most needs.
         """
         quote = await self._jupiter.get_quote(amount=amount_lamports)
+        quoted_at = datetime.now(timezone.utc)
 
-        problems: list[str] = []
-        if quote.swap_mode != "ExactIn":
-            # otherAmountThreshold means "minimum output" under ExactIn and
-            # "maximum input" under ExactOut. Every downstream guarantee in
-            # this lane reads it as the former.
-            problems.append(
-                f"quote swapMode is {quote.swap_mode!r}, not 'ExactIn' — "
-                "otherAmountThreshold would not be a minimum-output bound"
-            )
-        if quote.in_amount != amount_lamports:
-            problems.append(
-                f"quote inAmount {quote.in_amount} != requested "
-                f"{amount_lamports} lamports"
-            )
-        approved_bps = int(self._settings.SOLANA_PILOT_SLIPPAGE_BPS)
-        if quote.slippage_bps > approved_bps:
-            problems.append(
-                f"quote slippageBps {quote.slippage_bps} exceeds the approved "
-                f"SOLANA_PILOT_SLIPPAGE_BPS={approved_bps}"
-            )
+        exposure = await fetch_lane_exposure(self._db)
+        limits = self._limits.check_quote(
+            quote,
+            amount_lamports=amount_lamports,
+            price_impact_pct=quote_price_impact_pct(quote),
+            exposure=exposure,
+        )
 
         out_usd = usdc_from_raw(quote.out_amount) or Decimal("0")
-        min_usd = _dec(self._settings.SOLANA_PILOT_MIN_ORDER_USD)
-        max_usd = _dec(self._settings.SOLANA_PILOT_MAX_ORDER_USD)
-        if out_usd < min_usd or out_usd > max_usd:
-            problems.append(
-                f"quoted output {_fmt(out_usd)} USDC is outside the approved "
-                f"per-swap band [{_fmt(min_usd)}, {_fmt(max_usd)}] USD"
-            )
-
-        impact_pct = quote_price_impact_pct(quote)
-        max_impact = _dec(self._settings.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT)
-        if impact_pct > max_impact:
-            problems.append(
-                f"price impact {_fmt(impact_pct)}% exceeds "
-                f"SOLANA_PILOT_MAX_PRICE_IMPACT_PCT={_fmt(max_impact)}%"
-            )
-
         detail = {
             "in_amount_lamports": quote.in_amount,
             "in_amount_sol": _fmt(sol_from_lamports(quote.in_amount)),
@@ -2172,17 +2214,31 @@ class LaneRunner:
             "min_out_amount_raw": quote.min_out_amount,
             "min_out_amount_usdc": _fmt(usdc_from_raw(quote.min_out_amount)),
             "slippage_bps": quote.slippage_bps,
-            "price_impact_pct": _fmt(impact_pct),
+            "price_impact_pct": _fmt(quote_price_impact_pct(quote)),
             "price_impact_raw": quote.price_impact_pct,
             "swap_mode": quote.swap_mode,
             "route": _route_summary(quote),
             "context_slot": quote.context_slot,
-            "band_usd": [_fmt(min_usd), _fmt(max_usd)],
-            "problems": problems,
+            "quoted_at": quoted_at.isoformat(),
+            "exposure": exposure.as_evidence(),
+            "limits": limits.as_evidence(),
         }
-        if problems:
-            raise LaneAbort("quote_envelope", "; ".join(problems))
-        return quote, detail
+        evidence.record("quote", **detail)
+        self._enforce(limits, "quote_envelope")
+        return quote, quoted_at
+
+    def _enforce(self, limits: LimitsReport, stage: str) -> None:
+        """Turn a failed limits report into the lane's own refusal.
+
+        The engine raises its own domain exception so it can be used (and
+        tested) without the runner; the lane translates that into ``LaneAbort``
+        so every refusal reaches the operator through one path, with one exit
+        code and one evidence shape.
+        """
+        try:
+            limits.raise_if_failed()
+        except SolanaLimitBreached as exc:
+            raise LaneAbort(stage, str(exc)) from exc
 
     async def _inspect(
         self,
@@ -2191,7 +2247,7 @@ class LaneRunner:
         signer_pubkey: str,
         ata_rent_lamports: int,
         ata_rent_source: str,
-    ) -> tuple[VerificationReport, dict[str, Any]]:
+    ) -> tuple[VerificationReport, LimitsReport, dict[str, Any]]:
         """Step 8 — the inspector's verdict on the bytes Jupiter sent back.
 
         Three things are handed in rather than left to defaults, and each
@@ -2261,7 +2317,13 @@ class LaneRunner:
             "ata_rent_source": ata_rent_source,
             "rpc_client_supplied": True,
         }
-        return report, detail
+        # The fee ceilings, applied by the engine to what the inspector
+        # re-derived from the bytes. The inspector enforces the same three on
+        # its own — it has to be safe to use standalone — and both read them
+        # from `FeeCeilings.from_settings`, so they cannot drift apart.
+        limits = self._limits.check_transaction(report)
+        detail["limits"] = limits.as_evidence()
+        return report, limits, detail
 
     async def _ata_rent_lamports(self) -> tuple[int, str]:
         """Rent-exempt minimum for the output ATA, and where the figure came from.
@@ -2291,6 +2353,7 @@ class LaneRunner:
         signer_pubkey: str,
         amount_lamports: int,
         report: VerificationReport,
+        evidence: EvidenceLog,
     ) -> dict[str, Any]:
         """Step 9 — SOL covers the swap, every cost the bytes carry, and headroom.
 
@@ -2307,16 +2370,24 @@ class LaneRunner:
         the inspector, from the actual number of ATA-create instructions in
         the transaction — which is also why a wallet that already holds USDC
         is not charged for an account it does not need.
+
+        The headroom percentage and the cover comparison belong to the limits
+        engine; this method performs the two RPC reads and records the result —
+        before enforcing, so a refusal leaves the balances it refused on.
         """
-        required = amount_lamports + report.total_fee_lamports
-        # 10% headroom over the whole requirement, so a priority-fee market
-        # that moves between the build and the block cannot turn a
-        # just-affordable swap into an on-chain failure.
-        required_with_headroom = int(_dec(required) * Decimal("1.10"))
+        required, required_with_headroom = self._limits.required_lamports(
+            amount_lamports=amount_lamports,
+            total_fee_lamports=report.total_fee_lamports,
+        )
 
         sol_lamports = await self._rpc.get_balance(signer_pubkey)
         usdc_raw = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
 
+        limits = self._limits.check_balance(
+            sol_lamports=sol_lamports,
+            amount_lamports=amount_lamports,
+            total_fee_lamports=report.total_fee_lamports,
+        )
         detail = {
             "sol_balance_lamports": sol_lamports,
             "sol_balance": _fmt(sol_from_lamports(sol_lamports)),
@@ -2328,18 +2399,11 @@ class LaneRunner:
             "ata_create_count": report.ata_create_count,
             "required_lamports": required,
             "required_with_headroom_lamports": required_with_headroom,
-            "headroom_pct": 10,
+            "headroom_pct": self._settings.SOLANA_BALANCE_HEADROOM_PCT,
+            "limits": limits.as_evidence(),
         }
-        if sol_lamports < required_with_headroom:
-            raise LaneAbort(
-                "balance",
-                f"SOL balance {_fmt(sol_from_lamports(sol_lamports))} does not "
-                f"cover the required {_fmt(sol_from_lamports(required_with_headroom))} "
-                f"(swap {_fmt(sol_from_lamports(amount_lamports))} + "
-                f"{report.total_fee_lamports} lamports of fees and rent "
-                f"[{report.ata_create_count} ATA create(s) = "
-                f"{report.ata_rent_lamports} lamports] + 10% headroom)",
-            )
+        evidence.record("balance", **detail)
+        self._enforce(limits, "balance")
         return detail
 
     # ---------------- place ----------------
@@ -2422,10 +2486,9 @@ class LaneRunner:
                     exit_code=EXIT_BLOCKED,
                 )
 
-            quote, quote_detail = await self._quote_and_check(
-                amount_lamports=amount_lamports
+            quote, quoted_at = await self._quote_and_check(
+                amount_lamports=amount_lamports, evidence=evidence
             )
-            evidence.record("quote", **quote_detail)
             await self._state(
                 decision_id,
                 STATE_QUOTE_CREATED,
@@ -2465,7 +2528,7 @@ class LaneRunner:
             # afterwards would leave the ceiling evaluated against a
             # constant rather than this cluster's actual rent parameters.
             ata_rent, ata_rent_source = await self._ata_rent_lamports()
-            report, inspect_detail = await self._inspect(
+            report, fee_limits, inspect_detail = await self._inspect(
                 build=build,
                 signer_pubkey=signer_pubkey,
                 ata_rent_lamports=ata_rent,
@@ -2477,13 +2540,17 @@ class LaneRunner:
                     "tx_inspection",
                     "; ".join(f"{c.name}: {c.detail}" for c in report.failures),
                 )
+            # Inspection answers "are these the bytes we asked for"; the fee
+            # ceilings answer "are we allowed to spend this". A build can be
+            # perfectly well-formed and still be over a ceiling.
+            self._enforce(fee_limits, "tx_limits")
 
             balance = await self._check_balance(
                 signer_pubkey=signer_pubkey,
                 amount_lamports=amount_lamports,
                 report=report,
+                evidence=evidence,
             )
-            evidence.record("balance", **balance)
 
             sim = await self._rpc.simulate_transaction(build.swap_transaction_b64)
             evidence.record(
@@ -2671,7 +2738,7 @@ class LaneRunner:
                 )
             evidence.record("kill_switch_recheck", kill_active=False)
 
-            freshness = await self._recheck_blockhash(build=build)
+            freshness = await self._recheck_blockhash(build=build, quoted_at=quoted_at)
             evidence.record("blockhash_recheck", **freshness)
             if not freshness["valid"]:
                 await retire_row(self._db, live_trade_id)
@@ -2845,50 +2912,55 @@ class LaneRunner:
             )
             return EXIT_ESCALATE
 
-    async def _recheck_blockhash(self, *, build: SwapBuild) -> dict[str, Any]:
-        """Step 15 — is the authorized build still landable?
+    async def _recheck_blockhash(
+        self, *, build: SwapBuild, quoted_at: datetime | None
+    ) -> dict[str, Any]:
+        """Step 15 — is what the operator authorized still true?
 
-        The approval prompt is unbounded operator time, and a Solana build is
-        perishable: it carries a blockhash that stops being valid once the
-        chain passes ``lastValidBlockHeight``. Submitting past that point
-        cannot land, and submitting just short of it very likely cannot either,
-        so the check refuses inside a configurable safety margin.
+        Two perishable things, re-asked together because they go stale for the
+        same reason: the approval prompt is unbounded operator time. The
+        blockhash stops being valid once the chain passes
+        ``lastValidBlockHeight``, and the quote's price stops describing the
+        market. The on-chain minimum-output bound protects the trade from a
+        bad fill; nothing but this protects the operator's INTENT.
 
-        An RPC failure here counts as INVALID. We cannot show the transaction
-        is still fresh, and the whole point of the re-check is that a stale
+        An RPC failure counts as INVALID. We cannot show the transaction is
+        still fresh, and the whole point of the re-check is that a stale
         authorization must not be spent.
         """
-        margin = int(self._settings.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS)
-        deadline = build.last_valid_block_height - margin
         try:
-            height = await self._rpc.get_block_height()
+            height: int | None = await self._rpc.get_block_height()
+            read_error = None
         except Exception as exc:
-            return {
-                "valid": False,
-                "current_block_height": None,
-                "last_valid_block_height": build.last_valid_block_height,
-                "safety_margin_blocks": margin,
-                "detail": (
-                    f"could not read the current block height "
-                    f"({type(exc).__name__}: {exc}) — refusing to submit a build "
-                    "whose freshness cannot be shown"
-                ),
-            }
-        valid = height <= deadline
+            height = None
+            read_error = f"{type(exc).__name__}: {exc}"
+
+        age = (
+            None
+            if quoted_at is None
+            else (datetime.now(timezone.utc) - quoted_at).total_seconds()
+        )
+        limits = self._limits.check_freshness(
+            quote_age_sec=age,
+            current_block_height=height,
+            last_valid_block_height=build.last_valid_block_height,
+        )
         return {
-            "valid": valid,
+            "valid": limits.passed,
             "current_block_height": height,
             "last_valid_block_height": build.last_valid_block_height,
-            "safety_margin_blocks": margin,
-            "blocks_remaining": build.last_valid_block_height - height,
-            "detail": (
-                f"block height {height} of {build.last_valid_block_height} "
-                f"(margin {margin})"
-                if valid
-                else f"block height {height} is past the safe submission "
-                f"deadline {deadline} "
-                f"(lastValidBlockHeight {build.last_valid_block_height} minus a "
-                f"{margin}-block margin)"
+            "safety_margin_blocks": int(
+                self._settings.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS
+            ),
+            "blocks_remaining": (
+                None if height is None else build.last_valid_block_height - height
+            ),
+            "quote_age_sec": None if age is None else round(age, 1),
+            "block_height_read_error": read_error,
+            "limits": limits.as_evidence(),
+            "detail": "; ".join(
+                f"{c.name}: {c.detail}"
+                for c in (limits.failures if limits.failures else limits.checks)
             ),
         }
 
@@ -2931,6 +3003,8 @@ class LaneRunner:
         # transaction still landable", and a number computed a minute ago
         # answers a question about a moment that has passed.
         age = await self._blockhash_age(build)
+        limits = self._limits.declared_limits()
+        exposure = (await fetch_lane_exposure(self._db)).as_evidence()
         lines = [
             f"  pair                : SOL -> USDC",
             f"  input mint          : {quote.input_mint}",
@@ -2958,6 +3032,14 @@ class LaneRunner:
             f"  signer              : {signer_pubkey}",
             f"  current SOL         : {balance['sol_balance']} SOL",
             f"  current USDC        : {balance['usdc_balance']} USDC",
+            # The envelope this trade was judged against, shown alongside the
+            # trade. An operator asked to authorize a number should not have to
+            # reconstruct the bounds it cleared from a config file.
+            f"  envelope            : per-trade "
+            f"{limits['per_trade_usd'][0]}-{limits['per_trade_usd'][1]} USD, "
+            f"daily cap {limits['daily_notional_usd']} USD "
+            f"({exposure['notional_usd_today']} authorized today), "
+            f"max {limits['max_open_positions']} open position(s)",
             f"  MESSAGE SHA256      : {message_sha256}",
             f"  database            : {Path(self._settings.DB_PATH).resolve()}",
             f"  decision ID         : {decision_id}",
@@ -3836,6 +3918,11 @@ class LaneRunner:
             f"  pair                     : {PAIR} (mainnet, fixed)",
             f"  per-swap band            : {settings.SOLANA_PILOT_MIN_ORDER_USD} - "
             f"{settings.SOLANA_PILOT_MAX_ORDER_USD} USD on the USDC output",
+            f"  daily notional cap       : "
+            f"{settings.SOLANA_MAX_DAILY_NOTIONAL_USD} USD (authorized, UTC day)",
+            f"  concurrency              : "
+            f"{settings.SOLANA_MAX_OPEN_POSITIONS} open position(s), "
+            f"{settings.SOLANA_MAX_CONCURRENT_EXECUTIONS} execution(s) in flight",
             f"  slippage ceiling         : {settings.SOLANA_PILOT_SLIPPAGE_BPS} bps",
             f"  jito tip requested       : "
             f"{settings.SOLANA_PILOT_JITO_TIP_LAMPORTS} lamports",
@@ -3953,6 +4040,17 @@ class LaneRunner:
                 + ("" if row.get("blocking") else "  (place would auto-retire this)")
             )
         lines.append(f"  blocking                 : {reconciliation['blockers']}")
+
+        # Current exposure against the envelope, so "how much room is left
+        # today" is answerable without running a placement to find out.
+        exposure = await fetch_lane_exposure(self._db)
+        lines.append(
+            f"  used today               : "
+            f"{_fmt(exposure.notional_usd_today)} of "
+            f"{settings.SOLANA_MAX_DAILY_NOTIONAL_USD} USD, "
+            f"{exposure.open_positions} open position(s), "
+            f"{exposure.active_executions} execution(s) in flight"
+        )
 
         _print_block("SOLANA LANE STATUS", lines)
         if reconciliation["blockers"]:

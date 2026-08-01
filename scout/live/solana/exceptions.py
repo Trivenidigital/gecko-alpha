@@ -62,6 +62,19 @@ class SolanaVerificationError(SolanaError):
     """
 
 
+class SolanaLimitBreached(SolanaError):
+    """The trade is outside the lane's execution envelope.
+
+    Raised by ``scout.live.solana.limits`` and distinct from
+    ``SolanaVerificationError``: the inspector answers "are these bytes what we
+    asked for", this answers "are we allowed to do this at all". A build can be
+    perfectly well-formed and still exceed the daily cap.
+
+    Terminal for the attempt. Nothing has been signed or sent when it is
+    raised — every limit is evaluated before the funded key is read.
+    """
+
+
 class SolanaKeypairError(SolanaError):
     """The signing keypair could not be loaded, or its file is unsafe.
 
