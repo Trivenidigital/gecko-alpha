@@ -42,6 +42,22 @@ USDC_DECIMALS: Final[int] = 6
 LAMPORTS_PER_SOL: Final[int] = 10**SOL_DECIMALS
 
 # ----------------------------------------------------------------------
+# Cluster identity
+# ----------------------------------------------------------------------
+# The genesis hash of Solana mainnet-beta, as returned by ``getGenesisHash``.
+# It is the only unforgeable statement an endpoint makes about WHICH CHAIN it
+# serves: a URL can say "mainnet", a provider dashboard can say "mainnet", and
+# the node behind it can still be devnet or a fork.
+#
+# This matters most for the resolver. Every verdict it reaches is a claim about
+# whether one signature exists on the chain the swap was submitted to, and an
+# endpoint on a different chain answers "absent" to every signature it is ever
+# asked about — manufacturing `definitively_not_submitted` for a transaction
+# that landed. The host-substring checks elsewhere in the lane are a typo
+# guard; this is the actual proof.
+SOLANA_MAINNET_GENESIS_HASH: Final[str] = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+
+# ----------------------------------------------------------------------
 # Jito
 # ----------------------------------------------------------------------
 JITO_MAINNET_BLOCK_ENGINE_URL: Final[str] = "https://mainnet.block-engine.jito.wtf"

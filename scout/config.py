@@ -1405,6 +1405,38 @@ class Settings(BaseSettings):
     # URL is not itself a known round-robin — see
     # scout.live.solana_pilot.resolver_endpoint.
     SOLANA_RESOLVER_RPC_URL: str = ""
+    # The resolver POOL, in preference order. Supersedes the singular key above
+    # when non-empty; the singular key is read as a one-element pool otherwise,
+    # because that is what is deployed and it stays authoritative rather than
+    # becoming a legacy alias nobody remembers to migrate.
+    #
+    # A second endpoint buys two things the first cannot. READ FAILOVER: a
+    # resolution that cannot reach its node returns `unresolved`, which BLOCKS
+    # the lane — so a single endpoint being down is an outage of the recovery
+    # path, not just of a convenience. CORROBORATION: `definitively_not
+    # _submitted` is the one verdict that clears the lane, and it is built out
+    # of an ABSENCE. A second endpoint is asked to see the same absence before
+    # it is acted on, and disagreement collapses the verdict to `unresolved`.
+    #
+    # Empty is fully supported and is what ships first: one endpoint, no
+    # corroboration, and the evidence records that the verdict was
+    # uncorroborated so a single-node reading is never mistaken for two.
+    #
+    # Every endpoint must be a single dedicated node (the round-robin refusal
+    # applies to all of them) and must prove it is on mainnet-beta via
+    # getGenesisHash before it is used — see scout.live.solana.resolver_pool.
+    SOLANA_RESOLVER_RPC_URLS: Annotated[list[str], NoDecode] = []
+    # Per-endpoint budget for the genesis + health probes that admit an
+    # endpoint to the pool. Deliberately much shorter than
+    # SOLANA_HTTP_TIMEOUT_SEC: this is a liveness question, and an endpoint
+    # that needs 15s to say "ok" has already answered it.
+    SOLANA_RESOLVER_HEALTH_TIMEOUT_SEC: float = 5.0
+    # Above this, an endpoint is DEGRADED: still on the right chain and still
+    # caught up, so it stays usable as a fallback, but it is demoted behind the
+    # faster endpoints. Excluding it instead would trade a slow resolver for no
+    # resolver, which is the worse failure — an unresolvable signature blocks
+    # the lane.
+    SOLANA_RESOLVER_MAX_LATENCY_MS: float = 2_000.0
     # Age-derived blockhash expiry, bounded on BOTH sides.
     #
     # A Solana blockhash is valid for at most 150 slots (~60-90s), so a
@@ -1479,6 +1511,86 @@ class Settings(BaseSettings):
     SOLANA_PILOT_MAX_ATA_CREATES: int = 3
     SOLANA_PILOT_MIN_ORDER_USD: float = 5.0
     SOLANA_PILOT_MAX_ORDER_USD: float = 10.0
+
+    # -------- Solana lane limits engine --------
+    # The rest of the execution envelope, enforced by
+    # scout.live.solana.limits.LimitsEngine alongside the per-trade band and
+    # the fee ceilings above. BOUNDED_AUTONOMOUS inherits every one of these
+    # unchanged — the engine never sees SOLANA_MODE.
+    #
+    # Cap on AUTHORIZED notional per UTC day, summed over the lane's
+    # live_trades rows. Authorized rather than realised: a cap that only
+    # counted settled trades would let a burst of in-flight ones straight
+    # through, which is the exact shape of a runaway.
+    SOLANA_MAX_DAILY_NOTIONAL_USD: float = 25.0
+    # Positions the lane may hold at once. 1 makes the supervised lane
+    # strictly one-trade-at-a-time; raising it is the first real autonomy
+    # decision and is deliberately a separate value from the concurrency
+    # limit below, because holding two positions and having two transactions
+    # in flight are different risks.
+    SOLANA_MAX_OPEN_POSITIONS: int = 1
+    # Executions that may be in flight simultaneously. Belt to the lane lock's
+    # braces: the lock stops two PROCESSES, this stops one process from
+    # starting a second execution while an earlier one is unresolved.
+    SOLANA_MAX_CONCURRENT_EXECUTIONS: int = 1
+    # How stale a quote may be at SUBMISSION time. Checked after the approval
+    # prompt, which is unbounded operator time: the price that was authorized
+    # is not necessarily the price that will execute, and the on-chain
+    # minimum-output bound protects the trade but not the operator's intent.
+    SOLANA_MAX_QUOTE_AGE_SEC: float = 120.0
+    # Headroom over the full required balance (swap + every lamport the bytes
+    # charge). Was an inline constant; a fee market that moves between the
+    # build and the block must not turn a just-affordable swap into an
+    # on-chain failure after the operator has authorized it.
+    SOLANA_BALANCE_HEADROOM_PCT: float = 10.0
+    # Mint allowlists. The lane is SOL -> USDC today; these are what make a
+    # second pair a configuration change rather than a code change. Defaults
+    # are wrapped SOL and mainnet USDC — the same addresses as
+    # scout.live.solana.constants, inlined here to keep config free of a
+    # scout.live dependency (that module remains the source of truth).
+    SOLANA_ALLOWED_INPUT_MINTS: Annotated[list[str], NoDecode] = [
+        "So11111111111111111111111111111111111111112"
+    ]
+    SOLANA_ALLOWED_OUTPUT_MINTS: Annotated[list[str], NoDecode] = [
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    ]
+    # AMM labels the route may use, as Jupiter reports them ("Raydium",
+    # "Orca", ...). EMPTY MEANS UNRESTRICTED, and the check says so in its
+    # detail rather than implying a restriction that is not configured:
+    # Jupiter routes through dozens of AMMs and rotates which it picks, so a
+    # closed default would refuse essentially every real route.
+    SOLANA_ALLOWED_ROUTE_LABELS: Annotated[list[str], NoDecode] = []
+
+    # -------- Solana lane operations --------
+    # Stuck-execution watchdog (CLAUDE.md §12a, in the shape that fits this
+    # table). A row-rate SLO is the WRONG shape for solana_executions: it is
+    # only written when a trade runs, so silence is normal and says nothing.
+    # The analogue is STUCK STATE — a row that entered a non-terminal state and
+    # has not moved since — and the thresholds differ per state because the
+    # states mean different things.
+    SOLANA_EXECUTION_WATCHDOG_ENABLED: bool = True
+    # A human reading the decision screen. Generous on purpose.
+    SOLANA_STUCK_AWAITING_AUTHORIZATION_SEC: float = 3600.0
+    # Machine steps that take seconds. Sitting here means the process died
+    # between two durable writes.
+    SOLANA_STUCK_PRE_SUBMISSION_SEC: float = 900.0
+    # *** THE ONE THAT MUST NOT SIT. *** A row still in submission_attempted
+    # means a transaction may exist and nobody is asking the cluster about it.
+    SOLANA_STUCK_SUBMISSION_SEC: float = 180.0
+    # Landed, waiting on confirmation / finalization / reconciliation.
+    SOLANA_STUCK_POST_SUBMISSION_SEC: float = 900.0
+    # Already escalated and already blocking the lane. Alerted anyway, on a
+    # longer fuse: a blocked lane nobody remembers is a lane that has silently
+    # stopped trading.
+    SOLANA_STUCK_UNKNOWN_SUBMISSION_SEC: float = 1800.0
+
+    # -------- Bounded-autonomy preconditions --------
+    # Completed, RECONCILED supervised executions required in the ledger before
+    # BOUNDED_AUTONOMOUS will run. Counted from solana_executions, not from
+    # memory or a checklist: the transition has to be impossible by flipping a
+    # flag, and "we did the supervised trades" is a claim the database can
+    # settle. Raising this is a tightening; lowering it below 1 is refused.
+    SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS: int = 3
     # Settle delay between the two sweeps that resolve an ambiguous
     # submission. Same rationale as KRAKEN_SUBMISSION_SETTLE_SEC above: a
     # just-forwarded transaction is briefly unknown to the RPC's signature
@@ -1487,12 +1599,44 @@ class Settings(BaseSettings):
     # as an absence.
     SOLANA_SUBMISSION_SETTLE_SEC: float = 5.0
 
-    # -------- Solana supervised pilot runner (PR-S2, 2026-07-31) --------
-    # The mechanical envelope around the ONE operator-invoked supervised swap
-    # (scout.live.solana_pilot). Same posture as the Kraken pilot block above:
-    # every default is the refusing one, and none of these gate the
-    # signal-driven live engine.
-    SOLANA_PILOT_ENABLED: bool = False
+    # -------- Solana DEX execution lane --------
+    # The mechanical envelope around scout.live.solana_lane, the PERMANENT
+    # Solana execution path. Every default is the refusing one, and none of
+    # these gate the signal-driven live engine.
+    #
+    # *** SOLANA_MODE IS THE LANE'S MASTER CONTROL. ***
+    # It replaces the old SOLANA_PILOT_ENABLED boolean, which could only say
+    # on/off and had no way to express "rehearse" or "stop everything". The
+    # five modes are the whole spectrum the lane will ever operate in, and
+    # moving between them is CONFIGURATION — there is no second runner, no
+    # second adapter and no second code path behind any of them.
+    #
+    #   DISABLED            refuses everything. The default.
+    #   SIMULATION_ONLY     quotes, builds, inspects, simulates and prompts.
+    #                       Never reads the funded key, never submits.
+    #   SUPERVISED_LIVE     a human types the authorization before the funded
+    #                       key signs. The boundary, unchanged.
+    #   BOUNDED_AUTONOMOUS  a policy check substitutes for the typed prompt.
+    #                       Requires SOLANA_BOUNDED_AUTONOMOUS_ENABLED as well,
+    #                       so the mode alone cannot start it.
+    #   EMERGENCY_STOPPED   refuses all execution, like the kill switch, and is
+    #                       checked in the same places.
+    #
+    # The ONLY difference between SUPERVISED_LIVE and BOUNDED_AUTONOMOUS is
+    # which authorization policy is asked. Same limits, same signer, same
+    # state machine, same submission, same reconciliation, same evidence.
+    SOLANA_MODE: Literal[
+        "DISABLED",
+        "SIMULATION_ONLY",
+        "SUPERVISED_LIVE",
+        "BOUNDED_AUTONOMOUS",
+        "EMERGENCY_STOPPED",
+    ] = "DISABLED"
+    # Second lock on autonomy. BOUNDED_AUTONOMOUS additionally requires this,
+    # so promoting the lane cannot happen by editing one value — and the
+    # preconditions in the lane itself (recorded supervised executions,
+    # configured limits) are checked on top of both.
+    SOLANA_BOUNDED_AUTONOMOUS_ENABLED: bool = False
     # Tip REQUESTED from Jupiter via prioritizationFeeLamports.jitoTipLamports.
     # A request, not a guarantee: tx_inspector re-derives the tip actually
     # compiled into the transaction and enforces
@@ -2131,6 +2275,74 @@ class Settings(BaseSettings):
                 "inverted window means age can never establish expiry, so a row "
                 "whose evidence file is gone could never self-resolve."
             )
+        for name in (
+            "SOLANA_RESOLVER_HEALTH_TIMEOUT_SEC",
+            "SOLANA_RESOLVER_MAX_LATENCY_MS",
+        ):
+            if getattr(self, name) <= 0:
+                # Zero is not "no limit" for either: a zero timeout admits no
+                # endpoint and a zero latency budget marks every endpoint
+                # degraded, so both spellings of "off" silently break the pool.
+                raise ValueError(f"{name} must be > 0; got={getattr(self, name)}")
+        # A daily cap below one trade's maximum admits no trade at all, which
+        # is a lane that refuses everything for a reason no message explains.
+        if self.SOLANA_MAX_DAILY_NOTIONAL_USD < self.SOLANA_PILOT_MAX_ORDER_USD:
+            raise ValueError(
+                "SOLANA_MAX_DAILY_NOTIONAL_USD must be >= "
+                "SOLANA_PILOT_MAX_ORDER_USD; got "
+                f"daily={self.SOLANA_MAX_DAILY_NOTIONAL_USD}, "
+                f"per-trade max={self.SOLANA_PILOT_MAX_ORDER_USD}. A daily cap "
+                "below one trade's ceiling refuses every trade."
+            )
+        for name in ("SOLANA_MAX_OPEN_POSITIONS", "SOLANA_MAX_CONCURRENT_EXECUTIONS"):
+            if getattr(self, name) < 1:
+                # Zero is not "unlimited" — it is a lane that never trades, and
+                # DISABLED is how you say that.
+                raise ValueError(
+                    f"{name} must be >= 1; got={getattr(self, name)}. Use "
+                    "SOLANA_MODE=DISABLED to stop the lane."
+                )
+        if self.SOLANA_MAX_QUOTE_AGE_SEC <= 0:
+            raise ValueError(
+                "SOLANA_MAX_QUOTE_AGE_SEC must be > 0; got "
+                f"{self.SOLANA_MAX_QUOTE_AGE_SEC}. Zero rejects every quote, "
+                "including the one fetched a moment ago."
+            )
+        if self.SOLANA_BALANCE_HEADROOM_PCT < 0:
+            raise ValueError(
+                "SOLANA_BALANCE_HEADROOM_PCT must be >= 0; got "
+                f"{self.SOLANA_BALANCE_HEADROOM_PCT}"
+            )
+        for name in ("SOLANA_ALLOWED_INPUT_MINTS", "SOLANA_ALLOWED_OUTPUT_MINTS"):
+            if not getattr(self, name):
+                # Unlike the route allowlist, an EMPTY mint allowlist is not
+                # "unrestricted" — it is a lane with no permitted pair, and
+                # reading it as unrestricted would turn a config typo into an
+                # any-token lane.
+                raise ValueError(
+                    f"{name} must name at least one mint; an empty mint "
+                    "allowlist is not 'unrestricted', it is a lane with no "
+                    "tradable pair."
+                )
+        for name in (
+            "SOLANA_STUCK_AWAITING_AUTHORIZATION_SEC",
+            "SOLANA_STUCK_PRE_SUBMISSION_SEC",
+            "SOLANA_STUCK_SUBMISSION_SEC",
+            "SOLANA_STUCK_POST_SUBMISSION_SEC",
+            "SOLANA_STUCK_UNKNOWN_SUBMISSION_SEC",
+        ):
+            if getattr(self, name) <= 0:
+                # A zero threshold reports every row as stuck the instant it is
+                # written, which trains the operator to ignore the alert — the
+                # failure mode a watchdog exists to avoid.
+                raise ValueError(f"{name} must be > 0; got={getattr(self, name)}")
+        if self.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS < 1:
+            raise ValueError(
+                "SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS must be >= 1; got "
+                f"{self.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS}. Zero would "
+                "let the lane go autonomous having never executed anything "
+                "under supervision, which is the precondition's whole point."
+            )
         if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
             raise ValueError(
                 "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "
@@ -2342,6 +2554,48 @@ class Settings(BaseSettings):
                 if isinstance(parsed, list):
                     return [str(p).strip() for p in parsed if str(p).strip()]
             return [p.strip() for p in s.split(",") if p.strip()]
+        return v
+
+    @field_validator(
+        "SOLANA_ALLOWED_INPUT_MINTS",
+        "SOLANA_ALLOWED_OUTPUT_MINTS",
+        "SOLANA_ALLOWED_ROUTE_LABELS",
+        mode="before",
+    )
+    @classmethod
+    def parse_solana_allowlists(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decls) delivers the RAW env/init string here.
+        # Same three shapes as every other list field in this file.
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return v
+
+    @field_validator("SOLANA_RESOLVER_RPC_URLS", mode="before")
+    @classmethod
+    def parse_solana_resolver_rpc_urls(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) suppresses pydantic-settings' eager JSON
+        # decode, so the RAW env/init string reaches here. Accept three shapes:
+        #   * comma-separated string ("https://a,https://b") — the .env form
+        #   * JSON array string ('["https://a"]')  — back-compat with JSON envs
+        #   * native list                          — test / programmatic
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(u).strip() for u in parsed if str(u).strip()]
+            return [u.strip() for u in s.split(",") if u.strip()]
         return v
 
     @field_validator("SECONDWAVE_ALERT_THRESHOLD")

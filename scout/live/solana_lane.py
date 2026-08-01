@@ -1,4 +1,4 @@
-"""Solana supervised pilot runner — PR-S2.
+"""Solana DEX execution lane — the permanent runner.
 
 The operator-invoked CLI that executes ONE supervised SOL->USDC swap on
 mainnet behind a manual approval boundary. It composes PR-S1's venue clients
@@ -8,18 +8,20 @@ pipeline imports it.
 
 Usage::
 
-    python -m scout.live.solana_pilot place --sol 0.05 \\
+    python -m scout.live.solana_lane place --sol 0.05 \\
         [--simulate-only --yes-i-am-rehearsing]
-    python -m scout.live.solana_pilot status
-    python -m scout.live.solana_pilot resolve --decision-id <uuid>
+    python -m scout.live.solana_lane status
+    python -m scout.live.solana_lane resolve --decision-id <uuid>
 
 Place flow, in mechanical order — every step is printed, logged and appended
 to the evidence file before the next one starts:
 
-1.  envelope gate (SOLANA_PILOT_ENABLED, keypair path, mainnet hosts)
+1.  envelope gate (SOLANA_MODE, keypair path, mainnet hosts)
 2.  kill-switch check
 3.  keypair custody — load at call time, derive the signer pubkey
-4.  startup reconciliation — a restart must not forget a signature
+4.  resolver-pool validation (every endpoint proves it is on mainnet-beta and
+    caught up), then startup reconciliation — a restart must not forget a
+    signature
 5.  Jupiter quote
 6.  quote envelope (USD band on the USDC out, price impact, slippage, mints)
 7.  Jupiter build (unsigned) with the Jito tip requested
@@ -37,7 +39,7 @@ to the evidence file before the next one starts:
 
 Design decisions this module had to make, and why
 -------------------------------------------------
-**Authorization gates SIGNING, not submission.** The funded pilot key does
+**Authorization gates SIGNING, not submission.** The funded lane key does
 not sign until the operator has typed the authorization — including in
 rehearsal. A validly signed transaction is an irreversible-capability
 artifact: anyone who obtains those bytes can broadcast them, and the wallet
@@ -86,6 +88,16 @@ prompt — so ``read_persisted_intent`` reads the height back from it. When the
 file is missing or unreadable the height is ``None``, which makes the resolver
 fail CLOSED (``unresolved``, lane blocked) rather than degrade quietly.
 
+**The resolver reads from a POOL; one resolution reads from one node.**
+``SOLANA_RESOLVER_RPC_URLS`` is an ordered list and ``SOLANA_RESOLVER_RPC_URL``
+is read as a one-element pool, which is what is deployed. Every endpoint must
+prove via ``getGenesisHash`` that it is on mainnet-beta before it is used, and
+selection is deterministic in the signature so a resolution's two sweeps never
+straddle two nodes. A second endpoint buys read failover (an unreachable
+resolver blocks the lane) and corroboration of the one verdict that clears it.
+Adding one is configuration; the code path is the same one a single endpoint
+already runs. See ``scout.live.solana.resolver_pool``.
+
 **One PLACEMENT at a time, enforced by the filesystem.** Same reasoning and
 same ``O_CREAT | O_EXCL`` mechanism as the Kraken lane, on its own lock file:
 two ``place`` runs in two terminals are two swaps, each clearing its own
@@ -101,19 +113,19 @@ succeeds against an empty file where the kill switch is clear and no prior
 signature needs reconciling. Every safety mechanism reads "all clear"
 precisely because it is reading the wrong database.
 
-**``paper_trade_id`` is satisfied by a pilot ANCHOR row.**
+**``paper_trade_id`` is satisfied by a lane ANCHOR row.**
 ``live_trades.paper_trade_id`` is ``NOT NULL REFERENCES paper_trades(id)`` with
 ``PRAGMA foreign_keys=ON``, and there is no signal behind an operator-invoked
-swap. One sentinel row — token_id 'solana-pilot', signal_type 'solana_pilot',
-status 'solana_pilot_anchor', opened_at epoch — is created once and referenced
-by every pilot swap. The three field values are each load-bearing against a
+swap. One sentinel row — token_id 'solana-lane', signal_type 'solana_lane',
+status 'solana_lane_anchor', opened_at epoch — is created once and referenced
+by every lane swap. The three field values are each load-bearing against a
 specific reader: the status is not 'open' so no open-position loop scans it,
 the epoch ``opened_at`` keeps it out of the daily digest's
 ``date(opened_at) = ?`` count and the analytics windows' ``opened_at >=
 cutoff``, and ``closed_at`` stays NULL so the closed-trade digest never sees
 it. No schema migration.
 
-**A landed swap leaves the row 'open'.** 'open' here means "this pilot holds
+**A landed swap leaves the row 'open'.** 'open' here means "this lane holds
 the resulting position", which is what is true after a swap executes, and it
 blocks the next ``place`` run — correct for a supervised lane that trades once
 per authorization. The operator disposes of the USDC and resolves the row by
@@ -145,11 +157,11 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import aiohttp
@@ -166,18 +178,34 @@ from scout.live.solana.constants import (
     LAMPORTS_PER_SIGNATURE,
     LAMPORTS_PER_SOL,
     SOL_MINT,
+    SOLANA_MAINNET_GENESIS_HASH,
     TOKEN_ACCOUNT_DATA_LENGTH,
     USDC_DECIMALS,
     USDC_MINT,
 )
+from scout.live.solana.execution_watchdog import check_stuck_executions
 from scout.live.solana.exceptions import (
     SolanaAmbiguousSubmissionError,
     SolanaAPIError,
     SolanaKeypairError,
+    SolanaLimitBreached,
 )
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient, SolanaQuote, SwapBuild
-from scout.live.solana.resolver import ResolutionReport, resolve_submission
+from scout.live.solana.limits import (
+    LaneExposure,
+    LimitsEngine,
+    LimitsReport,
+    notional_usd_today,
+)
+from scout.live.solana.resolver import ResolutionReport
+from scout.live.solana.resolver_pool import (
+    PoolResolution,
+    ResolverPool,
+    redact_endpoint,
+    resolve_with_pool,
+    resolver_urls,
+)
 from scout.live.solana.rpc_client import SolanaRpcClient
 from scout.live.solana.signer import (
     SignedTransaction,
@@ -197,7 +225,7 @@ log = structlog.get_logger(__name__)
 #   1  EXIT_REFUSED   a gate said no, the operator did not authorize, or the
 #                     transaction definitively did not execute. No position.
 #   2  EXIT_BLOCKED   the lane is blocked — an unresolved prior signature, or
-#                     another pilot process holding the lock. Nothing tried.
+#                     another lane process holding the lock. Nothing tried.
 #   3  EXIT_ESCALATE  a submission could not be resolved, or the run failed
 #                     unexpectedly. State is UNKNOWN; a human must look.
 #   4  EXIT_REVIEW    the swap executed but the post-trade reconciliation could
@@ -212,11 +240,11 @@ VENUE = "solana"
 PAIR = "SOL/USDC"
 BASE_SYMBOL = "SOL"
 
-# The pilot anchor (see module docstring). Values are matched exactly on
+# The lane anchor (see module docstring). Values are matched exactly on
 # lookup, so they are constants rather than anything derived at runtime.
-_ANCHOR_TOKEN_ID = "solana-pilot"
-_ANCHOR_SIGNAL_TYPE = "solana_pilot"
-_ANCHOR_STATUS = "solana_pilot_anchor"
+_ANCHOR_TOKEN_ID = "solana-lane"
+_ANCHOR_SIGNAL_TYPE = "solana_lane"
+_ANCHOR_STATUS = "solana_lane_anchor"
 _ANCHOR_OPENED_AT = "1970-01-01T00:00:00+00:00"
 
 # live_trades statuses that mean "a signature may still be live, or a position
@@ -254,8 +282,278 @@ _REDACTED = "[REDACTED]"
 # why lastValidBlockHeight lives here.
 _INTENT_STEP = "intent_persisted"
 
+# ----------------------------------------------------------------------
+# Durable execution states
+# ----------------------------------------------------------------------
+# One run walks this vocabulary from left to right. The point of naming them
+# is RECOVERY: a process that dies mid-run must be able to say what had
+# already happened, and — far more important — what had NOT, so a restart can
+# never repeat an irreversible step.
+#
+# The dangerous boundary is SUBMISSION_ATTEMPTED. Before it, nothing was sent
+# and a restart may safely discard the run. At or after it, a transaction may
+# exist, and the ONLY permitted recovery is to ask the cluster: no rebuild, no
+# resubmission, ever.
+STATE_QUOTE_CREATED = "quote_created"
+STATE_TRANSACTION_BUILT = "transaction_built"
+STATE_SIMULATION_PASSED = "simulation_passed"
+STATE_AWAITING_AUTHORIZATION = "awaiting_authorization"
+STATE_AUTHORIZED = "authorized"
+STATE_SIGNED = "signed"
+STATE_SUBMISSION_ATTEMPTED = "submission_attempted"
+STATE_LANDED = "landed"
+STATE_CONFIRMED = "confirmed"
+STATE_FINALIZED = "finalized"
+STATE_RECONCILED = "reconciled"
+STATE_FAILED = "failed"
+STATE_SUBMISSION_UNKNOWN = "submission_unknown"
 
-class PilotAbort(Exception):
+ALL_STATES = (
+    STATE_QUOTE_CREATED,
+    STATE_TRANSACTION_BUILT,
+    STATE_SIMULATION_PASSED,
+    STATE_AWAITING_AUTHORIZATION,
+    STATE_AUTHORIZED,
+    STATE_SIGNED,
+    STATE_SUBMISSION_ATTEMPTED,
+    STATE_LANDED,
+    STATE_CONFIRMED,
+    STATE_FINALIZED,
+    STATE_RECONCILED,
+    STATE_FAILED,
+    STATE_SUBMISSION_UNKNOWN,
+)
+
+# States from which nothing was ever sent. A restart finding one of these knows
+# — from the state alone, without asking the network — that no transaction
+# exists, so the run can be discarded and the lane cleared.
+PRE_SUBMISSION_STATES = (
+    STATE_QUOTE_CREATED,
+    STATE_TRANSACTION_BUILT,
+    STATE_SIMULATION_PASSED,
+    STATE_AWAITING_AUTHORIZATION,
+    STATE_AUTHORIZED,
+    STATE_SIGNED,
+)
+
+# Terminal: the run is over and the lane is not waiting on it.
+TERMINAL_STATES = (STATE_RECONCILED, STATE_FAILED)
+
+# States that BLOCK the lane. A transaction may exist and its fate is either
+# unknown or requires disposition, so no new execution may start.
+BLOCKING_STATES = (
+    STATE_SUBMISSION_ATTEMPTED,
+    STATE_LANDED,
+    STATE_CONFIRMED,
+    STATE_FINALIZED,
+    STATE_SUBMISSION_UNKNOWN,
+)
+
+# Legal transitions. Declared rather than implied by the code's shape so an
+# illegal jump — say awaiting_authorization straight to submission_attempted,
+# which would mean submitting something nobody approved — is a loud error at
+# the write, not a silent state a later reader has to make sense of.
+LEGAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    STATE_QUOTE_CREATED: (STATE_TRANSACTION_BUILT, STATE_FAILED),
+    STATE_TRANSACTION_BUILT: (STATE_SIMULATION_PASSED, STATE_FAILED),
+    STATE_SIMULATION_PASSED: (STATE_AWAITING_AUTHORIZATION, STATE_FAILED),
+    STATE_AWAITING_AUTHORIZATION: (STATE_AUTHORIZED, STATE_FAILED),
+    STATE_AUTHORIZED: (STATE_SIGNED, STATE_FAILED),
+    STATE_SIGNED: (STATE_SUBMISSION_ATTEMPTED, STATE_FAILED),
+    # Past here a transaction may exist, so `failed` is NOT reachable by
+    # simply giving up — the only ways out are what the cluster reports.
+    STATE_SUBMISSION_ATTEMPTED: (
+        STATE_LANDED,
+        STATE_CONFIRMED,
+        STATE_FINALIZED,
+        STATE_SUBMISSION_UNKNOWN,
+        STATE_FAILED,
+    ),
+    STATE_LANDED: (STATE_CONFIRMED, STATE_FINALIZED, STATE_FAILED),
+    STATE_CONFIRMED: (STATE_FINALIZED, STATE_RECONCILED, STATE_FAILED),
+    STATE_FINALIZED: (STATE_RECONCILED, STATE_FAILED),
+    # An unknown submission resolves only into what the cluster says. It can
+    # never walk backwards into signing or submitting again.
+    STATE_SUBMISSION_UNKNOWN: (
+        STATE_LANDED,
+        STATE_CONFIRMED,
+        STATE_FINALIZED,
+        STATE_FAILED,
+    ),
+    STATE_RECONCILED: (),
+    STATE_FAILED: (),
+}
+
+
+class IllegalStateTransition(RuntimeError):
+    """A transition the state machine does not permit.
+
+    Raised rather than logged: an illegal transition means the caller believes
+    something happened that could not have, and continuing would persist that
+    belief.
+    """
+
+
+def assert_legal_transition(current: str | None, nxt: str) -> None:
+    """Guard every state write. ``None`` means the run is starting."""
+    if nxt not in ALL_STATES:
+        raise IllegalStateTransition(f"{nxt!r} is not an execution state")
+    if current is None:
+        if nxt != STATE_QUOTE_CREATED:
+            raise IllegalStateTransition(
+                f"a run must begin at {STATE_QUOTE_CREATED}, not {nxt!r}"
+            )
+        return
+    if current not in ALL_STATES:
+        raise IllegalStateTransition(f"{current!r} is not an execution state")
+    if nxt not in LEGAL_TRANSITIONS[current]:
+        raise IllegalStateTransition(
+            f"{current} -> {nxt} is not a legal transition; "
+            f"from {current} the lane may only reach "
+            f"{LEGAL_TRANSITIONS[current] or '(nothing — terminal)'}"
+        )
+
+
+def recovery_disposition(state: str) -> str:
+    """What a restart may do with a run left in ``state``.
+
+    Three answers, and the boundary between the first two is the whole reason
+    the states are persisted:
+
+    ``discard``  nothing was ever sent; the run can be abandoned and the lane
+                 cleared without asking anyone.
+    ``resolve``  a transaction may exist. Ask the cluster. NEVER rebuild and
+                 never resubmit — a rebuild is a second signature and both can
+                 land.
+    ``done``     terminal; nothing to recover.
+    """
+    if state in TERMINAL_STATES:
+        return "done"
+    if state in PRE_SUBMISSION_STATES:
+        return "discard"
+    return "resolve"
+
+
+# ----------------------------------------------------------------------
+# Lifecycle <-> money coherence
+# ----------------------------------------------------------------------
+# Two axes, two tables, and they must never disagree about whether the lane is
+# blocked. `solana_executions.state` is the source of truth for WHERE IN THE
+# PIPELINE a transaction is; `live_trades.status` is the source of truth for
+# WHAT HAPPENED TO THE MONEY. This maps each state to the live_trades statuses
+# that can coherently accompany it — an empty tuple meaning "no money row may
+# exist yet", because nothing financial has happened.
+COHERENT_STATUSES: dict[str, tuple[str, ...]] = {
+    # Before authorization there is no money row at all.
+    STATE_QUOTE_CREATED: (),
+    STATE_TRANSACTION_BUILT: (),
+    STATE_SIMULATION_PASSED: (),
+    # The intent row is written just before the prompt, so from here a row
+    # exists and is 'open' — or 'rejected' if the run was refused.
+    STATE_AWAITING_AUTHORIZATION: ("open", "rejected"),
+    STATE_AUTHORIZED: ("open", "rejected"),
+    STATE_SIGNED: ("open", "rejected"),
+    STATE_SUBMISSION_ATTEMPTED: ("open", "rejected"),
+    STATE_LANDED: ("open",),
+    STATE_CONFIRMED: ("open",),
+    STATE_FINALIZED: ("open",),
+    # A reconciled swap leaves a REAL position. 'open' here means "this lane
+    # holds USDC", which is why it keeps blocking until the operator disposes
+    # of it — the execution being finished and the position being open are
+    # different facts, and conflating them is what this mapping prevents.
+    STATE_RECONCILED: ("open",),
+    # Nothing executed: the row asserts no position.
+    STATE_FAILED: ("rejected",),
+    # A transaction may exist and nobody knows. The money row must say so.
+    STATE_SUBMISSION_UNKNOWN: ("needs_manual_review", "open"),
+}
+
+
+class IncoherentLaneState(RuntimeError):
+    """The lifecycle axis and the money axis disagree."""
+
+
+def assert_coherent(state: str, status: str | None) -> None:
+    """Guard against the two axes drifting apart.
+
+    ``status=None`` means no live_trades row exists. That is REQUIRED before
+    authorization and forbidden after it — a signed transaction with no money
+    row would be unrecoverable, and a money row before the quote would be an
+    open position backed by nothing.
+    """
+    permitted = COHERENT_STATUSES.get(state)
+    if permitted is None:
+        raise IncoherentLaneState(f"{state!r} is not an execution state")
+    if status is None:
+        if permitted:
+            raise IncoherentLaneState(
+                f"state {state} requires a live_trades row (one of {permitted}), "
+                "but none exists"
+            )
+        return
+    if not permitted:
+        raise IncoherentLaneState(
+            f"state {state} must not have a live_trades row yet, but one exists "
+            f"with status {status!r} — that row would read as a position backed "
+            "by no trade"
+        )
+    if status not in permitted:
+        raise IncoherentLaneState(
+            f"state {state} is incoherent with live_trades.status {status!r}; "
+            f"expected one of {permitted}"
+        )
+
+
+def lane_is_blocked_by(state: str, status: str | None) -> str | None:
+    """Why this execution blocks a new one, or None if it does not.
+
+    Both axes can block, for different reasons, and naming which one did is
+    what keeps an operator from chasing the wrong table.
+    """
+    if state in BLOCKING_STATES:
+        return f"execution_state={state}"
+    if status == "open":
+        return "live_trades.status=open (a position is held)"
+    if status == "needs_manual_review":
+        return "live_trades.status=needs_manual_review"
+    return None
+
+
+# ----------------------------------------------------------------------
+# Operating modes
+# ----------------------------------------------------------------------
+# The whole spectrum the lane will ever run in. Moving between them is
+# CONFIGURATION: the same runner, adapter, signer, state machine, limits and
+# reconciliation serve all of them, and only the authorization policy differs
+# between supervised and autonomous.
+MODE_DISABLED = "DISABLED"
+MODE_SIMULATION_ONLY = "SIMULATION_ONLY"
+MODE_SUPERVISED_LIVE = "SUPERVISED_LIVE"
+MODE_BOUNDED_AUTONOMOUS = "BOUNDED_AUTONOMOUS"
+MODE_EMERGENCY_STOPPED = "EMERGENCY_STOPPED"
+
+ALL_MODES = (
+    MODE_DISABLED,
+    MODE_SIMULATION_ONLY,
+    MODE_SUPERVISED_LIVE,
+    MODE_BOUNDED_AUTONOMOUS,
+    MODE_EMERGENCY_STOPPED,
+)
+
+# Modes in which a transaction may actually be signed and broadcast. Named as
+# a set rather than tested inline so a future mode cannot become executing by
+# accident — adding one to this tuple is a deliberate, reviewable act.
+EXECUTING_MODES = (MODE_SUPERVISED_LIVE, MODE_BOUNDED_AUTONOMOUS)
+
+# Modes that refuse before anything is built. EMERGENCY_STOPPED is here rather
+# than treated as "disabled with a different name": it is the kill switch's
+# configuration-side twin and is checked in the same places, so an operator who
+# sets it gets the same refusal wherever the kill switch would have produced
+# one.
+REFUSING_MODES = (MODE_DISABLED, MODE_EMERGENCY_STOPPED)
+
+
+class LaneAbort(Exception):
     """A gate refused. Carries the evidence step name and the exit code."""
 
     def __init__(self, stage: str, reason: str, *, exit_code: int = EXIT_REFUSED):
@@ -265,11 +563,11 @@ class PilotAbort(Exception):
         self.exit_code = exit_code
 
 
-class PilotLockHeld(Exception):
-    """Another pilot process holds the lock. Carries the holder's record."""
+class LaneLockHeld(Exception):
+    """Another lane process holds the lock. Carries the holder's record."""
 
     def __init__(self, lock_path: Path, holder: str) -> None:
-        super().__init__(f"solana pilot lock held: {lock_path}")
+        super().__init__(f"solana lane lock held: {lock_path}")
         self.lock_path = lock_path
         self.holder = holder
 
@@ -277,19 +575,19 @@ class PilotLockHeld(Exception):
 # ----------------------------------------------------------------------
 # Single-process lock
 # ----------------------------------------------------------------------
-def pilot_lock_path(db_path: str | Path) -> Path:
-    """Lock file for the Solana pilot lane, beside the database it guards.
+def lane_lock_path(db_path: str | Path) -> Path:
+    """Lock file for the Solana lane, beside the database it guards.
 
     Distinct from the Kraken pilot's lock: the two lanes hold different assets
     at different venues, and neither's envelope bounds the other's exposure.
     """
-    return Path(f"{db_path}.solana_pilot.lock")
+    return Path(f"{db_path}.solana_lane.lock")
 
 
-def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
-    """Take the Solana pilot lane's exclusive lock, or raise ``PilotLockHeld``.
+def acquire_lane_lock(db_path: str | Path) -> tuple[int, Path]:
+    """Take the Solana lane's exclusive lock, or raise ``LaneLockHeld``.
 
-    Two pilot runs in two terminals are two swaps: each passes its own
+    Two lane runs in two terminals are two swaps: each passes its own
     one-at-a-time check before either writes a ledger row, so the in-process
     check cannot see the other. ``O_CREAT | O_EXCL`` is the filesystem's
     atomic test-and-set, which closes the window at the only point the two
@@ -301,7 +599,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
     auto-break would step straight past that. The operator is told the PID and
     the file to delete.
     """
-    lock_path = pilot_lock_path(db_path)
+    lock_path = lane_lock_path(db_path)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
@@ -309,7 +607,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
             holder = lock_path.read_text(encoding="utf-8").strip()
         except OSError:
             holder = "(unreadable)"
-        raise PilotLockHeld(lock_path, holder or "(empty)") from exc
+        raise LaneLockHeld(lock_path, holder or "(empty)") from exc
     os.write(
         fd,
         f"pid={os.getpid()} acquired_at={datetime.now(timezone.utc).isoformat()}\n".encode(),
@@ -317,7 +615,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
     return fd, lock_path
 
 
-def release_pilot_lock(fd: int, lock_path: Path) -> None:
+def release_lane_lock(fd: int, lock_path: Path) -> None:
     """Close and remove the lock. Safe to call on a partially-taken lock."""
     try:
         os.close(fd)
@@ -326,7 +624,7 @@ def release_pilot_lock(fd: int, lock_path: Path) -> None:
     try:
         lock_path.unlink()
     except OSError:
-        log.warning("solana_pilot_lock_not_removed", lock_path=str(lock_path))
+        log.warning("solana_lane_lock_not_removed", lock_path=str(lock_path))
 
 
 # ----------------------------------------------------------------------
@@ -352,7 +650,7 @@ def _scrub(value: Any) -> Any:
 
 
 class EvidenceLog:
-    """Append-only JSON-Lines evidence file for one pilot decision.
+    """Append-only JSON-Lines evidence file for one lane decision.
 
     One object per step, flushed and fsynced before ``record`` returns, with
     the handle opened and closed per record. A crash mid-run therefore keeps
@@ -377,7 +675,7 @@ class EvidenceLog:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        log.info("solana_pilot_step", step=step, **_scrub(fields))
+        log.info("solana_lane_step", step=step, **_scrub(fields))
         return entry
 
 
@@ -396,7 +694,7 @@ def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
     raw = (settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip()
     if not raw:
         raise SolanaKeypairError(
-            "SOLANA_PILOT_KEYPAIR_PATH is unset. The Solana pilot refuses to "
+            "SOLANA_PILOT_KEYPAIR_PATH is unset. The Solana lane refuses to "
             "run without an explicitly configured key file."
         )
     resolved = Path(raw)
@@ -409,7 +707,7 @@ def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
         raise SolanaKeypairError(
             "refusing to use a signing key on a non-POSIX platform: key-file "
             "permissions and ownership cannot be verified. Run the Solana "
-            "pilot on the Linux host."
+            "lane on the Linux host."
         )
     info = resolved.stat()
     enforce_keyfile_security(
@@ -466,6 +764,19 @@ def keyfile_public_half(settings: Settings) -> tuple[str | None, str]:
         return None, f"public half does not encode ({type(exc).__name__})"
 
 
+def unpinned_resolver_urls(settings: Settings) -> list[str]:
+    """Configured resolver endpoints that sit behind a known load balancer.
+
+    Returned as REDACTED labels — the caller puts these in refusal messages
+    and evidence files, and a provider URL carries its API key.
+    """
+    return [
+        redact_endpoint(url)
+        for url in resolver_urls(settings)
+        if any(host in url.lower() for host in _ROUND_ROBIN_RPC_HOSTS)
+    ]
+
+
 def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     """The URL the §7 resolver reads from, and whether it is safely PINNED.
 
@@ -479,19 +790,20 @@ def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     transaction that is still in flight, and the operator would rerun: two
     swaps against one authorization.
 
-    So the endpoint has to be one consistent node. ``SOLANA_RESOLVER_RPC_URL``
-    names it; when unset the main RPC URL is used, but only if that is not
-    itself a known round-robin.
+    So every endpoint has to be one consistent node.
+    ``SOLANA_RESOLVER_RPC_URLS`` names the pool and ``SOLANA_RESOLVER_RPC_URL``
+    the single deployed one; when neither is set the main RPC URL is used, but
+    only if that is not itself a known round-robin.
 
-    Returns ``(url, pinned)``. Callers that are about to act irreversibly on a
+    Returns ``(primary_url, pinned)``. ``pinned`` is an ALL-endpoint property:
+    one load-balanced member of the pool is enough to manufacture a false
+    verdict, because selection is by signature and every endpoint eventually
+    serves a resolution. Callers that are about to act irreversibly on a
     verdict must refuse when ``pinned`` is False; callers that only REPORT a
     verdict may proceed and say the reading is degraded.
     """
-    configured = (settings.SOLANA_RESOLVER_RPC_URL or "").strip()
-    url = configured or settings.SOLANA_RPC_URL
-    lowered = url.lower()
-    pinned = not any(host in lowered for host in _ROUND_ROBIN_RPC_HOSTS)
-    return url, pinned
+    urls = resolver_urls(settings)
+    return urls[0], not unpinned_resolver_urls(settings)
 
 
 @dataclass(frozen=True)
@@ -545,6 +857,7 @@ def apply_age_policy(
     age_seconds: float | None,
     settings: Settings,
     had_evidence_height: bool,
+    pool_downgrade: str | None = None,
 ) -> LaneVerdict:
     """Decide what the lane may act on, given the cluster's verdict and the age.
 
@@ -574,12 +887,24 @@ def apply_age_policy(
     age. Those come from the cluster HAVING the signature, which is positive
     evidence — the history window bounds what absence means, not what presence
     means.
+
+    ``pool_downgrade`` is the resolver pool's refusal (a split view across
+    endpoints, or a corroborating endpoint that disagreed) and it is FINAL.
+    Without it the age rule below would happily re-derive the definitive
+    verdict the pool just refused, from the same probes the pool refused to
+    trust — the age rule reads absence off the probe trail, and the pool's
+    objection is about what those probes are worth.
     """
     min_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC)
     max_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC)
 
     if report.verdict in ("landed", "failed_on_chain"):
         return LaneVerdict(verdict=report.verdict, age_seconds=age_seconds)
+
+    if pool_downgrade is not None:
+        return LaneVerdict(
+            verdict="unresolved", reason=pool_downgrade, age_seconds=age_seconds
+        )
 
     if age_seconds is not None and age_seconds > max_sec:
         return LaneVerdict(
@@ -615,7 +940,7 @@ def apply_age_policy(
 
 def evidence_path_for(evidence_dir: str | Path, decision_id: str) -> Path:
     """Evidence file for one decision. One naming rule, one call site each."""
-    return Path(evidence_dir) / f"solana_pilot_{decision_id}.json"
+    return Path(evidence_dir) / f"solana_lane_{decision_id}.json"
 
 
 def read_persisted_intent(
@@ -719,8 +1044,8 @@ def quote_price_impact_pct(quote: SolanaQuote) -> Decimal:
 # ----------------------------------------------------------------------
 # Ledger helpers
 # ----------------------------------------------------------------------
-async def ensure_pilot_anchor(db: Database) -> int:
-    """Return the pilot anchor ``paper_trades.id``, creating it if absent.
+async def ensure_lane_anchor(db: Database) -> int:
+    """Return the lane anchor ``paper_trades.id``, creating it if absent.
 
     See the module docstring for why the anchor exists and why its status /
     opened_at are what they are. Idempotent: the natural key is
@@ -742,7 +1067,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
 
     signal_data = json.dumps(
         {
-            "note": "Anchor row for scout.live.solana_pilot. Not a trade.",
+            "note": "Anchor row for scout.live.solana_lane. Not a trade.",
             "why": "live_trades.paper_trade_id is NOT NULL REFERENCES "
             "paper_trades(id) and the supervised swap has no signal behind it.",
         }
@@ -754,7 +1079,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
                    (token_id, symbol, name, chain, signal_type, signal_data,
                     entry_price, amount_usd, quantity, tp_price, sl_price,
                     status, opened_at)
-                   VALUES (?, 'SOLANA-PILOT', 'Solana supervised pilot anchor',
+                   VALUES (?, 'SOLANA-LANE', 'Solana DEX lane anchor',
                            'solana', ?, ?, 0, 0, 0, 0, 0, ?, ?)""",
                 (
                     _ANCHOR_TOKEN_ID,
@@ -766,7 +1091,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
             )
             await db._conn.commit()
             anchor_id = int(cur.lastrowid or 0)
-        log.info("solana_pilot_anchor_created", paper_trade_id=anchor_id)
+        log.info("solana_lane_anchor_created", paper_trade_id=anchor_id)
         return anchor_id
     except sqlite3.IntegrityError:
         # Lost the race on the natural key — the other creator's row is the
@@ -880,6 +1205,146 @@ async def persist_expected_signature(
     return str(stored)
 
 
+_EXECUTION_COLUMNS = (
+    "decision_id, state, mode, live_trade_id, message_sha256, "
+    "expected_signature, last_valid_block_height, amount_lamports, "
+    "minimum_out_raw, detail, created_at, updated_at"
+)
+
+
+def _execution_row(row: Any) -> dict[str, Any]:
+    keys = [c.strip() for c in _EXECUTION_COLUMNS.split(",")]
+    record = {key: row[i] for i, key in enumerate(keys)}
+    raw = record.get("detail")
+    try:
+        record["detail"] = json.loads(raw) if raw else {}
+    except ValueError:
+        record["detail"] = {"unparseable": True}
+    return record
+
+
+async def load_execution(db: Database, decision_id: str) -> dict[str, Any] | None:
+    """The durable execution record, or None if this run never started."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        f"SELECT {_EXECUTION_COLUMNS} FROM solana_executions WHERE decision_id = ?",
+        (decision_id,),
+    )
+    row = await cur.fetchone()
+    return None if row is None else _execution_row(row)
+
+
+async def record_execution_state(
+    db: Database,
+    decision_id: str,
+    state: str,
+    *,
+    mode: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    """Move an execution to ``state``, durably, or refuse.
+
+    Every write goes through ``assert_legal_transition``, so an illegal jump
+    raises here rather than becoming a row a later reader has to interpret.
+    The row is upserted on ``decision_id``: one execution, one row, updated in
+    place, so recovery reads a single current state rather than replaying a
+    log and hoping it is complete.
+
+    Fields already recorded are never overwritten with NULL. A later step
+    knows less about the earlier ones than the earlier ones did — the
+    signature is written once and must survive every subsequent transition.
+    """
+    if db._conn is None or db._txn_lock is None:
+        raise RuntimeError("Database not initialized.")
+
+    existing = await load_execution(db, decision_id)
+    assert_legal_transition(None if existing is None else existing["state"], state)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    carried = {
+        "live_trade_id": None,
+        "message_sha256": None,
+        "expected_signature": None,
+        "last_valid_block_height": None,
+        "amount_lamports": None,
+        "minimum_out_raw": None,
+    }
+    if existing is not None:
+        for key in carried:
+            carried[key] = existing.get(key)
+    for key, value in fields.items():
+        if key in carried and value is not None:
+            carried[key] = value
+
+    detail = fields.get("detail")
+    detail_json = json.dumps(_scrub(detail)) if detail else None
+    if detail_json is None and existing is not None and existing.get("detail"):
+        detail_json = json.dumps(existing["detail"])
+
+    async with db._txn_lock:
+        await db._conn.execute(
+            """INSERT INTO solana_executions
+                 (decision_id, state, mode, live_trade_id, message_sha256,
+                  expected_signature, last_valid_block_height, amount_lamports,
+                  minimum_out_raw, detail, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(decision_id) DO UPDATE SET
+                 state = excluded.state,
+                 mode = excluded.mode,
+                 live_trade_id = excluded.live_trade_id,
+                 message_sha256 = excluded.message_sha256,
+                 expected_signature = excluded.expected_signature,
+                 last_valid_block_height = excluded.last_valid_block_height,
+                 amount_lamports = excluded.amount_lamports,
+                 minimum_out_raw = excluded.minimum_out_raw,
+                 detail = excluded.detail,
+                 updated_at = excluded.updated_at""",
+            (
+                decision_id,
+                state,
+                mode,
+                carried["live_trade_id"],
+                carried["message_sha256"],
+                carried["expected_signature"],
+                carried["last_valid_block_height"],
+                carried["amount_lamports"],
+                carried["minimum_out_raw"],
+                detail_json,
+                (existing or {}).get("created_at") or now_iso,
+                now_iso,
+            ),
+        )
+        await db._conn.commit()
+
+    log.info(
+        "solana_lane_state",
+        decision_id=decision_id,
+        state=state,
+        mode=mode,
+        recovery=recovery_disposition(state),
+    )
+    return await load_execution(db, decision_id) or {}
+
+
+async def fetch_recoverable_executions(db: Database) -> list[dict[str, Any]]:
+    """Executions a restart must decide about, oldest first.
+
+    Terminal states are excluded because there is nothing left to decide. What
+    comes back is exactly the set of runs that were interrupted, each carrying
+    the state that says whether anything was sent.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    cur = await db._conn.execute(
+        f"SELECT {_EXECUTION_COLUMNS} FROM solana_executions "
+        f"WHERE state NOT IN ({placeholders}) ORDER BY created_at",
+        TERMINAL_STATES,
+    )
+    return [_execution_row(row) for row in await cur.fetchall()]
+
+
 async def update_live_trade(db: Database, live_trade_id: int, **columns: Any) -> None:
     """UPDATE one ``live_trades`` row under ``db._txn_lock``.
 
@@ -932,6 +1397,80 @@ async def fetch_blocking_rows(db: Database) -> list[dict[str, Any]]:
         (VENUE, *_BLOCKING_STATUSES),
     )
     return [_row_dict(r) for r in await cur.fetchall()]
+
+
+async def count_supervised_reconciled(db: Database) -> int:
+    """Executions that reached ``reconciled`` under SUPERVISED_LIVE.
+
+    The bounded-autonomy precondition a flag cannot fake. ``reconciled`` and
+    not merely ``finalized``: a swap that landed but whose accounting could not
+    be explained is exactly the history that should NOT count toward promoting
+    the lane, and the state machine already refuses to advance such a run past
+    ``finalized``.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM solana_executions WHERE state = ? AND mode = ?",
+        (STATE_RECONCILED, MODE_SUPERVISED_LIVE),
+    )
+    return int((await cur.fetchone())[0])
+
+
+async def fetch_lane_exposure(
+    db: Database, settings: Settings, *, now: datetime | None = None
+) -> LaneExposure:
+    """What the lane already has on, for the concurrency and daily limits.
+
+    Three numbers, all read from the two tables that already exist:
+
+    * open positions — ``live_trades.status='open'`` for this venue;
+    * executions in flight — non-terminal ``solana_executions`` rows;
+    * notional authorized today — summed from the same ledger rows.
+
+    The notional query is bounded to the last two days rather than scanning
+    the table: every writer in this lane stamps ``created_at`` with
+    ``datetime.now(timezone.utc).isoformat()``, so a lexicographic bound on
+    that column is a real time bound. Two days rather than one because the
+    boundary is a UTC date and the string bound is a timestamp — the extra day
+    is slack, and ``notional_usd_today`` does the actual date filtering.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    reference = now or datetime.now(timezone.utc)
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM live_trades WHERE venue = ? AND status = 'open'",
+        (VENUE,),
+    )
+    open_positions = int((await cur.fetchone())[0])
+
+    placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    cur = await db._conn.execute(
+        f"SELECT COUNT(*) FROM solana_executions WHERE state NOT IN ({placeholders})",
+        TERMINAL_STATES,
+    )
+    active_executions = int((await cur.fetchone())[0])
+
+    since = (reference - timedelta(days=2)).isoformat()
+    cur = await db._conn.execute(
+        "SELECT size_usd, created_at FROM live_trades "
+        "WHERE venue = ? AND status != 'rejected' AND created_at >= ?",
+        (VENUE, since),
+    )
+    rows = await cur.fetchall()
+    return LaneExposure(
+        open_positions=open_positions,
+        active_executions=active_executions,
+        notional_usd_today=notional_usd_today(
+            [(r[0], r[1]) for r in rows],
+            # A row whose size will not parse is counted at the per-trade
+            # maximum: the largest it could legitimately have been. Bad data
+            # must never widen the cap.
+            unreadable_size_usd=_dec(settings.SOLANA_PILOT_MAX_ORDER_USD),
+            now=reference,
+        ),
+    )
 
 
 async def fetch_row_by_decision_id(
@@ -994,6 +1533,141 @@ def read_authorization(expected: str) -> tuple[bool, str]:
     return True, "authorized"
 
 
+@dataclass(frozen=True)
+class AuthorizationRequest:
+    """Everything an authorization policy is allowed to see.
+
+    Assembled once by the runner and handed to whichever policy is in force,
+    so a supervised run and an autonomous one are deciding on IDENTICAL facts.
+    A policy that needed extra context would be a policy making a different
+    decision, and that is exactly what this type exists to prevent.
+    """
+
+    decision_id: str
+    mode: str
+    message_sha256: str
+    signer_pubkey: str
+    amount_lamports: int
+    quoted_out_raw: int
+    minimum_out_raw: int
+    slippage_bps: int
+    price_impact_pct: Decimal
+    total_fee_lamports: int
+    last_valid_block_height: int
+    render: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class AuthorizationDecision:
+    """The verdict, plus how it was reached.
+
+    ``method`` is recorded in the evidence for every run, so an auditor reading
+    a pack can always tell whether a human typed the phrase or a policy
+    approved it — without inferring it from the mode.
+    """
+
+    authorized: bool
+    outcome: str
+    method: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+class AuthorizationPolicy:
+    """How this lane decides that a transaction may be signed.
+
+    THE seam between supervised and bounded-autonomous operation, and
+    deliberately the ONLY one. Everything else — quoting, building, inspection,
+    simulation, limits, signing, submission, reconciliation, evidence — is
+    identical in both, so promoting the lane cannot quietly change what a trade
+    is allowed to be. It changes only who says yes.
+    """
+
+    method = "undefined"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        raise NotImplementedError
+
+
+class TypedOperatorAuthorization(AuthorizationPolicy):
+    """SUPERVISED_LIVE and SIMULATION_ONLY: a human types the phrase.
+
+    Renders the decision screen, then requires the first 8 characters of the
+    transaction message hash. No signature exists yet and none may — the funded
+    key is not read until this returns an authorized decision.
+    """
+
+    method = "typed_operator_authorization"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        await request.render()
+        print(
+            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
+            "Anything else — including an empty line or a closed stdin — aborts. "
+            "The phrase is lowercase hex and is matched exactly."
+        )
+        authorized, outcome = read_authorization(request.message_sha256[:8])
+        return AuthorizationDecision(
+            authorized=authorized,
+            outcome=outcome,
+            method=self.method,
+            detail={"expected_prefix_len": 8, "prompted": True},
+        )
+
+
+class BoundedAutonomousAuthorization(AuthorizationPolicy):
+    """BOUNDED_AUTONOMOUS: a policy check substitutes for the typed phrase.
+
+    It substitutes for the PROMPT and nothing else. Every limit the supervised
+    path enforces has already run by the time this is asked — the request it
+    receives is the same object the operator would have been shown — so this
+    cannot widen what a trade may be, only decide that no human needs to
+    confirm this particular one.
+
+    The preconditions are checked by the runner before the mode is honoured at
+    all (see ``_check_autonomy_preconditions``); reaching this object already
+    means the lane was permitted to be autonomous.
+
+    *** THIS POLICY REFUSES BY CONSTRUCTION, AND THAT IS THE CURRENT STATE. ***
+    The execution ARCHITECTURE supports bounded autonomy today: the limits
+    engine never sees the mode, there is one authorization call site rather
+    than a second code path, and the preconditions are enforced against the
+    ledger. What does not exist is the per-trade DECISION — the thing that
+    would answer "should this specific swap happen without a human". That is
+    deliberate and it is not an oversight to be tidied up later: there is no
+    signal path into this lane, so there is nothing for such a policy to
+    decide ON, and inventing a trading decision nobody specified would be the
+    second architecture this design exists to avoid.
+
+    So ``authorize`` returns False unconditionally. A future policy replaces
+    THIS METHOD and nothing else — that is the measure of whether the seam
+    works. Anyone reading this after the lane goes live should take the
+    refusal at face value: the mode is reachable, the envelope is real, and
+    the decision is absent.
+    """
+
+    method = "bounded_autonomous_policy"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        return AuthorizationDecision(
+            authorized=False,
+            outcome="autonomous_policy_not_implemented",
+            method=self.method,
+            detail={
+                "prompted": False,
+                "note": "the execution architecture supports autonomy, but no "
+                "per-trade decision policy exists — there is no signal path "
+                "into this lane for one to decide on. Refuses by construction.",
+            },
+        )
+
+
+def authorization_policy_for(mode: str) -> AuthorizationPolicy:
+    """The policy that governs a mode. One mapping, one place."""
+    if mode == MODE_BOUNDED_AUTONOMOUS:
+        return BoundedAutonomousAuthorization()
+    return TypedOperatorAuthorization()
+
+
 def _print_block(title: str, lines: list[str]) -> None:
     bar = "=" * 68
     print(bar)
@@ -1007,8 +1681,8 @@ def _print_block(title: str, lines: list[str]) -> None:
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
-class PilotRunner:
-    """One supervised Solana pilot invocation.
+class LaneRunner:
+    """One Solana DEX lane invocation.
 
     Constructed with everything it needs so tests can drive it against a
     tmp_path DB and mocked venues; ``main`` wires the production instance.
@@ -1033,6 +1707,7 @@ class PilotRunner:
         keypair_loader: Callable[[], Keypair] | None = None,
         custody_prober: Callable[[], dict[str, Any]] | None = None,
         resolver_rpc: SolanaRpcClient | None = None,
+        resolver_pool: ResolverPool | None = None,
     ) -> None:
         self._settings = settings
         self._db = db
@@ -1049,11 +1724,33 @@ class PilotRunner:
         self._probe_custody = custody_prober or (
             lambda: probe_keyfile_custody(settings)
         )
-        # Both sweeps of every resolution read from THIS client, which must be
-        # bound to one consistent node — see ``resolver_endpoint``. Defaults to
+        # ONE envelope, built from Settings and never from the mode. Every
+        # limit the lane enforces is in here, which is what makes
+        # BOUNDED_AUTONOMOUS a policy change rather than a second envelope.
+        self._limits = LimitsEngine(settings)
+        # Both sweeps of every resolution read from ONE endpoint, which must be
+        # a single consistent node — see ``resolver_endpoint``. Defaults to
         # the main client so a test (or a deployment whose single RPC is
         # already dedicated) needs no second wiring.
         self._resolver_rpc = resolver_rpc or rpc
+        # Every resolution goes through the pool, including the one-endpoint
+        # case. A single code path means the multi-endpoint behaviour is the
+        # one that has been exercised by the time a second endpoint is added —
+        # the alternative is a standby path that first runs during an incident.
+        #
+        # The fallback pool's label comes from the CLIENT's own url rather than
+        # from config, because a caller that injects a resolver client can make
+        # the two differ, and an endpoint labelled as something it does not
+        # read from is worse than an unlabelled one.
+        self._pool = resolver_pool or ResolverPool.from_clients(
+            settings,
+            [
+                (
+                    getattr(self._resolver_rpc, "url", settings.SOLANA_RPC_URL),
+                    self._resolver_rpc,
+                )
+            ],
+        )
 
     # ---------------- shared gates ----------------
     def _evidence_for(self, decision_id: str) -> EvidenceLog:
@@ -1061,23 +1758,36 @@ class PilotRunner:
             evidence_path_for(self._settings.SOLANA_PILOT_EVIDENCE_DIR, decision_id)
         )
 
-    def _check_envelope(self, *, simulate_only: bool) -> dict[str, Any]:
-        """Step 1 — the pilot is enabled, a key is configured, hosts are mainnet."""
-        if not self._settings.SOLANA_PILOT_ENABLED:
-            raise PilotAbort(
+    async def _check_envelope(self, *, mode: str) -> dict[str, Any]:
+        """Step 1 — the lane is enabled, a key is configured, hosts are mainnet."""
+        if mode not in ALL_MODES:
+            raise LaneAbort(
                 "envelope_gate",
-                "SOLANA_PILOT_ENABLED is False — the pilot lane is off. Set it "
-                "in .env only for the supervised session.",
+                f"SOLANA_MODE={mode!r} is not a recognised mode. One of: "
+                f"{', '.join(ALL_MODES)}.",
             )
+        if mode == MODE_DISABLED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is DISABLED — the lane is off. Set it to SIMULATION_ONLY to rehearse, or SUPERVISED_LIVE for a supervised trade.",
+            )
+        if mode == MODE_EMERGENCY_STOPPED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is EMERGENCY_STOPPED — every execution path is refused. This is the configuration-side twin of the kill switch; clear it deliberately, and only once the reason it was set is understood.",
+            )
+        autonomy: dict[str, Any] | None = None
+        if mode == MODE_BOUNDED_AUTONOMOUS:
+            autonomy = await self._check_autonomy_preconditions()
         if not (self._settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip():
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 "SOLANA_PILOT_KEYPAIR_PATH is empty — name the id.json holding "
-                "the ONE approved pilot key before running the pilot.",
+                "the ONE approved lane key before running the lane.",
             )
         declared = (self._settings.SOLANA_PILOT_SIGNER_PUBKEY or "").strip()
         if not declared:
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 "SOLANA_PILOT_SIGNER_PUBKEY is empty — declare the wallet's "
                 "PUBLIC key. Everything before the approval prompt is built "
@@ -1086,7 +1796,7 @@ class PilotRunner:
         try:
             Pubkey.from_string(declared)
         except Exception as exc:
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 f"SOLANA_PILOT_SIGNER_PUBKEY is not a valid base58 public key "
                 f"({type(exc).__name__}). A malformed signer would surface as "
@@ -1098,7 +1808,7 @@ class PilotRunner:
             url = str(getattr(self._settings, field, "")).lower()
             hit = next((m for m in _NON_MAINNET_MARKERS if m in url), None)
             if hit is not None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "envelope_gate",
                     f"{field} points at a non-mainnet host (contains {hit!r}). "
                     "The approved envelope is mainnet only.",
@@ -1115,47 +1825,267 @@ class PilotRunner:
         # operator is told instead, because a rehearsal that passed on an
         # unpinned resolver must not read as a launch-ready lane.
         resolver_url, pinned = resolver_endpoint(self._settings)
-        if not pinned and not simulate_only:
-            raise PilotAbort(
+        unpinned = unpinned_resolver_urls(self._settings)
+        if not pinned and mode in EXECUTING_MODES:
+            raise LaneAbort(
                 "envelope_gate",
-                f"the resolver would read from {resolver_url}, which is a "
-                "load-balanced public endpoint. Two calls can land on two "
-                "nodes, and a node that is ahead on block height while missing "
-                "the signature manufactures a false "
+                f"the resolver pool contains {len(unpinned)} load-balanced "
+                f"public endpoint(s) ({', '.join(unpinned)}). Two calls can land "
+                "on two nodes, and a node that is ahead on block height while "
+                "missing the signature manufactures a false "
                 "'definitively_not_submitted' — which clears the lane and "
-                "invites a rerun of a swap that is still in flight. Set "
-                "SOLANA_RESOLVER_RPC_URL to a single dedicated node.",
+                "invites a rerun of a swap that is still in flight. Every "
+                "endpoint in SOLANA_RESOLVER_RPC_URLS (or the single "
+                "SOLANA_RESOLVER_RPC_URL) must be a dedicated node.",
             )
         if not pinned:
             print(
                 "NOTICE: resolver endpoint is NOT pinned "
-                f"({resolver_url}); a real placement will refuse until "
-                "SOLANA_RESOLVER_RPC_URL names a dedicated node. This "
+                f"({', '.join(unpinned)}); a real placement will refuse until "
+                "every resolver endpoint is a dedicated node. This "
                 "rehearsal proceeds because it never submits."
             )
         return {
-            "pilot_enabled": True,
             "keypair_path_configured": True,
             "declared_signer_pubkey": declared,
             "input_mint": SOL_MINT,
             "output_mint": USDC_MINT,
-            "rpc_url": self._settings.SOLANA_RPC_URL,
-            "resolver_rpc_url": resolver_url,
+            # Labels, never URLs. The deployment's RPC endpoints carry their
+            # API key in the path, and the evidence file is durable, copied
+            # into review packages and read by people who are not the operator.
+            "rpc_url": redact_endpoint(self._settings.SOLANA_RPC_URL),
+            "resolver_rpc_url": redact_endpoint(resolver_url),
+            "resolver_endpoints": list(self._pool.labels),
+            "resolver_endpoint_count": self._pool.size,
             "resolver_endpoint_pinned": pinned,
             # True only on a rehearsal that would have been refused. Recorded
             # so an evidence pack can never be mistaken for one produced under
             # the full envelope.
-            "resolver_pin_waived_for_rehearsal": simulate_only and not pinned,
+            "resolver_pin_waived_for_rehearsal": (
+                mode not in EXECUTING_MODES and not pinned
+            ),
             "block_engine_url": self._settings.JITO_BLOCK_ENGINE_URL,
-            "simulate_only": simulate_only,
+            "mode": mode,
+            "will_execute": mode in EXECUTING_MODES,
+            "authorization_method": authorization_policy_for(mode).method,
+            "autonomy_preconditions": autonomy,
+            "limits": self._limits.declared_limits(),
         }
+
+    async def _check_resolver_pool(
+        self, *, mode: str, evidence: EvidenceLog
+    ) -> dict[str, Any]:
+        """Prove every resolver endpoint is on mainnet-beta and caught up.
+
+        The host-substring checks in the envelope gate are a typo guard: they
+        catch ``devnet`` in a URL an operator pasted. This is the actual proof,
+        and it is a different question — a mainnet-looking URL can serve a
+        devnet node, a fork, or a node twenty thousand slots behind, and all
+        three answer "absent" to signatures that exist. That answer is one half
+        of the only verdict that clears the lane.
+
+        Runs BEFORE startup reconciliation, because reconciliation is the first
+        thing that reads a verdict off these endpoints.
+
+        Refusal is scoped to executing modes and to the whole pool being
+        unusable. One bad endpoint out of several is EXCLUDED, not fatal —
+        degrading to fewer endpoints is the pool working, and refusing to trade
+        because a spare is down would make adding a spare a liability.
+        """
+        health = await self._pool.check_health()
+        usable = [entry for entry in health if entry.usable]
+        detail = {
+            "endpoints": [entry.as_evidence() for entry in health],
+            "usable_count": len(usable),
+            "configured_count": len(health),
+            "expected_genesis": SOLANA_MAINNET_GENESIS_HASH,
+        }
+        # Recorded BEFORE the refusal decision. The run that gets refused here
+        # is the one whose per-endpoint findings an operator most needs, and an
+        # abort reason is a sentence where this is a structured record.
+        evidence.record("resolver_pool", **detail)
+        if usable:
+            return detail
+
+        reasons = "; ".join(f"{e.label}: {e.detail}" for e in health)
+        if mode in EXECUTING_MODES:
+            raise LaneAbort(
+                "resolver_pool",
+                "no resolver endpoint proved it is on Solana mainnet-beta and "
+                f"caught up ({reasons}). A swap that cannot be RESOLVED "
+                "afterwards has no recovery path, so the lane refuses before "
+                "building one.",
+            )
+        print(
+            "NOTICE: no resolver endpoint passed the genesis/health check "
+            f"({reasons}). A real placement will refuse; this rehearsal "
+            "proceeds because it never submits."
+        )
+        return detail
+
+    async def _resolve(
+        self,
+        *,
+        signature: str,
+        last_valid_block_height: int | None,
+        owner_pubkey: str | None = None,
+    ) -> PoolResolution:
+        """Every resolution in this module goes through here.
+
+        One call site for the pool means the split-view and corroboration rules
+        cannot be applied on one path and forgotten on another — and forgetting
+        them on the ambiguity path, which is the one that runs with a
+        transaction possibly in flight, would be the expensive place to do it.
+        """
+        return await resolve_with_pool(
+            pool=self._pool,
+            expected_signature=signature,
+            last_valid_block_height=last_valid_block_height,
+            settings=self._settings,
+            owner_pubkey=owner_pubkey,
+        )
+
+    async def _state(
+        self, decision_id: str, state: str, *, mode: str, **fields: Any
+    ) -> None:
+        """Record a durable transition. Executing modes only.
+
+        A rehearsal writes no execution row on purpose. It has nothing to
+        recover — it never signs and never submits — and a row from it would
+        have to satisfy the lifecycle/money coherence rules without any money
+        row to satisfy them with. Recovery is about transactions that might
+        exist; rehearsals are exactly the runs where none can.
+        """
+        if mode not in EXECUTING_MODES:
+            return
+        await record_execution_state(self._db, decision_id, state, mode=mode, **fields)
+
+    async def _recover_interrupted_executions(self) -> dict[str, Any]:
+        """What earlier runs left behind, and what may be done about it.
+
+        Read at the top of every placement. The disposition comes from the
+        STATE, not from guessing: before submission nothing was sent, so the
+        run is abandoned and the lane stays clear; at or after submission a
+        transaction may exist and the lane blocks until the resolver settles
+        it. Nothing here rebuilds or resubmits — there is no code path from a
+        recovered row back to signing.
+        """
+        rows = await fetch_recoverable_executions(self._db)
+        recovered: list[dict[str, Any]] = []
+        blockers = 0
+        for row in rows:
+            disposition = recovery_disposition(row["state"])
+            entry = {
+                "decision_id": row["decision_id"],
+                "state": row["state"],
+                "disposition": disposition,
+                "expected_signature": row["expected_signature"],
+                "live_trade_id": row["live_trade_id"],
+            }
+            if disposition == "discard":
+                # Provably nothing was sent. Retire the run so a crash at the
+                # prompt does not wedge the lane forever.
+                await record_execution_state(
+                    self._db,
+                    row["decision_id"],
+                    STATE_FAILED,
+                    mode=row["mode"],
+                    detail={"reason": "interrupted before submission"},
+                )
+                await retire_row(self._db, row["live_trade_id"])
+                entry["action"] = "abandoned"
+            else:
+                entry["action"] = "blocks"
+                blockers += 1
+            recovered.append(entry)
+        return {"executions": recovered, "blockers": blockers}
+
+    async def _check_autonomy_preconditions(self) -> dict[str, Any]:
+        """BOUNDED_AUTONOMOUS cannot be reached by setting one value.
+
+        *** THE TRANSITION IS MECHANICAL, NOT A CHECKLIST. ***
+        Three preconditions, and each one is verified against something that
+        cannot be asserted by editing a single line:
+
+        1. **The mode.** Necessary, never sufficient.
+        2. **A second explicit flag.** ``SOLANA_BOUNDED_AUTONOMOUS_ENABLED``, so
+           promotion takes two deliberate acts in two places.
+        3. **Recorded supervised history.** N executions that actually reached
+           ``reconciled`` under ``SUPERVISED_LIVE``, counted from
+           ``solana_executions``. This is the one a flag cannot fake: "we did
+           the supervised trades" is a claim the database settles, and a lane
+           that has never completed one under a human cannot promote itself by
+           configuration alone.
+
+        Every failure names what is missing and what would satisfy it, because
+        a refusal an operator cannot act on invites working around the gate.
+        """
+        settings = self._settings
+        detail: dict[str, Any] = {"mode": MODE_BOUNDED_AUTONOMOUS}
+
+        if not settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is BOUNDED_AUTONOMOUS but "
+                "SOLANA_BOUNDED_AUTONOMOUS_ENABLED is False. The mode alone "
+                "does not start autonomous execution — that takes two "
+                "deliberate settings, on purpose.",
+            )
+        detail["enable_flag"] = True
+
+        required = int(settings.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS)
+        completed = await count_supervised_reconciled(self._db)
+        detail["supervised_reconciled"] = completed
+        detail["supervised_required"] = required
+        if completed < required:
+            raise LaneAbort(
+                "envelope_gate",
+                f"BOUNDED_AUTONOMOUS requires {required} completed supervised "
+                f"execution(s) recorded in solana_executions; there "
+                f"{'is' if completed == 1 else 'are'} {completed}. Run the lane "
+                "under SUPERVISED_LIVE until that many have reached the "
+                "'reconciled' state. This is counted from the ledger and cannot "
+                "be satisfied by configuration.",
+            )
+
+        # The envelope has to be CONFIGURED, not merely defaulted-into. An
+        # autonomous lane running on whatever the caps happened to be is the
+        # failure this precondition exists to prevent, so the limits that bound
+        # a runaway are required to be present and finite.
+        envelope = self._limits.declared_limits()
+        missing = [
+            name
+            for name, value in (
+                ("daily_notional_usd", settings.SOLANA_MAX_DAILY_NOTIONAL_USD),
+                ("max_open_positions", settings.SOLANA_MAX_OPEN_POSITIONS),
+                (
+                    "max_concurrent_executions",
+                    settings.SOLANA_MAX_CONCURRENT_EXECUTIONS,
+                ),
+                ("per_trade_max_usd", settings.SOLANA_PILOT_MAX_ORDER_USD),
+                (
+                    "max_total_fee_lamports",
+                    settings.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS,
+                ),
+            )
+            if not value or value <= 0
+        ]
+        if missing:
+            raise LaneAbort(
+                "envelope_gate",
+                "BOUNDED_AUTONOMOUS requires a bounded envelope; these limits "
+                f"are unset or non-positive: {', '.join(missing)}.",
+            )
+        detail["envelope"] = envelope
+        log.info("solana_autonomy_preconditions_satisfied", **detail)
+        return detail
 
     async def _check_kill_switch(self, stage: str) -> dict[str, Any]:
         """Steps 2 and 14 — refuse while the live kill switch is engaged."""
         state = await self._ks.is_active()
         if state is None:
             return {"kill_active": False}
-        raise PilotAbort(
+        raise LaneAbort(
             stage,
             f"kill switch ACTIVE (event #{state.kill_event_id}, by "
             f"{state.triggered_by}, until {state.killed_until.isoformat()}): "
@@ -1176,7 +2106,7 @@ class PilotRunner:
         try:
             detail = dict(self._probe_custody())
         except SolanaKeypairError as exc:
-            raise PilotAbort("keypair_custody", str(exc)) from exc
+            raise LaneAbort("keypair_custody", str(exc)) from exc
         # The PATH is not the secret — the file's contents are, and those do
         # not reach this module at all. Named to avoid ``_SECRET_KEY_RE``,
         # which matches "keypair"; an evidence pack that cannot say which key
@@ -1201,10 +2131,10 @@ class PilotRunner:
         try:
             keypair = self._load_keypair()
         except SolanaKeypairError as exc:
-            raise PilotAbort("funded_signer", str(exc)) from exc
+            raise LaneAbort("funded_signer", str(exc)) from exc
         loaded = str(keypair.pubkey())
         if loaded != expected:
-            raise PilotAbort(
+            raise LaneAbort(
                 "funded_signer",
                 f"the key file decodes to {loaded}, but this run was built "
                 f"and authorized for {expected}. Refusing to sign.",
@@ -1266,7 +2196,7 @@ class PilotRunner:
                     await retire_row(self._db, row["live_trade_id"])
                     row["auto_retired"] = True
                     log.info(
-                        "solana_pilot_unsigned_row_retired",
+                        "solana_lane_unsigned_row_retired",
                         live_trade_id=row["live_trade_id"],
                     )
                 else:
@@ -1280,11 +2210,8 @@ class PilotRunner:
                 None if intent is None else intent.get("last_valid_block_height")
             )
             try:
-                report = await resolve_submission(
-                    expected_signature=signature,
-                    last_valid_block_height=last_valid,
-                    rpc_client=self._resolver_rpc,
-                    settings=self._settings,
+                pooled = await self._resolve(
+                    signature=str(signature), last_valid_block_height=last_valid
                 )
             except Exception as exc:  # pragma: no cover - resolver swallows its own
                 row["resolution"] = {
@@ -1295,13 +2222,16 @@ class PilotRunner:
                 blockers += 1
                 continue
 
+            report = pooled.report
             lane = apply_age_policy(
                 report,
                 age_seconds=row_age_seconds(row.get("created_at")),
                 settings=self._settings,
                 had_evidence_height=last_valid is not None,
+                pool_downgrade=pooled.downgrade_reason,
             )
             row["resolution"] = _resolution_summary(report)
+            row["resolution"].update(pooled.as_evidence())
             row["resolution"]["last_valid_block_height_source"] = (
                 "evidence_file" if intent is not None else "unavailable"
             )
@@ -1336,7 +2266,7 @@ class PilotRunner:
                     )
                     row["auto_retired"] = True
                     log.info(
-                        "solana_pilot_row_auto_retired",
+                        "solana_lane_row_auto_retired",
                         live_trade_id=row["live_trade_id"],
                         signature=signature,
                     )
@@ -1350,56 +2280,36 @@ class PilotRunner:
 
     # ---------------- quote / build / inspect ----------------
     async def _quote_and_check(
-        self, *, amount_lamports: int
-    ) -> tuple[SolanaQuote, dict[str, Any]]:
-        """Steps 5-6 — quote, then the envelope checks that read the quote.
+        self, *, amount_lamports: int, evidence: EvidenceLog
+    ) -> tuple[SolanaQuote, datetime]:
+        """Steps 5-6 — quote, then the limits engine's verdict on it.
 
-        The USD band is enforced on the QUOTE's USDC output, not on the SOL
-        input: USDC is the dollar-denominated leg (1 USDC ~ 1 USD), so what
-        the operator's $5-$10 envelope actually bounds is what comes back. A
-        band applied to the SOL side would need a price feed of its own and
-        would drift out of the envelope every time SOL moved.
+        Every check here belongs to ``LimitsEngine.check_quote``; this method
+        fetches the quote, reads the lane's current exposure out of the ledger
+        and records the result. It deliberately owns no threshold of its own —
+        the point of the engine is that "what is this lane allowed to do" has
+        exactly one answer.
+
+        The fetch time is returned alongside the quote because the freshness
+        stage re-asks how old it is AFTER the approval prompt, and the prompt
+        is unbounded operator time.
+
+        The evidence step is written BEFORE the limits are enforced, so a
+        refusal leaves the same structured record a pass would — the run that
+        gets refused is the one whose numbers an operator most needs.
         """
         quote = await self._jupiter.get_quote(amount=amount_lamports)
+        quoted_at = datetime.now(timezone.utc)
 
-        problems: list[str] = []
-        if quote.swap_mode != "ExactIn":
-            # otherAmountThreshold means "minimum output" under ExactIn and
-            # "maximum input" under ExactOut. Every downstream guarantee in
-            # this lane reads it as the former.
-            problems.append(
-                f"quote swapMode is {quote.swap_mode!r}, not 'ExactIn' — "
-                "otherAmountThreshold would not be a minimum-output bound"
-            )
-        if quote.in_amount != amount_lamports:
-            problems.append(
-                f"quote inAmount {quote.in_amount} != requested "
-                f"{amount_lamports} lamports"
-            )
-        approved_bps = int(self._settings.SOLANA_PILOT_SLIPPAGE_BPS)
-        if quote.slippage_bps > approved_bps:
-            problems.append(
-                f"quote slippageBps {quote.slippage_bps} exceeds the approved "
-                f"SOLANA_PILOT_SLIPPAGE_BPS={approved_bps}"
-            )
+        exposure = await fetch_lane_exposure(self._db, self._settings)
+        limits = self._limits.check_quote(
+            quote,
+            amount_lamports=amount_lamports,
+            price_impact_pct=quote_price_impact_pct(quote),
+            exposure=exposure,
+        )
 
         out_usd = usdc_from_raw(quote.out_amount) or Decimal("0")
-        min_usd = _dec(self._settings.SOLANA_PILOT_MIN_ORDER_USD)
-        max_usd = _dec(self._settings.SOLANA_PILOT_MAX_ORDER_USD)
-        if out_usd < min_usd or out_usd > max_usd:
-            problems.append(
-                f"quoted output {_fmt(out_usd)} USDC is outside the approved "
-                f"per-swap band [{_fmt(min_usd)}, {_fmt(max_usd)}] USD"
-            )
-
-        impact_pct = quote_price_impact_pct(quote)
-        max_impact = _dec(self._settings.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT)
-        if impact_pct > max_impact:
-            problems.append(
-                f"price impact {_fmt(impact_pct)}% exceeds "
-                f"SOLANA_PILOT_MAX_PRICE_IMPACT_PCT={_fmt(max_impact)}%"
-            )
-
         detail = {
             "in_amount_lamports": quote.in_amount,
             "in_amount_sol": _fmt(sol_from_lamports(quote.in_amount)),
@@ -1408,17 +2318,31 @@ class PilotRunner:
             "min_out_amount_raw": quote.min_out_amount,
             "min_out_amount_usdc": _fmt(usdc_from_raw(quote.min_out_amount)),
             "slippage_bps": quote.slippage_bps,
-            "price_impact_pct": _fmt(impact_pct),
+            "price_impact_pct": _fmt(quote_price_impact_pct(quote)),
             "price_impact_raw": quote.price_impact_pct,
             "swap_mode": quote.swap_mode,
             "route": _route_summary(quote),
             "context_slot": quote.context_slot,
-            "band_usd": [_fmt(min_usd), _fmt(max_usd)],
-            "problems": problems,
+            "quoted_at": quoted_at.isoformat(),
+            "exposure": exposure.as_evidence(),
+            "limits": limits.as_evidence(),
         }
-        if problems:
-            raise PilotAbort("quote_envelope", "; ".join(problems))
-        return quote, detail
+        evidence.record("quote", **detail)
+        self._enforce(limits, "quote_envelope")
+        return quote, quoted_at
+
+    def _enforce(self, limits: LimitsReport, stage: str) -> None:
+        """Turn a failed limits report into the lane's own refusal.
+
+        The engine raises its own domain exception so it can be used (and
+        tested) without the runner; the lane translates that into ``LaneAbort``
+        so every refusal reaches the operator through one path, with one exit
+        code and one evidence shape.
+        """
+        try:
+            limits.raise_if_failed()
+        except SolanaLimitBreached as exc:
+            raise LaneAbort(stage, str(exc)) from exc
 
     async def _inspect(
         self,
@@ -1427,7 +2351,7 @@ class PilotRunner:
         signer_pubkey: str,
         ata_rent_lamports: int,
         ata_rent_source: str,
-    ) -> tuple[VerificationReport, dict[str, Any]]:
+    ) -> tuple[VerificationReport, LimitsReport, dict[str, Any]]:
         """Step 8 — the inspector's verdict on the bytes Jupiter sent back.
 
         Three things are handed in rather than left to defaults, and each
@@ -1459,7 +2383,7 @@ class PilotRunner:
             else "live_block_engine"
         )
         if tip_source == "static_fallback":
-            log.warning("solana_pilot_tip_accounts_degraded", count=len(tip_accounts))
+            log.warning("solana_lane_tip_accounts_degraded", count=len(tip_accounts))
         report = await verify_swap_transaction(
             tx_b64=build.swap_transaction_b64,
             expected_signer=signer_pubkey,
@@ -1497,13 +2421,19 @@ class PilotRunner:
             "ata_rent_source": ata_rent_source,
             "rpc_client_supplied": True,
         }
-        return report, detail
+        # The fee ceilings, applied by the engine to what the inspector
+        # re-derived from the bytes. The inspector enforces the same three on
+        # its own — it has to be safe to use standalone — and both read them
+        # from `FeeCeilings.from_settings`, so they cannot drift apart.
+        limits = self._limits.check_transaction(report)
+        detail["limits"] = limits.as_evidence()
+        return report, limits, detail
 
     async def _ata_rent_lamports(self) -> tuple[int, str]:
         """Rent-exempt minimum for the output ATA, and where the figure came from.
 
         Asked of the cluster rather than hardcoded, because rent is a cluster
-        parameter. The documented fallback keeps the pilot runnable through an
+        parameter. The documented fallback keeps the lane runnable through an
         RPC hiccup, and the source is recorded so an evidence reader can tell
         which number the balance gate actually used.
         """
@@ -1513,7 +2443,7 @@ class PilotRunner:
             )
         except Exception as exc:
             log.warning(
-                "solana_pilot_ata_rent_fallback",
+                "solana_lane_ata_rent_fallback",
                 error_type=type(exc).__name__,
                 error=str(exc),
                 fallback=ATA_RENT_LAMPORTS_FALLBACK,
@@ -1527,6 +2457,7 @@ class PilotRunner:
         signer_pubkey: str,
         amount_lamports: int,
         report: VerificationReport,
+        evidence: EvidenceLog,
     ) -> dict[str, Any]:
         """Step 9 — SOL covers the swap, every cost the bytes carry, and headroom.
 
@@ -1543,16 +2474,24 @@ class PilotRunner:
         the inspector, from the actual number of ATA-create instructions in
         the transaction — which is also why a wallet that already holds USDC
         is not charged for an account it does not need.
+
+        The headroom percentage and the cover comparison belong to the limits
+        engine; this method performs the two RPC reads and records the result —
+        before enforcing, so a refusal leaves the balances it refused on.
         """
-        required = amount_lamports + report.total_fee_lamports
-        # 10% headroom over the whole requirement, so a priority-fee market
-        # that moves between the build and the block cannot turn a
-        # just-affordable swap into an on-chain failure.
-        required_with_headroom = int(_dec(required) * Decimal("1.10"))
+        required, required_with_headroom = self._limits.required_lamports(
+            amount_lamports=amount_lamports,
+            total_fee_lamports=report.total_fee_lamports,
+        )
 
         sol_lamports = await self._rpc.get_balance(signer_pubkey)
         usdc_raw = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
 
+        limits = self._limits.check_balance(
+            sol_lamports=sol_lamports,
+            amount_lamports=amount_lamports,
+            total_fee_lamports=report.total_fee_lamports,
+        )
         detail = {
             "sol_balance_lamports": sol_lamports,
             "sol_balance": _fmt(sol_from_lamports(sol_lamports)),
@@ -1564,18 +2503,11 @@ class PilotRunner:
             "ata_create_count": report.ata_create_count,
             "required_lamports": required,
             "required_with_headroom_lamports": required_with_headroom,
-            "headroom_pct": 10,
+            "headroom_pct": self._settings.SOLANA_BALANCE_HEADROOM_PCT,
+            "limits": limits.as_evidence(),
         }
-        if sol_lamports < required_with_headroom:
-            raise PilotAbort(
-                "balance",
-                f"SOL balance {_fmt(sol_from_lamports(sol_lamports))} does not "
-                f"cover the required {_fmt(sol_from_lamports(required_with_headroom))} "
-                f"(swap {_fmt(sol_from_lamports(amount_lamports))} + "
-                f"{report.total_fee_lamports} lamports of fees and rent "
-                f"[{report.ata_create_count} ATA create(s) = "
-                f"{report.ata_rent_lamports} lamports] + 10% headroom)",
-            )
+        evidence.record("balance", **detail)
+        self._enforce(limits, "balance")
         return detail
 
     # ---------------- place ----------------
@@ -1583,8 +2515,13 @@ class PilotRunner:
         self,
         *,
         sol: Decimal,
-        simulate_only: bool = False,
+        mode: str | None = None,
     ) -> int:
+        # The mode comes from CONFIG. `mode=` exists so the CLI can only
+        # ever NARROW it (--simulate-only), never widen it: a flag that
+        # could escalate DISABLED to SUPERVISED_LIVE would make the config
+        # setting advisory.
+        mode = mode or self._settings.SOLANA_MODE
         decision_id = str(uuid4())
         evidence = self._evidence_for(decision_id)
         try:
@@ -1600,7 +2537,7 @@ class PilotRunner:
             decision_id=decision_id,
             sol=_fmt(sol),
             amount_lamports=amount_lamports,
-            simulate_only=simulate_only,
+            mode=mode,
             evidence_path=str(evidence.path),
             # Which database this run read its safety state from. Without it,
             # an evidence pack cannot distinguish "the kill switch was clear"
@@ -1610,7 +2547,8 @@ class PilotRunner:
 
         live_trade_id: int | None = None
         try:
-            envelope = self._check_envelope(simulate_only=simulate_only)
+            envelope = await self._check_envelope(mode=mode)
+            executing = mode in EXECUTING_MODES
             evidence.record("envelope_gate", **envelope)
 
             kill = await self._check_kill_switch("kill_switch_check")
@@ -1620,6 +2558,23 @@ class PilotRunner:
             signer_pubkey = custody["declared_signer_pubkey"]
             evidence.record("keypair_custody", **custody)
 
+            recovery = await self._recover_interrupted_executions()
+            evidence.record("execution_recovery", **recovery)
+            if recovery["blockers"]:
+                raise LaneAbort(
+                    "execution_recovery",
+                    f"{recovery['blockers']} interrupted execution(s) may "
+                    "have reached the block engine. The lane is blocked until "
+                    "each is resolved. NEVER rebuild — run `resolve`.",
+                    exit_code=EXIT_BLOCKED,
+                )
+
+            # Immediately before startup reconciliation, which is the first
+            # step that reads a VERDICT off these endpoints — and after
+            # execution recovery, which decides from the database alone and
+            # must not need the network to say the lane is stuck.
+            await self._check_resolver_pool(mode=mode, evidence=evidence)
+
             reconciliation = await self._reconcile_open_rows(auto_retire=True)
             evidence.record(
                 "startup_reconciliation",
@@ -1628,17 +2583,23 @@ class PilotRunner:
             )
             if reconciliation["blockers"]:
                 self._print_blocked(reconciliation)
-                raise PilotAbort(
+                raise LaneAbort(
                     "startup_reconciliation",
                     f"{reconciliation['blockers']} unresolved signature(s) block "
                     "the lane",
                     exit_code=EXIT_BLOCKED,
                 )
 
-            quote, quote_detail = await self._quote_and_check(
-                amount_lamports=amount_lamports
+            quote, quoted_at = await self._quote_and_check(
+                amount_lamports=amount_lamports, evidence=evidence
             )
-            evidence.record("quote", **quote_detail)
+            await self._state(
+                decision_id,
+                STATE_QUOTE_CREATED,
+                mode=mode,
+                amount_lamports=amount_lamports,
+                minimum_out_raw=quote.min_out_amount,
+            )
 
             tip = int(self._settings.SOLANA_PILOT_JITO_TIP_LAMPORTS)
             build = await self._jupiter.build_swap_transaction(
@@ -1653,8 +2614,14 @@ class PilotRunner:
                 simulation_error=build.simulation_error,
                 tx_b64_len=len(build.swap_transaction_b64),
             )
+            await self._state(
+                decision_id,
+                STATE_TRANSACTION_BUILT,
+                mode=mode,
+                last_valid_block_height=build.last_valid_block_height,
+            )
             if build.simulation_error is not None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "swap_built",
                     f"Jupiter reported a simulation error on its own build: "
                     f"{build.simulation_error}",
@@ -1665,7 +2632,7 @@ class PilotRunner:
             # afterwards would leave the ceiling evaluated against a
             # constant rather than this cluster's actual rent parameters.
             ata_rent, ata_rent_source = await self._ata_rent_lamports()
-            report, inspect_detail = await self._inspect(
+            report, fee_limits, inspect_detail = await self._inspect(
                 build=build,
                 signer_pubkey=signer_pubkey,
                 ata_rent_lamports=ata_rent,
@@ -1673,17 +2640,21 @@ class PilotRunner:
             )
             evidence.record("tx_inspection", **inspect_detail)
             if not report.passed:
-                raise PilotAbort(
+                raise LaneAbort(
                     "tx_inspection",
                     "; ".join(f"{c.name}: {c.detail}" for c in report.failures),
                 )
+            # Inspection answers "are these the bytes we asked for"; the fee
+            # ceilings answer "are we allowed to spend this". A build can be
+            # perfectly well-formed and still be over a ceiling.
+            self._enforce(fee_limits, "tx_limits")
 
             balance = await self._check_balance(
                 signer_pubkey=signer_pubkey,
                 amount_lamports=amount_lamports,
                 report=report,
+                evidence=evidence,
             )
-            evidence.record("balance", **balance)
 
             sim = await self._rpc.simulate_transaction(build.swap_transaction_b64)
             evidence.record(
@@ -1695,12 +2666,14 @@ class PilotRunner:
                 logs_tail=list(sim.logs[-20:]),
             )
             if not sim.ok:
-                raise PilotAbort(
+                raise LaneAbort(
                     "simulation",
                     f"independent simulation failed against current chain state: "
                     f"err={sim.err}. Submitting anyway would burn a fee to land "
                     "a failure.",
                 )
+
+            await self._state(decision_id, STATE_SIMULATION_PASSED, mode=mode)
 
             # The identity the operator is about to authorize. It is the
             # sha256 of the exact bytes the key will sign, taken from the
@@ -1713,11 +2686,11 @@ class PilotRunner:
             if amount_lamports:
                 sol_price = out_usd / (_dec(amount_lamports) / _dec(LAMPORTS_PER_SOL))
 
-            if not simulate_only:
+            if executing:
                 live_trade_id = await record_solana_intent(
                     self._db,
                     decision_id=decision_id,
-                    paper_trade_id=await ensure_pilot_anchor(self._db),
+                    paper_trade_id=await ensure_lane_anchor(self._db),
                     size_usd=_fmt(out_usd) or "0",
                     sol_price_usdc=_fmt(sol_price),
                 )
@@ -1753,24 +2726,54 @@ class PilotRunner:
                     would_be_last_valid_block_height=build.last_valid_block_height,
                 )
 
-            authorized, outcome = await self._request_authorization(
+            await self._state(
+                decision_id,
+                STATE_AWAITING_AUTHORIZATION,
+                mode=mode,
+                live_trade_id=live_trade_id,
+                message_sha256=message_sha256,
+            )
+
+            # ONE call site. Which policy answers is the only thing that
+            # changes between SUPERVISED_LIVE and BOUNDED_AUTONOMOUS — there is
+            # deliberately no second branch through place() for autonomy to
+            # diverge down.
+            policy = authorization_policy_for(mode)
+            request = AuthorizationRequest(
                 decision_id=decision_id,
+                mode=mode,
                 message_sha256=message_sha256,
                 signer_pubkey=signer_pubkey,
-                quote=quote,
-                build=build,
-                report=report,
-                balance=balance,
-                sim=sim,
-                simulate_only=simulate_only,
+                amount_lamports=amount_lamports,
+                quoted_out_raw=quote.out_amount,
+                minimum_out_raw=quote.min_out_amount,
+                slippage_bps=quote.slippage_bps,
+                price_impact_pct=quote_price_impact_pct(quote),
+                total_fee_lamports=report.total_fee_lamports,
+                last_valid_block_height=build.last_valid_block_height,
+                render=lambda: self._render_decision_screen(
+                    decision_id=decision_id,
+                    message_sha256=message_sha256,
+                    signer_pubkey=signer_pubkey,
+                    quote=quote,
+                    build=build,
+                    report=report,
+                    balance=balance,
+                    sim=sim,
+                    mode=mode,
+                ),
             )
+            decision = await policy.authorize(request)
+            authorized = decision.authorized
             evidence.record(
                 "authorization",
                 outcome="authorized" if authorized else "authorization_refused",
-                detail=outcome,
-                expected_prefix_len=8,
+                detail=decision.outcome,
+                method=decision.method,
+                mode=mode,
                 bound_to_message_sha256=message_sha256,
                 funded_signer_loaded=False,
+                **decision.detail,
             )
             if not authorized:
                 await retire_row(self._db, live_trade_id)
@@ -1782,13 +2785,16 @@ class PilotRunner:
                         note="authorization refused — no signature was ever "
                         "derived and the funded key was never read",
                     )
-                raise PilotAbort(
+                raise LaneAbort(
                     "authorization",
-                    f"operator did not authorize ({outcome}) — nothing was "
-                    "signed and nothing was sent",
+                    f"not authorized by {decision.method} "
+                    f"({decision.outcome}) — nothing was signed and nothing "
+                    "was sent",
                 )
 
-            if simulate_only:
+            await self._state(decision_id, STATE_AUTHORIZED, mode=mode)
+
+            if not executing:
                 # The rehearsal ends HERE, before the funded key is read. A
                 # signed transaction is an irreversible capability, and a
                 # rehearsal has no business creating one.
@@ -1815,7 +2821,7 @@ class PilotRunner:
                 return EXIT_OK
 
             # Step 14 — post-approval kill re-check. Handled inline rather than
-            # through PilotAbort because the intent row already exists and must
+            # through LaneAbort because the intent row already exists and must
             # be retired: it asserts "a transaction may exist" and nothing was
             # sent.
             kill_state = await self._ks.is_active()
@@ -1829,14 +2835,14 @@ class PilotRunner:
                     live_trade_id=live_trade_id,
                     ledger_status="rejected",
                 )
-                raise PilotAbort(
+                raise LaneAbort(
                     "kill_switch_recheck",
                     f"kill switch engaged between approval and submission "
                     f"(event #{kill_state.kill_event_id}) — nothing was sent",
                 )
             evidence.record("kill_switch_recheck", kill_active=False)
 
-            freshness = await self._recheck_blockhash(build=build)
+            freshness = await self._recheck_blockhash(build=build, quoted_at=quoted_at)
             evidence.record("blockhash_recheck", **freshness)
             if not freshness["valid"]:
                 await retire_row(self._db, live_trade_id)
@@ -1875,7 +2881,7 @@ class PilotRunner:
             # ---------------------------------------------------------------
             try:
                 keypair = self._load_funded_signer(expected=signer_pubkey)
-            except PilotAbort:
+            except LaneAbort:
                 # Retire inline rather than leaving it to a later run's
                 # unsigned-row sweep. Every other refusal leaves its row
                 # terminal on its own, and a rule that depends on a
@@ -1916,7 +2922,7 @@ class PilotRunner:
                         ledger_status="rejected",
                         note="signed digest did not match the authorized one; nothing was sent",
                     )
-                raise PilotAbort(
+                raise LaneAbort(
                     "signed_in_memory",
                     f"signed message digest {signed.message_sha256} does not "
                     f"match the AUTHORIZED digest {message_sha256} — the "
@@ -1947,6 +2953,12 @@ class PilotRunner:
                     note="durable before the block engine is called; a crash "
                     "after this point leaves a resolvable row",
                 )
+            await self._state(
+                decision_id,
+                STATE_SIGNED,
+                mode=mode,
+                expected_signature=signed.signature,
+            )
 
             return await self._submit_and_resolve(
                 evidence=evidence,
@@ -1959,9 +2971,10 @@ class PilotRunner:
                 balance=balance,
                 amount_lamports=amount_lamports,
                 signer_pubkey=signer_pubkey,
+                mode=mode,
             )
 
-        except PilotAbort as abort:
+        except LaneAbort as abort:
             evidence.record(
                 "aborted",
                 stage=abort.stage,
@@ -1978,7 +2991,7 @@ class PilotRunner:
             # The ledger row is deliberately left as it stands — whatever it
             # says is what was last known to be true.
             log.error(
-                "solana_pilot_unexpected_error",
+                "solana_lane_unexpected_error",
                 decision_id=decision_id,
                 error_type=type(exc).__name__,
                 error=str(exc),
@@ -2003,54 +3016,59 @@ class PilotRunner:
             )
             return EXIT_ESCALATE
 
-    async def _recheck_blockhash(self, *, build: SwapBuild) -> dict[str, Any]:
-        """Step 15 — is the authorized build still landable?
+    async def _recheck_blockhash(
+        self, *, build: SwapBuild, quoted_at: datetime | None
+    ) -> dict[str, Any]:
+        """Step 15 — is what the operator authorized still true?
 
-        The approval prompt is unbounded operator time, and a Solana build is
-        perishable: it carries a blockhash that stops being valid once the
-        chain passes ``lastValidBlockHeight``. Submitting past that point
-        cannot land, and submitting just short of it very likely cannot either,
-        so the check refuses inside a configurable safety margin.
+        Two perishable things, re-asked together because they go stale for the
+        same reason: the approval prompt is unbounded operator time. The
+        blockhash stops being valid once the chain passes
+        ``lastValidBlockHeight``, and the quote's price stops describing the
+        market. The on-chain minimum-output bound protects the trade from a
+        bad fill; nothing but this protects the operator's INTENT.
 
-        An RPC failure here counts as INVALID. We cannot show the transaction
-        is still fresh, and the whole point of the re-check is that a stale
+        An RPC failure counts as INVALID. We cannot show the transaction is
+        still fresh, and the whole point of the re-check is that a stale
         authorization must not be spent.
         """
-        margin = int(self._settings.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS)
-        deadline = build.last_valid_block_height - margin
         try:
-            height = await self._rpc.get_block_height()
+            height: int | None = await self._rpc.get_block_height()
+            read_error = None
         except Exception as exc:
-            return {
-                "valid": False,
-                "current_block_height": None,
-                "last_valid_block_height": build.last_valid_block_height,
-                "safety_margin_blocks": margin,
-                "detail": (
-                    f"could not read the current block height "
-                    f"({type(exc).__name__}: {exc}) — refusing to submit a build "
-                    "whose freshness cannot be shown"
-                ),
-            }
-        valid = height <= deadline
+            height = None
+            read_error = f"{type(exc).__name__}: {exc}"
+
+        age = (
+            None
+            if quoted_at is None
+            else (datetime.now(timezone.utc) - quoted_at).total_seconds()
+        )
+        limits = self._limits.check_freshness(
+            quote_age_sec=age,
+            current_block_height=height,
+            last_valid_block_height=build.last_valid_block_height,
+        )
         return {
-            "valid": valid,
+            "valid": limits.passed,
             "current_block_height": height,
             "last_valid_block_height": build.last_valid_block_height,
-            "safety_margin_blocks": margin,
-            "blocks_remaining": build.last_valid_block_height - height,
-            "detail": (
-                f"block height {height} of {build.last_valid_block_height} "
-                f"(margin {margin})"
-                if valid
-                else f"block height {height} is past the safe submission "
-                f"deadline {deadline} "
-                f"(lastValidBlockHeight {build.last_valid_block_height} minus a "
-                f"{margin}-block margin)"
+            "safety_margin_blocks": int(
+                self._settings.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS
+            ),
+            "blocks_remaining": (
+                None if height is None else build.last_valid_block_height - height
+            ),
+            "quote_age_sec": None if age is None else round(age, 1),
+            "block_height_read_error": read_error,
+            "limits": limits.as_evidence(),
+            "detail": "; ".join(
+                f"{c.name}: {c.detail}"
+                for c in (limits.failures if limits.failures else limits.checks)
             ),
         }
 
-    async def _request_authorization(
+    async def _render_decision_screen(
         self,
         *,
         decision_id: str,
@@ -2061,9 +3079,9 @@ class PilotRunner:
         report: VerificationReport,
         balance: dict[str, Any],
         sim: Any,
-        simulate_only: bool,
-    ) -> tuple[bool, str]:
-        """Step 11 — print the decision block and require the typed prefix.
+        mode: str,
+    ) -> None:
+        """Print the decision block. Rendering only — it decides nothing.
 
         The phrase is the first 8 characters of the TRANSACTION MESSAGE HASH:
         the sha256 of the exact bytes the key will sign, computed from the
@@ -2089,6 +3107,8 @@ class PilotRunner:
         # transaction still landable", and a number computed a minute ago
         # answers a question about a moment that has passed.
         age = await self._blockhash_age(build)
+        limits = self._limits.declared_limits()
+        exposure = (await fetch_lane_exposure(self._db, self._settings)).as_evidence()
         lines = [
             f"  pair                : SOL -> USDC",
             f"  input mint          : {quote.input_mint}",
@@ -2116,15 +3136,23 @@ class PilotRunner:
             f"  signer              : {signer_pubkey}",
             f"  current SOL         : {balance['sol_balance']} SOL",
             f"  current USDC        : {balance['usdc_balance']} USDC",
+            # The envelope this trade was judged against, shown alongside the
+            # trade. An operator asked to authorize a number should not have to
+            # reconstruct the bounds it cleared from a config file.
+            f"  envelope            : per-trade "
+            f"{limits['per_trade_usd'][0]}-{limits['per_trade_usd'][1]} USD, "
+            f"daily cap {limits['daily_notional_usd']} USD "
+            f"({exposure['notional_usd_today']} authorized today), "
+            f"max {limits['max_open_positions']} open position(s)",
             f"  MESSAGE SHA256      : {message_sha256}",
             f"  database            : {Path(self._settings.DB_PATH).resolve()}",
             f"  decision ID         : {decision_id}",
             "  signing status      : NOT SIGNED - the funded key is read only "
             "after you authorize",
         ]
-        if simulate_only:
+        if mode not in EXECUTING_MODES:
             lines.append(
-                "  ** REHEARSAL        : --simulate-only — the funded key is "
+                f"  ** REHEARSAL        : mode {mode} — the funded key is "
                 "never read, nothing is signed and nothing is sent"
             )
             if not resolver_endpoint(self._settings)[1]:
@@ -2132,13 +3160,7 @@ class PilotRunner:
                     "  ** NOT LAUNCH-READY : resolver endpoint is not pinned; a "
                     "real placement will refuse"
                 )
-        _print_block("SOLANA SUPERVISED PILOT — MANUAL APPROVAL REQUIRED", lines)
-        print(
-            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
-            "Anything else — including an empty line or a closed stdin — aborts. "
-            "The phrase is lowercase hex and is matched exactly."
-        )
-        return read_authorization(message_sha256[:8])
+        _print_block("SOLANA DEX LANE — MANUAL APPROVAL REQUIRED", lines)
 
     async def _blockhash_age(self, build: SwapBuild) -> str:
         """One display line: how many blocks of life the build has left.
@@ -2177,8 +3199,14 @@ class PilotRunner:
         balance: dict[str, Any],
         amount_lamports: int,
         signer_pubkey: str,
+        mode: str,
     ) -> int:
         """Steps 16-18 — submit exactly once, then decide what happened."""
+        # Durable BEFORE the POST. The whole point of this state is that a
+        # process which dies mid-call has already recorded that a
+        # transaction MAY exist — recording it afterwards would leave the
+        # one window that matters unlogged.
+        await self._state(decision_id, STATE_SUBMISSION_ATTEMPTED, mode=mode)
         try:
             receipt = await self._jito.submit_transaction(
                 signed.signed_tx_b64,
@@ -2239,6 +3267,7 @@ class PilotRunner:
             balance=balance,
             amount_lamports=amount_lamports,
             signer_pubkey=signer_pubkey,
+            mode=mode,
         )
 
     async def _handle_ambiguity(
@@ -2261,14 +3290,17 @@ class PilotRunner:
         blockhash and a different signature, and BOTH can land — two swaps
         where the operator authorized one.
         """
-        resolution = await resolve_submission(
-            expected_signature=signed.signature,
+        pooled = await self._resolve(
+            signature=signed.signature,
             last_valid_block_height=build.last_valid_block_height,
-            rpc_client=self._resolver_rpc,
-            settings=self._settings,
             owner_pubkey=signer_pubkey,
         )
-        evidence.record("ambiguity_resolution", **_resolution_summary(resolution))
+        resolution = pooled.report
+        evidence.record(
+            "ambiguity_resolution",
+            **_resolution_summary(resolution),
+            **pooled.as_evidence(),
+        )
 
         if resolution.verdict == "landed":
             evidence.record(
@@ -2332,6 +3364,12 @@ class PilotRunner:
             await update_live_trade(
                 self._db, live_trade_id, status="needs_manual_review"
             )
+        await self._state(
+            decision_id,
+            STATE_SUBMISSION_UNKNOWN,
+            mode=self._settings.SOLANA_MODE,
+            detail={"reason": "resolver could not decide"},
+        )
         evidence.record(
             "ambiguity_unresolved",
             live_trade_id=live_trade_id,
@@ -2351,12 +3389,12 @@ class PilotRunner:
                 "  signature, and BOTH can land — two swaps where one was",
                 "  authorized.",
                 "",
-                "  The pilot lane is now BLOCKED: every future `place` run will",
+                "  The lane is now BLOCKED: every future `place` run will",
                 "  refuse at startup reconciliation until this row resolves.",
                 "",
                 "  Next steps, in order:",
                 "   1. Re-run the resolver as the blockhash expires:",
-                "        python -m scout.live.solana_pilot resolve "
+                "        python -m scout.live.solana_lane resolve "
                 f"--decision-id {decision_id}",
                 "   2. Once it reports definitively_not_submitted the row is",
                 "      retired automatically and the lane clears.",
@@ -2372,7 +3410,7 @@ class PilotRunner:
 
         Two waits rather than one, because they answer different questions.
         'confirmed' says a supermajority voted on the block; 'finalized' says
-        it is rooted and cannot be rolled back. A supervised pilot reports the
+        it is rooted and cannot be rolled back. A supervised lane reports the
         second, so a report of a completed swap is not something a fork can
         take back.
 
@@ -2462,6 +3500,7 @@ class PilotRunner:
         balance: dict[str, Any],
         amount_lamports: int,
         signer_pubkey: str,
+        mode: str,
     ) -> int:
         """Steps 17-18 — wait for finality, then reconcile the balances."""
         print(
@@ -2471,8 +3510,18 @@ class PilotRunner:
         )
         confirmation = await self._await_confirmation(signed.signature)
         evidence.record("confirmation", **confirmation)
+        if confirmation["outcome"] == "finalized":
+            await self._state(decision_id, STATE_FINALIZED, mode=mode)
+        elif confirmation["known"]:
+            await self._state(decision_id, STATE_LANDED, mode=mode)
 
         if confirmation["outcome"] == "failed_on_chain":
+            await self._state(
+                decision_id,
+                STATE_FAILED,
+                mode=mode,
+                detail={"reason": "failed_on_chain"},
+            )
             await retire_row(self._db, live_trade_id)
             evidence.record(
                 "failed_on_chain",
@@ -2560,6 +3609,12 @@ class PilotRunner:
             f"  slot         : {confirmation['slot']}",
             f"  SOL spent    : {summary['balance']['sol_spent']} SOL",
             f"  USDC received: {summary['balance']['usdc_received']} USDC",
+            f"  entry price  : "
+            f"{summary['entry_economics']['executed_price_usdc_per_sol']} USDC/SOL "
+            f"(quoted {summary['entry_economics']['quoted_price_usdc_per_sol']}, "
+            f"slippage {summary['entry_economics']['entry_slippage_bps']} bps)",
+            f"  position     : {summary['position']['wallet_usdc']} USDC in the "
+            f"wallet vs {summary['position']['ledger_usdc']} claimed by the ledger",
             f"  reconcile    : {summary['verdict']}",
             f"  ledger row   : {live_trade_id} (open — the position is yours to "
             f"dispose of)",
@@ -2569,9 +3624,19 @@ class PilotRunner:
             lines.extend(
                 ["", "  RECONCILIATION COULD NOT EXPLAIN THE BALANCE MOVE:"]
                 + [f"   - {m}" for m in summary["mismatches"]]
-                + ["  Check the wallet before running the pilot again."]
+                + ["  Check the wallet before running the lane again."]
             )
-        _print_block(f"PILOT SWAP {confirmation['outcome'].upper()}", lines)
+        if summary["verdict"] == "pass":
+            await self._state(
+                decision_id,
+                STATE_RECONCILED,
+                mode=mode,
+                detail={"reconciliation": "pass"},
+            )
+        # A `review` verdict does NOT advance the state. The swap finalized but
+        # did not reconcile, and `finalized` says exactly that — claiming
+        # `reconciled` would assert an accounting that failed.
+        _print_block(f"LANE SWAP {confirmation['outcome'].upper()}", lines)
         # An unexplained balance move exits non-zero even though the swap
         # itself completed: money moved in a way the runner cannot account
         # for, and a 0 here would tell a wrapper script everything is fine.
@@ -2686,7 +3751,9 @@ class PilotRunner:
                 f"rent, ±{slack})"
             )
 
-        on_chain_err = ((transaction or {}).get("meta") or {}).get("err")
+        _meta = (transaction or {}).get("meta") or {}
+        on_chain_err = _meta.get("err")
+        meta_fee = _meta.get("fee")
         if on_chain_err is not None:
             mismatches.append(f"the finalized transaction carries err={on_chain_err}")
         if confirmation["outcome"] == "finalize_timeout":
@@ -2695,18 +3762,31 @@ class PilotRunner:
                 "window — it is landed but not yet rooted"
             )
 
+        # ---- the position, and what it cost to open ----
+        # A balance delta says money moved. A POSITION record says what the
+        # lane now holds, at what price, and how far that landed from the
+        # quote the operator authorized. The second is what a later disposal
+        # needs and what the daily numbers are built from, so it is written
+        # into the durable row rather than only into the evidence.
+        pnl = _entry_economics(
+            amount_lamports=amount_lamports,
+            usdc_received=usdc_received,
+            quoted_out_raw=quote.out_amount,
+            fee_lamports=meta_fee,
+        )
         ledger = None
         if live_trade_id is not None:
             if usdc_received is not None and usdc_received > 0:
-                sol_units = _dec(amount_lamports) / _dec(LAMPORTS_PER_SOL)
-                usdc_units = usdc_from_raw(usdc_received) or Decimal("0")
                 await update_live_trade(
                     self._db,
                     live_trade_id,
-                    entry_fill_qty=_fmt(sol_units),
-                    entry_fill_price=_fmt(
-                        usdc_units / sol_units if sol_units else Decimal("0")
-                    ),
+                    entry_fill_qty=pnl["sol_spent"],
+                    entry_fill_price=pnl["executed_price_usdc_per_sol"],
+                    # Realised entry slippage against the quote the operator
+                    # saw. Positive means the fill was worse than quoted.
+                    # `mid_at_entry` already holds the quoted price, so the two
+                    # columns are readable together.
+                    entry_slippage_bps=pnl["entry_slippage_bps"],
                 )
             ledger = await fetch_row_by_decision_id(self._db, decision_id)
             if ledger is None:
@@ -2716,6 +3796,23 @@ class PilotRunner:
                     f"ledger entry_order_id {ledger.get('entry_order_id')!r} does "
                     f"not match the submitted signature {signature!r}"
                 )
+
+        # ---- position reconciliation ----
+        # Distinct from the balance check above, which asks "did the right
+        # amount move". This asks "does the wallet actually hold what the
+        # ledger now says the lane holds" — the dangerous direction being a
+        # ledger that asserts a position the wallet does not have, because
+        # every later decision is made against the ledger.
+        position = await self._reconcile_position(
+            signer_pubkey=signer_pubkey, measured_usdc_raw=usdc_after
+        )
+        if position["shortfall_raw"] > 0:
+            mismatches.append(
+                f"the ledger claims {position['ledger_usdc']} USDC across "
+                f"{position['open_rows']} open row(s) but the wallet holds "
+                f"{position['wallet_usdc']} — short by "
+                f"{position['shortfall_usdc']}"
+            )
 
         summary = {
             "verdict": "review" if mismatches else "pass",
@@ -2729,6 +3826,8 @@ class PilotRunner:
                 "transaction_found": transaction is not None,
             },
             "ledger": ledger,
+            "position": position,
+            "entry_economics": pnl,
             "balance": {
                 "sol_before_lamports": sol_before,
                 "sol_after_lamports": sol_after,
@@ -2748,7 +3847,7 @@ class PilotRunner:
         }
         evidence.record("reconciliation", **summary)
         if mismatches:
-            log.warning("solana_pilot_reconciliation_review", mismatches=mismatches)
+            log.warning("solana_lane_reconciliation_review", mismatches=mismatches)
         return summary
 
     # ---------------- resolve ----------------
@@ -2760,7 +3859,7 @@ class PilotRunner:
         verdict means the transaction can never land and the lane is genuinely
         clear. Every other verdict leaves the row exactly as it is.
 
-        Deliberately NOT gated on the kill switch or on SOLANA_PILOT_ENABLED.
+        Deliberately NOT gated on the kill switch or on SOLANA_MODE.
         Turning the master gate off is an operator's instinctive first move
         when something looks wrong, and it must not take away the tool that
         explains what happened.
@@ -2770,7 +3869,7 @@ class PilotRunner:
         try:
             row = await fetch_row_by_decision_id(self._db, decision_id)
             if row is None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "lookup",
                     f"no solana live_trades row with client_order_id={decision_id}",
                 )
@@ -2778,7 +3877,7 @@ class PilotRunner:
 
             signature = row.get("entry_order_id")
             if not signature:
-                raise PilotAbort(
+                raise LaneAbort(
                     "lookup",
                     f"live_trades row {row['live_trade_id']} carries no expected "
                     "signature, so there is nothing to ask the cluster about",
@@ -2792,25 +3891,37 @@ class PilotRunner:
                 None if intent is None else intent.get("last_valid_block_height")
             )
             resolver_url, pinned = resolver_endpoint(self._settings)
-            resolution = await resolve_submission(
-                expected_signature=str(signature),
-                last_valid_block_height=last_valid,
-                rpc_client=self._resolver_rpc,
-                settings=self._settings,
+            # The pool is validated here too, not only in `place`. This command
+            # is the one that RETIRES a row on a verdict, so an endpoint on the
+            # wrong chain does its damage here — and `resolve` is exactly the
+            # command an operator reaches for when things already look wrong.
+            pool_health = await self._pool.check_health()
+            evidence.record(
+                "resolver_pool",
+                endpoints=[entry.as_evidence() for entry in pool_health],
+                usable_count=sum(1 for entry in pool_health if entry.usable),
+                configured_count=len(pool_health),
+                expected_genesis=SOLANA_MAINNET_GENESIS_HASH,
             )
+            pooled = await self._resolve(
+                signature=str(signature), last_valid_block_height=last_valid
+            )
+            resolution = pooled.report
             lane = apply_age_policy(
                 resolution,
                 age_seconds=row_age_seconds(row.get("created_at")),
                 settings=self._settings,
                 had_evidence_height=last_valid is not None,
+                pool_downgrade=pooled.downgrade_reason,
             )
             evidence.record(
                 "resolution",
                 **_resolution_summary(resolution),
+                **pooled.as_evidence(),
                 last_valid_block_height_source=(
                     "evidence_file" if intent is not None else "unavailable"
                 ),
-                resolver_rpc_url=resolver_url,
+                resolver_rpc_url=redact_endpoint(resolver_url),
                 resolver_endpoint_pinned=pinned,
                 lane_verdict=lane.verdict,
                 expiry_source=lane.expiry_source,
@@ -2841,7 +3952,7 @@ class PilotRunner:
                     evidence.record(
                         "auto_retire_withheld",
                         live_trade_id=row["live_trade_id"],
-                        resolver_rpc_url=resolver_url,
+                        resolver_rpc_url=redact_endpoint(resolver_url),
                         note="verdict read from a load-balanced endpoint; the "
                         "row is NOT retired on it",
                     )
@@ -2853,8 +3964,9 @@ class PilotRunner:
                 f"  verdict     : {lane.verdict}"
                 + (
                     ""
-                    if lane.verdict == resolution.verdict
-                    else f"   (cluster said {resolution.verdict};" f" {lane.reason})"
+                    if lane.verdict == pooled.raw_verdict
+                    else f"   (cluster said {pooled.raw_verdict};"
+                    f" {lane.reason or pooled.downgrade_reason})"
                 ),
                 f"  expiry from : {lane.expiry_source or 'not established'}",
                 f"  row age     : "
@@ -2869,8 +3981,10 @@ class PilotRunner:
                 f"  lastValidBH : {last_valid}"
                 + ("" if intent is not None else "  (evidence file unreadable)"),
                 f"  sweeps      : {len(resolution.probes)}",
-                f"  resolver RPC: {resolver_url}"
+                f"  resolver    : {pooled.endpoint} "
+                f"({self._pool.size} endpoint(s) configured)"
                 + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
+                f"  corroborated: {_corroboration_line(pooled)}",
                 f"  evidence    : {evidence.path}",
             ]
             lines.extend(_verdict_guidance(lane.verdict, retired))
@@ -2897,7 +4011,7 @@ class PilotRunner:
                         "  and run this again before acting.",
                     ]
                 )
-            _print_block("SOLANA PILOT RESOLUTION", lines)
+            _print_block("SOLANA LANE RESOLUTION", lines)
             if lane.verdict == "landed":
                 return EXIT_BLOCKED
             if lane.verdict == "definitively_not_submitted":
@@ -2906,7 +4020,7 @@ class PilotRunner:
                 return EXIT_BLOCKED
             return EXIT_ESCALATE
 
-        except PilotAbort as abort:
+        except LaneAbort as abort:
             evidence.record(
                 "aborted",
                 stage=abort.stage,
@@ -2917,7 +4031,7 @@ class PilotRunner:
             return abort.exit_code
         except Exception as exc:
             log.error(
-                "solana_pilot_unexpected_error",
+                "solana_lane_unexpected_error",
                 decision_id=decision_id,
                 command="resolve",
                 error_type=type(exc).__name__,
@@ -2930,29 +4044,170 @@ class PilotRunner:
             print(f"ESCALATE [resolve]: {type(exc).__name__}: {exc}")
             return EXIT_ESCALATE
 
+    async def _reconcile_position(
+        self, *, signer_pubkey: str, measured_usdc_raw: int | None
+    ) -> dict[str, Any]:
+        """Does the wallet hold what the ledger says the lane holds?
+
+        Sums the recorded position across every open lane row and compares it
+        against the wallet's actual USDC. Only a SHORTFALL is a mismatch: the
+        wallet holding MORE is expected — it may hold USDC this lane never
+        bought — while it holding less means the ledger is asserting a position
+        that is not there, and every later decision is made against the ledger.
+
+        The measured balance is reused when the caller already has it, so this
+        adds no RPC call to the happy path.
+        """
+        if self._db._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._db._conn.execute(
+            "SELECT entry_fill_qty, entry_fill_price, size_usd FROM live_trades "
+            "WHERE venue = ? AND status = 'open'",
+            (VENUE,),
+        )
+        rows = await cur.fetchall()
+        ledger_usdc = Decimal("0")
+        for qty, price, size_usd in rows:
+            # Prefer the executed numbers; fall back to the authorized size for
+            # a row that has not reconciled yet. A row we cannot value at all
+            # is skipped rather than counted as zero, which would understate
+            # the claim and hide a shortfall.
+            filled_qty = _dec_or_none(qty)
+            filled_price = _dec_or_none(price)
+            if filled_qty is not None and filled_price is not None:
+                ledger_usdc += filled_qty * filled_price
+                continue
+            authorized = _dec_or_none(size_usd)
+            if authorized is not None:
+                ledger_usdc += authorized
+
+        wallet_raw = measured_usdc_raw
+        if wallet_raw is None:
+            try:
+                wallet_raw = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
+            except Exception as exc:
+                log.warning(
+                    "solana_position_balance_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                wallet_raw = None
+        wallet_usdc = usdc_from_raw(wallet_raw)
+
+        # An unreadable wallet balance is NOT a clean reconciliation. It is
+        # reported as the full ledger claim being unverified, so the verdict
+        # comes out as review rather than pass.
+        shortfall = (
+            ledger_usdc
+            if wallet_usdc is None
+            else max(Decimal("0"), ledger_usdc - wallet_usdc)
+        )
+        return {
+            "open_rows": len(rows),
+            "ledger_usdc": _fmt(ledger_usdc),
+            "wallet_usdc": "unreadable" if wallet_usdc is None else _fmt(wallet_usdc),
+            "wallet_usdc_raw": wallet_raw,
+            "shortfall_usdc": _fmt(shortfall),
+            "shortfall_raw": int(shortfall * (10**USDC_DECIMALS)),
+            "matches": shortfall == 0,
+        }
+
+    # ---------------- watchdog ----------------
+    async def watchdog(self, session: Any) -> int:
+        """Alert on executions stuck in a non-terminal state. For cron.
+
+        Deliberately NOT gated on SOLANA_MODE or the kill switch, and for the
+        same reason ``resolve`` is not: turning the lane off is an operator's
+        first instinct when something looks wrong, and it must not also turn
+        off the thing that would have told them what is wrong.
+
+        Exit 0 when nothing is stuck, ``EXIT_BLOCKED`` when something is — so a
+        cron wrapper can tell the two apart without parsing stdout.
+        """
+        summary = await check_stuck_executions(self._db, session, self._settings)
+        if not summary["enabled"]:
+            print("SOLANA_EXECUTION_WATCHDOG_ENABLED is False — nothing checked.")
+            return EXIT_OK
+        stuck = summary["stuck"]
+        if not stuck:
+            print("solana lane: no stuck executions.")
+            return EXIT_OK
+        _print_block(
+            f"SOLANA LANE: {len(stuck)} STUCK EXECUTION(S)",
+            [
+                f"  {e['decision_id']} {e['state']} "
+                f"{e['age_seconds'] / 60:.0f}m (threshold "
+                f"{e['threshold_seconds'] / 60:.0f}m)"
+                + ("  ** A TRANSACTION MAY EXIST **" if e["blocks_the_lane"] else "")
+                for e in stuck
+            ]
+            + [
+                "",
+                f"  operator alerts sent this run: {summary['alerted']}",
+                "  For anything marked above: NEVER rebuild. Run",
+                "    python -m scout.live.solana_lane resolve --decision-id <id>",
+            ],
+        )
+        return EXIT_BLOCKED
+
     # ---------------- status ----------------
     async def status(self) -> int:
         """Read-only lane report. Writes no evidence file — nothing decided."""
         settings = self._settings
         lines: list[str] = [
-            f"  SOLANA_PILOT_ENABLED     : {settings.SOLANA_PILOT_ENABLED}",
+            f"  SOLANA_MODE              : {settings.SOLANA_MODE}"
+            + (
+                ""
+                if settings.SOLANA_MODE in EXECUTING_MODES
+                else "   (no execution in this mode)"
+            ),
+            f"  bounded autonomy flag    : "
+            f"{settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED}",
+            f"  authorization            : "
+            f"{authorization_policy_for(settings.SOLANA_MODE).method}",
             f"  pair                     : {PAIR} (mainnet, fixed)",
             f"  per-swap band            : {settings.SOLANA_PILOT_MIN_ORDER_USD} - "
             f"{settings.SOLANA_PILOT_MAX_ORDER_USD} USD on the USDC output",
+            f"  daily notional cap       : "
+            f"{settings.SOLANA_MAX_DAILY_NOTIONAL_USD} USD (authorized, UTC day)",
+            f"  concurrency              : "
+            f"{settings.SOLANA_MAX_OPEN_POSITIONS} open position(s), "
+            f"{settings.SOLANA_MAX_CONCURRENT_EXECUTIONS} execution(s) in flight",
             f"  slippage ceiling         : {settings.SOLANA_PILOT_SLIPPAGE_BPS} bps",
             f"  jito tip requested       : "
             f"{settings.SOLANA_PILOT_JITO_TIP_LAMPORTS} lamports",
-            f"  rpc (read-only)          : {settings.SOLANA_RPC_URL}",
-            f"  resolver rpc             : {resolver_endpoint(settings)[0]}"
+            f"  rpc (read-only)          : {redact_endpoint(settings.SOLANA_RPC_URL)}",
+            f"  resolver endpoints       : {', '.join(self._pool.labels)}"
             + (
                 ""
                 if resolver_endpoint(settings)[1]
                 else "   ** NOT PINNED - a real place will refuse "
                 "(--simulate-only still runs) **"
             ),
+            "  corroboration            : "
+            + (
+                f"available ({self._pool.size} endpoints)"
+                if self._pool.size > 1
+                else "UNAVAILABLE - one endpoint, so a definitive "
+                "'not submitted' rests on a single node"
+            ),
             f"  block engine (submit)    : {settings.JITO_BLOCK_ENGINE_URL}",
             f"  database                 : {Path(settings.DB_PATH).resolve()}",
         ]
+
+        # Probed rather than assumed. Saying "corroboration: available" on the
+        # strength of a config line would be the claim an operator most wants
+        # checked BEFORE trade day — a second endpoint that is down, slow or on
+        # another chain looks identical in config to one that works.
+        for entry in await self._pool.check_health():
+            lines.append(
+                f"  endpoint {entry.label:<28}: "
+                + (
+                    ("ok" if not entry.degraded else "DEGRADED")
+                    + f" ({entry.latency_ms}ms)"
+                    if entry.usable
+                    else f"UNUSABLE — {entry.detail}"
+                )
+            )
 
         kill_state = await self._ks.is_active()
         lines.append(
@@ -3035,7 +4290,18 @@ class PilotRunner:
             )
         lines.append(f"  blocking                 : {reconciliation['blockers']}")
 
-        _print_block("SOLANA PILOT STATUS", lines)
+        # Current exposure against the envelope, so "how much room is left
+        # today" is answerable without running a placement to find out.
+        exposure = await fetch_lane_exposure(self._db, self._settings)
+        lines.append(
+            f"  used today               : "
+            f"{_fmt(exposure.notional_usd_today)} of "
+            f"{settings.SOLANA_MAX_DAILY_NOTIONAL_USD} USD, "
+            f"{exposure.open_positions} open position(s), "
+            f"{exposure.active_executions} execution(s) in flight"
+        )
+
+        _print_block("SOLANA LANE STATUS", lines)
         if reconciliation["blockers"]:
             print(
                 "The lane is BLOCKED: `place` will refuse until everything above "
@@ -3075,12 +4341,12 @@ class PilotRunner:
                 "   - failed_on_chain: the fee was paid and nothing executed.",
                 "     Record the cost, then retire the row by hand.",
                 "   - unresolved: re-run the resolver as the blockhash expires:",
-                "       python -m scout.live.solana_pilot resolve --decision-id <id>",
+                "       python -m scout.live.solana_lane resolve --decision-id <id>",
                 "     It retires the row automatically once the verdict becomes",
                 "     definitively_not_submitted. NEVER rebuild in the meantime.",
             ]
         )
-        _print_block("SOLANA PILOT LANE BLOCKED", lines)
+        _print_block("SOLANA LANE BLOCKED", lines)
 
 
 # ----------------------------------------------------------------------
@@ -3122,6 +4388,65 @@ def _resolution_summary(report: ResolutionReport) -> dict[str, Any]:
             for p in report.probes
         ],
     }
+
+
+def _entry_economics(
+    *,
+    amount_lamports: int,
+    usdc_received: int | None,
+    quoted_out_raw: int,
+    fee_lamports: int | None,
+) -> dict[str, Any]:
+    """What the position cost to open, in the terms a later disposal needs.
+
+    Not P&L on the trade — a SOL->USDC buy has no realised P&L until the USDC
+    is disposed of, and writing an execution cost into ``realized_pnl_usd``
+    would misreport it to every consumer that aggregates that column. What IS
+    realised here is the cost of ENTRY: the executed price, the transaction
+    fee, and how far the fill landed from the quote the operator authorized.
+
+    ``entry_slippage_bps`` is positive when the fill was WORSE than quoted,
+    matching the sign convention of the column it is written to.
+    """
+    sol_spent = _dec(amount_lamports) / _dec(LAMPORTS_PER_SOL)
+    received = usdc_from_raw(usdc_received)
+    quoted = usdc_from_raw(quoted_out_raw)
+    executed_price = None if received is None or not sol_spent else received / sol_spent
+    slippage_bps = None
+    if received is not None and quoted:
+        slippage_bps = int(((quoted - received) / quoted * 10_000).to_integral_value())
+    return {
+        "sol_spent": _fmt(sol_spent),
+        "sol_spent_lamports": amount_lamports,
+        "usdc_received": _fmt(received),
+        "usdc_received_raw": usdc_received,
+        "usdc_quoted": _fmt(quoted),
+        "executed_price_usdc_per_sol": _fmt(executed_price),
+        "quoted_price_usdc_per_sol": _fmt(
+            None if not sol_spent or quoted is None else quoted / sol_spent
+        ),
+        "entry_slippage_bps": slippage_bps,
+        "transaction_fee_lamports": fee_lamports,
+        "transaction_fee_sol": _fmt(sol_from_lamports(fee_lamports)),
+        "note": "entry economics, not realised P&L — the position is still open",
+    }
+
+
+def _corroboration_line(pooled: PoolResolution) -> str:
+    """One line saying whether a second endpoint backed a definitive absence.
+
+    Spelled out rather than left to a boolean because "not corroborated" has
+    three different meanings — nothing to corroborate, nobody to ask, and asked
+    and disagreed — and only the last one is a problem.
+    """
+    corroboration = pooled.corroboration
+    if pooled.raw_verdict != "definitively_not_submitted":
+        return "n/a (only a definitive absence needs a second opinion)"
+    if not corroboration.attempted:
+        return "NO — single endpoint, verdict rests on one node"
+    if corroboration.agrees:
+        return f"yes — {corroboration.endpoint} saw the same absence"
+    return f"DISAGREED — {corroboration.endpoint}: {corroboration.detail}"
 
 
 def _verdict_guidance(verdict: str, retired: bool) -> list[str]:
@@ -3207,7 +4532,7 @@ def _decision_id_arg(raw: str) -> str:
     value = raw.strip()
     if not _DECISION_ID_RE.match(value):
         raise argparse.ArgumentTypeError(
-            f"{raw!r} is not a pilot decision id (expected a dashed UUID, e.g. "
+            f"{raw!r} is not a lane decision id (expected a dashed UUID, e.g. "
             "6d1b345e-2821-40e2-ad83-4ecb18a06876)"
         )
     return value
@@ -3215,7 +4540,7 @@ def _decision_id_arg(raw: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="solana_pilot",
+        prog="solana_lane",
         description="Execute ONE supervised SOL->USDC swap on Solana mainnet.",
         epilog="There is no `cancel`: a submitted Solana transaction either "
         "lands before its lastValidBlockHeight or it can never land. Use "
@@ -3230,7 +4555,7 @@ def build_parser() -> argparse.ArgumentParser:
     place.add_argument(
         "--simulate-only",
         action="store_true",
-        help="full rehearsal including approval and signing; submits nothing",
+        help="force SIMULATION_ONLY for this run; can only NARROW SOLANA_MODE",
     )
     place.add_argument(
         "--yes-i-am-rehearsing",
@@ -3244,6 +4569,10 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--decision-id", type=_decision_id_arg, required=True)
 
     sub.add_parser("status", help="read-only lane report")
+    sub.add_parser(
+        "watchdog",
+        help="alert on executions stuck in a non-terminal state (for cron)",
+    )
     return parser
 
 
@@ -3292,7 +4621,7 @@ async def main(argv: list[str] | None = None) -> int:
             f"REFUSED [database]: no database at {db_path.resolve()}\n"
             "  DB_PATH resolves relative to the current directory, so this is "
             "almost always\n"
-            "  the wrong working directory. Run the pilot from the deployment "
+            "  the wrong working directory. Run the lane from the deployment "
             "root.\n"
             "  Creating one here would disable the kill switch and the startup "
             "reconciliation\n"
@@ -3313,10 +4642,10 @@ async def main(argv: list[str] | None = None) -> int:
     lock_path: Path | None = None
     if args.command == "place":
         try:
-            lock_fd, lock_path = acquire_pilot_lock(db_path)
-        except PilotLockHeld as held:
+            lock_fd, lock_path = acquire_lane_lock(db_path)
+        except LaneLockHeld as held:
             print(
-                f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
+                f"REFUSED [lock]: another lane run holds {held.lock_path}\n"
                 f"  holder: {held.holder}\n"
                 "  Two runs are two swaps, so only `place` is blocked.\n"
                 "  `status` and `resolve` still work — use them to see what is "
@@ -3344,39 +4673,41 @@ async def main(argv: list[str] | None = None) -> int:
             timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
         )
         try:
-            # Two RPC clients on one session. The resolver reads from a
-            # SINGLE pinned node (see `resolver_endpoint`) because its
-            # definitive verdict combines two facts that must come from the
-            # same view of the chain; everything else can use the general
-            # endpoint. When the two URLs are equal this is the same target
-            # twice, which is exactly what a deployment with one dedicated
-            # node wants.
-            resolver_url, _pinned = resolver_endpoint(settings)
-            resolver_settings = settings.model_copy(
-                update={"SOLANA_RPC_URL": resolver_url}
-            )
-            runner = PilotRunner(
+            # The general read client plus a resolver POOL, all on one session.
+            # The resolver's endpoints are separate from the general one
+            # because a definitive verdict combines two facts that must come
+            # from the same view of the chain, and a load-balanced general
+            # endpoint is fine for quotes and simulation but not for that.
+            # A one-URL pool is the normal single-node deployment.
+            pool = ResolverPool.from_settings(settings, session)
+            runner = LaneRunner(
                 settings=settings,
                 db=db,
                 jupiter=JupiterClient(settings, session),
                 rpc=SolanaRpcClient(settings, session),
                 jito=JitoClient(settings, session),
                 kill_switch=KillSwitch(db),
-                resolver_rpc=SolanaRpcClient(resolver_settings, session),
+                resolver_rpc=pool.endpoints[0].client,
+                resolver_pool=pool,
             )
             if args.command == "place":
-                return await runner.place(
-                    sol=args.sol, simulate_only=args.simulate_only
-                )
+                # --simulate-only NARROWS: it can turn an executing mode into a
+                # rehearsal, never the reverse. Passing None lets the runner
+                # take SOLANA_MODE as configured, so a flag can never escalate
+                # a DISABLED lane into a live one.
+                override = MODE_SIMULATION_ONLY if args.simulate_only else None
+                return await runner.place(sol=args.sol, mode=override)
             if args.command == "resolve":
                 return await runner.resolve(decision_id=args.decision_id)
+            if args.command == "watchdog":
+                return await runner.watchdog(session)
             return await runner.status()
         finally:
             await session.close()
             await db.close()
     finally:
         if lock_fd is not None and lock_path is not None:
-            release_pilot_lock(lock_fd, lock_path)
+            release_lane_lock(lock_fd, lock_path)
 
 
 if __name__ == "__main__":
