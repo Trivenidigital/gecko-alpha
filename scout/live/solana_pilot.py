@@ -870,7 +870,12 @@ class PilotRunner:
         pubkey = str(keypair.pubkey())
         return keypair, {
             "signer_pubkey": pubkey,
-            "keypair_path": self._settings.SOLANA_PILOT_KEYPAIR_PATH,
+            # Named to avoid ``_SECRET_KEY_RE``, which matches "keypair" and
+            # would redact this. The PATH is not the secret — the file's
+            # contents are, and those never reach this module — and an evidence
+            # pack that cannot say which key file was used has lost real
+            # provenance for no gain.
+            "signing_key_file": self._settings.SOLANA_PILOT_KEYPAIR_PATH,
             "loaded_at_call_time": True,
         }
 
@@ -2136,12 +2141,13 @@ class PilotRunner:
         estimate, and reconciling against an estimate would report a review on
         every swap that filled inside its slippage band.
 
-        The SOL side is a RANGE rather than a point. The swap amount is exact,
-        the fees are known from the inspected bytes, and the ATA rent is
-        conditional — it leaves the wallet only if the output token account had
-        to be created — so anything from "swap + fees" to "swap + fees + rent"
-        is fully explained. Outside that range, the runner says so rather than
-        silently accepting a move it cannot account for.
+        The SOL side is a RANGE rather than a point, and the range is exactly
+        as wide as the one genuinely unknown term. The swap amount is exact and
+        the fees are known from the inspected bytes, so "swap + fees" is the
+        FLOOR — those lamports always leave. Only the ATA rent is conditional,
+        recovered when an account Jupiter opened is closed again inside the
+        same transaction, so "swap + fees + rent" is the ceiling. Anything
+        outside is a move the runner cannot account for, and it says so.
         """
         sol_after = None
         usdc_after = None
@@ -2192,26 +2198,34 @@ class PilotRunner:
         # would widen the band exactly when the transaction got expensive,
         # which is when an unexplained move matters most.
         slack = LAMPORTS_PER_SIGNATURE
-        # The band spans "the swap alone" to "the swap plus everything the
-        # inspected bytes can charge". Its width is the rent, and that is not
-        # slop: rent is a rent-exempt DEPOSIT, and the temporary wSOL account
+        # The band's WIDTH is the ATA rent, and only the ATA rent. Rent is a
+        # rent-exempt DEPOSIT rather than a fee, and the temporary wSOL account
         # Jupiter opens is closed back to the owner inside the same
         # transaction — so whether a given account's rent comes back is a
-        # property of the route, not something knowable here. Both ends are
-        # explained; anything outside is not.
+        # property of the route, not something knowable here.
         #
-        # ``report.total_fee_lamports`` ALREADY includes the ATA rent, so it is
-        # not added a second time.
-        low = amount_lamports - slack
+        # Everything else is unconditional. The base signature fee, the
+        # priority fee and the Jito tip ALWAYS leave the wallet, so the floor
+        # is the swap plus those, not the swap alone. Anchoring the floor at
+        # the bare swap amount would have accepted a spend with zero fees —
+        # impossible on-chain, and this reconciliation is the evidence the
+        # slippage guarantee rests on, so it has to be exactly as tight as the
+        # facts allow.
+        #
+        # ``report.total_fee_lamports`` already includes the rent, hence
+        # subtracting it back out for the floor rather than adding it for the
+        # ceiling.
+        unconditional_cost = report.total_fee_lamports - ata_rent
+        low = amount_lamports + unconditional_cost - slack
         high = amount_lamports + report.total_fee_lamports + slack
         if sol_spent is None:
             mismatches.append("no post-trade SOL balance to compare against")
         elif not (low <= sol_spent <= high):
             mismatches.append(
                 f"SOL spent {sol_spent} lamports is outside the explained range "
-                f"[{low}, {high}] (swap {amount_lamports} + fees and rent "
-                f"{report.total_fee_lamports}, of which {ata_rent} is "
-                f"recoverable ATA rent)"
+                f"[{low}, {high}] (swap {amount_lamports} + unconditional "
+                f"{unconditional_cost} + up to {ata_rent} of recoverable ATA "
+                f"rent, ±{slack})"
             )
 
         on_chain_err = ((transaction or {}).get("meta") or {}).get("err")

@@ -208,7 +208,9 @@ async def test_ambiguous_submission_is_resolvable_from_the_derived_signature(
     two trades.
     """
     settings = settings_factory()
-    signed = sign_transaction(build_swap_tx().tx_b64, PAYER)
+    signed = sign_transaction(
+        build_swap_tx().tx_b64, PAYER, expected_signer=PAYER_PUBKEY
+    )
 
     async with aiohttp.ClientSession() as session:
         jito = JitoClient(settings, session)

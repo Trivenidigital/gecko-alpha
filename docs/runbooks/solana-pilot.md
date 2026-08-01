@@ -56,6 +56,12 @@ a refusal on trade day rather than as a deprecation notice. Re-run the capture
 against a live build before any future trade. This is not a one-time
 verification.
 
+### Confirm nothing prunes `pilot_evidence/`
+
+Check that no cleanup job touches it before the run — see
+[the evidence directory is operationally load-bearing](#-the-evidence-directory-is-operationally-load-bearing--do-not-prune-it).
+Losing a file there can leave a row permanently unresolvable.
+
 ### Rehearse the migration against a copy of prod
 
 `db.initialize()` runs every pending migration, and the pilot must not be the
@@ -249,18 +255,44 @@ buys revert protection at the cost of landing probability — a transaction that
 does not land resolves via blockhash expiry to `definitively_not_submitted`, and
 a fresh, fully-authorized rerun is safe.
 
+## ⚠ The evidence directory is operationally load-bearing — do not prune it
+
+**`pilot_evidence/` is not just an audit trail. Deleting from it can strand the
+lane.**
+
+`lastValidBlockHeight` lives *only* in the evidence file, not on the ledger row.
+The resolver needs it: `definitively_not_submitted` requires proving the
+blockhash expired, and without that height the proof is unavailable, so the
+verdict degrades to `unresolved` — permanently. A row in that state blocks every
+future `place` and cannot be cleared by re-running `resolve`; it needs manual
+intervention.
+
+It is stored there because `live_trades` has no column that fits a block height
+and this lane does not carry a schema migration. It fails closed — the lane
+refuses rather than trades — but the cost of losing the file is a blocked lane,
+not a lost audit record.
+
+Concretely:
+
+- **Do not** add `pilot_evidence/` to any log-rotation, tmp-cleaner or
+  retention job.
+- **Do not** delete a decision's evidence file while its `live_trades` row is
+  still `open` or `needs_manual_review`. Check with
+  `python -m scout.live.solana_pilot status` first.
+- **Do** carry `pilot_evidence/` with the database if the deployment ever moves
+  machines. The two are one unit; a database restored without its evidence
+  directory has unresolvable rows.
+- Files for rows that have reached `rejected` or have been dispositioned by
+  hand are safe to archive.
+
 ## If it goes wrong
 
 Every run writes `pilot_evidence/solana_pilot_<decision-id>.json` — one JSON
 object per step, fsynced as it goes, so it survives a crash. It records which
-database the run read, every inspector check by name with its verdict, the
-simulation result, the expected signature (before submission), the
-authorization, and the post-trade reconciliation including the
+database the run read, which key file signed, every inspector check by name with
+its verdict, the simulation result, the expected signature (before submission),
+the authorization, and the post-trade reconciliation including the
 `meets_minimum_output` comparison that is the slippage guarantee.
-
-That file is also where `lastValidBlockHeight` is persisted, which is what makes
-a stuck signature resolvable at all. Do not delete evidence files for rows that
-are still outstanding.
 
 ## After the pilot: drain and destroy
 

@@ -162,7 +162,7 @@ def _authorize(monkeypatch, typed: str | None = None) -> None:
 
 def _expected_signature(tx_b64: str) -> str:
     """The signature the runner will derive for this transaction."""
-    return sign_transaction(tx_b64, PAYER).signature
+    return sign_transaction(tx_b64, PAYER, expected_signer=PAYER_PUBKEY).signature
 
 
 def _evidence_path(tmp_path, decision_id: str):
@@ -787,14 +787,34 @@ async def test_a_failing_inspection_means_no_signature_is_ever_derived(tmp_path)
     await db.close()
 
 
-def test_the_runner_never_calls_the_signer_without_an_expected_signer():
-    """Static guarantee, checked over the AST rather than by running a path.
+def test_sign_transaction_cannot_be_called_without_an_expected_signer():
+    """*** The type-level guarantee, which is the real one. ***
 
-    ``sign_transaction(tx, keypair)`` is a valid call — ``expected_signer``
-    defaults to None, and with it the cheap guard against signing a
-    transaction built for a DIFFERENT key silently disappears. A runtime test
-    can only show that the call sites reached by that test pass it. This walks
-    every call in the module.
+    ``expected_signer`` is keyword-only with NO default, so a call that omits
+    it does not run at all. That holds for every caller in every module,
+    including ones reached through an alias or getattr — which is exactly
+    what a source-level lint cannot see.
+    """
+    import inspect
+
+    from scout.live.solana.signer import sign_transaction as real_signer
+
+    param = inspect.signature(real_signer).parameters["expected_signer"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is inspect.Parameter.empty
+
+    with pytest.raises(TypeError, match="expected_signer"):
+        real_signer(build_swap_tx().tx_b64, PAYER)
+
+
+def test_the_runner_never_calls_the_signer_without_an_expected_signer():
+    """A cheap EXTRA on top of the required keyword above, not the guarantee.
+
+    It reads only the direct-call form in this one module: an alias
+    (``_s = sign_transaction``), a ``getattr(mod, "sign_transaction")(...)``
+    and every call from another module are all invisible to it. Kept because
+    it costs nothing and localises a regression to this file, but the
+    signature is what actually enforces the rule.
     """
     import ast
     import inspect
@@ -829,8 +849,13 @@ async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
     real_sign = solana_pilot.sign_transaction
 
     def _sign_something_else(tx_b64, keypair, **kwargs):
-        signed = real_sign(build_swap_tx(tip_lamports=99_999).tx_b64, keypair)
-        return signed
+        # Signs a DIFFERENT transaction with the same key, so the signature
+        # is valid and the digest simply does not match what was inspected.
+        return real_sign(
+            build_swap_tx(tip_lamports=99_999).tx_b64,
+            keypair,
+            expected_signer=PAYER_PUBKEY,
+        )
 
     monkeypatch.setattr(solana_pilot, "sign_transaction", _sign_something_else)
     _authorize(monkeypatch, "whatever")
@@ -1377,6 +1402,86 @@ async def test_reconciliation_records_the_minimum_output_comparison(
     await db.close()
 
 
+async def test_the_explained_sol_band_is_exactly_as_wide_as_the_rent(
+    tmp_path, monkeypatch
+):
+    """*** Both ends of the band, for both ATA cases. ***
+
+    The floor is the swap plus the UNCONDITIONAL costs — base signature fee,
+    priority fee and tip always leave the wallet. Anchoring it at the bare
+    swap amount would accept a spend with zero fees paid, which cannot happen
+    on-chain; and this reconciliation is the evidence the slippage guarantee
+    rests on, so it has to be as tight as the facts allow.
+
+    The ceiling adds the ATA rent, the one genuinely conditional term — it
+    comes back when an account Jupiter opened is closed inside the same
+    transaction. So the band's WIDTH is the rent, and nothing else.
+    """
+    unconditional = _BASE_FEE + _PRIORITY_FEE + _TIP  # 105_200
+
+    async def _band(tx_b64, *, sol_after, workdir):
+        # A landed swap leaves an `open` row on purpose, and that row blocks
+        # the next placement — so each case gets its own database rather than
+        # having its predecessor's position deleted out from under it.
+        workdir.mkdir()
+        _authorize(monkeypatch, _expected_signature(tx_b64)[:8])
+        runner, db, session = await _make_runner(workdir)
+        with aioresponses() as m:
+            _mock_quote_and_build(m, tx_b64)
+            _mock_pre_approval_rpc(m)
+            _mock_post_approval_rpc(m)
+            m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx_b64)))
+            _mock_settlement_rpc(m, sol_after=sol_after)
+            assert await runner.place(sol=_SOL) == EXIT_OK
+        record = _step(_steps(workdir), "reconciliation")
+        await session.close()
+        await db.close()
+        return record
+
+    # One ATA create: the rent widens the ceiling but not the floor.
+    creates = await _band(
+        build_swap_tx().tx_b64, sol_after=_SOL_AFTER, workdir=tmp_path / "creates"
+    )
+    low, high = creates["balance"]["sol_spent_explained_range"]
+    assert low == _LAMPORTS + unconditional - _BASE_FEE
+    assert high == _LAMPORTS + unconditional + _ATA_RENT + _BASE_FEE
+    assert (low, high) == (50_100_200, 52_149_480)
+    assert creates["verdict"] == "pass"
+
+    # No ATA create: the band collapses to the slack on either side.
+    exists_tx = build_swap_tx(include_wrap_primitives=False).tx_b64
+    exists = await _band(
+        exists_tx,
+        sol_after=_SOL_BEFORE - _LAMPORTS - unconditional,
+        workdir=tmp_path / "exists",
+    )
+    low, high = exists["balance"]["sol_spent_explained_range"]
+    assert (low, high) == (50_100_200, 50_110_200)
+    assert high - low == 2 * _BASE_FEE  # width is the rent (zero) + slack
+    assert exists["verdict"] == "pass"
+
+
+async def test_a_spend_with_no_fees_paid_is_not_explained(tmp_path, monkeypatch):
+    """The defect the old floor admitted: swap amount, zero fees, `pass`."""
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx)))
+        # Exactly the swap amount left the wallet and nothing else, which
+        # no real transaction can do.
+        _mock_settlement_rpc(m, sol_after=_SOL_BEFORE - _LAMPORTS)
+        assert await runner.place(sol=_SOL) == EXIT_REVIEW
+    record = _step(_steps(tmp_path), "reconciliation")
+    assert record["verdict"] == "review"
+    assert any("outside the explained range" in m for m in record["mismatches"])
+    await session.close()
+    await db.close()
+
+
 async def test_reconciliation_reviews_an_unexplained_balance_move(
     tmp_path, monkeypatch
 ):
@@ -1807,10 +1912,14 @@ async def test_evidence_is_jsonlines_carries_the_signature_and_leaks_no_key(
     assert names.index("signed_in_memory") < names.index("submitted")
     assert signature in raw
 
-    # No key material anywhere. The path is redacted by the scrubber; the
-    # secret bytes were never handled by this module at all.
+    # No key MATERIAL anywhere — the secret bytes are never handled by this
+    # module at all. The key FILE's path is recorded on purpose: it is not a
+    # secret, and an evidence pack that cannot say which key signed has lost
+    # provenance for nothing.
     assert _PLANTED_KEY_BYTES not in raw
-    assert _PLANTED_KEYPAIR_PATH not in raw
+    custody = _step(steps, "keypair_custody")
+    assert custody["signing_key_file"] == _PLANTED_KEYPAIR_PATH
+    assert custody["signer_pubkey"] == PAYER_PUBKEY
     await session.close()
     await db.close()
 

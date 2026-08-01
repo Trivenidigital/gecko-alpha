@@ -159,7 +159,7 @@ def test_signature_is_over_the_version_prefixed_message():
     """Signing the UNPREFIXED message is the trap; pin the correct payload."""
     built = build_swap_tx()
     message = built.transaction.message
-    signed = sign_transaction(built.tx_b64, PAYER)
+    signed = sign_transaction(built.tx_b64, PAYER, expected_signer=PAYER_PUBKEY)
 
     correct = PAYER.sign_message(to_bytes_versioned(message))
     wrong = PAYER.sign_message(bytes(message))
@@ -171,7 +171,7 @@ def test_signature_is_over_the_version_prefixed_message():
 
 def test_signed_transaction_verifies():
     built = build_swap_tx()
-    signed = sign_transaction(built.tx_b64, PAYER)
+    signed = sign_transaction(built.tx_b64, PAYER, expected_signer=PAYER_PUBKEY)
     restored = VersionedTransaction.from_bytes(base64.b64decode(signed.signed_tx_b64))
     assert all(restored.verify_with_results())
 
@@ -182,8 +182,8 @@ def test_signature_is_derivable_before_submission_and_is_stable():
     This is what licenses persisting the signature pre-submission.
     """
     built = build_swap_tx()
-    first = sign_transaction(built.tx_b64, PAYER)
-    second = sign_transaction(built.tx_b64, PAYER)
+    first = sign_transaction(built.tx_b64, PAYER, expected_signer=PAYER_PUBKEY)
+    second = sign_transaction(built.tx_b64, PAYER, expected_signer=PAYER_PUBKEY)
     assert first.signature == second.signature
     assert first.message_sha256 == second.message_sha256
 
@@ -196,11 +196,11 @@ def test_sign_refuses_mismatched_expected_signer():
 
 def test_sign_refuses_undeserialisable_transaction():
     with pytest.raises(SolanaKeypairError, match="could not be deserialised"):
-        sign_transaction("!!!not base64!!!", PAYER)
+        sign_transaction("!!!not base64!!!", PAYER, expected_signer=PAYER_PUBKEY)
 
 
 def test_signed_transaction_repr_hides_raw_bytes():
     """Evidence records get repr'd; raw bytes must not ride along."""
     built = build_swap_tx()
-    signed = sign_transaction(built.tx_b64, PAYER)
+    signed = sign_transaction(built.tx_b64, PAYER, expected_signer=PAYER_PUBKEY)
     assert "signed_tx_bytes" not in repr(signed)

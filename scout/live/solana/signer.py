@@ -197,7 +197,7 @@ def load_keypair(settings: Settings, *, path: str | None = None) -> Keypair:
 
 
 def sign_transaction(
-    tx_b64: str, keypair: Keypair, *, expected_signer: str | None = None
+    tx_b64: str, keypair: Keypair, *, expected_signer: str
 ) -> SignedTransaction:
     """Sign a base64 transaction locally and derive its signature.
 
@@ -207,10 +207,19 @@ def sign_transaction(
     happened when a submission's outcome is unknown.
 
     Args:
-        expected_signer: if given, the keypair's pubkey must equal it. Cheap
-            guard against signing with a key that is not the one the
-            transaction was BUILT for, which would otherwise surface as an
-            opaque on-chain signature-verification failure.
+        expected_signer: base58 pubkey the transaction was BUILT for. The
+            keypair's own pubkey must equal it.
+
+            REQUIRED, keyword-only, and deliberately without a default. This
+            function holds the private key, and the caller is the only thing
+            that knows which transaction the key is supposed to be signing —
+            so "which key did you mean" cannot be optional. With a default of
+            None the guard silently disappeared for every caller that forgot
+            it, and the failure surfaced later as an opaque on-chain
+            signature-verification error rather than here. A required
+            keyword-only parameter is a guarantee the type system enforces on
+            every call site in every module, which a lint over one module's
+            AST cannot be.
 
     Raises:
         SolanaKeypairError: keypair does not match ``expected_signer``, or the
@@ -219,7 +228,7 @@ def sign_transaction(
     import base64
 
     pubkey = str(keypair.pubkey())
-    if expected_signer is not None and pubkey != expected_signer:
+    if pubkey != expected_signer:
         raise SolanaKeypairError(
             f"loaded keypair {pubkey} does not match the expected signer "
             f"{expected_signer}; refusing to sign"
