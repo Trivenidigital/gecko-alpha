@@ -1377,6 +1377,138 @@ class Settings(BaseSettings):
     # band for the post-trade balance reconciliation.
     KRAKEN_PILOT_FEE_HEADROOM_PCT: float = 1.0
 
+    # -------- Solana execution lane (PR-S1, 2026-07-31) --------
+    # Venue-client layer for the supervised SOL->USDC swap
+    # (scout.live.solana). Every default is the refusing or the read-only one.
+    #
+    # *** SOLANA_RPC_URL IS READ-ONLY. ***
+    # The lane NEVER broadcasts through it. scout.live.solana.rpc_client
+    # deliberately implements no send_transaction method at all — the only
+    # submission path is the Jito block engine, and that is a structural
+    # guarantee (there is no code to call) rather than a policy one. Reads and
+    # simulation through this URL are expected and safe; a public RPC is fine
+    # for both. If you are adding a broadcast method here, stop.
+    SOLANA_RPC_URL: str = "https://api.mainnet-beta.solana.com"
+    # *** THE RESOLVER'S ENDPOINT MUST BE A SINGLE CONSISTENT NODE. ***
+    # scout.live.solana.resolver reaches `definitively_not_submitted` — the one
+    # verdict that licenses clearing the lane and rebuilding — by combining two
+    # facts: the signature is absent, AND the current block height has passed
+    # lastValidBlockHeight. Read from a LOAD-BALANCED endpoint those two facts
+    # can come from different nodes, and a node that is simultaneously ahead on
+    # height and behind on (or missing) the signature status produces a FALSE
+    # definitively_not_submitted. The runner would then retire a live row and
+    # invite a rerun: two swaps where the operator authorised one.
+    #
+    # api.mainnet-beta.solana.com is exactly such a round-robin. Point this at
+    # a single dedicated node (Helius, Triton, QuickNode, your own validator).
+    # Empty means "use SOLANA_RPC_URL", which the runner accepts only when that
+    # URL is not itself a known round-robin — see
+    # scout.live.solana_pilot.resolver_endpoint.
+    SOLANA_RESOLVER_RPC_URL: str = ""
+    # Age-derived blockhash expiry, bounded on BOTH sides.
+    #
+    # A Solana blockhash is valid for at most 150 slots (~60-90s), so a
+    # sufficiently old ledger row has provably expired whatever height was
+    # recorded for it — which lets a row resolve from `created_at` alone when
+    # its evidence file is gone. Below MIN, age proves nothing and the runner
+    # falls back to the evidence file's lastValidBlockHeight.
+    #
+    # The MAX bound is the one that keeps this safe. `getSignatureStatuses`
+    # with searchTransactionHistory only reaches as far back as the node
+    # retains ledger history; past that, a LANDED transaction reads as absent.
+    # Absent plus provably-expired would then auto-retire a row whose swap
+    # actually executed — the single outcome the resolver exists to prevent.
+    # So beyond MAX the verdict is forced to `unresolved` and the row waits for
+    # a human. Lower MAX if your RPC provider's history window is shorter.
+    SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC: float = 3600.0
+    SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC: float = 86400.0
+    # Path to a Solana CLI id.json (a 64-byte secret-key array). The RUNNER
+    # loads it at call time; the key itself is NEVER config, never an env var,
+    # never in argv. scout.live.solana.signer refuses the file unless its mode
+    # is 0600 and its owner is the current uid.
+    SOLANA_PILOT_KEYPAIR_PATH: str = ""
+    # Jupiter Swap API. Overridable so tests / a staging proxy can retarget it.
+    JUPITER_API_BASE: str = "https://api.jup.ag/swap/v1"
+    # Optional. Jupiter serves a keyless tier at 0.5 req/sec; a free portal key
+    # raises that and is sent as the `x-api-key` header when set.
+    JUPITER_API_KEY: SecretStr | None = None
+    JITO_BLOCK_ENGINE_URL: str = "https://mainnet.block-engine.jito.wtf"
+    SOLANA_HTTP_TIMEOUT_SEC: float = 15.0
+
+    # Ceilings enforced by tx_inspector against the transaction Jupiter built.
+    # These are not requests to Jupiter — they are the limits above which we
+    # refuse to SIGN what came back, which is what makes them meaningful: a
+    # remotely-built transaction is only as safe as the checks we run on it.
+    SOLANA_PILOT_SLIPPAGE_BPS: int = 100
+    SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS: int = 1_000_000
+    SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS: int = 1_000_000
+    # Ceiling on base signature fee + priority fee + Jito tip + ATA RENT
+    # combined. Caps every lamport the transaction moves out of the wallet
+    # independently of how it is split, so a build that respects each
+    # component ceiling but stacks them still fails.
+    #
+    # 8_500_000 covers the worst case the inspector can price — 3 ATA creates
+    # at the maximum component ceilings: 3 x 2,039,280 + priority 1,000,000 +
+    # tip 1,000,000 + base 5,000 = 8,122,840 — with headroom. That is ~0.0085
+    # SOL (~$1.30 at $150/SOL), trivial absolute exposure against a $5-10
+    # trade, and loosening the aggregate loosens no individual lever: the
+    # priority and tip ceilings still bind on their own.
+    #
+    # Most of the rent comes back. It is a rent-exempt DEPOSIT rather than a
+    # fee, and the temporary wSOL account Jupiter opens is closed to the owner
+    # at the end of the swap — but the lamports must be available while the
+    # transaction runs, so the ceiling and the balance gate both count them.
+    SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS: int = 8_500_000
+    # How many associated-token-account creations a single build may pay for.
+    # Used by the config floor below; a first-ever SOL->USDC swap plausibly
+    # creates two (wSOL + USDC), and 3 leaves room for a route that opens an
+    # intermediate.
+    SOLANA_PILOT_MAX_ATA_CREATES: int = 3
+    SOLANA_PILOT_MIN_ORDER_USD: float = 5.0
+    SOLANA_PILOT_MAX_ORDER_USD: float = 10.0
+    # Settle delay between the two sweeps that resolve an ambiguous
+    # submission. Same rationale as KRAKEN_SUBMISSION_SETTLE_SEC above: a
+    # just-forwarded transaction is briefly unknown to the RPC's signature
+    # cache, and "definitively not submitted" is the verdict that tells an
+    # operator a rebuild is safe — so a propagation window must never be read
+    # as an absence.
+    SOLANA_SUBMISSION_SETTLE_SEC: float = 5.0
+
+    # -------- Solana supervised pilot runner (PR-S2, 2026-07-31) --------
+    # The mechanical envelope around the ONE operator-invoked supervised swap
+    # (scout.live.solana_pilot). Same posture as the Kraken pilot block above:
+    # every default is the refusing one, and none of these gate the
+    # signal-driven live engine.
+    SOLANA_PILOT_ENABLED: bool = False
+    # Tip REQUESTED from Jupiter via prioritizationFeeLamports.jitoTipLamports.
+    # A request, not a guarantee: tx_inspector re-derives the tip actually
+    # compiled into the transaction and enforces
+    # SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS against that. Jito's documented
+    # minimum is 1000 lamports and warns it "might not be sufficient" under
+    # load; 100_000 buys a realistic chance of landing on a $7 swap while
+    # staying two orders of magnitude under the ceiling.
+    SOLANA_PILOT_JITO_TIP_LAMPORTS: int = 100_000
+    # Ceiling on the quote's own priceImpactPct, expressed in PERCENT.
+    # Jupiter reports the field as a decimal FRACTION ("0.0025" = 0.25%), so
+    # the runner multiplies by 100 before comparing — see
+    # scout.live.solana_pilot._quote_price_impact_pct.
+    SOLANA_PILOT_MAX_PRICE_IMPACT_PCT: float = 1.0
+    # Safety margin, in blocks, subtracted from lastValidBlockHeight when the
+    # runner re-checks blockhash validity immediately after the operator
+    # authorizes. A transaction whose blockhash expires between authorization
+    # and landing is not dangerous, but it burns the authorization: the margin
+    # means the runner refuses a build that is about to expire rather than
+    # submitting one that almost certainly cannot land.
+    SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS: int = 15
+    SOLANA_PILOT_EVIDENCE_DIR: str = "pilot_evidence"
+    SOLANA_PILOT_CONFIRM_TIMEOUT_SEC: float = 90.0
+    SOLANA_PILOT_FINALIZE_TIMEOUT_SEC: float = 90.0
+    # Poll interval for the confirm / finalize waits. Mirrors
+    # KRAKEN_FILL_POLL_INTERVAL_SEC; kept separate from
+    # SOLANA_SUBMISSION_SETTLE_SEC because that value is the resolver's
+    # between-sweeps delay and the two are tuned against different questions.
+    SOLANA_PILOT_POLL_INTERVAL_SEC: float = 2.0
+
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
     FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT: float = 30.0
@@ -1935,6 +2067,146 @@ class Settings(BaseSettings):
                 f"daily_gross={self.KRAKEN_PILOT_MAX_DAILY_GROSS_USD}. A single "
                 "max-sized order would breach the daily ceiling."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_solana_pilot_caps(self) -> "Settings":
+        """PR-S1: the Solana lane's notional and fee ceilings must be coherent.
+
+        Same shape as ``_validate_kraken_pilot_caps`` above. The fee clause is
+        the one that matters most: if the combined ceiling is below what the
+        component ceilings plus the protocol's own base signature fee can
+        produce, ``tx_inspector`` rejects every transaction Jupiter builds and
+        the failure shows up as "the lane never trades" on pilot day rather
+        than as a config error now.
+        """
+        if self.SOLANA_PILOT_MIN_ORDER_USD > self.SOLANA_PILOT_MAX_ORDER_USD:
+            raise ValueError(
+                "SOLANA_PILOT_MIN_ORDER_USD must be <= SOLANA_PILOT_MAX_ORDER_USD; "
+                f"got min={self.SOLANA_PILOT_MIN_ORDER_USD}, "
+                f"max={self.SOLANA_PILOT_MAX_ORDER_USD}. No order size satisfies "
+                "both bounds."
+            )
+        if not 0 < self.SOLANA_PILOT_SLIPPAGE_BPS <= 10_000:
+            raise ValueError(
+                "SOLANA_PILOT_SLIPPAGE_BPS must be in (0, 10000]; "
+                f"got={self.SOLANA_PILOT_SLIPPAGE_BPS}. Zero slippage cannot "
+                "route and >100% is not a bound."
+            )
+        for name in (
+            "SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS",
+            "SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS",
+            "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        for name in (
+            "SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC",
+            "SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        if (
+            self.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC
+            >= self.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC
+        ):
+            raise ValueError(
+                "SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC must be < "
+                "SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC; got "
+                f"min={self.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC}, "
+                f"max={self.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC}. An empty or "
+                "inverted window means age can never establish expiry, so a row "
+                "whose evidence file is gone could never self-resolve."
+            )
+        if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "
+                f"got={self.SOLANA_PILOT_MAX_ATA_CREATES}"
+            )
+        # The total-fee ceiling now bounds every lamport the transaction moves
+        # out of the wallet, not just the fees: tx_inspector counts ATA rent
+        # against it. So the floor has to include the rent a legitimate build
+        # can charge, or the ceiling is set below what any real swap produces
+        # and the lane refuses everything.
+        #
+        # 5000 lamports = the protocol's base fee for the pilot's single
+        # required signature (scout.live.solana.constants.LAMPORTS_PER_SIGNATURE).
+        # 2039280 = the rent-exempt minimum for a 165-byte SPL token account
+        # (scout.live.solana.constants.ATA_RENT_LAMPORTS_FALLBACK). Both are
+        # inlined rather than imported to keep config free of a scout.live
+        # dependency; the constants module is the source of truth.
+        base_fee = 5_000
+        ata_rent_floor = self.SOLANA_PILOT_MAX_ATA_CREATES * 2_039_280
+        floor = (
+            self.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS
+            + self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS
+            + base_fee
+            + ata_rent_floor
+        )
+        if self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS < floor:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS is below what a legitimate "
+                "build can cost, so no swap could ever pass inspection. "
+                f"got total={self.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS}, "
+                f"required>={floor} = priority "
+                f"{self.SOLANA_PILOT_MAX_PRIORITY_FEE_LAMPORTS} + tip "
+                f"{self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS} + base signature fee "
+                f"{base_fee} + ATA rent {ata_rent_floor} "
+                f"({self.SOLANA_PILOT_MAX_ATA_CREATES} accounts x 2039280). "
+                "Lower SOLANA_PILOT_MAX_ATA_CREATES or the component ceilings "
+                "if you want a tighter total."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_solana_pilot_runner(self) -> "Settings":
+        """PR-S2: the runner's envelope must be able to produce a live trade.
+
+        Every clause here fails at config load rather than as "the lane never
+        trades" on pilot day — the same failure shape
+        ``_validate_solana_pilot_caps`` above exists to prevent. The tip clause
+        is the sharpest: ``jupiter_client.build_swap_transaction`` raises on a
+        requested tip above ``SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS`` BEFORE it
+        calls Jupiter, so an inverted pair means every build attempt dies.
+        """
+        tip = self.SOLANA_PILOT_JITO_TIP_LAMPORTS
+        if tip > self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS:
+            raise ValueError(
+                "SOLANA_PILOT_JITO_TIP_LAMPORTS must be <= "
+                "SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS; got "
+                f"tip={tip}, ceiling={self.SOLANA_PILOT_MAX_JITO_TIP_LAMPORTS}. "
+                "The build refuses a tip over the ceiling before it is even "
+                "requested, so no swap could ever be constructed."
+            )
+        # 1000 lamports = Jito's documented minimum tip
+        # (scout.live.solana.constants.JITO_MIN_TIP_LAMPORTS). Below it the
+        # auction will not pick the transaction up, so the lane would build,
+        # inspect, sign and submit something that cannot land.
+        if tip < 1_000:
+            raise ValueError(
+                f"SOLANA_PILOT_JITO_TIP_LAMPORTS must be >= 1000; got {tip}. "
+                "Jito's minimum tip is 1000 lamports and a transaction below "
+                "it will not be picked up by the auction."
+            )
+        if not 0 < self.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT <= 100:
+            raise ValueError(
+                "SOLANA_PILOT_MAX_PRICE_IMPACT_PCT must be in (0, 100]; got "
+                f"{self.SOLANA_PILOT_MAX_PRICE_IMPACT_PCT}. Zero admits no "
+                "route and >100% is not a bound."
+            )
+        if self.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS < 0:
+            raise ValueError(
+                "SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS must be >= 0; got "
+                f"{self.SOLANA_PILOT_BLOCKHASH_SAFETY_MARGIN_BLOCKS}. A negative "
+                "margin would extend the authorization past blockhash expiry."
+            )
+        for name in (
+            "SOLANA_PILOT_CONFIRM_TIMEOUT_SEC",
+            "SOLANA_PILOT_FINALIZE_TIMEOUT_SEC",
+            "SOLANA_PILOT_POLL_INTERVAL_SEC",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
         return self
 
     @field_validator("PEAK_FADE_RETRACE_RATIO")
