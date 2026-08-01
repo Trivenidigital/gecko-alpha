@@ -367,6 +367,7 @@ async def _seed_solana_row(
     signature: str | None,
     status: str = "open",
     size_usd: str = "8.52",
+    age_seconds: float = 0.0,
 ) -> int:
     anchor = await solana_pilot.ensure_pilot_anchor(db)
     async with db._txn_lock:
@@ -382,7 +383,9 @@ async def _seed_solana_row(
                 status,
                 decision_id,
                 signature,
-                datetime.now(timezone.utc).isoformat(),
+                (
+                    datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+                ).isoformat(),
             ),
         )
         await db._conn.commit()
@@ -1788,6 +1791,282 @@ async def test_a_row_without_a_signature_blocks_rather_than_being_repaired(tmp_p
         assert await runner.place(sol=_SOL) == EXIT_BLOCKED
         assert _submissions(m) == []
         assert list(m.requests) == []
+    await session.close()
+    await db.close()
+
+
+# ======================================================================
+# Age-derived blockhash expiry — bounded on both sides
+# ======================================================================
+def _report(verdict, *, outcomes=("absent",), lvbh=None):
+    from scout.live.solana.resolver import ResolutionProbe, ResolutionReport
+
+    return ResolutionReport(
+        verdict=verdict,
+        signature="5sig",
+        last_valid_block_height=lvbh,
+        probes=tuple(
+            ResolutionProbe(sweep=i, outcome=o) for i, o in enumerate(outcomes)
+        ),
+        checked_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def test_row_age_refuses_to_guess(tmp_path):
+    """An age that cannot be established must not license retiring a row."""
+    now = datetime.now(timezone.utc)
+    assert solana_pilot.row_age_seconds(None) is None
+    assert solana_pilot.row_age_seconds("") is None
+    assert solana_pilot.row_age_seconds("not-a-timestamp") is None
+    # Naive timestamps are of unknown origin — every writer here stamps UTC.
+    assert solana_pilot.row_age_seconds("2026-07-31T12:00:00") is None
+    aged = (now - timedelta(hours=2)).isoformat()
+    assert solana_pilot.row_age_seconds(aged, now=now) == pytest.approx(7200, abs=2)
+
+
+def test_age_policy_regimes(tmp_path):
+    """The three regimes, and the two that must never clear a row."""
+    settings = _settings(tmp_path)
+    absent = _report("unresolved")
+
+    # Too young: age proves nothing, so the resolver's answer stands.
+    young = solana_pilot.apply_age_policy(
+        absent, age_seconds=600, settings=settings, had_evidence_height=False
+    )
+    assert young.verdict == "unresolved"
+    assert young.expiry_source is None
+
+    # Inside the window: age alone establishes expiry.
+    inside = solana_pilot.apply_age_policy(
+        absent, age_seconds=7200, settings=settings, had_evidence_height=False
+    )
+    assert inside.verdict == "definitively_not_submitted"
+    assert inside.expiry_source == "row_age"
+    assert inside.clears_the_lane is True
+
+    # Past the history window: absence stops being evidence.
+    stale = solana_pilot.apply_age_policy(
+        absent, age_seconds=200_000, settings=settings, had_evidence_height=False
+    )
+    assert stale.verdict == "unresolved"
+    assert stale.reason == "history_window_exceeded"
+    assert stale.clears_the_lane is False
+
+    # ...even when the evidence file DID prove expiry. A landed transaction
+    # past the history window reads as absent, and that is the one outcome
+    # the resolver exists to prevent.
+    proven = _report("definitively_not_submitted", lvbh=_LAST_VALID)
+    assert (
+        solana_pilot.apply_age_policy(
+            proven, age_seconds=200_000, settings=settings, had_evidence_height=True
+        ).reason
+        == "history_window_exceeded"
+    )
+
+    # A recorded height is the fresher, more specific fact; age must not
+    # overrule it when it says the transaction can still land.
+    assert (
+        solana_pilot.apply_age_policy(
+            absent, age_seconds=7200, settings=settings, had_evidence_height=True
+        ).verdict
+        == "unresolved"
+    )
+
+    # Presence is trustworthy at any age — the window bounds what ABSENCE
+    # means, not what presence means.
+    for verdict in ("landed", "failed_on_chain"):
+        carried = solana_pilot.apply_age_policy(
+            _report(verdict, outcomes=(verdict,)),
+            age_seconds=200_000,
+            settings=settings,
+            had_evidence_height=False,
+        )
+        assert carried.verdict == verdict
+        assert carried.reason is None
+
+    # A probe that ERRORED is "we could not look", not "it is not there".
+    errored = _report("unresolved", outcomes=("error",))
+    assert (
+        solana_pilot.apply_age_policy(
+            errored, age_seconds=7200, settings=settings, had_evidence_height=False
+        ).verdict
+        == "unresolved"
+    )
+
+
+async def test_a_row_inside_the_window_resolves_without_its_evidence_file(
+    tmp_path, capsys
+):
+    """*** The case age-based expiry exists for. ***
+
+    The evidence file is gone, so lastValidBlockHeight is unavailable and the
+    resolver alone can only say `unresolved` — which would block the lane for
+    good. `created_at` is on the row, a blockhash lives at most 150 slots, so
+    a two-hour-old row has provably expired whatever height it carried.
+    """
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688b"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, age_seconds=7200
+    )
+    # Deliberately NO intent evidence written — this is the pruned-directory
+    # case, and it must still resolve.
+    assert (
+        solana_pilot.read_persisted_intent(tmp_path / "evidence", decision_id) is None
+    )
+
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_sig_status(known=False))
+        m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+
+    record = _step(_steps(tmp_path), "resolution")
+    assert record["verdict"] == "unresolved"  # what the cluster alone could say
+    assert record["lane_verdict"] == "definitively_not_submitted"
+    assert record["expiry_source"] == "row_age"
+    assert record["last_valid_block_height_source"] == "unavailable"
+    assert (await _row(db, decision_id))["status"] == "rejected"
+    assert "definitively_not_submitted" in capsys.readouterr().out
+    await session.close()
+    await db.close()
+
+
+async def test_a_row_below_the_lower_bound_falls_back_to_the_evidence_file(tmp_path):
+    """Too young for age to prove anything — the recorded height decides."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688c"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, age_seconds=600
+    )
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+    with aioresponses() as m:
+        for _ in range(2):
+            m.post(_RPC_URL, payload=_sig_status(known=False))
+            m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+
+    record = _step(_steps(tmp_path), "resolution")
+    assert record["expiry_source"] == "evidence_last_valid_block_height"
+    assert record["lane_verdict"] == "definitively_not_submitted"
+    assert (await _row(db, decision_id))["status"] == "rejected"
+    await session.close()
+    await db.close()
+
+
+async def test_a_young_row_without_an_evidence_file_still_blocks(tmp_path):
+    """Neither source can establish expiry, so nothing is retired."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688d"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, age_seconds=600
+    )
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_sig_status(known=False))
+        m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_ESCALATE
+    record = _step(_steps(tmp_path), "resolution")
+    assert record["lane_verdict"] == "unresolved"
+    assert record["expiry_source"] is None
+    assert (await _row(db, decision_id))["status"] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_past_the_history_window_absence_is_no_longer_evidence(tmp_path, capsys):
+    """*** The bound that makes age-based expiry safe. ***
+
+    searchTransactionHistory only reaches as far back as the node keeps
+    ledger history. Past that, a swap that LANDED reads exactly like one that
+    never existed — so retiring the row here would be the precise failure the
+    resolver exists to prevent.
+    """
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688e"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, age_seconds=200_000
+    )
+    # Even WITH a recorded height that proves expiry, the row must not clear.
+    _write_intent_evidence(
+        tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
+    )
+    with aioresponses() as m:
+        for _ in range(2):
+            m.post(_RPC_URL, payload=_sig_status(known=False))
+            m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_ESCALATE
+
+    record = _step(_steps(tmp_path), "resolution")
+    assert record["verdict"] == "definitively_not_submitted"  # cluster's view
+    assert record["lane_verdict"] == "unresolved"  # what we may act on
+    assert record["age_policy_reason"] == "history_window_exceeded"
+    assert _step(_steps(tmp_path), "row_auto_retired") is None
+    assert (await _row(db, decision_id))["status"] == "open"
+    out = capsys.readouterr().out
+    assert "history-history" not in out  # sanity: no duplicated phrasing
+    assert "older than the node's transaction-history" in out
+    await session.close()
+    await db.close()
+
+
+async def test_age_derived_expiry_still_requires_a_pinned_endpoint(tmp_path):
+    """Age establishes expiry; it does not make a load-balanced read safe."""
+    signature = _expected_signature(build_swap_tx().tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a0688f"
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
+    )
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=signature, age_seconds=7200
+    )
+    with aioresponses() as m:
+        m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
+        m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+        assert await runner.resolve(decision_id=decision_id) == EXIT_OK
+
+    steps = _steps(tmp_path)
+    assert _step(steps, "resolution")["lane_verdict"] == "definitively_not_submitted"
+    assert _step(steps, "resolution")["expiry_source"] == "row_age"
+    assert _step(steps, "auto_retire_withheld") is not None
+    assert _step(steps, "row_auto_retired") is None
+    assert (await _row(db, decision_id))["status"] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_startup_reconciliation_clears_an_aged_row_without_evidence(
+    tmp_path, monkeypatch
+):
+    """The lane unblocks itself on the next `place`, not just via `resolve`."""
+    tx = build_swap_tx().tx_b64
+    stale_sig = _expected_signature(build_swap_tx(tip_lamports=98_765).tx_b64)
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a06890"
+    runner, db, session = await _make_runner(tmp_path)
+    await _seed_solana_row(
+        db, decision_id=decision_id, signature=stale_sig, age_seconds=7200
+    )
+    _authorize(monkeypatch, None)  # stop at the approval boundary
+
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_sig_status(known=False))
+        m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        # Lane cleared, so the run reached the approval prompt and stopped
+        # there on a closed stdin.
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+
+    reconciliation = _step(_steps(tmp_path), "startup_reconciliation")
+    assert reconciliation["blocker_count"] == 0
+    row = reconciliation["rows"][0]
+    assert row["resolution"]["expiry_source"] == "row_age"
+    assert row["auto_retired"] is True
+    assert (await _row(db, decision_id))["status"] == "rejected"
     await session.close()
     await db.close()
 

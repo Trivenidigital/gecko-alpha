@@ -1405,6 +1405,23 @@ class Settings(BaseSettings):
     # URL is not itself a known round-robin — see
     # scout.live.solana_pilot.resolver_endpoint.
     SOLANA_RESOLVER_RPC_URL: str = ""
+    # Age-derived blockhash expiry, bounded on BOTH sides.
+    #
+    # A Solana blockhash is valid for at most 150 slots (~60-90s), so a
+    # sufficiently old ledger row has provably expired whatever height was
+    # recorded for it — which lets a row resolve from `created_at` alone when
+    # its evidence file is gone. Below MIN, age proves nothing and the runner
+    # falls back to the evidence file's lastValidBlockHeight.
+    #
+    # The MAX bound is the one that keeps this safe. `getSignatureStatuses`
+    # with searchTransactionHistory only reaches as far back as the node
+    # retains ledger history; past that, a LANDED transaction reads as absent.
+    # Absent plus provably-expired would then auto-retire a row whose swap
+    # actually executed — the single outcome the resolver exists to prevent.
+    # So beyond MAX the verdict is forced to `unresolved` and the row waits for
+    # a human. Lower MAX if your RPC provider's history window is shorter.
+    SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC: float = 3600.0
+    SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC: float = 86400.0
     # Path to a Solana CLI id.json (a 64-byte secret-key array). The RUNNER
     # loads it at call time; the key itself is NEVER config, never an env var,
     # never in argv. scout.live.solana.signer refuses the file unless its mode
@@ -2083,6 +2100,24 @@ class Settings(BaseSettings):
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        for name in (
+            "SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC",
+            "SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0; got={getattr(self, name)}")
+        if (
+            self.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC
+            >= self.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC
+        ):
+            raise ValueError(
+                "SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC must be < "
+                "SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC; got "
+                f"min={self.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC}, "
+                f"max={self.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC}. An empty or "
+                "inverted window means age can never establish expiry, so a row "
+                "whose evidence file is gone could never self-resolve."
+            )
         if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
             raise ValueError(
                 "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "

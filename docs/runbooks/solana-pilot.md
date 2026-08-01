@@ -59,8 +59,9 @@ verification.
 ### Confirm nothing prunes `pilot_evidence/`
 
 Check that no cleanup job touches it before the run — see
-[the evidence directory is operationally load-bearing](#-the-evidence-directory-is-operationally-load-bearing--do-not-prune-it).
-Losing a file there can leave a row permanently unresolvable.
+[the evidence directory is the audit record](#the-evidence-directory-is-the-audit-record--keep-it).
+Losing a file costs the audit record and narrows recovery of that row to a
+24-hour window.
 
 ### Rehearse the migration against a copy of prod
 
@@ -255,35 +256,45 @@ buys revert protection at the cost of landing probability — a transaction that
 does not land resolves via blockhash expiry to `definitively_not_submitted`, and
 a fresh, fully-authorized rerun is safe.
 
-## ⚠ The evidence directory is operationally load-bearing — do not prune it
+## The evidence directory is the audit record — keep it
 
-**`pilot_evidence/` is not just an audit trail. Deleting from it can strand the
-lane.**
+`pilot_evidence/` holds the only complete account of what each run did. Keep it
+for that reason alone.
 
-`lastValidBlockHeight` lives *only* in the evidence file, not on the ledger row.
-The resolver needs it: `definitively_not_submitted` requires proving the
-blockhash expired, and without that height the proof is unavailable, so the
-verdict degrades to `unresolved` — permanently. A row in that state blocks every
-future `place` and cannot be cleared by re-running `resolve`; it needs manual
-intervention.
+It also carries `lastValidBlockHeight`, which the resolver uses to prove a
+blockhash expired. That figure is not on the ledger row — `live_trades` has no
+column that fits a block height, and this lane does not carry a schema
+migration.
 
-It is stored there because `live_trades` has no column that fits a block height
-and this lane does not carry a schema migration. It fails closed — the lane
-refuses rather than trades — but the cost of losing the file is a blocked lane,
-not a lost audit record.
+**Losing a file is recoverable, but only inside a window.** A row whose evidence
+is gone falls back to age-derived expiry: a blockhash is valid for at most 150
+slots (~60-90 seconds), so a row older than `SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC`
+(default 1 hour) has provably expired whatever height it carried, and `resolve`
+clears it from `created_at` alone.
 
-Concretely:
+That fallback stops at `SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC` (default 24 hours),
+and the reason matters: `getSignatureStatuses` only searches as far back as the
+node retains ledger history. Past that, a swap that **actually landed** reads as
+absent, and clearing the row on that would be the one mistake this whole
+subsystem exists to prevent. So beyond the upper bound the verdict is forced to
+`unresolved` with reason `history_window_exceeded`, and the row waits for a
+human — check the wallet's USDC balance and the signature on an explorer before
+disposing of it by hand.
 
-- **Do not** add `pilot_evidence/` to any log-rotation, tmp-cleaner or
-  retention job.
-- **Do not** delete a decision's evidence file while its `live_trades` row is
-  still `open` or `needs_manual_review`. Check with
-  `python -m scout.live.solana_pilot status` first.
-- **Do** carry `pilot_evidence/` with the database if the deployment ever moves
-  machines. The two are one unit; a database restored without its evidence
-  directory has unresolvable rows.
-- Files for rows that have reached `rejected` or have been dispositioned by
-  hand are safe to archive.
+So:
+
+- **Do not** add `pilot_evidence/` to any log-rotation, tmp-cleaner or retention
+  job. Losing a file costs you the audit record and narrows recovery to a
+  24-hour window.
+- **Do** carry `pilot_evidence/` with the database if the deployment moves
+  machines.
+- If a file is lost, resolve the row **within a day**:
+  `python -m scout.live.solana_pilot resolve --decision-id <uuid>`.
+- Files for rows that have reached `rejected` or were dispositioned by hand are
+  safe to archive.
+
+Every resolution records `expiry_source` — `evidence_last_valid_block_height` or
+`row_age` — so a reviewer can always see which fact established expiry.
 
 ## If it goes wrong
 

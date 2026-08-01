@@ -140,6 +140,7 @@ import re
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -395,6 +396,125 @@ def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     lowered = url.lower()
     pinned = not any(host in lowered for host in _ROUND_ROBIN_RPC_HOSTS)
     return url, pinned
+
+
+@dataclass(frozen=True)
+class LaneVerdict:
+    """The resolver's verdict after the lane's age policy has been applied.
+
+    Kept separate from ``ResolutionReport`` because the two answer different
+    questions. The resolver answers "what does the cluster say about this
+    signature RIGHT NOW", from the cluster alone. This answers "what may the
+    lane ACT on", which also depends on how old the row is and therefore on
+    how much the cluster's silence is worth.
+    """
+
+    verdict: str
+    expiry_source: str | None = None
+    reason: str | None = None
+    age_seconds: float | None = None
+
+    @property
+    def clears_the_lane(self) -> bool:
+        return self.verdict == "definitively_not_submitted"
+
+
+def row_age_seconds(created_at: Any, *, now: datetime | None = None) -> float | None:
+    """Age of a ledger row in seconds, or None if it cannot be established.
+
+    Uses the same UTC clock that stamps ``created_at`` on insert. A system
+    clock stepped BACKWARDS makes rows look younger than they are, which can
+    only move a verdict toward ``unresolved`` — the row keeps blocking and a
+    human looks at it. That is the safe direction, and it is why this returns
+    None rather than guessing on any parse failure: an unreadable timestamp
+    must not become an age that licenses retiring a row.
+    """
+    if not created_at:
+        return None
+    try:
+        stamped = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return None
+    if stamped.tzinfo is None:
+        # Every writer in this tree stamps tz-aware UTC. A naive timestamp is
+        # of unknown origin, so it does not get to establish expiry.
+        return None
+    reference = now or datetime.now(timezone.utc)
+    return (reference - stamped).total_seconds()
+
+
+def apply_age_policy(
+    report: ResolutionReport,
+    *,
+    age_seconds: float | None,
+    settings: Settings,
+    had_evidence_height: bool,
+) -> LaneVerdict:
+    """Decide what the lane may act on, given the cluster's verdict and the age.
+
+    Three regimes, and the bounds are what make the middle one safe.
+
+    **Older than ``SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC``.** Absence stops being
+    evidence. ``getSignatureStatuses`` with ``searchTransactionHistory`` only
+    reaches as far back as the node retains ledger history, so past that
+    window a transaction that LANDED reads as absent. Retiring the row on that
+    would be exactly the failure the resolver exists to prevent, so any
+    absence-derived verdict is forced back to ``unresolved`` with reason
+    ``history_window_exceeded`` and the row waits for a human.
+
+    **Inside the window, at least ``..._MIN_SEC`` old.** A blockhash is valid
+    for at most 150 slots, so a row this old has provably expired no matter
+    what height was recorded. If the signature is cleanly absent, that is
+    enough to reach ``definitively_not_submitted`` from ``created_at`` alone —
+    which is what lets a row resolve when its evidence file is gone. Applied
+    only when the evidence height was UNAVAILABLE: a recorded height is the
+    fresher, more specific fact, and if it says the transaction can still land
+    then age must not overrule it.
+
+    **Younger than ``..._MIN_SEC``.** Age proves nothing yet; whatever the
+    resolver concluded from the evidence height stands.
+
+    A ``landed`` or ``failed_on_chain`` verdict passes through untouched at any
+    age. Those come from the cluster HAVING the signature, which is positive
+    evidence — the history window bounds what absence means, not what presence
+    means.
+    """
+    min_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC)
+    max_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC)
+
+    if report.verdict in ("landed", "failed_on_chain"):
+        return LaneVerdict(verdict=report.verdict, age_seconds=age_seconds)
+
+    if age_seconds is not None and age_seconds > max_sec:
+        return LaneVerdict(
+            verdict="unresolved",
+            reason="history_window_exceeded",
+            age_seconds=age_seconds,
+        )
+
+    if report.verdict == "definitively_not_submitted":
+        return LaneVerdict(
+            verdict="definitively_not_submitted",
+            expiry_source="evidence_last_valid_block_height",
+            age_seconds=age_seconds,
+        )
+
+    cleanly_absent = bool(report.probes) and all(
+        probe.outcome == "absent" for probe in report.probes
+    )
+    if (
+        not had_evidence_height
+        and cleanly_absent
+        and age_seconds is not None
+        and age_seconds >= min_sec
+    ):
+        return LaneVerdict(
+            verdict="definitively_not_submitted",
+            expiry_source="row_age",
+            age_seconds=age_seconds,
+        )
+
+    return LaneVerdict(verdict="unresolved", age_seconds=age_seconds)
 
 
 def evidence_path_for(evidence_dir: str | Path, decision_id: str) -> Path:
@@ -943,11 +1063,24 @@ class PilotRunner:
                 blockers += 1
                 continue
 
+            lane = apply_age_policy(
+                report,
+                age_seconds=row_age_seconds(row.get("created_at")),
+                settings=self._settings,
+                had_evidence_height=last_valid is not None,
+            )
             row["resolution"] = _resolution_summary(report)
             row["resolution"]["last_valid_block_height_source"] = (
                 "evidence_file" if intent is not None else "unavailable"
             )
-            if report.verdict == "definitively_not_submitted":
+            # The verdict the lane ACTS on, and how it got there. Recorded
+            # separately from the resolver's own so a reviewer can always
+            # see which fact established expiry.
+            row["resolution"]["lane_verdict"] = lane.verdict
+            row["resolution"]["expiry_source"] = lane.expiry_source
+            row["resolution"]["age_policy_reason"] = lane.reason
+            row["resolution"]["row_age_seconds"] = lane.age_seconds
+            if lane.clears_the_lane:
                 if not resolver_endpoint(self._settings)[1]:
                     # The verdict itself is not trustworthy from a
                     # load-balanced endpoint, so it neither retires the row nor
@@ -2340,6 +2473,12 @@ class PilotRunner:
                 rpc_client=self._resolver_rpc,
                 settings=self._settings,
             )
+            lane = apply_age_policy(
+                resolution,
+                age_seconds=row_age_seconds(row.get("created_at")),
+                settings=self._settings,
+                had_evidence_height=last_valid is not None,
+            )
             evidence.record(
                 "resolution",
                 **_resolution_summary(resolution),
@@ -2348,13 +2487,14 @@ class PilotRunner:
                 ),
                 resolver_rpc_url=resolver_url,
                 resolver_endpoint_pinned=pinned,
+                lane_verdict=lane.verdict,
+                expiry_source=lane.expiry_source,
+                age_policy_reason=lane.reason,
+                row_age_seconds=lane.age_seconds,
             )
 
             retired = False
-            if (
-                resolution.verdict == "definitively_not_submitted"
-                and row["status"] in _BLOCKING_STATUSES
-            ):
+            if lane.clears_the_lane and row["status"] in _BLOCKING_STATUSES:
                 if pinned:
                     await retire_row(
                         self._db,
@@ -2385,7 +2525,19 @@ class PilotRunner:
                 f"  decision ID : {decision_id}",
                 f"  signature   : {signature}",
                 f"  row         : #{row['live_trade_id']} ({row['status']})",
-                f"  verdict     : {resolution.verdict}",
+                f"  verdict     : {lane.verdict}"
+                + (
+                    ""
+                    if lane.verdict == resolution.verdict
+                    else f"   (cluster said {resolution.verdict};" f" {lane.reason})"
+                ),
+                f"  expiry from : {lane.expiry_source or 'not established'}",
+                f"  row age     : "
+                + (
+                    "unknown"
+                    if lane.age_seconds is None
+                    else f"{lane.age_seconds / 3600:.1f}h"
+                ),
                 f"  slot        : {resolution.slot}",
                 f"  confirmation: {resolution.confirmation_status}",
                 f"  on-chain err: {resolution.on_chain_err}",
@@ -2396,8 +2548,20 @@ class PilotRunner:
                 + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
                 f"  evidence    : {evidence.path}",
             ]
-            lines.extend(_verdict_guidance(resolution.verdict, retired))
-            if resolution.verdict == "definitively_not_submitted" and not pinned:
+            lines.extend(_verdict_guidance(lane.verdict, retired))
+            if lane.reason == "history_window_exceeded":
+                lines.extend(
+                    [
+                        "",
+                        "  This row is older than the node's transaction-history",
+                        "  window, so 'not found' no longer means 'never landed'.",
+                        "  A swap that DID execute would read exactly like this.",
+                        "  The row stays blocked: check the wallet's USDC balance",
+                        "  and an explorer for the signature, then dispose of the",
+                        "  row by hand.",
+                    ]
+                )
+            if lane.clears_the_lane and not pinned:
                 lines.extend(
                     [
                         "",
@@ -2409,11 +2573,11 @@ class PilotRunner:
                     ]
                 )
             _print_block("SOLANA PILOT RESOLUTION", lines)
-            if resolution.verdict == "landed":
+            if lane.verdict == "landed":
                 return EXIT_BLOCKED
-            if resolution.verdict == "definitively_not_submitted":
+            if lane.verdict == "definitively_not_submitted":
                 return EXIT_OK
-            if resolution.verdict == "failed_on_chain":
+            if lane.verdict == "failed_on_chain":
                 return EXIT_BLOCKED
             return EXIT_ESCALATE
 
