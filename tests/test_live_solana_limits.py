@@ -227,14 +227,43 @@ def test_a_corrupt_row_narrows_the_cap_rather_than_wedging_the_lane(engine):
     now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
     eng = engine(SOLANA_MAX_DAILY_NOTIONAL_USD=100.0, SOLANA_PILOT_MAX_ORDER_USD=10.0)
     spent = notional_usd_today(
-        [(None, now.isoformat()), ("garbage", now.isoformat())],
+        [("garbage", now.isoformat())],
         unreadable_size_usd=Decimal("10"),
         now=now,
     )
-    # None is a legitimate zero (NOT NULL is on size_usd, but be explicit);
-    # only the unparseable string is substituted.
     assert spent == Decimal("10")
+    # 10 of a 100 cap consumed: narrowed, not wedged. There is still room for a
+    # trade the budget genuinely allows.
     assert _quote_report(eng, exposure=LaneExposure(notional_usd_today=spent)).passed
+
+
+@pytest.mark.parametrize("absent", [None, "", "   "])
+def test_an_absent_size_is_not_read_as_zero(absent):
+    """Absence is not zero, and `or 0` would have been the same bug again.
+
+    ``size_usd`` is NOT NULL in the schema so this should be unreachable — but
+    "cannot happen" is precisely the reasoning that produced the
+    zero-substitution defect, so the missing case is handled explicitly rather
+    than resting on the constraint.
+    """
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert notional_usd_today(
+        [(absent, now.isoformat())], unreadable_size_usd=Decimal("10"), now=now
+    ) == Decimal("10")
+
+
+def test_a_literal_zero_size_really_is_zero():
+    """The complement: a legitimate "0" must NOT be inflated to the maximum.
+
+    Otherwise the conservative rule starts manufacturing exposure that never
+    existed, narrowing the cap for no reason.
+    """
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    assert notional_usd_today(
+        [("0", now.isoformat()), ("0.00", now.isoformat())],
+        unreadable_size_usd=Decimal("10"),
+        now=now,
+    ) == Decimal("0")
 
 
 # ======================================================================

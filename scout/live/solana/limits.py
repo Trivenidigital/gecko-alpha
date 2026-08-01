@@ -575,8 +575,22 @@ def notional_usd_today(
                 stamped = stamped.replace(tzinfo=timezone.utc)
             if stamped.astimezone(timezone.utc).date() != reference:
                 continue
+        # A MISSING size is absence, not zero, and gets the same treatment as
+        # an unparseable one. `size_usd` is NOT NULL in the schema so this
+        # should be unreachable — but "cannot happen" reasoning is exactly what
+        # produced the zero-substitution bug this branch fixes, and a `or 0`
+        # here would be a second instance of it.
+        if size_usd is None or str(size_usd).strip() == "":
+            total += unreadable_size_usd
+            log.warning(
+                "solana_limits_missing_notional",
+                counted_as=format(unreadable_size_usd, "f"),
+                reason="absent size counted at the per-trade maximum; absence "
+                "is not zero",
+            )
+            continue
         try:
-            total += _dec(size_usd or 0)
+            total += _dec(size_usd)
         except (InvalidOperation, ValueError):
             total += unreadable_size_usd
             log.warning(
