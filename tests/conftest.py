@@ -89,6 +89,33 @@ async def _reset_coingecko_limiter_state():
     await _reset_known_limiters()
 
 
+@pytest.fixture(autouse=True)
+def solana_retry_backoff(monkeypatch):
+    """Walk the Solana transport's retry ladder without waiting for it.
+
+    ``transport._BACKOFFS`` is (0.5, 1.0, 2.0) and is slept for real, so every
+    test that drove a full transient-retry ladder burned 3.5 seconds of wall
+    clock doing nothing. Autouse because the cost is invisible at the call
+    site: a test does not look slow, it just is, and the next one added would
+    pay the same toll silently.
+
+    The SLEEP is replaced, never the schedule. Attempt counts, ordering and
+    exhaustion behaviour are decided by the ladder's length, which is
+    untouched — so the retry semantics under test are exactly the production
+    ones. Yields the list of delays the ladder asked for, so a test can assert
+    the schedule was WALKED rather than merely skipped.
+    """
+    from scout.live.solana import transport
+
+    requested: list[float] = []
+
+    async def _instant(delay: float) -> None:
+        requested.append(delay)
+
+    monkeypatch.setattr(transport, "_retry_sleep", _instant)
+    return requested
+
+
 @pytest.fixture
 def settings_factory():
     def _make(**overrides):

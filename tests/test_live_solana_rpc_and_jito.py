@@ -28,6 +28,7 @@ from scout.live.solana.exceptions import (
     SolanaResponseError,
 )
 from scout.live.solana.jito_client import JitoClient
+from scout.live.solana import transport as transport_module
 from scout.live.solana.rpc_client import LOOKUP_TABLE_META_SIZE, SolanaRpcClient
 from solana_tx_builder import PAYER_PUBKEY, TIP_ACCOUNT, build_swap_tx
 
@@ -559,6 +560,54 @@ async def test_fetch_tip_accounts_falls_back_on_failure(settings_factory):
 
     assert accounts == JITO_TIP_ACCOUNTS_FALLBACK
     assert TIP_ACCOUNT in accounts
+
+
+async def test_a_transient_failure_walks_the_whole_backoff_ladder(
+    settings_factory, solana_retry_backoff
+):
+    """*** The retry SEMANTICS, asserted now that the waiting is gone. ***
+
+    The `solana_retry_backoff` fixture removes the sleeps, which would be a bad
+    trade if it also removed the thing the sleeps were evidence of. It does
+    not: the ladder's length still decides the attempt count, and the delays it
+    asks for are recorded. So this pins both — four attempts on a retryable
+    failure, and the exact schedule walked in order.
+    """
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(f"{_JITO}/api/v1/getTipAccounts", status=503, repeat=True)
+            await client.fetch_tip_accounts()
+            attempts = sum(len(calls) for calls in mock.requests.values())
+
+    # One initial attempt plus one per rung.
+    assert attempts == 4
+    assert solana_retry_backoff == [0.5, 1.0, 2.0]
+    assert list(transport_module._BACKOFFS) == [0.5, 1.0, 2.0]
+
+
+async def test_a_submission_never_sleeps_because_it_never_retries(
+    settings_factory, solana_retry_backoff
+):
+    """The submit path opts out of the ladder, so it must ask for no delay.
+
+    The anti-double-send property is asserted elsewhere on the POST count; this
+    is its companion — a lane that slept would be a lane that had retried.
+    """
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(_SUBMIT_RE, exception=asyncio.TimeoutError(), repeat=True)
+            with pytest.raises(SolanaAmbiguousSubmissionError):
+                await client.submit_transaction(
+                    build_swap_tx().tx_b64,
+                    expected_signature=_SIGNATURE,
+                    last_valid_block_height=283_000_500,
+                )
+            posts = sum(len(v) for k, v in mock.requests.items() if k[0] == "POST")
+
+    assert posts == 1
+    assert solana_retry_backoff == []
 
 
 async def test_inflight_bundle_statuses_parsed(settings_factory):
