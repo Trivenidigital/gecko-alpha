@@ -130,6 +130,16 @@ class SolanaRpcClient:
         self._timeout = float(settings.SOLANA_HTTP_TIMEOUT_SEC)
         self._request_id = 0
 
+    @property
+    def url(self) -> str:
+        """The endpoint this client actually reads from.
+
+        SECRET: provider URLs carry the API key in the path or query. Callers
+        that report an endpoint must label it through
+        ``resolver_pool.redact_endpoint`` rather than printing this.
+        """
+        return self._url
+
     async def _rpc(
         self,
         method: str,
@@ -193,6 +203,30 @@ class SolanaRpcClient:
                 require_field(value, "lastValidBlockHeight", label="getLatestBlockhash")
             ),
         )
+
+    async def get_genesis_hash(self) -> str:
+        """The genesis hash of the cluster behind this endpoint.
+
+        WHICH CHAIN this node serves, stated by the node itself. Compared
+        against ``SOLANA_MAINNET_GENESIS_HASH`` before an endpoint is allowed
+        into the resolver pool: a devnet or forked node answers "absent" to
+        every mainnet signature it is asked about, which is exactly the input
+        that manufactures a false ``definitively_not_submitted``.
+        """
+        return str(await self._rpc("getGenesisHash"))
+
+    async def get_health(self) -> str:
+        """``"ok"`` when the node is caught up with its cluster.
+
+        A lagging node reports its lag as a JSON-RPC ERROR rather than a
+        result, so an unhealthy endpoint surfaces here as ``SolanaAPIError``
+        rather than a string the caller has to interpret.
+
+        ``retry=False``: this is a liveness probe, and a probe that silently
+        retries reports the health of the retry rather than of the node. The
+        elapsed time of this one call is also the pool's latency measurement.
+        """
+        return str(await self._rpc("getHealth", retry=False))
 
     async def get_block_height(self, *, commitment: str = "confirmed") -> int:
         """Current block height — compared against ``lastValidBlockHeight``.

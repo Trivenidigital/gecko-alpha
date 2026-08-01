@@ -86,6 +86,68 @@ signature from its cache invents that verdict. Acting on it means retiring a row
 for a transaction that is still in flight, and then swapping again: two trades
 against one authorization.
 
+### Optional: add a second resolver endpoint
+
+```bash
+# Ordered, comma-separated. Supersedes SOLANA_RESOLVER_RPC_URL when set.
+SOLANA_RESOLVER_RPC_URLS=https://<primary-node>/...,https://<secondary-node>/...
+```
+
+Configuration only — no code change, and the single-endpoint deployment above
+is fully supported. What a second endpoint buys:
+
+* **Read failover.** A resolution that cannot reach its node returns
+  `unresolved`, and `unresolved` BLOCKS the lane. On one endpoint, an RPC
+  outage is an outage of the recovery path itself.
+* **Corroboration.** Before `definitively_not_submitted` is acted on, a second
+  endpoint is asked to see the same absence independently. Disagreement
+  collapses the verdict: if the second endpoint HAS the signature the verdict
+  becomes `landed`, and anything else — a node still below
+  `lastValidBlockHeight`, or a probe that failed — becomes `unresolved`. A
+  probe that could not be reached is never read as assent.
+
+Every endpoint must be a single dedicated node: the round-robin refusal is an
+**all-endpoint** property, because selection is keyed by signature and each
+endpoint eventually serves some resolution.
+
+Two related settings:
+
+```bash
+SOLANA_RESOLVER_HEALTH_TIMEOUT_SEC=5.0    # budget for the admission probes
+SOLANA_RESOLVER_MAX_LATENCY_MS=2000.0     # above this an endpoint is demoted
+```
+
+### What the pool checks before it trusts an endpoint
+
+`place` and `resolve` both probe every configured endpoint before reading a
+verdict off one, and record the result as the `resolver_pool` evidence step:
+
+| Check | Failing means | Effect |
+|---|---|---|
+| `getGenesisHash` == mainnet-beta | the node serves another chain or a fork | endpoint EXCLUDED |
+| `getHealth` | the node is behind its cluster | endpoint EXCLUDED |
+| latency vs `SOLANA_RESOLVER_MAX_LATENCY_MS` | the node is slow | endpoint DEMOTED — still used for failover and corroboration, but new resolutions prefer a faster one |
+
+The genesis check is the one that matters most and is not a formality: a devnet
+or forked node answers "absent" to **every** mainnet signature, and absence is
+half of the verdict that clears the lane. A URL cannot prove which chain is
+behind it; `getGenesisHash` can.
+
+If **no** endpoint passes, `place` refuses in `SUPERVISED_LIVE` and
+`BOUNDED_AUTONOMOUS` — a swap that cannot be resolved afterwards has no
+recovery path. A `--simulate-only` rehearsal prints a NOTICE and proceeds,
+because it provably never submits and therefore can never need the resolver.
+One bad endpoint out of several is excluded rather than fatal.
+
+### Endpoint URLs are secret
+
+Alchemy and Helius carry the API key in the **path**; some providers use the
+query string. Nothing in the lane prints a resolver or RPC URL: logs, evidence
+files and refusal messages all carry an opaque label of the form
+`host#<8 hex>` (the fingerprint distinguishes two keys on one host). If you
+ever see a full endpoint URL in an evidence file, treat the key as exposed and
+rotate it.
+
 ### Re-run the real-build capture
 
 The inspector's allowlists — permitted program ids, permitted SPL Token and

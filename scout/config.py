@@ -1405,6 +1405,38 @@ class Settings(BaseSettings):
     # URL is not itself a known round-robin — see
     # scout.live.solana_pilot.resolver_endpoint.
     SOLANA_RESOLVER_RPC_URL: str = ""
+    # The resolver POOL, in preference order. Supersedes the singular key above
+    # when non-empty; the singular key is read as a one-element pool otherwise,
+    # because that is what is deployed and it stays authoritative rather than
+    # becoming a legacy alias nobody remembers to migrate.
+    #
+    # A second endpoint buys two things the first cannot. READ FAILOVER: a
+    # resolution that cannot reach its node returns `unresolved`, which BLOCKS
+    # the lane — so a single endpoint being down is an outage of the recovery
+    # path, not just of a convenience. CORROBORATION: `definitively_not
+    # _submitted` is the one verdict that clears the lane, and it is built out
+    # of an ABSENCE. A second endpoint is asked to see the same absence before
+    # it is acted on, and disagreement collapses the verdict to `unresolved`.
+    #
+    # Empty is fully supported and is what ships first: one endpoint, no
+    # corroboration, and the evidence records that the verdict was
+    # uncorroborated so a single-node reading is never mistaken for two.
+    #
+    # Every endpoint must be a single dedicated node (the round-robin refusal
+    # applies to all of them) and must prove it is on mainnet-beta via
+    # getGenesisHash before it is used — see scout.live.solana.resolver_pool.
+    SOLANA_RESOLVER_RPC_URLS: Annotated[list[str], NoDecode] = []
+    # Per-endpoint budget for the genesis + health probes that admit an
+    # endpoint to the pool. Deliberately much shorter than
+    # SOLANA_HTTP_TIMEOUT_SEC: this is a liveness question, and an endpoint
+    # that needs 15s to say "ok" has already answered it.
+    SOLANA_RESOLVER_HEALTH_TIMEOUT_SEC: float = 5.0
+    # Above this, an endpoint is DEGRADED: still on the right chain and still
+    # caught up, so it stays usable as a fallback, but it is demoted behind the
+    # faster endpoints. Excluding it instead would trade a slow resolver for no
+    # resolver, which is the worse failure — an unresolvable signature blocks
+    # the lane.
+    SOLANA_RESOLVER_MAX_LATENCY_MS: float = 2_000.0
     # Age-derived blockhash expiry, bounded on BOTH sides.
     #
     # A Solana blockhash is valid for at most 150 slots (~60-90s), so a
@@ -2163,6 +2195,15 @@ class Settings(BaseSettings):
                 "inverted window means age can never establish expiry, so a row "
                 "whose evidence file is gone could never self-resolve."
             )
+        for name in (
+            "SOLANA_RESOLVER_HEALTH_TIMEOUT_SEC",
+            "SOLANA_RESOLVER_MAX_LATENCY_MS",
+        ):
+            if getattr(self, name) <= 0:
+                # Zero is not "no limit" for either: a zero timeout admits no
+                # endpoint and a zero latency budget marks every endpoint
+                # degraded, so both spellings of "off" silently break the pool.
+                raise ValueError(f"{name} must be > 0; got={getattr(self, name)}")
         if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
             raise ValueError(
                 "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "
@@ -2374,6 +2415,26 @@ class Settings(BaseSettings):
                 if isinstance(parsed, list):
                     return [str(p).strip() for p in parsed if str(p).strip()]
             return [p.strip() for p in s.split(",") if p.strip()]
+        return v
+
+    @field_validator("SOLANA_RESOLVER_RPC_URLS", mode="before")
+    @classmethod
+    def parse_solana_resolver_rpc_urls(cls, v: str | list[str]) -> list[str]:
+        # NoDecode (see field decl) suppresses pydantic-settings' eager JSON
+        # decode, so the RAW env/init string reaches here. Accept three shapes:
+        #   * comma-separated string ("https://a,https://b") — the .env form
+        #   * JSON array string ('["https://a"]')  — back-compat with JSON envs
+        #   * native list                          — test / programmatic
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(u).strip() for u in parsed if str(u).strip()]
+            return [u.strip() for u in s.split(",") if u.strip()]
         return v
 
     @field_validator("SECONDWAVE_ALERT_THRESHOLD")

@@ -19,7 +19,9 @@ to the evidence file before the next one starts:
 1.  envelope gate (SOLANA_MODE, keypair path, mainnet hosts)
 2.  kill-switch check
 3.  keypair custody — load at call time, derive the signer pubkey
-4.  startup reconciliation — a restart must not forget a signature
+4.  resolver-pool validation (every endpoint proves it is on mainnet-beta and
+    caught up), then startup reconciliation — a restart must not forget a
+    signature
 5.  Jupiter quote
 6.  quote envelope (USD band on the USDC out, price impact, slippage, mints)
 7.  Jupiter build (unsigned) with the Jito tip requested
@@ -85,6 +87,16 @@ substrate — JSON Lines, fsynced per record, written before the approval
 prompt — so ``read_persisted_intent`` reads the height back from it. When the
 file is missing or unreadable the height is ``None``, which makes the resolver
 fail CLOSED (``unresolved``, lane blocked) rather than degrade quietly.
+
+**The resolver reads from a POOL; one resolution reads from one node.**
+``SOLANA_RESOLVER_RPC_URLS`` is an ordered list and ``SOLANA_RESOLVER_RPC_URL``
+is read as a one-element pool, which is what is deployed. Every endpoint must
+prove via ``getGenesisHash`` that it is on mainnet-beta before it is used, and
+selection is deterministic in the signature so a resolution's two sweeps never
+straddle two nodes. A second endpoint buys read failover (an unreachable
+resolver blocks the lane) and corroboration of the one verdict that clears it.
+Adding one is configuration; the code path is the same one a single endpoint
+already runs. See ``scout.live.solana.resolver_pool``.
 
 **One PLACEMENT at a time, enforced by the filesystem.** Same reasoning and
 same ``O_CREAT | O_EXCL`` mechanism as the Kraken lane, on its own lock file:
@@ -166,6 +178,7 @@ from scout.live.solana.constants import (
     LAMPORTS_PER_SIGNATURE,
     LAMPORTS_PER_SOL,
     SOL_MINT,
+    SOLANA_MAINNET_GENESIS_HASH,
     TOKEN_ACCOUNT_DATA_LENGTH,
     USDC_DECIMALS,
     USDC_MINT,
@@ -177,7 +190,14 @@ from scout.live.solana.exceptions import (
 )
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient, SolanaQuote, SwapBuild
-from scout.live.solana.resolver import ResolutionReport, resolve_submission
+from scout.live.solana.resolver import ResolutionReport
+from scout.live.solana.resolver_pool import (
+    PoolResolution,
+    ResolverPool,
+    redact_endpoint,
+    resolve_with_pool,
+    resolver_urls,
+)
 from scout.live.solana.rpc_client import SolanaRpcClient
 from scout.live.solana.signer import (
     SignedTransaction,
@@ -736,6 +756,19 @@ def keyfile_public_half(settings: Settings) -> tuple[str | None, str]:
         return None, f"public half does not encode ({type(exc).__name__})"
 
 
+def unpinned_resolver_urls(settings: Settings) -> list[str]:
+    """Configured resolver endpoints that sit behind a known load balancer.
+
+    Returned as REDACTED labels — the caller puts these in refusal messages
+    and evidence files, and a provider URL carries its API key.
+    """
+    return [
+        redact_endpoint(url)
+        for url in resolver_urls(settings)
+        if any(host in url.lower() for host in _ROUND_ROBIN_RPC_HOSTS)
+    ]
+
+
 def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     """The URL the §7 resolver reads from, and whether it is safely PINNED.
 
@@ -749,19 +782,20 @@ def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     transaction that is still in flight, and the operator would rerun: two
     swaps against one authorization.
 
-    So the endpoint has to be one consistent node. ``SOLANA_RESOLVER_RPC_URL``
-    names it; when unset the main RPC URL is used, but only if that is not
-    itself a known round-robin.
+    So every endpoint has to be one consistent node.
+    ``SOLANA_RESOLVER_RPC_URLS`` names the pool and ``SOLANA_RESOLVER_RPC_URL``
+    the single deployed one; when neither is set the main RPC URL is used, but
+    only if that is not itself a known round-robin.
 
-    Returns ``(url, pinned)``. Callers that are about to act irreversibly on a
+    Returns ``(primary_url, pinned)``. ``pinned`` is an ALL-endpoint property:
+    one load-balanced member of the pool is enough to manufacture a false
+    verdict, because selection is by signature and every endpoint eventually
+    serves a resolution. Callers that are about to act irreversibly on a
     verdict must refuse when ``pinned`` is False; callers that only REPORT a
     verdict may proceed and say the reading is degraded.
     """
-    configured = (settings.SOLANA_RESOLVER_RPC_URL or "").strip()
-    url = configured or settings.SOLANA_RPC_URL
-    lowered = url.lower()
-    pinned = not any(host in lowered for host in _ROUND_ROBIN_RPC_HOSTS)
-    return url, pinned
+    urls = resolver_urls(settings)
+    return urls[0], not unpinned_resolver_urls(settings)
 
 
 @dataclass(frozen=True)
@@ -815,6 +849,7 @@ def apply_age_policy(
     age_seconds: float | None,
     settings: Settings,
     had_evidence_height: bool,
+    pool_downgrade: str | None = None,
 ) -> LaneVerdict:
     """Decide what the lane may act on, given the cluster's verdict and the age.
 
@@ -844,12 +879,24 @@ def apply_age_policy(
     age. Those come from the cluster HAVING the signature, which is positive
     evidence — the history window bounds what absence means, not what presence
     means.
+
+    ``pool_downgrade`` is the resolver pool's refusal (a split view across
+    endpoints, or a corroborating endpoint that disagreed) and it is FINAL.
+    Without it the age rule below would happily re-derive the definitive
+    verdict the pool just refused, from the same probes the pool refused to
+    trust — the age rule reads absence off the probe trail, and the pool's
+    objection is about what those probes are worth.
     """
     min_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MIN_SEC)
     max_sec = float(settings.SOLANA_RESOLVER_AGE_EXPIRY_MAX_SEC)
 
     if report.verdict in ("landed", "failed_on_chain"):
         return LaneVerdict(verdict=report.verdict, age_seconds=age_seconds)
+
+    if pool_downgrade is not None:
+        return LaneVerdict(
+            verdict="unresolved", reason=pool_downgrade, age_seconds=age_seconds
+        )
 
     if age_seconds is not None and age_seconds > max_sec:
         return LaneVerdict(
@@ -1562,6 +1609,7 @@ class LaneRunner:
         keypair_loader: Callable[[], Keypair] | None = None,
         custody_prober: Callable[[], dict[str, Any]] | None = None,
         resolver_rpc: SolanaRpcClient | None = None,
+        resolver_pool: ResolverPool | None = None,
     ) -> None:
         self._settings = settings
         self._db = db
@@ -1578,11 +1626,29 @@ class LaneRunner:
         self._probe_custody = custody_prober or (
             lambda: probe_keyfile_custody(settings)
         )
-        # Both sweeps of every resolution read from THIS client, which must be
-        # bound to one consistent node — see ``resolver_endpoint``. Defaults to
+        # Both sweeps of every resolution read from ONE endpoint, which must be
+        # a single consistent node — see ``resolver_endpoint``. Defaults to
         # the main client so a test (or a deployment whose single RPC is
         # already dedicated) needs no second wiring.
         self._resolver_rpc = resolver_rpc or rpc
+        # Every resolution goes through the pool, including the one-endpoint
+        # case. A single code path means the multi-endpoint behaviour is the
+        # one that has been exercised by the time a second endpoint is added —
+        # the alternative is a standby path that first runs during an incident.
+        #
+        # The fallback pool's label comes from the CLIENT's own url rather than
+        # from config, because a caller that injects a resolver client can make
+        # the two differ, and an endpoint labelled as something it does not
+        # read from is worse than an unlabelled one.
+        self._pool = resolver_pool or ResolverPool.from_clients(
+            settings,
+            [
+                (
+                    getattr(self._resolver_rpc, "url", settings.SOLANA_RPC_URL),
+                    self._resolver_rpc,
+                )
+            ],
+        )
 
     # ---------------- shared gates ----------------
     def _evidence_for(self, decision_id: str) -> EvidenceLog:
@@ -1656,22 +1722,24 @@ class LaneRunner:
         # operator is told instead, because a rehearsal that passed on an
         # unpinned resolver must not read as a launch-ready lane.
         resolver_url, pinned = resolver_endpoint(self._settings)
+        unpinned = unpinned_resolver_urls(self._settings)
         if not pinned and mode in EXECUTING_MODES:
             raise LaneAbort(
                 "envelope_gate",
-                f"the resolver would read from {resolver_url}, which is a "
-                "load-balanced public endpoint. Two calls can land on two "
-                "nodes, and a node that is ahead on block height while missing "
-                "the signature manufactures a false "
+                f"the resolver pool contains {len(unpinned)} load-balanced "
+                f"public endpoint(s) ({', '.join(unpinned)}). Two calls can land "
+                "on two nodes, and a node that is ahead on block height while "
+                "missing the signature manufactures a false "
                 "'definitively_not_submitted' — which clears the lane and "
-                "invites a rerun of a swap that is still in flight. Set "
-                "SOLANA_RESOLVER_RPC_URL to a single dedicated node.",
+                "invites a rerun of a swap that is still in flight. Every "
+                "endpoint in SOLANA_RESOLVER_RPC_URLS (or the single "
+                "SOLANA_RESOLVER_RPC_URL) must be a dedicated node.",
             )
         if not pinned:
             print(
                 "NOTICE: resolver endpoint is NOT pinned "
-                f"({resolver_url}); a real placement will refuse until "
-                "SOLANA_RESOLVER_RPC_URL names a dedicated node. This "
+                f"({', '.join(unpinned)}); a real placement will refuse until "
+                "every resolver endpoint is a dedicated node. This "
                 "rehearsal proceeds because it never submits."
             )
         return {
@@ -1679,8 +1747,13 @@ class LaneRunner:
             "declared_signer_pubkey": declared,
             "input_mint": SOL_MINT,
             "output_mint": USDC_MINT,
-            "rpc_url": self._settings.SOLANA_RPC_URL,
-            "resolver_rpc_url": resolver_url,
+            # Labels, never URLs. The deployment's RPC endpoints carry their
+            # API key in the path, and the evidence file is durable, copied
+            # into review packages and read by people who are not the operator.
+            "rpc_url": redact_endpoint(self._settings.SOLANA_RPC_URL),
+            "resolver_rpc_url": redact_endpoint(resolver_url),
+            "resolver_endpoints": list(self._pool.labels),
+            "resolver_endpoint_count": self._pool.size,
             "resolver_endpoint_pinned": pinned,
             # True only on a rehearsal that would have been refused. Recorded
             # so an evidence pack can never be mistaken for one produced under
@@ -1693,6 +1766,79 @@ class LaneRunner:
             "will_execute": mode in EXECUTING_MODES,
             "authorization_method": authorization_policy_for(mode).method,
         }
+
+    async def _check_resolver_pool(
+        self, *, mode: str, evidence: EvidenceLog
+    ) -> dict[str, Any]:
+        """Prove every resolver endpoint is on mainnet-beta and caught up.
+
+        The host-substring checks in the envelope gate are a typo guard: they
+        catch ``devnet`` in a URL an operator pasted. This is the actual proof,
+        and it is a different question — a mainnet-looking URL can serve a
+        devnet node, a fork, or a node twenty thousand slots behind, and all
+        three answer "absent" to signatures that exist. That answer is one half
+        of the only verdict that clears the lane.
+
+        Runs BEFORE startup reconciliation, because reconciliation is the first
+        thing that reads a verdict off these endpoints.
+
+        Refusal is scoped to executing modes and to the whole pool being
+        unusable. One bad endpoint out of several is EXCLUDED, not fatal —
+        degrading to fewer endpoints is the pool working, and refusing to trade
+        because a spare is down would make adding a spare a liability.
+        """
+        health = await self._pool.check_health()
+        usable = [entry for entry in health if entry.usable]
+        detail = {
+            "endpoints": [entry.as_evidence() for entry in health],
+            "usable_count": len(usable),
+            "configured_count": len(health),
+            "expected_genesis": SOLANA_MAINNET_GENESIS_HASH,
+        }
+        # Recorded BEFORE the refusal decision. The run that gets refused here
+        # is the one whose per-endpoint findings an operator most needs, and an
+        # abort reason is a sentence where this is a structured record.
+        evidence.record("resolver_pool", **detail)
+        if usable:
+            return detail
+
+        reasons = "; ".join(f"{e.label}: {e.detail}" for e in health)
+        if mode in EXECUTING_MODES:
+            raise LaneAbort(
+                "resolver_pool",
+                "no resolver endpoint proved it is on Solana mainnet-beta and "
+                f"caught up ({reasons}). A swap that cannot be RESOLVED "
+                "afterwards has no recovery path, so the lane refuses before "
+                "building one.",
+            )
+        print(
+            "NOTICE: no resolver endpoint passed the genesis/health check "
+            f"({reasons}). A real placement will refuse; this rehearsal "
+            "proceeds because it never submits."
+        )
+        return detail
+
+    async def _resolve(
+        self,
+        *,
+        signature: str,
+        last_valid_block_height: int | None,
+        owner_pubkey: str | None = None,
+    ) -> PoolResolution:
+        """Every resolution in this module goes through here.
+
+        One call site for the pool means the split-view and corroboration rules
+        cannot be applied on one path and forgotten on another — and forgetting
+        them on the ambiguity path, which is the one that runs with a
+        transaction possibly in flight, would be the expensive place to do it.
+        """
+        return await resolve_with_pool(
+            pool=self._pool,
+            expected_signature=signature,
+            last_valid_block_height=last_valid_block_height,
+            settings=self._settings,
+            owner_pubkey=owner_pubkey,
+        )
 
     async def _state(
         self, decision_id: str, state: str, *, mode: str, **fields: Any
@@ -1898,11 +2044,8 @@ class LaneRunner:
                 None if intent is None else intent.get("last_valid_block_height")
             )
             try:
-                report = await resolve_submission(
-                    expected_signature=signature,
-                    last_valid_block_height=last_valid,
-                    rpc_client=self._resolver_rpc,
-                    settings=self._settings,
+                pooled = await self._resolve(
+                    signature=str(signature), last_valid_block_height=last_valid
                 )
             except Exception as exc:  # pragma: no cover - resolver swallows its own
                 row["resolution"] = {
@@ -1913,13 +2056,16 @@ class LaneRunner:
                 blockers += 1
                 continue
 
+            report = pooled.report
             lane = apply_age_policy(
                 report,
                 age_seconds=row_age_seconds(row.get("created_at")),
                 settings=self._settings,
                 had_evidence_height=last_valid is not None,
+                pool_downgrade=pooled.downgrade_reason,
             )
             row["resolution"] = _resolution_summary(report)
+            row["resolution"].update(pooled.as_evidence())
             row["resolution"]["last_valid_block_height_source"] = (
                 "evidence_file" if intent is not None else "unavailable"
             )
@@ -2254,6 +2400,12 @@ class LaneRunner:
                     "each is resolved. NEVER rebuild — run `resolve`.",
                     exit_code=EXIT_BLOCKED,
                 )
+
+            # Immediately before startup reconciliation, which is the first
+            # step that reads a VERDICT off these endpoints — and after
+            # execution recovery, which decides from the database alone and
+            # must not need the network to say the lane is stuck.
+            await self._check_resolver_pool(mode=mode, evidence=evidence)
 
             reconciliation = await self._reconcile_open_rows(auto_retire=True)
             evidence.record(
@@ -2952,14 +3104,17 @@ class LaneRunner:
         blockhash and a different signature, and BOTH can land — two swaps
         where the operator authorized one.
         """
-        resolution = await resolve_submission(
-            expected_signature=signed.signature,
+        pooled = await self._resolve(
+            signature=signed.signature,
             last_valid_block_height=build.last_valid_block_height,
-            rpc_client=self._resolver_rpc,
-            settings=self._settings,
             owner_pubkey=signer_pubkey,
         )
-        evidence.record("ambiguity_resolution", **_resolution_summary(resolution))
+        resolution = pooled.report
+        evidence.record(
+            "ambiguity_resolution",
+            **_resolution_summary(resolution),
+            **pooled.as_evidence(),
+        )
 
         if resolution.verdict == "landed":
             evidence.record(
@@ -3510,25 +3665,37 @@ class LaneRunner:
                 None if intent is None else intent.get("last_valid_block_height")
             )
             resolver_url, pinned = resolver_endpoint(self._settings)
-            resolution = await resolve_submission(
-                expected_signature=str(signature),
-                last_valid_block_height=last_valid,
-                rpc_client=self._resolver_rpc,
-                settings=self._settings,
+            # The pool is validated here too, not only in `place`. This command
+            # is the one that RETIRES a row on a verdict, so an endpoint on the
+            # wrong chain does its damage here — and `resolve` is exactly the
+            # command an operator reaches for when things already look wrong.
+            pool_health = await self._pool.check_health()
+            evidence.record(
+                "resolver_pool",
+                endpoints=[entry.as_evidence() for entry in pool_health],
+                usable_count=sum(1 for entry in pool_health if entry.usable),
+                configured_count=len(pool_health),
+                expected_genesis=SOLANA_MAINNET_GENESIS_HASH,
             )
+            pooled = await self._resolve(
+                signature=str(signature), last_valid_block_height=last_valid
+            )
+            resolution = pooled.report
             lane = apply_age_policy(
                 resolution,
                 age_seconds=row_age_seconds(row.get("created_at")),
                 settings=self._settings,
                 had_evidence_height=last_valid is not None,
+                pool_downgrade=pooled.downgrade_reason,
             )
             evidence.record(
                 "resolution",
                 **_resolution_summary(resolution),
+                **pooled.as_evidence(),
                 last_valid_block_height_source=(
                     "evidence_file" if intent is not None else "unavailable"
                 ),
-                resolver_rpc_url=resolver_url,
+                resolver_rpc_url=redact_endpoint(resolver_url),
                 resolver_endpoint_pinned=pinned,
                 lane_verdict=lane.verdict,
                 expiry_source=lane.expiry_source,
@@ -3559,7 +3726,7 @@ class LaneRunner:
                     evidence.record(
                         "auto_retire_withheld",
                         live_trade_id=row["live_trade_id"],
-                        resolver_rpc_url=resolver_url,
+                        resolver_rpc_url=redact_endpoint(resolver_url),
                         note="verdict read from a load-balanced endpoint; the "
                         "row is NOT retired on it",
                     )
@@ -3571,8 +3738,9 @@ class LaneRunner:
                 f"  verdict     : {lane.verdict}"
                 + (
                     ""
-                    if lane.verdict == resolution.verdict
-                    else f"   (cluster said {resolution.verdict};" f" {lane.reason})"
+                    if lane.verdict == pooled.raw_verdict
+                    else f"   (cluster said {pooled.raw_verdict};"
+                    f" {lane.reason or pooled.downgrade_reason})"
                 ),
                 f"  expiry from : {lane.expiry_source or 'not established'}",
                 f"  row age     : "
@@ -3587,8 +3755,10 @@ class LaneRunner:
                 f"  lastValidBH : {last_valid}"
                 + ("" if intent is not None else "  (evidence file unreadable)"),
                 f"  sweeps      : {len(resolution.probes)}",
-                f"  resolver RPC: {resolver_url}"
+                f"  resolver    : {pooled.endpoint} "
+                f"({self._pool.size} endpoint(s) configured)"
                 + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
+                f"  corroborated: {_corroboration_line(pooled)}",
                 f"  evidence    : {evidence.path}",
             ]
             lines.extend(_verdict_guidance(lane.verdict, retired))
@@ -3669,17 +3839,39 @@ class LaneRunner:
             f"  slippage ceiling         : {settings.SOLANA_PILOT_SLIPPAGE_BPS} bps",
             f"  jito tip requested       : "
             f"{settings.SOLANA_PILOT_JITO_TIP_LAMPORTS} lamports",
-            f"  rpc (read-only)          : {settings.SOLANA_RPC_URL}",
-            f"  resolver rpc             : {resolver_endpoint(settings)[0]}"
+            f"  rpc (read-only)          : {redact_endpoint(settings.SOLANA_RPC_URL)}",
+            f"  resolver endpoints       : {', '.join(self._pool.labels)}"
             + (
                 ""
                 if resolver_endpoint(settings)[1]
                 else "   ** NOT PINNED - a real place will refuse "
                 "(--simulate-only still runs) **"
             ),
+            "  corroboration            : "
+            + (
+                f"available ({self._pool.size} endpoints)"
+                if self._pool.size > 1
+                else "UNAVAILABLE - one endpoint, so a definitive "
+                "'not submitted' rests on a single node"
+            ),
             f"  block engine (submit)    : {settings.JITO_BLOCK_ENGINE_URL}",
             f"  database                 : {Path(settings.DB_PATH).resolve()}",
         ]
+
+        # Probed rather than assumed. Saying "corroboration: available" on the
+        # strength of a config line would be the claim an operator most wants
+        # checked BEFORE trade day — a second endpoint that is down, slow or on
+        # another chain looks identical in config to one that works.
+        for entry in await self._pool.check_health():
+            lines.append(
+                f"  endpoint {entry.label:<28}: "
+                + (
+                    ("ok" if not entry.degraded else "DEGRADED")
+                    + f" ({entry.latency_ms}ms)"
+                    if entry.usable
+                    else f"UNUSABLE — {entry.detail}"
+                )
+            )
 
         kill_state = await self._ks.is_active()
         lines.append(
@@ -3849,6 +4041,23 @@ def _resolution_summary(report: ResolutionReport) -> dict[str, Any]:
             for p in report.probes
         ],
     }
+
+
+def _corroboration_line(pooled: PoolResolution) -> str:
+    """One line saying whether a second endpoint backed a definitive absence.
+
+    Spelled out rather than left to a boolean because "not corroborated" has
+    three different meanings — nothing to corroborate, nobody to ask, and asked
+    and disagreed — and only the last one is a problem.
+    """
+    corroboration = pooled.corroboration
+    if pooled.raw_verdict != "definitively_not_submitted":
+        return "n/a (only a definitive absence needs a second opinion)"
+    if not corroboration.attempted:
+        return "NO — single endpoint, verdict rests on one node"
+    if corroboration.agrees:
+        return f"yes — {corroboration.endpoint} saw the same absence"
+    return f"DISAGREED — {corroboration.endpoint}: {corroboration.detail}"
 
 
 def _verdict_guidance(verdict: str, retired: bool) -> list[str]:
@@ -4071,17 +4280,13 @@ async def main(argv: list[str] | None = None) -> int:
             timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
         )
         try:
-            # Two RPC clients on one session. The resolver reads from a
-            # SINGLE pinned node (see `resolver_endpoint`) because its
-            # definitive verdict combines two facts that must come from the
-            # same view of the chain; everything else can use the general
-            # endpoint. When the two URLs are equal this is the same target
-            # twice, which is exactly what a deployment with one dedicated
-            # node wants.
-            resolver_url, _pinned = resolver_endpoint(settings)
-            resolver_settings = settings.model_copy(
-                update={"SOLANA_RPC_URL": resolver_url}
-            )
+            # The general read client plus a resolver POOL, all on one session.
+            # The resolver's endpoints are separate from the general one
+            # because a definitive verdict combines two facts that must come
+            # from the same view of the chain, and a load-balanced general
+            # endpoint is fine for quotes and simulation but not for that.
+            # A one-URL pool is the normal single-node deployment.
+            pool = ResolverPool.from_settings(settings, session)
             runner = LaneRunner(
                 settings=settings,
                 db=db,
@@ -4089,7 +4294,8 @@ async def main(argv: list[str] | None = None) -> int:
                 rpc=SolanaRpcClient(settings, session),
                 jito=JitoClient(settings, session),
                 kill_switch=KillSwitch(db),
-                resolver_rpc=SolanaRpcClient(resolver_settings, session),
+                resolver_rpc=pool.endpoints[0].client,
+                resolver_pool=pool,
             )
             if args.command == "place":
                 # --simulate-only NARROWS: it can turn an executing mode into a

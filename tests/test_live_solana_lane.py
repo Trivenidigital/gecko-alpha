@@ -34,9 +34,14 @@ from scout.config import Settings
 from scout.db import Database
 from scout.live import solana_lane
 from scout.live.kill_switch import KillSwitch
-from scout.live.solana.constants import SOL_MINT, USDC_MINT
+from scout.live.solana.constants import (
+    SOL_MINT,
+    SOLANA_MAINNET_GENESIS_HASH,
+    USDC_MINT,
+)
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient
+from scout.live.solana.resolver_pool import ResolverPool, redact_endpoint
 from scout.live.solana.rpc_client import SolanaRpcClient
 from scout.live.solana.signer import (
     REQUIRED_MODE,
@@ -86,6 +91,9 @@ _MIN_OUT_RAW = 8_443_443
 
 _LAST_VALID = 283_000_500
 _HEIGHT_FRESH = 283_000_100
+# Not mainnet-beta. Every endpoint in the resolver pool has to prove which
+# chain it serves before it is allowed to answer a question about a signature.
+_DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
 _ATA_RENT = 2_039_280
 
 # What the inspector prices for the baseline fixture. The rent term is the
@@ -187,6 +195,10 @@ async def _make_runner(tmp_path, *, keypair=PAYER, custody_ok=True, **overrides)
     session = aiohttp.ClientSession()
     loader = _LoaderSpy(keypair)
     prober = _CustodyProbeSpy(ok=custody_ok)
+    # The resolver pool is built from settings exactly as `main()` builds it,
+    # so a test that configures SOLANA_RESOLVER_RPC_URLS gets the pool the
+    # deployment would get rather than a one-endpoint stand-in.
+    pool = ResolverPool.from_settings(settings, session)
     runner = LaneRunner(
         settings=settings,
         db=db,
@@ -196,6 +208,8 @@ async def _make_runner(tmp_path, *, keypair=PAYER, custody_ok=True, **overrides)
         kill_switch=KillSwitch(db),
         keypair_loader=loader,
         custody_prober=prober,
+        resolver_rpc=pool.endpoints[0].client,
+        resolver_pool=pool,
     )
     runner.loader_spy = loader
     runner.custody_spy = prober
@@ -392,6 +406,24 @@ def _mock_quote_and_build(m: aioresponses, tx_b64: str, **quote_kw) -> None:
     _mock_tip_accounts(m)
 
 
+def _mock_resolver_pool_rpc(
+    m: aioresponses,
+    *,
+    rpc_url: str = _RPC_URL,
+    genesis: str = SOLANA_MAINNET_GENESIS_HASH,
+    health: str = "ok",
+    repeat: bool = False,
+) -> None:
+    """The resolver pool's admission probe: getGenesisHash then getHealth.
+
+    Registered before every other RPC mock because it is the first pair of
+    calls ``place`` and ``resolve`` issue — an endpoint proves it is on
+    mainnet-beta and caught up before anything reads a verdict off it.
+    """
+    m.post(rpc_url, payload=_rpc(genesis), repeat=repeat)
+    m.post(rpc_url, payload=_rpc(health), repeat=repeat)
+
+
 def _mock_pre_approval_rpc(
     m: aioresponses,
     *,
@@ -399,12 +431,17 @@ def _mock_pre_approval_rpc(
     usdc_before: int = 0,
     simulation_err=None,
     rpc_url: str = _RPC_URL,
+    pool_probe: bool = True,
 ) -> None:
-    """The RPC reads ``place`` issues between the build and the prompt.
+    """The RPC reads ``place`` issues up to the prompt.
 
-    Order: ATA rent -> SOL balance -> USDC balance -> simulate -> the
-    display-time block height on the approval screen.
+    Order: resolver-pool genesis + health -> ATA rent -> SOL balance -> USDC
+    balance -> simulate -> the display-time block height on the approval
+    screen. ``pool_probe=False`` is for tests that register the pool's mocks
+    themselves because a resolution runs in between.
     """
+    if pool_probe:
+        _mock_resolver_pool_rpc(m, rpc_url=rpc_url)
     m.post(rpc_url, payload=_rpc(_ATA_RENT))
     m.post(rpc_url, payload=_rpc({"context": {"slot": 1}, "value": sol_before}))
     m.post(rpc_url, payload=_token_accounts(usdc_before))
@@ -1125,6 +1162,7 @@ async def test_place_refuses_when_the_quoted_usdc_is_outside_the_band(
     """$4.99 and $10.01 both refuse; the band is [5, 10] on what comes back."""
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload(out_amount=out_raw))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1140,6 +1178,7 @@ async def test_place_refuses_when_price_impact_exceeds_the_ceiling(tmp_path):
     """Jupiter reports priceImpactPct as a FRACTION — 0.02 is 2%, not 0.02%."""
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload(priceImpactPct="0.02"))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1154,6 +1193,7 @@ async def test_unparseable_price_impact_fails_closed(tmp_path):
     """A field we cannot read is not a zero-impact route."""
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload(priceImpactPct="not-a-number"))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1166,6 +1206,7 @@ async def test_place_refuses_a_quote_that_is_not_exact_in(tmp_path):
     """otherAmountThreshold is a minimum-output bound only under ExactIn."""
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload(swapMode="ExactOut"))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1177,6 +1218,7 @@ async def test_place_refuses_a_quote_that_is_not_exact_in(tmp_path):
 async def test_place_refuses_a_quote_with_looser_slippage_than_approved(tmp_path):
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload(slippageBps=500))
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1193,6 +1235,7 @@ async def test_place_refuses_a_transaction_that_pays_a_stranger(tmp_path):
     runner, db, session = await _make_runner(tmp_path)
     hostile = build_swap_tx(extra_transfer_dest=STRANGER).tx_b64
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         _mock_quote_and_build(m, hostile)
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1224,6 +1267,7 @@ async def test_place_refuses_a_tip_over_the_ceiling(tmp_path):
     )
     # Jupiter builds a 100_000-lamport tip regardless of what we asked for.
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         _mock_quote_and_build(m, build_swap_tx(tip_lamports=100_000).tx_b64)
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -1239,6 +1283,7 @@ async def test_place_refuses_when_sol_does_not_cover_swap_fees_and_ata_rent(tmp_
     # Enough for the swap and the FEES, but not for the rent plus headroom.
     barely = _LAMPORTS + _TX_FEES + 1_000
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         _mock_quote_and_build(m, tx)
         m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
         m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": barely}))
@@ -1268,6 +1313,7 @@ async def test_required_balance_counts_the_ata_rent_exactly_once(tmp_path):
     async def _required(tx_b64, sol_balance):
         runner, db, session = await _make_runner(tmp_path)
         with aioresponses() as m:
+            _mock_resolver_pool_rpc(m)
             _mock_quote_and_build(m, tx_b64)
             m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
             m.post(
@@ -1317,6 +1363,7 @@ async def test_ata_rent_falls_back_and_says_so(tmp_path, monkeypatch):
         runner._rpc, "get_minimum_balance_for_rent_exemption", _unreachable
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         _mock_quote_and_build(m, tx)
         # Too little SOL, so the gate refuses and names the rent figure it used.
         m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": 1_000}))
@@ -1507,6 +1554,7 @@ async def test_a_static_tip_list_is_recorded_as_the_degraded_mode(tmp_path):
     tx = build_swap_tx().tx_b64
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload())
         m.post(
             _SWAP_URL,
@@ -1560,6 +1608,7 @@ async def test_a_lookup_table_route_is_approvable_because_a_real_rpc_is_passed(
 
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         _mock_quote_and_build(m, built.tx_b64)
         m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
         # The inspector resolves the table before it can judge the route.
@@ -1774,7 +1823,9 @@ async def test_an_explicit_resolver_url_satisfies_the_pin(tmp_path):
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
     envelope = _step(_steps(tmp_path), "envelope_gate")
     assert envelope["resolver_endpoint_pinned"] is True
-    assert envelope["resolver_rpc_url"] == _RPC_URL
+    # A LABEL, not the URL: provider endpoints carry the API key in the path.
+    assert envelope["resolver_rpc_url"] == redact_endpoint(_RPC_URL)
+    assert _RPC_URL not in json.dumps(envelope)
     await session.close()
     await db.close()
 
@@ -1793,6 +1844,7 @@ async def test_resolve_reports_but_will_not_retire_on_an_unpinned_verdict(
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
         for _ in range(2):
             m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
             m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_LAST_VALID + 50))
@@ -1827,6 +1879,159 @@ def test_resolver_endpoint_prefers_the_explicit_url_and_flags_round_robins(
         SOLANA_RESOLVER_RPC_URL=_RPC_URL,
     )
     assert resolver_endpoint(override) == (_RPC_URL, True)
+
+
+# ======================================================================
+# Resolver pool: chain identity, secrecy, and the all-endpoints pin rule
+# ======================================================================
+async def test_place_refuses_when_the_resolver_is_not_on_mainnet(tmp_path):
+    """*** The verdict-poisoning case, at the lane boundary. ***
+
+    A devnet node reports every mainnet signature as absent, and absence is
+    half of the one verdict that clears the lane. The URL says nothing about
+    which chain is behind it; getGenesisHash does. Nothing is quoted, built or
+    sent.
+    """
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc(_DEVNET_GENESIS))
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+        assert _posts_to(m, _QUOTE_RE) == []
+
+    steps = _steps(tmp_path)
+    abort = _step(steps, "aborted")
+    assert abort["stage"] == "resolver_pool"
+    assert "mainnet-beta" in abort["reason"]
+    pool = _step(steps, "resolver_pool")
+    assert pool["usable_count"] == 0
+    assert pool["endpoints"][0]["genesis_ok"] is False
+    await session.close()
+    await db.close()
+
+
+async def test_a_rehearsal_proceeds_past_a_failed_pool_and_says_so(
+    tmp_path, monkeypatch, capsys
+):
+    """A rehearsal provably never submits, so it can never need the resolver.
+
+    Refusing one for the quality of an endpoint it will not read would block
+    the run that exists to exercise everything else — but it must not read as
+    a launch-ready lane either.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, None)  # stop at the approval boundary
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MODE="SIMULATION_ONLY")
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc(_DEVNET_GENESIS))
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m, pool_probe=False)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    assert _step(steps, "resolver_pool")["usable_count"] == 0
+    assert _step(steps, "quote") is not None, "the rehearsal was blocked by the pool"
+    assert "NOTICE: no resolver endpoint passed" in capsys.readouterr().out
+    await session.close()
+    await db.close()
+
+
+async def test_one_load_balanced_endpoint_in_the_pool_refuses_the_whole_lane(tmp_path):
+    """Pinning is an ALL-endpoint property.
+
+    Selection is by signature, so every endpoint in the pool eventually serves
+    a resolution — one round-robin member is enough to manufacture a false
+    'definitively_not_submitted' on some future signature.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_RESOLVER_RPC_URLS=f"{_RPC_URL},{_ROUND_ROBIN_RPC_URL}",
+    )
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []  # refused before any network call
+
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "envelope_gate"
+    assert "load-balanced" in abort["reason"]
+    assert "api.mainnet-beta.solana.com" in abort["reason"]
+    await session.close()
+    await db.close()
+
+
+async def test_a_resolver_url_carrying_an_api_key_never_reaches_the_evidence(tmp_path):
+    """Provider endpoints put the key IN the URL. Evidence is a durable file."""
+    keyed = "https://solana-mainnet.g.alchemy.com/v2/SECRET-LANE-KEY-DO-NOT-LEAK"
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=keyed, SOLANA_RESOLVER_RPC_URLS=keyed
+    )
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m, rpc_url=keyed)
+        # Refuse at the quote so the run stays short; the pool step is already
+        # written by then.
+        m.get(_QUOTE_RE, payload=_quote_payload(out_amount=4_990_000))
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+
+    raw = _only_evidence_file(tmp_path).read_text(encoding="utf-8")
+    assert "SECRET-LANE-KEY-DO-NOT-LEAK" not in raw
+    assert "solana-mainnet.g.alchemy.com#" in raw  # labelled, not silent
+    pool = _step(_steps(tmp_path), "resolver_pool")
+    assert pool["usable_count"] == 1
+    await session.close()
+    await db.close()
+
+
+async def test_a_runner_built_without_a_pool_labels_the_client_it_actually_reads(
+    tmp_path,
+):
+    """The fallback wiring must not label an endpoint it does not read from.
+
+    `LaneRunner` takes its clients by injection, so a caller may omit the pool.
+    The one-endpoint pool it then builds has to describe the client it was
+    handed — a label taken from config instead would name a node the runner
+    never contacts, which is worse than no label at all.
+    """
+    import aiohttp as _aiohttp
+
+    settings = _settings(
+        tmp_path,
+        SOLANA_RPC_URL=_RPC_URL,
+        SOLANA_RESOLVER_RPC_URL="https://never-contacted.example/rpc",
+    )
+    db = Database(tmp_path / "lane.db")
+    await db.initialize()
+    async with _aiohttp.ClientSession() as session:
+        runner = LaneRunner(
+            settings=settings,
+            db=db,
+            jupiter=JupiterClient(settings, session),
+            rpc=SolanaRpcClient(settings, session),
+            jito=JitoClient(settings, session),
+            kill_switch=KillSwitch(db),
+        )
+        assert runner._pool.size == 1
+        assert runner._pool.labels == (redact_endpoint(_RPC_URL),)
+    await db.close()
+
+
+async def test_the_pool_is_built_from_the_ordered_url_list(tmp_path):
+    """Adding an endpoint is configuration — this is the wiring that proves it."""
+    import aiohttp as _aiohttp
+
+    from scout.live.solana.resolver_pool import ResolverPool
+
+    settings = _settings(
+        tmp_path, SOLANA_RESOLVER_RPC_URLS=f"{_RPC_URL},https://second-node.example/rpc"
+    )
+    async with _aiohttp.ClientSession() as session:
+        pool = ResolverPool.from_settings(settings, session)
+        assert pool.size == 2
+        assert len(set(pool.labels)) == 2
+        assert [e.client._url for e in pool.endpoints] == [
+            _RPC_URL,
+            "https://second-node.example/rpc",
+        ]
 
 
 # ======================================================================
@@ -2288,6 +2493,7 @@ async def test_an_interruption_after_signing_leaves_a_recoverable_row(
 
     monkeypatch.setattr(JitoClient, "submit_transaction", _detonate)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         # Absent and expired: the transaction never landed, so the lane clears.
         for _ in range(2):
             m.post(_RPC_URL, payload=_sig_status(known=False))
@@ -2697,13 +2903,14 @@ async def test_startup_auto_retires_a_row_whose_transaction_can_never_land(
     _authorize(monkeypatch, None)  # stop at the approval boundary
 
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         # Startup reconciliation: two absent sweeps past the expiry height.
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
         _mock_quote_and_build(m, tx)
-        _mock_pre_approval_rpc(m)
+        _mock_pre_approval_rpc(m, pool_probe=False)
         # The lane cleared, so the run proceeded all the way to the prompt.
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -2724,6 +2931,7 @@ async def test_startup_keeps_blocking_a_row_whose_swap_landed(tmp_path):
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status())
         assert await runner.place(sol=_SOL) == EXIT_BLOCKED
         assert _submissions(m) == []
@@ -2741,6 +2949,7 @@ async def test_a_missing_evidence_file_makes_the_row_block(tmp_path):
     await _seed_solana_row(db, decision_id=decision_id, signature=signature)
     # Deliberately NO intent evidence written.
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
         assert await runner.place(sol=_SOL) == EXIT_BLOCKED
@@ -2906,6 +3115,7 @@ async def test_a_row_inside_the_window_resolves_without_its_evidence_file(
     assert solana_lane.read_persisted_intent(tmp_path / "evidence", decision_id) is None
 
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
         assert await runner.resolve(decision_id=decision_id) == EXIT_OK
@@ -2933,6 +3143,7 @@ async def test_a_row_below_the_lower_bound_falls_back_to_the_evidence_file(tmp_p
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         for _ in range(2):
             m.post(_RPC_URL, payload=_sig_status(known=False))
             m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
@@ -2985,6 +3196,7 @@ async def test_past_the_history_window_absence_is_no_longer_evidence(tmp_path, c
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         for _ in range(2):
             m.post(_RPC_URL, payload=_sig_status(known=False))
             m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
@@ -3014,6 +3226,7 @@ async def test_age_derived_expiry_still_requires_a_pinned_endpoint(tmp_path):
         db, decision_id=decision_id, signature=signature, age_seconds=7200
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
         m.post(_ROUND_ROBIN_RPC_URL, payload=_sig_status(known=False))
         m.post(_ROUND_ROBIN_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
         assert await runner.resolve(decision_id=decision_id) == EXIT_OK
@@ -3042,10 +3255,11 @@ async def test_startup_reconciliation_clears_an_aged_row_without_evidence(
     _authorize(monkeypatch, None)  # stop at the approval boundary
 
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
         _mock_quote_and_build(m, tx)
-        _mock_pre_approval_rpc(m)
+        _mock_pre_approval_rpc(m, pool_probe=False)
         # Lane cleared, so the run reached the approval prompt and stopped
         # there on a closed stdin.
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
@@ -3076,6 +3290,7 @@ async def test_resolve_reports_and_auto_retires_only_when_it_can_never_land(
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status(known=False))
         m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
         m.post(_RPC_URL, payload=_sig_status(known=False))
@@ -3094,6 +3309,7 @@ async def test_resolve_leaves_a_landed_row_alone(tmp_path):
     runner, db, session = await _make_runner(tmp_path)
     await _seed_solana_row(db, decision_id=decision_id, signature=signature)
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_sig_status())
         assert await runner.resolve(decision_id=decision_id) == EXIT_BLOCKED
     assert (await _row(db, decision_id))["status"] == "open"
@@ -3123,6 +3339,7 @@ async def test_status_is_read_only_and_reports_blockers(tmp_path, capsys):
         tmp_path, decision_id, signature=signature, last_valid=_LAST_VALID
     )
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}))
         m.post(_RPC_URL, payload=_token_accounts(0))
         # The row resolves as never-submitted, which `place` would auto-retire.
@@ -3152,6 +3369,30 @@ async def test_status_reports_a_refused_keypair_without_crashing(tmp_path, capsy
     assert "keypair custody          : REFUSED" in out
     # Custody was judged from stat, so the key file was never opened.
     assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_status_reports_a_dead_resolver_endpoint_without_crashing(
+    tmp_path, capsys
+):
+    """A dead endpoint is exactly what status is run to discover.
+
+    A read-only report that crashes on the failure it exists to surface tells
+    the operator nothing, and `status` is also the command reached for when
+    something already looks wrong.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RESOLVER_RPC_URLS=f"{_RPC_URL},https://second-node.example/rpc"
+    )
+    with aioresponses() as m:
+        # Neither endpoint answers anything.
+        _mock_resolver_pool_rpc(m, genesis=_DEVNET_GENESIS)
+        assert await runner.status() == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "UNUSABLE" in out
+    assert "corroboration            : available" in out  # configured, not proven
     await session.close()
     await db.close()
 
@@ -3307,6 +3548,7 @@ async def test_evidence_survives_a_crash_mid_run(tmp_path):
         raise RuntimeError("simulated crash after the quote")
 
     with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
         m.get(_QUOTE_RE, payload=_quote_payload())
         runner._jupiter.build_swap_transaction = _boom
         assert await runner.place(sol=_SOL) == EXIT_ESCALATE
