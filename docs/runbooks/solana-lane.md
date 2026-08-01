@@ -588,6 +588,27 @@ machine, same limits, same reconciliation, same evidence — only which
 authorization policy answers. If you find yourself writing a second code path
 for autonomy, that is the design going wrong, not the design being extended.
 
+### Satisfying all three preconditions does NOT make the lane trade
+
+**The autonomous per-trade decision policy does not exist, and its absence is
+deliberate.** `BoundedAutonomousAuthorization.authorize()` returns False
+unconditionally, so a lane with the mode set, the flag on, the supervised
+history recorded and the envelope configured will reach the authorization
+boundary and refuse there, every time.
+
+What exists is the execution *architecture* for autonomy: the limits engine
+never sees the mode, there is one authorization call site rather than a second
+code path, and the preconditions are enforced against the ledger. What does
+not exist is the thing that would answer "should this specific swap happen
+without a human" — because **there is no signal path into this lane**. Nothing
+feeds it candidates; it is invoked by an operator with an amount. A policy
+would have nothing to decide on, and inventing a trading decision nobody
+specified is precisely the second architecture this design exists to avoid.
+
+So do not read a refusal at the authorization boundary as a misconfiguration
+to be debugged. Adding autonomy later means replacing that one method, and if
+it ever means more than that, the seam did not hold.
+
 ## After the lane: drain and destroy
 
 The lane key is single-purpose. When the run is done:

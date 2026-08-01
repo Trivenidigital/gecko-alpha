@@ -538,14 +538,28 @@ class LimitsEngine:
 
 
 def notional_usd_today(
-    rows: Iterable[tuple[Any, Any]], *, now: datetime | None = None
+    rows: Iterable[tuple[Any, Any]],
+    *,
+    unreadable_size_usd: Decimal,
+    now: datetime | None = None,
 ) -> Decimal:
     """Sum today's authorized notional from ``(size_usd, created_at)`` rows.
 
-    A row whose timestamp will not parse COUNTS toward today. That is the
-    conservative direction for a cap: an unreadable row that is silently
-    dropped raises the amount the lane may still spend, and a cap that
-    loosens itself on bad data is not a cap.
+    Two kinds of unreadable data, one rule: **bad data must never widen the
+    cap.** A cap that loosens itself on corruption is not a cap.
+
+    A row whose TIMESTAMP will not parse counts toward today, because dropping
+    it would raise the amount the lane may still spend.
+
+    A row whose SIZE will not parse counts as ``unreadable_size_usd`` — the
+    caller passes the per-trade maximum, the largest that row could legitimately
+    have been. Treating it as zero (which this function used to do, against its
+    own docstring) is the exact bug: two $40 authorizations total $80, but
+    corrupt the second row and the day reads $40, silently creating $40 of
+    headroom that was already spent. Refusing outright would be the other
+    extreme — one corrupt row would wedge the lane until someone edited the
+    database — so the conservative substitution keeps the cap meaningful and
+    the lane recoverable.
 
     Today is UTC, matching the clock every writer in this lane stamps with.
     """
@@ -564,7 +578,12 @@ def notional_usd_today(
         try:
             total += _dec(size_usd or 0)
         except (InvalidOperation, ValueError):
-            # Same reasoning: a size we cannot read is not zero. It cannot be
-            # added, so the row is logged rather than quietly ignored.
-            log.warning("solana_limits_unreadable_notional", size_usd=str(size_usd))
+            total += unreadable_size_usd
+            log.warning(
+                "solana_limits_unreadable_notional",
+                size_usd=str(size_usd),
+                counted_as=format(unreadable_size_usd, "f"),
+                reason="unreadable size counted at the per-trade maximum so a "
+                "corrupt row cannot widen the daily cap",
+            )
     return total

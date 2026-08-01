@@ -181,17 +181,60 @@ def test_a_daily_cap_below_one_trade_is_refused_at_config_time(settings_factory)
         )
 
 
-def test_notional_today_ignores_yesterday_and_keeps_unreadable_rows(engine):
+def test_notional_today_ignores_yesterday_and_keeps_unreadable_timestamps(engine):
     now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
     rows = [
         ("5.00", now.isoformat()),
         ("7.00", (now - timedelta(days=1)).isoformat()),  # yesterday: excluded
-        ("3.00", "not-a-timestamp"),  # unreadable: COUNTS
+        ("3.00", "not-a-timestamp"),  # unreadable stamp: COUNTS
     ]
     # 5 + 3, not 5 and not 15. An unreadable row that were dropped would raise
     # the amount the lane may still spend, and a cap that loosens itself on bad
     # data is not a cap.
-    assert notional_usd_today(rows, now=now) == Decimal("8.00")
+    assert notional_usd_today(
+        rows, unreadable_size_usd=Decimal("10"), now=now
+    ) == Decimal("8.00")
+
+
+def test_an_unreadable_size_counts_at_the_per_trade_maximum(engine):
+    """*** The documented-vs-actual mismatch on a money cap. ***
+
+    An unreadable SIZE used to contribute zero, which silently created
+    headroom that had already been spent: two $40 authorizations total $80,
+    but corrupt the second row and the day reads $40. It now counts at the
+    largest the row could legitimately have been.
+    """
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    rows = [("40.00", now.isoformat()), ("!!corrupt!!", now.isoformat())]
+
+    assert notional_usd_today(
+        rows, unreadable_size_usd=Decimal("40"), now=now
+    ) == Decimal("80.00")
+    # And NOT the old behaviour, which is the whole point of the test.
+    assert notional_usd_today(
+        rows, unreadable_size_usd=Decimal("40"), now=now
+    ) != Decimal("40.00")
+
+
+def test_a_corrupt_row_narrows_the_cap_rather_than_wedging_the_lane(engine):
+    """Substitution, not refusal.
+
+    Refusing outright on unreadable data would let one corrupt row block the
+    lane until somebody edited the database. The conservative substitution
+    keeps the cap meaningful AND the lane recoverable — there is still room
+    under the cap for a trade the budget genuinely allows.
+    """
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+    eng = engine(SOLANA_MAX_DAILY_NOTIONAL_USD=100.0, SOLANA_PILOT_MAX_ORDER_USD=10.0)
+    spent = notional_usd_today(
+        [(None, now.isoformat()), ("garbage", now.isoformat())],
+        unreadable_size_usd=Decimal("10"),
+        now=now,
+    )
+    # None is a legitimate zero (NOT NULL is on size_usd, but be explicit);
+    # only the unparseable string is substituted.
+    assert spent == Decimal("10")
+    assert _quote_report(eng, exposure=LaneExposure(notional_usd_today=spent)).passed
 
 
 # ======================================================================

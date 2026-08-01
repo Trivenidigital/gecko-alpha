@@ -124,6 +124,42 @@ def redact_endpoint(url: str) -> str:
     return f"{host or 'unparseable'}{port}#{fingerprint}"
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def endpoint_identity(url: str) -> str:
+    """A comparison key for "is this the same node?".
+
+    Two URLs that differ only in spelling are ONE endpoint, and treating them
+    as two is not cosmetic: the pool would then "corroborate" a
+    ``definitively_not_submitted`` verdict from node A with a second opinion
+    from node A. If that node is wrong — pruned status history, a stale replica
+    — the corroboration is worthless, the verdict stands, the lane clears, and
+    a fresh attempt is licensed for a transaction that may have landed. The
+    ``single_view`` guard does NOT catch it, because both reads did come from
+    one pinned endpoint.
+
+    Normalised: trailing slashes stripped, scheme and host lowercased, a
+    default port dropped. The PATH and QUERY are compared verbatim and are
+    never case-folded — they carry the API key on every provider this lane
+    runs against, and two different keys are two different credentials even on
+    one host.
+    """
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port
+    if port is not None and _DEFAULT_PORTS.get(scheme) == port:
+        port = None
+    authority = f"{host}:{port}" if port else host
+    path = parts.path.rstrip("/")
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{scheme}://{authority}{path}{query}"
+
+
 def resolver_urls(settings: Settings) -> list[str]:
     """The resolver's endpoints, in preference order, de-duplicated.
 
@@ -137,9 +173,16 @@ def resolver_urls(settings: Settings) -> list[str]:
        itself a known round-robin (that check lives in ``solana_lane``, which
        owns the refusal).
 
-    Order is preserved because it is a preference order for failover. Exact
-    duplicates are dropped: two identical URLs are one node, and treating them
-    as two would let "corroborated by a second endpoint" mean nothing.
+    Order is preserved because it is a preference order for failover.
+    Duplicates are dropped by ``endpoint_identity``, so a copy-paste that
+    differs only in a trailing slash, host case or an explicit ``:443`` does
+    not become two entries that are one node.
+
+    The FIRST spelling of each endpoint is what gets requested — the
+    normalisation decides identity, never the URL that is used. A trailing
+    slash is almost always equivalent for a JSON-RPC POST, but "almost always"
+    is not a property worth silently relying on when keeping the operator's
+    own string costs nothing.
     """
     configured = [
         u.strip() for u in (settings.SOLANA_RESOLVER_RPC_URLS or []) if u.strip()
@@ -153,8 +196,11 @@ def resolver_urls(settings: Settings) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
     for url in configured:
-        if url and url not in seen:
-            seen.add(url)
+        if not url:
+            continue
+        identity = endpoint_identity(url)
+        if identity not in seen:
+            seen.add(identity)
             ordered.append(url)
     return ordered
 

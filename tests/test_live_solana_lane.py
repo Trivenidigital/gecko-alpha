@@ -1207,8 +1207,9 @@ async def test_bounded_autonomous_swaps_the_policy_and_nothing_else(tmp_path, ca
 
     With both settings on, the lane runs the SAME path — quote, build,
     inspect, balance, simulate — and differs only in who is asked. No prompt
-    is printed, and the phase-5 policy refuses rather than approving by
-    default, so an unfinished policy cannot trade.
+    is printed, and the policy refuses BY CONSTRUCTION — the architecture
+    supports autonomy but no per-trade decision exists — so the mode is
+    reachable without anything being able to trade through it.
     """
     tx = build_swap_tx().tx_b64
     runner, db, session = await _make_runner(
@@ -1234,7 +1235,9 @@ async def test_bounded_autonomous_swaps_the_policy_and_nothing_else(tmp_path, ca
     authorization = _step(steps, "authorization")
     assert authorization["method"] == "bounded_autonomous_policy"
     assert authorization["outcome"] == "authorization_refused"
-    assert authorization["detail"] == "autonomous_policy_not_yet_implemented"
+    # Refuses BY CONSTRUCTION: the architecture supports autonomy, the
+    # per-trade decision deliberately does not exist.
+    assert authorization["detail"] == "autonomous_policy_not_implemented"
     assert authorization["prompted"] is False
     # No human was asked, and the key was never read.
     assert "MANUAL APPROVAL REQUIRED" not in capsys.readouterr().out
@@ -2250,6 +2253,49 @@ async def test_place_refuses_when_the_daily_cap_is_already_spent(tmp_path):
     quote = _step(steps, "quote")
     assert quote["exposure"]["notional_usd_today"] == "20.00"
     assert quote["limits"]["failed_checks"] == ["daily_notional_within_cap"]
+    await session.close()
+    await db.close()
+
+
+async def test_a_corrupt_size_row_still_consumes_the_daily_budget(tmp_path):
+    """*** LANE-2 end to end: bad data must not widen a money cap. ***
+
+    A row whose ``size_usd`` will not parse counts at the per-trade maximum,
+    not at zero. Proven through `place` rather than only against the helper,
+    because the bug was that the conservative rule was documented but the
+    wiring passed nothing.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_MAX_DAILY_NOTIONAL_USD=25.0,
+        SOLANA_PILOT_MAX_ORDER_USD=10.0,
+    )
+    # 10.00 readable + one corrupt row counted at the 10.00 per-trade max = 20.
+    # This trade quotes 8.52, so 28.52 breaches the 25.00 cap. Counted at zero
+    # — the old behaviour — the day would read 10.00 and the trade would pass.
+    await _seed_solana_row(
+        db,
+        decision_id="9c1e0f5a-4d21-4d0e-bb2c-9f31d0f4a002",
+        signature=None,
+        status="closed_tp",
+        size_usd="10.00",
+    )
+    await _seed_solana_row(
+        db,
+        decision_id="9c1e0f5a-4d21-4d0e-bb2c-9f31d0f4a003",
+        signature=None,
+        status="closed_tp",
+        size_usd="!!corrupt!!",
+    )
+    with aioresponses() as m:
+        _mock_resolver_pool_rpc(m)
+        m.get(_QUOTE_RE, payload=_quote_payload())
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    assert "daily_notional_within_cap" in _step(steps, "aborted")["reason"]
+    assert _step(steps, "quote")["exposure"]["notional_usd_today"] == "20.00"
     await session.close()
     await db.close()
 

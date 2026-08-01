@@ -1418,7 +1418,7 @@ async def count_supervised_reconciled(db: Database) -> int:
 
 
 async def fetch_lane_exposure(
-    db: Database, *, now: datetime | None = None
+    db: Database, settings: Settings, *, now: datetime | None = None
 ) -> LaneExposure:
     """What the lane already has on, for the concurrency and daily limits.
 
@@ -1463,7 +1463,12 @@ async def fetch_lane_exposure(
         open_positions=open_positions,
         active_executions=active_executions,
         notional_usd_today=notional_usd_today(
-            [(r[0], r[1]) for r in rows], now=reference
+            [(r[0], r[1]) for r in rows],
+            # A row whose size will not parse is counted at the per-trade
+            # maximum: the largest it could legitimately have been. Bad data
+            # must never widen the cap.
+            unreadable_size_usd=_dec(settings.SOLANA_PILOT_MAX_ORDER_USD),
+            now=reference,
         ),
     )
 
@@ -1620,9 +1625,24 @@ class BoundedAutonomousAuthorization(AuthorizationPolicy):
 
     The preconditions are checked by the runner before the mode is honoured at
     all (see ``_check_autonomy_preconditions``); reaching this object already
-    means the lane was permitted to be autonomous. Phase 5 fills in the
-    remaining per-trade policy; until then it refuses, because a policy object
-    that approved everything would be an authorization boundary in name only.
+    means the lane was permitted to be autonomous.
+
+    *** THIS POLICY REFUSES BY CONSTRUCTION, AND THAT IS THE CURRENT STATE. ***
+    The execution ARCHITECTURE supports bounded autonomy today: the limits
+    engine never sees the mode, there is one authorization call site rather
+    than a second code path, and the preconditions are enforced against the
+    ledger. What does not exist is the per-trade DECISION — the thing that
+    would answer "should this specific swap happen without a human". That is
+    deliberate and it is not an oversight to be tidied up later: there is no
+    signal path into this lane, so there is nothing for such a policy to
+    decide ON, and inventing a trading decision nobody specified would be the
+    second architecture this design exists to avoid.
+
+    So ``authorize`` returns False unconditionally. A future policy replaces
+    THIS METHOD and nothing else — that is the measure of whether the seam
+    works. Anyone reading this after the lane goes live should take the
+    refusal at face value: the mode is reachable, the envelope is real, and
+    the decision is absent.
     """
 
     method = "bounded_autonomous_policy"
@@ -1630,12 +1650,13 @@ class BoundedAutonomousAuthorization(AuthorizationPolicy):
     async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
         return AuthorizationDecision(
             authorized=False,
-            outcome="autonomous_policy_not_yet_implemented",
+            outcome="autonomous_policy_not_implemented",
             method=self.method,
             detail={
                 "prompted": False,
-                "note": "bounded-autonomous per-trade policy lands in phase 5; "
-                "refusing rather than approving by default",
+                "note": "the execution architecture supports autonomy, but no "
+                "per-trade decision policy exists — there is no signal path "
+                "into this lane for one to decide on. Refuses by construction.",
             },
         )
 
@@ -2280,7 +2301,7 @@ class LaneRunner:
         quote = await self._jupiter.get_quote(amount=amount_lamports)
         quoted_at = datetime.now(timezone.utc)
 
-        exposure = await fetch_lane_exposure(self._db)
+        exposure = await fetch_lane_exposure(self._db, self._settings)
         limits = self._limits.check_quote(
             quote,
             amount_lamports=amount_lamports,
@@ -3087,7 +3108,7 @@ class LaneRunner:
         # answers a question about a moment that has passed.
         age = await self._blockhash_age(build)
         limits = self._limits.declared_limits()
-        exposure = (await fetch_lane_exposure(self._db)).as_evidence()
+        exposure = (await fetch_lane_exposure(self._db, self._settings)).as_evidence()
         lines = [
             f"  pair                : SOL -> USDC",
             f"  input mint          : {quote.input_mint}",
@@ -4271,7 +4292,7 @@ class LaneRunner:
 
         # Current exposure against the envelope, so "how much room is left
         # today" is answerable without running a placement to find out.
-        exposure = await fetch_lane_exposure(self._db)
+        exposure = await fetch_lane_exposure(self._db, self._settings)
         lines.append(
             f"  used today               : "
             f"{_fmt(exposure.notional_usd_today)} of "

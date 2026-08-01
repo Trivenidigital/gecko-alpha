@@ -162,16 +162,69 @@ def test_neither_key_set_falls_back_to_the_general_rpc(settings_factory):
     assert resolver_urls(settings) == ["https://general.example/rpc"]
 
 
-def test_duplicate_urls_collapse_to_one_endpoint(settings_factory):
-    """Two identical URLs are ONE node.
+@pytest.mark.parametrize(
+    "configured,expected_count",
+    [
+        # exact duplicate
+        ("https://a.example/rpc,https://a.example/rpc", 1),
+        # duplicate with whitespace
+        ("https://a.example/rpc ,  https://a.example/rpc", 1),
+        # duplicate with a trailing slash — the ordinary copy-paste
+        ("https://a.example/rpc,https://a.example/rpc/", 1),
+        # duplicate differing only in host case
+        ("https://A.Example/rpc,https://a.example/rpc", 1),
+        # duplicate with an explicit default port
+        ("https://a.example/rpc,https://a.example:443/rpc", 1),
+        # genuinely different hosts
+        ("https://a.example/rpc,https://b.example/rpc", 2),
+    ],
+)
+def test_urls_that_name_one_node_collapse_to_one_endpoint(
+    settings_factory, configured, expected_count
+):
+    """*** Two spellings of one node would make corroboration meaningless. ***
 
-    Left alone they would let a 'corroborated by a second endpoint' verdict be
-    one node agreeing with itself, which is the opposite of corroboration.
+    The pool would "corroborate" a `definitively_not_submitted` from node A
+    with a second opinion from node A. If that node is wrong — pruned status
+    history, a stale replica — the corroboration is worthless, the verdict
+    stands, the lane clears, and a rerun is licensed for a transaction that may
+    have landed. ``single_view`` does NOT catch it: both reads genuinely came
+    from one pinned endpoint.
+    """
+    settings = settings_factory(SOLANA_RESOLVER_RPC_URLS=configured)
+    assert len(resolver_urls(settings)) == expected_count
+
+
+def test_two_api_keys_on_one_host_are_two_endpoints(settings_factory):
+    """The path is NOT case-folded or collapsed — it carries the credential.
+
+    The mirror of the test above: normalising too aggressively would merge two
+    genuinely distinct endpoints and silently halve the pool.
     """
     settings = settings_factory(
-        SOLANA_RESOLVER_RPC_URLS="https://a.example/rpc,https://a.example/rpc"
+        SOLANA_RESOLVER_RPC_URLS="https://h.example/v2/KEY-A,https://h.example/v2/key-a"
     )
-    assert resolver_urls(settings) == ["https://a.example/rpc"]
+    assert len(resolver_urls(settings)) == 2
+
+
+def test_a_non_default_port_is_a_different_endpoint(settings_factory):
+    settings = settings_factory(
+        SOLANA_RESOLVER_RPC_URLS="https://a.example/rpc,https://a.example:8899/rpc"
+    )
+    assert len(resolver_urls(settings)) == 2
+
+
+def test_the_operators_own_spelling_is_what_gets_requested(settings_factory):
+    """Normalisation decides IDENTITY, never the URL that is used.
+
+    A trailing slash is almost always equivalent for a JSON-RPC POST, and
+    "almost always" is not worth relying on when keeping the original costs
+    nothing. The first spelling wins.
+    """
+    settings = settings_factory(
+        SOLANA_RESOLVER_RPC_URLS="https://a.example/rpc/,https://a.example/rpc"
+    )
+    assert resolver_urls(settings) == ["https://a.example/rpc/"]
 
 
 def test_a_zero_health_timeout_is_refused(settings_factory):
