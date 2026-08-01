@@ -68,6 +68,7 @@ not yet a runtime field.
 | Narrative agent | `narrative_agent` | Narrative-agent alert | trading | None | info | N |
 | Combo-refresh failure streak | `price_refresh_streak` | `combo_refresh` failed ≥3× consecutively | trading | None | warning | N |
 | Second-wave detector | `secondwave` | Second-wave detector fires | trading | None | info | N |
+| Solana stuck-execution watchdog | `solana_execution_watchdog` | A `solana_executions` row has sat in a non-terminal state past its per-state threshold — `submission_attempted` means a transaction may exist that nobody is resolving | trading | None | warning | Y |
 | Source-call coverage watchdog (script) | `source_call_coverage_watchdog` | Source-call price-coverage staleness | trading | None | warning | Y |
 | Stale SQLite reader watchdog | `sqlite_stale_reader_watchdog` | Stale reader pinning the WAL | trading | None | warning | Y |
 | WAL checkpoint-busy watchdog | `sqlite_wal_checkpoint_busy` | WAL checkpoint repeatedly busy | trading | None | warning | Y |
@@ -106,7 +107,8 @@ Known instances: `scripts/acceleration-heartbeat-watchdog.sh`,
    the health chat; every other watchdog / health / state-reversal alert
    (`ingest_watchdog`, `sqlite_stale_reader_watchdog`, `sqlite_wal_checkpoint_busy`,
    `conviction_watchlist_watchdog`, `price_refresh_streak`, `auto_suspend`,
-   `kill_switch`, plus the `scripts/` watchdogs) posts to the **trading** chat,
+   `kill_switch`, `solana_execution_watchdog`, plus the `scripts/` watchdogs)
+   posts to the **trading** chat,
    interleaving operator-health noise with trade opportunities. This is the
    mis-routing ALR-06 was opened to surface.
 
