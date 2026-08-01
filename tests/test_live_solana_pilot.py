@@ -309,17 +309,18 @@ def _mock_pre_approval_rpc(
     sol_before: int = _SOL_BEFORE,
     usdc_before: int = 0,
     simulation_err=None,
+    rpc_url: str = _RPC_URL,
 ) -> None:
     """The RPC reads ``place`` issues between the build and the prompt.
 
     Order: ATA rent -> SOL balance -> USDC balance -> simulate -> the
     display-time block height on the approval screen.
     """
-    m.post(_RPC_URL, payload=_rpc(_ATA_RENT))
-    m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": sol_before}))
-    m.post(_RPC_URL, payload=_token_accounts(usdc_before))
-    m.post(_RPC_URL, payload=_simulation_ok(simulation_err))
-    m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
+    m.post(rpc_url, payload=_rpc(_ATA_RENT))
+    m.post(rpc_url, payload=_rpc({"context": {"slot": 1}, "value": sol_before}))
+    m.post(rpc_url, payload=_token_accounts(usdc_before))
+    m.post(rpc_url, payload=_simulation_ok(simulation_err))
+    m.post(rpc_url, payload=_rpc(_HEIGHT_FRESH))
 
 
 def _mock_post_approval_rpc(m: aioresponses, *, height: int = _HEIGHT_FRESH) -> None:
@@ -1013,6 +1014,145 @@ async def test_place_refuses_a_load_balanced_resolver_endpoint(tmp_path):
     assert "SOLANA_RESOLVER_RPC_URL" in abort["reason"]
     await session.close()
     await db.close()
+
+
+async def test_simulate_only_runs_on_an_unpinned_resolver_and_says_so(
+    tmp_path, monkeypatch, capsys
+):
+    """*** The pin gates SUBMISSION, so it must not gate a rehearsal. ***
+
+    A --simulate-only run provably never submits, so it can never produce an
+    ambiguous submission, so the resolver is never consulted. Refusing one for
+    the quality of an endpoint it will not read blocks the only rehearsal that
+    exercises the real Jupiter/Jito/RPC path.
+
+    It still has to SAY so: a rehearsal that passed on an unpinned resolver
+    must not be mistaken for a launch-ready lane.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
+    )
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
+        assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        # The property the relaxation rests on.
+        assert _submissions(m) == []
+
+    out = capsys.readouterr().out
+    assert "resolver endpoint is NOT pinned" in out
+    assert "a real placement will refuse" in out
+    assert "NOT LAUNCH-READY" in out  # on the approval screen itself
+
+    envelope = _step(_steps(tmp_path), "envelope_gate")
+    assert envelope["resolver_endpoint_pinned"] is False
+    assert envelope["resolver_pin_waived_for_rehearsal"] is True
+    # A rehearsal still writes no ledger row.
+    assert await _count(db, "live_trades") == 0
+    await session.close()
+    await db.close()
+
+
+async def test_simulate_only_on_a_pinned_resolver_says_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """The notice is about a real gap, so it must not cry wolf."""
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        assert _submissions(m) == []
+
+    out = capsys.readouterr().out
+    assert "NOT pinned" not in out
+    assert "NOT LAUNCH-READY" not in out
+    envelope = _step(_steps(tmp_path), "envelope_gate")
+    assert envelope["resolver_endpoint_pinned"] is True
+    assert envelope["resolver_pin_waived_for_rehearsal"] is False
+    await session.close()
+    await db.close()
+
+
+async def test_the_jito_client_is_unreachable_from_any_rehearsal_path(
+    tmp_path, monkeypatch
+):
+    """Belt to the AST test's braces: make submission itself explode.
+
+    The relaxation is only safe because --simulate-only cannot submit. Patched
+    at the CLASS, so any route to it — the runner's client, a second client, a
+    retry — trips the same wire.
+    """
+
+    def _detonate(*_args, **_kwargs):
+        raise AssertionError("a rehearsal reached the block engine")
+
+    monkeypatch.setattr(JitoClient, "submit_transaction", _detonate)
+
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    for pinned, overrides in (
+        (True, {}),
+        (False, {"SOLANA_RPC_URL": _ROUND_ROBIN_RPC_URL}),
+    ):
+        workdir = tmp_path / f"pinned_{pinned}"
+        workdir.mkdir()
+        runner, db, session = await _make_runner(workdir, **overrides)
+        rpc_url = _RPC_URL if pinned else _ROUND_ROBIN_RPC_URL
+        with aioresponses() as m:
+            _mock_quote_and_build(m, tx)
+            _mock_pre_approval_rpc(m, rpc_url=rpc_url)
+            assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        await session.close()
+        await db.close()
+
+
+def test_no_rehearsal_path_can_reach_the_submit_step():
+    """Structural: `place` returns on the rehearsal branch before submitting.
+
+    Same shape as the rpc_client no-broadcast test — an AST walk rather than a
+    grep, because the module's prose says "the submission step is skipped" in
+    several places and text matching cannot tell prose from control flow.
+    """
+    import ast
+    import inspect
+
+    from scout.live import solana_pilot as module
+
+    tree = ast.parse(inspect.getsource(module))
+    place = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "place"
+    )
+
+    submit_lines = [
+        node.lineno
+        for node in ast.walk(place)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "_submit_and_resolve"
+    ]
+    assert submit_lines, "expected to find the submission call site"
+
+    # An `if simulate_only:` whose body returns — the guard itself.
+    guard_returns = [
+        stmt.lineno
+        for node in ast.walk(place)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "simulate_only"
+        for stmt in node.body
+        if isinstance(stmt, ast.Return)
+    ]
+    assert guard_returns, "no `if simulate_only: ... return` guard in place()"
+    assert min(guard_returns) < min(submit_lines), (
+        "the rehearsal guard must return BEFORE the submission call, "
+        f"got guard at {min(guard_returns)} and submit at {min(submit_lines)}"
+    )
 
 
 async def test_an_explicit_resolver_url_satisfies_the_pin(tmp_path):

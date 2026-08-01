@@ -937,11 +937,19 @@ class PilotRunner:
                     f"{field} points at a non-mainnet host (contains {hit!r}). "
                     "The approved envelope is mainnet only.",
                 )
-        # The resolver's endpoint is an envelope property, not an operational
-        # detail: a placement that cannot be RESOLVED afterwards is a placement
-        # whose recovery path is broken before it starts.
+        # The resolver's endpoint is an envelope property for a REAL placement,
+        # not an operational detail: a swap that cannot be RESOLVED afterwards
+        # is a swap whose recovery path is broken before it starts.
+        #
+        # It is not an envelope property for a rehearsal. A --simulate-only run
+        # provably never submits, so it can never produce an ambiguous
+        # submission, so the resolver is never consulted — refusing one for the
+        # quality of an endpoint it will not read is a category error, and it
+        # blocks the rehearsal that exists to exercise everything else. The
+        # operator is told instead, because a rehearsal that passed on an
+        # unpinned resolver must not read as a launch-ready lane.
         resolver_url, pinned = resolver_endpoint(self._settings)
-        if not pinned:
+        if not pinned and not simulate_only:
             raise PilotAbort(
                 "envelope_gate",
                 f"the resolver would read from {resolver_url}, which is a "
@@ -952,6 +960,13 @@ class PilotRunner:
                 "invites a rerun of a swap that is still in flight. Set "
                 "SOLANA_RESOLVER_RPC_URL to a single dedicated node.",
             )
+        if not pinned:
+            print(
+                "NOTICE: resolver endpoint is NOT pinned "
+                f"({resolver_url}); a real placement will refuse until "
+                "SOLANA_RESOLVER_RPC_URL names a dedicated node. This "
+                "rehearsal proceeds because it never submits."
+            )
         return {
             "pilot_enabled": True,
             "keypair_path_configured": True,
@@ -959,7 +974,11 @@ class PilotRunner:
             "output_mint": USDC_MINT,
             "rpc_url": self._settings.SOLANA_RPC_URL,
             "resolver_rpc_url": resolver_url,
-            "resolver_endpoint_pinned": True,
+            "resolver_endpoint_pinned": pinned,
+            # True only on a rehearsal that would have been refused. Recorded
+            # so an evidence pack can never be mistaken for one produced under
+            # the full envelope.
+            "resolver_pin_waived_for_rehearsal": simulate_only and not pinned,
             "block_engine_url": self._settings.JITO_BLOCK_ENGINE_URL,
             "simulate_only": simulate_only,
         }
@@ -1807,6 +1826,11 @@ class PilotRunner:
                 "  ** REHEARSAL        : --simulate-only — the submission step "
                 "is skipped entirely and NOTHING is sent"
             )
+            if not resolver_endpoint(self._settings)[1]:
+                lines.append(
+                    "  ** NOT LAUNCH-READY : resolver endpoint is not pinned; a "
+                    "real placement will refuse"
+                )
         _print_block("SOLANA SUPERVISED PILOT — MANUAL APPROVAL REQUIRED", lines)
         print(
             "Type the first 8 characters of the EXPECTED SIGNATURE to authorize. "
@@ -2622,7 +2646,8 @@ class PilotRunner:
             + (
                 ""
                 if resolver_endpoint(settings)[1]
-                else "   ** NOT PINNED - place will refuse **"
+                else "   ** NOT PINNED - a real place will refuse "
+                "(--simulate-only still runs) **"
             ),
             f"  block engine (submit)    : {settings.JITO_BLOCK_ENGINE_URL}",
             f"  database                 : {Path(settings.DB_PATH).resolve()}",
