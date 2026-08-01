@@ -115,7 +115,14 @@ class SolanaAmbiguousSubmissionError(SolanaError):
         *,
         expected_signature: str,
         last_valid_block_height: int | None = None,
+        bundle_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.expected_signature = expected_signature
         self.last_valid_block_height = last_valid_block_height
+        # The block engine can return `x-bundle-id` on a response whose BODY
+        # never arrived, so the ambiguous path is exactly where a bundle id is
+        # most useful and most easily lost. Diagnostic only — the verdict is
+        # always decided from the signature, because a submission whose
+        # response was lost entirely has no bundle id at all.
+        self.bundle_id = bundle_id

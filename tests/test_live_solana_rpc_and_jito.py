@@ -424,26 +424,126 @@ async def test_submit_success_returns_receipt(settings_factory):
     assert receipt.signature == _SIGNATURE
     assert receipt.returned_signature == _SIGNATURE
     assert receipt.bundle_id == "bundle-abc"
+    # The DEFAULT is now False — revert protection costs landing probability,
+    # and this lane covers revert risk with an independent pre-sign simulation.
+    assert receipt.bundle_only is False
+
+
+@pytest.mark.parametrize("configured", [True, False])
+async def test_bundle_only_comes_from_config_and_sets_the_query_param(
+    settings_factory, configured
+):
+    """*** It was a hardcoded ``bundle_only: bool = True`` default parameter. ***
+
+    Not settable at all, so the trade-off it encodes could not be changed
+    without a code edit. Both directions issue exactly ONE post — the
+    anti-double-send property is independent of the routing choice.
+    """
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(
+            settings_factory(SOLANA_JITO_BUNDLE_ONLY=configured), session
+        )
+        with aioresponses() as mock:
+            mock.post(
+                _SUBMIT_RE, payload={"jsonrpc": "2.0", "id": 1, "result": _SIGNATURE}
+            )
+            receipt = await client.submit_transaction(
+                build_swap_tx().tx_b64, expected_signature=_SIGNATURE
+            )
+            key = next(iter(mock.requests))
+            posts = mock.requests[key]
+            body = posts[0].kwargs["json"]
+
+    assert len(posts) == 1, "a submission must never post twice"
+    assert receipt.bundle_only is configured
+    assert ("bundleOnly=true" in str(key[1])) is configured
+    assert body["method"] == "sendTransaction"
+    # Explicit base64: the param default is the deprecated base58.
+    assert body["params"][1] == {"encoding": "base64"}
+
+
+async def test_an_explicit_bundle_only_argument_still_wins(settings_factory):
+    """Config is the default, not a cage — a caller may still pin it."""
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(settings_factory(SOLANA_JITO_BUNDLE_ONLY=False), session)
+        with aioresponses() as mock:
+            mock.post(
+                _SUBMIT_RE, payload={"jsonrpc": "2.0", "id": 1, "result": _SIGNATURE}
+            )
+            receipt = await client.submit_transaction(
+                build_swap_tx().tx_b64,
+                expected_signature=_SIGNATURE,
+                bundle_only=True,
+            )
     assert receipt.bundle_only is True
 
 
-async def test_submit_sends_bundle_only_and_base64_encoding(settings_factory):
+@pytest.mark.parametrize("casing", ["x-bundle-id", "X-Bundle-Id", "X-BUNDLE-ID"])
+async def test_the_bundle_id_header_is_read_whatever_its_casing(
+    settings_factory, casing
+):
+    """*** THE REASON PRODUCTION LOGGED bundle_id=None. ***
+
+    The header was always read and the constant was always right. What broke
+    it was one layer down: aiohttp's ``resp.headers`` is a case-INSENSITIVE
+    CIMultiDict, and copying it into a plain dict silently made the lookup
+    case-SENSITIVE. HTTP header names are case-insensitive by spec (RFC 9110
+    section 5.1), so the casing is the server's choice and can change without
+    notice.
+
+    Every existing test mocked the header lowercase, so the tests encoded the
+    same assumption as the code and passed while the live lane went blind.
+    """
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(
+                _SUBMIT_RE,
+                payload={"jsonrpc": "2.0", "id": 1, "result": _SIGNATURE},
+                headers={casing: "bundle-xyz"},
+            )
+            receipt = await client.submit_transaction(
+                build_swap_tx().tx_b64, expected_signature=_SIGNATURE
+            )
+    assert receipt.bundle_id == "bundle-xyz"
+
+
+async def test_a_missing_bundle_id_header_is_tolerated(settings_factory):
+    """Absent is not an error — some responses simply do not carry it, and a
+    submission still has to complete and stay resolvable by signature."""
     async with aiohttp.ClientSession() as session:
         client = JitoClient(settings_factory(), session)
         with aioresponses() as mock:
             mock.post(
                 _SUBMIT_RE, payload={"jsonrpc": "2.0", "id": 1, "result": _SIGNATURE}
             )
-            await client.submit_transaction(
+            receipt = await client.submit_transaction(
                 build_swap_tx().tx_b64, expected_signature=_SIGNATURE
             )
-            key = next(iter(mock.requests))
-            body = mock.requests[key][0].kwargs["json"]
+    assert receipt.bundle_id is None
+    assert receipt.signature == _SIGNATURE
 
-    assert "bundleOnly=true" in str(key[1])
-    assert body["method"] == "sendTransaction"
-    # Explicit base64: the param default is the deprecated base58.
-    assert body["params"][1] == {"encoding": "base64"}
+
+@pytest.mark.parametrize("casing", ["x-bundle-id", "X-Bundle-Id"])
+async def test_the_bundle_id_survives_an_ambiguous_submission(settings_factory, casing):
+    """The ambiguous path is where a bundle id is most useful and most easily
+    lost — the body never arrived, but the header may still have."""
+    async with aiohttp.ClientSession() as session:
+        client = JitoClient(settings_factory(), session)
+        with aioresponses() as mock:
+            mock.post(
+                _SUBMIT_RE,
+                status=503,
+                body="busy",
+                headers={casing: "b-9"},
+                repeat=True,
+            )
+            with pytest.raises(SolanaAmbiguousSubmissionError) as excinfo:
+                await client.submit_transaction(
+                    build_swap_tx().tx_b64, expected_signature=_SIGNATURE
+                )
+    assert excinfo.value.bundle_id == "b-9"
+    assert excinfo.value.expected_signature == _SIGNATURE
 
 
 async def test_submit_timeout_is_ambiguous_and_posts_exactly_once(settings_factory):

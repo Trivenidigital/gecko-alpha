@@ -3309,12 +3309,17 @@ class LaneRunner:
         # transaction MAY exist — recording it afterwards would leave the
         # one window that matters unlogged.
         await self._state(decision_id, STATE_SUBMISSION_ATTEMPTED, mode=mode)
+        # Bound on EVERY path out of the try, including the ambiguous one that
+        # falls through when the resolver finds the transaction landed — there
+        # is no `receipt` on that path, only the exception's copy of the id.
+        submitted_bundle_id: str | None = None
         try:
             receipt = await self._jito.submit_transaction(
                 signed.signed_tx_b64,
                 expected_signature=signed.signature,
                 last_valid_block_height=build.last_valid_block_height,
-                bundle_only=True,
+                # Not passed: the client takes SOLANA_JITO_BUNDLE_ONLY. Pinning
+                # it here was how a hardcoded True survived becoming config.
             )
         except SolanaAmbiguousSubmissionError as exc:
             evidence.record(
@@ -3323,7 +3328,9 @@ class LaneRunner:
                 error=str(exc),
                 expected_signature=exc.expected_signature,
                 note="NEVER rebuild — resolving the persisted signature instead",
+                bundle_id=exc.bundle_id,
             )
+            submitted_bundle_id = exc.bundle_id
             code, _resolution = await self._handle_ambiguity(
                 evidence=evidence,
                 decision_id=decision_id,
@@ -3331,6 +3338,7 @@ class LaneRunner:
                 signed=signed,
                 build=build,
                 signer_pubkey=signer_pubkey,
+                bundle_id=exc.bundle_id,
             )
             if code is not None:
                 return code
@@ -3350,6 +3358,7 @@ class LaneRunner:
             print(f"evidence: {evidence.path}")
             return EXIT_REFUSED
         else:
+            submitted_bundle_id = receipt.bundle_id
             evidence.record(
                 "submitted",
                 expected_signature=receipt.signature,
@@ -3370,7 +3379,55 @@ class LaneRunner:
             amount_lamports=amount_lamports,
             signer_pubkey=signer_pubkey,
             mode=mode,
+            bundle_id=submitted_bundle_id,
         )
+
+    async def _record_bundle_diagnostics(
+        self, evidence: EvidenceLog, bundle_id: str | None
+    ) -> None:
+        """Record what Jito says about the bundle. Never raises, never decides.
+
+        ``getInflightBundleStatuses`` only covers the last five minutes and
+        ``getBundleStatuses`` is meaningful only for a ``bundleOnly`` send, so
+        both are best-effort. An empty or failed lookup is recorded as such
+        rather than swallowed — "we asked and got nothing" and "we never asked"
+        are different facts, and only the first tells an operator the bundle
+        was genuinely unknown to the block engine.
+        """
+        if not bundle_id:
+            evidence.record(
+                "bundle_diagnostics",
+                bundle_id=None,
+                available=False,
+                note="no bundle id — either the response carrying x-bundle-id "
+                "never arrived, or the block engine did not return one. The "
+                "verdict does not depend on this.",
+            )
+            return
+        detail: dict[str, Any] = {"bundle_id": bundle_id, "available": True}
+        for label, lookup in (
+            ("inflight", self._jito.get_inflight_bundle_statuses),
+            ("final", self._jito.get_bundle_statuses),
+        ):
+            try:
+                statuses = await lookup([bundle_id])
+            except Exception as exc:
+                detail[label] = {"error_type": type(exc).__name__}
+                continue
+            detail[label] = [
+                {
+                    "bundle_id": entry.bundle_id,
+                    "status": entry.status,
+                    "landed_slot": entry.landed_slot,
+                    "confirmation_status": entry.confirmation_status,
+                }
+                for entry in statuses
+            ] or "no entry returned"
+        detail["note"] = (
+            "diagnostic only — the verdict is decided from the signature by "
+            "the resolver pool, never from bundle status"
+        )
+        evidence.record("bundle_diagnostics", **detail)
 
     async def _handle_ambiguity(
         self,
@@ -3381,6 +3438,7 @@ class LaneRunner:
         signed: SignedTransaction,
         build: SwapBuild,
         signer_pubkey: str,
+        bundle_id: str | None = None,
     ) -> tuple[int | None, ResolutionReport]:
         """Turn an ambiguous submission into a decided state.
 
@@ -3403,6 +3461,16 @@ class LaneRunner:
             **_resolution_summary(resolution),
             **pooled.as_evidence(),
         )
+        # DIAGNOSTIC ONLY, recorded AFTER the verdict is already decided.
+        #
+        # Jito's bundle status answers "why did this not land", which is the
+        # question an operator has at 2am — but it must never answer "did this
+        # land", and the ordering here is what keeps those apart. A submission
+        # whose response was lost entirely has no bundle id at all, which is
+        # precisely the case the resolver exists for, so a verdict that leaned
+        # on bundle status would be undecidable exactly when it mattered. The
+        # signature is the authority; this is colour.
+        await self._record_bundle_diagnostics(evidence, bundle_id)
 
         if resolution.verdict == "landed":
             evidence.record(
@@ -3628,6 +3696,7 @@ class LaneRunner:
         amount_lamports: int,
         signer_pubkey: str,
         mode: str,
+        bundle_id: str | None = None,
     ) -> int:
         """Steps 17-18 — wait for finality, then reconcile the balances."""
         print(
@@ -3685,6 +3754,7 @@ class LaneRunner:
                 signed=signed,
                 build=build,
                 signer_pubkey=signer_pubkey,
+                bundle_id=bundle_id,
             )
             if code is not None:
                 return code

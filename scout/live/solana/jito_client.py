@@ -117,6 +117,11 @@ class JitoClient:
         self._base_url = settings.JITO_BLOCK_ENGINE_URL.rstrip("/")
         self._timeout = float(settings.SOLANA_HTTP_TIMEOUT_SEC)
         self._request_id = 0
+        # Configuration, not a hardcoded default. See SOLANA_JITO_BUNDLE_ONLY
+        # for the trade-off; the short version is that bundleOnly buys revert
+        # protection at the cost of landing probability, and this lane already
+        # covers revert risk with an independent pre-sign simulation.
+        self._bundle_only = bool(settings.SOLANA_JITO_BUNDLE_ONLY)
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -165,7 +170,7 @@ class JitoClient:
         *,
         expected_signature: str,
         last_valid_block_height: int | None = None,
-        bundle_only: bool = True,
+        bundle_only: bool | None = None,
     ) -> SubmissionReceipt:
         """Submit ONE signed transaction. Exactly one POST, ever.
 
@@ -189,6 +194,12 @@ class JitoClient:
                 accepted.
             SolanaAmbiguousSubmissionError: everything else.
         """
+        # None means "take the configured value". An explicit argument still
+        # wins so a caller can pin it, but no call site gets to disagree
+        # with SOLANA_JITO_BUNDLE_ONLY by omission — which is exactly what
+        # a hardcoded `= True` default did.
+        if bundle_only is None:
+            bundle_only = self._bundle_only
         query = {"bundleOnly": "true"} if bundle_only else None
         headers: dict[str, str] = {}
 
@@ -234,6 +245,7 @@ class JitoClient:
                 "resolver.resolve_submission using the expected signature.",
                 expected_signature=expected_signature,
                 last_valid_block_height=last_valid_block_height,
+                bundle_id=bundle_id,
             ) from exc
 
         returned_signature = result if isinstance(result, str) else None
