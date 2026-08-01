@@ -505,6 +505,58 @@ Any message that says the lane is clear is now computed from what `place` will
 actually find on both axes, and `resolve` exits non-zero whenever it is not
 clear — including when it withheld action on an unpinned endpoint.
 
+## Revert protection vs. landing probability (`SOLANA_JITO_BUNDLE_ONLY`)
+
+**Default: `false`.** This is a genuine trade-off, not a safety setting with
+an obvious side.
+
+| | `true` | `false` (default) |
+|---|---|---|
+| Revert protection | yes — a failing transaction is not included, no fee paid | no — a failing transaction lands and burns the ~5,000-lamport base fee |
+| Routing | **auction only, no fallback** | normal routing plus the auction |
+| `getBundleStatuses` | usable | not meaningful |
+
+Jito's own documentation warns that `bundleOnly=true` *"may reduce landing
+probability since the transaction must win the block-engine auction rather
+than having fallback routing options."* There is no fallback path: the bundle
+wins its auction or nothing happens at all.
+
+`false` is right for this lane because **the revert risk `bundleOnly` was
+buying is already covered twice**: Jupiter simulates its own build, and the
+lane runs an independent pre-sign simulation against current chain state and
+refuses on any error. Paying for that protection a third time, in landing
+probability, buys nothing.
+
+Two live mainnet attempts (2026-08) were acknowledged by Jito with the
+signature returned and never landed, at tips of 100,000 and 500,000 lamports
+against an observed P95 of 370,000. Both had `bundleOnly` on. Tip and latency
+were both ruled out first — every Jito region measured 0.096-0.160s from the
+host.
+
+Setting this to `true` does not widen the broadcast surface and setting it to
+`false` does not either: Jito remains the only submission path, and
+`rpc_client` is still structurally incapable of sending.
+
+### Bundle ids and why they were missing
+
+The bundle id arrives in the **`x-bundle-id` response header**, not in the
+JSON-RPC result, and it is the only handle `getBundleStatuses` accepts.
+Without it you cannot ask why a bundle did not land.
+
+If you see `bundle_id=None` in the logs for a submission that was
+acknowledged, that is worth investigating rather than accepting — it means the
+lane is blind to bundle status for that submission. It is now captured
+regardless of header casing (a case-sensitivity bug made it invisible until
+2026-08), and it survives an ambiguous submission, since the header can arrive
+on a response whose body did not.
+
+**Bundle status never decides a verdict.** It is recorded in the
+`bundle_diagnostics` evidence step after the resolver has already ruled, and
+the ruling always comes from the signature. A submission whose response was
+lost entirely has no bundle id at all — precisely the case the resolver exists
+for — so a verdict that leaned on bundle status would be undecidable exactly
+when it mattered most.
+
 ## The stuck-execution watchdog
 
 ```bash

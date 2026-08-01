@@ -122,7 +122,18 @@ async def request_json(
                     # the bundle id, and on the submit path that header is the
                     # difference between a resolvable submission and a blind
                     # one.
-                    capture_headers.update({k: v for k, v in resp.headers.items()})
+                    #
+                    # *** KEYS ARE LOWERCASED, AND THAT IS LOAD-BEARING. ***
+                    # `resp.headers` is a CIMultiDict — case-INSENSITIVE.
+                    # Copying it into a plain dict silently makes lookup
+                    # case-SENSITIVE, so a server sending `X-Bundle-Id` instead
+                    # of `x-bundle-id` reads back as absent. HTTP header names
+                    # are case-insensitive (RFC 9110 §5.1), so the casing is
+                    # the server's choice and may change without notice.
+                    # Callers look up lowercase constants.
+                    capture_headers.update(
+                        {k.lower(): v for k, v in resp.headers.items()}
+                    )
 
                 if resp.status == 429:
                     raise SolanaRateLimitError(f"{label}: HTTP 429")

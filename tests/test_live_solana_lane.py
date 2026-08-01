@@ -2851,10 +2851,12 @@ async def test_happy_path_submits_confirms_finalizes_and_reconciles(
         assert await runner.place(sol=_SOL) == EXIT_OK
         submissions = _submissions(m)
         assert len(submissions) == 1
-        # bundleOnly=true is what buys revert protection.
-        assert "bundleOnly=true" in str(submissions[0].kwargs.get("params", "")) or (
-            submissions[0].kwargs.get("params", {}).get("bundleOnly") == "true"
-        )
+        # bundleOnly is OFF by default: it buys revert protection at the cost
+        # of landing probability, and this lane already refuses on a failed
+        # independent pre-sign simulation. See SOLANA_JITO_BUNDLE_ONLY, and
+        # test_bundle_only_comes_from_config_and_sets_the_query_param for both
+        # directions.
+        assert submissions[0].kwargs.get("params") is None
 
     steps = _steps(tmp_path)
     names = _step_names(steps)
@@ -3220,7 +3222,17 @@ async def test_a_signature_the_cluster_never_knew_is_a_confirm_timeout(tmp_path)
 # ======================================================================
 # Ambiguous submission — all four verdicts
 # ======================================================================
-async def _run_ambiguous(tmp_path, monkeypatch, *, resolver_payloads):
+async def _run_ambiguous(
+    tmp_path, monkeypatch, *, resolver_payloads, submit_bundle_id=None
+):
+    """Drive a run whose submission is AMBIGUOUS, then feed the resolver.
+
+    ``submit_bundle_id`` switches the failure shape. The default raises a
+    timeout, which carries no response at all and so no bundle id — the
+    commonest real case. Passing an id instead returns HTTP 503 with the
+    ``x-bundle-id`` header, which is the case where the block engine
+    acknowledged the bundle but the outcome is still unknown.
+    """
     tx = build_swap_tx().tx_b64
     _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
@@ -3228,7 +3240,15 @@ async def _run_ambiguous(tmp_path, monkeypatch, *, resolver_payloads):
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
         _mock_post_approval_rpc(m)
-        m.post(_SUBMIT_RE, exception=TimeoutError())
+        if submit_bundle_id is None:
+            m.post(_SUBMIT_RE, exception=TimeoutError())
+        else:
+            m.post(
+                _SUBMIT_RE,
+                status=503,
+                body="busy",
+                headers={"X-Bundle-Id": submit_bundle_id},
+            )
         for payload in resolver_payloads:
             if isinstance(payload, dict):
                 m.post(_RPC_URL, payload=payload)
@@ -3372,6 +3392,70 @@ async def test_after_an_in_run_definitive_verdict_a_fresh_place_reaches_the_quot
     assert recovery["blockers"] == 0
     await session2.close()
     await db2.close()
+    await db.close()
+
+
+async def test_a_bundle_status_never_changes_the_resolver_verdict(
+    tmp_path, monkeypatch
+):
+    """*** Jito status is colour; the SIGNATURE is the authority. ***
+
+    Here Jito cheerfully reports the bundle as `Landed`, and the cluster says
+    the signature is absent with an expired blockhash. The verdict must stay
+    `definitively_not_submitted` — a submission whose response was lost has no
+    bundle id at all, so a verdict that leaned on bundle status would be
+    undecidable in exactly the case the resolver exists for.
+    """
+    from scout.live.solana.jito_client import BundleStatus, JitoClient
+
+    async def _claims_landed(_self, _bundle_ids):
+        return [
+            BundleStatus(
+                bundle_id="b-1",
+                status="Landed",
+                landed_slot=283_000_999,
+                confirmation_status="finalized",
+            )
+        ]
+
+    monkeypatch.setattr(JitoClient, "get_inflight_bundle_statuses", _claims_landed)
+    monkeypatch.setattr(JitoClient, "get_bundle_statuses", _claims_landed)
+
+    expired = _rpc(_LAST_VALID + 50)
+    code, db, session, _tx, _subs = await _run_ambiguous(
+        tmp_path,
+        monkeypatch,
+        # A 503 that still carries the bundle id — the block engine
+        # acknowledged it, the outcome is unknown. Header deliberately
+        # mixed-case, which is what defeated the old lookup.
+        submit_bundle_id="b-1",
+        resolver_payloads=[
+            _sig_status(known=False),
+            expired,
+            _sig_status(known=False),
+            expired,
+            _rpc({"context": {"slot": 1}, "value": _SOL_BEFORE}),
+            _token_accounts(0),
+            _token_accounts(0),
+        ],
+    )
+
+    steps = _steps(tmp_path)
+    # The bundle id was captured despite the mixed-case header and the 503.
+    assert _step(steps, "submission_ambiguous")["bundle_id"] == "b-1"
+    # The cluster decided, not Jito.
+    assert (
+        _step(steps, "ambiguity_resolution")["verdict"] == "definitively_not_submitted"
+    )
+    assert code == EXIT_REFUSED
+    assert (await _live_rows(db))[0][0] == "rejected"
+    # And the contradicting status IS recorded — suppressing it would throw
+    # away the best clue about why the bundle did not land.
+    diagnostics = _step(steps, "bundle_diagnostics")
+    assert diagnostics["bundle_id"] == "b-1"
+    assert diagnostics["inflight"][0]["status"] == "Landed"
+    assert "diagnostic only" in diagnostics["note"]
+    await session.close()
     await db.close()
 
 

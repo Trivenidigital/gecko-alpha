@@ -1478,6 +1478,33 @@ class Settings(BaseSettings):
     # raises that and is sent as the `x-api-key` header when set.
     JUPITER_API_KEY: SecretStr | None = None
     JITO_BLOCK_ENGINE_URL: str = "https://mainnet.block-engine.jito.wtf"
+    # Revert protection vs. landing probability. An honest trade-off, and the
+    # default is the one that LANDS.
+    #
+    # True  — `bundleOnly=true`. The transaction is submitted as a bundle with
+    #         revert protection: if it would fail, it is not included and no
+    #         fee is paid. Jito's own docs warn this "may reduce landing
+    #         probability since the transaction must win the block-engine
+    #         auction rather than having fallback routing options." There is NO
+    #         fallback path: the bundle wins its auction or nothing happens.
+    # False — normal routing. The transaction can land through Jito's regular
+    #         paths as well as the auction. The cost is that a transaction
+    #         which WOULD revert now lands and burns the ~5,000-lamport base
+    #         fee instead of being silently dropped.
+    #
+    # False is right for this lane because the revert risk bundleOnly was
+    # buying is already covered twice over: Jupiter simulates its own build,
+    # and the lane runs an INDEPENDENT pre-sign simulation against current
+    # chain state and refuses on any error. Paying for the same protection a
+    # third time — in landing probability — buys nothing.
+    #
+    # Two live mainnet attempts (2026-08) were acknowledged by Jito with the
+    # signature returned and never landed, at tips of 100,000 and 500,000
+    # lamports against an observed P95 of 370,000. Both had bundleOnly on.
+    #
+    # This does NOT widen the broadcast surface: Jito remains the only path,
+    # and rpc_client is still structurally incapable of sending.
+    SOLANA_JITO_BUNDLE_ONLY: bool = False
     SOLANA_HTTP_TIMEOUT_SEC: float = 15.0
 
     # Ceilings enforced by tx_inspector against the transaction Jupiter built.
