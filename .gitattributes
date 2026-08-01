@@ -24,3 +24,6 @@ dashboard/frontend/index.html text eol=lf
 # the `dist/** text eol=lf` rule above for assets/ only — dist/index.html stays
 # LF text.
 dashboard/frontend/dist/assets/** -text
+
+# Ops shell tools deployed to Linux hosts — LF-only, same reason as scripts/*.sh
+ops/* text eol=lf

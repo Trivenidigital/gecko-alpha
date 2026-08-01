@@ -10,11 +10,11 @@ Installed 2026-08-01 with `--yes` only. **`--force` was never used.**
 
 ## 1. Adoption record
 
-| Full identifier | Version / author | Tree SHA-256 (first 32) | Hermes scan verdict | Gecko classification |
+| Full identifier | Version / author | Tree SHA-256 (first 32) | Hermes scan verdict | Gecko classification (final) |
 |---|---|---|---|---|
 | `official/software-development/rest-graphql-debug` | 1.2.0 / eren-karakus0 | `0905d084803548b58f5b0c8f87c7385a` | **DANGEROUS** | **QUARANTINED_REFERENCE_ONLY** |
-| `official/blockchain/solana` | 0.2.0 / Deniz Alagoz (gizdusum), enhanced by Hermes Agent | `1739e4b54d0e5b150cdaf123bc73f748` | CAUTION | **APPROVED_SECONDARY_READ_ONLY** |
-| `official/blockchain/evm` | 1.0.0 / Mibayy, youssefea, ethernet8023, Hermes Agent | `28e9f025feb23c384dd0718305cd29cf` | SAFE | **INCONCLUSIVE — do not rely on** |
+| `official/blockchain/solana` | 0.2.0 / Deniz Alagoz (gizdusum), enhanced by Hermes Agent | `1739e4b54d0e5b150cdaf123bc73f748` | CAUTION | **APPROVED_SECONDARY_READ_ONLY — ONLY THROUGH THE GUARDED RESOLVER WRAPPER** |
+| `official/blockchain/evm` | 1.0.0 / Mibayy, youssefea, ethernet8023, Hermes Agent | `28e9f025feb23c384dd0718305cd29cf` | SAFE | **RESTRICTED_REFERENCE_ONLY — NOT ACCEPTABLE FOR MINARA AUTHORIZATION OR PRE-SIGN VALIDATION** |
 
 Per-file hashes (first 16):
 
@@ -164,9 +164,44 @@ Gecko's deterministic reconciliation in `scout/live/solana/` remains
 compute authorization limits, sign, submit through Jito, or resolve ambiguous
 submission state.
 
+**The skill is approved only when invoked through the guarded wrapper.** Direct
+invocation of `solana_client.py` is not approved, because it reintroduces the
+silent public-RPC fallback.
+
+### Wrapper provenance — repo is the source of truth
+
+The wrapper is version-controlled at `ops/gecko-solana-verify` (mode 755) and
+deployed by `ops/deploy-ops-tools.sh`, which is idempotent and supports
+`--check` for drift detection. It must not exist only as an unmanaged file on a
+VPS.
+
+Deployed parity verified 2026-08-01:
+
+```
+repo blob          sha256 de40595cf29ab8858dc45ad1beecb970b6500bd66f5c64af7128cd8d305a0478
+/usr/local/bin/…   sha256 de40595cf29ab8858dc45ad1beecb970b6500bd66f5c64af7128cd8d305a0478
+mode 755, 2870 bytes, LF-only — byte-identical
+```
+
 ---
 
-## 5. `official/blockchain/evm` — INCONCLUSIVE
+## 5. `official/blockchain/evm` — RESTRICTED_REFERENCE_ONLY
+
+**Final classification: `RESTRICTED_REFERENCE_ONLY`. Not acceptable for Minara
+authorization or pre-sign validation.** This is no longer "inconclusive" — the
+limitations below are proven, not suspected:
+
+- it can hang indefinitely in CoinGecko enrichment (§5.1);
+- it leaks queried public-address activity to an external pricing service (§5.1);
+- it accepts mined transaction hashes only (§5.3);
+- it therefore cannot inspect Minara's unsigned pre-sign artifact (§5.3);
+- proxy detection misses legacy ZeppelinOS proxies (§5.2);
+- proxy detection misses EIP-7702 delegation (§5.2).
+
+It may still be used for **non-sensitive public-address investigation**. It must
+remain outside every safety and authorization decision.
+
+### Evidence
 
 Read-only verification: `evm_client.py` scores **0** for signing and broadcast
 patterns. Chains configured: `arbitrum, avalanche, base, bsc, ethereum,
