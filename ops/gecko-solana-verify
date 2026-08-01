@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# gecko-solana-verify — SECONDARY READ-ONLY verifier for Gecko-Alpha.
+#
+# Wraps the official Hermes skill `official/blockchain/solana` so it can only
+# ever run against Gecko's APPROVED resolver.
+#
+# WHY THIS EXISTS: the skill reads SOLANA_RPC_URL and, when it is unset,
+# SILENTLY falls back to the public endpoint https://api.mainnet-beta.solana.com
+# (evm_client.py-style default at solana_client.py:31-33). Verified on
+# 2026-08-01: with the variable unset the skill returns byte-identical output
+# with exit status 0 and NO warning on stdout or stderr. An operator who forgets
+# the variable therefore gets plausible-looking evidence from an unapproved
+# endpoint with zero indication. This wrapper converts that silent fallback into
+# a loud refusal.
+#
+# TRUST BOUNDARY: this is EVIDENCE tooling only. Authoritative reconciliation
+# stays in scout/live/solana/. This wrapper and the skill it calls must never
+# select a route, approve a transaction, compute authorization limits, sign,
+# submit through Jito, or resolve ambiguous submission state.
+#
+# Usage:  gecko-solana-verify wallet <address>
+#         gecko-solana-verify tx <signature>
+# Exit 78 (EX_CONFIG) on refusal, so callers can distinguish "misconfigured"
+# from "the query failed".
+set -euo pipefail
+
+ENV_FILE=/root/gecko-alpha/.env
+SKILL=/home/gecko-agent/.hermes/skills/blockchain/solana/scripts/solana_client.py
+PY=/home/gecko-agent/.hermes/hermes-agent/venv/bin/python
+PUBLIC_DEFAULT='api.mainnet-beta.solana.com'
+EXPECTED_GENESIS='5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d'
+
+die() { printf 'REFUSED: %s\n' "$*" >&2; exit 78; }
+
+[ -r "$ENV_FILE" ] || die "cannot read $ENV_FILE — run this as root"
+[ -r "$SKILL" ]    || die "skill script missing at $SKILL"
+[ -x "$PY" ]       || die "hermes venv python missing at $PY"
+
+URL=$(sed -n 's/^SOLANA_RESOLVER_RPC_URL=//p' "$ENV_FILE" | head -1)
+[ -n "$URL" ] || die "SOLANA_RESOLVER_RPC_URL is unset or empty in $ENV_FILE"
+
+case "$URL" in
+  *"$PUBLIC_DEFAULT"*) die "approved resolver points at the PUBLIC default endpoint" ;;
+  https://*)           : ;;
+  *)                   die "SOLANA_RESOLVER_RPC_URL is not an https:// URL" ;;
+esac
+
+# Prove the endpoint is really Solana mainnet before trusting anything it says.
+GENESIS=$(curl -s -m 15 -X POST "$URL" \
+            -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' \
+          | sed -n 's/.*"result":"\([^"]*\)".*/\1/p')
+[ -n "$GENESIS" ] || die "resolver did not answer getGenesisHash"
+[ "$GENESIS" = "$EXPECTED_GENESIS" ] \
+  || die "resolver genesis $GENESIS != mainnet $EXPECTED_GENESIS (wrong network)"
+
+HOST=$(printf '%s' "$URL" | sed -E 's#https://([^/]+).*#\1#')
+printf '# resolver OK: %s (mainnet genesis verified)\n' "$HOST" >&2
+
+exec sudo -u gecko-agent env SOLANA_RPC_URL="$URL" "$PY" "$SKILL" "$@"
