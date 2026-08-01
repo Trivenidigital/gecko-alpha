@@ -598,6 +598,123 @@ async def test_place_refuses_while_the_kill_switch_is_engaged(tmp_path):
 
 
 # ======================================================================
+# Durable execution states
+# ======================================================================
+def test_every_state_has_a_transition_rule():
+    """A state with no rule is a state the machine cannot reason about."""
+    from scout.live import solana_lane as lane
+
+    assert len(lane.ALL_STATES) == 13
+    assert set(lane.LEGAL_TRANSITIONS) == set(lane.ALL_STATES)
+    # Every destination is itself a real state.
+    for origin, destinations in lane.LEGAL_TRANSITIONS.items():
+        for destination in destinations:
+            assert destination in lane.ALL_STATES, f"{origin} -> {destination}"
+
+
+def test_a_run_must_begin_at_quote_created():
+    from scout.live import solana_lane as lane
+
+    lane.assert_legal_transition(None, lane.STATE_QUOTE_CREATED)
+    for state in lane.ALL_STATES:
+        if state == lane.STATE_QUOTE_CREATED:
+            continue
+        with pytest.raises(lane.IllegalStateTransition, match="must begin"):
+            lane.assert_legal_transition(None, state)
+
+
+def test_authorization_cannot_be_skipped():
+    """*** The transition that would submit something nobody approved. ***"""
+    from scout.live import solana_lane as lane
+
+    with pytest.raises(lane.IllegalStateTransition):
+        lane.assert_legal_transition(
+            lane.STATE_AWAITING_AUTHORIZATION, lane.STATE_SUBMISSION_ATTEMPTED
+        )
+    with pytest.raises(lane.IllegalStateTransition):
+        lane.assert_legal_transition(lane.STATE_SIMULATION_PASSED, lane.STATE_SIGNED)
+    # The legal route runs through authorization, then signing.
+    lane.assert_legal_transition(
+        lane.STATE_AWAITING_AUTHORIZATION, lane.STATE_AUTHORIZED
+    )
+    lane.assert_legal_transition(lane.STATE_AUTHORIZED, lane.STATE_SIGNED)
+    lane.assert_legal_transition(lane.STATE_SIGNED, lane.STATE_SUBMISSION_ATTEMPTED)
+
+
+def test_no_state_can_walk_backwards_into_signing_or_submitting():
+    """*** The anti-double-send property, stated over the whole machine. ***
+
+    Not "the submit path does not retry" — that is asserted elsewhere on the
+    POST count. This is stronger: from ANY state at or after submission, there
+    is no path in the transition table that reaches signing or submitting
+    again. A rebuild would need one.
+    """
+    from scout.live import solana_lane as lane
+
+    post_submission = (
+        lane.STATE_SUBMISSION_ATTEMPTED,
+        lane.STATE_LANDED,
+        lane.STATE_CONFIRMED,
+        lane.STATE_FINALIZED,
+        lane.STATE_SUBMISSION_UNKNOWN,
+    )
+    # Breadth-first over everything reachable from each post-submission state.
+    for origin in post_submission:
+        seen, frontier = set(), [origin]
+        while frontier:
+            current = frontier.pop()
+            for nxt in lane.LEGAL_TRANSITIONS[current]:
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                frontier.append(nxt)
+        assert lane.STATE_SIGNED not in seen, f"{origin} can reach signing"
+        assert (
+            lane.STATE_SUBMISSION_ATTEMPTED not in seen
+        ), f"{origin} can reach submission again"
+        assert lane.STATE_QUOTE_CREATED not in seen, f"{origin} can restart"
+
+
+def test_recovery_disposition_splits_on_whether_anything_was_sent():
+    """The boundary the persistence exists for.
+
+    Before submission a restart may discard the run without asking anyone;
+    at or after it, the only permitted action is to ask the cluster.
+    """
+    from scout.live import solana_lane as lane
+
+    for state in lane.PRE_SUBMISSION_STATES:
+        assert lane.recovery_disposition(state) == "discard", state
+    for state in lane.BLOCKING_STATES:
+        assert lane.recovery_disposition(state) == "resolve", state
+    for state in lane.TERMINAL_STATES:
+        assert lane.recovery_disposition(state) == "done", state
+    # Exhaustive: every state has a disposition, and the sets do not overlap.
+    assert set(lane.PRE_SUBMISSION_STATES) | set(lane.BLOCKING_STATES) | set(
+        lane.TERMINAL_STATES
+    ) == set(lane.ALL_STATES)
+    assert not set(lane.PRE_SUBMISSION_STATES) & set(lane.BLOCKING_STATES)
+
+
+def test_terminal_states_go_nowhere():
+    from scout.live import solana_lane as lane
+
+    for state in lane.TERMINAL_STATES:
+        assert lane.LEGAL_TRANSITIONS[state] == ()
+        with pytest.raises(lane.IllegalStateTransition):
+            lane.assert_legal_transition(state, lane.STATE_QUOTE_CREATED)
+
+
+def test_an_unknown_state_is_rejected_rather_than_tolerated():
+    from scout.live import solana_lane as lane
+
+    with pytest.raises(lane.IllegalStateTransition, match="not an execution state"):
+        lane.assert_legal_transition(lane.STATE_SIGNED, "nearly_submitted")
+    with pytest.raises(lane.IllegalStateTransition, match="not an execution state"):
+        lane.assert_legal_transition("halfway", lane.STATE_SIGNED)
+
+
+# ======================================================================
 # Operating modes + the authorization seam
 # ======================================================================
 @pytest.mark.parametrize(

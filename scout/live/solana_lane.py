@@ -255,6 +255,158 @@ _REDACTED = "[REDACTED]"
 _INTENT_STEP = "intent_persisted"
 
 # ----------------------------------------------------------------------
+# Durable execution states
+# ----------------------------------------------------------------------
+# One run walks this vocabulary from left to right. The point of naming them
+# is RECOVERY: a process that dies mid-run must be able to say what had
+# already happened, and — far more important — what had NOT, so a restart can
+# never repeat an irreversible step.
+#
+# The dangerous boundary is SUBMISSION_ATTEMPTED. Before it, nothing was sent
+# and a restart may safely discard the run. At or after it, a transaction may
+# exist, and the ONLY permitted recovery is to ask the cluster: no rebuild, no
+# resubmission, ever.
+STATE_QUOTE_CREATED = "quote_created"
+STATE_TRANSACTION_BUILT = "transaction_built"
+STATE_SIMULATION_PASSED = "simulation_passed"
+STATE_AWAITING_AUTHORIZATION = "awaiting_authorization"
+STATE_AUTHORIZED = "authorized"
+STATE_SIGNED = "signed"
+STATE_SUBMISSION_ATTEMPTED = "submission_attempted"
+STATE_LANDED = "landed"
+STATE_CONFIRMED = "confirmed"
+STATE_FINALIZED = "finalized"
+STATE_RECONCILED = "reconciled"
+STATE_FAILED = "failed"
+STATE_SUBMISSION_UNKNOWN = "submission_unknown"
+
+ALL_STATES = (
+    STATE_QUOTE_CREATED,
+    STATE_TRANSACTION_BUILT,
+    STATE_SIMULATION_PASSED,
+    STATE_AWAITING_AUTHORIZATION,
+    STATE_AUTHORIZED,
+    STATE_SIGNED,
+    STATE_SUBMISSION_ATTEMPTED,
+    STATE_LANDED,
+    STATE_CONFIRMED,
+    STATE_FINALIZED,
+    STATE_RECONCILED,
+    STATE_FAILED,
+    STATE_SUBMISSION_UNKNOWN,
+)
+
+# States from which nothing was ever sent. A restart finding one of these knows
+# — from the state alone, without asking the network — that no transaction
+# exists, so the run can be discarded and the lane cleared.
+PRE_SUBMISSION_STATES = (
+    STATE_QUOTE_CREATED,
+    STATE_TRANSACTION_BUILT,
+    STATE_SIMULATION_PASSED,
+    STATE_AWAITING_AUTHORIZATION,
+    STATE_AUTHORIZED,
+    STATE_SIGNED,
+)
+
+# Terminal: the run is over and the lane is not waiting on it.
+TERMINAL_STATES = (STATE_RECONCILED, STATE_FAILED)
+
+# States that BLOCK the lane. A transaction may exist and its fate is either
+# unknown or requires disposition, so no new execution may start.
+BLOCKING_STATES = (
+    STATE_SUBMISSION_ATTEMPTED,
+    STATE_LANDED,
+    STATE_CONFIRMED,
+    STATE_FINALIZED,
+    STATE_SUBMISSION_UNKNOWN,
+)
+
+# Legal transitions. Declared rather than implied by the code's shape so an
+# illegal jump — say awaiting_authorization straight to submission_attempted,
+# which would mean submitting something nobody approved — is a loud error at
+# the write, not a silent state a later reader has to make sense of.
+LEGAL_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    STATE_QUOTE_CREATED: (STATE_TRANSACTION_BUILT, STATE_FAILED),
+    STATE_TRANSACTION_BUILT: (STATE_SIMULATION_PASSED, STATE_FAILED),
+    STATE_SIMULATION_PASSED: (STATE_AWAITING_AUTHORIZATION, STATE_FAILED),
+    STATE_AWAITING_AUTHORIZATION: (STATE_AUTHORIZED, STATE_FAILED),
+    STATE_AUTHORIZED: (STATE_SIGNED, STATE_FAILED),
+    STATE_SIGNED: (STATE_SUBMISSION_ATTEMPTED, STATE_FAILED),
+    # Past here a transaction may exist, so `failed` is NOT reachable by
+    # simply giving up — the only ways out are what the cluster reports.
+    STATE_SUBMISSION_ATTEMPTED: (
+        STATE_LANDED,
+        STATE_CONFIRMED,
+        STATE_FINALIZED,
+        STATE_SUBMISSION_UNKNOWN,
+        STATE_FAILED,
+    ),
+    STATE_LANDED: (STATE_CONFIRMED, STATE_FINALIZED, STATE_FAILED),
+    STATE_CONFIRMED: (STATE_FINALIZED, STATE_RECONCILED, STATE_FAILED),
+    STATE_FINALIZED: (STATE_RECONCILED, STATE_FAILED),
+    # An unknown submission resolves only into what the cluster says. It can
+    # never walk backwards into signing or submitting again.
+    STATE_SUBMISSION_UNKNOWN: (
+        STATE_LANDED,
+        STATE_CONFIRMED,
+        STATE_FINALIZED,
+        STATE_FAILED,
+    ),
+    STATE_RECONCILED: (),
+    STATE_FAILED: (),
+}
+
+
+class IllegalStateTransition(RuntimeError):
+    """A transition the state machine does not permit.
+
+    Raised rather than logged: an illegal transition means the caller believes
+    something happened that could not have, and continuing would persist that
+    belief.
+    """
+
+
+def assert_legal_transition(current: str | None, nxt: str) -> None:
+    """Guard every state write. ``None`` means the run is starting."""
+    if nxt not in ALL_STATES:
+        raise IllegalStateTransition(f"{nxt!r} is not an execution state")
+    if current is None:
+        if nxt != STATE_QUOTE_CREATED:
+            raise IllegalStateTransition(
+                f"a run must begin at {STATE_QUOTE_CREATED}, not {nxt!r}"
+            )
+        return
+    if current not in ALL_STATES:
+        raise IllegalStateTransition(f"{current!r} is not an execution state")
+    if nxt not in LEGAL_TRANSITIONS[current]:
+        raise IllegalStateTransition(
+            f"{current} -> {nxt} is not a legal transition; "
+            f"from {current} the lane may only reach "
+            f"{LEGAL_TRANSITIONS[current] or '(nothing — terminal)'}"
+        )
+
+
+def recovery_disposition(state: str) -> str:
+    """What a restart may do with a run left in ``state``.
+
+    Three answers, and the boundary between the first two is the whole reason
+    the states are persisted:
+
+    ``discard``  nothing was ever sent; the run can be abandoned and the lane
+                 cleared without asking anyone.
+    ``resolve``  a transaction may exist. Ask the cluster. NEVER rebuild and
+                 never resubmit — a rebuild is a second signature and both can
+                 land.
+    ``done``     terminal; nothing to recover.
+    """
+    if state in TERMINAL_STATES:
+        return "done"
+    if state in PRE_SUBMISSION_STATES:
+        return "discard"
+    return "resolve"
+
+
+# ----------------------------------------------------------------------
 # Operating modes
 # ----------------------------------------------------------------------
 # The whole spectrum the lane will ever run in. Moving between them is
