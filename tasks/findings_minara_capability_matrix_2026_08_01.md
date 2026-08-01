@@ -50,6 +50,19 @@ where the Solana answer is a proven no.
 
 ## 2. The matrix
 
+**Status vocabulary — these four are distinct and must not be collapsed:**
+
+| Status | Meaning |
+|---|---|
+| `DOC_SUPPORTED` | Minara's published documentation states the capability. **Not** evidence that it works. |
+| `RUNTIME_PROVEN` | We have observed it working against the live API. **Nothing currently holds this status.** |
+| `UNSUPPORTED` | Positive evidence of absence (an explicit negative, or exhaustive search of the full corpus). |
+| `UNKNOWN_PENDING_PRO` | Cannot be determined without Minara Pro access. Blocked on operator spend, not on analysis. |
+
+Everything in the "yes" column below is `DOC_SUPPORTED` **and simultaneously**
+`UNKNOWN_PENDING_PRO` at runtime. No row is `RUNTIME_PROVEN`.
+
+
 | Chain | Minara supports it? | Unsigned tx artifact? | Evidence | Status |
 |---|---|---|---|---|
 | ethereum | yes | **yes** | `intent-to-swap-tx` returns `unsignedTx{chainType,from,to,data,value,gas,gasPrice,maxPriorityFeePerGas}`, described as "Unsigned transaction ready to be signed and broadcasted" | PROVEN doc-level, **UNPROVEN at runtime** |
