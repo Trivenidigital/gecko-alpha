@@ -1435,15 +1435,24 @@ async def find_incoherent_executions(db: Database) -> list[dict[str, Any]]:
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
-    terminal_states = ", ".join("?" for _ in TERMINAL_STATES)
+    # Both halves are expressed as NOT IN the non-terminal sets rather than as
+    # IN a list of terminal ones. An enumeration of terminal ledger statuses
+    # would go stale the moment someone widened the CHECK constraint, and it
+    # would go stale SILENTLY — the query would keep running and quietly stop
+    # catching the case it exists for. `_BLOCKING_STATUSES` is the same
+    # definition `place` blocks on, so the two cannot drift.
+    #
+    # The join is on live_trades.client_order_id, which is UNIQUE and therefore
+    # indexed — `status` runs this on every invocation.
+    execution_placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    ledger_placeholders = ", ".join("?" for _ in _BLOCKING_STATUSES)
     cur = await db._conn.execute(
         f"""SELECT e.decision_id, e.state, t.status, e.live_trade_id
             FROM solana_executions e
             JOIN live_trades t ON t.client_order_id = e.decision_id
-            WHERE e.state NOT IN ({terminal_states})
-              AND t.status IN ('rejected', 'closed_tp', 'closed_sl',
-                               'closed_duration', 'closed_via_reconciliation')""",
-        TERMINAL_STATES,
+            WHERE e.state NOT IN ({execution_placeholders})
+              AND t.status NOT IN ({ledger_placeholders})""",
+        (*TERMINAL_STATES, *_BLOCKING_STATUSES),
     )
     return [
         {
