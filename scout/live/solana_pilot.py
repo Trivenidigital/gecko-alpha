@@ -425,6 +425,47 @@ def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
     }
 
 
+def keyfile_public_half(settings: Settings) -> tuple[str | None, str]:
+    """The key file's PUBLIC key, derived without constructing a signer.
+
+    A Solana ``id.json`` is 64 bytes: the 32-byte secret seed followed by the
+    32-byte PUBLIC key. Only the second half is used here, and no ``Keypair``
+    is ever built — so this function cannot sign anything, and neither can a
+    caller holding its result.
+
+    That distinction is why ``status`` uses this instead of the loader. Reading
+    a file and holding a signer are different capabilities, and the one command
+    an operator runs constantly should hold neither more than it must. The file
+    IS read (there is no way to learn the public half without reading it), so
+    callers are expected to say so rather than imply otherwise.
+
+    Returns ``(pubkey_or_None, detail)``. Never raises: this is a reporting
+    path, and a status command that crashes on a malformed key file is worse
+    than one that describes it.
+    """
+    raw = (settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip()
+    if not raw:
+        return None, "SOLANA_PILOT_KEYPAIR_PATH is unset"
+    try:
+        payload = json.loads(Path(raw).read_text())
+    except (OSError, ValueError) as exc:
+        # Deliberately does not chain the original message: a JSONDecodeError
+        # renders the offending document fragment, which here is key bytes.
+        return None, f"unreadable as JSON ({type(exc).__name__})"
+    if not isinstance(payload, list) or len(payload) != 64:
+        return None, (
+            "not a 64-integer array "
+            f"({type(payload).__name__} of length "
+            f"{len(payload) if isinstance(payload, list) else 'n/a'})"
+        )
+    try:
+        import base58
+
+        return base58.b58encode(bytes(payload[32:])).decode(), "ok"
+    except (TypeError, ValueError) as exc:
+        return None, f"public half does not encode ({type(exc).__name__})"
+
+
 def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
     """The URL the §7 resolver reads from, and whether it is safely PINNED.
 
@@ -1832,7 +1873,23 @@ class PilotRunner:
             # operator authorized a message hash. A refusal at any of those
             # gates leaves the key file unopened.
             # ---------------------------------------------------------------
-            keypair = self._load_funded_signer(expected=signer_pubkey)
+            try:
+                keypair = self._load_funded_signer(expected=signer_pubkey)
+            except PilotAbort:
+                # Retire inline rather than leaving it to a later run's
+                # unsigned-row sweep. Every other refusal leaves its row
+                # terminal on its own, and a rule that depends on a
+                # subsequent run is harder to reason about — particularly
+                # when that rule is itself an inference from ordering.
+                await retire_row(self._db, live_trade_id)
+                if live_trade_id is not None:
+                    evidence.record(
+                        "intent_retired",
+                        live_trade_id=live_trade_id,
+                        ledger_status="rejected",
+                        note="the key file does not hold the authorized wallet; nothing was signed",
+                    )
+                raise
             evidence.record(
                 "funded_signer_loaded",
                 signer_pubkey=signer_pubkey,
@@ -1848,6 +1905,17 @@ class PilotRunner:
                 # signed. This is the authorization's binding made checkable:
                 # the operator typed a prefix of `message_sha256`, and anything
                 # that changed the message since then invalidates it.
+                #
+                # Retired inline for the same reason as the signer-mismatch
+                # path above: this row is terminal now, not on some later run.
+                await retire_row(self._db, live_trade_id)
+                if live_trade_id is not None:
+                    evidence.record(
+                        "intent_retired",
+                        live_trade_id=live_trade_id,
+                        ledger_status="rejected",
+                        note="signed digest did not match the authorized one; nothing was sent",
+                    )
                 raise PilotAbort(
                     "signed_in_memory",
                     f"signed message digest {signed.message_sha256} does not "
@@ -2896,18 +2964,39 @@ class PilotRunner:
             )
         )
 
-        signer_pubkey: str | None = None
+        # `status` reads state; it must never hold signing capability. Custody
+        # comes from stat, the wallet from config, and the key file is checked
+        # only via its public half — no Keypair is constructed anywhere here.
+        declared = (settings.SOLANA_PILOT_SIGNER_PUBKEY or "").strip()
+        signer_pubkey: str | None = declared or None
         try:
-            keypair = self._load_keypair()
+            self._probe_custody()
         except SolanaKeypairError as exc:
             lines.append(f"  keypair custody          : REFUSED — {exc}")
-        except Exception as exc:  # pragma: no cover - loader contract is typed
+        except Exception as exc:  # pragma: no cover - prober contract is typed
             lines.append(
                 f"  keypair custody          : FAILED {type(exc).__name__}: {exc}"
             )
         else:
-            signer_pubkey = str(keypair.pubkey())
-            lines.append(f"  keypair custody          : ok, signer {signer_pubkey}")
+            lines.append("  keypair custody          : ok (mode and owner from stat)")
+
+        lines.append(f"  declared signer          : {declared or '(none)'}")
+        from_file, detail = keyfile_public_half(settings)
+        if from_file is None:
+            lines.append(
+                f"  key file public half     : UNREADABLE — {detail} "
+                "(no signer was constructed)"
+            )
+        elif from_file == declared:
+            lines.append(
+                "  key file public half     : matches the declared signer "
+                "(read from the file; no signer constructed)"
+            )
+        else:
+            lines.append(
+                f"  key file public half     : MISMATCH — file holds {from_file}, "
+                f"config declares {declared}. `place` will refuse at signing."
+            )
 
         if signer_pubkey is not None:
             try:

@@ -124,6 +124,8 @@ rm <db>.solana_pilot.lock        # only once the on-chain state is known
 
 ```bash
 # Read-only. Custody, balances, kill state, outstanding rows.
+# Constructs no signer: custody comes from stat, and the key file is
+# checked only via its public half.
 python -m scout.live.solana_pilot status
 
 # Rehearsal — quotes, builds, inspects, simulates and prompts.
@@ -161,6 +163,11 @@ until you have said yes.
 The key is read once, immediately after your authorization, used to sign, and
 dropped. Every refusal path — a wrong phrase, a kill switch, a stale blockhash,
 a failed gate, and every `--simulate-only` run — leaves the key file untouched.
+
+`status` never constructs a signer either. It reports custody from `stat`, and
+compares the key file's PUBLIC half against `SOLANA_PILOT_SIGNER_PUBKEY` so a
+wrong key file is caught before trade day rather than at the signing step. Its
+output says which of the two it did. Run it freely; it cannot sign.
 
 ### What you type at the prompt
 

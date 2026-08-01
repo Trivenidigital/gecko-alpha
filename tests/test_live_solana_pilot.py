@@ -54,7 +54,7 @@ from scout.live.solana_pilot import (
     PilotRunner,
     build_parser,
 )
-from solana_tx_builder import PAYER, PAYER_PUBKEY, STRANGER, build_swap_tx
+from solana_tx_builder import OTHER, PAYER, PAYER_PUBKEY, STRANGER, build_swap_tx
 
 _REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
 
@@ -952,9 +952,10 @@ async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "signed_in_memory"
     assert "does not match the AUTHORIZED digest" in abort["reason"]
-    # The row exists (it was written before the prompt) but never received a
-    # signature, so it is provably un-submitted.
-    assert await _live_rows(db) == [("open", None)]
+    # The row is terminal already — this path retires its own row rather
+    # than leaving it for a later run's unsigned-row sweep.
+    assert await _live_rows(db) == [("rejected", None)]
+    assert _step(_steps(tmp_path), "intent_retired")["ledger_status"] == "rejected"
     await session.close()
     await db.close()
 
@@ -2618,11 +2619,117 @@ async def test_status_is_read_only_and_reports_blockers(tmp_path, capsys):
 
 
 async def test_status_reports_a_refused_keypair_without_crashing(tmp_path, capsys):
-    runner, db, session = await _make_runner(tmp_path, keypair=None)
+    runner, db, session = await _make_runner(tmp_path, custody_ok=False)
     with aioresponses():
         assert await runner.status() == EXIT_OK
     out = capsys.readouterr().out
     assert "keypair custody          : REFUSED" in out
+    # Custody was judged from stat, so the key file was never opened.
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+def _write_keyfile(tmp_path, keypair) -> str:
+    """A real Solana id.json: 32 secret bytes then the 32-byte public key."""
+    path = tmp_path / "id.json"
+    path.write_text(json.dumps(list(bytes(keypair))), encoding="utf-8")
+    return str(path)
+
+
+async def test_status_never_constructs_a_signer(tmp_path, capsys, monkeypatch):
+    """*** `status` reads state; it must not hold signing capability. ***
+
+    It cannot sign today either way — but it was the one command that read
+    funded key material with no authorization at all, which reads badly for
+    a boundary whose whole point is that the key is not touched until you
+    approve. Custody now comes from stat, and the file is checked only via
+    its PUBLIC half, so no Keypair is built anywhere on this path.
+
+    Spied at the construction site rather than at the file read, because
+    reading a file and holding a signer are different capabilities and it is
+    the second one that matters here.
+    """
+    import scout.live.solana.signer as signer_module
+
+    class _ExplodingKeypair:
+        @staticmethod
+        def from_bytes(*_args, **_kwargs):
+            raise AssertionError("status constructed a signer")
+
+    monkeypatch.setattr(signer_module, "Keypair", _ExplodingKeypair)
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("status called load_keypair")
+
+    monkeypatch.setattr(solana_pilot, "load_keypair", _forbidden)
+
+    keyfile = _write_keyfile(tmp_path, PAYER)
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_PILOT_KEYPAIR_PATH=keyfile
+    )
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": 1}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        assert await runner.status() == EXIT_OK
+
+    out = capsys.readouterr().out
+    assert "keypair custody          : ok (mode and owner from stat)" in out
+    assert f"declared signer          : {PAYER_PUBKEY}" in out
+    assert "matches the declared signer" in out
+    assert "no signer constructed" in out
+    # The injected loader is the runner's only route to a signer.
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_status_flags_a_key_file_that_is_not_the_declared_wallet(
+    tmp_path, capsys
+):
+    """A wrong key file is worth knowing about BEFORE trade day."""
+    keyfile = _write_keyfile(tmp_path, OTHER)
+    runner, db, session = await _make_runner(
+        tmp_path, SOLANA_PILOT_KEYPAIR_PATH=keyfile
+    )
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": 1}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        assert await runner.status() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "key file public half     : MISMATCH" in out
+    assert "`place` will refuse at signing" in out
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_a_signer_mismatch_retires_its_own_row(tmp_path, monkeypatch):
+    """The refusal is terminal now, not on some later run.
+
+    Every other refusal path leaves its row terminal on its own. Leaning on
+    a subsequent run's unsigned-row sweep would make this one the exception,
+    and that sweep is itself an inference from ordering rather than a
+    directly observed fact.
+    """
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    # The key file decodes to a DIFFERENT wallet than the one this run was
+    # built and authorized for.
+    runner, db, session = await _make_runner(tmp_path, keypair=OTHER)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "funded_signer"
+    assert "was built and authorized for" in abort["reason"]
+    # Terminal immediately — no second run required.
+    assert await _live_rows(db) == [("rejected", None)]
+    assert _step(_steps(tmp_path), "intent_retired")["ledger_status"] == "rejected"
     await session.close()
     await db.close()
 
