@@ -477,16 +477,131 @@ its verdict, the simulation result, the expected signature (before submission),
 the authorization, and the post-trade reconciliation including the
 `meets_minimum_output` comparison that is the slippage guarantee.
 
+## The stuck-execution watchdog
+
+```bash
+python -m scout.live.solana_lane watchdog     # exit 0 clean, 2 = something stuck
+```
+
+`solana_executions` is only written when a trade runs, so a row-rate SLO is
+the wrong shape — silence is the normal state of a supervised lane and says
+nothing. The analogue is **stuck state**: a row that entered a non-terminal
+state and has not moved since. Thresholds differ per state because the states
+mean different things:
+
+| State(s) | Default | Setting |
+|---|---|---|
+| `awaiting_authorization` | 60 min | `SOLANA_STUCK_AWAITING_AUTHORIZATION_SEC` |
+| `quote_created` … `signed` | 15 min | `SOLANA_STUCK_PRE_SUBMISSION_SEC` |
+| **`submission_attempted`** | **3 min** | `SOLANA_STUCK_SUBMISSION_SEC` |
+| `landed` / `confirmed` / `finalized` | 15 min | `SOLANA_STUCK_POST_SUBMISSION_SEC` |
+| `submission_unknown` | 30 min | `SOLANA_STUCK_UNKNOWN_SUBMISSION_SEC` |
+
+`submission_attempted` is the tight one on purpose: a row still sitting there
+means a transaction may exist and nobody is asking the cluster about it. A
+slow human at the approval prompt is not an incident, and paging on one is how
+alerts get muted.
+
+Alerts are plain text (`parse_mode=None`) because every state name contains an
+underscore and MarkdownV1 would eat them while Telegram still returned HTTP
+200. Each alert is deduped per `(decision_id, state)`, re-fires when a row
+moves to a *new* stuck state, and a failed delivery is retried on the next run
+rather than marked as sent.
+
+**Wire it to cron** at 5-minute granularity or tighter. Without it the
+`submission_attempted` threshold is a number nobody reads.
+
+If the watchdog reports something blocking: **never rebuild**. Run
+`resolve --decision-id <id>`.
+
+## Signer rotation
+
+The lane key is single-purpose and every gate reads it from configuration, so
+rotation is a config change plus a sweep — there is no key material in the
+database, in the evidence files, or in this repository.
+
+1. Confirm the lane is idle: `status` shows no outstanding rows and `watchdog`
+   exits 0. **Do not rotate with an unresolved signature outstanding** — the
+   resolver identifies transactions by signature, not by key, but a sweep that
+   races an in-flight swap can leave the wallet short.
+2. Generate the new keypair on the deployment host, mode `0600`, owned by the
+   deploy user. The lane refuses any other permissions or owner.
+3. Sweep SOL and USDC from the old wallet to the new one, supervised. Record
+   the signature.
+4. Update **both** `SOLANA_PILOT_KEYPAIR_PATH` and
+   `SOLANA_PILOT_SIGNER_PUBKEY`. Changing only the path is caught at signing
+   time (the loaded key must equal the declared pubkey) but that is late —
+   `status` reports the mismatch immediately, so run it.
+5. `shred -uz` the old key file and record the destruction.
+6. Run `place --simulate-only --yes-i-am-rehearsing` end to end before the
+   next real trade. A rehearsal never reads the funded key, so it proves the
+   declared pubkey, the balance and the envelope — not the file itself; step 4
+   plus the `status` public-half check is what proves that.
+
+## Emergency shutdown
+
+Three levers, deliberately different in reach:
+
+| Lever | Reach | Reversal |
+|---|---|---|
+| `SOLANA_MODE=EMERGENCY_STOPPED` | this lane only, refuses at the envelope gate before anything is built | edit config |
+| Kill switch (`scout.live.kill_switch`) | **all** live lanes, checked before the build AND again after authorization | `clear` |
+| `SOLANA_MODE=DISABLED` | this lane only, the resting state | edit config |
+
+`EMERGENCY_STOPPED` is the kill switch's configuration-side twin and is checked
+in the same places. The kill switch is the one to reach for mid-run: it is
+re-read after the operator authorizes and before submission, so engaging it
+while someone is at the prompt stops the trade with nothing signed and the
+intent row retired.
+
+**Neither stops `resolve`, `status` or `watchdog`.** That is deliberate:
+turning the lane off is an operator's first instinct when something looks
+wrong, and it must not also turn off the tools that explain what is wrong or
+the alert that would have told them.
+
+Order for a real incident:
+
+1. Kill switch first — it is the widest and takes effect mid-run.
+2. `status` and `watchdog` to see what is outstanding.
+3. `resolve --decision-id <id>` for anything blocking. Never rebuild.
+4. Only then decide about draining the wallet.
+
+## Promoting to bounded autonomy
+
+Three preconditions, all enforced mechanically at the envelope gate — the
+transition is impossible by flipping one flag:
+
+1. `SOLANA_MODE=BOUNDED_AUTONOMOUS`.
+2. `SOLANA_BOUNDED_AUTONOMOUS_ENABLED=true` — a second deliberate act in a
+   second place.
+3. `SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS` (default 3) executions that
+   actually reached the `reconciled` state under `SUPERVISED_LIVE`, counted
+   from `solana_executions`. **This is the one configuration cannot fake.**
+   `finalized` does not count: a swap that landed but whose accounting could
+   not be explained is exactly the history that should not promote the lane.
+
+Plus a bounded envelope: the daily cap, position and concurrency limits,
+per-trade ceiling and total-fee ceiling must all be set and positive.
+
+Nothing else changes. Same runner, same adapter, same signer, same state
+machine, same limits, same reconciliation, same evidence — only which
+authorization policy answers. If you find yourself writing a second code path
+for autonomy, that is the design going wrong, not the design being extended.
+
 ## After the lane: drain and destroy
 
 The lane key is single-purpose. When the run is done:
 
-1. Supervised sweep of all balances (SOL and USDC) to an operator-designated
+1. Confirm nothing is outstanding first: `status` (no blocking rows) and
+   `watchdog` (exit 0). Draining a wallet with a signature still in flight can
+   leave the swap short of funds and turn a clean lane into a failed
+   transaction.
+2. Supervised sweep of all balances (SOL and USDC) to an operator-designated
    address.
-2. Verify both balances read zero:
+3. Verify both balances read zero:
    `python -m scout.live.solana_lane status`.
-3. `shred -uz /root/solana-lane/lane-keypair.json`
-4. `rmdir /root/solana-lane`
+4. `shred -uz /root/solana-lane/lane-keypair.json`
+5. `rmdir /root/solana-lane`
 
-Record steps 1 and 3 in the evidence pack — the sweep transaction signature and
+Record steps 2 and 4 in the evidence pack — the sweep transaction signature and
 the destruction — so the key's whole lifetime is accounted for.

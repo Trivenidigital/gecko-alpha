@@ -183,6 +183,7 @@ from scout.live.solana.constants import (
     USDC_DECIMALS,
     USDC_MINT,
 )
+from scout.live.solana.execution_watchdog import check_stuck_executions
 from scout.live.solana.exceptions import (
     SolanaAmbiguousSubmissionError,
     SolanaAPIError,
@@ -1398,6 +1399,24 @@ async def fetch_blocking_rows(db: Database) -> list[dict[str, Any]]:
     return [_row_dict(r) for r in await cur.fetchall()]
 
 
+async def count_supervised_reconciled(db: Database) -> int:
+    """Executions that reached ``reconciled`` under SUPERVISED_LIVE.
+
+    The bounded-autonomy precondition a flag cannot fake. ``reconciled`` and
+    not merely ``finalized``: a swap that landed but whose accounting could not
+    be explained is exactly the history that should NOT count toward promoting
+    the lane, and the state machine already refuses to advance such a run past
+    ``finalized``.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM solana_executions WHERE state = ? AND mode = ?",
+        (STATE_RECONCILED, MODE_SUPERVISED_LIVE),
+    )
+    return int((await cur.fetchone())[0])
+
+
 async def fetch_lane_exposure(
     db: Database, *, now: datetime | None = None
 ) -> LaneExposure:
@@ -1718,7 +1737,7 @@ class LaneRunner:
             evidence_path_for(self._settings.SOLANA_PILOT_EVIDENCE_DIR, decision_id)
         )
 
-    def _check_envelope(self, *, mode: str) -> dict[str, Any]:
+    async def _check_envelope(self, *, mode: str) -> dict[str, Any]:
         """Step 1 — the lane is enabled, a key is configured, hosts are mainnet."""
         if mode not in ALL_MODES:
             raise LaneAbort(
@@ -1736,8 +1755,9 @@ class LaneRunner:
                 "envelope_gate",
                 "SOLANA_MODE is EMERGENCY_STOPPED — every execution path is refused. This is the configuration-side twin of the kill switch; clear it deliberately, and only once the reason it was set is understood.",
             )
+        autonomy: dict[str, Any] | None = None
         if mode == MODE_BOUNDED_AUTONOMOUS:
-            self._check_autonomy_preconditions()
+            autonomy = await self._check_autonomy_preconditions()
         if not (self._settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip():
             raise LaneAbort(
                 "envelope_gate",
@@ -1827,6 +1847,8 @@ class LaneRunner:
             "mode": mode,
             "will_execute": mode in EXECUTING_MODES,
             "authorization_method": authorization_policy_for(mode).method,
+            "autonomy_preconditions": autonomy,
+            "limits": self._limits.declared_limits(),
         }
 
     async def _check_resolver_pool(
@@ -1957,17 +1979,30 @@ class LaneRunner:
             recovered.append(entry)
         return {"executions": recovered, "blockers": blockers}
 
-    def _check_autonomy_preconditions(self) -> None:
+    async def _check_autonomy_preconditions(self) -> dict[str, Any]:
         """BOUNDED_AUTONOMOUS cannot be reached by setting one value.
 
-        The mode is necessary and not sufficient. A second explicit flag is
-        required, so promoting the lane takes two deliberate acts in two
-        places; phase 5 adds the rest (a minimum number of completed
-        supervised executions recorded in the ledger, and limits configured),
-        checked here so the transition stays mechanical rather than a matter
-        of remembering.
+        *** THE TRANSITION IS MECHANICAL, NOT A CHECKLIST. ***
+        Three preconditions, and each one is verified against something that
+        cannot be asserted by editing a single line:
+
+        1. **The mode.** Necessary, never sufficient.
+        2. **A second explicit flag.** ``SOLANA_BOUNDED_AUTONOMOUS_ENABLED``, so
+           promotion takes two deliberate acts in two places.
+        3. **Recorded supervised history.** N executions that actually reached
+           ``reconciled`` under ``SUPERVISED_LIVE``, counted from
+           ``solana_executions``. This is the one a flag cannot fake: "we did
+           the supervised trades" is a claim the database settles, and a lane
+           that has never completed one under a human cannot promote itself by
+           configuration alone.
+
+        Every failure names what is missing and what would satisfy it, because
+        a refusal an operator cannot act on invites working around the gate.
         """
-        if not self._settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED:
+        settings = self._settings
+        detail: dict[str, Any] = {"mode": MODE_BOUNDED_AUTONOMOUS}
+
+        if not settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED:
             raise LaneAbort(
                 "envelope_gate",
                 "SOLANA_MODE is BOUNDED_AUTONOMOUS but "
@@ -1975,6 +2010,54 @@ class LaneRunner:
                 "does not start autonomous execution — that takes two "
                 "deliberate settings, on purpose.",
             )
+        detail["enable_flag"] = True
+
+        required = int(settings.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS)
+        completed = await count_supervised_reconciled(self._db)
+        detail["supervised_reconciled"] = completed
+        detail["supervised_required"] = required
+        if completed < required:
+            raise LaneAbort(
+                "envelope_gate",
+                f"BOUNDED_AUTONOMOUS requires {required} completed supervised "
+                f"execution(s) recorded in solana_executions; there "
+                f"{'is' if completed == 1 else 'are'} {completed}. Run the lane "
+                "under SUPERVISED_LIVE until that many have reached the "
+                "'reconciled' state. This is counted from the ledger and cannot "
+                "be satisfied by configuration.",
+            )
+
+        # The envelope has to be CONFIGURED, not merely defaulted-into. An
+        # autonomous lane running on whatever the caps happened to be is the
+        # failure this precondition exists to prevent, so the limits that bound
+        # a runaway are required to be present and finite.
+        envelope = self._limits.declared_limits()
+        missing = [
+            name
+            for name, value in (
+                ("daily_notional_usd", settings.SOLANA_MAX_DAILY_NOTIONAL_USD),
+                ("max_open_positions", settings.SOLANA_MAX_OPEN_POSITIONS),
+                (
+                    "max_concurrent_executions",
+                    settings.SOLANA_MAX_CONCURRENT_EXECUTIONS,
+                ),
+                ("per_trade_max_usd", settings.SOLANA_PILOT_MAX_ORDER_USD),
+                (
+                    "max_total_fee_lamports",
+                    settings.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS,
+                ),
+            )
+            if not value or value <= 0
+        ]
+        if missing:
+            raise LaneAbort(
+                "envelope_gate",
+                "BOUNDED_AUTONOMOUS requires a bounded envelope; these limits "
+                f"are unset or non-positive: {', '.join(missing)}.",
+            )
+        detail["envelope"] = envelope
+        log.info("solana_autonomy_preconditions_satisfied", **detail)
+        return detail
 
     async def _check_kill_switch(self, stage: str) -> dict[str, Any]:
         """Steps 2 and 14 — refuse while the live kill switch is engaged."""
@@ -2443,7 +2526,7 @@ class LaneRunner:
 
         live_trade_id: int | None = None
         try:
-            envelope = self._check_envelope(mode=mode)
+            envelope = await self._check_envelope(mode=mode)
             executing = mode in EXECUTING_MODES
             evidence.record("envelope_gate", **envelope)
 
@@ -3505,6 +3588,12 @@ class LaneRunner:
             f"  slot         : {confirmation['slot']}",
             f"  SOL spent    : {summary['balance']['sol_spent']} SOL",
             f"  USDC received: {summary['balance']['usdc_received']} USDC",
+            f"  entry price  : "
+            f"{summary['entry_economics']['executed_price_usdc_per_sol']} USDC/SOL "
+            f"(quoted {summary['entry_economics']['quoted_price_usdc_per_sol']}, "
+            f"slippage {summary['entry_economics']['entry_slippage_bps']} bps)",
+            f"  position     : {summary['position']['wallet_usdc']} USDC in the "
+            f"wallet vs {summary['position']['ledger_usdc']} claimed by the ledger",
             f"  reconcile    : {summary['verdict']}",
             f"  ledger row   : {live_trade_id} (open — the position is yours to "
             f"dispose of)",
@@ -3641,7 +3730,9 @@ class LaneRunner:
                 f"rent, ±{slack})"
             )
 
-        on_chain_err = ((transaction or {}).get("meta") or {}).get("err")
+        _meta = (transaction or {}).get("meta") or {}
+        on_chain_err = _meta.get("err")
+        meta_fee = _meta.get("fee")
         if on_chain_err is not None:
             mismatches.append(f"the finalized transaction carries err={on_chain_err}")
         if confirmation["outcome"] == "finalize_timeout":
@@ -3650,18 +3741,31 @@ class LaneRunner:
                 "window — it is landed but not yet rooted"
             )
 
+        # ---- the position, and what it cost to open ----
+        # A balance delta says money moved. A POSITION record says what the
+        # lane now holds, at what price, and how far that landed from the
+        # quote the operator authorized. The second is what a later disposal
+        # needs and what the daily numbers are built from, so it is written
+        # into the durable row rather than only into the evidence.
+        pnl = _entry_economics(
+            amount_lamports=amount_lamports,
+            usdc_received=usdc_received,
+            quoted_out_raw=quote.out_amount,
+            fee_lamports=meta_fee,
+        )
         ledger = None
         if live_trade_id is not None:
             if usdc_received is not None and usdc_received > 0:
-                sol_units = _dec(amount_lamports) / _dec(LAMPORTS_PER_SOL)
-                usdc_units = usdc_from_raw(usdc_received) or Decimal("0")
                 await update_live_trade(
                     self._db,
                     live_trade_id,
-                    entry_fill_qty=_fmt(sol_units),
-                    entry_fill_price=_fmt(
-                        usdc_units / sol_units if sol_units else Decimal("0")
-                    ),
+                    entry_fill_qty=pnl["sol_spent"],
+                    entry_fill_price=pnl["executed_price_usdc_per_sol"],
+                    # Realised entry slippage against the quote the operator
+                    # saw. Positive means the fill was worse than quoted.
+                    # `mid_at_entry` already holds the quoted price, so the two
+                    # columns are readable together.
+                    entry_slippage_bps=pnl["entry_slippage_bps"],
                 )
             ledger = await fetch_row_by_decision_id(self._db, decision_id)
             if ledger is None:
@@ -3671,6 +3775,23 @@ class LaneRunner:
                     f"ledger entry_order_id {ledger.get('entry_order_id')!r} does "
                     f"not match the submitted signature {signature!r}"
                 )
+
+        # ---- position reconciliation ----
+        # Distinct from the balance check above, which asks "did the right
+        # amount move". This asks "does the wallet actually hold what the
+        # ledger now says the lane holds" — the dangerous direction being a
+        # ledger that asserts a position the wallet does not have, because
+        # every later decision is made against the ledger.
+        position = await self._reconcile_position(
+            signer_pubkey=signer_pubkey, measured_usdc_raw=usdc_after
+        )
+        if position["shortfall_raw"] > 0:
+            mismatches.append(
+                f"the ledger claims {position['ledger_usdc']} USDC across "
+                f"{position['open_rows']} open row(s) but the wallet holds "
+                f"{position['wallet_usdc']} — short by "
+                f"{position['shortfall_usdc']}"
+            )
 
         summary = {
             "verdict": "review" if mismatches else "pass",
@@ -3684,6 +3805,8 @@ class LaneRunner:
                 "transaction_found": transaction is not None,
             },
             "ledger": ledger,
+            "position": position,
+            "entry_economics": pnl,
             "balance": {
                 "sol_before_lamports": sol_before,
                 "sol_after_lamports": sol_after,
@@ -3899,6 +4022,111 @@ class LaneRunner:
             )
             print(f"ESCALATE [resolve]: {type(exc).__name__}: {exc}")
             return EXIT_ESCALATE
+
+    async def _reconcile_position(
+        self, *, signer_pubkey: str, measured_usdc_raw: int | None
+    ) -> dict[str, Any]:
+        """Does the wallet hold what the ledger says the lane holds?
+
+        Sums the recorded position across every open lane row and compares it
+        against the wallet's actual USDC. Only a SHORTFALL is a mismatch: the
+        wallet holding MORE is expected — it may hold USDC this lane never
+        bought — while it holding less means the ledger is asserting a position
+        that is not there, and every later decision is made against the ledger.
+
+        The measured balance is reused when the caller already has it, so this
+        adds no RPC call to the happy path.
+        """
+        if self._db._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._db._conn.execute(
+            "SELECT entry_fill_qty, entry_fill_price, size_usd FROM live_trades "
+            "WHERE venue = ? AND status = 'open'",
+            (VENUE,),
+        )
+        rows = await cur.fetchall()
+        ledger_usdc = Decimal("0")
+        for qty, price, size_usd in rows:
+            # Prefer the executed numbers; fall back to the authorized size for
+            # a row that has not reconciled yet. A row we cannot value at all
+            # is skipped rather than counted as zero, which would understate
+            # the claim and hide a shortfall.
+            filled_qty = _dec_or_none(qty)
+            filled_price = _dec_or_none(price)
+            if filled_qty is not None and filled_price is not None:
+                ledger_usdc += filled_qty * filled_price
+                continue
+            authorized = _dec_or_none(size_usd)
+            if authorized is not None:
+                ledger_usdc += authorized
+
+        wallet_raw = measured_usdc_raw
+        if wallet_raw is None:
+            try:
+                wallet_raw = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
+            except Exception as exc:
+                log.warning(
+                    "solana_position_balance_unavailable",
+                    error_type=type(exc).__name__,
+                )
+                wallet_raw = None
+        wallet_usdc = usdc_from_raw(wallet_raw)
+
+        # An unreadable wallet balance is NOT a clean reconciliation. It is
+        # reported as the full ledger claim being unverified, so the verdict
+        # comes out as review rather than pass.
+        shortfall = (
+            ledger_usdc
+            if wallet_usdc is None
+            else max(Decimal("0"), ledger_usdc - wallet_usdc)
+        )
+        return {
+            "open_rows": len(rows),
+            "ledger_usdc": _fmt(ledger_usdc),
+            "wallet_usdc": "unreadable" if wallet_usdc is None else _fmt(wallet_usdc),
+            "wallet_usdc_raw": wallet_raw,
+            "shortfall_usdc": _fmt(shortfall),
+            "shortfall_raw": int(shortfall * (10**USDC_DECIMALS)),
+            "matches": shortfall == 0,
+        }
+
+    # ---------------- watchdog ----------------
+    async def watchdog(self, session: Any) -> int:
+        """Alert on executions stuck in a non-terminal state. For cron.
+
+        Deliberately NOT gated on SOLANA_MODE or the kill switch, and for the
+        same reason ``resolve`` is not: turning the lane off is an operator's
+        first instinct when something looks wrong, and it must not also turn
+        off the thing that would have told them what is wrong.
+
+        Exit 0 when nothing is stuck, ``EXIT_BLOCKED`` when something is — so a
+        cron wrapper can tell the two apart without parsing stdout.
+        """
+        summary = await check_stuck_executions(self._db, session, self._settings)
+        if not summary["enabled"]:
+            print("SOLANA_EXECUTION_WATCHDOG_ENABLED is False — nothing checked.")
+            return EXIT_OK
+        stuck = summary["stuck"]
+        if not stuck:
+            print("solana lane: no stuck executions.")
+            return EXIT_OK
+        _print_block(
+            f"SOLANA LANE: {len(stuck)} STUCK EXECUTION(S)",
+            [
+                f"  {e['decision_id']} {e['state']} "
+                f"{e['age_seconds'] / 60:.0f}m (threshold "
+                f"{e['threshold_seconds'] / 60:.0f}m)"
+                + ("  ** A TRANSACTION MAY EXIST **" if e["blocks_the_lane"] else "")
+                for e in stuck
+            ]
+            + [
+                "",
+                f"  operator alerts sent this run: {summary['alerted']}",
+                "  For anything marked above: NEVER rebuild. Run",
+                "    python -m scout.live.solana_lane resolve --decision-id <id>",
+            ],
+        )
+        return EXIT_BLOCKED
 
     # ---------------- status ----------------
     async def status(self) -> int:
@@ -4141,6 +4369,48 @@ def _resolution_summary(report: ResolutionReport) -> dict[str, Any]:
     }
 
 
+def _entry_economics(
+    *,
+    amount_lamports: int,
+    usdc_received: int | None,
+    quoted_out_raw: int,
+    fee_lamports: int | None,
+) -> dict[str, Any]:
+    """What the position cost to open, in the terms a later disposal needs.
+
+    Not P&L on the trade — a SOL->USDC buy has no realised P&L until the USDC
+    is disposed of, and writing an execution cost into ``realized_pnl_usd``
+    would misreport it to every consumer that aggregates that column. What IS
+    realised here is the cost of ENTRY: the executed price, the transaction
+    fee, and how far the fill landed from the quote the operator authorized.
+
+    ``entry_slippage_bps`` is positive when the fill was WORSE than quoted,
+    matching the sign convention of the column it is written to.
+    """
+    sol_spent = _dec(amount_lamports) / _dec(LAMPORTS_PER_SOL)
+    received = usdc_from_raw(usdc_received)
+    quoted = usdc_from_raw(quoted_out_raw)
+    executed_price = None if received is None or not sol_spent else received / sol_spent
+    slippage_bps = None
+    if received is not None and quoted:
+        slippage_bps = int(((quoted - received) / quoted * 10_000).to_integral_value())
+    return {
+        "sol_spent": _fmt(sol_spent),
+        "sol_spent_lamports": amount_lamports,
+        "usdc_received": _fmt(received),
+        "usdc_received_raw": usdc_received,
+        "usdc_quoted": _fmt(quoted),
+        "executed_price_usdc_per_sol": _fmt(executed_price),
+        "quoted_price_usdc_per_sol": _fmt(
+            None if not sol_spent or quoted is None else quoted / sol_spent
+        ),
+        "entry_slippage_bps": slippage_bps,
+        "transaction_fee_lamports": fee_lamports,
+        "transaction_fee_sol": _fmt(sol_from_lamports(fee_lamports)),
+        "note": "entry economics, not realised P&L — the position is still open",
+    }
+
+
 def _corroboration_line(pooled: PoolResolution) -> str:
     """One line saying whether a second endpoint backed a definitive absence.
 
@@ -4278,6 +4548,10 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--decision-id", type=_decision_id_arg, required=True)
 
     sub.add_parser("status", help="read-only lane report")
+    sub.add_parser(
+        "watchdog",
+        help="alert on executions stuck in a non-terminal state (for cron)",
+    )
     return parser
 
 
@@ -4404,6 +4678,8 @@ async def main(argv: list[str] | None = None) -> int:
                 return await runner.place(sol=args.sol, mode=override)
             if args.command == "resolve":
                 return await runner.resolve(decision_id=args.decision_id)
+            if args.command == "watchdog":
+                return await runner.watchdog(session)
             return await runner.status()
         finally:
             await session.close()

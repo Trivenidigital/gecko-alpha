@@ -487,6 +487,25 @@ def _mock_happy_path(m: aioresponses, tx_b64: str) -> None:
 # ----------------------------------------------------------------------
 # Ledger seeding
 # ----------------------------------------------------------------------
+async def _seed_supervised_history(db, count: int) -> None:
+    """Record ``count`` completed supervised executions, as the ledger holds them.
+
+    Inserted directly rather than walked through the state machine: these rows
+    stand in for trades that happened on earlier days, and the autonomy
+    precondition reads exactly two columns — state and mode.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    async with db._txn_lock:
+        for i in range(count):
+            await db._conn.execute(
+                "INSERT INTO solana_executions "
+                "(decision_id, state, mode, created_at, updated_at) "
+                "VALUES (?, 'reconciled', 'SUPERVISED_LIVE', ?, ?)",
+                (f"historic-supervised-{i}", now, now),
+            )
+        await db._conn.commit()
+
+
 async def _seed_solana_row(
     db: Database,
     *,
@@ -989,6 +1008,171 @@ async def test_refusing_modes_refuse_before_anything_is_built(tmp_path, mode, fr
     await db.close()
 
 
+async def test_emergency_stopped_and_the_kill_switch_refuse_in_the_same_places(
+    tmp_path, monkeypatch
+):
+    """*** The configuration-side twin of the kill switch. ***
+
+    EMERGENCY_STOPPED exists so an operator who sets it gets a refusal wherever
+    the kill switch would have produced one. The two are checked at the same
+    two boundaries — before anything is built, and again after authorization
+    and before submission — and this pins BOTH boundaries for BOTH mechanisms
+    so one can never drift ahead of the other.
+    """
+    from scout.live.kill_switch import KillSwitch
+
+    # Boundary 1: before anything is built.
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MODE="EMERGENCY_STOPPED")
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []
+    assert _step(_steps(tmp_path), "aborted")["stage"] == "envelope_gate"
+    await session.close()
+    await db.close()
+
+    for stale in (tmp_path / "evidence").glob("*.json"):
+        stale.unlink()
+
+    # Boundary 2: after authorization, before submission. The kill switch is
+    # re-read there; the mode is fixed for the run by then, which is exactly
+    # why the kill switch is the mechanism that can be engaged mid-run.
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+    # A REAL kill event, captured before the method is patched — calling the
+    # patched method from inside the fake would recurse into the counter.
+    ks = KillSwitch(db)
+    await ks.trigger(
+        triggered_by="manual", reason="ops drill", duration=timedelta(hours=1)
+    )
+    engaged_state = await ks.is_active()
+    assert engaged_state is not None
+
+    original = KillSwitch.is_active
+    calls = {"n": 0}
+
+    async def _engaged_after_approval(self):
+        calls["n"] += 1
+        # Clear on the pre-build check, engaged on the post-approval one.
+        return None if calls["n"] == 1 else engaged_state
+
+    monkeypatch.setattr(KillSwitch, "is_active", _engaged_after_approval)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+    monkeypatch.setattr(KillSwitch, "is_active", original)
+
+    steps = _steps(tmp_path)
+    assert _step(steps, "kill_switch_recheck")["kill_active"] is True
+    assert calls["n"] == 2, "the kill switch must be read at BOTH boundaries"
+    # Authorized, then stopped: nothing signed, nothing sent, row retired.
+    assert _step(steps, "signed_in_memory") is None
+    assert runner.loader_spy.calls == 0
+    assert (await _live_rows(db)) == [("rejected", None)]
+    await session.close()
+    await db.close()
+
+
+async def test_bounded_autonomous_refuses_without_recorded_supervised_history(
+    tmp_path,
+):
+    """*** The precondition configuration cannot fake. ***
+
+    Mode set, flag on, envelope configured — and the lane still refuses,
+    because the ledger holds no completed supervised execution. The transition
+    is impossible by flipping one flag, which is the product mandate.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_MODE="BOUNDED_AUTONOMOUS",
+        SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
+        SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=3,
+    )
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []  # refused before anything was contacted
+
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "envelope_gate"
+    assert "3 completed supervised execution(s)" in abort["reason"]
+    assert "cannot be satisfied by configuration" in abort["reason"]
+    assert runner.loader_spy.calls == 0
+
+    # Two is still not three: the count is a threshold, not a boolean.
+    await _seed_supervised_history(db, 2)
+    for stale in (tmp_path / "evidence").glob("*.json"):
+        stale.unlink()
+    with aioresponses():
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+    assert "there are 2" in _step(_steps(tmp_path), "aborted")["reason"]
+    await session.close()
+    await db.close()
+
+
+async def test_the_autonomy_preconditions_are_recorded_in_the_evidence(tmp_path):
+    """A promoted lane's evidence has to show WHY it was allowed to run."""
+    tx = build_swap_tx().tx_b64
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_MODE="BOUNDED_AUTONOMOUS",
+        SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
+        SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=1,
+    )
+    await _seed_supervised_history(db, 1)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        await runner.place(sol=_SOL)
+
+    envelope = _step(_steps(tmp_path), "envelope_gate")
+    preconditions = envelope["autonomy_preconditions"]
+    assert preconditions["enable_flag"] is True
+    assert preconditions["supervised_reconciled"] == 1
+    assert preconditions["supervised_required"] == 1
+    # And the envelope it will trade inside, recorded with it.
+    assert envelope["limits"]["daily_notional_usd"] == "25.0"
+    await session.close()
+    await db.close()
+
+
+async def test_the_watchdog_command_reports_a_stuck_execution(tmp_path, capsys):
+    """The lane's own CLI surface for the stuck-state watchdog, for cron.
+
+    Exit code distinguishes healthy from stuck so a wrapper does not parse
+    stdout.
+    """
+    from datetime import timedelta as _timedelta
+
+    from scout.live.solana import execution_watchdog
+
+    execution_watchdog._reset_for_tests()
+    runner, db, session = await _make_runner(tmp_path)
+    assert await runner.watchdog(session) == EXIT_OK
+    assert "no stuck executions" in capsys.readouterr().out
+
+    stale = (datetime.now(timezone.utc) - _timedelta(hours=2)).isoformat()
+    async with db._txn_lock:
+        await db._conn.execute(
+            "INSERT INTO solana_executions "
+            "(decision_id, state, mode, expected_signature, created_at, updated_at) "
+            "VALUES ('stuck-1', 'submission_attempted', 'SUPERVISED_LIVE', "
+            "'sig', ?, ?)",
+            (stale, stale),
+        )
+        await db._conn.commit()
+
+    assert await runner.watchdog(session) == EXIT_BLOCKED
+    out = capsys.readouterr().out
+    assert "STUCK EXECUTION" in out
+    assert "A TRANSACTION MAY EXIST" in out
+    assert "NEVER rebuild" in out
+    execution_watchdog._reset_for_tests()
+    await session.close()
+    await db.close()
+
+
 async def test_an_unrecognised_mode_refuses_rather_than_defaulting(tmp_path):
     """A typo in .env must not fall back to some 'safe' behaviour.
 
@@ -1031,7 +1215,12 @@ async def test_bounded_autonomous_swaps_the_policy_and_nothing_else(tmp_path, ca
         tmp_path,
         SOLANA_MODE="BOUNDED_AUTONOMOUS",
         SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
+        SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=3,
     )
+    # The mode and the flag are not enough on their own — the lane also
+    # requires recorded supervised history. See
+    # test_bounded_autonomous_refuses_without_recorded_supervised_history.
+    await _seed_supervised_history(db, 3)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)

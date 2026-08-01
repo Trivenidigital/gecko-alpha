@@ -1560,6 +1560,37 @@ class Settings(BaseSettings):
     # Jupiter routes through dozens of AMMs and rotates which it picks, so a
     # closed default would refuse essentially every real route.
     SOLANA_ALLOWED_ROUTE_LABELS: Annotated[list[str], NoDecode] = []
+
+    # -------- Solana lane operations --------
+    # Stuck-execution watchdog (CLAUDE.md §12a, in the shape that fits this
+    # table). A row-rate SLO is the WRONG shape for solana_executions: it is
+    # only written when a trade runs, so silence is normal and says nothing.
+    # The analogue is STUCK STATE — a row that entered a non-terminal state and
+    # has not moved since — and the thresholds differ per state because the
+    # states mean different things.
+    SOLANA_EXECUTION_WATCHDOG_ENABLED: bool = True
+    # A human reading the decision screen. Generous on purpose.
+    SOLANA_STUCK_AWAITING_AUTHORIZATION_SEC: float = 3600.0
+    # Machine steps that take seconds. Sitting here means the process died
+    # between two durable writes.
+    SOLANA_STUCK_PRE_SUBMISSION_SEC: float = 900.0
+    # *** THE ONE THAT MUST NOT SIT. *** A row still in submission_attempted
+    # means a transaction may exist and nobody is asking the cluster about it.
+    SOLANA_STUCK_SUBMISSION_SEC: float = 180.0
+    # Landed, waiting on confirmation / finalization / reconciliation.
+    SOLANA_STUCK_POST_SUBMISSION_SEC: float = 900.0
+    # Already escalated and already blocking the lane. Alerted anyway, on a
+    # longer fuse: a blocked lane nobody remembers is a lane that has silently
+    # stopped trading.
+    SOLANA_STUCK_UNKNOWN_SUBMISSION_SEC: float = 1800.0
+
+    # -------- Bounded-autonomy preconditions --------
+    # Completed, RECONCILED supervised executions required in the ledger before
+    # BOUNDED_AUTONOMOUS will run. Counted from solana_executions, not from
+    # memory or a checklist: the transition has to be impossible by flipping a
+    # flag, and "we did the supervised trades" is a claim the database can
+    # settle. Raising this is a tightening; lowering it below 1 is refused.
+    SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS: int = 3
     # Settle delay between the two sweeps that resolve an ambiguous
     # submission. Same rationale as KRAKEN_SUBMISSION_SETTLE_SEC above: a
     # just-forwarded transaction is briefly unknown to the RPC's signature
@@ -2293,6 +2324,25 @@ class Settings(BaseSettings):
                     "allowlist is not 'unrestricted', it is a lane with no "
                     "tradable pair."
                 )
+        for name in (
+            "SOLANA_STUCK_AWAITING_AUTHORIZATION_SEC",
+            "SOLANA_STUCK_PRE_SUBMISSION_SEC",
+            "SOLANA_STUCK_SUBMISSION_SEC",
+            "SOLANA_STUCK_POST_SUBMISSION_SEC",
+            "SOLANA_STUCK_UNKNOWN_SUBMISSION_SEC",
+        ):
+            if getattr(self, name) <= 0:
+                # A zero threshold reports every row as stuck the instant it is
+                # written, which trains the operator to ignore the alert — the
+                # failure mode a watchdog exists to avoid.
+                raise ValueError(f"{name} must be > 0; got={getattr(self, name)}")
+        if self.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS < 1:
+            raise ValueError(
+                "SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS must be >= 1; got "
+                f"{self.SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS}. Zero would "
+                "let the lane go autonomous having never executed anything "
+                "under supervision, which is the precondition's whole point."
+            )
         if self.SOLANA_PILOT_MAX_ATA_CREATES < 0:
             raise ValueError(
                 "SOLANA_PILOT_MAX_ATA_CREATES must be >= 0; "
