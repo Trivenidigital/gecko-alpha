@@ -1,7 +1,7 @@
-# Solana supervised pilot — operator runbook
+# Solana DEX execution lane — operator runbook
 
 For the single supervised SOL→USDC swap on mainnet
-(`python -m scout.live.solana_pilot`). Read this before the run, not during it.
+(`python -m scout.live.solana_lane`). Read this before the run, not during it.
 
 The swap is ~$7. **The success criterion is path validation, not P&L** — see
 [Fees and friction](#fees-and-friction).
@@ -11,11 +11,11 @@ The swap is ~$7. **The success criterion is path validation, not P&L** — see
 ### Custody
 
 The signing key lives outside the repository, owned by the account that runs the
-pilot:
+lane:
 
 ```bash
-/root/solana-pilot/                       # dir 0700, root-owned
-/root/solana-pilot/pilot-keypair.json     # file 0600, root-owned
+/root/solana-lane/                       # dir 0700, root-owned
+/root/solana-lane/lane-keypair.json     # file 0600, root-owned
 ```
 
 Wallet: `CqnCgVWJCimvkNX1YE1nerNZgBD69qKu8rhrqWGeDDAE`, funded with 0.2 SOL.
@@ -28,6 +28,35 @@ a key that may have been read.
 
 The key is read at call time, used, and dropped. It is never cached, never
 passed through argv or the environment, and never logged.
+
+### Set the operating mode
+
+```bash
+SOLANA_MODE=SIMULATION_ONLY     # or SUPERVISED_LIVE for a real trade
+```
+
+`SOLANA_MODE` is the lane's master control and replaces the old
+`SOLANA_PILOT_ENABLED` boolean. **Remove `SOLANA_PILOT_ENABLED` from `.env`** —
+config forbids unknown keys, so a stale one fails loudly at startup rather than
+being ignored.
+
+| Mode | What it does |
+|---|---|
+| `DISABLED` | Refuses everything. The default. |
+| `SIMULATION_ONLY` | Quotes, builds, inspects, simulates, prompts. Never reads the funded key, never submits. |
+| `SUPERVISED_LIVE` | A human types the authorization before the funded key signs. |
+| `BOUNDED_AUTONOMOUS` | A policy check replaces the typed prompt. Also requires `SOLANA_BOUNDED_AUTONOMOUS_ENABLED=true`. |
+| `EMERGENCY_STOPPED` | Refuses all execution, like the kill switch, and is checked in the same places. |
+
+Moving between modes is configuration. The same runner, signer, limits, state
+machine, submission path and reconciliation serve all of them — only the
+authorization policy differs between supervised and autonomous, so promoting
+the lane cannot quietly change what a trade is allowed to be.
+
+`--simulate-only` on the command line can only ever **narrow** the configured
+mode to `SIMULATION_ONLY`. There is deliberately no flag that can raise it: a
+flag that could escalate a `DISABLED` lane into a live one would make the
+config setting advisory.
 
 ### Declare the signer's public key
 
@@ -67,7 +96,7 @@ a refusal on trade day rather than as a deprecation notice. Re-run the capture
 against a live build before any future trade. This is not a one-time
 verification.
 
-### Confirm nothing prunes `pilot_evidence/`
+### Confirm nothing prunes `lane_evidence/`
 
 Check that no cleanup job touches it before the run — see
 [the evidence directory is the audit record](#the-evidence-directory-is-the-audit-record--keep-it).
@@ -76,12 +105,12 @@ Losing a file costs the audit record and narrows recovery of that row to a
 
 ### Rehearse the migration against a copy of prod
 
-`db.initialize()` runs every pending migration, and the pilot must not be the
+`db.initialize()` runs every pending migration, and the lane must not be the
 thing that discovers one is slow:
 
 ```bash
 cp /root/gecko-alpha/scout.db /tmp/solana-rehearsal.db
-DB_PATH=/tmp/solana-rehearsal.db python -m scout.live.solana_pilot status
+DB_PATH=/tmp/solana-rehearsal.db python -m scout.live.solana_lane status
 ```
 
 ## On the day
@@ -90,7 +119,7 @@ DB_PATH=/tmp/solana-rehearsal.db python -m scout.live.solana_pilot status
 
 ```bash
 cd /root/gecko-alpha        # NOT from anywhere else
-python -m scout.live.solana_pilot status
+python -m scout.live.solana_lane status
 ```
 
 `DB_PATH` resolves relative to the working directory. SQLite creates a database
@@ -101,13 +130,13 @@ creating one.
 
 ### Leave the pipeline running
 
-Do not stop `gecko-pipeline` for the pilot. The kill switch the pilot reads is
+Do not stop `gecko-pipeline` for the lane. The kill switch the lane reads is
 the one the pipeline writes; stopping the pipeline removes the mechanism that
 would halt trading if something else went wrong.
 
 ### One swap at a time
 
-`place` takes an exclusive lock (`<db>.solana_pilot.lock`) before any gate. A
+`place` takes an exclusive lock (`<db>.solana_lane.lock`) before any gate. A
 second `place` refuses with exit 2 and prints the holder's PID.
 
 **`status` and `resolve` are never locked.** A stale lock arises exactly when an
@@ -115,9 +144,9 @@ earlier run died with a signature possibly in flight, which is the moment you
 most need to ask what happened. The lock is never broken automatically:
 
 ```bash
-python -m scout.live.solana_pilot status
-python -m scout.live.solana_pilot resolve --decision-id <uuid>
-rm <db>.solana_pilot.lock        # only once the on-chain state is known
+python -m scout.live.solana_lane status
+python -m scout.live.solana_lane resolve --decision-id <uuid>
+rm <db>.solana_lane.lock        # only once the on-chain state is known
 ```
 
 ## The run
@@ -126,19 +155,20 @@ rm <db>.solana_pilot.lock        # only once the on-chain state is known
 # Read-only. Custody, balances, kill state, outstanding rows.
 # Constructs no signer: custody comes from stat, and the key file is
 # checked only via its public half.
-python -m scout.live.solana_pilot status
+python -m scout.live.solana_lane status
 
-# Rehearsal — quotes, builds, inspects, simulates and prompts.
+# Rehearsal (or set SOLANA_MODE=SIMULATION_ONLY).
+# Quotes, builds, inspects, simulates and prompts.
 # Never reads the funded key, signs nothing, submits nothing,
 # writes no ledger row.
-python -m scout.live.solana_pilot place --sol 0.05 \
+python -m scout.live.solana_lane place --sol 0.05 \
     --simulate-only --yes-i-am-rehearsing
 
 # The real thing.
-python -m scout.live.solana_pilot place --sol 0.05
+python -m scout.live.solana_lane place --sol 0.05
 
 # Ask the cluster what a persisted signature did.
-python -m scout.live.solana_pilot resolve --decision-id <uuid>
+python -m scout.live.solana_lane resolve --decision-id <uuid>
 ```
 
 There is no `cancel`. Solana has no cancellation primitive: a submitted
@@ -230,7 +260,7 @@ the row resolves.
 The response is `resolve`, repeatedly, as the blockhash expires:
 
 ```bash
-python -m scout.live.solana_pilot resolve --decision-id <uuid>
+python -m scout.live.solana_lane resolve --decision-id <uuid>
 ```
 
 Once the verdict becomes `definitively_not_submitted` — absent from the cluster
@@ -299,7 +329,7 @@ a fresh, fully-authorized rerun is safe.
 
 ## The evidence directory is the audit record — keep it
 
-`pilot_evidence/` holds the only complete account of what each run did. Keep it
+`lane_evidence/` holds the only complete account of what each run did. Keep it
 for that reason alone.
 
 It also carries `lastValidBlockHeight`, which the resolver uses to prove a
@@ -324,13 +354,13 @@ disposing of it by hand.
 
 So:
 
-- **Do not** add `pilot_evidence/` to any log-rotation, tmp-cleaner or retention
+- **Do not** add `lane_evidence/` to any log-rotation, tmp-cleaner or retention
   job. Losing a file costs you the audit record and narrows recovery to a
   24-hour window.
-- **Do** carry `pilot_evidence/` with the database if the deployment moves
+- **Do** carry `lane_evidence/` with the database if the deployment moves
   machines.
 - If a file is lost, resolve the row **within a day**:
-  `python -m scout.live.solana_pilot resolve --decision-id <uuid>`.
+  `python -m scout.live.solana_lane resolve --decision-id <uuid>`.
 - Files for rows that have reached `rejected` or were dispositioned by hand are
   safe to archive.
 
@@ -339,23 +369,23 @@ Every resolution records `expiry_source` — `evidence_last_valid_block_height` 
 
 ## If it goes wrong
 
-Every run writes `pilot_evidence/solana_pilot_<decision-id>.json` — one JSON
+Every run writes `lane_evidence/solana_lane_<decision-id>.json` — one JSON
 object per step, fsynced as it goes, so it survives a crash. It records which
 database the run read, which key file signed, every inspector check by name with
 its verdict, the simulation result, the expected signature (before submission),
 the authorization, and the post-trade reconciliation including the
 `meets_minimum_output` comparison that is the slippage guarantee.
 
-## After the pilot: drain and destroy
+## After the lane: drain and destroy
 
-The pilot key is single-purpose. When the run is done:
+The lane key is single-purpose. When the run is done:
 
 1. Supervised sweep of all balances (SOL and USDC) to an operator-designated
    address.
 2. Verify both balances read zero:
-   `python -m scout.live.solana_pilot status`.
-3. `shred -uz /root/solana-pilot/pilot-keypair.json`
-4. `rmdir /root/solana-pilot`
+   `python -m scout.live.solana_lane status`.
+3. `shred -uz /root/solana-lane/lane-keypair.json`
+4. `rmdir /root/solana-lane`
 
 Record steps 1 and 3 in the evidence pack — the sweep transaction signature and
 the destruction — so the key's whole lifetime is accounted for.

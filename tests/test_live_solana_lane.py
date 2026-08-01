@@ -1,4 +1,4 @@
-"""PR-S2: the supervised Solana pilot runner.
+"""PR-S2: the Solana DEX execution lane runner.
 
 The load-bearing assertions here are negative: no Jito POST when a gate
 refuses, none when the operator types the wrong phrase, none when the kill
@@ -32,7 +32,7 @@ from aioresponses import aioresponses
 
 from scout.config import Settings
 from scout.db import Database
-from scout.live import solana_pilot
+from scout.live import solana_lane
 from scout.live.kill_switch import KillSwitch
 from scout.live.solana.constants import SOL_MINT, USDC_MINT
 from scout.live.solana.jito_client import JitoClient
@@ -44,14 +44,14 @@ from scout.live.solana.signer import (
     enforce_keyfile_security,
     sign_transaction,
 )
-from scout.live.solana_pilot import (
+from scout.live.solana_lane import (
     EXIT_BLOCKED,
     EXIT_ESCALATE,
     EXIT_OK,
     EXIT_REFUSED,
     EXIT_REVIEW,
-    PilotLockHeld,
-    PilotRunner,
+    LaneLockHeld,
+    LaneRunner,
     build_parser,
 )
 from solana_tx_builder import OTHER, PAYER, PAYER_PUBKEY, STRANGER, build_swap_tx
@@ -71,7 +71,7 @@ _SWAP_URL = "https://api.jup.ag/swap/v1/swap"
 # anything while the resolver would read from a load-balanced endpoint (see
 # test_place_refuses_a_load_balanced_resolver_endpoint), so every fixture
 # that is meant to get past the envelope has to name a pinned one.
-_RPC_URL = "https://pilot-node.example-rpc.net/rpc"
+_RPC_URL = "https://dedicated-node.example-rpc.net/rpc"
 _ROUND_ROBIN_RPC_URL = "https://api.mainnet-beta.solana.com"
 _SUBMIT_RE = re.compile(
     r"https://mainnet\.block-engine\.jito\.wtf/api/v1/transactions.*"
@@ -111,7 +111,7 @@ _SOL_AFTER = _SOL_BEFORE - _LAMPORTS - _TX_FEES
 # ----------------------------------------------------------------------
 def _settings(tmp_path, **overrides) -> Settings:
     base = dict(
-        SOLANA_PILOT_ENABLED=True,
+        SOLANA_MODE="SUPERVISED_LIVE",
         SOLANA_PILOT_KEYPAIR_PATH=_PLANTED_KEYPAIR_PATH,
         SOLANA_PILOT_SIGNER_PUBKEY=PAYER_PUBKEY,
         SOLANA_RPC_URL=_RPC_URL,
@@ -120,7 +120,7 @@ def _settings(tmp_path, **overrides) -> Settings:
         SOLANA_PILOT_POLL_INTERVAL_SEC=0.0,
         SOLANA_PILOT_CONFIRM_TIMEOUT_SEC=0.05,
         SOLANA_PILOT_FINALIZE_TIMEOUT_SEC=0.05,
-        DB_PATH=str(tmp_path / "pilot.db"),
+        DB_PATH=str(tmp_path / "lane.db"),
     )
     base.update(overrides)
     return Settings(_env_file=None, **_REQUIRED, **base)
@@ -182,12 +182,12 @@ async def _make_runner(tmp_path, *, keypair=PAYER, custody_ok=True, **overrides)
     attached to the runner so a test can assert on call counts.
     """
     settings = _settings(tmp_path, **overrides)
-    db = Database(tmp_path / "pilot.db")
+    db = Database(tmp_path / "lane.db")
     await db.initialize()
     session = aiohttp.ClientSession()
     loader = _LoaderSpy(keypair)
     prober = _CustodyProbeSpy(ok=custody_ok)
-    runner = PilotRunner(
+    runner = LaneRunner(
         settings=settings,
         db=db,
         jupiter=JupiterClient(settings, session),
@@ -241,11 +241,11 @@ def _phrase(tx_b64: str) -> str:
 
 
 def _evidence_path(tmp_path, decision_id: str):
-    return tmp_path / "evidence" / f"solana_pilot_{decision_id}.json"
+    return tmp_path / "evidence" / f"solana_lane_{decision_id}.json"
 
 
 def _only_evidence_file(tmp_path):
-    files = sorted((tmp_path / "evidence").glob("solana_pilot_*.json"))
+    files = sorted((tmp_path / "evidence").glob("solana_lane_*.json"))
     assert len(files) == 1, f"expected one evidence file, got {files}"
     return files[0]
 
@@ -445,14 +445,14 @@ async def _seed_solana_row(
     size_usd: str = "8.52",
     age_seconds: float = 0.0,
 ) -> int:
-    anchor = await solana_pilot.ensure_pilot_anchor(db)
+    anchor = await solana_lane.ensure_lane_anchor(db)
     async with db._txn_lock:
         cur = await db._conn.execute(
             """INSERT INTO live_trades
                (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
                 size_usd, status, client_order_id, entry_order_id, created_at)
-               VALUES (?, 'solana-pilot', 'SOL', 'solana', 'SOL/USDC',
-                       'solana_pilot', ?, ?, ?, ?, ?)""",
+               VALUES (?, 'solana-lane', 'SOL', 'solana', 'SOL/USDC',
+                       'solana_lane', ?, ?, ?, ?, ?)""",
             (
                 anchor,
                 size_usd,
@@ -489,7 +489,7 @@ def _write_intent_evidence(
 
 
 async def _row(db: Database, decision_id: str) -> dict | None:
-    return await solana_pilot.fetch_row_by_decision_id(db, decision_id)
+    return await solana_lane.fetch_row_by_decision_id(db, decision_id)
 
 
 async def _count(db: Database, table: str) -> int:
@@ -507,13 +507,13 @@ async def _live_rows(db: Database) -> list:
 # ======================================================================
 # Envelope gates — every one asserts nothing was submitted
 # ======================================================================
-async def test_place_refuses_when_pilot_disabled(tmp_path):
-    runner, db, session = await _make_runner(tmp_path, SOLANA_PILOT_ENABLED=False)
+async def test_place_refuses_when_the_lane_is_disabled(tmp_path):
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MODE="DISABLED")
     with aioresponses() as m:
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
         assert list(m.requests) == []  # nothing was asked of any venue
-    assert "SOLANA_PILOT_ENABLED" in _step(_steps(tmp_path), "aborted")["reason"]
+    assert "SOLANA_MODE" in _step(_steps(tmp_path), "aborted")["reason"]
     await session.close()
     await db.close()
 
@@ -567,7 +567,7 @@ def test_keyfile_policy_rejects_wide_permissions_and_foreign_owners():
     """The policy itself, exercised without depending on the host honouring chmod.
 
     Windows does not implement POSIX modes, so a policy only reachable through
-    the filesystem would first be verified on pilot day.
+    the filesystem would first be verified on trade day.
     """
     enforce_keyfile_security(
         mode=0o100600, file_uid=1000, current_uid=1000, path="/k/id.json"
@@ -595,6 +595,194 @@ async def test_place_refuses_while_the_kill_switch_is_engaged(tmp_path):
     assert _step(_steps(tmp_path), "aborted")["stage"] == "kill_switch_check"
     await session.close()
     await db.close()
+
+
+# ======================================================================
+# Operating modes + the authorization seam
+# ======================================================================
+@pytest.mark.parametrize(
+    "mode,fragment",
+    [
+        ("DISABLED", "SOLANA_MODE is DISABLED"),
+        ("EMERGENCY_STOPPED", "EMERGENCY_STOPPED"),
+    ],
+)
+async def test_refusing_modes_refuse_before_anything_is_built(tmp_path, mode, fragment):
+    """DISABLED and EMERGENCY_STOPPED stop at the envelope, key untouched."""
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MODE=mode)
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+        assert list(m.requests) == []  # no venue was contacted at all
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "envelope_gate"
+    assert fragment in abort["reason"]
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_an_unrecognised_mode_refuses_rather_than_defaulting(tmp_path):
+    """A typo in .env must not fall back to some 'safe' behaviour.
+
+    Falling back would mean the mode an operator THINKS is in force and the
+    one actually in force can differ, which is the property the mode exists to
+    remove.
+    """
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL, mode="SUPERVISED") == EXIT_REFUSED
+        assert list(m.requests) == []
+    assert "not a recognised mode" in _step(_steps(tmp_path), "aborted")["reason"]
+    await session.close()
+    await db.close()
+
+
+async def test_bounded_autonomous_needs_a_second_deliberate_setting(tmp_path):
+    """*** The mode alone must not start autonomous execution. ***"""
+    runner, db, session = await _make_runner(tmp_path, SOLANA_MODE="BOUNDED_AUTONOMOUS")
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []
+    abort = _step(_steps(tmp_path), "aborted")
+    assert "SOLANA_BOUNDED_AUTONOMOUS_ENABLED is False" in abort["reason"]
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_bounded_autonomous_swaps_the_policy_and_nothing_else(tmp_path, capsys):
+    """*** The seam. ***
+
+    With both settings on, the lane runs the SAME path — quote, build,
+    inspect, balance, simulate — and differs only in who is asked. No prompt
+    is printed, and the phase-5 policy refuses rather than approving by
+    default, so an unfinished policy cannot trade.
+    """
+    tx = build_swap_tx().tx_b64
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_MODE="BOUNDED_AUTONOMOUS",
+        SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
+    )
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert _submissions(m) == []
+
+    steps = _steps(tmp_path)
+    # It got all the way to the authorization boundary on the normal path.
+    names = _step_names(steps)
+    assert "tx_inspection" in names and "simulation" in names
+    authorization = _step(steps, "authorization")
+    assert authorization["method"] == "bounded_autonomous_policy"
+    assert authorization["outcome"] == "authorization_refused"
+    assert authorization["detail"] == "autonomous_policy_not_yet_implemented"
+    assert authorization["prompted"] is False
+    # No human was asked, and the key was never read.
+    assert "MANUAL APPROVAL REQUIRED" not in capsys.readouterr().out
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_supervised_live_uses_the_typed_policy(tmp_path, monkeypatch):
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+    with aioresponses() as m:
+        _mock_happy_path(m, tx)
+        assert await runner.place(sol=_SOL) == EXIT_OK
+    authorization = _step(_steps(tmp_path), "authorization")
+    assert authorization["method"] == "typed_operator_authorization"
+    assert authorization["prompted"] is True
+    assert authorization["mode"] == "SUPERVISED_LIVE"
+    await session.close()
+    await db.close()
+
+
+def test_the_two_executing_modes_share_one_authorization_call_site():
+    """*** Structural: autonomy is a policy swap, not a second code path. ***
+
+    The completion standard says moving to bounded autonomy must be
+    configuration and authorization only. That is only true if `place()` asks
+    ONE question in ONE place — a second call site is where the two modes would
+    start to diverge.
+    """
+    import ast
+    import inspect
+
+    from scout.live import solana_lane as module
+
+    tree = ast.parse(inspect.getsource(module))
+    place = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "place"
+    )
+    authorize_calls = [
+        n
+        for n in ast.walk(place)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "authorize"
+    ]
+    assert len(authorize_calls) == 1, (
+        "place() must ask exactly one authorization question; found "
+        f"{len(authorize_calls)}"
+    )
+    # `mode in EXECUTING_MODES` is legitimate and expected — it is the
+    # execute-or-rehearse decision. What must NOT appear is place() knowing
+    # WHICH executing mode it is in: the moment it can tell supervised from
+    # autonomous, the two have somewhere to diverge.
+    named = [
+        n.id
+        for n in ast.walk(place)
+        if isinstance(n, ast.Name)
+        and n.id in ("MODE_SUPERVISED_LIVE", "MODE_BOUNDED_AUTONOMOUS")
+    ]
+    assert not named, (
+        "place() references a specific executing mode "
+        f"({sorted(set(named))}); that distinction belongs to the policy "
+        "factory, so supervised and autonomous cannot diverge here"
+    )
+    literals = [
+        n.value
+        for n in ast.walk(place)
+        if isinstance(n, ast.Constant)
+        and n.value in ("SUPERVISED_LIVE", "BOUNDED_AUTONOMOUS")
+    ]
+    assert not literals, f"place() hardcodes a mode name: {sorted(set(literals))}"
+
+
+def test_every_mode_maps_to_a_policy():
+    from scout.live import solana_lane
+
+    for mode in solana_lane.ALL_MODES:
+        policy = solana_lane.authorization_policy_for(mode)
+        assert policy.method != "undefined"
+    # Only the autonomous mode gets the non-interactive policy.
+    assert (
+        solana_lane.authorization_policy_for("BOUNDED_AUTONOMOUS").method
+        == "bounded_autonomous_policy"
+    )
+    for mode in ("SIMULATION_ONLY", "SUPERVISED_LIVE"):
+        assert (
+            solana_lane.authorization_policy_for(mode).method
+            == "typed_operator_authorization"
+        )
+
+
+def test_simulate_only_can_only_narrow_the_mode():
+    """The CLI flag restricts; it can never escalate a configured mode."""
+    args = build_parser().parse_args(
+        ["place", "--sol", "0.05", "--simulate-only", "--yes-i-am-rehearsing"]
+    )
+    assert args.simulate_only is True
+    # There is deliberately no flag that can SET an executing mode.
+    assert not any(
+        "supervised" in (a or "").lower() or "autonomous" in (a or "").lower()
+        for a in vars(args)
+    )
 
 
 # ======================================================================
@@ -788,7 +976,7 @@ async def test_required_balance_counts_the_ata_rent_exactly_once(tmp_path):
 
 
 async def test_ata_rent_falls_back_and_says_so(tmp_path, monkeypatch):
-    """An RPC hiccup on rent must not block the pilot, but must be visible."""
+    """An RPC hiccup on rent must not block the lane, but must be visible."""
     tx = build_swap_tx().tx_b64
     runner, db, session = await _make_runner(tmp_path)
 
@@ -901,7 +1089,7 @@ def test_the_runner_never_calls_the_signer_without_an_expected_signer():
     import ast
     import inspect
 
-    from scout.live import solana_pilot as module
+    from scout.live import solana_lane as module
 
     tree = ast.parse(inspect.getsource(module))
     calls = [
@@ -928,7 +1116,7 @@ async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
     """
     tx = build_swap_tx().tx_b64
     runner, db, session = await _make_runner(tmp_path)
-    real_sign = solana_pilot.sign_transaction
+    real_sign = solana_lane.sign_transaction
 
     def _sign_something_else(tx_b64, keypair, **kwargs):
         # Signs a DIFFERENT transaction with the same key, so the signature
@@ -939,7 +1127,7 @@ async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
             expected_signer=PAYER_PUBKEY,
         )
 
-    monkeypatch.setattr(solana_pilot, "sign_transaction", _sign_something_else)
+    monkeypatch.setattr(solana_lane, "sign_transaction", _sign_something_else)
     # The operator authorizes the REAL transaction's hash; the signer then
     # produces a signature over different bytes.
     _authorize(monkeypatch, _phrase(tx))
@@ -1121,7 +1309,7 @@ async def test_simulate_only_runs_on_an_unpinned_resolver_and_says_so(
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m, rpc_url=_ROUND_ROBIN_RPC_URL)
-        assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        assert await runner.place(sol=_SOL, mode="SIMULATION_ONLY") == EXIT_OK
         # The property the relaxation rests on.
         assert _submissions(m) == []
 
@@ -1149,7 +1337,7 @@ async def test_simulate_only_on_a_pinned_resolver_says_nothing(
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
-        assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        assert await runner.place(sol=_SOL, mode="SIMULATION_ONLY") == EXIT_OK
         assert _submissions(m) == []
 
     out = capsys.readouterr().out
@@ -1190,7 +1378,7 @@ async def test_the_jito_client_is_unreachable_from_any_rehearsal_path(
         with aioresponses() as m:
             _mock_quote_and_build(m, tx)
             _mock_pre_approval_rpc(m, rpc_url=rpc_url)
-            assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+            assert await runner.place(sol=_SOL, mode="SIMULATION_ONLY") == EXIT_OK
         await session.close()
         await db.close()
 
@@ -1205,7 +1393,7 @@ def test_no_rehearsal_path_can_reach_the_submit_step():
     import ast
     import inspect
 
-    from scout.live import solana_pilot as module
+    from scout.live import solana_lane as module
 
     tree = ast.parse(inspect.getsource(module))
     place = next(
@@ -1222,17 +1410,21 @@ def test_no_rehearsal_path_can_reach_the_submit_step():
     ]
     assert submit_lines, "expected to find the submission call site"
 
-    # An `if simulate_only:` whose body returns — the guard itself.
+    # An `if not executing:` whose body returns — the guard itself. `executing`
+    # is `mode in EXECUTING_MODES`, so this is the mode check that decides
+    # whether the funded key is ever read.
     guard_returns = [
         stmt.lineno
         for node in ast.walk(place)
         if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Name)
-        and node.test.id == "simulate_only"
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "executing"
         for stmt in node.body
         if isinstance(stmt, ast.Return)
     ]
-    assert guard_returns, "no `if simulate_only: ... return` guard in place()"
+    assert guard_returns, "no `if not executing: ... return` guard in place()"
     assert min(guard_returns) < min(submit_lines), (
         "the rehearsal guard must return BEFORE the submission call, "
         f"got guard at {min(guard_returns)} and submit at {min(submit_lines)}"
@@ -1291,7 +1483,7 @@ async def test_resolve_reports_but_will_not_retire_on_an_unpinned_verdict(
 def test_resolver_endpoint_prefers_the_explicit_url_and_flags_round_robins(
     tmp_path,
 ):
-    from scout.live.solana_pilot import resolver_endpoint
+    from scout.live.solana_lane import resolver_endpoint
 
     pinned = _settings(tmp_path, SOLANA_RPC_URL=_RPC_URL)
     assert resolver_endpoint(pinned) == (_RPC_URL, True)
@@ -1428,7 +1620,7 @@ async def test_the_funded_key_is_not_read_on_any_pre_authorization_refusal(
     because an absence is only checkable if the thing absent is observable.
     """
     cases = {
-        "disabled": dict(SOLANA_PILOT_ENABLED=False),
+        "disabled": dict(SOLANA_MODE="DISABLED"),
         "no_signer_declared": dict(SOLANA_PILOT_SIGNER_PUBKEY=""),
         "devnet_host": dict(SOLANA_RPC_URL="https://api.devnet.solana.com"),
     }
@@ -1557,14 +1749,14 @@ def test_simulate_only_requires_the_rehearsal_flag():
 
 
 async def test_rehearsal_flags_are_cross_checked(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(solana_pilot, "load_settings", lambda: _settings(tmp_path))
+    monkeypatch.setattr(solana_lane, "load_settings", lambda: _settings(tmp_path))
     assert (
-        await solana_pilot.main(["place", "--sol", "0.05", "--simulate-only"])
+        await solana_lane.main(["place", "--sol", "0.05", "--simulate-only"])
         == EXIT_REFUSED
     )
     assert "requires --yes-i-am-rehearsing" in capsys.readouterr().out
     assert (
-        await solana_pilot.main(["place", "--sol", "0.05", "--yes-i-am-rehearsing"])
+        await solana_lane.main(["place", "--sol", "0.05", "--yes-i-am-rehearsing"])
         == EXIT_REFUSED
     )
     assert "This would be a REAL swap" in capsys.readouterr().out
@@ -1584,7 +1776,7 @@ async def test_simulate_only_never_reads_the_funded_key(tmp_path, monkeypatch, c
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
-        assert await runner.place(sol=_SOL, simulate_only=True) == EXIT_OK
+        assert await runner.place(sol=_SOL, mode="SIMULATION_ONLY") == EXIT_OK
         assert _submissions(m) == []
 
     steps = _steps(tmp_path)
@@ -1674,7 +1866,7 @@ async def test_happy_path_submits_confirms_finalizes_and_reconciles(
     assert row["entry_order_id"] == signature
     assert row["entry_fill_qty"] == "0.05"
     assert Decimal(row["entry_fill_price"]) == Decimal("8.528730") / Decimal("0.05")
-    assert "PILOT SWAP FINALIZED" in capsys.readouterr().out
+    assert "LANE SWAP FINALIZED" in capsys.readouterr().out
     await session.close()
     await db.close()
 
@@ -1789,7 +1981,7 @@ def test_the_submit_call_cannot_precede_the_signature_write():
     import ast
     import inspect
 
-    from scout.live import solana_pilot as module
+    from scout.live import solana_lane as module
 
     tree = ast.parse(inspect.getsource(module))
     place = next(
@@ -2134,7 +2326,7 @@ async def test_ambiguous_then_unresolved_escalates_and_blocks_the_next_run(
         assert await runner2.place(sol=_SOL) == EXIT_BLOCKED
         assert _submissions(m) == []
         assert _posts_to(m, _QUOTE_RE) == []  # never even quoted
-    assert "SOLANA PILOT LANE BLOCKED" in capsys.readouterr().out
+    assert "SOLANA LANE LANE BLOCKED" in capsys.readouterr().out
     # The blocked run resolved the row using the signature and the height it
     # read back out of the first run's evidence file.
     blocked_steps = [
@@ -2278,13 +2470,13 @@ def _report(verdict, *, outcomes=("absent",), lvbh=None):
 def test_row_age_refuses_to_guess(tmp_path):
     """An age that cannot be established must not license retiring a row."""
     now = datetime.now(timezone.utc)
-    assert solana_pilot.row_age_seconds(None) is None
-    assert solana_pilot.row_age_seconds("") is None
-    assert solana_pilot.row_age_seconds("not-a-timestamp") is None
+    assert solana_lane.row_age_seconds(None) is None
+    assert solana_lane.row_age_seconds("") is None
+    assert solana_lane.row_age_seconds("not-a-timestamp") is None
     # Naive timestamps are of unknown origin — every writer here stamps UTC.
-    assert solana_pilot.row_age_seconds("2026-07-31T12:00:00") is None
+    assert solana_lane.row_age_seconds("2026-07-31T12:00:00") is None
     aged = (now - timedelta(hours=2)).isoformat()
-    assert solana_pilot.row_age_seconds(aged, now=now) == pytest.approx(7200, abs=2)
+    assert solana_lane.row_age_seconds(aged, now=now) == pytest.approx(7200, abs=2)
 
 
 def test_age_policy_regimes(tmp_path):
@@ -2293,14 +2485,14 @@ def test_age_policy_regimes(tmp_path):
     absent = _report("unresolved")
 
     # Too young: age proves nothing, so the resolver's answer stands.
-    young = solana_pilot.apply_age_policy(
+    young = solana_lane.apply_age_policy(
         absent, age_seconds=600, settings=settings, had_evidence_height=False
     )
     assert young.verdict == "unresolved"
     assert young.expiry_source is None
 
     # Inside the window: age alone establishes expiry.
-    inside = solana_pilot.apply_age_policy(
+    inside = solana_lane.apply_age_policy(
         absent, age_seconds=7200, settings=settings, had_evidence_height=False
     )
     assert inside.verdict == "definitively_not_submitted"
@@ -2308,7 +2500,7 @@ def test_age_policy_regimes(tmp_path):
     assert inside.clears_the_lane is True
 
     # Past the history window: absence stops being evidence.
-    stale = solana_pilot.apply_age_policy(
+    stale = solana_lane.apply_age_policy(
         absent, age_seconds=200_000, settings=settings, had_evidence_height=False
     )
     assert stale.verdict == "unresolved"
@@ -2320,7 +2512,7 @@ def test_age_policy_regimes(tmp_path):
     # the resolver exists to prevent.
     proven = _report("definitively_not_submitted", lvbh=_LAST_VALID)
     assert (
-        solana_pilot.apply_age_policy(
+        solana_lane.apply_age_policy(
             proven, age_seconds=200_000, settings=settings, had_evidence_height=True
         ).reason
         == "history_window_exceeded"
@@ -2329,7 +2521,7 @@ def test_age_policy_regimes(tmp_path):
     # A recorded height is the fresher, more specific fact; age must not
     # overrule it when it says the transaction can still land.
     assert (
-        solana_pilot.apply_age_policy(
+        solana_lane.apply_age_policy(
             absent, age_seconds=7200, settings=settings, had_evidence_height=True
         ).verdict
         == "unresolved"
@@ -2338,7 +2530,7 @@ def test_age_policy_regimes(tmp_path):
     # Presence is trustworthy at any age — the window bounds what ABSENCE
     # means, not what presence means.
     for verdict in ("landed", "failed_on_chain"):
-        carried = solana_pilot.apply_age_policy(
+        carried = solana_lane.apply_age_policy(
             _report(verdict, outcomes=(verdict,)),
             age_seconds=200_000,
             settings=settings,
@@ -2350,7 +2542,7 @@ def test_age_policy_regimes(tmp_path):
     # A probe that ERRORED is "we could not look", not "it is not there".
     errored = _report("unresolved", outcomes=("error",))
     assert (
-        solana_pilot.apply_age_policy(
+        solana_lane.apply_age_policy(
             errored, age_seconds=7200, settings=settings, had_evidence_height=False
         ).verdict
         == "unresolved"
@@ -2375,9 +2567,7 @@ async def test_a_row_inside_the_window_resolves_without_its_evidence_file(
     )
     # Deliberately NO intent evidence written — this is the pruned-directory
     # case, and it must still resolve.
-    assert (
-        solana_pilot.read_persisted_intent(tmp_path / "evidence", decision_id) is None
-    )
+    assert solana_lane.read_persisted_intent(tmp_path / "evidence", decision_id) is None
 
     with aioresponses() as m:
         m.post(_RPC_URL, payload=_sig_status(known=False))
@@ -2609,7 +2799,7 @@ async def test_status_is_read_only_and_reports_blockers(tmp_path, capsys):
         assert _posts_to(m, _SWAP_URL) == []
 
     out = capsys.readouterr().out
-    assert "SOLANA PILOT STATUS" in out
+    assert "SOLANA LANE STATUS" in out
     assert "keypair custody          : ok" in out
     assert "place would auto-retire this" in out
     # Read-only means read-only: status did NOT retire it.
@@ -2662,7 +2852,7 @@ async def test_status_never_constructs_a_signer(tmp_path, capsys, monkeypatch):
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("status called load_keypair")
 
-    monkeypatch.setattr(solana_pilot, "load_keypair", _forbidden)
+    monkeypatch.setattr(solana_lane, "load_keypair", _forbidden)
 
     keyfile = _write_keyfile(tmp_path, PAYER)
     runner, db, session = await _make_runner(
@@ -2795,12 +2985,12 @@ async def test_evidence_survives_a_crash_mid_run(tmp_path):
 
 
 def test_evidence_scrubs_secret_shaped_keys():
-    scrubbed = solana_pilot._scrub(
+    scrubbed = solana_lane._scrub(
         {
             "keypair_path": "/srv/id.json",
             "API-Key": "xyz",
             "nested": {"private_key": "s3cr3t"},
-            "signal_type": "solana_pilot",
+            "signal_type": "solana_lane",
             "expected_signature": "5xY",
             "signer_pubkey": "abc",
             "raw": b"\x00\x01\x02",
@@ -2810,7 +3000,7 @@ def test_evidence_scrubs_secret_shaped_keys():
     assert scrubbed["API-Key"] == "[REDACTED]"
     assert scrubbed["nested"]["private_key"] == "[REDACTED]"
     # Public identifiers must survive — they are the whole audit trail.
-    assert scrubbed["signal_type"] == "solana_pilot"
+    assert scrubbed["signal_type"] == "solana_lane"
     assert scrubbed["expected_signature"] == "5xY"
     assert scrubbed["signer_pubkey"] == "abc"
     assert scrubbed["raw"] == "<3 bytes>"
@@ -2818,28 +3008,28 @@ def test_evidence_scrubs_secret_shaped_keys():
 
 def test_persisted_intent_reads_back_and_fails_closed(tmp_path):
     path = tmp_path / "evidence"
-    assert solana_pilot.read_persisted_intent(path, "nope") is None
+    assert solana_lane.read_persisted_intent(path, "nope") is None
     path.mkdir()
-    target = path / "solana_pilot_abc.json"
+    target = path / "solana_lane_abc.json"
     target.write_text('{"step": "run_started"}\nnot json\n', encoding="utf-8")
-    assert solana_pilot.read_persisted_intent(path, "abc") is None
+    assert solana_lane.read_persisted_intent(path, "abc") is None
     with open(target, "a", encoding="utf-8") as handle:
         handle.write(
             json.dumps({"step": "intent_persisted", "last_valid_block_height": 42})
             + "\n"
         )
     assert (
-        solana_pilot.read_persisted_intent(path, "abc")["last_valid_block_height"] == 42
+        solana_lane.read_persisted_intent(path, "abc")["last_valid_block_height"] == 42
     )
 
 
 # ======================================================================
 # Ledger anchor
 # ======================================================================
-async def test_pilot_anchor_is_created_once_and_hidden_from_paper_readers(tmp_path):
+async def test_lane_anchor_is_created_once_and_hidden_from_paper_readers(tmp_path):
     runner, db, session = await _make_runner(tmp_path)
-    first = await solana_pilot.ensure_pilot_anchor(db)
-    second = await solana_pilot.ensure_pilot_anchor(db)
+    first = await solana_lane.ensure_lane_anchor(db)
+    second = await solana_lane.ensure_lane_anchor(db)
     assert first == second
     assert await _count(db, "paper_trades") == 1
 
@@ -2864,8 +3054,8 @@ async def test_pilot_anchor_is_created_once_and_hidden_from_paper_readers(tmp_pa
 async def test_the_intent_insert_writes_the_signature_atomically(tmp_path):
     """One statement, so no crash window leaves an unresolvable 'open' row."""
     runner, db, session = await _make_runner(tmp_path)
-    anchor = await solana_pilot.ensure_pilot_anchor(db)
-    row_id = await solana_pilot.record_solana_intent(
+    anchor = await solana_lane.ensure_lane_anchor(db)
+    row_id = await solana_lane.record_solana_intent(
         db,
         decision_id="6d1b345e-2821-40e2-ad83-4ecb18a0687e",
         paper_trade_id=anchor,
@@ -2880,7 +3070,7 @@ async def test_the_intent_insert_writes_the_signature_atomically(tmp_path):
     assert (row["status"], row["entry_order_id"]) == ("open", None)
 
     # ...and the signature arrives later, confirmed by read-back.
-    stored = await solana_pilot.persist_expected_signature(db, row_id, "5sig")
+    stored = await solana_lane.persist_expected_signature(db, row_id, "5sig")
     assert stored == "5sig"
     row = await _row(db, "6d1b345e-2821-40e2-ad83-4ecb18a0687e")
     assert row["entry_order_id"] == "5sig"
@@ -2891,20 +3081,20 @@ async def test_the_intent_insert_writes_the_signature_atomically(tmp_path):
 # ======================================================================
 # Lock + main() wiring
 # ======================================================================
-def test_pilot_lock_is_exclusive_and_never_broken_automatically(tmp_path):
+def test_lane_lock_is_exclusive_and_never_broken_automatically(tmp_path):
     import os
 
-    db_path = tmp_path / "pilot.db"
-    fd, path = solana_pilot.acquire_pilot_lock(db_path)
+    db_path = tmp_path / "lane.db"
+    fd, path = solana_lane.acquire_lane_lock(db_path)
     try:
-        with pytest.raises(PilotLockHeld) as excinfo:
-            solana_pilot.acquire_pilot_lock(db_path)
+        with pytest.raises(LaneLockHeld) as excinfo:
+            solana_lane.acquire_lane_lock(db_path)
         # The holder's PID is named so the operator knows what to look for;
         # the lock is never broken for them.
         assert str(os.getpid()) in excinfo.value.holder
         assert path.exists()
     finally:
-        solana_pilot.release_pilot_lock(fd, path)
+        solana_lane.release_lane_lock(fd, path)
     assert not path.exists()
 
 
@@ -2912,10 +3102,8 @@ def test_the_solana_lock_is_not_the_kraken_lock(tmp_path):
     """Two lanes, two assets, two venues — neither bounds the other."""
     from scout.live import kraken_pilot
 
-    db_path = tmp_path / "pilot.db"
-    assert solana_pilot.pilot_lock_path(db_path) != kraken_pilot.pilot_lock_path(
-        db_path
-    )
+    db_path = tmp_path / "lane.db"
+    assert solana_lane.lane_lock_path(db_path) != kraken_pilot.pilot_lock_path(db_path)
 
 
 async def test_main_refuses_when_the_database_does_not_exist(
@@ -2924,9 +3112,9 @@ async def test_main_refuses_when_the_database_does_not_exist(
     """sqlite3 creates a DB for any path, so the wrong directory is silent."""
     missing = tmp_path / "nowhere" / "scout.db"
     monkeypatch.setattr(
-        solana_pilot, "load_settings", lambda: _settings(tmp_path, DB_PATH=str(missing))
+        solana_lane, "load_settings", lambda: _settings(tmp_path, DB_PATH=str(missing))
     )
-    assert await solana_pilot.main(["status"]) == EXIT_REFUSED
+    assert await solana_lane.main(["status"]) == EXIT_REFUSED
     assert str(missing.resolve()) in capsys.readouterr().out
     assert not missing.exists()
 
@@ -2934,16 +3122,16 @@ async def test_main_refuses_when_the_database_does_not_exist(
 async def test_main_blocks_place_but_not_status_while_the_lock_is_held(
     tmp_path, monkeypatch, capsys
 ):
-    db_path = tmp_path / "pilot.db"
+    db_path = tmp_path / "lane.db"
     db = Database(db_path)
     await db.initialize()
     await db.close()
     settings = _settings(tmp_path, DB_PATH=str(db_path))
-    monkeypatch.setattr(solana_pilot, "load_settings", lambda: settings)
-    solana_pilot.pilot_lock_path(db_path).write_text("pid=4242 acquired_at=now\n")
+    monkeypatch.setattr(solana_lane, "load_settings", lambda: settings)
+    solana_lane.lane_lock_path(db_path).write_text("pid=4242 acquired_at=now\n")
 
     with aioresponses() as m:
-        assert await solana_pilot.main(["place", "--sol", "0.05"]) == EXIT_BLOCKED
+        assert await solana_lane.main(["place", "--sol", "0.05"]) == EXIT_BLOCKED
         assert list(m.requests) == []  # refused before any venue was touched
     out = capsys.readouterr().out
     assert "4242" in out and "Two runs are two swaps" in out
@@ -2952,21 +3140,21 @@ async def test_main_blocks_place_but_not_status_while_the_lock_is_held(
     with aioresponses() as m:
         m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": 1}))
         m.post(_RPC_URL, payload=_token_accounts(0))
-        assert await solana_pilot.main(["status"]) == EXIT_OK
-    assert solana_pilot.pilot_lock_path(db_path).exists()  # untouched
-    solana_pilot.pilot_lock_path(db_path).unlink()
+        assert await solana_lane.main(["status"]) == EXIT_OK
+    assert solana_lane.lane_lock_path(db_path).exists()  # untouched
+    solana_lane.lane_lock_path(db_path).unlink()
 
 
 async def test_main_releases_the_lock_after_a_run(tmp_path, monkeypatch):
-    db_path = tmp_path / "pilot.db"
+    db_path = tmp_path / "lane.db"
     db = Database(db_path)
     await db.initialize()
     await db.close()
-    settings = _settings(tmp_path, DB_PATH=str(db_path), SOLANA_PILOT_ENABLED=False)
-    monkeypatch.setattr(solana_pilot, "load_settings", lambda: settings)
+    settings = _settings(tmp_path, DB_PATH=str(db_path), SOLANA_MODE="DISABLED")
+    monkeypatch.setattr(solana_lane, "load_settings", lambda: settings)
     with aioresponses():
-        assert await solana_pilot.main(["place", "--sol", "0.05"]) == EXIT_REFUSED
-    assert not solana_pilot.pilot_lock_path(db_path).exists()
+        assert await solana_lane.main(["place", "--sol", "0.05"]) == EXIT_REFUSED
+    assert not solana_lane.lane_lock_path(db_path).exists()
 
 
 # ======================================================================
@@ -2981,7 +3169,7 @@ def test_sol_argument_rejects_what_would_reach_the_trading_logic(bad):
 def test_sol_argument_accepts_a_whole_number_of_lamports():
     args = build_parser().parse_args(["place", "--sol", "0.05"])
     assert args.sol == Decimal("0.05")
-    assert solana_pilot.lamports_from_sol(args.sol) == _LAMPORTS
+    assert solana_lane.lamports_from_sol(args.sol) == _LAMPORTS
 
 
 def test_decision_id_is_stripped_and_shape_checked():
@@ -3064,7 +3252,7 @@ def test_config_rejects_a_ceiling_no_build_could_ever_satisfy():
 
     The old floor knew nothing about ATA rent, so it accepted ceilings that
     tx_inspector then refused on every single transaction — a config error
-    that only showed up as "the pilot does not work" on trade day.
+    that only showed up as "the lane does not work" on trade day.
     """
     with pytest.raises(ValueError) as excinfo:
         Settings(
@@ -3089,9 +3277,9 @@ def test_config_rejects_a_ceiling_no_build_could_ever_satisfy():
     assert tighter.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS == 2_005_000
 
 
-def test_solana_pilot_defaults_are_safe():
+def test_solana_lane_defaults_are_safe():
     s = Settings(_env_file=None, **_REQUIRED)
-    assert s.SOLANA_PILOT_ENABLED is False
+    assert s.SOLANA_MODE == "DISABLED"
     assert s.SOLANA_PILOT_KEYPAIR_PATH == ""
     assert s.SOLANA_RESOLVER_RPC_URL == ""
     assert s.SOLANA_PILOT_MIN_ORDER_USD == 5.0

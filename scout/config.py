@@ -1487,12 +1487,44 @@ class Settings(BaseSettings):
     # as an absence.
     SOLANA_SUBMISSION_SETTLE_SEC: float = 5.0
 
-    # -------- Solana supervised pilot runner (PR-S2, 2026-07-31) --------
-    # The mechanical envelope around the ONE operator-invoked supervised swap
-    # (scout.live.solana_pilot). Same posture as the Kraken pilot block above:
-    # every default is the refusing one, and none of these gate the
-    # signal-driven live engine.
-    SOLANA_PILOT_ENABLED: bool = False
+    # -------- Solana DEX execution lane --------
+    # The mechanical envelope around scout.live.solana_lane, the PERMANENT
+    # Solana execution path. Every default is the refusing one, and none of
+    # these gate the signal-driven live engine.
+    #
+    # *** SOLANA_MODE IS THE LANE'S MASTER CONTROL. ***
+    # It replaces the old SOLANA_PILOT_ENABLED boolean, which could only say
+    # on/off and had no way to express "rehearse" or "stop everything". The
+    # five modes are the whole spectrum the lane will ever operate in, and
+    # moving between them is CONFIGURATION — there is no second runner, no
+    # second adapter and no second code path behind any of them.
+    #
+    #   DISABLED            refuses everything. The default.
+    #   SIMULATION_ONLY     quotes, builds, inspects, simulates and prompts.
+    #                       Never reads the funded key, never submits.
+    #   SUPERVISED_LIVE     a human types the authorization before the funded
+    #                       key signs. The boundary, unchanged.
+    #   BOUNDED_AUTONOMOUS  a policy check substitutes for the typed prompt.
+    #                       Requires SOLANA_BOUNDED_AUTONOMOUS_ENABLED as well,
+    #                       so the mode alone cannot start it.
+    #   EMERGENCY_STOPPED   refuses all execution, like the kill switch, and is
+    #                       checked in the same places.
+    #
+    # The ONLY difference between SUPERVISED_LIVE and BOUNDED_AUTONOMOUS is
+    # which authorization policy is asked. Same limits, same signer, same
+    # state machine, same submission, same reconciliation, same evidence.
+    SOLANA_MODE: Literal[
+        "DISABLED",
+        "SIMULATION_ONLY",
+        "SUPERVISED_LIVE",
+        "BOUNDED_AUTONOMOUS",
+        "EMERGENCY_STOPPED",
+    ] = "DISABLED"
+    # Second lock on autonomy. BOUNDED_AUTONOMOUS additionally requires this,
+    # so promoting the lane cannot happen by editing one value — and the
+    # preconditions in the lane itself (recorded supervised executions,
+    # configured limits) are checked on top of both.
+    SOLANA_BOUNDED_AUTONOMOUS_ENABLED: bool = False
     # Tip REQUESTED from Jupiter via prioritizationFeeLamports.jitoTipLamports.
     # A request, not a guarantee: tx_inspector re-derives the tip actually
     # compiled into the transaction and enforces

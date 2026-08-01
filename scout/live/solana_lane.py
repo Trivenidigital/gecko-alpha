@@ -1,4 +1,4 @@
-"""Solana supervised pilot runner — PR-S2.
+"""Solana DEX execution lane — the permanent runner.
 
 The operator-invoked CLI that executes ONE supervised SOL->USDC swap on
 mainnet behind a manual approval boundary. It composes PR-S1's venue clients
@@ -8,15 +8,15 @@ pipeline imports it.
 
 Usage::
 
-    python -m scout.live.solana_pilot place --sol 0.05 \\
+    python -m scout.live.solana_lane place --sol 0.05 \\
         [--simulate-only --yes-i-am-rehearsing]
-    python -m scout.live.solana_pilot status
-    python -m scout.live.solana_pilot resolve --decision-id <uuid>
+    python -m scout.live.solana_lane status
+    python -m scout.live.solana_lane resolve --decision-id <uuid>
 
 Place flow, in mechanical order — every step is printed, logged and appended
 to the evidence file before the next one starts:
 
-1.  envelope gate (SOLANA_PILOT_ENABLED, keypair path, mainnet hosts)
+1.  envelope gate (SOLANA_MODE, keypair path, mainnet hosts)
 2.  kill-switch check
 3.  keypair custody — load at call time, derive the signer pubkey
 4.  startup reconciliation — a restart must not forget a signature
@@ -37,7 +37,7 @@ to the evidence file before the next one starts:
 
 Design decisions this module had to make, and why
 -------------------------------------------------
-**Authorization gates SIGNING, not submission.** The funded pilot key does
+**Authorization gates SIGNING, not submission.** The funded lane key does
 not sign until the operator has typed the authorization — including in
 rehearsal. A validly signed transaction is an irreversible-capability
 artifact: anyone who obtains those bytes can broadcast them, and the wallet
@@ -101,19 +101,19 @@ succeeds against an empty file where the kill switch is clear and no prior
 signature needs reconciling. Every safety mechanism reads "all clear"
 precisely because it is reading the wrong database.
 
-**``paper_trade_id`` is satisfied by a pilot ANCHOR row.**
+**``paper_trade_id`` is satisfied by a lane ANCHOR row.**
 ``live_trades.paper_trade_id`` is ``NOT NULL REFERENCES paper_trades(id)`` with
 ``PRAGMA foreign_keys=ON``, and there is no signal behind an operator-invoked
-swap. One sentinel row — token_id 'solana-pilot', signal_type 'solana_pilot',
-status 'solana_pilot_anchor', opened_at epoch — is created once and referenced
-by every pilot swap. The three field values are each load-bearing against a
+swap. One sentinel row — token_id 'solana-lane', signal_type 'solana_lane',
+status 'solana_lane_anchor', opened_at epoch — is created once and referenced
+by every lane swap. The three field values are each load-bearing against a
 specific reader: the status is not 'open' so no open-position loop scans it,
 the epoch ``opened_at`` keeps it out of the daily digest's
 ``date(opened_at) = ?`` count and the analytics windows' ``opened_at >=
 cutoff``, and ``closed_at`` stays NULL so the closed-trade digest never sees
 it. No schema migration.
 
-**A landed swap leaves the row 'open'.** 'open' here means "this pilot holds
+**A landed swap leaves the row 'open'.** 'open' here means "this lane holds
 the resulting position", which is what is true after a swap executes, and it
 blocks the next ``place`` run — correct for a supervised lane that trades once
 per authorization. The operator disposes of the USDC and resolves the row by
@@ -145,11 +145,11 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import aiohttp
@@ -197,7 +197,7 @@ log = structlog.get_logger(__name__)
 #   1  EXIT_REFUSED   a gate said no, the operator did not authorize, or the
 #                     transaction definitively did not execute. No position.
 #   2  EXIT_BLOCKED   the lane is blocked — an unresolved prior signature, or
-#                     another pilot process holding the lock. Nothing tried.
+#                     another lane process holding the lock. Nothing tried.
 #   3  EXIT_ESCALATE  a submission could not be resolved, or the run failed
 #                     unexpectedly. State is UNKNOWN; a human must look.
 #   4  EXIT_REVIEW    the swap executed but the post-trade reconciliation could
@@ -212,11 +212,11 @@ VENUE = "solana"
 PAIR = "SOL/USDC"
 BASE_SYMBOL = "SOL"
 
-# The pilot anchor (see module docstring). Values are matched exactly on
+# The lane anchor (see module docstring). Values are matched exactly on
 # lookup, so they are constants rather than anything derived at runtime.
-_ANCHOR_TOKEN_ID = "solana-pilot"
-_ANCHOR_SIGNAL_TYPE = "solana_pilot"
-_ANCHOR_STATUS = "solana_pilot_anchor"
+_ANCHOR_TOKEN_ID = "solana-lane"
+_ANCHOR_SIGNAL_TYPE = "solana_lane"
+_ANCHOR_STATUS = "solana_lane_anchor"
 _ANCHOR_OPENED_AT = "1970-01-01T00:00:00+00:00"
 
 # live_trades statuses that mean "a signature may still be live, or a position
@@ -254,8 +254,41 @@ _REDACTED = "[REDACTED]"
 # why lastValidBlockHeight lives here.
 _INTENT_STEP = "intent_persisted"
 
+# ----------------------------------------------------------------------
+# Operating modes
+# ----------------------------------------------------------------------
+# The whole spectrum the lane will ever run in. Moving between them is
+# CONFIGURATION: the same runner, adapter, signer, state machine, limits and
+# reconciliation serve all of them, and only the authorization policy differs
+# between supervised and autonomous.
+MODE_DISABLED = "DISABLED"
+MODE_SIMULATION_ONLY = "SIMULATION_ONLY"
+MODE_SUPERVISED_LIVE = "SUPERVISED_LIVE"
+MODE_BOUNDED_AUTONOMOUS = "BOUNDED_AUTONOMOUS"
+MODE_EMERGENCY_STOPPED = "EMERGENCY_STOPPED"
 
-class PilotAbort(Exception):
+ALL_MODES = (
+    MODE_DISABLED,
+    MODE_SIMULATION_ONLY,
+    MODE_SUPERVISED_LIVE,
+    MODE_BOUNDED_AUTONOMOUS,
+    MODE_EMERGENCY_STOPPED,
+)
+
+# Modes in which a transaction may actually be signed and broadcast. Named as
+# a set rather than tested inline so a future mode cannot become executing by
+# accident — adding one to this tuple is a deliberate, reviewable act.
+EXECUTING_MODES = (MODE_SUPERVISED_LIVE, MODE_BOUNDED_AUTONOMOUS)
+
+# Modes that refuse before anything is built. EMERGENCY_STOPPED is here rather
+# than treated as "disabled with a different name": it is the kill switch's
+# configuration-side twin and is checked in the same places, so an operator who
+# sets it gets the same refusal wherever the kill switch would have produced
+# one.
+REFUSING_MODES = (MODE_DISABLED, MODE_EMERGENCY_STOPPED)
+
+
+class LaneAbort(Exception):
     """A gate refused. Carries the evidence step name and the exit code."""
 
     def __init__(self, stage: str, reason: str, *, exit_code: int = EXIT_REFUSED):
@@ -265,11 +298,11 @@ class PilotAbort(Exception):
         self.exit_code = exit_code
 
 
-class PilotLockHeld(Exception):
-    """Another pilot process holds the lock. Carries the holder's record."""
+class LaneLockHeld(Exception):
+    """Another lane process holds the lock. Carries the holder's record."""
 
     def __init__(self, lock_path: Path, holder: str) -> None:
-        super().__init__(f"solana pilot lock held: {lock_path}")
+        super().__init__(f"solana lane lock held: {lock_path}")
         self.lock_path = lock_path
         self.holder = holder
 
@@ -277,19 +310,19 @@ class PilotLockHeld(Exception):
 # ----------------------------------------------------------------------
 # Single-process lock
 # ----------------------------------------------------------------------
-def pilot_lock_path(db_path: str | Path) -> Path:
-    """Lock file for the Solana pilot lane, beside the database it guards.
+def lane_lock_path(db_path: str | Path) -> Path:
+    """Lock file for the Solana lane, beside the database it guards.
 
     Distinct from the Kraken pilot's lock: the two lanes hold different assets
     at different venues, and neither's envelope bounds the other's exposure.
     """
-    return Path(f"{db_path}.solana_pilot.lock")
+    return Path(f"{db_path}.solana_lane.lock")
 
 
-def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
-    """Take the Solana pilot lane's exclusive lock, or raise ``PilotLockHeld``.
+def acquire_lane_lock(db_path: str | Path) -> tuple[int, Path]:
+    """Take the Solana lane's exclusive lock, or raise ``LaneLockHeld``.
 
-    Two pilot runs in two terminals are two swaps: each passes its own
+    Two lane runs in two terminals are two swaps: each passes its own
     one-at-a-time check before either writes a ledger row, so the in-process
     check cannot see the other. ``O_CREAT | O_EXCL`` is the filesystem's
     atomic test-and-set, which closes the window at the only point the two
@@ -301,7 +334,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
     auto-break would step straight past that. The operator is told the PID and
     the file to delete.
     """
-    lock_path = pilot_lock_path(db_path)
+    lock_path = lane_lock_path(db_path)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
@@ -309,7 +342,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
             holder = lock_path.read_text(encoding="utf-8").strip()
         except OSError:
             holder = "(unreadable)"
-        raise PilotLockHeld(lock_path, holder or "(empty)") from exc
+        raise LaneLockHeld(lock_path, holder or "(empty)") from exc
     os.write(
         fd,
         f"pid={os.getpid()} acquired_at={datetime.now(timezone.utc).isoformat()}\n".encode(),
@@ -317,7 +350,7 @@ def acquire_pilot_lock(db_path: str | Path) -> tuple[int, Path]:
     return fd, lock_path
 
 
-def release_pilot_lock(fd: int, lock_path: Path) -> None:
+def release_lane_lock(fd: int, lock_path: Path) -> None:
     """Close and remove the lock. Safe to call on a partially-taken lock."""
     try:
         os.close(fd)
@@ -326,7 +359,7 @@ def release_pilot_lock(fd: int, lock_path: Path) -> None:
     try:
         lock_path.unlink()
     except OSError:
-        log.warning("solana_pilot_lock_not_removed", lock_path=str(lock_path))
+        log.warning("solana_lane_lock_not_removed", lock_path=str(lock_path))
 
 
 # ----------------------------------------------------------------------
@@ -352,7 +385,7 @@ def _scrub(value: Any) -> Any:
 
 
 class EvidenceLog:
-    """Append-only JSON-Lines evidence file for one pilot decision.
+    """Append-only JSON-Lines evidence file for one lane decision.
 
     One object per step, flushed and fsynced before ``record`` returns, with
     the handle opened and closed per record. A crash mid-run therefore keeps
@@ -377,7 +410,7 @@ class EvidenceLog:
             handle.write(line + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        log.info("solana_pilot_step", step=step, **_scrub(fields))
+        log.info("solana_lane_step", step=step, **_scrub(fields))
         return entry
 
 
@@ -396,7 +429,7 @@ def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
     raw = (settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip()
     if not raw:
         raise SolanaKeypairError(
-            "SOLANA_PILOT_KEYPAIR_PATH is unset. The Solana pilot refuses to "
+            "SOLANA_PILOT_KEYPAIR_PATH is unset. The Solana lane refuses to "
             "run without an explicitly configured key file."
         )
     resolved = Path(raw)
@@ -409,7 +442,7 @@ def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
         raise SolanaKeypairError(
             "refusing to use a signing key on a non-POSIX platform: key-file "
             "permissions and ownership cannot be verified. Run the Solana "
-            "pilot on the Linux host."
+            "lane on the Linux host."
         )
     info = resolved.stat()
     enforce_keyfile_security(
@@ -615,7 +648,7 @@ def apply_age_policy(
 
 def evidence_path_for(evidence_dir: str | Path, decision_id: str) -> Path:
     """Evidence file for one decision. One naming rule, one call site each."""
-    return Path(evidence_dir) / f"solana_pilot_{decision_id}.json"
+    return Path(evidence_dir) / f"solana_lane_{decision_id}.json"
 
 
 def read_persisted_intent(
@@ -719,8 +752,8 @@ def quote_price_impact_pct(quote: SolanaQuote) -> Decimal:
 # ----------------------------------------------------------------------
 # Ledger helpers
 # ----------------------------------------------------------------------
-async def ensure_pilot_anchor(db: Database) -> int:
-    """Return the pilot anchor ``paper_trades.id``, creating it if absent.
+async def ensure_lane_anchor(db: Database) -> int:
+    """Return the lane anchor ``paper_trades.id``, creating it if absent.
 
     See the module docstring for why the anchor exists and why its status /
     opened_at are what they are. Idempotent: the natural key is
@@ -742,7 +775,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
 
     signal_data = json.dumps(
         {
-            "note": "Anchor row for scout.live.solana_pilot. Not a trade.",
+            "note": "Anchor row for scout.live.solana_lane. Not a trade.",
             "why": "live_trades.paper_trade_id is NOT NULL REFERENCES "
             "paper_trades(id) and the supervised swap has no signal behind it.",
         }
@@ -754,7 +787,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
                    (token_id, symbol, name, chain, signal_type, signal_data,
                     entry_price, amount_usd, quantity, tp_price, sl_price,
                     status, opened_at)
-                   VALUES (?, 'SOLANA-PILOT', 'Solana supervised pilot anchor',
+                   VALUES (?, 'SOLANA-LANE', 'Solana DEX lane anchor',
                            'solana', ?, ?, 0, 0, 0, 0, 0, ?, ?)""",
                 (
                     _ANCHOR_TOKEN_ID,
@@ -766,7 +799,7 @@ async def ensure_pilot_anchor(db: Database) -> int:
             )
             await db._conn.commit()
             anchor_id = int(cur.lastrowid or 0)
-        log.info("solana_pilot_anchor_created", paper_trade_id=anchor_id)
+        log.info("solana_lane_anchor_created", paper_trade_id=anchor_id)
         return anchor_id
     except sqlite3.IntegrityError:
         # Lost the race on the natural key — the other creator's row is the
@@ -994,6 +1027,125 @@ def read_authorization(expected: str) -> tuple[bool, str]:
     return True, "authorized"
 
 
+@dataclass(frozen=True)
+class AuthorizationRequest:
+    """Everything an authorization policy is allowed to see.
+
+    Assembled once by the runner and handed to whichever policy is in force,
+    so a supervised run and an autonomous one are deciding on IDENTICAL facts.
+    A policy that needed extra context would be a policy making a different
+    decision, and that is exactly what this type exists to prevent.
+    """
+
+    decision_id: str
+    mode: str
+    message_sha256: str
+    signer_pubkey: str
+    amount_lamports: int
+    quoted_out_raw: int
+    minimum_out_raw: int
+    slippage_bps: int
+    price_impact_pct: Decimal
+    total_fee_lamports: int
+    last_valid_block_height: int
+    render: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class AuthorizationDecision:
+    """The verdict, plus how it was reached.
+
+    ``method`` is recorded in the evidence for every run, so an auditor reading
+    a pack can always tell whether a human typed the phrase or a policy
+    approved it — without inferring it from the mode.
+    """
+
+    authorized: bool
+    outcome: str
+    method: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+class AuthorizationPolicy:
+    """How this lane decides that a transaction may be signed.
+
+    THE seam between supervised and bounded-autonomous operation, and
+    deliberately the ONLY one. Everything else — quoting, building, inspection,
+    simulation, limits, signing, submission, reconciliation, evidence — is
+    identical in both, so promoting the lane cannot quietly change what a trade
+    is allowed to be. It changes only who says yes.
+    """
+
+    method = "undefined"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        raise NotImplementedError
+
+
+class TypedOperatorAuthorization(AuthorizationPolicy):
+    """SUPERVISED_LIVE and SIMULATION_ONLY: a human types the phrase.
+
+    Renders the decision screen, then requires the first 8 characters of the
+    transaction message hash. No signature exists yet and none may — the funded
+    key is not read until this returns an authorized decision.
+    """
+
+    method = "typed_operator_authorization"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        await request.render()
+        print(
+            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
+            "Anything else — including an empty line or a closed stdin — aborts. "
+            "The phrase is lowercase hex and is matched exactly."
+        )
+        authorized, outcome = read_authorization(request.message_sha256[:8])
+        return AuthorizationDecision(
+            authorized=authorized,
+            outcome=outcome,
+            method=self.method,
+            detail={"expected_prefix_len": 8, "prompted": True},
+        )
+
+
+class BoundedAutonomousAuthorization(AuthorizationPolicy):
+    """BOUNDED_AUTONOMOUS: a policy check substitutes for the typed phrase.
+
+    It substitutes for the PROMPT and nothing else. Every limit the supervised
+    path enforces has already run by the time this is asked — the request it
+    receives is the same object the operator would have been shown — so this
+    cannot widen what a trade may be, only decide that no human needs to
+    confirm this particular one.
+
+    The preconditions are checked by the runner before the mode is honoured at
+    all (see ``_check_autonomy_preconditions``); reaching this object already
+    means the lane was permitted to be autonomous. Phase 5 fills in the
+    remaining per-trade policy; until then it refuses, because a policy object
+    that approved everything would be an authorization boundary in name only.
+    """
+
+    method = "bounded_autonomous_policy"
+
+    async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
+        return AuthorizationDecision(
+            authorized=False,
+            outcome="autonomous_policy_not_yet_implemented",
+            method=self.method,
+            detail={
+                "prompted": False,
+                "note": "bounded-autonomous per-trade policy lands in phase 5; "
+                "refusing rather than approving by default",
+            },
+        )
+
+
+def authorization_policy_for(mode: str) -> AuthorizationPolicy:
+    """The policy that governs a mode. One mapping, one place."""
+    if mode == MODE_BOUNDED_AUTONOMOUS:
+        return BoundedAutonomousAuthorization()
+    return TypedOperatorAuthorization()
+
+
 def _print_block(title: str, lines: list[str]) -> None:
     bar = "=" * 68
     print(bar)
@@ -1007,8 +1159,8 @@ def _print_block(title: str, lines: list[str]) -> None:
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
-class PilotRunner:
-    """One supervised Solana pilot invocation.
+class LaneRunner:
+    """One Solana DEX lane invocation.
 
     Constructed with everything it needs so tests can drive it against a
     tmp_path DB and mocked venues; ``main`` wires the production instance.
@@ -1061,23 +1213,35 @@ class PilotRunner:
             evidence_path_for(self._settings.SOLANA_PILOT_EVIDENCE_DIR, decision_id)
         )
 
-    def _check_envelope(self, *, simulate_only: bool) -> dict[str, Any]:
-        """Step 1 — the pilot is enabled, a key is configured, hosts are mainnet."""
-        if not self._settings.SOLANA_PILOT_ENABLED:
-            raise PilotAbort(
+    def _check_envelope(self, *, mode: str) -> dict[str, Any]:
+        """Step 1 — the lane is enabled, a key is configured, hosts are mainnet."""
+        if mode not in ALL_MODES:
+            raise LaneAbort(
                 "envelope_gate",
-                "SOLANA_PILOT_ENABLED is False — the pilot lane is off. Set it "
-                "in .env only for the supervised session.",
+                f"SOLANA_MODE={mode!r} is not a recognised mode. One of: "
+                f"{', '.join(ALL_MODES)}.",
             )
+        if mode == MODE_DISABLED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is DISABLED — the lane is off. Set it to SIMULATION_ONLY to rehearse, or SUPERVISED_LIVE for a supervised trade.",
+            )
+        if mode == MODE_EMERGENCY_STOPPED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is EMERGENCY_STOPPED — every execution path is refused. This is the configuration-side twin of the kill switch; clear it deliberately, and only once the reason it was set is understood.",
+            )
+        if mode == MODE_BOUNDED_AUTONOMOUS:
+            self._check_autonomy_preconditions()
         if not (self._settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip():
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 "SOLANA_PILOT_KEYPAIR_PATH is empty — name the id.json holding "
-                "the ONE approved pilot key before running the pilot.",
+                "the ONE approved lane key before running the lane.",
             )
         declared = (self._settings.SOLANA_PILOT_SIGNER_PUBKEY or "").strip()
         if not declared:
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 "SOLANA_PILOT_SIGNER_PUBKEY is empty — declare the wallet's "
                 "PUBLIC key. Everything before the approval prompt is built "
@@ -1086,7 +1250,7 @@ class PilotRunner:
         try:
             Pubkey.from_string(declared)
         except Exception as exc:
-            raise PilotAbort(
+            raise LaneAbort(
                 "envelope_gate",
                 f"SOLANA_PILOT_SIGNER_PUBKEY is not a valid base58 public key "
                 f"({type(exc).__name__}). A malformed signer would surface as "
@@ -1098,7 +1262,7 @@ class PilotRunner:
             url = str(getattr(self._settings, field, "")).lower()
             hit = next((m for m in _NON_MAINNET_MARKERS if m in url), None)
             if hit is not None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "envelope_gate",
                     f"{field} points at a non-mainnet host (contains {hit!r}). "
                     "The approved envelope is mainnet only.",
@@ -1115,8 +1279,8 @@ class PilotRunner:
         # operator is told instead, because a rehearsal that passed on an
         # unpinned resolver must not read as a launch-ready lane.
         resolver_url, pinned = resolver_endpoint(self._settings)
-        if not pinned and not simulate_only:
-            raise PilotAbort(
+        if not pinned and mode in EXECUTING_MODES:
+            raise LaneAbort(
                 "envelope_gate",
                 f"the resolver would read from {resolver_url}, which is a "
                 "load-balanced public endpoint. Two calls can land on two "
@@ -1134,7 +1298,6 @@ class PilotRunner:
                 "rehearsal proceeds because it never submits."
             )
         return {
-            "pilot_enabled": True,
             "keypair_path_configured": True,
             "declared_signer_pubkey": declared,
             "input_mint": SOL_MINT,
@@ -1145,17 +1308,40 @@ class PilotRunner:
             # True only on a rehearsal that would have been refused. Recorded
             # so an evidence pack can never be mistaken for one produced under
             # the full envelope.
-            "resolver_pin_waived_for_rehearsal": simulate_only and not pinned,
+            "resolver_pin_waived_for_rehearsal": (
+                mode not in EXECUTING_MODES and not pinned
+            ),
             "block_engine_url": self._settings.JITO_BLOCK_ENGINE_URL,
-            "simulate_only": simulate_only,
+            "mode": mode,
+            "will_execute": mode in EXECUTING_MODES,
+            "authorization_method": authorization_policy_for(mode).method,
         }
+
+    def _check_autonomy_preconditions(self) -> None:
+        """BOUNDED_AUTONOMOUS cannot be reached by setting one value.
+
+        The mode is necessary and not sufficient. A second explicit flag is
+        required, so promoting the lane takes two deliberate acts in two
+        places; phase 5 adds the rest (a minimum number of completed
+        supervised executions recorded in the ledger, and limits configured),
+        checked here so the transition stays mechanical rather than a matter
+        of remembering.
+        """
+        if not self._settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED:
+            raise LaneAbort(
+                "envelope_gate",
+                "SOLANA_MODE is BOUNDED_AUTONOMOUS but "
+                "SOLANA_BOUNDED_AUTONOMOUS_ENABLED is False. The mode alone "
+                "does not start autonomous execution — that takes two "
+                "deliberate settings, on purpose.",
+            )
 
     async def _check_kill_switch(self, stage: str) -> dict[str, Any]:
         """Steps 2 and 14 — refuse while the live kill switch is engaged."""
         state = await self._ks.is_active()
         if state is None:
             return {"kill_active": False}
-        raise PilotAbort(
+        raise LaneAbort(
             stage,
             f"kill switch ACTIVE (event #{state.kill_event_id}, by "
             f"{state.triggered_by}, until {state.killed_until.isoformat()}): "
@@ -1176,7 +1362,7 @@ class PilotRunner:
         try:
             detail = dict(self._probe_custody())
         except SolanaKeypairError as exc:
-            raise PilotAbort("keypair_custody", str(exc)) from exc
+            raise LaneAbort("keypair_custody", str(exc)) from exc
         # The PATH is not the secret — the file's contents are, and those do
         # not reach this module at all. Named to avoid ``_SECRET_KEY_RE``,
         # which matches "keypair"; an evidence pack that cannot say which key
@@ -1201,10 +1387,10 @@ class PilotRunner:
         try:
             keypair = self._load_keypair()
         except SolanaKeypairError as exc:
-            raise PilotAbort("funded_signer", str(exc)) from exc
+            raise LaneAbort("funded_signer", str(exc)) from exc
         loaded = str(keypair.pubkey())
         if loaded != expected:
-            raise PilotAbort(
+            raise LaneAbort(
                 "funded_signer",
                 f"the key file decodes to {loaded}, but this run was built "
                 f"and authorized for {expected}. Refusing to sign.",
@@ -1266,7 +1452,7 @@ class PilotRunner:
                     await retire_row(self._db, row["live_trade_id"])
                     row["auto_retired"] = True
                     log.info(
-                        "solana_pilot_unsigned_row_retired",
+                        "solana_lane_unsigned_row_retired",
                         live_trade_id=row["live_trade_id"],
                     )
                 else:
@@ -1336,7 +1522,7 @@ class PilotRunner:
                     )
                     row["auto_retired"] = True
                     log.info(
-                        "solana_pilot_row_auto_retired",
+                        "solana_lane_row_auto_retired",
                         live_trade_id=row["live_trade_id"],
                         signature=signature,
                     )
@@ -1417,7 +1603,7 @@ class PilotRunner:
             "problems": problems,
         }
         if problems:
-            raise PilotAbort("quote_envelope", "; ".join(problems))
+            raise LaneAbort("quote_envelope", "; ".join(problems))
         return quote, detail
 
     async def _inspect(
@@ -1459,7 +1645,7 @@ class PilotRunner:
             else "live_block_engine"
         )
         if tip_source == "static_fallback":
-            log.warning("solana_pilot_tip_accounts_degraded", count=len(tip_accounts))
+            log.warning("solana_lane_tip_accounts_degraded", count=len(tip_accounts))
         report = await verify_swap_transaction(
             tx_b64=build.swap_transaction_b64,
             expected_signer=signer_pubkey,
@@ -1503,7 +1689,7 @@ class PilotRunner:
         """Rent-exempt minimum for the output ATA, and where the figure came from.
 
         Asked of the cluster rather than hardcoded, because rent is a cluster
-        parameter. The documented fallback keeps the pilot runnable through an
+        parameter. The documented fallback keeps the lane runnable through an
         RPC hiccup, and the source is recorded so an evidence reader can tell
         which number the balance gate actually used.
         """
@@ -1513,7 +1699,7 @@ class PilotRunner:
             )
         except Exception as exc:
             log.warning(
-                "solana_pilot_ata_rent_fallback",
+                "solana_lane_ata_rent_fallback",
                 error_type=type(exc).__name__,
                 error=str(exc),
                 fallback=ATA_RENT_LAMPORTS_FALLBACK,
@@ -1567,7 +1753,7 @@ class PilotRunner:
             "headroom_pct": 10,
         }
         if sol_lamports < required_with_headroom:
-            raise PilotAbort(
+            raise LaneAbort(
                 "balance",
                 f"SOL balance {_fmt(sol_from_lamports(sol_lamports))} does not "
                 f"cover the required {_fmt(sol_from_lamports(required_with_headroom))} "
@@ -1583,8 +1769,13 @@ class PilotRunner:
         self,
         *,
         sol: Decimal,
-        simulate_only: bool = False,
+        mode: str | None = None,
     ) -> int:
+        # The mode comes from CONFIG. `mode=` exists so the CLI can only
+        # ever NARROW it (--simulate-only), never widen it: a flag that
+        # could escalate DISABLED to SUPERVISED_LIVE would make the config
+        # setting advisory.
+        mode = mode or self._settings.SOLANA_MODE
         decision_id = str(uuid4())
         evidence = self._evidence_for(decision_id)
         try:
@@ -1600,7 +1791,7 @@ class PilotRunner:
             decision_id=decision_id,
             sol=_fmt(sol),
             amount_lamports=amount_lamports,
-            simulate_only=simulate_only,
+            mode=mode,
             evidence_path=str(evidence.path),
             # Which database this run read its safety state from. Without it,
             # an evidence pack cannot distinguish "the kill switch was clear"
@@ -1610,7 +1801,8 @@ class PilotRunner:
 
         live_trade_id: int | None = None
         try:
-            envelope = self._check_envelope(simulate_only=simulate_only)
+            envelope = self._check_envelope(mode=mode)
+            executing = mode in EXECUTING_MODES
             evidence.record("envelope_gate", **envelope)
 
             kill = await self._check_kill_switch("kill_switch_check")
@@ -1628,7 +1820,7 @@ class PilotRunner:
             )
             if reconciliation["blockers"]:
                 self._print_blocked(reconciliation)
-                raise PilotAbort(
+                raise LaneAbort(
                     "startup_reconciliation",
                     f"{reconciliation['blockers']} unresolved signature(s) block "
                     "the lane",
@@ -1654,7 +1846,7 @@ class PilotRunner:
                 tx_b64_len=len(build.swap_transaction_b64),
             )
             if build.simulation_error is not None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "swap_built",
                     f"Jupiter reported a simulation error on its own build: "
                     f"{build.simulation_error}",
@@ -1673,7 +1865,7 @@ class PilotRunner:
             )
             evidence.record("tx_inspection", **inspect_detail)
             if not report.passed:
-                raise PilotAbort(
+                raise LaneAbort(
                     "tx_inspection",
                     "; ".join(f"{c.name}: {c.detail}" for c in report.failures),
                 )
@@ -1695,7 +1887,7 @@ class PilotRunner:
                 logs_tail=list(sim.logs[-20:]),
             )
             if not sim.ok:
-                raise PilotAbort(
+                raise LaneAbort(
                     "simulation",
                     f"independent simulation failed against current chain state: "
                     f"err={sim.err}. Submitting anyway would burn a fee to land "
@@ -1713,11 +1905,11 @@ class PilotRunner:
             if amount_lamports:
                 sol_price = out_usd / (_dec(amount_lamports) / _dec(LAMPORTS_PER_SOL))
 
-            if not simulate_only:
+            if executing:
                 live_trade_id = await record_solana_intent(
                     self._db,
                     decision_id=decision_id,
-                    paper_trade_id=await ensure_pilot_anchor(self._db),
+                    paper_trade_id=await ensure_lane_anchor(self._db),
                     size_usd=_fmt(out_usd) or "0",
                     sol_price_usdc=_fmt(sol_price),
                 )
@@ -1753,24 +1945,46 @@ class PilotRunner:
                     would_be_last_valid_block_height=build.last_valid_block_height,
                 )
 
-            authorized, outcome = await self._request_authorization(
+            # ONE call site. Which policy answers is the only thing that
+            # changes between SUPERVISED_LIVE and BOUNDED_AUTONOMOUS — there is
+            # deliberately no second branch through place() for autonomy to
+            # diverge down.
+            policy = authorization_policy_for(mode)
+            request = AuthorizationRequest(
                 decision_id=decision_id,
+                mode=mode,
                 message_sha256=message_sha256,
                 signer_pubkey=signer_pubkey,
-                quote=quote,
-                build=build,
-                report=report,
-                balance=balance,
-                sim=sim,
-                simulate_only=simulate_only,
+                amount_lamports=amount_lamports,
+                quoted_out_raw=quote.out_amount,
+                minimum_out_raw=quote.min_out_amount,
+                slippage_bps=quote.slippage_bps,
+                price_impact_pct=quote_price_impact_pct(quote),
+                total_fee_lamports=report.total_fee_lamports,
+                last_valid_block_height=build.last_valid_block_height,
+                render=lambda: self._render_decision_screen(
+                    decision_id=decision_id,
+                    message_sha256=message_sha256,
+                    signer_pubkey=signer_pubkey,
+                    quote=quote,
+                    build=build,
+                    report=report,
+                    balance=balance,
+                    sim=sim,
+                    mode=mode,
+                ),
             )
+            decision = await policy.authorize(request)
+            authorized = decision.authorized
             evidence.record(
                 "authorization",
                 outcome="authorized" if authorized else "authorization_refused",
-                detail=outcome,
-                expected_prefix_len=8,
+                detail=decision.outcome,
+                method=decision.method,
+                mode=mode,
                 bound_to_message_sha256=message_sha256,
                 funded_signer_loaded=False,
+                **decision.detail,
             )
             if not authorized:
                 await retire_row(self._db, live_trade_id)
@@ -1782,13 +1996,14 @@ class PilotRunner:
                         note="authorization refused — no signature was ever "
                         "derived and the funded key was never read",
                     )
-                raise PilotAbort(
+                raise LaneAbort(
                     "authorization",
-                    f"operator did not authorize ({outcome}) — nothing was "
-                    "signed and nothing was sent",
+                    f"not authorized by {decision.method} "
+                    f"({decision.outcome}) — nothing was signed and nothing "
+                    "was sent",
                 )
 
-            if simulate_only:
+            if not executing:
                 # The rehearsal ends HERE, before the funded key is read. A
                 # signed transaction is an irreversible capability, and a
                 # rehearsal has no business creating one.
@@ -1815,7 +2030,7 @@ class PilotRunner:
                 return EXIT_OK
 
             # Step 14 — post-approval kill re-check. Handled inline rather than
-            # through PilotAbort because the intent row already exists and must
+            # through LaneAbort because the intent row already exists and must
             # be retired: it asserts "a transaction may exist" and nothing was
             # sent.
             kill_state = await self._ks.is_active()
@@ -1829,7 +2044,7 @@ class PilotRunner:
                     live_trade_id=live_trade_id,
                     ledger_status="rejected",
                 )
-                raise PilotAbort(
+                raise LaneAbort(
                     "kill_switch_recheck",
                     f"kill switch engaged between approval and submission "
                     f"(event #{kill_state.kill_event_id}) — nothing was sent",
@@ -1875,7 +2090,7 @@ class PilotRunner:
             # ---------------------------------------------------------------
             try:
                 keypair = self._load_funded_signer(expected=signer_pubkey)
-            except PilotAbort:
+            except LaneAbort:
                 # Retire inline rather than leaving it to a later run's
                 # unsigned-row sweep. Every other refusal leaves its row
                 # terminal on its own, and a rule that depends on a
@@ -1916,7 +2131,7 @@ class PilotRunner:
                         ledger_status="rejected",
                         note="signed digest did not match the authorized one; nothing was sent",
                     )
-                raise PilotAbort(
+                raise LaneAbort(
                     "signed_in_memory",
                     f"signed message digest {signed.message_sha256} does not "
                     f"match the AUTHORIZED digest {message_sha256} — the "
@@ -1961,7 +2176,7 @@ class PilotRunner:
                 signer_pubkey=signer_pubkey,
             )
 
-        except PilotAbort as abort:
+        except LaneAbort as abort:
             evidence.record(
                 "aborted",
                 stage=abort.stage,
@@ -1978,7 +2193,7 @@ class PilotRunner:
             # The ledger row is deliberately left as it stands — whatever it
             # says is what was last known to be true.
             log.error(
-                "solana_pilot_unexpected_error",
+                "solana_lane_unexpected_error",
                 decision_id=decision_id,
                 error_type=type(exc).__name__,
                 error=str(exc),
@@ -2050,7 +2265,7 @@ class PilotRunner:
             ),
         }
 
-    async def _request_authorization(
+    async def _render_decision_screen(
         self,
         *,
         decision_id: str,
@@ -2061,9 +2276,9 @@ class PilotRunner:
         report: VerificationReport,
         balance: dict[str, Any],
         sim: Any,
-        simulate_only: bool,
-    ) -> tuple[bool, str]:
-        """Step 11 — print the decision block and require the typed prefix.
+        mode: str,
+    ) -> None:
+        """Print the decision block. Rendering only — it decides nothing.
 
         The phrase is the first 8 characters of the TRANSACTION MESSAGE HASH:
         the sha256 of the exact bytes the key will sign, computed from the
@@ -2122,9 +2337,9 @@ class PilotRunner:
             "  signing status      : NOT SIGNED - the funded key is read only "
             "after you authorize",
         ]
-        if simulate_only:
+        if mode not in EXECUTING_MODES:
             lines.append(
-                "  ** REHEARSAL        : --simulate-only — the funded key is "
+                f"  ** REHEARSAL        : mode {mode} — the funded key is "
                 "never read, nothing is signed and nothing is sent"
             )
             if not resolver_endpoint(self._settings)[1]:
@@ -2132,13 +2347,7 @@ class PilotRunner:
                     "  ** NOT LAUNCH-READY : resolver endpoint is not pinned; a "
                     "real placement will refuse"
                 )
-        _print_block("SOLANA SUPERVISED PILOT — MANUAL APPROVAL REQUIRED", lines)
-        print(
-            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
-            "Anything else — including an empty line or a closed stdin — aborts. "
-            "The phrase is lowercase hex and is matched exactly."
-        )
-        return read_authorization(message_sha256[:8])
+        _print_block("SOLANA DEX LANE — MANUAL APPROVAL REQUIRED", lines)
 
     async def _blockhash_age(self, build: SwapBuild) -> str:
         """One display line: how many blocks of life the build has left.
@@ -2351,12 +2560,12 @@ class PilotRunner:
                 "  signature, and BOTH can land — two swaps where one was",
                 "  authorized.",
                 "",
-                "  The pilot lane is now BLOCKED: every future `place` run will",
+                "  The lane is now BLOCKED: every future `place` run will",
                 "  refuse at startup reconciliation until this row resolves.",
                 "",
                 "  Next steps, in order:",
                 "   1. Re-run the resolver as the blockhash expires:",
-                "        python -m scout.live.solana_pilot resolve "
+                "        python -m scout.live.solana_lane resolve "
                 f"--decision-id {decision_id}",
                 "   2. Once it reports definitively_not_submitted the row is",
                 "      retired automatically and the lane clears.",
@@ -2372,7 +2581,7 @@ class PilotRunner:
 
         Two waits rather than one, because they answer different questions.
         'confirmed' says a supermajority voted on the block; 'finalized' says
-        it is rooted and cannot be rolled back. A supervised pilot reports the
+        it is rooted and cannot be rolled back. A supervised lane reports the
         second, so a report of a completed swap is not something a fork can
         take back.
 
@@ -2569,9 +2778,9 @@ class PilotRunner:
             lines.extend(
                 ["", "  RECONCILIATION COULD NOT EXPLAIN THE BALANCE MOVE:"]
                 + [f"   - {m}" for m in summary["mismatches"]]
-                + ["  Check the wallet before running the pilot again."]
+                + ["  Check the wallet before running the lane again."]
             )
-        _print_block(f"PILOT SWAP {confirmation['outcome'].upper()}", lines)
+        _print_block(f"LANE SWAP {confirmation['outcome'].upper()}", lines)
         # An unexplained balance move exits non-zero even though the swap
         # itself completed: money moved in a way the runner cannot account
         # for, and a 0 here would tell a wrapper script everything is fine.
@@ -2748,7 +2957,7 @@ class PilotRunner:
         }
         evidence.record("reconciliation", **summary)
         if mismatches:
-            log.warning("solana_pilot_reconciliation_review", mismatches=mismatches)
+            log.warning("solana_lane_reconciliation_review", mismatches=mismatches)
         return summary
 
     # ---------------- resolve ----------------
@@ -2760,7 +2969,7 @@ class PilotRunner:
         verdict means the transaction can never land and the lane is genuinely
         clear. Every other verdict leaves the row exactly as it is.
 
-        Deliberately NOT gated on the kill switch or on SOLANA_PILOT_ENABLED.
+        Deliberately NOT gated on the kill switch or on SOLANA_MODE.
         Turning the master gate off is an operator's instinctive first move
         when something looks wrong, and it must not take away the tool that
         explains what happened.
@@ -2770,7 +2979,7 @@ class PilotRunner:
         try:
             row = await fetch_row_by_decision_id(self._db, decision_id)
             if row is None:
-                raise PilotAbort(
+                raise LaneAbort(
                     "lookup",
                     f"no solana live_trades row with client_order_id={decision_id}",
                 )
@@ -2778,7 +2987,7 @@ class PilotRunner:
 
             signature = row.get("entry_order_id")
             if not signature:
-                raise PilotAbort(
+                raise LaneAbort(
                     "lookup",
                     f"live_trades row {row['live_trade_id']} carries no expected "
                     "signature, so there is nothing to ask the cluster about",
@@ -2897,7 +3106,7 @@ class PilotRunner:
                         "  and run this again before acting.",
                     ]
                 )
-            _print_block("SOLANA PILOT RESOLUTION", lines)
+            _print_block("SOLANA LANE RESOLUTION", lines)
             if lane.verdict == "landed":
                 return EXIT_BLOCKED
             if lane.verdict == "definitively_not_submitted":
@@ -2906,7 +3115,7 @@ class PilotRunner:
                 return EXIT_BLOCKED
             return EXIT_ESCALATE
 
-        except PilotAbort as abort:
+        except LaneAbort as abort:
             evidence.record(
                 "aborted",
                 stage=abort.stage,
@@ -2917,7 +3126,7 @@ class PilotRunner:
             return abort.exit_code
         except Exception as exc:
             log.error(
-                "solana_pilot_unexpected_error",
+                "solana_lane_unexpected_error",
                 decision_id=decision_id,
                 command="resolve",
                 error_type=type(exc).__name__,
@@ -2935,7 +3144,16 @@ class PilotRunner:
         """Read-only lane report. Writes no evidence file — nothing decided."""
         settings = self._settings
         lines: list[str] = [
-            f"  SOLANA_PILOT_ENABLED     : {settings.SOLANA_PILOT_ENABLED}",
+            f"  SOLANA_MODE              : {settings.SOLANA_MODE}"
+            + (
+                ""
+                if settings.SOLANA_MODE in EXECUTING_MODES
+                else "   (no execution in this mode)"
+            ),
+            f"  bounded autonomy flag    : "
+            f"{settings.SOLANA_BOUNDED_AUTONOMOUS_ENABLED}",
+            f"  authorization            : "
+            f"{authorization_policy_for(settings.SOLANA_MODE).method}",
             f"  pair                     : {PAIR} (mainnet, fixed)",
             f"  per-swap band            : {settings.SOLANA_PILOT_MIN_ORDER_USD} - "
             f"{settings.SOLANA_PILOT_MAX_ORDER_USD} USD on the USDC output",
@@ -3035,7 +3253,7 @@ class PilotRunner:
             )
         lines.append(f"  blocking                 : {reconciliation['blockers']}")
 
-        _print_block("SOLANA PILOT STATUS", lines)
+        _print_block("SOLANA LANE STATUS", lines)
         if reconciliation["blockers"]:
             print(
                 "The lane is BLOCKED: `place` will refuse until everything above "
@@ -3075,12 +3293,12 @@ class PilotRunner:
                 "   - failed_on_chain: the fee was paid and nothing executed.",
                 "     Record the cost, then retire the row by hand.",
                 "   - unresolved: re-run the resolver as the blockhash expires:",
-                "       python -m scout.live.solana_pilot resolve --decision-id <id>",
+                "       python -m scout.live.solana_lane resolve --decision-id <id>",
                 "     It retires the row automatically once the verdict becomes",
                 "     definitively_not_submitted. NEVER rebuild in the meantime.",
             ]
         )
-        _print_block("SOLANA PILOT LANE BLOCKED", lines)
+        _print_block("SOLANA LANE LANE BLOCKED", lines)
 
 
 # ----------------------------------------------------------------------
@@ -3207,7 +3425,7 @@ def _decision_id_arg(raw: str) -> str:
     value = raw.strip()
     if not _DECISION_ID_RE.match(value):
         raise argparse.ArgumentTypeError(
-            f"{raw!r} is not a pilot decision id (expected a dashed UUID, e.g. "
+            f"{raw!r} is not a lane decision id (expected a dashed UUID, e.g. "
             "6d1b345e-2821-40e2-ad83-4ecb18a06876)"
         )
     return value
@@ -3215,7 +3433,7 @@ def _decision_id_arg(raw: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="solana_pilot",
+        prog="solana_lane",
         description="Execute ONE supervised SOL->USDC swap on Solana mainnet.",
         epilog="There is no `cancel`: a submitted Solana transaction either "
         "lands before its lastValidBlockHeight or it can never land. Use "
@@ -3230,7 +3448,7 @@ def build_parser() -> argparse.ArgumentParser:
     place.add_argument(
         "--simulate-only",
         action="store_true",
-        help="full rehearsal including approval and signing; submits nothing",
+        help="force SIMULATION_ONLY for this run; can only NARROW SOLANA_MODE",
     )
     place.add_argument(
         "--yes-i-am-rehearsing",
@@ -3292,7 +3510,7 @@ async def main(argv: list[str] | None = None) -> int:
             f"REFUSED [database]: no database at {db_path.resolve()}\n"
             "  DB_PATH resolves relative to the current directory, so this is "
             "almost always\n"
-            "  the wrong working directory. Run the pilot from the deployment "
+            "  the wrong working directory. Run the lane from the deployment "
             "root.\n"
             "  Creating one here would disable the kill switch and the startup "
             "reconciliation\n"
@@ -3313,10 +3531,10 @@ async def main(argv: list[str] | None = None) -> int:
     lock_path: Path | None = None
     if args.command == "place":
         try:
-            lock_fd, lock_path = acquire_pilot_lock(db_path)
-        except PilotLockHeld as held:
+            lock_fd, lock_path = acquire_lane_lock(db_path)
+        except LaneLockHeld as held:
             print(
-                f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
+                f"REFUSED [lock]: another lane run holds {held.lock_path}\n"
                 f"  holder: {held.holder}\n"
                 "  Two runs are two swaps, so only `place` is blocked.\n"
                 "  `status` and `resolve` still work — use them to see what is "
@@ -3355,7 +3573,7 @@ async def main(argv: list[str] | None = None) -> int:
             resolver_settings = settings.model_copy(
                 update={"SOLANA_RPC_URL": resolver_url}
             )
-            runner = PilotRunner(
+            runner = LaneRunner(
                 settings=settings,
                 db=db,
                 jupiter=JupiterClient(settings, session),
@@ -3365,9 +3583,12 @@ async def main(argv: list[str] | None = None) -> int:
                 resolver_rpc=SolanaRpcClient(resolver_settings, session),
             )
             if args.command == "place":
-                return await runner.place(
-                    sol=args.sol, simulate_only=args.simulate_only
-                )
+                # --simulate-only NARROWS: it can turn an executing mode into a
+                # rehearsal, never the reverse. Passing None lets the runner
+                # take SOLANA_MODE as configured, so a flag can never escalate
+                # a DISABLED lane into a live one.
+                override = MODE_SIMULATION_ONLY if args.simulate_only else None
+                return await runner.place(sol=args.sol, mode=override)
             if args.command == "resolve":
                 return await runner.resolve(decision_id=args.decision_id)
             return await runner.status()
@@ -3376,7 +3597,7 @@ async def main(argv: list[str] | None = None) -> int:
             await db.close()
     finally:
         if lock_fd is not None and lock_path is not None:
-            release_pilot_lock(lock_fd, lock_path)
+            release_lane_lock(lock_fd, lock_path)
 
 
 if __name__ == "__main__":
