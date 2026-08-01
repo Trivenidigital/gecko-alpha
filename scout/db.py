@@ -214,6 +214,13 @@ class Database:
         # the approved hot+cold storage architecture. schema_version 20260727.
         await self._migrate_detection_receipt_archive_v1()
 
+        # Solana DEX lane execution state machine. schema_version 20260801.
+        # Bare-additive new table: the 13 execution states are a lane-specific
+        # LIFECYCLE axis, orthogonal to live_trades.status which means "what
+        # happened to the trade" and is read cross-venue. Four of the states
+        # exist before any money does, so they cannot live on a money row.
+        await self._migrate_solana_executions_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -6573,6 +6580,160 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
+
+    async def _migrate_solana_executions_v1(self) -> None:
+        """Durable execution state for the Solana DEX lane.
+
+        A NEW TABLE rather than a column on live_trades, and the reason is
+        correctness rather than tidiness. ``live_trades.status`` is a
+        CROSS-VENUE column meaning "what happened to the trade" — Binance and
+        Kraken rows share it, and the exposure view, the daily-gross rollups
+        and the Kraken lane's own gates all read its vocabulary. The Solana
+        lane's 13 states are a different axis: where in the pipeline this
+        transaction is. Overloading one column with two orthogonal meanings is
+        how a cross-venue query silently misreads a row.
+
+        Four of those states — quote_created, transaction_built,
+        simulation_passed, awaiting_authorization — also exist BEFORE anything
+        financial does. Holding them on live_trades would mean a row in `open`
+        status backed by no trade, which every consumer of exposure would
+        count as a live position.
+
+        Hence: lifecycle here, money in live_trades, joined by a NULLABLE
+        live_trade_id. Nullable because an execution that never reaches signing
+        has no money row and must still be storable — that is the case the
+        recovery path most needs to read.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "solana_executions_v1"
+        schema_version = 20260801
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                await self._assert_solana_executions_schema(conn)
+                _db_log.info("solana_executions_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version = ?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if existing_version is not None and existing_version[0] != migration_name:
+                raise RuntimeError(
+                    "solana_executions_v1 schema_version description mismatch - "
+                    f"version {schema_version} already owned by "
+                    f"{existing_version[0]!r}"
+                )
+            # The CHECK enumerates exactly the 13 states. A state the machine
+            # does not know cannot be written at all, so a typo in a future
+            # transition fails at the write rather than becoming a row nobody
+            # can classify on recovery.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS solana_executions (
+                    decision_id             TEXT PRIMARY KEY,
+                    state                   TEXT NOT NULL CHECK (state IN (
+                        'quote_created','transaction_built','simulation_passed',
+                        'awaiting_authorization','authorized','signed',
+                        'submission_attempted','landed','confirmed','finalized',
+                        'reconciled','failed','submission_unknown'
+                    )),
+                    mode                    TEXT NOT NULL,
+                    live_trade_id           INTEGER,
+                    message_sha256          TEXT,
+                    expected_signature      TEXT,
+                    last_valid_block_height INTEGER,
+                    amount_lamports         INTEGER,
+                    minimum_out_raw         INTEGER,
+                    detail                  TEXT,
+                    created_at              TEXT NOT NULL,
+                    updated_at              TEXT NOT NULL,
+                    FOREIGN KEY (live_trade_id)
+                        REFERENCES live_trades(id) ON DELETE SET NULL
+                )
+                """)
+            # Indexes AFTER the table (project DDL-ordering discipline). The
+            # state index is what the stuck-execution watchdog and the startup
+            # recovery scan both read.
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_solana_executions_state "
+                "ON solana_executions(state, updated_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_solana_executions_signature "
+                "ON solana_executions(expected_signature)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            await self._assert_solana_executions_schema(conn)
+            _db_log.info(
+                "solana_executions_v1_migration_complete", table="solana_executions"
+            )
+        except BaseException as e:
+            _db_log.exception(
+                "schema_migration_failed",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _db_log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _db_log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _assert_solana_executions_schema(self, conn) -> None:
+        """Fail loudly if the table is not the shape the lane expects."""
+        cur = await conn.execute("PRAGMA table_info(solana_executions)")
+        columns = {row[1] for row in await cur.fetchall()}
+        required = {
+            "decision_id",
+            "state",
+            "mode",
+            "live_trade_id",
+            "message_sha256",
+            "expected_signature",
+            "last_valid_block_height",
+            "amount_lamports",
+            "minimum_out_raw",
+            "detail",
+            "created_at",
+            "updated_at",
+        }
+        missing = required - columns
+        if missing:
+            raise RuntimeError(
+                f"solana_executions is missing column(s): {sorted(missing)}"
+            )
 
     async def _migrate_retire_dead_tables_v1(self, *, enabled: bool = False) -> None:
         """NAR-06 + INF-07: retire dead tables. schema_version 20260711.

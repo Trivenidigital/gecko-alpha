@@ -407,6 +407,91 @@ def recovery_disposition(state: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# Lifecycle <-> money coherence
+# ----------------------------------------------------------------------
+# Two axes, two tables, and they must never disagree about whether the lane is
+# blocked. `solana_executions.state` is the source of truth for WHERE IN THE
+# PIPELINE a transaction is; `live_trades.status` is the source of truth for
+# WHAT HAPPENED TO THE MONEY. This maps each state to the live_trades statuses
+# that can coherently accompany it — an empty tuple meaning "no money row may
+# exist yet", because nothing financial has happened.
+COHERENT_STATUSES: dict[str, tuple[str, ...]] = {
+    # Before authorization there is no money row at all.
+    STATE_QUOTE_CREATED: (),
+    STATE_TRANSACTION_BUILT: (),
+    STATE_SIMULATION_PASSED: (),
+    # The intent row is written just before the prompt, so from here a row
+    # exists and is 'open' — or 'rejected' if the run was refused.
+    STATE_AWAITING_AUTHORIZATION: ("open", "rejected"),
+    STATE_AUTHORIZED: ("open", "rejected"),
+    STATE_SIGNED: ("open", "rejected"),
+    STATE_SUBMISSION_ATTEMPTED: ("open", "rejected"),
+    STATE_LANDED: ("open",),
+    STATE_CONFIRMED: ("open",),
+    STATE_FINALIZED: ("open",),
+    # A reconciled swap leaves a REAL position. 'open' here means "this lane
+    # holds USDC", which is why it keeps blocking until the operator disposes
+    # of it — the execution being finished and the position being open are
+    # different facts, and conflating them is what this mapping prevents.
+    STATE_RECONCILED: ("open",),
+    # Nothing executed: the row asserts no position.
+    STATE_FAILED: ("rejected",),
+    # A transaction may exist and nobody knows. The money row must say so.
+    STATE_SUBMISSION_UNKNOWN: ("needs_manual_review", "open"),
+}
+
+
+class IncoherentLaneState(RuntimeError):
+    """The lifecycle axis and the money axis disagree."""
+
+
+def assert_coherent(state: str, status: str | None) -> None:
+    """Guard against the two axes drifting apart.
+
+    ``status=None`` means no live_trades row exists. That is REQUIRED before
+    authorization and forbidden after it — a signed transaction with no money
+    row would be unrecoverable, and a money row before the quote would be an
+    open position backed by nothing.
+    """
+    permitted = COHERENT_STATUSES.get(state)
+    if permitted is None:
+        raise IncoherentLaneState(f"{state!r} is not an execution state")
+    if status is None:
+        if permitted:
+            raise IncoherentLaneState(
+                f"state {state} requires a live_trades row (one of {permitted}), "
+                "but none exists"
+            )
+        return
+    if not permitted:
+        raise IncoherentLaneState(
+            f"state {state} must not have a live_trades row yet, but one exists "
+            f"with status {status!r} — that row would read as a position backed "
+            "by no trade"
+        )
+    if status not in permitted:
+        raise IncoherentLaneState(
+            f"state {state} is incoherent with live_trades.status {status!r}; "
+            f"expected one of {permitted}"
+        )
+
+
+def lane_is_blocked_by(state: str, status: str | None) -> str | None:
+    """Why this execution blocks a new one, or None if it does not.
+
+    Both axes can block, for different reasons, and naming which one did is
+    what keeps an operator from chasing the wrong table.
+    """
+    if state in BLOCKING_STATES:
+        return f"execution_state={state}"
+    if status == "open":
+        return "live_trades.status=open (a position is held)"
+    if status == "needs_manual_review":
+        return "live_trades.status=needs_manual_review"
+    return None
+
+
+# ----------------------------------------------------------------------
 # Operating modes
 # ----------------------------------------------------------------------
 # The whole spectrum the lane will ever run in. Moving between them is
@@ -1063,6 +1148,146 @@ async def persist_expected_signature(
             f"wrote {signature!r}, read back {stored!r}"
         )
     return str(stored)
+
+
+_EXECUTION_COLUMNS = (
+    "decision_id, state, mode, live_trade_id, message_sha256, "
+    "expected_signature, last_valid_block_height, amount_lamports, "
+    "minimum_out_raw, detail, created_at, updated_at"
+)
+
+
+def _execution_row(row: Any) -> dict[str, Any]:
+    keys = [c.strip() for c in _EXECUTION_COLUMNS.split(",")]
+    record = {key: row[i] for i, key in enumerate(keys)}
+    raw = record.get("detail")
+    try:
+        record["detail"] = json.loads(raw) if raw else {}
+    except ValueError:
+        record["detail"] = {"unparseable": True}
+    return record
+
+
+async def load_execution(db: Database, decision_id: str) -> dict[str, Any] | None:
+    """The durable execution record, or None if this run never started."""
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        f"SELECT {_EXECUTION_COLUMNS} FROM solana_executions WHERE decision_id = ?",
+        (decision_id,),
+    )
+    row = await cur.fetchone()
+    return None if row is None else _execution_row(row)
+
+
+async def record_execution_state(
+    db: Database,
+    decision_id: str,
+    state: str,
+    *,
+    mode: str,
+    **fields: Any,
+) -> dict[str, Any]:
+    """Move an execution to ``state``, durably, or refuse.
+
+    Every write goes through ``assert_legal_transition``, so an illegal jump
+    raises here rather than becoming a row a later reader has to interpret.
+    The row is upserted on ``decision_id``: one execution, one row, updated in
+    place, so recovery reads a single current state rather than replaying a
+    log and hoping it is complete.
+
+    Fields already recorded are never overwritten with NULL. A later step
+    knows less about the earlier ones than the earlier ones did — the
+    signature is written once and must survive every subsequent transition.
+    """
+    if db._conn is None or db._txn_lock is None:
+        raise RuntimeError("Database not initialized.")
+
+    existing = await load_execution(db, decision_id)
+    assert_legal_transition(None if existing is None else existing["state"], state)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    carried = {
+        "live_trade_id": None,
+        "message_sha256": None,
+        "expected_signature": None,
+        "last_valid_block_height": None,
+        "amount_lamports": None,
+        "minimum_out_raw": None,
+    }
+    if existing is not None:
+        for key in carried:
+            carried[key] = existing.get(key)
+    for key, value in fields.items():
+        if key in carried and value is not None:
+            carried[key] = value
+
+    detail = fields.get("detail")
+    detail_json = json.dumps(_scrub(detail)) if detail else None
+    if detail_json is None and existing is not None and existing.get("detail"):
+        detail_json = json.dumps(existing["detail"])
+
+    async with db._txn_lock:
+        await db._conn.execute(
+            """INSERT INTO solana_executions
+                 (decision_id, state, mode, live_trade_id, message_sha256,
+                  expected_signature, last_valid_block_height, amount_lamports,
+                  minimum_out_raw, detail, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(decision_id) DO UPDATE SET
+                 state = excluded.state,
+                 mode = excluded.mode,
+                 live_trade_id = excluded.live_trade_id,
+                 message_sha256 = excluded.message_sha256,
+                 expected_signature = excluded.expected_signature,
+                 last_valid_block_height = excluded.last_valid_block_height,
+                 amount_lamports = excluded.amount_lamports,
+                 minimum_out_raw = excluded.minimum_out_raw,
+                 detail = excluded.detail,
+                 updated_at = excluded.updated_at""",
+            (
+                decision_id,
+                state,
+                mode,
+                carried["live_trade_id"],
+                carried["message_sha256"],
+                carried["expected_signature"],
+                carried["last_valid_block_height"],
+                carried["amount_lamports"],
+                carried["minimum_out_raw"],
+                detail_json,
+                (existing or {}).get("created_at") or now_iso,
+                now_iso,
+            ),
+        )
+        await db._conn.commit()
+
+    log.info(
+        "solana_lane_state",
+        decision_id=decision_id,
+        state=state,
+        mode=mode,
+        recovery=recovery_disposition(state),
+    )
+    return await load_execution(db, decision_id) or {}
+
+
+async def fetch_recoverable_executions(db: Database) -> list[dict[str, Any]]:
+    """Executions a restart must decide about, oldest first.
+
+    Terminal states are excluded because there is nothing left to decide. What
+    comes back is exactly the set of runs that were interrupted, each carrying
+    the state that says whether anything was sent.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+    cur = await db._conn.execute(
+        f"SELECT {_EXECUTION_COLUMNS} FROM solana_executions "
+        f"WHERE state NOT IN ({placeholders}) ORDER BY created_at",
+        TERMINAL_STATES,
+    )
+    return [_execution_row(row) for row in await cur.fetchall()]
 
 
 async def update_live_trade(db: Database, live_trade_id: int, **columns: Any) -> None:

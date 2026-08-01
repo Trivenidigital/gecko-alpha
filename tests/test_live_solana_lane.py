@@ -715,6 +715,205 @@ def test_an_unknown_state_is_rejected_rather_than_tolerated():
 
 
 # ======================================================================
+# Durable execution store
+# ======================================================================
+async def _fresh_db(tmp_path, name="exec.db"):
+    db = Database(tmp_path / name)
+    await db.initialize()
+    return db
+
+
+async def test_the_store_persists_and_recovers_every_state(tmp_path):
+    """*** Requirement 2: recovery at EVERY durable state, on real state. ***
+
+    Each state is written, the connection is CLOSED, and a FRESH Database is
+    opened against the same file — the closest a test gets to a process
+    restart without forking. What comes back must be the state written and the
+    disposition that state implies. Asserted on the recovered row, never on a
+    mock.
+    """
+    from scout.live import solana_lane as lane
+
+    walk = [
+        lane.STATE_QUOTE_CREATED,
+        lane.STATE_TRANSACTION_BUILT,
+        lane.STATE_SIMULATION_PASSED,
+        lane.STATE_AWAITING_AUTHORIZATION,
+        lane.STATE_AUTHORIZED,
+        lane.STATE_SIGNED,
+        lane.STATE_SUBMISSION_ATTEMPTED,
+        lane.STATE_LANDED,
+        lane.STATE_CONFIRMED,
+        lane.STATE_FINALIZED,
+        lane.STATE_RECONCILED,
+    ]
+    decision_id = "walk-0001"
+    for state in walk:
+        db = await _fresh_db(tmp_path)
+        await lane.record_execution_state(
+            db, decision_id, state, mode="SUPERVISED_LIVE"
+        )
+        await db.close()
+
+        # A brand-new connection: nothing in memory carried over.
+        db = await _fresh_db(tmp_path)
+        recovered = await lane.load_execution(db, decision_id)
+        assert recovered is not None, state
+        assert recovered["state"] == state
+        expected = (
+            "done"
+            if state in lane.TERMINAL_STATES
+            else "discard" if state in lane.PRE_SUBMISSION_STATES else "resolve"
+        )
+        assert lane.recovery_disposition(recovered["state"]) == expected, state
+        await db.close()
+
+
+async def test_recovery_scan_returns_only_interrupted_runs(tmp_path):
+    from scout.live import solana_lane as lane
+
+    db = await _fresh_db(tmp_path)
+    await lane.record_execution_state(
+        db, "live-1", lane.STATE_QUOTE_CREATED, mode="SUPERVISED_LIVE"
+    )
+    await lane.record_execution_state(
+        db, "done-1", lane.STATE_QUOTE_CREATED, mode="SUPERVISED_LIVE"
+    )
+    await lane.record_execution_state(
+        db, "done-1", lane.STATE_FAILED, mode="SUPERVISED_LIVE"
+    )
+    await db.close()
+
+    db = await _fresh_db(tmp_path)
+    recoverable = await lane.fetch_recoverable_executions(db)
+    assert [r["decision_id"] for r in recoverable] == ["live-1"]
+    await db.close()
+
+
+async def test_the_store_refuses_an_illegal_transition(tmp_path):
+    """The guard is at the WRITE, so the bad state never reaches the disk."""
+    from scout.live import solana_lane as lane
+
+    db = await _fresh_db(tmp_path)
+    await lane.record_execution_state(
+        db, "d1", lane.STATE_QUOTE_CREATED, mode="SUPERVISED_LIVE"
+    )
+    with pytest.raises(lane.IllegalStateTransition):
+        await lane.record_execution_state(
+            db, "d1", lane.STATE_SUBMISSION_ATTEMPTED, mode="SUPERVISED_LIVE"
+        )
+    assert (await lane.load_execution(db, "d1"))["state"] == lane.STATE_QUOTE_CREATED
+    await db.close()
+
+
+async def test_earlier_facts_survive_later_transitions(tmp_path):
+    """The signature is written once and must outlive every step after it.
+
+    A later transition knows less about the earlier ones than they did, so a
+    naive UPDATE would blank the very field recovery depends on.
+    """
+    from scout.live import solana_lane as lane
+
+    db = await _fresh_db(tmp_path)
+    for state, fields in (
+        (lane.STATE_QUOTE_CREATED, {"amount_lamports": 50_000_000}),
+        (lane.STATE_TRANSACTION_BUILT, {"last_valid_block_height": 283_000_500}),
+        (lane.STATE_SIMULATION_PASSED, {}),
+        (lane.STATE_AWAITING_AUTHORIZATION, {"message_sha256": "abc123"}),
+        (lane.STATE_AUTHORIZED, {}),
+        (lane.STATE_SIGNED, {"expected_signature": "5sig"}),
+        (lane.STATE_SUBMISSION_ATTEMPTED, {}),
+    ):
+        await lane.record_execution_state(
+            db, "carry", state, mode="SUPERVISED_LIVE", **fields
+        )
+    await db.close()
+
+    db = await _fresh_db(tmp_path)
+    recovered = await lane.load_execution(db, "carry")
+    assert recovered["state"] == lane.STATE_SUBMISSION_ATTEMPTED
+    assert recovered["expected_signature"] == "5sig"
+    assert recovered["last_valid_block_height"] == 283_000_500
+    assert recovered["message_sha256"] == "abc123"
+    assert recovered["amount_lamports"] == 50_000_000
+    await db.close()
+
+
+async def test_the_state_check_constraint_rejects_an_unknown_state(tmp_path):
+    """Defence below the application guard: the database refuses it too."""
+    import sqlite3
+
+    db = await _fresh_db(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        await db._conn.execute(
+            "INSERT INTO solana_executions "
+            "(decision_id, state, mode, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("x", "almost_submitted", "SUPERVISED_LIVE", "t", "t"),
+        )
+    await db.close()
+
+
+# ======================================================================
+# Lifecycle <-> money coherence
+# ======================================================================
+def test_every_state_declares_its_coherent_statuses():
+    from scout.live import solana_lane as lane
+
+    assert set(lane.COHERENT_STATUSES) == set(lane.ALL_STATES)
+
+
+def test_no_money_row_may_exist_before_authorization():
+    """*** The defect a live_trades column would have introduced. ***
+
+    quote_created through simulation_passed happen before anything financial
+    does. A live_trades row there would read as an `open` position to every
+    cross-venue consumer — the exposure view, daily gross, the Kraken gates.
+    """
+    from scout.live import solana_lane as lane
+
+    for state in (
+        lane.STATE_QUOTE_CREATED,
+        lane.STATE_TRANSACTION_BUILT,
+        lane.STATE_SIMULATION_PASSED,
+    ):
+        lane.assert_coherent(state, None)  # correct: no row yet
+        with pytest.raises(lane.IncoherentLaneState, match="must not have"):
+            lane.assert_coherent(state, "open")
+
+
+def test_a_signed_execution_must_have_a_money_row():
+    """The mirror: past authorization, a missing row is unrecoverable."""
+    from scout.live import solana_lane as lane
+
+    with pytest.raises(lane.IncoherentLaneState, match="requires a live_trades row"):
+        lane.assert_coherent(lane.STATE_SIGNED, None)
+    lane.assert_coherent(lane.STATE_SIGNED, "open")
+
+
+def test_the_two_axes_cannot_disagree_about_blocking():
+    """*** Coherence, stated as the question an operator actually asks. ***"""
+    from scout.live import solana_lane as lane
+
+    # An unknown submission blocks on the LIFECYCLE axis...
+    assert lane.lane_is_blocked_by(lane.STATE_SUBMISSION_UNKNOWN, "needs_manual_review")
+    lane.assert_coherent(lane.STATE_SUBMISSION_UNKNOWN, "needs_manual_review")
+
+    # ...a completed swap blocks on the MONEY axis, because a position is held
+    # even though the execution itself is finished. Different reasons, and the
+    # blocker names which, so nobody chases the wrong table.
+    assert "position is held" in lane.lane_is_blocked_by(lane.STATE_RECONCILED, "open")
+
+    # A failed run blocks on neither.
+    assert lane.lane_is_blocked_by(lane.STATE_FAILED, "rejected") is None
+    lane.assert_coherent(lane.STATE_FAILED, "rejected")
+
+    # Every blocking state names a reason rather than silently blocking.
+    for state in lane.BLOCKING_STATES:
+        assert lane.lane_is_blocked_by(state, None) is not None
+
+
+# ======================================================================
 # Operating modes + the authorization seam
 # ======================================================================
 @pytest.mark.parametrize(
