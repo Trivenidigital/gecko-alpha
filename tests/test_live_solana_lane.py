@@ -255,6 +255,20 @@ def _steps(tmp_path) -> list[dict]:
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 
+def _steps_for(tmp_path, runner):
+    """Evidence steps of the most recent run in this workdir.
+
+    The recovery-blocked run mints its own decision id, so its evidence file is
+    the newest one rather than the one under test.
+    """
+    files = sorted(
+        (tmp_path / "evidence").glob("solana_lane_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    raw = files[-1].read_text(encoding="utf-8")
+    return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
 def _step(steps: list[dict], name: str) -> dict | None:
     return next((s for s in steps if s["step"] == name), None)
 
@@ -2637,12 +2651,18 @@ async def test_ambiguous_then_unresolved_escalates_and_blocks_the_next_run(
     # A FRESH runner against the same database refuses to place anything.
     runner2, db2, session2 = await _make_runner(tmp_path)
     with aioresponses() as m:
-        m.post(_RPC_URL, payload=_sig_status(known=False))
-        m.post(_RPC_URL, payload=_rpc(_HEIGHT_FRESH))
         assert await runner2.place(sol=_SOL) == EXIT_BLOCKED
         assert _submissions(m) == []
         assert _posts_to(m, _QUOTE_RE) == []  # never even quoted
-    assert "SOLANA LANE LANE BLOCKED" in capsys.readouterr().out
+        # The durable execution row now blocks BEFORE the ledger scan runs, so
+        # the fresh runner does not even need the network to know it is stuck.
+        assert list(m.requests) == []
+    recovery = _step(_steps_for(tmp_path, runner2), "execution_recovery")
+    assert recovery["blockers"] == 1
+    assert recovery["executions"][0]["state"] == "submission_unknown"
+    assert recovery["executions"][0]["disposition"] == "resolve"
+    assert recovery["executions"][0]["action"] == "blocks"
+    capsys.readouterr()
     # The blocked run resolved the row using the signature and the height it
     # read back out of the first run's evidence file.
     blocked_steps = [

@@ -1694,6 +1694,61 @@ class LaneRunner:
             "authorization_method": authorization_policy_for(mode).method,
         }
 
+    async def _state(
+        self, decision_id: str, state: str, *, mode: str, **fields: Any
+    ) -> None:
+        """Record a durable transition. Executing modes only.
+
+        A rehearsal writes no execution row on purpose. It has nothing to
+        recover — it never signs and never submits — and a row from it would
+        have to satisfy the lifecycle/money coherence rules without any money
+        row to satisfy them with. Recovery is about transactions that might
+        exist; rehearsals are exactly the runs where none can.
+        """
+        if mode not in EXECUTING_MODES:
+            return
+        await record_execution_state(self._db, decision_id, state, mode=mode, **fields)
+
+    async def _recover_interrupted_executions(self) -> dict[str, Any]:
+        """What earlier runs left behind, and what may be done about it.
+
+        Read at the top of every placement. The disposition comes from the
+        STATE, not from guessing: before submission nothing was sent, so the
+        run is abandoned and the lane stays clear; at or after submission a
+        transaction may exist and the lane blocks until the resolver settles
+        it. Nothing here rebuilds or resubmits — there is no code path from a
+        recovered row back to signing.
+        """
+        rows = await fetch_recoverable_executions(self._db)
+        recovered: list[dict[str, Any]] = []
+        blockers = 0
+        for row in rows:
+            disposition = recovery_disposition(row["state"])
+            entry = {
+                "decision_id": row["decision_id"],
+                "state": row["state"],
+                "disposition": disposition,
+                "expected_signature": row["expected_signature"],
+                "live_trade_id": row["live_trade_id"],
+            }
+            if disposition == "discard":
+                # Provably nothing was sent. Retire the run so a crash at the
+                # prompt does not wedge the lane forever.
+                await record_execution_state(
+                    self._db,
+                    row["decision_id"],
+                    STATE_FAILED,
+                    mode=row["mode"],
+                    detail={"reason": "interrupted before submission"},
+                )
+                await retire_row(self._db, row["live_trade_id"])
+                entry["action"] = "abandoned"
+            else:
+                entry["action"] = "blocks"
+                blockers += 1
+            recovered.append(entry)
+        return {"executions": recovered, "blockers": blockers}
+
     def _check_autonomy_preconditions(self) -> None:
         """BOUNDED_AUTONOMOUS cannot be reached by setting one value.
 
@@ -2189,6 +2244,17 @@ class LaneRunner:
             signer_pubkey = custody["declared_signer_pubkey"]
             evidence.record("keypair_custody", **custody)
 
+            recovery = await self._recover_interrupted_executions()
+            evidence.record("execution_recovery", **recovery)
+            if recovery["blockers"]:
+                raise LaneAbort(
+                    "execution_recovery",
+                    f"{recovery['blockers']} interrupted execution(s) may "
+                    "have reached the block engine. The lane is blocked until "
+                    "each is resolved. NEVER rebuild — run `resolve`.",
+                    exit_code=EXIT_BLOCKED,
+                )
+
             reconciliation = await self._reconcile_open_rows(auto_retire=True)
             evidence.record(
                 "startup_reconciliation",
@@ -2208,6 +2274,13 @@ class LaneRunner:
                 amount_lamports=amount_lamports
             )
             evidence.record("quote", **quote_detail)
+            await self._state(
+                decision_id,
+                STATE_QUOTE_CREATED,
+                mode=mode,
+                amount_lamports=amount_lamports,
+                minimum_out_raw=quote.min_out_amount,
+            )
 
             tip = int(self._settings.SOLANA_PILOT_JITO_TIP_LAMPORTS)
             build = await self._jupiter.build_swap_transaction(
@@ -2221,6 +2294,12 @@ class LaneRunner:
                 compute_unit_limit=build.compute_unit_limit,
                 simulation_error=build.simulation_error,
                 tx_b64_len=len(build.swap_transaction_b64),
+            )
+            await self._state(
+                decision_id,
+                STATE_TRANSACTION_BUILT,
+                mode=mode,
+                last_valid_block_height=build.last_valid_block_height,
             )
             if build.simulation_error is not None:
                 raise LaneAbort(
@@ -2270,6 +2349,8 @@ class LaneRunner:
                     f"err={sim.err}. Submitting anyway would burn a fee to land "
                     "a failure.",
                 )
+
+            await self._state(decision_id, STATE_SIMULATION_PASSED, mode=mode)
 
             # The identity the operator is about to authorize. It is the
             # sha256 of the exact bytes the key will sign, taken from the
@@ -2321,6 +2402,14 @@ class LaneRunner:
                     message_sha256=message_sha256,
                     would_be_last_valid_block_height=build.last_valid_block_height,
                 )
+
+            await self._state(
+                decision_id,
+                STATE_AWAITING_AUTHORIZATION,
+                mode=mode,
+                live_trade_id=live_trade_id,
+                message_sha256=message_sha256,
+            )
 
             # ONE call site. Which policy answers is the only thing that
             # changes between SUPERVISED_LIVE and BOUNDED_AUTONOMOUS — there is
@@ -2379,6 +2468,8 @@ class LaneRunner:
                     f"({decision.outcome}) — nothing was signed and nothing "
                     "was sent",
                 )
+
+            await self._state(decision_id, STATE_AUTHORIZED, mode=mode)
 
             if not executing:
                 # The rehearsal ends HERE, before the funded key is read. A
@@ -2539,6 +2630,12 @@ class LaneRunner:
                     note="durable before the block engine is called; a crash "
                     "after this point leaves a resolvable row",
                 )
+            await self._state(
+                decision_id,
+                STATE_SIGNED,
+                mode=mode,
+                expected_signature=signed.signature,
+            )
 
             return await self._submit_and_resolve(
                 evidence=evidence,
@@ -2551,6 +2648,7 @@ class LaneRunner:
                 balance=balance,
                 amount_lamports=amount_lamports,
                 signer_pubkey=signer_pubkey,
+                mode=mode,
             )
 
         except LaneAbort as abort:
@@ -2763,8 +2861,14 @@ class LaneRunner:
         balance: dict[str, Any],
         amount_lamports: int,
         signer_pubkey: str,
+        mode: str,
     ) -> int:
         """Steps 16-18 — submit exactly once, then decide what happened."""
+        # Durable BEFORE the POST. The whole point of this state is that a
+        # process which dies mid-call has already recorded that a
+        # transaction MAY exist — recording it afterwards would leave the
+        # one window that matters unlogged.
+        await self._state(decision_id, STATE_SUBMISSION_ATTEMPTED, mode=mode)
         try:
             receipt = await self._jito.submit_transaction(
                 signed.signed_tx_b64,
@@ -2825,6 +2929,7 @@ class LaneRunner:
             balance=balance,
             amount_lamports=amount_lamports,
             signer_pubkey=signer_pubkey,
+            mode=mode,
         )
 
     async def _handle_ambiguity(
@@ -2918,6 +3023,12 @@ class LaneRunner:
             await update_live_trade(
                 self._db, live_trade_id, status="needs_manual_review"
             )
+        await self._state(
+            decision_id,
+            STATE_SUBMISSION_UNKNOWN,
+            mode=self._settings.SOLANA_MODE,
+            detail={"reason": "resolver could not decide"},
+        )
         evidence.record(
             "ambiguity_unresolved",
             live_trade_id=live_trade_id,
@@ -3048,6 +3159,7 @@ class LaneRunner:
         balance: dict[str, Any],
         amount_lamports: int,
         signer_pubkey: str,
+        mode: str,
     ) -> int:
         """Steps 17-18 — wait for finality, then reconcile the balances."""
         print(
@@ -3057,8 +3169,18 @@ class LaneRunner:
         )
         confirmation = await self._await_confirmation(signed.signature)
         evidence.record("confirmation", **confirmation)
+        if confirmation["outcome"] == "finalized":
+            await self._state(decision_id, STATE_FINALIZED, mode=mode)
+        elif confirmation["known"]:
+            await self._state(decision_id, STATE_LANDED, mode=mode)
 
         if confirmation["outcome"] == "failed_on_chain":
+            await self._state(
+                decision_id,
+                STATE_FAILED,
+                mode=mode,
+                detail={"reason": "failed_on_chain"},
+            )
             await retire_row(self._db, live_trade_id)
             evidence.record(
                 "failed_on_chain",
@@ -3157,6 +3279,16 @@ class LaneRunner:
                 + [f"   - {m}" for m in summary["mismatches"]]
                 + ["  Check the wallet before running the lane again."]
             )
+        if summary["verdict"] == "pass":
+            await self._state(
+                decision_id,
+                STATE_RECONCILED,
+                mode=mode,
+                detail={"reconciliation": "pass"},
+            )
+        # A `review` verdict does NOT advance the state. The swap finalized but
+        # did not reconcile, and `finalized` says exactly that — claiming
+        # `reconciled` would assert an accounting that failed.
         _print_block(f"LANE SWAP {confirmation['outcome'].upper()}", lines)
         # An unexplained balance move exits non-zero even though the swap
         # itself completed: money moved in a way the runner cannot account
@@ -3675,7 +3807,7 @@ class LaneRunner:
                 "     definitively_not_submitted. NEVER rebuild in the meantime.",
             ]
         )
-        _print_block("SOLANA LANE LANE BLOCKED", lines)
+        _print_block("SOLANA LANE BLOCKED", lines)
 
 
 # ----------------------------------------------------------------------
