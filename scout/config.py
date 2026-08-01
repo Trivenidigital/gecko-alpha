@@ -1309,12 +1309,23 @@ class Settings(BaseSettings):
     # LIVE-02 interim fail-closed guard. The live close/exit loop
     # (live_evaluator_loop) is the only thing that ever sells a live position;
     # a routing engine that can buy while the closer is off is the buy-only
-    # orphan-money state the reconciler exists to prevent. Default True (closer
-    # runs). scout/main.py spawns the loop only when this is True; LiveEngine
-    # __init__ CRASHES if LIVE_MODE=live AND LIVE_USE_ROUTING_LAYER=True AND
-    # this is False (fail-closed — refuse to boot buy-only). Set False only for
-    # a deliberate maintenance window with routing also off.
-    LIVE_CLOSER_ENABLED: bool = True
+    # orphan-money state the reconciler exists to prevent. scout/main.py spawns
+    # the loop only when this is True; LiveEngine __init__ CRASHES if
+    # LIVE_MODE=live AND LIVE_USE_ROUTING_LAYER=True AND this is False
+    # (fail-closed — refuse to boot buy-only).
+    #
+    # DEFAULT FLIPPED True -> False, 2026-08-01. Autonomous selling must be an
+    # ACT OF CONFIGURATION, never something you get by omission. The old default
+    # meant an absent .env key silently armed the only code path that can sell a
+    # real position; the supervised Kraken and Solana lanes are operator-invoked
+    # and do not need it. Turning autonomous exits on is now explicit and
+    # auditable: set LIVE_CLOSER_ENABLED=True.
+    #
+    # Consequence, deliberately kept: with LIVE_MODE=live and
+    # LIVE_USE_ROUTING_LAYER=True, boot now FAILS unless this is explicitly
+    # True. That is the fail-closed guard doing its job — an autonomous buyer
+    # must not start without its matching seller.
+    LIVE_CLOSER_ENABLED: bool = False
 
     # Credentials (live mode only; never in .env.example — see spec §4.4)
     BINANCE_API_KEY: SecretStr | None = None
