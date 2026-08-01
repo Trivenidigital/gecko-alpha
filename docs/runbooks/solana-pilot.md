@@ -29,6 +29,17 @@ a key that may have been read.
 The key is read at call time, used, and dropped. It is never cached, never
 passed through argv or the environment, and never logged.
 
+### Declare the signer's public key
+
+```bash
+SOLANA_PILOT_SIGNER_PUBKEY=CqnCgVWJCimvkNX1YE1nerNZgBD69qKu8rhrqWGeDDAE
+```
+
+Required. Everything before the approval prompt is built against this wallet
+without opening the key file. It is also a second lock: at signing time the
+loaded keypair must equal it, so a key file that points at a different wallet
+cannot sign a transaction built for this one.
+
 ### Pin the resolver's RPC endpoint
 
 ```bash
@@ -115,8 +126,9 @@ rm <db>.solana_pilot.lock        # only once the on-chain state is known
 # Read-only. Custody, balances, kill state, outstanding rows.
 python -m scout.live.solana_pilot status
 
-# Rehearsal — quotes, builds, inspects, simulates, signs, and prompts.
-# Submits nothing and writes no ledger row.
+# Rehearsal — quotes, builds, inspects, simulates and prompts.
+# Never reads the funded key, signs nothing, submits nothing,
+# writes no ledger row.
 python -m scout.live.solana_pilot place --sol 0.05 \
     --simulate-only --yes-i-am-rehearsing
 
@@ -131,20 +143,41 @@ There is no `cancel`. Solana has no cancellation primitive: a submitted
 transaction either lands before its `lastValidBlockHeight` or it can never land.
 `resolve` is how you find out which.
 
+### The funded key does not sign until after you authorize
+
+**Nothing is signed when the approval screen appears.** The key file has not
+been opened. Custody is checked from `stat` — mode and owner — which needs no
+read, and the wallet's public key comes from `SOLANA_PILOT_SIGNER_PUBKEY`, so
+Jupiter can build for it and the inspector can check the fee payer against it
+without the private key being involved at all.
+
+This is deliberate and it is the reason the screen shows a hash rather than a
+signature. A validly signed transaction is an irreversible capability: whoever
+holds those bytes can broadcast them, and the wallet cannot take that back.
+Holding them only in memory limits who is likely to see them; it does not undo
+the fact that a spendable artifact now exists. So the artifact is not created
+until you have said yes.
+
+The key is read once, immediately after your authorization, used to sign, and
+dropped. Every refusal path — a wrong phrase, a kill switch, a stale blockhash,
+a failed gate, and every `--simulate-only` run — leaves the key file untouched.
+
 ### What you type at the prompt
 
-**The first 8 characters of the EXPECTED SIGNATURE** shown on the approval
-screen. Not a decision ID, not a uuid.
+**The first 8 characters of the MESSAGE SHA256** shown on the approval screen.
+Not a signature, not a decision ID, not a uuid.
 
-This is what binds the authorization to one exact transaction. The signature is
-a pure function of the transaction's bytes and the key, so any rebuild — a fresh
-quote, a new blockhash, a different route — produces a different signature and
-therefore a different phrase. An authorization can never be carried across a
-rebuild, because the phrase that authorized the old one does not authorize the
-new one.
+That hash is of the exact bytes the key will sign. Everything you are agreeing
+to lives inside those bytes — amount, route, slippage bound, fees, tip,
+blockhash, the full instruction list — so changing any one of them changes the
+hash, and the phrase you were given stops matching. An authorization cannot be
+carried across a rebuild, because the rebuild has a different hash.
 
-It is case-sensitive; base58 distinguishes `A` from `a`. Anything else — a wrong
-prefix, an empty line, a closed stdin — aborts without submitting.
+After signing, the runner re-checks that the signed message hash equals the one
+you authorized, and refuses to submit if it does not.
+
+It is lowercase hex and is matched exactly. Anything else — a wrong prefix, an
+empty line, a closed stdin — aborts without signing and without submitting.
 
 **You have well under a minute.** A Jupiter build is valid for roughly 150
 blocks (~60 seconds), the runner spends a few seconds inspecting and simulating,
@@ -201,7 +234,8 @@ dispose of it and resolve the row by hand. Escalate either way.
 ### 2. A stale blockhash invalidates the authorization by design
 
 If the build goes stale between your approval and submission, the run stops with
-`AUTHORIZATION INVALIDATED` and nothing is sent.
+`AUTHORIZATION INVALIDATED`. The staleness check runs before the key is read, so
+nothing was signed and nothing was sent.
 
 **A rerun is a full new loop, not a retry.** New quote, new transaction, new
 signature, new typed authorization. There is no mechanism to "resume" the old

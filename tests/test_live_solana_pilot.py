@@ -113,6 +113,7 @@ def _settings(tmp_path, **overrides) -> Settings:
     base = dict(
         SOLANA_PILOT_ENABLED=True,
         SOLANA_PILOT_KEYPAIR_PATH=_PLANTED_KEYPAIR_PATH,
+        SOLANA_PILOT_SIGNER_PUBKEY=PAYER_PUBKEY,
         SOLANA_RPC_URL=_RPC_URL,
         SOLANA_PILOT_EVIDENCE_DIR=str(tmp_path / "evidence"),
         SOLANA_SUBMISSION_SETTLE_SEC=0.0,
@@ -125,12 +126,67 @@ def _settings(tmp_path, **overrides) -> Settings:
     return Settings(_env_file=None, **_REQUIRED, **base)
 
 
-async def _make_runner(tmp_path, *, keypair=PAYER, **overrides):
-    """Runner + db + session against a tmp DB. Caller closes db and session."""
+class _LoaderSpy:
+    """Stands in for `signer.load_keypair`, and COUNTS being called.
+
+    The count is the point. "The funded key was never read on this path" is a
+    claim about an absence, and the only way to assert an absence is to make
+    the thing being absent observable.
+    """
+
+    def __init__(self, keypair):
+        self._keypair = keypair
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self._keypair is None:
+            raise SolanaKeypairError(
+                f"keypair file {_PLANTED_KEYPAIR_PATH} could not be loaded"
+            )
+        return self._keypair
+
+
+class _CustodyProbeSpy:
+    """Stands in for the stat-only custody probe.
+
+    Injected because the real one refuses on Windows by design — it cannot
+    verify POSIX mode or ownership there — and the test suite runs on
+    developer machines as well as the deployment host.
+    """
+
+    def __init__(self, *, ok=True):
+        self._ok = ok
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if not self._ok:
+            raise SolanaKeypairError(
+                f"keypair file {_PLANTED_KEYPAIR_PATH} has mode 0o644; "
+                "required 0o600 (owner read/write only)"
+            )
+        return {
+            "custody_verified": True,
+            "signing_key_file": _PLANTED_KEYPAIR_PATH,
+            "key_material_read": False,
+        }
+
+
+async def _make_runner(tmp_path, *, keypair=PAYER, custody_ok=True, **overrides):
+    """Runner + db + session against a tmp DB. Caller closes db and session.
+
+    The loader and the custody probe are separate injections because they are
+    separate in the runner: custody is checked from stat before anything is
+    built, the key is read only after the operator authorizes. Both spies are
+    attached to the runner so a test can assert on call counts.
+    """
     settings = _settings(tmp_path, **overrides)
     db = Database(tmp_path / "pilot.db")
     await db.initialize()
     session = aiohttp.ClientSession()
+    loader = _LoaderSpy(keypair)
+    prober = _CustodyProbeSpy(ok=custody_ok)
     runner = PilotRunner(
         settings=settings,
         db=db,
@@ -138,15 +194,12 @@ async def _make_runner(tmp_path, *, keypair=PAYER, **overrides):
         rpc=SolanaRpcClient(settings, session),
         jito=JitoClient(settings, session),
         kill_switch=KillSwitch(db),
-        keypair_loader=(lambda: keypair) if keypair is not None else _refusing_loader,
+        keypair_loader=loader,
+        custody_prober=prober,
     )
+    runner.loader_spy = loader
+    runner.custody_spy = prober
     return runner, db, session
-
-
-def _refusing_loader():
-    raise SolanaKeypairError(
-        f"keypair file {_PLANTED_KEYPAIR_PATH} has mode 0o644; required 0o600"
-    )
 
 
 def _authorize(monkeypatch, typed: str | None = None) -> None:
@@ -161,8 +214,30 @@ def _authorize(monkeypatch, typed: str | None = None) -> None:
 
 
 def _expected_signature(tx_b64: str) -> str:
-    """The signature the runner will derive for this transaction."""
+    """The signature the runner will derive for this transaction AFTER approval."""
     return sign_transaction(tx_b64, PAYER, expected_signer=PAYER_PUBKEY).signature
+
+
+def _message_sha256(tx_b64: str) -> str:
+    """The hash the operator authorizes — computed WITHOUT any key.
+
+    Deliberately derived here from the transaction bytes rather than read out
+    of the runner, so the test and the runner agree only if both are hashing
+    the same thing.
+    """
+    import base64
+    import hashlib
+
+    from solders.message import to_bytes_versioned
+    from solders.transaction import VersionedTransaction
+
+    tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    return hashlib.sha256(to_bytes_versioned(tx.message)).hexdigest()
+
+
+def _phrase(tx_b64: str) -> str:
+    """What the operator types: the first 8 chars of the message hash."""
+    return _message_sha256(tx_b64)[:8]
 
 
 def _evidence_path(tmp_path, decision_id: str):
@@ -473,7 +548,7 @@ async def test_place_refuses_a_non_mainnet_host(tmp_path, field, url):
 
 async def test_place_refuses_when_the_keypair_file_is_unsafe(tmp_path):
     """A loader refusal is an envelope refusal — nothing was built or sent."""
-    runner, db, session = await _make_runner(tmp_path, keypair=None)
+    runner, db, session = await _make_runner(tmp_path, custody_ok=False)
     with aioresponses() as m:
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
@@ -481,6 +556,9 @@ async def test_place_refuses_when_the_keypair_file_is_unsafe(tmp_path):
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "keypair_custody"
     assert "0o600" in abort["reason"]
+    # The verdict came from stat; the key file itself was never opened.
+    assert runner.custody_spy.calls == 1
+    assert runner.loader_spy.calls == 0
     await session.close()
     await db.close()
 
@@ -862,16 +940,21 @@ async def test_the_inspected_bytes_and_the_signed_bytes_must_be_the_same(
         )
 
     monkeypatch.setattr(solana_pilot, "sign_transaction", _sign_something_else)
-    _authorize(monkeypatch, "whatever")
+    # The operator authorizes the REAL transaction's hash; the signer then
+    # produces a signature over different bytes.
+    _authorize(monkeypatch, _phrase(tx))
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
     abort = _step(_steps(tmp_path), "aborted")
     assert abort["stage"] == "signed_in_memory"
-    assert "does not match the inspected digest" in abort["reason"]
-    assert await _count(db, "live_trades") == 0
+    assert "does not match the AUTHORIZED digest" in abort["reason"]
+    # The row exists (it was written before the prompt) but never received a
+    # signature, so it is provably un-submitted.
+    assert await _live_rows(db) == [("open", None)]
     await session.close()
     await db.close()
 
@@ -883,7 +966,7 @@ async def test_the_live_jito_tip_list_is_used_and_its_provenance_recorded(
     tmp_path, monkeypatch
 ):
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
@@ -954,7 +1037,7 @@ async def test_a_lookup_table_route_is_approvable_because_a_real_rpc_is_passed(
     table_bytes = bytes(LOOKUP_TABLE_META_SIZE) + b"".join(
         bytes(Pubkey.from_string(m)) for m in (SOL_MINT, USDC_MINT)
     )
-    _authorize(monkeypatch, _expected_signature(built.tx_b64)[:8])
+    _authorize(monkeypatch, _phrase(built.tx_b64))
 
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
@@ -1030,7 +1113,7 @@ async def test_simulate_only_runs_on_an_unpinned_resolver_and_says_so(
     must not be mistaken for a launch-ready lane.
     """
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(
         tmp_path, SOLANA_RPC_URL=_ROUND_ROBIN_RPC_URL
     )
@@ -1060,7 +1143,7 @@ async def test_simulate_only_on_a_pinned_resolver_says_nothing(
 ):
     """The notice is about a real gap, so it must not cry wolf."""
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1094,7 +1177,7 @@ async def test_the_jito_client_is_unreachable_from_any_rehearsal_path(
     monkeypatch.setattr(JitoClient, "submit_transaction", _detonate)
 
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     for pinned, overrides in (
         (True, {}),
         (False, {"SOLANA_RPC_URL": _ROUND_ROBIN_RPC_URL}),
@@ -1242,22 +1325,34 @@ async def test_wrong_authorization_submits_nothing_and_retires_the_row(
 
     steps = _steps(tmp_path)
     assert _step(steps, "authorization")["outcome"] == "authorization_refused"
-    # The row existed (it must, before submission is possible) and is now
-    # retired, so it does not block the next run.
-    assert _step(steps, "intent_persisted") is not None
+    # *** The funded key was never read. *** This is what the reordering
+    # exists for: a refused authorization must not leave a broadcastable
+    # artifact behind, and the only way to be sure is that nothing signed.
+    assert runner.loader_spy.calls == 0
+    assert _step(steps, "signed_in_memory") is None
+    assert _step(steps, "funded_signer_loaded") is None
+    # The intent row recorded what was being authorized and is now retired,
+    # still carrying no signature.
+    assert _step(steps, "intent_persisted")["entry_order_id"] is None
     assert _step(steps, "intent_retired")["ledger_status"] == "rejected"
-    assert await _live_rows(db) == [("rejected", _expected_signature(tx))]
+    assert await _live_rows(db) == [("rejected", None)]
     await session.close()
     await db.close()
 
 
-async def test_the_authorization_phrase_is_the_signature_prefix(
+async def test_the_authorization_phrase_is_the_message_hash_prefix(
     tmp_path, monkeypatch, capsys
 ):
-    """Not a uuid: any rebuild changes the signature and so changes the phrase."""
+    """*** Authorization binds to the message, and precedes any signature. ***
+
+    The screen cannot show an expected signature, because none exists when
+    the operator is asked — the funded key has not been read. It shows the
+    sha256 of the exact bytes the key will sign, and the operator types the
+    first 8 characters of that.
+    """
     tx = build_swap_tx().tx_b64
-    signature = _expected_signature(tx)
-    _authorize(monkeypatch, signature[:8])
+    message_hash = _message_sha256(tx)
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
@@ -1265,28 +1360,96 @@ async def test_the_authorization_phrase_is_the_signature_prefix(
         assert len(_submissions(m)) == 1
 
     out = capsys.readouterr().out
-    assert f"EXPECTED SIGNATURE  : {signature}" in out
-    assert "first 8 characters of the EXPECTED SIGNATURE" in out
+    assert f"MESSAGE SHA256      : {message_hash}" in out
+    assert "first 8 characters of the MESSAGE SHA256" in out
+    # The screen must not promise a signature it cannot have.
+    assert "EXPECTED SIGNATURE" not in out
+    assert "NOT SIGNED - the funded key is read only after you authorize" in out
+
     steps = _steps(tmp_path)
-    assert _step(steps, "authorization")["bound_to_signature"] == signature
+    assert _step(steps, "authorization")["bound_to_message_sha256"] == message_hash
+    assert _step(steps, "authorization")["funded_signer_loaded"] is False
+    # ...and the hash the operator approved is the hash that got signed.
+    assert _step(steps, "signed_in_memory")["message_sha256"] == message_hash
+    assert _step(steps, "signed_in_memory")["matches_authorized_hash"] is True
     await session.close()
     await db.close()
 
 
-async def test_a_signature_from_a_different_build_does_not_authorize(
+@pytest.mark.parametrize(
+    "field,variant",
+    [
+        ("amount", dict(route_amount_lamports=60_000_000)),
+        ("slippage", dict(route_slippage_bps=300)),
+        ("blockhash", dict(blockhash="9zjmVQzTaMSKtP2rWXvcH6EABKPBGKGKZfNmMbT7xkFq")),
+        ("tip", dict(tip_lamports=123_456)),
+        ("priority fee", dict(compute_unit_price=9_999)),
+    ],
+)
+def test_changing_any_message_field_invalidates_the_authorization(field, variant):
+    """Every one of these lives IN the message, so each moves the hash.
+
+    That is what makes the hash safe to bind an authorization to: an
+    operator who approved one set of numbers cannot have that approval spent
+    on another, because the phrase they typed no longer matches.
+    """
+    baseline = _message_sha256(build_swap_tx().tx_b64)
+    changed = _message_sha256(build_swap_tx(**variant).tx_b64)
+    assert changed != baseline, f"{field} is not represented in the message"
+    assert changed[:8] != baseline[:8], f"{field} did not change the phrase"
+
+
+async def test_a_phrase_for_a_different_transaction_does_not_authorize(
     tmp_path, monkeypatch
 ):
-    """The prefix of some OTHER transaction's signature is just a wrong phrase."""
+    """End-to-end companion to the hash-level check above."""
     tx = build_swap_tx().tx_b64
-    other = build_swap_tx(tip_lamports=99_999).tx_b64
-    assert _expected_signature(other) != _expected_signature(tx)
-    _authorize(monkeypatch, _expected_signature(other)[:8])
+    other = build_swap_tx(route_amount_lamports=60_000_000).tx_b64
+    _authorize(monkeypatch, _phrase(other))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
         assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+async def test_the_funded_key_is_not_read_on_any_pre_authorization_refusal(
+    tmp_path,
+):
+    """*** Required property 2, swept across the gates. ***
+
+    Every refusal reachable before the prompt must leave the key file
+    unopened — not merely unused. Asserted on the loader's call count,
+    because an absence is only checkable if the thing absent is observable.
+    """
+    cases = {
+        "disabled": dict(SOLANA_PILOT_ENABLED=False),
+        "no_signer_declared": dict(SOLANA_PILOT_SIGNER_PUBKEY=""),
+        "devnet_host": dict(SOLANA_RPC_URL="https://api.devnet.solana.com"),
+    }
+    for label, overrides in cases.items():
+        workdir = tmp_path / label
+        workdir.mkdir()
+        runner, db, session = await _make_runner(workdir, **overrides)
+        with aioresponses() as m:
+            assert await runner.place(sol=_SOL) == EXIT_REFUSED, label
+            assert _submissions(m) == [], label
+        assert runner.loader_spy.calls == 0, label
+        await session.close()
+        await db.close()
+
+    # ...and for a refusal deep in the flow, after the venue was called.
+    workdir = tmp_path / "band"
+    workdir.mkdir()
+    runner, db, session = await _make_runner(workdir)
+    with aioresponses() as m:
+        m.get(_QUOTE_RE, payload=_quote_payload(out_amount=4_990_000))
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+    assert runner.loader_spy.calls == 0
     await session.close()
     await db.close()
 
@@ -1321,7 +1484,7 @@ async def test_kill_switch_recheck_retires_the_row_and_sends_nothing(
         )
 
     monkeypatch.setattr(runner._ks, "is_active", _clear_then_active)
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
@@ -1330,7 +1493,10 @@ async def test_kill_switch_recheck_retires_the_row_and_sends_nothing(
 
     steps = _steps(tmp_path)
     assert _step(steps, "kill_switch_recheck")["kill_active"] is True
-    assert await _live_rows(db) == [("rejected", _expected_signature(tx))]
+    # The kill re-check runs before signing, so the row retires still holding
+    # no signature — and the funded key was never read.
+    assert await _live_rows(db) == [("rejected", None)]
+    assert runner.loader_spy.calls == 0
     await session.close()
     await db.close()
 
@@ -1340,7 +1506,7 @@ async def test_stale_blockhash_invalidates_the_authorization(
 ):
     """The operator read the screen too slowly; the numbers went stale."""
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1353,10 +1519,13 @@ async def test_stale_blockhash_invalidates_the_authorization(
     steps = _steps(tmp_path)
     assert _step(steps, "blockhash_recheck")["valid"] is False
     assert _step(steps, "authorization_invalidated")["ledger_status"] == "rejected"
-    assert await _live_rows(db) == [("rejected", _expected_signature(tx))]
+    assert await _live_rows(db) == [("rejected", None)]
+    # Stale numbers are caught before the key is read, so a rerun is a clean
+    # loop rather than a second signed artifact.
+    assert runner.loader_spy.calls == 0
     out = capsys.readouterr().out
     assert "AUTHORIZATION INVALIDATED" in out
-    assert "a NEW quote, a NEW signature, and a NEW" in out
+    assert "a NEW quote, a NEW message hash, and a NEW" in out
     await session.close()
     await db.close()
 
@@ -1365,7 +1534,7 @@ async def test_unreadable_block_height_after_approval_fails_closed(
     tmp_path, monkeypatch
 ):
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1400,13 +1569,16 @@ async def test_rehearsal_flags_are_cross_checked(tmp_path, monkeypatch, capsys):
     assert "This would be a REAL swap" in capsys.readouterr().out
 
 
-async def test_simulate_only_signs_prompts_and_submits_nothing(
-    tmp_path, monkeypatch, capsys
-):
-    """The rehearsal is the real flow minus the one irreversible step."""
+async def test_simulate_only_never_reads_the_funded_key(tmp_path, monkeypatch, capsys):
+    """*** Required property 1. ***
+
+    A rehearsal runs the whole flow — inspection, simulation, the approval
+    prompt — and stops before the one step that creates something
+    irreversible. A validly signed transaction is a broadcastable artifact
+    whoever holds it, so a rehearsal has no business producing one.
+    """
     tx = build_swap_tx().tx_b64
-    signature = _expected_signature(tx)
-    _authorize(monkeypatch, signature[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1416,15 +1588,30 @@ async def test_simulate_only_signs_prompts_and_submits_nothing(
 
     steps = _steps(tmp_path)
     names = _step_names(steps)
-    # It really did everything else: inspected, simulated, signed, prompted.
+    # Everything except signing really happened, including the prompt.
     assert "tx_inspection" in names and "simulation" in names
-    assert _step(steps, "signed_in_memory")["expected_signature"] == signature
     assert _step(steps, "authorization")["outcome"] == "authorized"
-    # And left NO ledger row — a row would be a phantom blocking the next run.
+
+    # *** The funded key was never read, and nothing was signed. ***
+    assert runner.loader_spy.calls == 0
+    assert "signed_in_memory" not in names
+    assert "funded_signer_loaded" not in names
+    assert _step(steps, "rehearsal_complete")["funded_signer_loaded"] is False
+    # Custody was still verified — from stat, without opening the file.
+    assert runner.custody_spy.calls == 1
+    assert _step(steps, "keypair_custody")["key_material_read"] is False
+
+    # No signature appears anywhere in the evidence, because none exists.
+    raw = _only_evidence_file(tmp_path).read_text(encoding="utf-8")
+    assert _expected_signature(tx) not in raw
+    assert _message_sha256(tx) in raw
+
+    # And no ledger row: a row would be a phantom blocking the next run.
     assert "intent_persisted" not in names
-    assert _step(steps, "intent_skipped")["would_be_expected_signature"] == signature
     assert await _count(db, "live_trades") == 0
-    assert "REHEARSAL COMPLETE" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "nothing was signed, nothing was sent" in out
+    assert "funded key     : NOT read" in out
     await session.close()
     await db.close()
 
@@ -1437,7 +1624,7 @@ async def test_happy_path_submits_confirms_finalizes_and_reconciles(
 ):
     tx = build_swap_tx().tx_b64
     signature = _expected_signature(tx)
-    _authorize(monkeypatch, signature[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
@@ -1491,27 +1678,140 @@ async def test_happy_path_submits_confirms_finalizes_and_reconciles(
     await db.close()
 
 
-async def test_the_expected_signature_is_persisted_before_the_submission_step(
-    tmp_path, monkeypatch
-):
-    """The idempotency key must be durable before anything can be sent."""
+async def test_the_signature_is_persisted_before_the_jito_call(tmp_path, monkeypatch):
+    """*** Required property 6. ***
+
+    The idempotency key has to be durable before the POST, or a crash right
+    after submission leaves a transaction nobody can resolve. The whole
+    ordering is asserted here in one place, because each step's meaning
+    depends on the ones around it.
+    """
     tx = build_swap_tx().tx_b64
     signature = _expected_signature(tx)
-    _authorize(monkeypatch, signature[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
         assert await runner.place(sol=_SOL) == EXIT_OK
 
-    names = _step_names(_steps(tmp_path))
-    intent = _step(_steps(tmp_path), "intent_persisted")
-    assert intent["expected_signature"] == signature
+    steps = _steps(tmp_path)
+    names = _step_names(steps)
+
+    # What is being authorized is durable BEFORE the prompt...
+    intent = _step(steps, "intent_persisted")
+    assert intent["message_sha256"] == _message_sha256(tx)
     assert intent["last_valid_block_height"] == _LAST_VALID
-    assert names.index("intent_persisted") < names.index("submitted")
-    # ...and before the operator was even asked.
+    assert intent["entry_order_id"] is None
     assert names.index("intent_persisted") < names.index("authorization")
+
+    # ...the key is read only after it...
+    assert names.index("authorization") < names.index("funded_signer_loaded")
+    assert names.index("funded_signer_loaded") < names.index("signed_in_memory")
+
+    # ...and the signature is committed, read back, and only then sent.
+    persisted = _step(steps, "signature_persisted")
+    assert persisted["expected_signature"] == signature
+    assert persisted["confirmed_by_read_back"] is True
+    assert names.index("signed_in_memory") < names.index("signature_persisted")
+    assert names.index("signature_persisted") < names.index("submitted")
     await session.close()
     await db.close()
+
+
+async def test_an_interruption_after_signing_leaves_a_recoverable_row(
+    tmp_path, monkeypatch
+):
+    """*** Required property 7, the crash-after-signing half. ***
+
+    The dangerous window is between the signature being committed and the POST
+    completing: a transaction may or may not exist. The row must survive
+    carrying its signature, and the NEXT run must resolve it — never resubmit
+    it, because a rebuild or a resend is how one authorization becomes two
+    swaps.
+    """
+    tx = build_swap_tx().tx_b64
+    signature = _expected_signature(tx)
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+
+    def _interrupt(*_args, **_kwargs):
+        # Not an exception the runner handles — this is the process going away
+        # between the durable write and the block engine answering.
+        raise KeyboardInterrupt("operator interrupted mid-submission")
+
+    monkeypatch.setattr(JitoClient, "submit_transaction", _interrupt)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        with pytest.raises(KeyboardInterrupt):
+            await runner.place(sol=_SOL)
+
+    # The signature was durable BEFORE the interruption, so the row is
+    # recoverable rather than a mystery.
+    assert await _live_rows(db) == [("open", signature)]
+    steps = _steps(tmp_path)
+    assert _step(steps, "signature_persisted")["expected_signature"] == signature
+    assert _step(steps, "submitted") is None
+    decision_id = _step(steps, "run_started")["decision_id"]
+    await session.close()
+
+    # A FRESH runner against the same database resolves and never submits.
+    monkeypatch.undo()
+    runner2, db2, session2 = await _make_runner(tmp_path)
+
+    def _detonate(*_args, **_kwargs):
+        raise AssertionError("the recovery path submitted something")
+
+    monkeypatch.setattr(JitoClient, "submit_transaction", _detonate)
+    with aioresponses() as m:
+        # Absent and expired: the transaction never landed, so the lane clears.
+        for _ in range(2):
+            m.post(_RPC_URL, payload=_sig_status(known=False))
+            m.post(_RPC_URL, payload=_rpc(_LAST_VALID + 50))
+        assert await runner2.resolve(decision_id=decision_id) == EXIT_OK
+        assert _submissions(m) == []
+
+    assert (await _row(db2, decision_id))["status"] == "rejected"
+    await session2.close()
+    await db2.close()
+    await db.close()
+
+
+def test_the_submit_call_cannot_precede_the_signature_write():
+    """Structural companion: the ordering above, asserted over the AST.
+
+    A runtime test shows the order on the path it exercised. This shows it
+    for the function — and the NULL-signature ledger state means 'provably
+    never submitted' only because this ordering holds.
+    """
+    import ast
+    import inspect
+
+    from scout.live import solana_pilot as module
+
+    tree = ast.parse(inspect.getsource(module))
+    place = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "place"
+    )
+    persist = [
+        n.lineno
+        for n in ast.walk(place)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "id", getattr(n.func, "attr", None))
+        == "persist_expected_signature"
+    ]
+    submit = [
+        n.lineno
+        for n in ast.walk(place)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) == "_submit_and_resolve"
+    ]
+    assert persist, "expected the signature-persist call site"
+    assert submit, "expected the submission call site"
+    assert max(persist) < min(submit)
 
 
 async def test_reconciliation_records_the_minimum_output_comparison(
@@ -1528,7 +1828,7 @@ async def test_reconciliation_records_the_minimum_output_comparison(
     complaint.
     """
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
@@ -1567,7 +1867,7 @@ async def test_the_explained_sol_band_is_exactly_as_wide_as_the_rent(
         # the next placement — so each case gets its own database rather than
         # having its predecessor's position deleted out from under it.
         workdir.mkdir()
-        _authorize(monkeypatch, _expected_signature(tx_b64)[:8])
+        _authorize(monkeypatch, _phrase(tx_b64))
         runner, db, session = await _make_runner(workdir)
         with aioresponses() as m:
             _mock_quote_and_build(m, tx_b64)
@@ -1607,7 +1907,7 @@ async def test_the_explained_sol_band_is_exactly_as_wide_as_the_rent(
 async def test_a_spend_with_no_fees_paid_is_not_explained(tmp_path, monkeypatch):
     """The defect the old floor admitted: swap amount, zero fees, `pass`."""
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1630,7 +1930,7 @@ async def test_reconciliation_reviews_an_unexplained_balance_move(
 ):
     """Receiving less than the on-chain minimum is money we cannot account for."""
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1701,7 +2001,7 @@ async def test_a_signature_the_cluster_never_knew_is_a_confirm_timeout(tmp_path)
 # ======================================================================
 async def _run_ambiguous(tmp_path, monkeypatch, *, resolver_payloads):
     tx = build_swap_tx().tx_b64
-    _authorize(monkeypatch, _expected_signature(tx)[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
@@ -1922,15 +2222,37 @@ async def test_a_missing_evidence_file_makes_the_row_block(tmp_path):
     await db.close()
 
 
-async def test_a_row_without_a_signature_blocks_rather_than_being_repaired(tmp_path):
+async def test_a_row_without_a_signature_is_provably_unsubmitted(tmp_path, monkeypatch):
+    """*** Required property 7, the crash-before-signing half. ***
+
+    Submission is reachable only after the signature is committed and read
+    back, so a row still holding NULL is one where the run ended before
+    signing — a refusal, a Ctrl+C at the prompt, a crash. No transaction
+    exists, so the row is retired and the lane clears rather than stalling
+    on a row that asserts nothing.
+    """
+    tx = build_swap_tx().tx_b64
+    decision_id = "6d1b345e-2821-40e2-ad83-4ecb18a06879"
     runner, db, session = await _make_runner(tmp_path)
-    await _seed_solana_row(
-        db, decision_id="6d1b345e-2821-40e2-ad83-4ecb18a06879", signature=None
-    )
+    await _seed_solana_row(db, decision_id=decision_id, signature=None)
+    _authorize(monkeypatch, None)  # stop at the approval boundary
+
     with aioresponses() as m:
-        assert await runner.place(sol=_SOL) == EXIT_BLOCKED
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        # The lane clears, so the run proceeds all the way to the prompt.
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
         assert _submissions(m) == []
-        assert list(m.requests) == []
+        # Nothing was asked of the cluster ABOUT the stale row: there is no
+        # signature to ask about, and none is needed to know the answer.
+
+    reconciliation = _step(_steps(tmp_path), "startup_reconciliation")
+    assert reconciliation["blocker_count"] == 0
+    stale = reconciliation["rows"][0]
+    assert stale["resolution"]["verdict"] == "definitively_not_submitted"
+    assert stale["resolution"]["expiry_source"] == "never_signed"
+    assert stale["auto_retired"] is True
+    assert (await _row(db, decision_id))["status"] == "rejected"
     await session.close()
     await db.close()
 
@@ -2313,7 +2635,7 @@ async def test_evidence_is_jsonlines_carries_the_signature_and_leaks_no_key(
 ):
     tx = build_swap_tx().tx_b64
     signature = _expected_signature(tx)
-    _authorize(monkeypatch, signature[:8])
+    _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_happy_path(m, tx)
@@ -2338,7 +2660,8 @@ async def test_evidence_is_jsonlines_carries_the_signature_and_leaks_no_key(
     assert _PLANTED_KEY_BYTES not in raw
     custody = _step(steps, "keypair_custody")
     assert custody["signing_key_file"] == _PLANTED_KEYPAIR_PATH
-    assert custody["signer_pubkey"] == PAYER_PUBKEY
+    assert custody["declared_signer_pubkey"] == PAYER_PUBKEY
+    assert custody["key_material_read"] is False
     await session.close()
     await db.close()
 
@@ -2438,14 +2761,22 @@ async def test_the_intent_insert_writes_the_signature_atomically(tmp_path):
     row_id = await solana_pilot.record_solana_intent(
         db,
         decision_id="6d1b345e-2821-40e2-ad83-4ecb18a0687e",
-        expected_signature="5sig",
         paper_trade_id=anchor,
         size_usd="8.52",
         sol_price_usdc="170.5",
     )
     assert row_id > 0
     row = await _row(db, "6d1b345e-2821-40e2-ad83-4ecb18a0687e")
-    assert (row["status"], row["entry_order_id"]) == ("open", "5sig")
+    # The row is written BEFORE the approval prompt, when no signature can
+    # exist yet. NULL here is what makes 'provably never submitted' readable
+    # straight off the ledger.
+    assert (row["status"], row["entry_order_id"]) == ("open", None)
+
+    # ...and the signature arrives later, confirmed by read-back.
+    stored = await solana_pilot.persist_expected_signature(db, row_id, "5sig")
+    assert stored == "5sig"
+    row = await _row(db, "6d1b345e-2821-40e2-ad83-4ecb18a0687e")
+    assert row["entry_order_id"] == "5sig"
     await session.close()
     await db.close()
 

@@ -37,23 +37,28 @@ to the evidence file before the next one starts:
 
 Design decisions this module had to make, and why
 -------------------------------------------------
-**Signing precedes authorization, and that is deliberate.** The approval
-screen is required to show the expected transaction signature, and that
-signature does not exist until the message has been signed — it is a pure
-function of the message bytes and the key, computed locally with no network
-involved (``solana.signer``). So the order is build -> inspect -> simulate ->
-SIGN -> persist -> approve -> submit.
+**Authorization gates SIGNING, not submission.** The funded pilot key does
+not sign until the operator has typed the authorization — including in
+rehearsal. A validly signed transaction is an irreversible-capability
+artifact: anyone who obtains those bytes can broadcast them, and the wallet
+cannot take that back. Holding them only in memory bounds the EXPOSURE, but
+it does not reduce the CAPABILITY that was created, and it is the capability
+the authorization exists to gate. So the order is build -> inspect ->
+simulate (unsigned) -> approve -> load key -> sign -> persist -> submit.
 
-Nothing leaves the process between signing and authorization. What the
-operator's authorization gates is BROADCAST, not signature creation: an
-unbroadcast signed transaction is inert bytes in memory, indistinguishable in
-effect from no transaction at all. Signing first is what makes the
-authorization bind to one exact transaction rather than to an intention — the
-operator types the first 8 characters of the signature they are looking at,
-so a rebuilt transaction (different blockhash, different signature) cannot be
-submitted under an authorization given for a different one. There is no
-approve-then-sign ordering that preserves that property, because approving a
-transaction whose identity is not yet fixed is approving a description.
+The authorization therefore binds to the TRANSACTION MESSAGE HASH — the
+sha256 of the exact bytes the key will sign, which ``tx_inspector`` computes
+from the unsigned transaction. It keeps the property the signature had: any
+change to the quote, route, amount, fees, slippage, blockhash or instructions
+changes the message, changes the hash, and invalidates the authorization. The
+operator types the first 8 characters of that hash.
+
+The funded key is not merely unused before authorization — it is not READ.
+The signer's public key comes from ``SOLANA_PILOT_SIGNER_PUBKEY`` so that
+Jupiter can build for it, the inspector can check the fee payer against it and
+the balance gate can read it, all without opening the key file. Custody is
+verified by ``stat`` alone (mode and owner), never by loading. A refusal at
+any gate, and every ``--simulate-only`` run, leaves the key file untouched.
 
 **The expected signature IS the idempotency key**, and it is persisted before
 submission. Solana has no client-order-id and no server-side dedup. A
@@ -150,6 +155,7 @@ from uuid import uuid4
 import aiohttp
 import structlog
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 
 from scout.config import Settings, load_settings
 from scout.db import Database
@@ -173,7 +179,12 @@ from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient, SolanaQuote, SwapBuild
 from scout.live.solana.resolver import ResolutionReport, resolve_submission
 from scout.live.solana.rpc_client import SolanaRpcClient
-from scout.live.solana.signer import SignedTransaction, load_keypair, sign_transaction
+from scout.live.solana.signer import (
+    SignedTransaction,
+    enforce_keyfile_security,
+    load_keypair,
+    sign_transaction,
+)
 from scout.live.solana.tx_inspector import VerificationReport, verify_swap_transaction
 
 log = structlog.get_logger(__name__)
@@ -368,6 +379,50 @@ class EvidenceLog:
             os.fsync(handle.fileno())
         log.info("solana_pilot_step", step=step, **_scrub(fields))
         return entry
+
+
+def probe_keyfile_custody(settings: Settings) -> dict[str, Any]:
+    """Verify the key file's custody WITHOUT reading a byte of it.
+
+    Mode and ownership are properties of the directory entry, so ``stat``
+    answers the custody question completely and ``open`` is never needed. That
+    matters because this runs before the operator has authorized anything, and
+    the rule is that the funded key is not read until after.
+
+    Raises:
+        SolanaKeypairError: missing file, permissions wider than 0600, another
+            owner, or a platform where neither can be checked.
+    """
+    raw = (settings.SOLANA_PILOT_KEYPAIR_PATH or "").strip()
+    if not raw:
+        raise SolanaKeypairError(
+            "SOLANA_PILOT_KEYPAIR_PATH is unset. The Solana pilot refuses to "
+            "run without an explicitly configured key file."
+        )
+    resolved = Path(raw)
+    if not resolved.is_file():
+        raise SolanaKeypairError(f"keypair file not found: {resolved}")
+    if not hasattr(os, "getuid"):
+        # Same refusal as `signer.load_keypair`: Windows reports synthetic
+        # POSIX mode bits and no meaningful uid, so the guarantee would be
+        # absent exactly where nobody looks for it.
+        raise SolanaKeypairError(
+            "refusing to use a signing key on a non-POSIX platform: key-file "
+            "permissions and ownership cannot be verified. Run the Solana "
+            "pilot on the Linux host."
+        )
+    info = resolved.stat()
+    enforce_keyfile_security(
+        mode=info.st_mode,
+        file_uid=info.st_uid,
+        current_uid=os.getuid(),
+        path=str(resolved),
+    )
+    return {
+        "custody_verified": True,
+        "signing_key_file": str(resolved),
+        "key_material_read": False,
+    }
 
 
 def resolver_endpoint(settings: Settings) -> tuple[str, bool]:
@@ -686,31 +741,41 @@ async def record_solana_intent(
     db: Database,
     *,
     decision_id: str,
-    expected_signature: str,
     paper_trade_id: int,
     size_usd: str,
     sol_price_usdc: str | None,
 ) -> int:
     """Insert the 'open' ledger row carrying the expected signature.
 
-    Deliberately NOT ``idempotency.record_pending_order``. That helper inserts
-    without ``entry_order_id`` and every caller fills it in afterwards, which
-    on this lane would leave a window where the row exists and the signature
-    does not — an 'open' row with no signature is unresolvable, so a crash in
-    that window would block the lane permanently on a transaction nobody can
-    ask about. The signature is the idempotency key here, so it goes in the
-    same INSERT.
+    The row is written BEFORE the approval prompt, and at that point no
+        signature exists — the funded key has not signed yet, by design. So
+        ``entry_order_id`` starts NULL and is filled in by
+        ``persist_expected_signature`` after signing, which is the step that must
+        complete before anything can be submitted.
 
-    Everything else follows the shared contract: one write under
-    ``db._txn_lock`` (the connection is shared, and an unlocked commit would
-    also commit another coroutine's half-built transaction), status 'open'
-    meaning "a transaction may exist from this instant", and the UNIQUE
-    ``client_order_id`` index as the DB-layer backstop.
+        That gives a durable three-state ledger, and the states are distinguishable
+        precisely because submission happens strictly after the signature is
+        committed:
 
-    ``size_usd`` is the quote's USDC output — the AUTHORIZED value of the
-    swap, recorded before anything executes. It is not realised proceeds;
-    those land in ``entry_fill_qty`` / ``entry_fill_price`` after
-    reconciliation.
+        * no row            -> nothing was ever authorized
+        * row, NULL sig     -> authorized-or-not, but PROVABLY never submitted
+        * row, signature    -> may or may not have reached the block engine; the
+                               §7 resolver is what decides which
+
+        Deliberately NOT ``idempotency.record_pending_order``: that helper hardcodes
+        its own column list and status, and this lane needs the row shaped around
+        the signature arriving later.
+
+        Everything else follows the shared contract: one write under
+        ``db._txn_lock`` (the connection is shared, and an unlocked commit would
+        also commit another coroutine's half-built transaction), status 'open'
+        meaning "a transaction may exist from this instant", and the UNIQUE
+        ``client_order_id`` index as the DB-layer backstop.
+
+        ``size_usd`` is the quote's USDC output — the AUTHORIZED value of the
+        swap, recorded before anything executes. It is not realised proceeds;
+        those land in ``entry_fill_qty`` / ``entry_fill_price`` after
+        reconciliation.
     """
     if db._conn is None or db._txn_lock is None:
         raise RuntimeError("Database not initialized.")
@@ -721,7 +786,7 @@ async def record_solana_intent(
                (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
                 size_usd, mid_at_entry, entry_order_id, status,
                 client_order_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?, ?)""",
             (
                 paper_trade_id,
                 _ANCHOR_TOKEN_ID,
@@ -731,13 +796,47 @@ async def record_solana_intent(
                 _ANCHOR_SIGNAL_TYPE,
                 size_usd,
                 sol_price_usdc,
-                expected_signature,
                 decision_id,
                 now_iso,
             ),
         )
         await db._conn.commit()
         return int(cur.lastrowid or 0)
+
+
+async def persist_expected_signature(
+    db: Database, live_trade_id: int, signature: str
+) -> str:
+    """Commit the expected signature to the row, then READ IT BACK.
+
+    This is the boundary that makes the ledger's three states meaningful. The
+    read-back is not paranoia about SQLite: it is what lets the caller submit
+    knowing the idempotency key is durable, so that a crash immediately after
+    the POST still leaves a row the next run can ask the cluster about. A
+    submission that raced ahead of this write would be a transaction nobody
+    could resolve.
+
+    Returns the value read back, so the caller can assert on it rather than
+    assume the UPDATE landed.
+
+    Raises:
+        RuntimeError: the row could not be re-read, or came back holding
+            something other than the signature we wrote.
+    """
+    await update_live_trade(db, live_trade_id, entry_order_id=signature)
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        "SELECT entry_order_id FROM live_trades WHERE id = ?", (live_trade_id,)
+    )
+    row = await cur.fetchone()
+    stored = None if row is None else row[0]
+    if stored != signature:
+        raise RuntimeError(
+            f"expected signature did not persist to live_trades {live_trade_id}: "
+            f"wrote {signature!r}, read back {stored!r}"
+        )
+    return str(stored)
 
 
 async def update_live_trade(db: Database, live_trade_id: int, **columns: Any) -> None:
@@ -891,6 +990,7 @@ class PilotRunner:
         jito: JitoClient,
         kill_switch: KillSwitch,
         keypair_loader: Callable[[], Keypair] | None = None,
+        custody_prober: Callable[[], dict[str, Any]] | None = None,
         resolver_rpc: SolanaRpcClient | None = None,
     ) -> None:
         self._settings = settings
@@ -899,7 +999,15 @@ class PilotRunner:
         self._rpc = rpc
         self._jito = jito
         self._ks = kill_switch
+        # Two separate dependencies on purpose. The prober answers "is this
+        # key file safe to use" from stat alone and runs early; the loader
+        # reads key material and runs ONLY after the operator authorizes.
+        # Splitting them is what makes "the funded key was never opened on a
+        # refusal path" a testable claim rather than a narrative one.
         self._load_keypair = keypair_loader or (lambda: load_keypair(settings))
+        self._probe_custody = custody_prober or (
+            lambda: probe_keyfile_custody(settings)
+        )
         # Both sweeps of every resolution read from THIS client, which must be
         # bound to one consistent node — see ``resolver_endpoint``. Defaults to
         # the main client so a test (or a deployment whose single RPC is
@@ -926,6 +1034,23 @@ class PilotRunner:
                 "SOLANA_PILOT_KEYPAIR_PATH is empty — name the id.json holding "
                 "the ONE approved pilot key before running the pilot.",
             )
+        declared = (self._settings.SOLANA_PILOT_SIGNER_PUBKEY or "").strip()
+        if not declared:
+            raise PilotAbort(
+                "envelope_gate",
+                "SOLANA_PILOT_SIGNER_PUBKEY is empty — declare the wallet's "
+                "PUBLIC key. Everything before the approval prompt is built "
+                "against it, and none of it may open the funded key file.",
+            )
+        try:
+            Pubkey.from_string(declared)
+        except Exception as exc:
+            raise PilotAbort(
+                "envelope_gate",
+                f"SOLANA_PILOT_SIGNER_PUBKEY is not a valid base58 public key "
+                f"({type(exc).__name__}). A malformed signer would surface as "
+                "an opaque build or inspection failure much later.",
+            ) from exc
         # "Mainnet only" is part of the approved envelope, and the realistic
         # way to leave it is an .env host left over from a devnet experiment.
         for field in ("SOLANA_RPC_URL", "JITO_BLOCK_ENGINE_URL"):
@@ -970,6 +1095,7 @@ class PilotRunner:
         return {
             "pilot_enabled": True,
             "keypair_path_configured": True,
+            "declared_signer_pubkey": declared,
             "input_mint": SOL_MINT,
             "output_mint": USDC_MINT,
             "rpc_url": self._settings.SOLANA_RPC_URL,
@@ -995,28 +1121,54 @@ class PilotRunner:
             f"{state.reason}",
         )
 
-    def _custody_check(self) -> tuple[Keypair, dict[str, Any]]:
-        """Step 3 — load the key at call time and derive the signer pubkey.
+    def _custody_precheck(self) -> dict[str, Any]:
+        """Step 3 — prove the key file is safe to use WITHOUT opening it.
 
-        The loader enforces the file's mode and ownership
-        (``signer.enforce_keyfile_security``). A refusal here is an envelope
-        refusal, not an escalation: nothing has been built and nothing sent.
+        Mode and ownership come from ``stat``, so this answers the custody
+        question completely while leaving the funded key unread. That is the
+        point: it runs before the operator has authorized anything, and the
+        rule is that the funded key is not read until after.
+
+        A refusal here is an envelope refusal, not an escalation: nothing has
+        been built and nothing sent.
+        """
+        try:
+            detail = dict(self._probe_custody())
+        except SolanaKeypairError as exc:
+            raise PilotAbort("keypair_custody", str(exc)) from exc
+        # The PATH is not the secret — the file's contents are, and those do
+        # not reach this module at all. Named to avoid ``_SECRET_KEY_RE``,
+        # which matches "keypair"; an evidence pack that cannot say which key
+        # file was checked has lost real provenance for no gain.
+        detail.setdefault("signing_key_file", self._settings.SOLANA_PILOT_KEYPAIR_PATH)
+        detail["declared_signer_pubkey"] = (
+            self._settings.SOLANA_PILOT_SIGNER_PUBKEY or ""
+        ).strip()
+        detail["key_material_read"] = False
+        return detail
+
+    def _load_funded_signer(self, *, expected: str) -> Keypair:
+        """Read the funded key. Called ONLY after a successful authorization.
+
+        The loaded key must be the wallet the whole run was built against —
+        Jupiter built for it, the inspector checked the fee payer against it,
+        the operator approved a transaction that pays from it. A key file
+        that decodes to a different wallet is a configuration error that
+        would otherwise surface as an opaque on-chain signature failure, so
+        ``sign_transaction`` is given the declared pubkey and refuses.
         """
         try:
             keypair = self._load_keypair()
         except SolanaKeypairError as exc:
-            raise PilotAbort("keypair_custody", str(exc)) from exc
-        pubkey = str(keypair.pubkey())
-        return keypair, {
-            "signer_pubkey": pubkey,
-            # Named to avoid ``_SECRET_KEY_RE``, which matches "keypair" and
-            # would redact this. The PATH is not the secret — the file's
-            # contents are, and those never reach this module — and an evidence
-            # pack that cannot say which key file was used has lost real
-            # provenance for no gain.
-            "signing_key_file": self._settings.SOLANA_PILOT_KEYPAIR_PATH,
-            "loaded_at_call_time": True,
-        }
+            raise PilotAbort("funded_signer", str(exc)) from exc
+        loaded = str(keypair.pubkey())
+        if loaded != expected:
+            raise PilotAbort(
+                "funded_signer",
+                f"the key file decodes to {loaded}, but this run was built "
+                f"and authorized for {expected}. Refusing to sign.",
+            )
+        return keypair
 
     async def _reconcile_open_rows(self, *, auto_retire: bool) -> dict[str, Any]:
         """Step 4 — decide what every outstanding signature actually did.
@@ -1049,15 +1201,35 @@ class PilotRunner:
             signature = row.get("entry_order_id")
             decision_id = row.get("client_order_id") or ""
             if not signature:
-                # An 'open' row with no signature cannot be asked about. It
-                # should be unreachable (the INSERT writes both), so it is
-                # reported rather than repaired.
+                # PROVABLY never submitted, and that is a fact about ordering
+                # rather than a guess. The row is inserted before the approval
+                # prompt with a NULL signature; the signature is written and
+                # READ BACK by `persist_expected_signature`; only then can
+                # `_submit_and_resolve` be reached. So a row still holding NULL
+                # is one where the run ended before signing — a refusal, a
+                # Ctrl+C at the prompt, a crash — and no transaction exists to
+                # ask the cluster about.
+                #
+                # Retiring it is therefore safe, and leaving it would block the
+                # lane on a row that asserts nothing. The ordering this rests on
+                # is pinned by
+                # test_the_signature_is_persisted_before_the_jito_call.
                 row["resolution"] = {
-                    "verdict": "unresolved",
-                    "detail": "ledger row carries no expected signature",
+                    "verdict": "definitively_not_submitted",
+                    "detail": "row carries no signature, so signing never "
+                    "completed and submission was never reachable",
+                    "expiry_source": "never_signed",
                 }
-                row["blocking"] = True
-                blockers += 1
+                row["blocking"] = False
+                if auto_retire:
+                    await retire_row(self._db, row["live_trade_id"])
+                    row["auto_retired"] = True
+                    log.info(
+                        "solana_pilot_unsigned_row_retired",
+                        live_trade_id=row["live_trade_id"],
+                    )
+                else:
+                    row["auto_retired"] = False
                 continue
 
             intent = read_persisted_intent(
@@ -1403,8 +1575,8 @@ class PilotRunner:
             kill = await self._check_kill_switch("kill_switch_check")
             evidence.record("kill_switch_check", **kill)
 
-            keypair, custody = self._custody_check()
-            signer_pubkey = custody["signer_pubkey"]
+            custody = self._custody_precheck()
+            signer_pubkey = custody["declared_signer_pubkey"]
             evidence.record("keypair_custody", **custody)
 
             reconciliation = await self._reconcile_open_rows(auto_retire=True)
@@ -1489,28 +1661,11 @@ class PilotRunner:
                     "a failure.",
                 )
 
-            # Step 11 — LOCAL SIGNING. Nothing leaves the process here; this
-            # exists to derive the signature the operator is about to
-            # authorize. See the module docstring on the ordering.
-            signed = sign_transaction(
-                build.swap_transaction_b64, keypair, expected_signer=signer_pubkey
-            )
-            evidence.record(
-                "signed_in_memory",
-                expected_signature=signed.signature,
-                message_sha256=signed.message_sha256,
-                signer_pubkey=signed.signer_pubkey,
-                note="signed locally and held in memory; nothing has been sent",
-            )
-            if signed.message_sha256 != report.message_sha256:
-                # The bytes that were inspected must be the bytes that were
-                # signed. A divergence means the report on the approval screen
-                # describes a different transaction than the signature does.
-                raise PilotAbort(
-                    "signed_in_memory",
-                    f"signed message digest {signed.message_sha256} does not "
-                    f"match the inspected digest {report.message_sha256}",
-                )
+            # The identity the operator is about to authorize. It is the
+            # sha256 of the exact bytes the key will sign, taken from the
+            # UNSIGNED transaction — no key is involved in computing it, which
+            # is what lets the approval come first.
+            message_sha256 = report.message_sha256
 
             sol_price = None
             out_usd = usdc_from_raw(quote.out_amount) or Decimal("0")
@@ -1521,25 +1676,31 @@ class PilotRunner:
                 live_trade_id = await record_solana_intent(
                     self._db,
                     decision_id=decision_id,
-                    expected_signature=signed.signature,
                     paper_trade_id=await ensure_pilot_anchor(self._db),
                     size_usd=_fmt(out_usd) or "0",
                     sol_price_usdc=_fmt(sol_price),
                 )
-                # This record is the durable home of lastValidBlockHeight (see
-                # the module docstring). It is fsynced before the approval
-                # prompt, so a crash at the prompt still leaves the signature
-                # resolvable on the next run.
+                # The durable record of WHAT IS BEING AUTHORIZED, fsynced
+                # before the prompt. It carries the message hash and
+                # lastValidBlockHeight but no signature — none exists yet, and
+                # none will unless the operator authorizes. The row's
+                # entry_order_id stays NULL until then, which is exactly what
+                # makes "provably never submitted" readable off the ledger.
                 evidence.record(
                     _INTENT_STEP,
                     live_trade_id=live_trade_id,
                     decision_id=decision_id,
-                    expected_signature=signed.signature,
+                    message_sha256=message_sha256,
                     last_valid_block_height=build.last_valid_block_height,
+                    amount_lamports=amount_lamports,
+                    min_out_amount_raw=quote.min_out_amount,
+                    slippage_bps=quote.slippage_bps,
+                    total_fee_lamports=report.total_fee_lamports,
                     status="open",
+                    entry_order_id=None,
                     note="written BEFORE the approval prompt; the signature is "
-                    "the idempotency key and must be durable before anything "
-                    "can be submitted",
+                    "added only after the operator authorizes, and submission "
+                    "cannot happen until that write is confirmed",
                 )
             else:
                 evidence.record(
@@ -1547,13 +1708,14 @@ class PilotRunner:
                     reason="--simulate-only rehearsal never submits, so no ledger "
                     "row is written (a row would be a phantom that blocks the "
                     "next run's startup reconciliation)",
-                    would_be_expected_signature=signed.signature,
+                    message_sha256=message_sha256,
                     would_be_last_valid_block_height=build.last_valid_block_height,
                 )
 
             authorized, outcome = await self._request_authorization(
                 decision_id=decision_id,
-                signed=signed,
+                message_sha256=message_sha256,
+                signer_pubkey=signer_pubkey,
                 quote=quote,
                 build=build,
                 report=report,
@@ -1566,7 +1728,8 @@ class PilotRunner:
                 outcome="authorized" if authorized else "authorization_refused",
                 detail=outcome,
                 expected_prefix_len=8,
-                bound_to_signature=signed.signature,
+                bound_to_message_sha256=message_sha256,
+                funded_signer_loaded=False,
             )
             if not authorized:
                 await retire_row(self._db, live_trade_id)
@@ -1575,31 +1738,37 @@ class PilotRunner:
                         "intent_retired",
                         live_trade_id=live_trade_id,
                         ledger_status="rejected",
-                        note="authorization refused before submission — the row "
-                        "asserted a transaction that was never sent",
+                        note="authorization refused — no signature was ever "
+                        "derived and the funded key was never read",
                     )
                 raise PilotAbort(
                     "authorization",
-                    f"operator did not authorize ({outcome}) — nothing was sent",
+                    f"operator did not authorize ({outcome}) — nothing was "
+                    "signed and nothing was sent",
                 )
 
             if simulate_only:
+                # The rehearsal ends HERE, before the funded key is read. A
+                # signed transaction is an irreversible capability, and a
+                # rehearsal has no business creating one.
                 evidence.record(
                     "rehearsal_complete",
-                    would_be_expected_signature=signed.signature,
+                    message_sha256=message_sha256,
                     simulation_ok=sim.ok,
                     units_consumed=sim.units_consumed,
-                    note="--simulate-only: the submission step is skipped "
-                    "entirely; no transaction was sent and no ledger row exists",
+                    funded_signer_loaded=False,
+                    note="--simulate-only: the funded key was never read and "
+                    "nothing was signed, so no transaction exists to submit",
                 )
                 _print_block(
-                    "REHEARSAL COMPLETE — nothing was submitted",
+                    "REHEARSAL COMPLETE — nothing was signed, nothing was sent",
                     [
-                        f"  decision ID        : {decision_id}",
-                        f"  would-be signature : {signed.signature}",
-                        f"  simulation         : ok, "
+                        f"  decision ID    : {decision_id}",
+                        f"  message sha256 : {message_sha256}",
+                        f"  simulation     : ok, "
                         f"{sim.units_consumed} compute units",
-                        f"  evidence           : {evidence.path}",
+                        "  funded key     : NOT read (a rehearsal never signs)",
+                        f"  evidence       : {evidence.path}",
                     ],
                 )
                 return EXIT_OK
@@ -1638,21 +1807,78 @@ class PilotRunner:
                     "stale before submission",
                 )
                 _print_block(
-                    "AUTHORIZATION INVALIDATED — nothing was sent",
+                    "AUTHORIZATION INVALIDATED — nothing was signed or sent",
                     [
                         f"  {freshness['detail']}",
                         "",
-                        "  The quote, the transaction and the signature you",
-                        "  authorized are all stale. Nothing was submitted and the",
-                        "  ledger row is rejected.",
+                        "  The quote and the transaction you authorized are stale.",
+                        "  The funded key was never read, nothing was signed and",
+                        "  nothing was submitted. The ledger row is rejected.",
                         "",
                         "  Rerun the command. The next run does the whole loop",
-                        "  again: a NEW quote, a NEW signature, and a NEW",
-                        "  authorization bound to that new signature.",
+                        "  again: a NEW quote, a NEW message hash, and a NEW",
+                        "  authorization bound to that new hash.",
                         f"  evidence: {evidence.path}",
                     ],
                 )
                 return EXIT_REFUSED
+
+            # ---------------------------------------------------------------
+            # THE FUNDED KEY IS READ HERE, AND NOWHERE EARLIER.
+            #
+            # Everything above this line runs without the private key: Jupiter
+            # built for the declared pubkey, the inspector checked the fee
+            # payer against it, the simulation ran on unsigned bytes, and the
+            # operator authorized a message hash. A refusal at any of those
+            # gates leaves the key file unopened.
+            # ---------------------------------------------------------------
+            keypair = self._load_funded_signer(expected=signer_pubkey)
+            evidence.record(
+                "funded_signer_loaded",
+                signer_pubkey=signer_pubkey,
+                after_authorization=True,
+                note="read at call time, used once, dropped; never cached",
+            )
+
+            signed = sign_transaction(
+                build.swap_transaction_b64, keypair, expected_signer=signer_pubkey
+            )
+            if signed.message_sha256 != message_sha256:
+                # The bytes that were AUTHORIZED must be the bytes that were
+                # signed. This is the authorization's binding made checkable:
+                # the operator typed a prefix of `message_sha256`, and anything
+                # that changed the message since then invalidates it.
+                raise PilotAbort(
+                    "signed_in_memory",
+                    f"signed message digest {signed.message_sha256} does not "
+                    f"match the AUTHORIZED digest {message_sha256} — the "
+                    "transaction changed after approval and will not be sent",
+                )
+            evidence.record(
+                "signed_in_memory",
+                expected_signature=signed.signature,
+                message_sha256=signed.message_sha256,
+                signer_pubkey=signed.signer_pubkey,
+                matches_authorized_hash=True,
+                note="signed AFTER authorization; still nothing has been sent",
+            )
+
+            # The signature must be durable before the POST, or a crash
+            # immediately after submission leaves a transaction nobody can
+            # resolve. `persist_expected_signature` reads it back, so this
+            # returning is proof the idempotency key is on disk.
+            if live_trade_id is not None:
+                stored = await persist_expected_signature(
+                    self._db, live_trade_id, signed.signature
+                )
+                evidence.record(
+                    "signature_persisted",
+                    live_trade_id=live_trade_id,
+                    expected_signature=stored,
+                    confirmed_by_read_back=True,
+                    note="durable before the block engine is called; a crash "
+                    "after this point leaves a resolvable row",
+                )
 
             return await self._submit_and_resolve(
                 evidence=evidence,
@@ -1760,7 +1986,8 @@ class PilotRunner:
         self,
         *,
         decision_id: str,
-        signed: SignedTransaction,
+        message_sha256: str,
+        signer_pubkey: str,
         quote: SolanaQuote,
         build: SwapBuild,
         report: VerificationReport,
@@ -1768,13 +1995,18 @@ class PilotRunner:
         sim: Any,
         simulate_only: bool,
     ) -> tuple[bool, str]:
-        """Step 13 — print the decision block and require the typed prefix.
+        """Step 11 — print the decision block and require the typed prefix.
 
-        The phrase is the first 8 characters of the EXPECTED TRANSACTION
-        SIGNATURE, not of the decision id. That is what binds the
-        authorization to one exact transaction: any rebuild produces different
-        bytes, therefore a different signature, therefore a different phrase,
-        so an authorization can never be carried across a rebuild.
+        The phrase is the first 8 characters of the TRANSACTION MESSAGE HASH:
+        the sha256 of the exact bytes the key will sign, computed from the
+        UNSIGNED transaction. No signature exists at this point and none may —
+        the funded key is not read until this returns True.
+
+        The hash binds the authorization every bit as tightly as a signature
+        would. Amount, route, slippage, fees, blockhash, instruction list: all
+        of them are IN the message, so changing any one changes the hash and
+        the operator's phrase stops matching. What it does not do is create a
+        broadcastable artifact before anyone has approved one.
 
         Every figure here is a value read this run. The numeric lines use
         ASCII operators (``->``) rather than typographic ones: this block is
@@ -1813,18 +2045,19 @@ class PilotRunner:
             f"  blockhash age       : {age}",
             f"  simulation          : err={sim.err}, "
             f"{sim.units_consumed} compute units consumed",
-            f"  signer              : {signed.signer_pubkey}",
+            f"  signer              : {signer_pubkey}",
             f"  current SOL         : {balance['sol_balance']} SOL",
             f"  current USDC        : {balance['usdc_balance']} USDC",
-            f"  message sha256      : {signed.message_sha256}",
-            f"  EXPECTED SIGNATURE  : {signed.signature}",
+            f"  MESSAGE SHA256      : {message_sha256}",
             f"  database            : {Path(self._settings.DB_PATH).resolve()}",
             f"  decision ID         : {decision_id}",
+            "  signing status      : NOT SIGNED - the funded key is read only "
+            "after you authorize",
         ]
         if simulate_only:
             lines.append(
-                "  ** REHEARSAL        : --simulate-only — the submission step "
-                "is skipped entirely and NOTHING is sent"
+                "  ** REHEARSAL        : --simulate-only — the funded key is "
+                "never read, nothing is signed and nothing is sent"
             )
             if not resolver_endpoint(self._settings)[1]:
                 lines.append(
@@ -1833,11 +2066,11 @@ class PilotRunner:
                 )
         _print_block("SOLANA SUPERVISED PILOT — MANUAL APPROVAL REQUIRED", lines)
         print(
-            "Type the first 8 characters of the EXPECTED SIGNATURE to authorize. "
+            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
             "Anything else — including an empty line or a closed stdin — aborts. "
-            "The phrase is case-sensitive."
+            "The phrase is lowercase hex and is matched exactly."
         )
-        return read_authorization(signed.signature[:8])
+        return read_authorization(message_sha256[:8])
 
     async def _blockhash_age(self, build: SwapBuild) -> str:
         """One display line: how many blocks of life the build has left.

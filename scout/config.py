@@ -1427,6 +1427,19 @@ class Settings(BaseSettings):
     # never in argv. scout.live.solana.signer refuses the file unless its mode
     # is 0600 and its owner is the current uid.
     SOLANA_PILOT_KEYPAIR_PATH: str = ""
+    # The wallet the pilot trades from, declared as a PUBLIC key.
+    #
+    # Everything before the approval prompt needs this — Jupiter builds for it,
+    # tx_inspector checks the fee payer against it, the balance gate reads it —
+    # and none of that may open the funded key file, because the funded key
+    # must not be touched until the operator has authorized. A public key is
+    # public, so declaring it in config costs nothing and buys the ordering.
+    #
+    # It is also a second lock: at signing time the loaded keypair must equal
+    # this value or `signer.sign_transaction` refuses, so a swapped or
+    # mistakenly-pointed key file cannot sign a transaction built for another
+    # wallet.
+    SOLANA_PILOT_SIGNER_PUBKEY: str = ""
     # Jupiter Swap API. Overridable so tests / a staging proxy can retarget it.
     JUPITER_API_BASE: str = "https://api.jup.ag/swap/v1"
     # Optional. Jupiter serves a keyless tier at 0.5 req/sec; a free portal key
