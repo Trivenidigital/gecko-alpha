@@ -474,3 +474,84 @@ class TestBackwardCompatibility:
             assert candidates[0].asset_class == "spot"
         finally:
             await db.close()
+
+
+class TestTheDelistingFilterHasNoWriter:
+    """*** A SAFETY FILTER THAT MATCHES NO ROWS IS NOT PROVIDING SAFETY. ***
+
+    `_LISTINGS_SQL` excludes `delisted_at IS NOT NULL`, and `venue_listings`
+    declares the column — but nothing in the repository ever writes it, while
+    `RoutingLayer`'s module docstring advertises a "delisting fallback:
+    re-evaluates on adapter reject with 'delisted'".
+
+    So the clause excludes nothing today. That is recorded here as an assertion
+    rather than left as a comment, so the day a writer appears this test fails and
+    someone has to decide deliberately whether the fallback is now real.
+    """
+
+    def test_nothing_in_the_repository_writes_delisted_at(self):
+        """Scans SQL STRING LITERALS via the AST, not raw file text.
+
+        The first draft used a file-wide regex with `[^;]*` between the verb and
+        the column. Python has no statement semicolons, so that span swallowed the
+        whole file — and the first thing it matched was the explanatory COMMENT in
+        `routing.py` describing this very gap. A prose mention of a column is not a
+        write to it; only a literal that is itself SQL can be.
+        """
+        import ast
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[2]
+        # Applied per string literal, where a statement really is one statement.
+        writer = re.compile(
+            r"UPDATE\s+venue_listings\b.*\bdelisted_at\s*="
+            r"|INSERT\b.*\bvenue_listings\s*\([^)]*\bdelisted_at\b",
+            re.IGNORECASE | re.DOTALL,
+        )
+        offenders = []
+        sources = list(root.glob("scout/**/*.py")) + list(root.glob("scripts/**/*.py"))
+        for path in sources:
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                tree = ast.parse(path.read_text("utf-8", errors="ignore"))
+            except SyntaxError:
+                continue
+            literals = [
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            ]
+            # A docstring is a string literal too, so require the literal to look
+            # like a statement rather than merely to contain the words.
+            if any(writer.search(lit) for lit in literals):
+                offenders.append(str(path.relative_to(root)))
+        assert offenders == [], (
+            f"{offenders} now write venue_listings.delisted_at. The delisting "
+            "filter in _LISTINGS_SQL has become live — re-read the UPSERT in "
+            "_on_demand_listings_fetch, which deliberately PRESERVES delisted_at "
+            "and therefore now needs a way for a re-listed venue to be cleared."
+        )
+
+    async def test_a_delisted_listing_is_excluded_when_one_exists(self, tmp_path):
+        """The predicate itself is correct — it is only the writer that is
+        missing. Asserted by writing the column by hand, which is the one place
+        in the tree that does."""
+        db = await _db_with_listings(tmp_path, [])
+        await db._conn.execute(
+            "INSERT INTO venue_listings (venue, canonical, venue_pair, quote, "
+            "asset_class, refreshed_at, delisted_at) VALUES ('binance','SYM',"
+            "'SYMUSDT','USDT','spot','2026-06-01T00:00:00Z','2026-07-01T00:00:00Z')"
+        )
+        await db._conn.commit()
+        try:
+            candidates = await _routing(db, {}).get_candidates(
+                canonical="SYM",
+                chain_hint=None,
+                signal_type="first_signal",
+                size_usd=100.0,
+            )
+            assert candidates == []
+        finally:
+            await db.close()

@@ -34,6 +34,20 @@ log = structlog.get_logger(__name__)
 # columns into a 4-tuple unpack, so the FIRST-EVER signal on any token raised
 # ValueError out of routing, past `_dispatch_live`'s NoRoutableVenue handler, and
 # produced no reject row and no log. A constant makes that divergence unstateable.
+#
+# *** `delisted_at IS NULL` FILTERS ON A COLUMN NOTHING EVER WRITES. ***
+# Verified 2026-08-02: `delisted_at` is declared in `venue_listings` (db.py) and
+# READ here, and there is no writer anywhere in the repository — not in scout/,
+# not in scripts/, not in any migration. The module docstring below still
+# advertises a "delisting fallback: re-evaluates on adapter reject with
+# 'delisted'"; that fallback does not exist.
+#
+# So this clause currently excludes nothing, and the protection it appears to
+# provide is not being provided. It is left in place because it is the correct
+# predicate the moment a writer exists, and because removing it would make the
+# gap harder to find, not easier. Recorded rather than quietly relied upon:
+# a filter that reads as a safety check and matches no rows is the shape that
+# gets trusted in an incident.
 _LISTINGS_SQL = (
     "SELECT venue, venue_pair, asset_class, quote FROM venue_listings "
     "WHERE canonical = ? AND delisted_at IS NULL"
