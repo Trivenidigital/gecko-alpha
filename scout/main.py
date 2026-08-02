@@ -2302,12 +2302,34 @@ async def main(argv: list[str] | None = None) -> int:
         if getattr(settings, "LIVE_USE_ROUTING_LAYER", False):
             from scout.live.routing import RoutingLayer
 
+            # The 0x AllowanceHolder adapter is registered so its DECLARED
+            # capabilities are reachable through the provider-neutral router
+            # rather than only from its own tests. It cannot be selected for a
+            # swap by the signal-driven path: `_dispatch_live` builds
+            # `venue_family="cex"` intents and `permits_order` refuses a `dex`
+            # descriptor on family alone — so registration exposes the capability
+            # without creating a route to it. Execution beyond capability
+            # reporting additionally requires the mandate (inactive) and a funded
+            # EVM signer (absent).
+            from scout.live.evm.adapter import ZeroExAllowanceHolderAdapter
+
+            zeroex_adapter = ZeroExAllowanceHolderAdapter(chain_id=1)
             live_routing = RoutingLayer(
                 db=db,
                 settings=settings,
-                adapters={"binance": live_adapter},
+                adapters={
+                    "binance": live_adapter,
+                    zeroex_adapter.venue_name: zeroex_adapter,
+                },
             )
-            logger.info("routing_layer_constructed", venues=["binance"])
+            zeroex_caps = zeroex_adapter.describe_capabilities()
+            logger.info(
+                "routing_layer_constructed",
+                venues=["binance", zeroex_adapter.venue_name],
+                zeroex_family=zeroex_caps.venue_family,
+                zeroex_unsigned_tx=zeroex_caps.supports_unsigned_transaction,
+                zeroex_money_movement=zeroex_caps.grants_money_movement(),
+            )
 
         # Cross-venue execution mandate. Constructed unconditionally and reported at
         # boot: an operator needs to see "the autonomy gate is CLOSED" in the log,

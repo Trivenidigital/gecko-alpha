@@ -555,3 +555,63 @@ class TestTheDelistingFilterHasNoWriter:
             assert candidates == []
         finally:
             await db.close()
+
+
+class TestZeroExAdapterThroughTheRealRouter:
+    """*** THE CAPABILITY MUST BE REACHABLE THROUGH THE ROUTER, NOT ONLY ITS
+    OWN TESTS. ***
+
+    An adapter with zero production importers is an adapter the system does not
+    have. These drive the REAL `RoutingLayer.select_route` against the 0x
+    adapter, and assert both that a dex intent reaches it and that the
+    signal-driven cex path cannot.
+    """
+
+    def _zeroex(self):
+        from scout.live.evm.adapter import ZeroExAllowanceHolderAdapter
+
+        return ZeroExAllowanceHolderAdapter(chain_id=1)
+
+    async def test_a_dex_intent_routes_to_the_zeroex_adapter(self, tmp_path):
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            routed = await _select(
+                _routing(db, {adapter.venue_name: adapter}), venue_family="dex"
+            )
+            assert routed.adapter is adapter
+            assert routed.capabilities.supports_unsigned_transaction is True
+        finally:
+            await db.close()
+
+    async def test_the_signal_driven_cex_path_cannot_select_it(self, tmp_path):
+        """`_dispatch_live` builds `venue_family="cex"` intents, so the family
+        gate alone keeps a DEX descriptor off the autonomous path. Registration
+        exposes the capability without creating a route to it."""
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            with pytest.raises(NoRoutableVenue) as exc:
+                await _select(
+                    _routing(db, {adapter.venue_name: adapter}), venue_family="cex"
+                )
+            assert "intent requires cex" in exc.value.rejections[0][1]
+        finally:
+            await db.close()
+
+    async def test_it_declares_no_money_movement_through_the_router(self, tmp_path):
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            routed = await _select(
+                _routing(db, {adapter.venue_name: adapter}), venue_family="dex"
+            )
+            assert routed.capabilities.grants_money_movement() is False
+        finally:
+            await db.close()
