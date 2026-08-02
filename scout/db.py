@@ -9939,7 +9939,30 @@ class Database:
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration)
             raise
         finally:
-            # Restore enforcement on every exit path. Leaving it OFF would silently
-            # disable foreign keys for the entire process lifetime — every writer
-            # after this point, not just the migration.
+            # Restore enforcement on every exit path — including the early return
+            # on the already-applied marker, which `finally` covers.
+            #
+            # *** AND VERIFY IT, BECAUSE THE PRAGMA CAN SILENTLY NO-OP. ***
+            # `PRAGMA foreign_keys` does nothing while a transaction is open. The
+            # normal and error paths both leave one — commit, or ROLLBACK — but
+            # ROLLBACK is itself wrapped in a try/except above (a failing rollback
+            # must not mask the original error). If that except fires, the
+            # connection is still in a transaction, this PRAGMA quietly does
+            # nothing, and foreign keys stay OFF for every writer in the process
+            # for the rest of its life. That is a strictly worse failure than the
+            # severed-links defect this OFF exists to avoid, so it is checked
+            # rather than assumed.
             await conn.execute("PRAGMA foreign_keys=ON")
+            _cur = await conn.execute("PRAGMA foreign_keys")
+            _fk = await _cur.fetchone()
+            if not (_fk and _fk[0]):
+                _log.error(
+                    "FOREIGN_KEYS_LEFT_DISABLED",
+                    migration=migration,
+                    detail=(
+                        "PRAGMA foreign_keys=ON did not take effect, which means a "
+                        "transaction is still open on this connection. Every "
+                        "subsequent write in this process runs unenforced. Restart "
+                        "the service to get a clean connection."
+                    ),
+                )
