@@ -187,6 +187,7 @@ from scout.live.kraken_signing import (
     key_fingerprint,
     sign_kraken_request,
 )
+from scout.live.capabilities import VenueCapabilities
 from scout.live.types import Depth, DepthLevel
 
 log = structlog.get_logger(__name__)
@@ -869,6 +870,27 @@ class KrakenSpotAdapter(ExchangeAdapter):
     # ------------------------------------------------------------------
     # Market rules / resolution
     # ------------------------------------------------------------------
+    def describe_capabilities(self) -> VenueCapabilities:
+        """Declared strictly from what this adapter implements, not from what
+        Kraken's API offers.
+
+        ``send_order`` / ``place_order_request`` / ``place_exit_order`` all raise
+        (module docstring item 8); ``place_limit_order`` is the only method that
+        reaches ``AddOrder``. So market orders and reduce-only exits are NOT
+        declared — routing must not hand this venue an intent it structurally
+        cannot fill. Withdrawal is refused in code via
+        ``KrakenWithdrawalCapabilityError``, and the descriptor agrees.
+        """
+        return VenueCapabilities(
+            venue="kraken",
+            supports_limit_orders=True,
+            supports_cancel=True,
+            supports_client_order_id=True,
+            supports_partial_fills=True,
+            # `validate=true` on AddOrder is an order-validation echo, not a
+            # market simulation — deliberately not declared as simulation.
+        )
+
     async def fetch_exchange_info_row(self, pair: str) -> dict | None:
         """Return the raw ``AssetPairs`` row for ``pair``, or ``None``.
 

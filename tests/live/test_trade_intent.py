@@ -192,11 +192,15 @@ class TestIdentityBinding:
         i = _intent()
         assert i.intent_id.endswith(i.intent_hash[:16])
 
-    def test_client_order_id_is_stable_and_venue_safe(self):
+    def test_client_order_id_is_kraken_short_uuid_form(self):
+        """Kraken accepts a dashed UUID, 32 hex chars, or <=18 ASCII free text
+        (kraken_adapter.py:90-97). Only the 32-hex form satisfies Kraken and
+        Binance at once while staying derived from the hash. A prefixed id like
+        "gecko<hex>" is neither hex nor <=18 and gets rejected locally."""
         i = _intent()
         assert i.client_order_id == _intent().client_order_id
-        assert len(i.client_order_id) <= 32
-        assert i.client_order_id.replace("-", "").isalnum()
+        assert len(i.client_order_id) == 32
+        assert all(c in "0123456789abcdef" for c in i.client_order_id)
 
     def test_differing_intents_get_differing_client_order_ids(self):
         assert (

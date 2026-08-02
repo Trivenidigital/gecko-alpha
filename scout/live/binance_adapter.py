@@ -29,6 +29,7 @@ from scout.live.adapter_base import (
     VenueMetadata,
 )
 from scout.live.exceptions import RateLimitError, VenueTransientError
+from scout.live.capabilities import VenueCapabilities
 from scout.live.types import Depth, DepthLevel
 
 log = structlog.get_logger(__name__)
@@ -351,6 +352,23 @@ class BinanceSpotAdapter(ExchangeAdapter):
     # ------------------------------------------------------------------
     # Public API (ExchangeAdapter)
     # ------------------------------------------------------------------
+    def describe_capabilities(self) -> VenueCapabilities:
+        """Binance is the v1 live implementation and overrides both
+        ``place_exit_order`` and ``fetch_order_by_client_id`` (adapter_base
+        comment), so a held-size-bounded exit is supported here.
+
+        Spot has no venue-side reduceOnly flag — the bound is enforced host-side
+        against the held position. Declared true because the *capability* exists
+        end to end, not because Binance carries a flag.
+        """
+        return VenueCapabilities(
+            venue="binance",
+            supports_market_orders=True,
+            supports_reduce_only=True,
+            supports_client_order_id=True,
+            supports_partial_fills=True,
+        )
+
     async def fetch_exchange_info_row(self, pair: str) -> dict | None:
         """Fetch the single-symbol exchangeInfo row.
 

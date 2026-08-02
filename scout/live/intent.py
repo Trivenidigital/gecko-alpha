@@ -158,9 +158,13 @@ class TradeIntent:
         ).hexdigest()
         object.__setattr__(self, "intent_hash", digest)
         object.__setattr__(self, "intent_id", f"gi-{digest[:16]}")
-        # Kraken caps userref/clordid well below 32; Binance allows 36. 26 chars
-        # keeps one format valid everywhere and leaves the prefix human-greppable.
-        object.__setattr__(self, "client_order_id", f"gecko{digest[:21]}")
+        # Kraken's cl_ord_id accepts exactly three forms (kraken_adapter.py:90-97):
+        # a dashed UUID, 32 hex characters with no dashes, or free text of at most
+        # 18 ASCII characters. Binance allows 36. The 32-hex form is the only one
+        # that satisfies both venues AND stays derived from the hash, so a prefixed
+        # id like "gecko<hex>" is not an option — it is neither hex nor <=18 and
+        # `_validate_cl_ord_id` rejects it locally before any HTTP.
+        object.__setattr__(self, "client_order_id", digest[:32])
 
     # ------------------------------------------------------------------
     def canonical_form(self) -> dict[str, Any]:
