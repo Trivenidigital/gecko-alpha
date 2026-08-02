@@ -221,6 +221,13 @@ class Database:
         # exist before any money does, so they cannot live on a money row.
         await self._migrate_solana_executions_v1()
 
+        # Venue-neutral execution binding. schema_version 20260802.
+        # Adds live_trades.intent_hash + live_trades.mandate_mode and widens the
+        # reject_reason CHECK with the three refusals the mandate + capability gate
+        # can produce. MUST run after `_migrate_reject_reason_extend_v2` so it
+        # operates on the already-widened CHECK and preserves every value.
+        await self._migrate_venue_neutral_execution_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -3086,7 +3093,9 @@ class Database:
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
                     'master_kill','mode_paper',
-                    'live_signed_disabled','api_key_lacks_trade_scope'
+                    'live_signed_disabled','api_key_lacks_trade_scope',
+                    'mandate_inactive','venue_capability_refused',
+                    'no_adapter_for_venue'
                 )),
                 exit_walked_vwap    TEXT,
                 realized_pnl_usd    TEXT,
@@ -3126,7 +3135,9 @@ class Database:
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
                     'master_kill','mode_paper',
-                    'live_signed_disabled','api_key_lacks_trade_scope'
+                    'live_signed_disabled','api_key_lacks_trade_scope',
+                    'mandate_inactive','venue_capability_refused',
+                    'no_adapter_for_venue'
                 )),
                 exit_order_id       TEXT,
                 exit_fill_price     TEXT,
@@ -3134,7 +3145,13 @@ class Database:
                 realized_pnl_pct    TEXT,
                 kill_event_id       INTEGER REFERENCES kill_events(id),
                 created_at          TEXT NOT NULL,
-                closed_at           TEXT
+                closed_at           TEXT,
+                -- Venue-neutral execution binding (2026-08-02). Both nullable with
+                -- no DEFAULT: NULL means "written before intents were bound", which
+                -- is what makes the mandate's supervised-history count start at zero
+                -- instead of inheriting history that was never mandate-gated.
+                intent_hash         TEXT,
+                mandate_mode        TEXT
             )
             """,
             # 3. kill_events — append-only audit log of daily-loss-cap trips etc.
@@ -9565,3 +9582,502 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Venue-neutral execution binding (2026-08-02)
+    # ------------------------------------------------------------------
+    async def _migrate_venue_neutral_execution_v1(self) -> None:
+        """Venue-neutral execution binding: intent hash, mandate mode, refusals.
+
+        Three changes, all on ``live_trades`` (plus the CHECK on ``shadow_trades``,
+        which shares the constraint):
+
+        1. ``intent_hash TEXT`` — the SHA-256 that binds a submission to its TERMS.
+           ``client_order_id`` already gave a submission an identity; this is what
+           makes that identity mean "these exact terms" rather than "some submission".
+        2. ``mandate_mode TEXT`` — which execution mandate authorized the row.
+           ``ExecutionMandate`` counts supervised CEX history from this column, so a
+           NULL is load-bearing: every row that predates the mandate correctly counts
+           for NOTHING toward autonomous promotion. Backfilling it would hand the
+           promotion bar a history that was never mandate-gated, which is the exact
+           claim the count exists to refuse.
+        3. Widen the ``reject_reason`` CHECK with the three refusals the new gates
+           produce: ``mandate_inactive``, ``venue_capability_refused``,
+           ``no_adapter_for_venue``. Without this the engine's rejection INSERT would
+           raise IntegrityError and the refusal would be invisible — a fail-closed
+           gate whose audit trail fails open.
+
+        Both columns are nullable with NO DEFAULT, preserving absence-vs-value
+        semantics (the project-wide convention). The CHECK widening uses the
+        established rename-rebuild pattern from ``_migrate_reject_reason_extend_v2``,
+        including the ``cross_venue_exposure`` / ``cross_venue_pnl`` view
+        drop-and-recreate, because SQLite cannot ALTER a CHECK in place.
+
+        Idempotent on the ``paper_migrations`` marker AND on per-object inspection,
+        so a partially-applied run (crash between the rebuild and the marker) is safe
+        to re-run.
+
+        Migration ``bl_venue_neutral_execution_v1``, schema_version 20260802.
+        """
+        import re as _re
+
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        migration = "bl_venue_neutral_execution_v1"
+        new_reasons = (
+            "mandate_inactive",
+            "venue_capability_refused",
+            "no_adapter_for_venue",
+        )
+
+        # *** PRAGMA foreign_keys MUST BE SET BEFORE `BEGIN`. ***
+        # SQLite documents it as a no-op inside a transaction, so setting it after
+        # BEGIN would silently leave enforcement ON and the defect below live.
+        #
+        # WHY IT HAS TO BE OFF AT ALL: `DROP TABLE live_trades` performs an implicit
+        # DELETE of every row, which FIRES child foreign-key ACTIONS.
+        # `solana_executions.live_trade_id` is declared
+        # `REFERENCES live_trades(id) ON DELETE SET NULL` — so a rebuild with
+        # enforcement on permanently NULLs every Solana execution's link to its
+        # ledger row. Nothing detects it: `PRAGMA foreign_key_check` stays clean
+        # because SET NULL is a legal outcome, not a violation. The runtime cost is
+        # concrete — `_recover_interrupted_executions` calls `retire_row(...
+        # live_trade_id)`, which returns early on None, so an interrupted execution
+        # strands its `live_trades` row `open` forever, counting against the lane's
+        # exposure and concurrency caps.
+        #
+        # This is NEW to this migration and not a latent flaw in the pattern it
+        # copies: `_migrate_reject_reason_extend_v2` (20260514) predates
+        # `solana_executions` (20260801), so this is the first live_trades rebuild
+        # that has an FK child at all.
+        #
+        # This is SQLite's own documented 12-step ALTER TABLE procedure: disable
+        # enforcement, rebuild, verify with foreign_key_check, commit, re-enable.
+        await conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)""")
+
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration,)
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            # ---- Part 1: widen the reject_reason CHECK -------------------
+            new_check = (
+                "CHECK (reject_reason IS NULL OR reject_reason IN ("
+                "'no_venue','insufficient_depth','slippage_exceeds_cap',"
+                "'insufficient_balance','daily_cap_hit','kill_switch',"
+                "'exposure_cap','override_disabled','venue_unavailable',"
+                "'notional_cap_exceeded','signal_disabled','token_aggregate',"
+                "'dual_signal_aggregate','all_candidates_failed',"
+                "'master_kill','mode_paper',"
+                "'live_signed_disabled','api_key_lacks_trade_scope',"
+                "'mandate_inactive','venue_capability_refused',"
+                "'no_adapter_for_venue'))"
+            )
+            # Hoisted above the loop because Part 3's post-condition uses it to
+            # isolate the CHECK clause. Bound inside the loop body it would be
+            # UNBOUND whenever every table was already widened — the common
+            # fresh-install path, where each iteration `continue`s before reaching
+            # the assignment. A NameError there would turn the safest case into
+            # the only one that crashes.
+            pattern = _re.compile(
+                r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                _re.IGNORECASE | _re.DOTALL,
+            )
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue
+                table_sql = row[0] or ""
+                if all(reason in table_sql for reason in new_reasons):
+                    continue  # already widened
+
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = await cur.fetchall()
+                if not cols:
+                    continue
+                col_list = ", ".join(c[1] for c in cols)
+
+                new_table_sql = pattern.sub(
+                    f"reject_reason       TEXT {new_check}", table_sql
+                )
+                if new_table_sql == table_sql:
+                    _log.warning(
+                        "venue_neutral_reject_reason_pattern_miss",
+                        table=table,
+                        sql_excerpt=table_sql[:200],
+                    )
+                    continue
+
+                # Prod's sqlite_master.sql may carry the table name QUOTED after an
+                # earlier rebuild; the pattern covers quoted, unquoted and
+                # IF NOT EXISTS forms (hotfix lesson from the v2 migration).
+                name_pattern = (
+                    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                    r'["\x60]?' + table + r'["\x60]?\s*\('
+                )
+                new_table_sql_renamed = _re.sub(
+                    name_pattern,
+                    f"TABLE {table}_new (",
+                    new_table_sql,
+                    count=1,
+                    flags=_re.IGNORECASE,
+                )
+                if new_table_sql_renamed == new_table_sql:
+                    _log.warning(
+                        "venue_neutral_reject_reason_rename_miss",
+                        table=table,
+                        sql_excerpt=new_table_sql[:200],
+                    )
+                    continue
+
+                # *** CAPTURE EVERY INDEX, DO NOT ENUMERATE THEM. ***
+                # DROP TABLE takes the table's indexes with it. An enumerated
+                # recreate list is a list that goes stale the moment someone adds
+                # an index in another migration — and it goes stale SILENTLY: the
+                # rebuild still succeeds, the index is simply gone. Reading the
+                # CREATE statements out of sqlite_master and replaying them cannot
+                # drift. (`sql IS NULL` for auto-indexes backing UNIQUE/PK
+                # constraints; those come back with the table definition itself.)
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                    (table,),
+                )
+                index_ddl = [r[0] for r in await cur.fetchall()]
+
+                # AUTOINCREMENT's contract is that an id is never reused. The
+                # rebuild resets `sqlite_sequence`, so ids above the surviving
+                # max(id) become allocatable again — and live_trade ids are quoted
+                # in evidence files, Telegram messages and Solana execution rows,
+                # where a reused id names a different trade.
+                cur = await conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+                )
+                seq_row = await cur.fetchone()
+                prior_seq = seq_row[0] if seq_row is not None else None
+
+                if table == "live_trades":
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+
+                await conn.execute(new_table_sql_renamed)
+                await conn.execute(
+                    f"INSERT INTO {table}_new ({col_list}) "
+                    f"SELECT {col_list} FROM {table}"
+                )
+                await conn.execute(f"DROP TABLE {table}")
+                await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+                for ddl in index_ddl:
+                    await conn.execute(ddl)
+
+                if prior_seq is not None:
+                    # UPDATE-then-INSERT rather than UPSERT: `sqlite_sequence` is an
+                    # internal table with NO primary key and NO unique constraint,
+                    # so `ON CONFLICT(name)` raises "does not match any PRIMARY KEY
+                    # or UNIQUE constraint".
+                    cur = await conn.execute(
+                        "UPDATE sqlite_sequence SET seq=? WHERE name=?",
+                        (prior_seq, table),
+                    )
+                    if cur.rowcount == 0:
+                        await conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                            (table, prior_seq),
+                        )
+
+                if table == "live_trades":
+                    # Belt to the capture-and-replay braces: v2's rebuild did NOT
+                    # recreate this index, so a database migrated by v2 may reach
+                    # here without it — in which case there was nothing to capture.
+                    # It is the DB-layer backstop that stops a concurrent retry
+                    # double-submitting, so it is recreated unconditionally.
+                    await conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_live_trades_client_order_id "
+                        "ON live_trades(client_order_id) "
+                        "WHERE client_order_id IS NOT NULL"
+                    )
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                           SELECT
+                               'binance' AS venue,
+                               COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM live_trades
+                           WHERE status = 'open'
+                           UNION ALL
+                           SELECT
+                               'minara_' || COALESCE(chain, 'unknown') AS venue,
+                               COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM paper_trades
+                           WHERE status = 'open'
+                             AND chain != 'coingecko'
+                             AND chain != ''
+                           GROUP BY chain"""
+                    )
+                    await conn.execute("""CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                           SELECT
+                               'placeholder_m1' AS venue,
+                               0.0 AS realized_pnl_usd,
+                               0.0 AS unrealized_pnl_usd""")
+
+            # ---- Part 2: the two additive columns ------------------------
+            cur = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {r[1] for r in await cur.fetchall()}
+            if existing_cols:
+                if "intent_hash" not in existing_cols:
+                    await conn.execute(
+                        "ALTER TABLE live_trades ADD COLUMN intent_hash TEXT"
+                    )
+                if "mandate_mode" not in existing_cols:
+                    await conn.execute(
+                        "ALTER TABLE live_trades ADD COLUMN mandate_mode TEXT"
+                    )
+                # Non-unique: two rows CAN legitimately share an intent_hash (a
+                # rejection row written before submission, then a submitted row for
+                # the same intent). Uniqueness lives on client_order_id, the
+                # per-submission key; this index only serves lookup.
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_live_trades_intent_hash "
+                    "ON live_trades(intent_hash) WHERE intent_hash IS NOT NULL"
+                )
+                # The mandate's supervised-history count filters on mandate_mode;
+                # without this it table-scans live_trades on every autonomy check.
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_live_trades_mandate_mode "
+                    "ON live_trades(mandate_mode) WHERE mandate_mode IS NOT NULL"
+                )
+
+            # ---- Part 3: POST-CONDITIONS, checked before the marker ------
+            #
+            # *** THE MARKER IS A CLAIM THAT THE MIGRATION WORKED. ***
+            # Every `continue` above is a path where a regex did not match the
+            # table's actual DDL — a quoted name shape, a NOT NULL before the
+            # CHECK, a named constraint, a COLLATE clause. Those log a warning and
+            # move on. Without this block the marker is still written, the
+            # migration is permanently recorded as applied, and it never retries:
+            # `reject_reason='mandate_inactive'` then raises IntegrityError forever
+            # and every mandate refusal becomes invisible. That is precisely the
+            # "fail-closed gate whose audit trail fails open" this widening exists
+            # to prevent — reintroduced by the migration meant to prevent it.
+            #
+            # So the post-condition is asserted against the DATABASE, not inferred
+            # from the fact that no exception was raised. A failure here rolls the
+            # whole transaction back, leaving the migration un-marked and therefore
+            # retried on the next boot with the operator holding a loud error.
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue  # table genuinely absent — nothing was claimed for it
+                # *** LOOK INSIDE THE CHECK CLAUSE, NOT AT THE WHOLE DDL. ***
+                # A substring test over the full CREATE TABLE text shares its
+                # failure mode with the already-widened skip at the top of the
+                # loop: any occurrence of the three strings ANYWHERE in the DDL —
+                # a comment, a column name, another constraint — satisfies both
+                # while the CHECK itself stays narrow. A backstop that fails the
+                # same way as the thing it backstops is not a backstop.
+                check_clause = pattern.search(row[0] or "")
+                haystack = check_clause.group(0) if check_clause else ""
+                missing = [r for r in new_reasons if r not in haystack]
+                if missing:
+                    # Two ways to arrive here, and the message must not assert the
+                    # wrong one: the rewrite ran and its pattern missed, OR the
+                    # skip-check at the top of the loop matched the reason strings
+                    # somewhere else in the DDL and never attempted a rewrite at
+                    # all. Both leave the CHECK narrow; only the second means no
+                    # rewrite was tried.
+                    raise RuntimeError(
+                        f"{migration}: {table}.reject_reason CHECK still refuses "
+                        f"{missing}. Either the rewrite pattern did not match this "
+                        "table's DDL, or the already-widened skip matched those "
+                        "strings outside the CHECK clause and skipped the rebuild. "
+                        "Refusing to record the migration as applied — a gate whose "
+                        "refusals raise IntegrityError is worse than no gate."
+                    )
+            cur = await conn.execute("PRAGMA table_info(live_trades)")
+            live_cols = {r[1] for r in await cur.fetchall()}
+            if live_cols and not {"intent_hash", "mandate_mode"} <= live_cols:
+                raise RuntimeError(
+                    f"{migration}: live_trades is missing "
+                    f"{ {'intent_hash', 'mandate_mode'} - live_cols }"
+                )
+
+            # Foreign keys were disabled for the rebuild; prove THIS rebuild left
+            # nothing dangling before committing.
+            #
+            # *** SCOPED TO THE TABLES THIS MIGRATION TOUCHES. ***
+            # `PRAGMA foreign_key_check` with no argument checks the ENTIRE
+            # database. One pre-existing dangling row in a table this migration
+            # never opens — and there are eleven FK-bearing tables it never
+            # opens — would raise here, roll back, leave the marker unwritten, and
+            # therefore fail EVERY boot from then on. Not hypothetical for this
+            # database: `dashboard/api.py::_build_alert_outcome` documents handling
+            # exactly that state in production ("FK set but the paper_trades row is
+            # gone — ON DELETE SET NULL race / manual delete").
+            #
+            # A migration's post-condition must be about the migration. Asserting a
+            # whole-database invariant here converts unrelated pre-existing data
+            # into a permanent boot failure — a strictly worse outcome than the one
+            # this check guards against.
+            #
+            # Worth being precise about what it can prove: `foreign_key_check(T)`
+            # validates the FKs DECLARED ON T, and ON DELETE SET NULL is a legal
+            # outcome rather than a violation — so this check could never have
+            # caught the severed-links defect. `foreign_keys=OFF` is what fixes
+            # that. This is belt-and-braces, and belt-and-braces must not have a
+            # larger blast radius than the thing it braces.
+            #
+            # ONE FUTURE HAZARD, recorded because its symptom is opaque: the pragma
+            # RAISES `OperationalError: foreign key mismatch` — rather than
+            # reporting a violation — when a table declares an FK referencing a
+            # column that is not UNIQUE or a PRIMARY KEY. Unreachable today: every
+            # FK on these three points at an INTEGER PRIMARY KEY (`paper_trades.id`,
+            # `kill_events.id`, `live_trades.id`). A later migration adding an FK to
+            # a non-unique column on any of them turns this into a hard boot failure
+            # whose message names neither the migration nor the cause. It fails loud
+            # and un-marked, so it is correctness-preserving — just expensive to
+            # diagnose without this note.
+            violations: list = []
+            for table in ("live_trades", "shadow_trades", "solana_executions"):
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                if await cur.fetchone() is None:
+                    continue
+                cur = await conn.execute(f"PRAGMA foreign_key_check({table})")
+                # `row_factory` is `aiosqlite.Row`, which reprs as an object
+                # address — useless in the error an operator has to act on.
+                violations.extend((table, tuple(r)) for r in await cur.fetchall())
+            if violations:
+                raise RuntimeError(
+                    f"{migration}: rebuild left {len(violations)} foreign-key "
+                    f"violation(s), first={violations[0]}"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260802, now_iso, migration),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration,)
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(f"{migration} cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration=migration)
+            raise
+        finally:
+            # Restore enforcement on every exit path — including the early return
+            # on the already-applied marker, which `finally` covers.
+            #
+            # *** AND VERIFY IT, BECAUSE THE PRAGMA CAN SILENTLY NO-OP. ***
+            # `PRAGMA foreign_keys` does nothing while a transaction is open. The
+            # normal and error paths both leave one — commit, or ROLLBACK — but
+            # ROLLBACK is itself wrapped in a try/except above (a failing rollback
+            # must not mask the original error). If that except fires, the
+            # connection is still in a transaction, this PRAGMA quietly does
+            # nothing, and foreign keys stay OFF for every writer in the process
+            # for the rest of its life. That is a strictly worse failure than the
+            # severed-links defect this OFF exists to avoid, so it is checked
+            # rather than assumed.
+            # *** CLOSE THE TRANSACTION FIRST, IF ONE IS STILL OPEN. ***
+            # The `except` above rolls back inside its own try/except, because a
+            # failing rollback must not mask the original error. But swallowing it
+            # leaves the transaction OPEN, and an open transaction is exactly the
+            # condition under which the pragma below does nothing.
+            #
+            # Guarded on `in_transaction` rather than attempted unconditionally.
+            # An unconditional ROLLBACK fails with "no transaction is active" on
+            # every NORMAL path, which forces the choice between swallowing that
+            # expected failure — banned in this module by
+            # `tests/test_db_rollback_observability.py`, and rightly, since a
+            # swallowed rollback hides disk/lock/WAL failures — and logging an
+            # exception on every successful boot. Asking first makes a failure
+            # here genuinely exceptional, so it can be logged loudly without noise.
+            if conn.in_transaction:
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception as rb_err:
+                    _log.exception(
+                        "schema_migration_finally_rollback_failed",
+                        migration=migration,
+                        err=str(rb_err),
+                    )
+
+            await conn.execute("PRAGMA foreign_keys=ON")
+            _cur = await conn.execute("PRAGMA foreign_keys")
+            _fk = await _cur.fetchone()
+            if not (_fk and _fk[0]):
+                # A restore that is not verified is the same class of unchecked
+                # claim the post-condition above just replaced. Verified, and then
+                # ACTED ON: a connection with enforcement off is not safe to hand
+                # back, and callers cache it — `dashboard/api.py` assigns its
+                # module-level handle BEFORE `initialize()` and reuses it on every
+                # later request even when initialization raised, so "the process
+                # dies anyway" is not a safe assumption.
+                #
+                # Dropping the handle makes every subsequent use raise
+                # "Database not initialized" instead of writing unenforced. Not
+                # raising from `finally`: that would replace the in-flight
+                # exception, and the original migration failure is the more useful
+                # one to surface.
+                _log.error(
+                    "FOREIGN_KEYS_LEFT_DISABLED",
+                    migration=migration,
+                    detail=(
+                        "PRAGMA foreign_keys=ON did not take effect even after an "
+                        "unconditional ROLLBACK, so a transaction is still open on "
+                        "this connection. The connection has been dropped rather "
+                        "than returned with enforcement off; restart the service."
+                    ),
+                )
+                try:
+                    await conn.close()
+                except Exception as close_err:  # pragma: no cover — defensive
+                    # Logged, not swallowed: a close that fails here means the
+                    # connection is still open AND unenforced, which is the worst
+                    # of the states this branch exists to escape. Dropping the
+                    # handle below still happens either way.
+                    _log.exception(
+                        "schema_migration_unenforced_close_failed",
+                        migration=migration,
+                        err=str(close_err),
+                    )
+                self._conn = None

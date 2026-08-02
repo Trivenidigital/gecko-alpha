@@ -82,8 +82,9 @@ class TestTransferAuthorityIsSeparate:
 
     def test_grants_money_movement_reports_true_only_when_declared(self):
         assert not VenueCapabilities(venue="k").grants_money_movement()
-        assert VenueCapabilities(venue="k", supports_withdrawal=True
-                                 ).grants_money_movement()
+        assert VenueCapabilities(
+            venue="k", supports_withdrawal=True
+        ).grants_money_movement()
 
 
 class TestIntentCompatibility:
@@ -214,14 +215,23 @@ class TestDecimalTypeLeak:
 
         t0 = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
         kw = dict(
-            strategy_id="s", decision_id="d", created_at=t0,
+            strategy_id="s",
+            decision_id="d",
+            created_at=t0,
             expires_at=t0 + timedelta(minutes=5),
             execution_deadline=t0 + timedelta(minutes=5),
-            mode="SUPERVISED_LIVE", policy_version="v1", venue_family="cex",
-            preferred_venue="kraken", base_asset="BTC", quote_asset="USD",
-            side="buy", quantity_denomination="base",
-            maximum_notional=D("25"), order_type="market",
-            maximum_slippage_bps=100, maximum_price_impact_bps=100,
+            mode="SUPERVISED_LIVE",
+            policy_version="v1",
+            venue_family="cex",
+            preferred_venue="kraken",
+            base_asset="BTC",
+            quote_asset="USD",
+            side="buy",
+            quantity_denomination="base",
+            maximum_notional=D("25"),
+            order_type="market",
+            maximum_slippage_bps=100,
+            maximum_price_impact_bps=100,
         )
         with pytest.raises(TypeError, match="must be a Decimal"):
             TradeIntent(**kw, exact_quantity=5)

@@ -261,3 +261,131 @@ async def test_adapter_error_leaves_row_open_and_logs_done(tmp_path):
         )
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Intent binding — a row whose two halves describe different trades
+# ---------------------------------------------------------------------------
+
+
+async def _seed_bound_live(db, *, paper_trade_id, intent_hash, cid, venue="binance"):
+    assert db._conn is not None
+    await db._conn.execute(
+        "INSERT INTO live_trades "
+        "(paper_trade_id, coin_id, symbol, venue, pair, signal_type, size_usd, "
+        " status, client_order_id, created_at, intent_hash) "
+        "VALUES (?,'c','L',?,'LUSDT','first_signal','100','open',?,?,?)",
+        (
+            paper_trade_id,
+            venue,
+            cid,
+            datetime.now(timezone.utc).isoformat(),
+            intent_hash,
+        ),
+    )
+    await db._conn.commit()
+    cur = await db._conn.execute("SELECT last_insert_rowid()")
+    return (await cur.fetchone())[0]
+
+
+async def test_a_row_whose_cid_does_not_derive_from_its_hash_is_terminalized(tmp_path):
+    """*** The row and the order are about different trades. ***
+
+    `intent_hash` and `client_order_id` are written together, but a row can be
+    edited, restored from a stale backup, or written by a future bug. Resuming it
+    would manage a position under terms nobody authorized — and the venue cannot
+    detect that, because the id it holds is perfectly valid.
+
+    Checked BEFORE the venue is asked anything, so a broken binding never
+    produces a venue round trip.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        pt = await _seed_paper_trade(db)
+        lid = await _seed_bound_live(
+            db, paper_trade_id=pt, intent_hash="a" * 64, cid="gecko-not-derived-at-all"
+        )
+        adapter = _adapter(conf=_conf("filled", fill_price="100", filled_qty="1"))
+        with structlog.testing.capture_logs() as logs:
+            await _run(db, adapter)
+        cur = await db._conn.execute(
+            "SELECT status FROM live_trades WHERE id=?", (lid,)
+        )
+        assert (await cur.fetchone())[0] == "needs_manual_review"
+        assert any(
+            le.get("event") == "live_orphan_intent_binding_broken" for le in logs
+        )
+        # And the venue was never consulted about it.
+        adapter.fetch_order_by_client_id.assert_not_awaited()
+    finally:
+        await db.close()
+
+
+async def test_a_correctly_bound_row_is_resumed(tmp_path):
+    """Guard on the guard: the check clears a row whose halves DO agree,
+    otherwise the test above would pass on a reconciler that terminalizes
+    everything."""
+    from scout.live.order_id import VENUE_ORDER_ID_FORMS
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        intent_hash = "b" * 64
+        cid = VENUE_ORDER_ID_FORMS["binance"].render(intent_hash)
+        pt = await _seed_paper_trade(db)
+        lid = await _seed_bound_live(
+            db, paper_trade_id=pt, intent_hash=intent_hash, cid=cid
+        )
+        adapter = _adapter(conf=_conf("filled", fill_price="100", filled_qty="1"))
+        await _run(db, adapter)
+        cur = await db._conn.execute(
+            "SELECT status FROM live_trades WHERE id=?", (lid,)
+        )
+        assert (await cur.fetchone())[0] == "open"
+        adapter.fetch_order_by_client_id.assert_awaited()
+    finally:
+        await db.close()
+
+
+async def test_a_row_with_no_intent_hash_is_not_subjected_to_the_check(tmp_path):
+    """Rows predating intent binding carry no claim. Absence of a claim is not a
+    broken claim — terminalizing them would flag every legacy row for review."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        pt = await _seed_paper_trade(db)
+        lid = await _seed_open_live(
+            db, paper_trade_id=pt, entry_fill_price="100", entry_fill_qty="1"
+        )
+        await _run(db, _adapter(conf=_conf("filled", fill_price="100", filled_qty="1")))
+        cur = await db._conn.execute(
+            "SELECT status FROM live_trades WHERE id=?", (lid,)
+        )
+        assert (await cur.fetchone())[0] == "open"
+    finally:
+        await db.close()
+
+
+async def test_a_bound_row_on_a_venue_with_no_declared_form_is_terminalized(tmp_path):
+    """Fail-closed. A check that cannot clear a row must not pass it: the cost is
+    an operator review, and the alternative is a position managed under terms
+    nothing verified."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        pt = await _seed_paper_trade(db)
+        lid = await _seed_bound_live(
+            db,
+            paper_trade_id=pt,
+            intent_hash="c" * 64,
+            cid="whatever",
+            venue="coinbase",
+        )
+        await _run(db, _adapter(conf=_conf("filled")))
+        cur = await db._conn.execute(
+            "SELECT status FROM live_trades WHERE id=?", (lid,)
+        )
+        assert (await cur.fetchone())[0] == "needs_manual_review"
+    finally:
+        await db.close()

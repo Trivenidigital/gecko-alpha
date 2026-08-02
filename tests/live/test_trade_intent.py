@@ -54,25 +54,46 @@ class TestCanonicalHash:
         assert _intent().intent_hash == _intent().intent_hash
 
     def test_hash_is_stable_across_field_construction_order(self):
-        a = TradeIntent(strategy_id="s", decision_id="d", created_at=_T0,
-                        expires_at=_T0 + timedelta(minutes=1),
-                        execution_deadline=_T0 + timedelta(minutes=1),
-                        mode="SUPERVISED_LIVE", venue_family="cex",
-                        preferred_venue="kraken", base_asset="BTC",
-                        quote_asset="USD", side="buy",
-                        exact_quantity=Decimal("1"), quantity_denomination="base",
-                        maximum_notional=Decimal("25"), order_type="market",
-                        maximum_slippage_bps=100, maximum_price_impact_bps=100,
-                        policy_version="v1")
-        b = TradeIntent(policy_version="v1", maximum_price_impact_bps=100,
-                        maximum_slippage_bps=100, order_type="market",
-                        maximum_notional=Decimal("25"), quantity_denomination="base",
-                        exact_quantity=Decimal("1"), side="buy", quote_asset="USD",
-                        base_asset="BTC", preferred_venue="kraken",
-                        venue_family="cex", mode="SUPERVISED_LIVE",
-                        execution_deadline=_T0 + timedelta(minutes=1),
-                        expires_at=_T0 + timedelta(minutes=1), created_at=_T0,
-                        decision_id="d", strategy_id="s")
+        a = TradeIntent(
+            strategy_id="s",
+            decision_id="d",
+            created_at=_T0,
+            expires_at=_T0 + timedelta(minutes=1),
+            execution_deadline=_T0 + timedelta(minutes=1),
+            mode="SUPERVISED_LIVE",
+            venue_family="cex",
+            preferred_venue="kraken",
+            base_asset="BTC",
+            quote_asset="USD",
+            side="buy",
+            exact_quantity=Decimal("1"),
+            quantity_denomination="base",
+            maximum_notional=Decimal("25"),
+            order_type="market",
+            maximum_slippage_bps=100,
+            maximum_price_impact_bps=100,
+            policy_version="v1",
+        )
+        b = TradeIntent(
+            policy_version="v1",
+            maximum_price_impact_bps=100,
+            maximum_slippage_bps=100,
+            order_type="market",
+            maximum_notional=Decimal("25"),
+            quantity_denomination="base",
+            exact_quantity=Decimal("1"),
+            side="buy",
+            quote_asset="USD",
+            base_asset="BTC",
+            preferred_venue="kraken",
+            venue_family="cex",
+            mode="SUPERVISED_LIVE",
+            execution_deadline=_T0 + timedelta(minutes=1),
+            expires_at=_T0 + timedelta(minutes=1),
+            created_at=_T0,
+            decision_id="d",
+            strategy_id="s",
+        )
         assert a.intent_hash == b.intent_hash
 
     def test_decimal_equality_is_value_based_not_repr_based(self):
@@ -128,10 +149,14 @@ class TestCanonicalHash:
         validation companion. Vary the pair; the hash must still move."""
         base = _intent().intent_hash
         assert base != _intent(venue_family="dex", chain="base").intent_hash
-        assert base != _intent(order_type="limit",
-                               limit_price=Decimal("63000")).intent_hash
-        assert base != _intent(reduce_only=True, side="sell",
-                               position_id="pos-1").intent_hash
+        assert (
+            base
+            != _intent(order_type="limit", limit_price=Decimal("63000")).intent_hash
+        )
+        assert (
+            base
+            != _intent(reduce_only=True, side="sell", position_id="pos-1").intent_hash
+        )
 
 
 class TestImmutability:
@@ -248,7 +273,9 @@ class TestCanonicalizationIsContextIndependent:
         baseline = _intent(exact_quantity=Decimal("1.2345678901234567890123456789"))
         with localcontext() as ctx:
             ctx.prec = prec
-            under_ctx = _intent(exact_quantity=Decimal("1.2345678901234567890123456789"))
+            under_ctx = _intent(
+                exact_quantity=Decimal("1.2345678901234567890123456789")
+            )
             assert under_ctx.intent_hash == baseline.intent_hash
             assert baseline.verify()
 

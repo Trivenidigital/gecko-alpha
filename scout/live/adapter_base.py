@@ -43,6 +43,20 @@ class OrderRequest:
     size_usd: float
     intent_uuid: str  # gecko-side; populates client_order_id
 
+    # ------------------------------------------------------------------
+    # Intent binding. All three are optional and TRAILING so every existing
+    # construction site keeps working unchanged; when they are absent the adapter
+    # falls back to the legacy uuid-derived client_order_id.
+    #
+    # `client_order_id` is passed IN rather than derived inside the adapter because
+    # the correct form is per-venue (see scout/live/order_id.py) and is derived from
+    # the intent's content hash. An adapter deriving its own id would re-introduce
+    # exactly the "identity that binds no terms" gap TradeIntent exists to close.
+    # ------------------------------------------------------------------
+    client_order_id: str | None = None
+    intent_hash: str | None = None
+    mandate_mode: str | None = None
+
 
 @dataclass(frozen=True)
 class OrderConfirmation:

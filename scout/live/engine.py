@@ -27,7 +27,8 @@ LIVE_USE_ROUTING_LAYER=True (design §2.7a).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 
 import structlog
@@ -36,7 +37,9 @@ from scout.db import Database
 from scout.live.adapter_base import ExchangeAdapter
 from scout.live.config import LiveConfig
 from scout.live.gates import Gates
+from scout.live.intent import TradeIntent
 from scout.live.kill_switch import KillSwitch
+from scout.live.mandate import ExecutionMandate, MandateRefused
 from scout.live.metrics import inc
 from scout.live.orderbook import walk_asks
 from scout.live.resolver import VenueResolver
@@ -45,6 +48,17 @@ if TYPE_CHECKING:
     from scout.live.routing import RoutingLayer
 
 log = structlog.get_logger(__name__)
+
+#: How long a dispatch intent stays valid. The engine builds, authorizes and submits
+#: within one coroutine, so this is a crash-recovery bound rather than a queueing one:
+#: an intent read back from the ledger after a restart must not still look live.
+INTENT_TTL = timedelta(minutes=5)
+
+#: Bumped whenever the terms the engine puts INTO an intent change shape. It is part
+#: of the hashed content, so a bump makes every subsequently-minted intent
+#: distinguishable from one built by the previous policy — which is what lets a
+#: reconciler tell "same trade" from "same trade under different rules".
+DISPATCH_POLICY_VERSION = "engine-dispatch-v1"
 
 
 class _PaperTradeLike(Protocol):
@@ -70,6 +84,7 @@ class LiveEngine:
         db: Database,
         kill_switch: KillSwitch,
         routing: "RoutingLayer | None" = None,
+        mandate: ExecutionMandate | None = None,
     ) -> None:
         self._config = config
         self._resolver = resolver
@@ -77,6 +92,12 @@ class LiveEngine:
         self._db = db
         self._ks = kill_switch
         self._routing = routing
+        # Default-constructed from settings when not injected, so a caller cannot get
+        # an UNGATED engine by forgetting the kwarg. Absent settings yields a mandate
+        # whose every getattr default refuses — the fail-closed direction.
+        self._mandate = mandate or ExecutionMandate(
+            settings=getattr(config, "_s", None), db=db
+        )
         self._gates = Gates(
             config=config,
             db=db,
@@ -307,24 +328,118 @@ class LiveEngine:
             size_usd=str(size_usd),
         )
 
+    async def _write_live_reject(
+        self,
+        *,
+        paper_trade: _PaperTradeLike,
+        size_usd,
+        reject_reason: str,
+        venue: str = "",
+        pair: str = "",
+        intent_hash: str | None = None,
+    ) -> None:
+        """Write a terminal ``rejected`` ``live_trades`` row.
+
+        ``live_trades`` declares venue and pair NOT NULL, so a rejection that
+        happened before a venue was chosen writes sentinel-empty strings — the
+        existing no-venue convention, factored out because there are now four
+        pre-submission refusal paths rather than one.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        assert self._db._conn is not None
+        async with self._db._txn_lock:
+            await self._db._conn.execute(
+                "INSERT INTO live_trades "
+                "(paper_trade_id, coin_id, symbol, venue, pair, "
+                " signal_type, size_usd, status, reject_reason, "
+                " created_at, intent_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'rejected', ?, ?, ?)",
+                (
+                    paper_trade.id,
+                    paper_trade.coin_id,
+                    paper_trade.symbol,
+                    venue,
+                    pair,
+                    paper_trade.signal_type,
+                    str(size_usd),
+                    reject_reason,
+                    now_iso,
+                    intent_hash,
+                ),
+            )
+            await self._db._conn.commit()
+        await inc(self._db, f"live_dispatch_rejected_{reject_reason}")
+
+    def _build_entry_intent(
+        self,
+        *,
+        paper_trade: _PaperTradeLike,
+        size_usd,
+        routed,
+        now: datetime,
+    ) -> TradeIntent:
+        """Mint the content-bound intent for this dispatch.
+
+        Every term the execution depends on goes in, because the hash is only worth
+        what it covers: venue, instrument, side, size, order type and the slippage
+        bound. ``exact_quantity`` is denominated in QUOTE units — the Binance path
+        submits ``quoteOrderQty``, i.e. "spend this much USDT", not "buy this many
+        coins" — and ``quantity_denomination='quote'`` records that so a reader
+        cannot mistake the number for a base amount.
+
+        Built AFTER routing because ``preferred_venue`` is one of the hashed terms:
+        an intent minted before the venue is known would have to carry a placeholder,
+        and a placeholder in a hashed term is a hash that does not bind what happened.
+        """
+        notional = Decimal(str(size_usd))
+        slippage_cap = int(getattr(self._config._s, "LIVE_SLIPPAGE_BPS_CAP", 50))
+        return TradeIntent(
+            strategy_id=paper_trade.signal_type,
+            decision_id=f"paper-{paper_trade.id}",
+            created_at=now,
+            expires_at=now + INTENT_TTL,
+            execution_deadline=now + INTENT_TTL,
+            mode=self._mandate.mode,
+            policy_version=DISPATCH_POLICY_VERSION,
+            venue_family="cex",
+            preferred_venue=routed.venue,
+            base_asset=paper_trade.symbol,
+            quote_asset=str(routed.candidate.quote),
+            side="buy",
+            exact_quantity=notional,
+            quantity_denomination="quote",
+            maximum_notional=notional,
+            order_type="market",
+            # The SAME cap Gate 5 already enforces (gates.py:196), read from the same
+            # setting rather than restated — a second slippage number here would be a
+            # bound the pre-trade gate does not know about, and the two would drift.
+            maximum_slippage_bps=slippage_cap,
+            maximum_price_impact_bps=slippage_cap,
+        )
+
     async def _dispatch_live(
         self,
         *,
         paper_trade: _PaperTradeLike,
         size_usd,
     ) -> None:
-        """M1.5b live-mode dispatch (V1-C1 routing-half + V1-C2 closures).
+        """M1.5b live-mode dispatch, now mandate-gated and intent-bound.
 
-        - Routes via RoutingLayer
-        - Calls adapter.place_order_request (M1.5a idempotency-aware)
-        - Calls adapter.await_fill_confirmation (M1.5a polling) using
-          the same cid the adapter just wrote to live_trades
-        - On terminal=filled -> increment correction counter
-        - On BinanceAuthError mid-session -> engages KillSwitch
-        - On no candidates -> writes live_trades reject row (Q2 fold)
+        Order of operations, and why each step is where it is:
+
+        1. **Mandate precheck**, before anything with a side effect. Routing does
+           on-demand venue-metadata fetches and DB writes; an inactive mandate must
+           not cause them.
+        2. **Route**, through the capability gate — which also yields the ADAPTER for
+           the selected venue. Previously this method routed to pick ``top.venue`` and
+           then submitted through ``self._adapter``, so selecting any venue other than
+           the injected one placed that venue's pair on the injected venue.
+        3. **Mint the intent** bound to the selected venue and its instrument.
+        4. **Authorize** the full intent against the mandate.
+        5. **Derive the venue's client order id from the intent hash**, so the
+           submission's identity is its terms.
+        6. Submit through the routed adapter; await the fill; record.
         """
-        from uuid import uuid4
-
         from scout.live.adapter_base import OrderRequest
         from scout.live.binance_adapter import (
             BinanceAuthError,
@@ -332,8 +447,12 @@ class LiveEngine:
         )
         from scout.live.correction_counter import increment_consecutive
         from scout.live.exceptions import VenueTransientError
-        from scout.live.idempotency import make_client_order_id
         from scout.live.kill_switch import compute_kill_duration
+        from scout.live.order_id import (
+            UnknownVenueOrderIdForm,
+            client_order_id_for_venue,
+        )
+        from scout.live.routing import NoRoutableVenue
 
         canonical = paper_trade.symbol
         chain_hint = getattr(paper_trade, "chain", None)
@@ -346,70 +465,147 @@ class LiveEngine:
             signal_type=paper_trade.signal_type,
         )
 
-        candidates = await self._routing.get_candidates(
-            canonical=canonical,
-            chain_hint=chain_hint,
-            signal_type=paper_trade.signal_type,
-            size_usd=float(size_usd),
-        )
-
-        log.info(
-            "live_dispatch_candidates_returned",
-            paper_trade_id=paper_trade.id,
-            count=len(candidates),
-            top_venue=candidates[0].venue if candidates else None,
-        )
-
-        if not candidates:
-            # V1-C2 + V3-C1 PR-stage fix: live_trades has 7 NOT NULL columns
-            # (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
-            # size_usd, status). venue/pair are sentinel-empty since no
-            # candidate was selected.
-            now_iso = datetime.now(timezone.utc).isoformat()
-            assert self._db._conn is not None
-            async with self._db._txn_lock:
-                await self._db._conn.execute(
-                    "INSERT INTO live_trades "
-                    "(paper_trade_id, coin_id, symbol, venue, pair, "
-                    " signal_type, size_usd, status, reject_reason, "
-                    " created_at) "
-                    "VALUES (?, ?, ?, '', '', ?, ?, 'rejected', "
-                    " 'no_venue', ?)",
-                    (
-                        paper_trade.id,
-                        paper_trade.coin_id,
-                        paper_trade.symbol,
-                        paper_trade.signal_type,
-                        str(size_usd),
-                        now_iso,
-                    ),
-                )
-                await self._db._conn.commit()
-            # V3-I2 PR-stage fix: WARN level — operator searches "did this
-            # signal succeed?" should not skim past INFO when routing
-            # silently returns zero candidates.
+        # --- 1. Mandate precheck, before any side effect -------------------
+        try:
+            self._mandate.precheck()
+        except MandateRefused as exc:
+            await self._write_live_reject(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                reject_reason="mandate_inactive",
+            )
             log.warning(
-                "live_dispatch_no_venue",
+                "live_dispatch_mandate_refused",
                 paper_trade_id=paper_trade.id,
-                canonical=canonical,
+                gate=exc.gate,
+                detail=exc.message,
+                phase="precheck",
             )
             return
 
-        top = candidates[0]
-        intent_uuid = str(uuid4())
+        # --- 2. Route through the capability gate --------------------------
+        try:
+            routed = await self._routing.select_route(
+                canonical=canonical,
+                chain_hint=chain_hint,
+                signal_type=paper_trade.signal_type,
+                size_usd=float(size_usd),
+                venue_family="cex",
+                order_type="market",
+                reduce_only=False,
+            )
+        except NoRoutableVenue as exc:
+            await self._write_live_reject(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                reject_reason=exc.reject_reason,
+            )
+            # V3-I2: WARN level — an operator asking "did this signal succeed?"
+            # should not have to skim INFO to find out nothing routed.
+            log.warning(
+                "live_dispatch_no_route",
+                paper_trade_id=paper_trade.id,
+                canonical=canonical,
+                reject_reason=exc.reject_reason,
+                rejections=list(exc.rejections),
+            )
+            return
+
+        log.info(
+            "live_dispatch_venue_selected",
+            paper_trade_id=paper_trade.id,
+            venue=routed.venue,
+            venue_pair=routed.venue_pair,
+        )
+
+        # --- 3 + 4. Mint the intent, then authorize it ---------------------
+        now = datetime.now(timezone.utc)
+        try:
+            intent = self._build_entry_intent(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                routed=routed,
+                now=now,
+            )
+        except (ValueError, TypeError) as exc:
+            # An intent that will not construct is terms that will not validate.
+            # Refusing is the only safe answer — there is nothing to bind an order to.
+            await self._write_live_reject(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                reject_reason="venue_capability_refused",
+                venue=routed.venue,
+                pair=routed.venue_pair,
+            )
+            log.warning(
+                "live_dispatch_intent_invalid",
+                paper_trade_id=paper_trade.id,
+                venue=routed.venue,
+                err=str(exc),
+            )
+            return
+
+        try:
+            decision = await self._mandate.authorize(intent, at=now)
+        except MandateRefused as exc:
+            await self._write_live_reject(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                reject_reason="mandate_inactive",
+                venue=routed.venue,
+                pair=routed.venue_pair,
+                intent_hash=intent.intent_hash,
+            )
+            log.warning(
+                "live_dispatch_mandate_refused",
+                paper_trade_id=paper_trade.id,
+                gate=exc.gate,
+                detail=exc.message,
+                phase="authorize",
+                intent_id=intent.intent_id,
+            )
+            return
+
+        # --- 5. The submission's identity IS its terms ---------------------
+        try:
+            cid = client_order_id_for_venue(intent, routed.venue)
+        except (UnknownVenueOrderIdForm, ValueError) as exc:
+            await self._write_live_reject(
+                paper_trade=paper_trade,
+                size_usd=size_usd,
+                reject_reason="venue_capability_refused",
+                venue=routed.venue,
+                pair=routed.venue_pair,
+                intent_hash=intent.intent_hash,
+            )
+            log.warning(
+                "live_dispatch_no_order_id_form",
+                paper_trade_id=paper_trade.id,
+                venue=routed.venue,
+                err=str(exc),
+            )
+            return
+
         request = OrderRequest(
             paper_trade_id=paper_trade.id,
             canonical=canonical,
-            venue_pair=top.venue_pair,
+            venue_pair=routed.venue_pair,
             side="buy",
             size_usd=float(size_usd),
-            intent_uuid=intent_uuid,
+            # Legacy field, retained so adapters that have not been wired to intents
+            # still have something stable to derive from. It is NOT what mints the
+            # cid here — `client_order_id` below is, and it is content-bound.
+            intent_uuid=intent.intent_id,
+            client_order_id=cid,
+            intent_hash=intent.intent_hash,
+            mandate_mode=decision.mode,
         )
-        # R1-C2 fix: derive same cid the adapter writes to live_trades.
-        cid = make_client_order_id(paper_trade.id, intent_uuid)
 
+        # --- 6. Submit through the ROUTED adapter --------------------------
+        adapter = routed.adapter
+        top = routed.candidate
         try:
-            venue_order_id = await self._adapter.place_order_request(request)
+            venue_order_id = await adapter.place_order_request(request)
         except NotImplementedError as exc:
             log.info(
                 "live_dispatch_signed_disabled",
@@ -466,7 +662,7 @@ class LiveEngine:
             return
 
         try:
-            confirmation = await self._adapter.await_fill_confirmation(
+            confirmation = await adapter.await_fill_confirmation(
                 venue_order_id=venue_order_id,
                 client_order_id=cid,
                 timeout_sec=30.0,

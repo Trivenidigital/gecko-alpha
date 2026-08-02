@@ -1562,6 +1562,20 @@ class PilotRunner:
                 # entry_fill_qty, the per-fill rows, and the evidence file. Any
                 # reader totalling size_usd is measuring authorized exposure
                 # (which is what the daily cap governs), not realised volume.
+                # *** DO NOT ADD `mandate_mode=` HERE. ***
+                # It looks like a harmless completeness fix and it is not.
+                # `ExecutionMandate._count_supervised` counts CEX rows by
+                # `mandate_mode='SUPERVISED_LIVE'` to decide when a venue may be
+                # promoted to BOUNDED_AUTONOMOUS. This pilot is deliberately
+                # OUTSIDE the mandate — it places orders behind a typed per-trade
+                # authorization instead — so its trades must not raise the
+                # autonomous bar. Leaving the column NULL is what keeps
+                # operator-run pilot entries from counting as the supervised
+                # history that authorizes the machine to trade unattended.
+                #
+                # `intent_hash` is likewise absent: this runner mints no
+                # TradeIntent, and `record_pending_order` refuses a hash whose
+                # client_order_id does not derive from it.
                 live_trade_id = await record_pending_order(
                     self._db,
                     client_order_id=client_order_id,

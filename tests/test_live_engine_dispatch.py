@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 from scout.config import Settings
 from scout.db import Database
 from scout.live.adapter_base import OrderConfirmation
+from scout.live.capabilities import VenueCapabilities
 from scout.live.binance_adapter import (
     BinanceAuthError,
     BinanceIPBanError,
@@ -25,7 +27,8 @@ from scout.live.config import LiveConfig
 from scout.live.engine import LiveEngine
 from scout.live.exceptions import VenueTransientError
 from scout.live.kill_switch import KillSwitch
-from scout.live.routing import RouteCandidate
+from scout.live.mandate import ExecutionMandate
+from scout.live.routing import NoRoutableVenue, RouteCandidate, RoutedVenue
 
 _REQUIRED = {
     "TELEGRAM_BOT_TOKEN": "x",
@@ -88,6 +91,7 @@ async def _make_engine(
         LIVE_USE_ROUTING_LAYER=routing_flag,
         LIVE_CLOSER_ENABLED=closer_enabled,
         LIVE_SIGNAL_ALLOWLIST="first_signal",
+        **_MANDATE_OPEN,
     )
     config = LiveConfig(settings)
     if adapter is None:
@@ -111,6 +115,11 @@ async def _make_engine(
     # need explicit AsyncMock binding.
     kill_switch = MagicMock(spec=KillSwitch)
     kill_switch.trigger = AsyncMock(return_value=(1, True))
+    # The stub routing layer returns the adapter alongside the venue, exactly as
+    # the real one does — so the test cannot accidentally assert against an
+    # adapter the engine never used.
+    if isinstance(routing, _RoutingStub):
+        routing.adapter = adapter
     return LiveEngine(
         config=config,
         resolver=resolver,
@@ -118,7 +127,59 @@ async def _make_engine(
         db=db,
         kill_switch=kill_switch,
         routing=routing,
+        mandate=ExecutionMandate(settings=settings, db=db),
     )
+
+
+
+_TEST_CAPS = VenueCapabilities(
+    venue="binance",
+    venue_family="cex",
+    supports_market_orders=True,
+    supports_client_order_id=True,
+)
+
+#: Mandate settings that leave every lock open. These tests are about the
+#: DISPATCH mechanics downstream of the gate; the gate itself is the subject of
+#: tests/live/test_execution_mandate.py and
+#: tests/live/test_inactive_mandate_has_no_execution_path.py.
+_MANDATE_OPEN = {
+    "LIVE_EXECUTION_MANDATE_MODE": "SUPERVISED_LIVE",
+    "LIVE_EXECUTION_MANDATE_ENABLED": True,
+    "LIVE_EXECUTION_MANDATE_FAMILIES": "cex",
+    "LIVE_EXECUTION_MANDATE_VENUES": "binance,kraken,other",
+    "LIVE_EXECUTION_MANDATE_PER_TRADE_MAX_USD": Decimal("1000"),
+    "LIVE_EXECUTION_MANDATE_DAILY_MAX_USD": Decimal("1000"),
+    "LIVE_EXECUTION_MANDATE_MAX_OPEN_POSITIONS": 5,
+}
+
+
+class _RoutingStub:
+    """Stands in for RoutingLayer at the dispatch boundary.
+
+    A real class rather than a MagicMock because `select_route` must RAISE
+    `NoRoutableVenue` on the empty case, and a MagicMock cannot express "raises
+    this typed exception" without the test restating the engine's own control
+    flow. `adapter` is filled in by `_make_engine`, which sees both.
+    """
+
+    def __init__(self, candidates):
+        self._candidates = list(candidates)
+        self.adapter = None
+
+    async def get_candidates(self, **_kw):
+        return self._candidates
+
+    async def select_route(self, **_kw):
+        if not self._candidates:
+            raise NoRoutableVenue("no_venue", ())
+        # Mirrors the real layer's rank: health score DESC, stable.
+        top = sorted(
+            self._candidates, key=lambda c: c.venue_health_score, reverse=True
+        )[0]
+        return RoutedVenue(
+            candidate=top, adapter=self.adapter, capabilities=_TEST_CAPS
+        )
 
 
 def _candidate(venue="binance", pair="BTCUSDT", score=0.9) -> RouteCandidate:
@@ -129,6 +190,8 @@ def _candidate(venue="binance", pair="BTCUSDT", score=0.9) -> RouteCandidate:
         expected_slippage_bps=5.0,
         available_capital_usd=1000.0,
         venue_health_score=score,
+        quote="USDT",
+        asset_class="spot",
     )
 
 
@@ -232,8 +295,7 @@ async def test_dispatch_live_increments_counter_on_filled(tmp_path):
     """Top candidate + adapter returns FILLED -> counter incremented."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     engine = await _make_engine(db, routing=routing)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
@@ -253,8 +315,7 @@ async def test_dispatch_live_uses_full_cid_for_await_fill(tmp_path):
     cid format, NOT raw intent_uuid."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(return_value="VENUE-1")
     adapter.await_fill_confirmation = AsyncMock(
@@ -273,24 +334,37 @@ async def test_dispatch_live_uses_full_cid_for_await_fill(tmp_path):
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
     call = adapter.await_fill_confirmation.call_args
     cid = call.kwargs["client_order_id"]
-    # Format: gecko-{paper_trade_id}-{uuid8} where uuid8 is 8 hex chars
-    # (no dashes within). For paper_trade_id=42, cid is "gecko-42-XXXXXXXX".
-    assert cid.startswith("gecko-42-"), f"cid format wrong: {cid!r}"
-    assert len(cid) == len("gecko-42-") + 8, f"cid length wrong: {cid!r}"
-    assert cid != "42", "raw intent_uuid leaked through"
+    # The cid is now CONTENT-BOUND rather than uuid-derived: `gecko-` + the
+    # first 22 hex characters of the intent hash (28 chars, Binance's form).
+    # The old `gecko-{paper_trade_id}-{uuid8}` shape identified a submission but
+    # bound none of its terms, which is exactly the gap TradeIntent closes.
+    place_call = adapter.place_order_request.call_args
+    request = place_call.args[0]
+    assert cid == request.client_order_id
+    assert cid.startswith("gecko-"), f"cid format wrong: {cid!r}"
+    assert len(cid) == 28, f"cid length wrong: {cid!r}"
+    assert cid == "gecko-" + request.intent_hash[:22], "cid is not intent-bound"
     await db.close()
 
 
 def _recording_adapter(db, *, confirmation):
     """Mock adapter whose place_order_request INSERTs the 'open' live_trades row
     (mimicking the real BinanceSpotAdapter.record_pending_order) keyed by the
-    same cid the engine derives, so the post-fill UPDATE has a row to hit."""
+    same cid the engine derives, so the post-fill UPDATE has a row to hit.
+
+    The cid now comes from ``request.client_order_id`` — the content-bound id the
+    engine derived from the intent hash — with the legacy uuid derivation as the
+    fallback, mirroring the real adapter exactly. Deriving it here independently
+    would put a SECOND idea of the key in the test, which is how the engine's
+    post-fill UPDATE silently stops matching any row."""
     from scout.live.idempotency import make_client_order_id, record_pending_order
 
     adapter = MagicMock()
 
     async def _place(request):
-        cid = make_client_order_id(request.paper_trade_id, request.intent_uuid)
+        cid = request.client_order_id or make_client_order_id(
+            request.paper_trade_id, request.intent_uuid
+        )
         await record_pending_order(
             db,
             client_order_id=cid,
@@ -302,6 +376,8 @@ def _recording_adapter(db, *, confirmation):
             signal_type="first_signal",
             size_usd=str(request.size_usd),
             mid_at_entry="10.0",
+            intent_hash=request.intent_hash,
+            mandate_mode=request.mandate_mode,
         )
         return "VENUE-1"
 
@@ -320,8 +396,7 @@ async def test_dispatch_live_filled_persists_entry_fill(tmp_path):
     await db.initialize()
     pt = _make_paper_trade(id=42)
     await _insert_paper_trade(db, trade_id=pt.id)
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = _recording_adapter(
         db,
         confirmation=OrderConfirmation(
@@ -357,8 +432,7 @@ async def test_dispatch_live_rejected_buy_flags_needs_manual_review(tmp_path):
     await db.initialize()
     pt = _make_paper_trade(id=42)
     await _insert_paper_trade(db, trade_id=pt.id)
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = _recording_adapter(
         db,
         confirmation=OrderConfirmation(
@@ -388,8 +462,7 @@ async def test_dispatch_live_no_counter_on_partial(tmp_path):
     """R1+R2 C3: partial fills do NOT increment counter."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(return_value="VENUE-1")
     adapter.await_fill_confirmation = AsyncMock(
@@ -416,8 +489,7 @@ async def test_dispatch_live_no_counter_on_partial(tmp_path):
 async def test_dispatch_live_no_counter_on_timeout(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(return_value="VENUE-1")
     adapter.await_fill_confirmation = AsyncMock(
@@ -444,8 +516,7 @@ async def test_dispatch_live_status_rejected_no_counter(tmp_path):
     """R1-I2 fold: status='rejected' -> counter NOT incremented."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(return_value="VENUE-1")
     adapter.await_fill_confirmation = AsyncMock(
@@ -475,8 +546,7 @@ async def test_dispatch_live_no_venue_writes_reject_row(tmp_path):
     await db.initialize()
     pt = _make_paper_trade()
     await _insert_paper_trade(db, trade_id=pt.id)
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[])
+    routing = _RoutingStub([])
     engine = await _make_engine(db, routing=routing)
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
     cur = await db._conn.execute(
@@ -500,8 +570,7 @@ async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
     raised AttributeError silently."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(side_effect=BinanceAuthError("revoked"))
     adapter.await_fill_confirmation = AsyncMock()
@@ -524,8 +593,7 @@ async def test_dispatch_live_binance_auth_error_engages_killswitch(tmp_path):
 async def test_dispatch_live_ip_ban_engages_killswitch(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(side_effect=BinanceIPBanError("418"))
     adapter.await_fill_confirmation = AsyncMock()
@@ -546,8 +614,7 @@ async def test_dispatch_live_ip_ban_engages_killswitch(tmp_path):
 async def test_dispatch_live_venue_transient_no_counter(tmp_path):
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(side_effect=VenueTransientError("503"))
     adapter.await_fill_confirmation = AsyncMock()
@@ -572,8 +639,7 @@ async def test_dispatch_live_picks_highest_health_score(tmp_path):
         _candidate(venue="kraken", pair="XBTUSD", score=0.6),
         _candidate(venue="other", pair="BTC-USD", score=0.4),
     ]
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=cands)
+    routing = _RoutingStub(cands)
     engine = await _make_engine(db, routing=routing)
     pt = _make_paper_trade()
     await engine._dispatch_live(paper_trade=pt, size_usd=10.0)
@@ -595,8 +661,7 @@ async def test_dispatch_live_signed_disabled_no_counter(tmp_path):
     """Defense-in-depth: NotImplementedError silently returns."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
-    routing = MagicMock()
-    routing.get_candidates = AsyncMock(return_value=[_candidate()])
+    routing = _RoutingStub([_candidate()])
     adapter = MagicMock()
     adapter.place_order_request = AsyncMock(side_effect=NotImplementedError("disabled"))
     adapter.await_fill_confirmation = AsyncMock()

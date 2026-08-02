@@ -2611,6 +2611,49 @@ class LaneRunner:
                 f"are unset or non-positive: {', '.join(missing)}.",
             )
         detail["envelope"] = envelope
+
+        # 4. **The cross-venue mandate.** The three locks above are lane-local: they
+        # answer "may THIS lane run autonomously". They cannot answer "is autonomous
+        # execution authorized at all, across venues", because nothing outside this
+        # module is in their scope — and an operator promoting Solana while the CEX
+        # path sits under a separate, differently-configured gate is exactly how two
+        # autonomy postures drift apart without either being wrong on its own terms.
+        #
+        # STRICTLY ADDITIVE. This runs only after all three lane locks have already
+        # passed, so it can refuse a promotion the lane would have allowed and can
+        # never permit one the lane would have refused. Today the lane is not in
+        # BOUNDED_AUTONOMOUS at all, so this path is unreachable and the check is
+        # inert; what it buys is that promoting it later takes the cross-venue
+        # mandate too.
+        #
+        # `precheck()` rather than `authorize()`: the mandate's full authorization
+        # binds a TradeIntent, and this lane's unit of work is a transaction message
+        # hash, not an intent. The venue-independent locks — mode, second flag,
+        # bounded envelope — are the part that means anything here.
+        from scout.live.mandate import (
+            MODE_BOUNDED_AUTONOMOUS as MANDATE_MODE_BOUNDED_AUTONOMOUS,
+        )
+        from scout.live.mandate import ExecutionMandate, MandateRefused
+
+        mandate = ExecutionMandate(settings=settings, db=self._db)
+        try:
+            mandate.precheck()
+        except MandateRefused as exc:
+            raise LaneAbort(
+                "envelope_gate",
+                f"the cross-venue execution mandate refuses ({exc.gate}): "
+                f"{exc.message} Autonomous execution is authorized once, for every "
+                "venue, not per lane.",
+            ) from exc
+        if mandate.mode != MANDATE_MODE_BOUNDED_AUTONOMOUS:
+            raise LaneAbort(
+                "envelope_gate",
+                f"SOLANA_MODE is {MODE_BOUNDED_AUTONOMOUS} but "
+                f"LIVE_EXECUTION_MANDATE_MODE is {mandate.mode!r}. A lane cannot be "
+                "more autonomous than the cross-venue mandate that covers it.",
+            )
+        detail["cross_venue_mandate"] = mandate.mode
+
         log.info("solana_autonomy_preconditions_satisfied", **detail)
         return detail
 

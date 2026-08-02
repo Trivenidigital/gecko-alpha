@@ -1271,6 +1271,46 @@ class Settings(BaseSettings):
     # Signal allowlist — CSV, lowercased, trimmed; empty = no signals eligible
     LIVE_SIGNAL_ALLOWLIST: str = ""
 
+    # -------- Cross-venue execution mandate (scout.live.mandate) --------
+    # *** THE AUTONOMY GATE FOR THE SIGNAL-DRIVEN LIVE PATH. ***
+    # `LiveEngine._dispatch_live` fires from a paper-trade signal with no human in
+    # the loop, and until this existed the only things in front of it were the
+    # "is live trading wired up" flags. The Solana lane has had a three-lock
+    # promotion gate since it shipped; this is the same discipline, venue-neutral,
+    # and the Solana lane consults it too.
+    #
+    # EVERY DEFAULT REFUSES. The allowlists default to EMPTY, which means "nothing
+    # is permitted" — never "nothing was restricted, so everything is permitted".
+    # A typo therefore closes the gate.
+    #
+    #   DISABLED            refuses everything. The default.
+    #   SIMULATION_ONLY     not an executing mode; refuses like DISABLED.
+    #   SUPERVISED_LIVE     execution permitted within the envelope.
+    #   BOUNDED_AUTONOMOUS  additionally requires N supervised executions already
+    #                       recorded in the ledger for that venue family.
+    LIVE_EXECUTION_MANDATE_MODE: Literal[
+        "DISABLED",
+        "SIMULATION_ONLY",
+        "SUPERVISED_LIVE",
+        "BOUNDED_AUTONOMOUS",
+    ] = "DISABLED"
+    # Second lock. The mode alone does not authorize execution, so promoting the
+    # path cannot happen by editing one value.
+    LIVE_EXECUTION_MANDATE_ENABLED: bool = False
+    # CSV allowlists. Empty permits nothing.
+    LIVE_EXECUTION_MANDATE_FAMILIES: str = ""
+    LIVE_EXECUTION_MANDATE_VENUES: str = ""
+    # The bounded envelope. Each must be present, finite and positive before any
+    # order is authorized; 0 means "unset", which refuses.
+    LIVE_EXECUTION_MANDATE_PER_TRADE_MAX_USD: Decimal = Decimal("0")
+    LIVE_EXECUTION_MANDATE_DAILY_MAX_USD: Decimal = Decimal("0")
+    LIVE_EXECUTION_MANDATE_MAX_OPEN_POSITIONS: int = 0
+    # Completed supervised executions required in the ledger before
+    # BOUNDED_AUTONOMOUS runs for a venue family. Counted from solana_executions
+    # (dex) / live_trades.mandate_mode (cex), never from a checklist: "we did the
+    # supervised trades" is a claim the database settles. Below 1 is refused.
+    LIVE_EXECUTION_MANDATE_MIN_SUPERVISED_EXECUTIONS: int = 3
+
     # -------- BL-NEW-LIVE-HYBRID M1 (design v2.1, 2026-05-08) --------
     # Layer 1 of 4-layer kill stack. Master kill — when False, all live
     # execution short-circuits at engine entry regardless of LIVE_MODE /

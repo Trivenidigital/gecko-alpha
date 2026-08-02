@@ -69,6 +69,7 @@ number to appear in the table below.
 | 20260726 | detection_decision_receipts_v1 | #474 |
 | 20260727 | detection_receipt_archive_v1 | #475 |
 | 20260801 | solana_executions_v1 | #487-followup |
+| 20260802 | bl_venue_neutral_execution_v1 | #500 |
 
 ## Notes / gaps
 

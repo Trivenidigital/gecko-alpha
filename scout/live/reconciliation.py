@@ -254,6 +254,32 @@ async def _emit_orphan_alert(
         )
 
 
+def _client_order_id_matches_hash(
+    client_order_id: str, intent_hash: str, venue: str | None
+) -> bool:
+    """Whether ``client_order_id`` is what ``intent_hash`` mints at ``venue``.
+
+    Works from the two stored columns alone — the original ``TradeIntent`` is long
+    gone by reconciliation time, and re-minting it would require the terms, which is
+    precisely what the hash exists to stand in for. The venue's declared form is a
+    pure function of the hash, so the derivation is reproducible from the row.
+
+    An unknown venue returns ``False``: a row whose venue has no declared id form is
+    a row this check cannot clear, and a check that cannot clear a row must not pass
+    it. Fail-closed here costs an operator review; failing open costs a position
+    managed under unverified terms.
+    """
+    from scout.live.order_id import VENUE_ORDER_ID_FORMS
+
+    form = VENUE_ORDER_ID_FORMS.get(venue or "")
+    if form is None:
+        return False
+    try:
+        return client_order_id == form.render(intent_hash)
+    except ValueError:
+        return False
+
+
 async def _flag_live_review(db: Database, trade_id: int) -> None:
     """Terminalize an open live row to ``needs_manual_review`` (fail-closed)."""
     assert db._conn is not None
@@ -327,7 +353,7 @@ async def reconcile_open_live_trades(
 
     cur = await db._conn.execute(
         "SELECT id, pair, client_order_id, entry_fill_price, entry_fill_qty, "
-        " created_at "
+        " created_at, venue, intent_hash "
         "FROM live_trades WHERE status='open'"
     )
     rows = await cur.fetchall()
@@ -336,9 +362,53 @@ async def reconcile_open_live_trades(
     rows_recovered = 0
     rows_terminalized = 0
     rows_resumed = 0
+    rows_binding_broken = 0
 
-    for trade_id, pair, cid, entry_price_s, entry_qty_s, _created in rows:
+    for (
+        trade_id,
+        pair,
+        cid,
+        entry_price_s,
+        entry_qty_s,
+        _created,
+        venue,
+        intent_hash,
+    ) in rows:
         rows_inspected += 1
+
+        # Intent binding, checked BEFORE the venue is asked anything.
+        #
+        # A row carrying an intent_hash asserts that its client_order_id was DERIVED
+        # from that hash at that venue (scout/live/order_id.py). The two fields
+        # arrive independently — the hash from the intent, the id from the same
+        # derivation — so a row where the id is not the one the hash mints is a row
+        # whose two halves describe different trades. Resuming it would manage a
+        # position under terms nobody authorized, and the venue cannot detect that
+        # because the id it holds is perfectly valid.
+        #
+        # Deliberately NOT applied to rows with intent_hash IS NULL: those predate
+        # intent binding and have no claim to check. Absence of a claim is not a
+        # broken claim.
+        if intent_hash is not None and cid is not None:
+            if not _client_order_id_matches_hash(cid, intent_hash, venue):
+                await _flag_live_review(db, trade_id)
+                rows_terminalized += 1
+                rows_binding_broken += 1
+                log.error(
+                    "live_orphan_intent_binding_broken",
+                    live_trade_id=trade_id,
+                    venue=venue,
+                    client_order_id=cid,
+                    intent_hash=intent_hash,
+                )
+                await _emit_orphan_alert(
+                    alert_hook,
+                    f"live orphan (intent binding broken): trade #{trade_id} "
+                    f"client_order_id does not derive from its intent_hash",
+                    event="live_orphan_intent_binding_broken",
+                    live_trade_id=trade_id,
+                )
+                continue
 
         if cid is None:
             await _flag_live_review(db, trade_id)
@@ -425,4 +495,5 @@ async def reconcile_open_live_trades(
         rows_recovered=rows_recovered,
         rows_terminalized=rows_terminalized,
         rows_resumed=rows_resumed,
+        rows_binding_broken=rows_binding_broken,
     )
