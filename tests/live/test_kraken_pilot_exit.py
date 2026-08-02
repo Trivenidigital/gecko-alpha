@@ -57,6 +57,7 @@ _ENTRY_TXID = "OENTRY-BW3P3-BUCMWZ"
 _EXIT_TXID = "OEXIT1-BW3P3-BUCMWZ"
 _PAIR = "XBTUSD"
 _SYMBOL = "BTC"
+_QUOTE = "USD"
 _CID = "gecko-x-1"
 
 _ENTRY_PRICE = Decimal("100.0")
@@ -137,17 +138,30 @@ def _settings(tmp_path, **overrides) -> Settings:
 
 
 class _Balances:
-    """``fetch_account_balance`` side effect with a mutable current value."""
+    """Per-asset ``fetch_account_balance`` side effect.
 
-    def __init__(self, *values: str) -> None:
-        self.remaining = [Decimal(v) for v in values]
+    Keyed by asset because the exit path now samples BOTH sides — the base to
+    prove the coins left and the quote to prove the money arrived — so a
+    single call-ordered sequence would silently hand a BTC figure to a USD
+    question. The last value in a sequence repeats.
+    """
+
+    def __init__(
+        self,
+        base: tuple[str, ...] = ("1.0", "1.0", "0.85"),
+        quote: tuple[str, ...] = ("500.0", "516.368"),
+    ) -> None:
+        self.seqs = {_SYMBOL: list(base), _QUOTE: list(quote)}
 
     def __call__(self, *, asset: str) -> float:
-        value = self.remaining.pop(0) if len(self.remaining) > 1 else self.remaining[0]
-        return float(value)
+        seq = self.seqs.get(asset.upper())
+        if not seq:
+            return 0.0
+        value = seq.pop(0) if len(seq) > 1 else seq[0]
+        return float(Decimal(value))
 
-    def set(self, value: str) -> None:
-        self.remaining = [Decimal(value)]
+    def set(self, asset: str, value: str) -> None:
+        self.seqs[asset.upper()] = [value]
 
 
 def _fills_by_txid(mapping: dict[str, list[dict]]):
@@ -188,7 +202,7 @@ def _fee_tier(**overrides) -> dict:
 def _adapter() -> MagicMock:
     """A happy-path adapter double. Tests override one method at a time."""
     adapter = MagicMock(spec=KrakenSpotAdapter)
-    adapter.balances = _Balances("1.0", "1.0", "0.85")
+    adapter.balances = _Balances()
     adapter.fetch_account_balance.side_effect = adapter.balances
     adapter.fetch_open_orders.return_value = []
     adapter.fetch_exchange_info_row.return_value = dict(_XBTUSD_ROW)
@@ -251,8 +265,8 @@ def _snapshot(
     row_id: int = 1,
     balance: Decimal = Decimal("1.0"),
     open_orders: list[dict] | None = None,
-    maker: str = _MAKER_PCT,
-    taker: str = _TAKER_PCT,
+    maker_ceiling: str = _MAKER_PCT,
+    taker_ceiling: str = _TAKER_PCT,
 ) -> dict:
     return build_exit_snapshot(
         live_trade_id=row_id,
@@ -266,8 +280,8 @@ def _snapshot(
         position_qty=volume,
         base_balance=balance,
         open_orders=open_orders or [],
-        maker_pct=Decimal(maker),
-        taker_pct=Decimal(taker),
+        maker_ceiling_pct=Decimal(maker_ceiling),
+        taker_ceiling_pct=Decimal(taker_ceiling),
     )
 
 
@@ -489,7 +503,7 @@ async def test_exit_refuses_when_the_venue_balance_is_short(tmp_path, monkeypatc
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
-    adapter.fetch_account_balance.side_effect = _Balances("0.05")
+    adapter.fetch_account_balance.side_effect = _Balances(base=("0.05",))
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
@@ -802,8 +816,8 @@ def test_the_token_changes_with_every_bound_field():
         _token(volume=Decimal("0.16")),
         _token(row_id=2),
         _token(balance=Decimal("2.0")),
-        _token(maker="0.5000"),
-        _token(taker="0.9000"),
+        _token(maker_ceiling="0.5000"),
+        _token(taker_ceiling="0.9000"),
         _token(open_orders=[{"txid": "OTHER", "pair": "ETHUSD", "vol": "1"}]),
     ]
     for variant in variants:
@@ -835,7 +849,7 @@ async def test_a_balance_drop_after_approval_voids_the_authorization(
 
     def _typed(_prompt: str = "") -> str:
         # The operator types the token; the world moves while they do.
-        balances.set("0.02")
+        balances.set(_SYMBOL, "0.02")
         return _token()
 
     monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
@@ -935,14 +949,92 @@ async def test_a_position_quantity_change_after_approval_voids_the_authorization
         await db.close()
 
 
-async def test_a_worsened_fee_after_approval_voids_the_authorization(
-    tmp_path, monkeypatch
-):
+# ----------------------------------------------------------------------
+# The fee contract, in full. ONE rule:
+#
+#     current fee <= approved ceiling  -> remains authorized
+#     current fee >  approved ceiling  -> authorization invalidated
+#
+# An earlier revision digested the exact current rates, which made the
+# contract self-contradictory: an IMPROVED rate also changed the digest and
+# voided an authorization the operator would obviously still give. These six
+# cases pin the single coherent rule so that cannot come back.
+# ----------------------------------------------------------------------
+async def _run_exit_with_fee_change_at_prompt(tmp_path, monkeypatch, tier_override):
+    """Approve, then move the fee schedule while the operator types."""
     _fix_decision_id(monkeypatch)
     adapter = _adapter()
 
     def _typed(_prompt: str = "") -> str:
-        adapter.fetch_fee_tier.return_value = _fee_tier(taker_pct="1.2000")
+        if tier_override is not None:
+            adapter.fetch_fee_tier.return_value = _fee_tier(**tier_override)
+        return _token()
+
+    monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", _typed)
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+        return code, adapter, _steps(tmp_path, row_id)
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize(
+    ("label", "override"),
+    [
+        ("unchanged", None),
+        ("improved-maker", {"maker_pct": "0.2000"}),
+        ("improved-taker", {"taker_pct": "0.5000"}),
+        ("improved-both", {"maker_pct": "0.2000", "taker_pct": "0.5000"}),
+    ],
+)
+async def test_a_fee_at_or_below_the_ceiling_remains_authorized(
+    tmp_path, monkeypatch, label, override
+):
+    """A rate the operator would be HAPPIER with must not void their approval."""
+    code, adapter, steps = await _run_exit_with_fee_change_at_prompt(
+        tmp_path, monkeypatch, override
+    )
+    assert code == EXIT_OK, label
+    assert adapter.place_limit_order.call_count == 1, label
+    recheck = _step(steps, "pre_submit_recheck")
+    assert recheck["outcome"] == "clear", label
+    # The ceiling is what was bound, so the digest is unmoved by a better rate.
+    assert recheck["digest"] == _step(steps, "authorization_bound")["digest"], label
+
+
+@pytest.mark.parametrize(
+    ("label", "override"),
+    [
+        ("worsened-maker", {"maker_pct": "0.9000"}),
+        ("worsened-taker", {"taker_pct": "1.2000"}),
+        ("worsened-both", {"maker_pct": "0.9000", "taker_pct": "1.2000"}),
+    ],
+)
+async def test_a_fee_above_the_ceiling_invalidates_the_authorization(
+    tmp_path, monkeypatch, label, override
+):
+    code, adapter, steps = await _run_exit_with_fee_change_at_prompt(
+        tmp_path, monkeypatch, override
+    )
+    assert code == EXIT_REFUSED, label
+    adapter.place_limit_order.assert_not_called()
+    abort = _step(steps, "aborted")
+    assert abort["stage"] == "pre_submit_recheck", label
+    assert "above the authorized ceiling" in abort["reason"].lower(), label
+
+
+async def test_a_fee_schedule_that_breaks_at_the_recheck_is_refused(
+    tmp_path, monkeypatch
+):
+    """Malformed or missing rates refuse — never a guess, never a stale reuse."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+
+    def _typed(_prompt: str = "") -> str:
+        adapter.fetch_fee_tier.side_effect = KrakenAPIError("TradeVolume down")
         return _token()
 
     monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
@@ -955,11 +1047,20 @@ async def test_a_worsened_fee_after_approval_voids_the_authorization(
             == EXIT_REFUSED
         )
         adapter.place_limit_order.assert_not_called()
-        abort = _step(_steps(tmp_path, row_id), "aborted")
-        assert abort["stage"] == "pre_submit_recheck"
-        assert "WORSENED" in abort["reason"]
+        assert _step(_steps(tmp_path, row_id), "aborted")["stage"] == "fee_tier"
     finally:
         await db.close()
+
+
+def test_the_digest_binds_ceilings_and_not_current_rates():
+    """Structural: the bound field set names ceilings, and only ceilings."""
+    snapshot = _snapshot()
+    assert "maker_ceiling" in snapshot and "taker_ceiling" in snapshot
+    assert "maker_pct" not in snapshot and "taker_pct" not in snapshot
+    # Two runs whose CURRENT rates differ but whose ceilings match are one
+    # approval; two whose ceilings differ are not.
+    assert _token(maker_ceiling=_MAKER_PCT) == _token()
+    assert _token(maker_ceiling="0.9000") != _token()
 
 
 async def test_the_recheck_records_a_matching_digest_on_the_clean_path(
@@ -1268,7 +1369,9 @@ async def test_a_balance_delta_one_lot_tick_out_still_closes(tmp_path, monkeypat
     _authorize(monkeypatch, _token())
     adapter = _adapter()
     # 1.0 -> 0.85000001 : one lot tick short of the exact 0.15 move.
-    adapter.fetch_account_balance.side_effect = _Balances("1.0", "1.0", "0.85000001")
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("1.0", "1.0", "0.85000001")
+    )
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
@@ -1290,7 +1393,7 @@ async def test_a_materially_short_balance_move_does_not_close_the_row(
     _authorize(monkeypatch, _token())
     adapter = _adapter()
     # Only 0.1485 actually left the account — 1% short of the 0.15 sold.
-    adapter.fetch_account_balance.side_effect = _Balances("1.0", "1.0", "0.8515")
+    adapter.fetch_account_balance.side_effect = _Balances(base=("1.0", "1.0", "0.8515"))
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
@@ -1690,7 +1793,7 @@ async def test_exit_cancel_after_the_order_already_filled_does_not_close_the_row
     adapter = _adapter()
     adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
     # Already reduced when the command starts — the sale predates this run.
-    adapter.fetch_account_balance.side_effect = _Balances("0.85")
+    adapter.fetch_account_balance.side_effect = _Balances(base=("0.85",))
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
@@ -1907,3 +2010,361 @@ def test_a_decision_id_resolves_to_its_live_trade_id(tmp_path):
     (directory / f"kraken_pilot_exit_42_{_DECISION}.json").write_text("", "utf-8")
     assert kraken_pilot.resolve_exit_decision_id(directory, _DECISION) == 42
     assert kraken_pilot.resolve_exit_decision_id(directory, "no-such-run") is None
+
+
+# ======================================================================
+# Crash recovery — a landed exit must be RETIRABLE without its process
+#
+# The originating run fsyncs its baseline (both balances, lot precision, fee
+# ceilings, limit price, entry economics) immediately before submitting,
+# precisely so a later process that shares none of its memory can reconcile
+# the trade. needs_manual_review is for contradictory or unavailable exchange
+# evidence — never for "the process exited".
+# ======================================================================
+def _write_intent(
+    tmp_path,
+    row_id: int = 1,
+    decision_id: str = "dead-run",
+    *,
+    submitted_txid: str | None = None,
+    base_before: str | None = "1.0",
+    quote_before: str | None = "500.0",
+    completed: bool = False,
+):
+    """An evidence file exactly as a run that died would have left it."""
+    directory = _evidence_dir(tmp_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"kraken_pilot_exit_{row_id}_{decision_id}.json"
+    records = [
+        {
+            "step": "exit_intent_persisted",
+            "at": "2026-08-02T00:00:00+00:00",
+            "decision_id": decision_id,
+            "live_trade_id": row_id,
+            "pair": _PAIR,
+            "side": "sell",
+            "volume": "0.15",
+            "price": "110.0",
+            "client_order_id": f"gecko-x-{row_id}",
+            "base_asset": _SYMBOL,
+            "quote_asset": _QUOTE,
+            "base_balance_before": base_before,
+            "quote_balance_before": quote_before,
+            "maker_ceiling_pct": _MAKER_PCT,
+            "taker_ceiling_pct": _TAKER_PCT,
+            "lot_decimals": _LOT_DECIMALS,
+            "base_tolerance": "0.00000001",
+            "entry_fill_price": "100.0",
+            "entry_fee": "0.12",
+            "entry_fee_source": "actual_entry_fills",
+            "submission_state": "about_to_submit",
+        }
+    ]
+    if submitted_txid:
+        records.append(
+            {
+                "step": "submitted",
+                "at": "2026-08-02T00:00:01+00:00",
+                "txid": submitted_txid,
+                "submission_state": "submitted",
+            }
+        )
+    if completed:
+        records.append(
+            {
+                "step": "run_completed",
+                "at": "2026-08-02T00:00:02+00:00",
+                "decision_id": decision_id,
+                "exit_code": 0,
+            }
+        )
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return path
+
+
+async def test_the_persisted_intent_carries_the_whole_recovery_baseline(
+    tmp_path, monkeypatch
+):
+    """Everything a foreign process needs to reconcile, in one fsynced record."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
+        intent = _step(_steps(tmp_path, row_id), "exit_intent_persisted")
+        for field in (
+            "live_trade_id",
+            "decision_id",
+            "pair",
+            "side",
+            "volume",
+            "price",
+            "client_order_id",
+            "digest",
+            "base_asset",
+            "quote_asset",
+            "base_balance_before",
+            "quote_balance_before",
+            "open_order_fingerprint",
+            "maker_ceiling_pct",
+            "taker_ceiling_pct",
+            "lot_decimals",
+            "base_tolerance",
+            "entry_fill_price",
+            "entry_fee",
+            "authorized_at",
+            "submission_state",
+        ):
+            assert intent.get(field) is not None, field
+        assert Decimal(intent["base_balance_before"]) == Decimal("1.0")
+        assert Decimal(intent["quote_balance_before"]) == Decimal("500.0")
+        assert intent["submission_state"] == "about_to_submit"
+        # Written BEFORE the order existed.
+        assert intent["at"] < _step(_steps(tmp_path, row_id), "submitted")["at"]
+    finally:
+        await db.close()
+
+
+async def test_restart_after_intent_but_before_submission_retains_the_position(
+    tmp_path, monkeypatch
+):
+    """Interruption point 1. No order was created, so the coins are still ours
+    and the lane must unblock — not escalate."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = None
+    adapter.resolve_order_submission_detail.return_value = {
+        "verdict": "not_accepted",
+        "client_order_id": _CID,
+        "txid": [],
+        "probes": [],
+    }
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_OK
+        row = await _row(db, row_id)
+        assert row["status"] == "open"
+        assert Decimal(row["entry_fill_qty"]) == _HELD_QTY
+        assert row["realized_pnl_usd"] is None
+        assert runner.dangling_exit_intents(row_id) == []
+        adapter.place_limit_order.assert_not_called()
+        adapter.cancel_order.assert_not_called()
+    finally:
+        await db.close()
+
+
+async def test_restart_after_submission_closes_a_fully_filled_exit(
+    tmp_path, monkeypatch
+):
+    """Interruption point 2/3, the one the previous revision could not do.
+
+    The process that submitted is gone. exit-status resolves the order, reads
+    the fills, compares CURRENT balances against the PERSISTED baseline, and
+    RETIRES the row with realised P&L — no needs_manual_review."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    # Post-restart balances: the sale already happened.
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.85",), quote=("516.368",)
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_OK
+        row = await _row(db, row_id)
+        assert row["status"] == "closed_via_reconciliation"
+        assert row["exit_order_id"] == _EXIT_TXID
+        assert Decimal(row["realized_pnl_usd"]) == _EXPECTED_PNL
+        assert row["closed_at"] is not None
+        recon = _step(_steps(tmp_path, row_id, "status"), "exit_reconciliation")
+        assert recon["origin"] == "exit-status"
+        assert recon["verdict"] == "pass"
+        assert Decimal(recon["base"]["before"]) == Decimal("1.0")
+        assert recon["quote"]["checked"] is True
+        # The interrupted run is accounted for, so the lane unblocks.
+        assert runner.dangling_exit_intents(row_id) == []
+        adapter.place_limit_order.assert_not_called()
+        adapter.cancel_order.assert_not_called()
+    finally:
+        await db.close()
+
+
+async def test_restart_after_submission_reduces_a_partially_filled_exit(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation(
+        "partial", filled_qty=0.05, fill_price=110.0
+    )
+    adapter.fetch_order_fills.side_effect = _fills_by_txid(
+        {
+            _ENTRY_TXID: _ENTRY_FILLS,
+            _EXIT_TXID: [{**_EXIT_FILLS[0], "vol": "0.05", "cost": "5.5"}],
+        }
+    )
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.95",), quote=("505.456",)
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_REVIEW
+        row = await _row(db, row_id)
+        assert row["status"] == "open"
+        assert Decimal(row["entry_fill_qty"]) == Decimal("0.10")
+        assert row["exit_order_id"] == _EXIT_TXID
+        assert row["realized_pnl_usd"] is None
+        partial = _step(_steps(tmp_path, row_id, "status"), "exit_partial_fill")
+        assert partial["origin"] == "exit-status"
+        assert partial["remaining_qty"] == "0.10"
+    finally:
+        await db.close()
+
+
+async def test_restart_with_the_order_still_working_changes_nothing(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation(
+        "pending", filled_qty=0.0, fill_price=None
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_BLOCKED
+        row = await _row(db, row_id)
+        assert row["status"] == "open"
+        assert Decimal(row["entry_fill_qty"]) == _HELD_QTY
+        adapter.cancel_order.assert_not_called()
+        adapter.place_limit_order.assert_not_called()
+        # Still working, so the intent stays dangling and `exit` stays blocked.
+        assert runner.dangling_exit_intents(row_id) != []
+    finally:
+        await db.close()
+
+
+async def test_recovery_uses_the_same_predicate_and_will_not_close_on_a_short_move(
+    tmp_path, monkeypatch
+):
+    """Recovery must not have a looser standard than the path that submitted.
+    A materially short base move fails the SAME one-lot-tick check."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    # 1.0 -> 0.8515 : only 0.1485 left, 1% short of the 0.15 the venue claims.
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.8515",), quote=("516.368",)
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_REVIEW
+        row = await _row(db, row_id)
+        assert row["status"] == "needs_manual_review"
+        assert row["realized_pnl_usd"] is None
+        recon = _step(_steps(tmp_path, row_id, "status"), "exit_reconciliation")
+        assert any("cumulative executed volume" in m for m in recon["base_mismatches"])
+        assert Decimal(recon["base"]["lot_tolerance"]) == Decimal("0.00000001")
+    finally:
+        await db.close()
+
+
+async def test_recovery_notices_when_the_proceeds_never_arrived(tmp_path, monkeypatch):
+    """The base check proves the coins left; only the quote check proves they
+    were paid for. That is why the intent persists BOTH balances."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.85",),
+        quote=("500.0",),  # unchanged: no money arrived
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_REVIEW
+        assert (await _row(db, row_id))["status"] == "needs_manual_review"
+        recon = _step(_steps(tmp_path, row_id, "status"), "exit_reconciliation")
+        assert recon["base_mismatches"] == []
+        assert any("did not arrive" in m for m in recon["quote_mismatches"])
+    finally:
+        await db.close()
+
+
+async def test_recovery_without_a_persisted_baseline_is_the_only_review_case(
+    tmp_path, monkeypatch
+):
+    """needs_manual_review for UNAVAILABLE evidence — and the message says the
+    baseline is what is missing, not that a process exited."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.85",), quote=("516.368",)
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID, base_before=None)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_REVIEW
+        assert (await _row(db, row_id))["status"] == "needs_manual_review"
+        recon = _step(_steps(tmp_path, row_id, "status"), "exit_reconciliation")
+        assert any("no pre-trade balance sample" in m for m in recon["base_mismatches"])
+    finally:
+        await db.close()
+
+
+async def test_a_completed_intent_is_not_replayed_by_recovery(tmp_path, monkeypatch):
+    """A run that finished is not dangling, and its row is left alone."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = None
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID, completed=True)
+        assert runner.dangling_exit_intents(row_id) == []
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_OK
+        assert (await _row(db, row_id))["status"] == "open"
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_settles_a_terminal_order_from_the_persisted_baseline(
+    tmp_path, monkeypatch
+):
+    """The gap the previous revision left open: an already-filled order found
+    by exit-cancel now closes, because the baseline was persisted."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    adapter.fetch_account_balance.side_effect = _Balances(
+        base=("0.85",), quote=("516.368",)
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_intent(tmp_path, row_id, submitted_txid=_EXIT_TXID)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_OK
+        adapter.cancel_order.assert_not_called()
+        row = await _row(db, row_id)
+        assert row["status"] == "closed_via_reconciliation"
+        assert Decimal(row["realized_pnl_usd"]) == _EXPECTED_PNL
+        baseline = _step(_steps(tmp_path, row_id, "cancel"), "recovery_baseline")
+        assert baseline["source"] == "persisted_exit_intent"
+    finally:
+        await db.close()

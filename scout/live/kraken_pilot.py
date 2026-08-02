@@ -242,7 +242,11 @@ from scout.live.idempotency import (
     record_pending_order,
 )
 from scout.live.kill_switch import KillSwitch
-from scout.live.kraken_adapter import KrakenAmbiguousSubmissionError, KrakenSpotAdapter
+from scout.live.kraken_adapter import (
+    KrakenAmbiguousSubmissionError,
+    KrakenSpotAdapter,
+    normalize_kraken_asset,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -303,7 +307,7 @@ _EXIT_AUTH_DOMAIN = "kraken-pilot-exit-v1"
 # in the venue's own published precision, and nothing above it. Deliberately
 # NOT a percentage of position size: Kraken takes its fee in the quote asset,
 # so the base-side move is exact, and a percentage band would mark a
-# materially short sale as fully reconciled. See _exit_lot_epsilon.
+# materially short sale as fully reconciled. See _exit_market_rules.
 _EXIT_BASE_TOLERANCE_LOT_TICKS = Decimal("1")
 
 # Redacted before anything is written to the evidence file or the log. The
@@ -769,9 +773,22 @@ def exit_intent_digest(snapshot: dict[str, Any]) -> str:
     ``open_orders``
         an order appeared, vanished or filled — including one placed from the
         web UI, which takes no lock of ours.
-    ``maker_pct`` / ``taker_pct``
-        the fee schedule moved. The screen's cost scenarios were computed
-        from these, so a change makes every figure on it stale.
+    ``maker_ceiling`` / ``taker_ceiling``
+        the MAXIMUM fee rates the operator authorized. Ceilings, not current
+        rates — see below.
+
+    **Fees are bound as ceilings, deliberately.** An earlier revision digested
+    the exact current ``maker_pct`` / ``taker_pct``, which made the contract
+    self-contradictory: a rate that IMPROVED also changed the digest and voided
+    an authorization the operator would obviously still give. Binding the
+    ceiling makes the rule single and monotone::
+
+        current fee <= approved ceiling  ->  remains authorized
+        current fee >  approved ceiling  ->  authorization invalidated
+
+    The ceiling is what the operator approves; the current rates are shown on
+    the screen and written to the evidence, but they are NOT digested, so only
+    a move against the operator can void the approval.
 
     Numbers are canonicalized — trailing zeros stripped, then rendered
     fixed-point — so ``0.1500`` and ``0.15`` are one value and not two. The
@@ -798,10 +815,16 @@ def build_exit_snapshot(
     position_qty: Decimal,
     base_balance: Decimal,
     open_orders: list[dict[str, Any]],
-    maker_pct: Decimal,
-    taker_pct: Decimal,
+    maker_ceiling_pct: Decimal,
+    taker_ceiling_pct: Decimal,
 ) -> dict[str, Any]:
-    """The comparable state snapshot an exit authorization is bound to."""
+    """The comparable state snapshot an exit authorization is bound to.
+
+    ``maker_ceiling_pct`` / ``taker_ceiling_pct`` are the MAXIMUM rates the
+    operator authorized, not the rates currently in force. They are carried
+    unchanged from the approval into the pre-submit rebuild, so a fee that
+    moved in the operator's favour leaves the digest identical.
+    """
     return {
         "live_trade_id": str(live_trade_id),
         "pair": pair.strip().upper(),
@@ -814,8 +837,8 @@ def build_exit_snapshot(
         "position_qty": _canonical_amount(position_qty),
         "base_balance": _canonical_amount(base_balance),
         "open_orders": open_order_fingerprint(open_orders),
-        "maker_pct": _canonical_amount(maker_pct),
-        "taker_pct": _canonical_amount(taker_pct),
+        "maker_ceiling": _canonical_amount(maker_ceiling_pct),
+        "taker_ceiling": _canonical_amount(taker_ceiling_pct),
     }
 
 
@@ -2464,8 +2487,8 @@ class PilotRunner:
             "venue_open_orders": open_orders,
         }
 
-    async def _exit_lot_epsilon(self, pair: str) -> tuple[Decimal, int]:
-        """The base-asset comparison epsilon for ``pair``, from ``lot_decimals``.
+    async def _exit_market_rules(self, pair: str) -> dict[str, Any]:
+        """Lot precision and the quote asset for ``pair``.
 
         Kraken charges the fee in the QUOTE asset, so a sell moves the base
         balance by exactly the executed quantity — there is no slippage to
@@ -2480,7 +2503,12 @@ class PilotRunner:
         BEFORE the approval so an unreadable pair refuses early;
         ``place_limit_order`` reads the same row and would fail on it anyway.
 
-        Returns ``(epsilon, lot_decimals)``.
+        The quote asset comes out of the same row because the recovery baseline
+        needs it: reconciling proceeds after a restart means comparing the
+        QUOTE balance too, and the pair is the only thing that says which asset
+        that is.
+
+        Returns ``{"base_epsilon", "lot_decimals", "quote_asset"}``.
         """
         try:
             row = await self._adapter.fetch_exchange_info_row(pair)
@@ -2507,7 +2535,12 @@ class PilotRunner:
                 f"Kraken returned a non-numeric lot_decimals {lot_decimals!r} "
                 f"for {pair}",
             ) from exc
-        return Decimal(1).scaleb(-places) * _EXIT_BASE_TOLERANCE_LOT_TICKS, places
+        quote_raw = str((row or {}).get("quote") or "")
+        return {
+            "base_epsilon": Decimal(1).scaleb(-places) * _EXIT_BASE_TOLERANCE_LOT_TICKS,
+            "lot_decimals": places,
+            "quote_asset": normalize_kraken_asset(quote_raw) if quote_raw else None,
+        }
 
     async def _exit_fee_tier(
         self, pair: str
@@ -2686,12 +2719,16 @@ class PilotRunner:
             )
             evidence.record("venue_state", **venue_state)
 
-            base_epsilon, lot_decimals = await self._exit_lot_epsilon(pair)
+            rules = await self._exit_market_rules(pair)
+            base_epsilon: Decimal = rules["base_epsilon"]
+            lot_decimals: int = rules["lot_decimals"]
+            quote_asset: str | None = rules["quote_asset"]
             evidence.record(
                 "market_rules",
                 pair=pair,
                 lot_decimals=lot_decimals,
                 base_tolerance=_fmt(base_epsilon),
+                quote_asset=quote_asset,
                 note="one lot tick; the base-side move on a sell is exact "
                 "because Kraken takes its fee in the quote asset",
             )
@@ -2748,6 +2785,12 @@ class PilotRunner:
                 taker=scenarios["taker"],
             )
 
+            # The rates in force at approval time BECOME the authorized
+            # ceilings. The operator is approving "at most this much fee", so a
+            # later improvement stays inside the approval and only a worsening
+            # breaks it. See exit_intent_digest for why binding the exact
+            # current rates instead was self-contradictory.
+            maker_ceiling, taker_ceiling = maker_pct, taker_pct
             approved = build_exit_snapshot(
                 live_trade_id=live_trade_id,
                 pair=pair,
@@ -2760,8 +2803,8 @@ class PilotRunner:
                 position_qty=held_qty,
                 base_balance=_dec_or_none(venue_state["available"]) or Decimal("0"),
                 open_orders=venue_state["venue_open_orders"],
-                maker_pct=maker_pct,
-                taker_pct=taker_pct,
+                maker_ceiling_pct=maker_ceiling,
+                taker_ceiling_pct=taker_ceiling,
             )
             token = exit_authorization_token(approved)
             evidence.record(
@@ -2769,9 +2812,13 @@ class PilotRunner:
                 token=token,
                 digest=exit_intent_digest(approved),
                 snapshot=approved,
+                maker_pct_at_approval=_fmt(maker_pct),
+                taker_pct_at_approval=_fmt(taker_pct),
                 note="the typed token is derived from this snapshot; it is "
                 "recomputed from freshly-read state immediately before "
-                "submission and any difference voids the authorization",
+                "submission and any difference voids the authorization. Fees "
+                "are bound as CEILINGS: a rate at or below the ceiling stays "
+                "authorized, a rate above it does not.",
             )
 
             authorized, outcome = self._request_exit_authorization(
@@ -2813,7 +2860,7 @@ class PilotRunner:
                     ),
                 )
 
-            await self._verify_snapshot_before_submit(
+            verified = await self._verify_snapshot_before_submit(
                 evidence=evidence,
                 approved=approved,
                 decision_id=decision_id,
@@ -2821,18 +2868,24 @@ class PilotRunner:
                 client_order_id=client_order_id,
                 pair=pair,
                 base_asset=base_asset,
+                quote_asset=quote_asset,
                 price=price,
                 held_qty=held_qty,
             )
-            # The verified sample is the honest reconciliation baseline: it was
-            # taken seconds before the order rather than across the approval.
-            balance_before = _dec_or_none(approved["base_balance"])
+            # The verified samples are the honest reconciliation baseline: taken
+            # seconds before the order rather than across the approval.
+            balance_before = verified["base_balance"]
+            quote_before = verified["quote_balance"]
 
-            # Durable intent, immediately before the submission. Fsynced by
-            # EvidenceLog.record, so a crash in the next few milliseconds
-            # leaves a record naming exactly what was about to be sent — and
-            # the client order id in it is deterministic, so the recovery run
-            # finds the order if it landed instead of selling twice.
+            # THE RECOVERY BASELINE. Written and fsynced immediately before the
+            # submission, and deliberately self-sufficient: a later process
+            # that has none of this run's memory must be able to reconcile the
+            # order from this record alone. That is why the balances, the lot
+            # precision and the fee ceilings are in it and not just the order
+            # parameters — without the pre-trade balances there is nothing to
+            # compare the post-restart balances against, and "the process
+            # exited" would become an excuse to escalate a perfectly
+            # reconcilable trade.
             evidence.record(
                 "exit_intent_persisted",
                 decision_id=decision_id,
@@ -2843,6 +2896,22 @@ class PilotRunner:
                 price=_fmt(price),
                 client_order_id=client_order_id,
                 digest=exit_intent_digest(approved),
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                base_balance_before=_fmt(balance_before),
+                quote_balance_before=_fmt(quote_before),
+                open_order_fingerprint=verified["open_orders"],
+                maker_ceiling_pct=_fmt(maker_ceiling),
+                taker_ceiling_pct=_fmt(taker_ceiling),
+                maker_pct_at_submit=_fmt(verified["maker_pct"]),
+                taker_pct_at_submit=_fmt(verified["taker_pct"]),
+                lot_decimals=lot_decimals,
+                base_tolerance=_fmt(base_epsilon),
+                entry_fill_price=_fmt(entry_price),
+                entry_fee=_fmt(entry_fee),
+                entry_fee_source=entry_fee_source,
+                authorized_at=verified["authorized_at"],
+                submission_state="about_to_submit",
                 validate_only=validate_only,
                 note="written and fsynced BEFORE submission; if the run dies "
                 "after this record the order may exist — resolve with "
@@ -2856,14 +2925,16 @@ class PilotRunner:
                 client_order_id=client_order_id,
                 pair=pair,
                 base_asset=base_asset,
+                quote_asset=quote_asset,
                 entry_price=entry_price,
                 entry_fee=entry_fee,
                 entry_fee_source=entry_fee_source,
                 held_qty=held_qty,
                 price=price,
-                taker_pct=taker_pct,
+                taker_pct=taker_ceiling,
                 base_epsilon=base_epsilon,
                 balance_before=balance_before,
+                quote_before=quote_before,
                 validate_only=validate_only,
             )
 
@@ -2919,9 +2990,10 @@ class PilotRunner:
         client_order_id: str,
         pair: str,
         base_asset: str,
+        quote_asset: str | None,
         price: Decimal,
         held_qty: Decimal,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Re-read every assumption the approval screen rested on, then compare.
 
         The approval prompt is unbounded operator time and the pilot lock only
@@ -2935,6 +3007,14 @@ class PilotRunner:
         screen the only honest move is to show them a new one. The individual
         checks below run first purely so the refusal can name what moved;
         the digest comparison is the backstop that catches anything they miss.
+
+        Fees are the one asymmetric field: the snapshot carries CEILINGS, which
+        are carried across unchanged, so the digest cannot move when a rate
+        improves. Only the explicit ceiling comparison can refuse, and only
+        upward. See ``exit_intent_digest``.
+
+        Returns the freshly-sampled baseline the caller persists and later
+        reconciles against.
         """
         selection = await self._load_exit_row(live_trade_id, stage="pre_submit_recheck")
         row = selection["row"]
@@ -2961,18 +3041,23 @@ class PilotRunner:
         )
         maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
 
-        approved_maker = _dec_or_none(approved["maker_pct"]) or Decimal("0")
-        approved_taker = _dec_or_none(approved["taker_pct"]) or Decimal("0")
-        if maker_pct > approved_maker or taker_pct > approved_taker:
+        # The ONE-WAY fee gate. The ceilings came from the approval and are
+        # reused verbatim below, so a rate that improved cannot move the
+        # digest; only this comparison can refuse, and only when a rate rose
+        # above what the operator authorized.
+        maker_ceiling = _dec_or_none(approved["maker_ceiling"]) or Decimal("0")
+        taker_ceiling = _dec_or_none(approved["taker_ceiling"]) or Decimal("0")
+        if maker_pct > maker_ceiling or taker_pct > taker_ceiling:
             raise PilotAbort(
                 "pre_submit_recheck",
-                f"the fee schedule WORSENED after the authorization "
-                f"(maker {_fmt(approved_maker)}% -> {_fmt(maker_pct)}%, taker "
-                f"{_fmt(approved_taker)}% -> {_fmt(taker_pct)}%) — every cost "
-                "figure the operator approved is now understated. Nothing was "
-                "sent.",
+                f"the fee schedule rose ABOVE the authorized ceiling "
+                f"(maker {_fmt(maker_pct)}% vs ceiling {_fmt(maker_ceiling)}%, "
+                f"taker {_fmt(taker_pct)}% vs ceiling {_fmt(taker_ceiling)}%) — "
+                "every cost figure the operator approved is now understated. "
+                "Nothing was sent.",
             )
 
+        quote_balance = await self._sample_quote_balance(quote_asset)
         current = build_exit_snapshot(
             live_trade_id=live_trade_id,
             pair=pair,
@@ -2985,8 +3070,10 @@ class PilotRunner:
             position_qty=current_qty,
             base_balance=_dec_or_none(venue_state["available"]) or Decimal("0"),
             open_orders=venue_state["venue_open_orders"],
-            maker_pct=maker_pct,
-            taker_pct=taker_pct,
+            # Carried, not re-derived: the ceiling is the operator's decision,
+            # not a fact about the venue, so it does not change under them.
+            maker_ceiling_pct=maker_ceiling,
+            taker_ceiling_pct=taker_ceiling,
         )
         differences = snapshot_differences(approved, current)
         if differences:
@@ -3005,14 +3092,54 @@ class PilotRunner:
                 "fresh approval screen. Changed: " + "; ".join(differences),
             )
 
+        authorized_at = datetime.now(timezone.utc).isoformat()
         evidence.record(
             "pre_submit_recheck",
             outcome="clear",
             digest=exit_intent_digest(current),
+            maker_pct=_fmt(maker_pct),
+            taker_pct=_fmt(taker_pct),
+            maker_ceiling_pct=_fmt(maker_ceiling),
+            taker_ceiling_pct=_fmt(taker_ceiling),
+            fee_verdict="at or below the authorized ceilings",
+            quote_asset=quote_asset,
+            quote_balance=_fmt(quote_balance),
+            authorized_at=authorized_at,
             other_blocking_rows=lane["other_blocking_rows"],
             dangling_exit_intents=lane["dangling_exit_intents"],
             **venue_state,
         )
+        return {
+            "base_balance": _dec_or_none(current["base_balance"]),
+            "quote_balance": quote_balance,
+            "open_orders": current["open_orders"],
+            "maker_pct": maker_pct,
+            "taker_pct": taker_pct,
+            "authorized_at": authorized_at,
+        }
+
+    async def _sample_quote_balance(self, quote_asset: str | None) -> Decimal | None:
+        """The quote-asset balance, best effort.
+
+        Part of the recovery baseline rather than a gate: proceeds land in the
+        quote asset, so a restart needs a pre-trade figure to compare against.
+        A failure here must NOT block a sale — the base-side checks are the
+        ones that decide whether the coins left — so it degrades to ``None``
+        and the reconciliation simply skips the quote-balance comparison and
+        says so.
+        """
+        if not quote_asset:
+            return None
+        try:
+            return _dec(await self._adapter.fetch_account_balance(asset=quote_asset))
+        except Exception as exc:
+            log.warning(
+                "kraken_pilot_quote_balance_unavailable",
+                asset=quote_asset,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return None
 
     def _request_exit_authorization(
         self,
@@ -3151,6 +3278,7 @@ class PilotRunner:
         client_order_id: str,
         pair: str,
         base_asset: str,
+        quote_asset: str | None,
         entry_price: Decimal,
         entry_fee: Decimal,
         entry_fee_source: str,
@@ -3159,6 +3287,7 @@ class PilotRunner:
         taker_pct: Decimal,
         base_epsilon: Decimal,
         balance_before: Decimal | None,
+        quote_before: Decimal | None,
         validate_only: bool,
     ) -> int:
         """Submit exactly once, then decide what came back."""
@@ -3254,6 +3383,7 @@ class PilotRunner:
             txid=txid,
             pair=pair,
             base_asset=base_asset,
+            quote_asset=quote_asset,
             entry_price=entry_price,
             entry_fee=entry_fee,
             entry_fee_source=entry_fee_source,
@@ -3262,6 +3392,7 @@ class PilotRunner:
             taker_pct=taker_pct,
             base_epsilon=base_epsilon,
             balance_before=balance_before,
+            quote_before=quote_before,
         )
 
     async def _resolve_exit_ambiguity(
@@ -3355,6 +3486,7 @@ class PilotRunner:
         txid: str | None,
         pair: str,
         base_asset: str,
+        quote_asset: str | None,
         entry_price: Decimal,
         entry_fee: Decimal,
         entry_fee_source: str,
@@ -3363,6 +3495,7 @@ class PilotRunner:
         taker_pct: Decimal,
         base_epsilon: Decimal,
         balance_before: Decimal | None,
+        quote_before: Decimal | None,
     ) -> int:
         """Wait for the fill, then hand the outcome to the settlement path."""
         timeout_sec = float(self._settings.KRAKEN_PILOT_FILL_TIMEOUT_SEC)
@@ -3390,6 +3523,7 @@ class PilotRunner:
             txid=txid,
             pair=pair,
             base_asset=base_asset,
+            quote_asset=quote_asset,
             entry_price=entry_price,
             entry_fee=entry_fee,
             entry_fee_source=entry_fee_source,
@@ -3398,6 +3532,7 @@ class PilotRunner:
             taker_pct=taker_pct,
             base_epsilon=base_epsilon,
             balance_before=balance_before,
+            quote_before=quote_before,
             origin="exit",
         )
 
@@ -3411,6 +3546,7 @@ class PilotRunner:
         txid: str | None,
         pair: str,
         base_asset: str,
+        quote_asset: str | None,
         entry_price: Decimal,
         entry_fee: Decimal,
         entry_fee_source: str,
@@ -3419,6 +3555,7 @@ class PilotRunner:
         taker_pct: Decimal,
         base_epsilon: Decimal,
         balance_before: Decimal | None,
+        quote_before: Decimal | None,
         origin: str,
     ) -> int:
         """Decide what a terminal (or timed-out) exit order means for the row.
@@ -3547,6 +3684,7 @@ class PilotRunner:
             txid=lookup_txid or None,
             pair=pair,
             base_asset=base_asset,
+            quote_asset=quote_asset,
             entry_price=entry_price,
             entry_fee=entry_fee,
             entry_fee_source=entry_fee_source,
@@ -3559,6 +3697,7 @@ class PilotRunner:
             taker_pct=taker_pct,
             base_epsilon=base_epsilon,
             balance_before=balance_before,
+            quote_before=quote_before,
             origin=origin,
         )
 
@@ -3684,6 +3823,7 @@ class PilotRunner:
         txid: str | None,
         pair: str,
         base_asset: str,
+        quote_asset: str | None,
         entry_price: Decimal,
         entry_fee: Decimal,
         entry_fee_source: str,
@@ -3696,6 +3836,7 @@ class PilotRunner:
         taker_pct: Decimal,
         base_epsilon: Decimal,
         balance_before: Decimal | None,
+        quote_before: Decimal | None,
         origin: str,
     ) -> int:
         """Reconcile, and close ONLY if the reconciliation confirms.
@@ -3711,9 +3852,15 @@ class PilotRunner:
 
         **Quote asset** — proceeds and fees, where a percentage genuinely
         applies. The fee is checked against the account's own taker rate (the
-        worst case) with ``KRAKEN_PILOT_FEE_HEADROOM_PCT`` of slack, and the
-        executed price is checked against the limit, because a limit SELL can
-        never execute below its limit and a VWAP that did is not our order.
+        worst case) with ``KRAKEN_PILOT_FEE_HEADROOM_PCT`` of slack, the
+        executed price is checked against the limit (a limit SELL can never
+        execute below its limit, so a VWAP that did is not our order), and —
+        when a pre-trade quote balance was persisted — the proceeds are
+        checked to have actually ARRIVED in the quote asset.
+
+        This is the ONLY reconciliation predicate in the module. ``exit``,
+        ``exit-cancel`` and ``exit-status`` all reach it, so recovery cannot
+        drift to a looser standard than the path that placed the order.
 
         A close asserts the position is gone. Asserting that on evidence we
         could not corroborate is how a phantom position gets created, and the
@@ -3736,15 +3883,15 @@ class PilotRunner:
         observed_delta: Decimal | None = None
         expected_delta = -filled_qty
         if balance_before is None:
-            # No usable baseline. Reached when a recovery command finds an
-            # order that was ALREADY terminal — the coins left before this
-            # process sampled anything, so there is no delta to measure and
-            # none may be invented. The sale is not denied; it is unconfirmed,
-            # which is a different thing and must not close the row.
+            # No usable baseline — UNAVAILABLE EVIDENCE, which is a legitimate
+            # reason to withhold a close. Not reached merely because the
+            # originating process exited: that process persists the pre-trade
+            # balances in its intent record precisely so a later run can pass
+            # them back in here. This fires only when no such record survives.
             base_mismatches.append(
-                "no pre-trade balance sample to compare the sale against — the "
-                "order was already terminal before this run sampled the balance, "
-                "so the coins leaving cannot be independently corroborated here"
+                "no pre-trade balance sample to compare the sale against, and "
+                "none was recoverable from a persisted exit intent — the coins "
+                "leaving cannot be independently corroborated here"
             )
         elif balance_after is not None:
             observed_delta = balance_after - balance_before
@@ -3797,12 +3944,44 @@ class PilotRunner:
                         f"notional ({_fmt(fee_ceiling)} including headroom)"
                     )
 
-        mismatches = base_mismatches + quote_mismatches
         proceeds = (
             totals["cost"] - totals["fee"]
             if totals["cost"] > 0
             else (exit_vwap or Decimal("0")) * filled_qty - totals["fee"]
         )
+
+        # Did the money actually ARRIVE? The base check proves the coins left;
+        # only this proves they were paid for. Available only when a pre-trade
+        # quote balance was persisted, which is the whole reason the intent
+        # record carries one. A percentage band is right here — the quote side
+        # is where fee and rounding variability legitimately lives.
+        quote_after: Decimal | None = None
+        quote_delta: Decimal | None = None
+        if quote_before is not None and quote_asset and proceeds > 0:
+            try:
+                quote_after = _dec(
+                    await self._adapter.fetch_account_balance(asset=quote_asset)
+                )
+            except Exception as exc:
+                quote_mismatches.append(
+                    f"could not re-read the {quote_asset} balance after the sale "
+                    f"({type(exc).__name__})"
+                )
+            else:
+                quote_delta = quote_after - quote_before
+                band = (
+                    proceeds
+                    * _dec(self._settings.KRAKEN_PILOT_FEE_HEADROOM_PCT)
+                    / Decimal("100")
+                )
+                if abs(quote_delta - proceeds) > band:
+                    quote_mismatches.append(
+                        f"{quote_asset} balance rose by {_fmt(quote_delta)} but the "
+                        f"sale's net proceeds are {_fmt(proceeds)} — the money did "
+                        f"not arrive as the fills describe (band {_fmt(band)})"
+                    )
+
+        mismatches = base_mismatches + quote_mismatches
         cost_basis = entry_price * held_qty + entry_fee
         pnl = proceeds - cost_basis
         pnl_pct = pnl / cost_basis * Decimal("100") if cost_basis > 0 else None
@@ -3833,6 +4012,14 @@ class PilotRunner:
                 "lot_tolerance": _fmt(base_epsilon),
                 "note": "exact comparison — Kraken takes its fee in the quote "
                 "asset, so no quote-side variability may widen this band",
+            },
+            "quote": {
+                "asset": quote_asset,
+                "before": _fmt(quote_before),
+                "after": _fmt(quote_after),
+                "observed_delta": _fmt(quote_delta),
+                "expected_delta": _fmt(proceeds),
+                "checked": quote_delta is not None,
             },
             "fill_count": len(fills),
         }
@@ -3919,6 +4106,55 @@ class PilotRunner:
         return EXIT_OK
 
     # -------- exit-cancel / exit-status --------
+    def latest_exit_intent(self, live_trade_id: int) -> dict[str, Any]:
+        """The most recent persisted exit intent for a position, if any.
+
+        This is the recovery baseline. The run that placed the order fsynced
+        it immediately before submitting, precisely so a process that shares
+        none of that run's memory can still reconcile the trade: the pre-trade
+        base and quote balances, the lot precision, the fee ceilings, the
+        entry economics and the limit price are all in it.
+
+        Returns ``{}`` when no intent was ever recorded for the row — which is
+        a real absence (nothing was ever authorized), not a read failure.
+        """
+        best: dict[str, Any] = {}
+        best_at = ""
+        for path in self._exit_intent_files(live_trade_id):
+            steps = self._read_evidence_steps(path)
+            intent = next(
+                (s for s in steps if s.get("step") == "exit_intent_persisted"), None
+            )
+            if intent is None:
+                continue
+            at = str(intent.get("at") or "")
+            if at >= best_at:
+                best_at, best = at, dict(intent)
+                best["evidence_path"] = str(path)
+                best["completed"] = any(s.get("step") == "run_completed" for s in steps)
+                best["submitted_txid"] = next(
+                    (
+                        s.get("txid")
+                        for s in steps
+                        if s.get("step") in ("submitted", "exit_txid_persisted")
+                    ),
+                    None,
+                )
+        return best
+
+    @staticmethod
+    def _baseline_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
+        """Parse the numeric baseline out of a persisted intent record."""
+        return {
+            "base_balance_before": _dec_or_none(intent.get("base_balance_before")),
+            "quote_balance_before": _dec_or_none(intent.get("quote_balance_before")),
+            "base_epsilon": _dec_or_none(intent.get("base_tolerance")),
+            "price": _dec_or_none(intent.get("price")),
+            "taker_ceiling_pct": _dec_or_none(intent.get("taker_ceiling_pct")),
+            "entry_fee": _dec_or_none(intent.get("entry_fee")),
+            "entry_fee_source": intent.get("entry_fee_source"),
+        }
+
     async def _exit_context(
         self, live_trade_id: int, *, command: str
     ) -> dict[str, Any]:
@@ -3929,6 +4165,7 @@ class PilotRunner:
         entry_price: Decimal = selection["entry_price"]
         held_qty: Decimal = selection["held_qty"]
         client_order_id = make_exit_client_order_id(live_trade_id)
+        intent = self.latest_exit_intent(live_trade_id)
         conf = await self._adapter.fetch_order_by_client_id(
             pair=pair, client_order_id=client_order_id
         )
@@ -3939,6 +4176,8 @@ class PilotRunner:
             "entry_price": entry_price,
             "held_qty": held_qty,
             "client_order_id": client_order_id,
+            "intent": intent,
+            "baseline": self._baseline_from_intent(intent),
             "conf": conf,
         }
 
@@ -3998,24 +4237,41 @@ class PilotRunner:
                 )
 
             row = context["row"]
-            base_epsilon, _places = await self._exit_lot_epsilon(pair)
+            rules = await self._exit_market_rules(pair)
+            base_epsilon: Decimal = rules["base_epsilon"]
+            quote_asset = context["intent"].get("quote_asset") or rules["quote_asset"]
 
             # A balance sampled AFTER the order already went terminal is not a
             # pre-trade baseline — the coins left before we looked, so the
             # delta it produces would be ~0 and would read as "nothing sold"
-            # for a sale that did happen. Sampling it anyway and calling it a
-            # baseline is worse than having none: it turns an unconfirmable
-            # sale into a confidently wrong one. So the baseline exists only
-            # when the order was still working when we looked.
+            # for a sale that did happen. The PERSISTED intent is the honest
+            # source in that case: the run that placed the order recorded the
+            # balances immediately before submitting. Only when no such record
+            # survives is there genuinely no baseline.
             already_terminal = conf.status in ("filled", "partial", "rejected")
-            balance_before = (
-                None
-                if already_terminal
-                else _dec(
+            persisted = context["baseline"]
+            if already_terminal:
+                balance_before = persisted["base_balance_before"]
+                quote_before = persisted["quote_balance_before"]
+            else:
+                balance_before = _dec(
                     await self._adapter.fetch_account_balance(
                         asset=context["base_asset"]
                     )
                 )
+                quote_before = await self._sample_quote_balance(quote_asset)
+            evidence.record(
+                "recovery_baseline",
+                source=(
+                    "persisted_exit_intent"
+                    if already_terminal and balance_before is not None
+                    else "sampled_now" if not already_terminal else "unavailable"
+                ),
+                base_asset=context["base_asset"],
+                quote_asset=quote_asset,
+                base_balance_before=_fmt(balance_before),
+                quote_balance_before=_fmt(quote_before),
+                intent_decision_id=context["intent"].get("decision_id"),
             )
 
             if already_terminal:
@@ -4036,7 +4292,9 @@ class PilotRunner:
                     context=context,
                     conf=conf,
                     base_epsilon=base_epsilon,
+                    quote_asset=quote_asset,
                     balance_before=balance_before,
+                    quote_before=quote_before,
                     origin="exit-cancel",
                 )
 
@@ -4109,7 +4367,9 @@ class PilotRunner:
                 context=context,
                 conf=conf,
                 base_epsilon=base_epsilon,
+                quote_asset=quote_asset,
                 balance_before=balance_before,
+                quote_before=quote_before,
                 origin="exit-cancel",
             )
 
@@ -4156,38 +4416,67 @@ class PilotRunner:
         context: dict[str, Any],
         conf: Any,
         base_epsilon: Decimal,
+        quote_asset: str | None,
         balance_before: Decimal | None,
+        quote_before: Decimal | None,
         origin: str,
     ) -> int:
         """Account for an exit order found by a recovery command.
 
-        Needs the fee tier and the entry fee for the same reason ``exit`` does
-        — a close writes realised P&L — so both are read here rather than
-        assumed. A fee-tier failure refuses, exactly as it does on the way in.
+        Every economic input is taken from the PERSISTED intent when one
+        exists and re-read only as a fallback. That ordering matters: the
+        persisted figures are the ones the authorization was given against, so
+        using them keeps a recovered settlement identical to the one the
+        original process would have produced. Only the entry fee and the fee
+        tier are re-read when absent, and a fee-tier failure refuses exactly as
+        it does on the way in.
         """
         row = context["row"]
         held_qty: Decimal = context["held_qty"]
         entry_price: Decimal = context["entry_price"]
         pair = context["pair"]
-        maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
-        entry_fee, entry_fee_source = await self._entry_fee(
-            row=row, entry_notional=entry_price * held_qty, taker_pct=taker_pct
-        )
+        persisted = context["baseline"]
+
+        taker_ceiling = persisted["taker_ceiling_pct"]
+        maker_pct = taker_pct = None
+        if taker_ceiling is None:
+            maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
+            taker_ceiling = taker_pct
+
+        entry_fee = persisted["entry_fee"]
+        entry_fee_source = persisted["entry_fee_source"] or "unknown"
+        if entry_fee is None:
+            if taker_pct is None:
+                maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
+            entry_fee, entry_fee_source = await self._entry_fee(
+                row=row, entry_notional=entry_price * held_qty, taker_pct=taker_pct
+            )
         evidence.record(
             "recovery_economics",
+            taker_ceiling_pct=_fmt(taker_ceiling),
             maker_pct=_fmt(maker_pct),
             taker_pct=_fmt(taker_pct),
             entry_fee=_fmt(entry_fee),
             entry_fee_source=entry_fee_source,
+            economics_source=(
+                "persisted_exit_intent"
+                if persisted["entry_fee"] is not None
+                else "re-read"
+            ),
         )
-        # The limit price the order actually carries, so the "a sell cannot
-        # execute below its limit" check compares against the real instruction
-        # rather than something this command invented.
-        limit_price = _dec_or_none(
-            (conf.raw_response or {}).get("descr", {}).get("price")
-            if isinstance(conf.raw_response, dict)
-            else None
-        ) or _dec_or_none(conf.fill_price)
+        # The limit price the order actually carries. Persisted intent first —
+        # it is what the operator authorized — then the venue's own descr, so
+        # the "a sell cannot execute below its limit" check never compares
+        # against something this command invented.
+        limit_price = (
+            persisted["price"]
+            or _dec_or_none(
+                (conf.raw_response or {}).get("descr", {}).get("price")
+                if isinstance(conf.raw_response, dict)
+                else None
+            )
+            or _dec_or_none(conf.fill_price)
+        )
         return await self._settle_exit_outcome(
             evidence=evidence,
             decision_id=decision_id,
@@ -4196,27 +4485,45 @@ class PilotRunner:
             txid=conf.venue_order_id,
             pair=pair,
             base_asset=context["base_asset"],
+            quote_asset=quote_asset,
             entry_price=entry_price,
             entry_fee=entry_fee,
             entry_fee_source=entry_fee_source,
             held_qty=held_qty,
             price=limit_price or Decimal("0"),
-            taker_pct=taker_pct,
-            base_epsilon=base_epsilon,
+            taker_pct=taker_ceiling,
+            base_epsilon=persisted["base_epsilon"] or base_epsilon,
             balance_before=balance_before,
+            quote_before=quote_before,
             origin=origin,
         )
 
     async def exit_status(self, *, live_trade_id: int) -> int:
-        """READ-ONLY recovery report for one position's exit.
+        """Recover one position's exit WITHOUT the process that started it.
 
-        Sends nothing to the venue but reads. Its second job is clearing the
-        lane after an interrupted run: an exit that died between authorizing
-        and accounting leaves a dangling intent that blocks the next ``exit``,
-        and only positive evidence may clear it. So the exit client id is put
-        through the adapter's two-sweep resolver, and the intent is marked
-        resolved ONLY on a ``not_accepted`` verdict — the one verdict that
-        means no such order exists. Anything else leaves the block in place.
+        Sends nothing to the venue but reads, and settles the ledger from what
+        it finds. This is the crash-recovery path, and it is required to reach
+        a real verdict rather than parking everything as needs_manual_review —
+        "the process exited" is not evidence about the money.
+
+        It works because the originating run fsynced its baseline before
+        submitting: the pre-trade base AND quote balances, the lot precision,
+        the fee ceilings, the limit price and the entry economics. With those
+        in hand this command runs the SAME reconciliation predicate ``exit``
+        runs, so recovery cannot settle to a looser standard.
+
+        Outcomes:
+
+        - order fully filled            -> CLOSE the row (realised P&L written)
+        - order partially filled        -> REDUCE the held quantity, stay open
+        - order absent, resolver clean  -> RETAIN the position, clear the intent
+        - order still working           -> report and leave everything alone
+        - contradictory / unreadable    -> needs_manual_review, and only then
+
+        The three restart points are all covered by this one path: after
+        intent persistence (no order exists — retain), after submission (order
+        exists, may be working or terminal), and after the fill (terminal,
+        settle it).
         """
         decision_id = str(uuid4())
         evidence = self._evidence_for_exit_command("status", live_trade_id, decision_id)
@@ -4236,6 +4543,8 @@ class PilotRunner:
                 )
             client_order_id = make_exit_client_order_id(live_trade_id)
             pair = str(row["pair"] or "")
+            intent = self.latest_exit_intent(live_trade_id)
+            baseline = self._baseline_from_intent(intent)
 
             conf = await self._adapter.fetch_order_by_client_id(
                 pair=pair, client_order_id=client_order_id
@@ -4259,7 +4568,11 @@ class PilotRunner:
                 )
                 if resolution.get("verdict") == "not_accepted":
                     resolved_paths = self._mark_intents_resolved(
-                        dangling, decision_id=decision_id
+                        dangling,
+                        decision_id=decision_id,
+                        note="two clean sweeps of OpenOrders + ClosedOrders found "
+                        "no order carrying this exit client id, so the interrupted "
+                        "run never created one; the position is retained",
                     )
 
             evidence.record(
@@ -4278,6 +4591,8 @@ class PilotRunner:
                 open_order_count=len(open_orders),
                 listing_error=listing_error,
                 dangling_exit_intents=dangling,
+                persisted_intent=intent.get("decision_id"),
+                baseline_available=baseline["base_balance_before"] is not None,
                 resolution=resolution,
                 resolved_intent_files=resolved_paths,
             )
@@ -4302,6 +4617,12 @@ class PilotRunner:
                     else str(len(open_orders))
                 ),
                 f"  dangling intents : {len(dangling)}",
+                "  persisted baseline: "
+                + (
+                    f"yes (from {intent.get('decision_id')})"
+                    if baseline["base_balance_before"] is not None
+                    else "none — a settlement cannot be corroborated"
+                ),
             ]
             for item in dangling:
                 lines.append(
@@ -4313,28 +4634,58 @@ class PilotRunner:
             if resolved_paths:
                 lines.append(
                     f"  cleared          : {len(resolved_paths)} dangling intent(s) "
-                    "— the venue proved no such order exists"
+                    "— the venue proved no such order exists; position RETAINED"
                 )
             lines.append("")
             lines.append("  This command sent NOTHING to the venue but reads.")
+            _print_block("KRAKEN PILOT EXIT STATUS", lines)
+
+            # ---- settlement ----
+            terminal = conf is not None and conf.status in (
+                "filled",
+                "partial",
+                "rejected",
+            )
+            if terminal and row["status"] == "open":
+                context = await self._exit_context(live_trade_id, command="exit_status")
+                rules = await self._exit_market_rules(pair)
+                quote_asset = intent.get("quote_asset") or rules["quote_asset"]
+                code = await self._settle_terminal_from_recovery(
+                    evidence=evidence,
+                    decision_id=decision_id,
+                    live_trade_id=live_trade_id,
+                    context=context,
+                    conf=conf,
+                    base_epsilon=rules["base_epsilon"],
+                    quote_asset=quote_asset,
+                    balance_before=baseline["base_balance_before"],
+                    quote_before=baseline["quote_balance_before"],
+                    origin="exit-status",
+                )
+                if code in (EXIT_OK, EXIT_REVIEW) and dangling:
+                    # The order has been accounted for either way — closed,
+                    # reduced, or explicitly parked for review with its numbers
+                    # recorded. Leaving the intent dangling after that would
+                    # block the lane on a run that IS now resolved.
+                    resolved_paths += self._mark_intents_resolved(
+                        dangling,
+                        decision_id=decision_id,
+                        note="the interrupted run's order was found terminal and "
+                        f"settled by exit-status (exit code {code})",
+                        exit_code=code,
+                    )
+                return code
+
             if conf is not None and conf.status == "pending":
-                lines.append(
+                print(
                     "  An exit order is WORKING. To pull it: exit-cancel "
                     f"--live-trade-id {live_trade_id}"
                 )
-            elif conf is not None:
-                lines.append(
-                    "  The exit order is terminal. To account for it: exit-cancel "
-                    f"--live-trade-id {live_trade_id} (it settles, it does not "
-                    "re-send)"
-                )
-            _print_block("KRAKEN PILOT EXIT STATUS", lines)
+                return EXIT_BLOCKED
+            if terminal and row["status"] != "open":
+                print(f"  The row is already {row['status']} — nothing left to settle.")
 
-            blocked = bool(
-                listing_error
-                or (dangling and not resolved_paths)
-                or (conf is not None and conf.status == "pending")
-            )
+            blocked = bool(listing_error or (dangling and not resolved_paths))
             return EXIT_BLOCKED if blocked else EXIT_OK
 
         except PilotAbort as abort:
@@ -4371,14 +4722,21 @@ class PilotRunner:
             return EXIT_ESCALATE
 
     def _mark_intents_resolved(
-        self, dangling: list[dict[str, Any]], *, decision_id: str
+        self,
+        dangling: list[dict[str, Any]],
+        *,
+        decision_id: str,
+        note: str,
+        exit_code: int = EXIT_REFUSED,
     ) -> list[str]:
-        """Append a completion record to intents the venue proved never landed.
+        """Append a completion record to intents that have been accounted for.
 
         Writes only to OUR OWN evidence files — nothing at the venue, nothing
-        in the ledger. The append is what unblocks the lane, and it happens
-        only after ``resolve_order_submission_detail`` returned
-        ``not_accepted``, which is the adapter's hardest-to-reach verdict.
+        in the ledger. The append is what unblocks the lane, and it happens on
+        exactly two grounds: ``resolve_order_submission_detail`` returned
+        ``not_accepted`` (the adapter's hardest-to-reach verdict, meaning no
+        such order exists), or the order was found terminal and put through
+        the settlement path. Never merely because time passed.
         """
         resolved: list[str] = []
         for item in dangling:
@@ -4387,12 +4745,10 @@ class PilotRunner:
                 EvidenceLog(path).record(
                     "run_completed",
                     decision_id=item.get("decision_id"),
-                    exit_code=EXIT_REFUSED,
+                    exit_code=exit_code,
                     resolved_by="exit-status",
                     resolver_decision_id=decision_id,
-                    note="two clean sweeps of OpenOrders + ClosedOrders found no "
-                    "order carrying this exit client id, so the interrupted run "
-                    "never created one",
+                    note=note,
                 )
             except OSError as exc:  # pragma: no cover - unwritable evidence dir
                 log.warning(
