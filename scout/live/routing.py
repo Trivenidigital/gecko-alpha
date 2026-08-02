@@ -48,6 +48,32 @@ log = structlog.get_logger(__name__)
 # gap harder to find, not easier. Recorded rather than quietly relied upon:
 # a filter that reads as a safety check and matches no rows is the shape that
 # gets trusted in an incident.
+#
+# *** WHOEVER ADDS THAT WRITER MUST ADD A CLEARER IN THE SAME CHANGE. ***
+# `_on_demand_listings_fetch` deliberately PRESERVES `delisted_at` (it used to
+# erase it, which resurrected delisted venues). Nothing else sets it back to
+# NULL. So the moment delisting becomes writable, it also becomes ONE-WAY: a
+# venue that re-lists the pair can never be routed again, because the fetch that
+# would rediscover it cannot clear the flag.
+#
+# Two things go wrong then, and the second is the less obvious one:
+#   1. Permanent invisibility. Under the old REPLACE this self-healed — wrongly,
+#      but it healed. Fixing the erasure removed the only mechanism that ever
+#      cleared the flag without adding a replacement.
+#   2. A freshness signal that lies. `if not listings` stays true forever for
+#      that canonical, so the on-demand REST fetch re-runs on EVERY signal and
+#      bumps `refreshed_at` each time. The row looks continuously fresh to any
+#      staleness check while routing can never see it, and the venue takes an
+#      unbounded repeated metadata fetch. A healthy-looking indicator over a dead
+#      path — the §12a shape.
+#
+# The replacement is a deliberate clear, not a silent one: set `delisted_at`
+# back to NULL in the DO UPDATE when the venue's own `fetch_venue_metadata`
+# reports the pair tradable again, and LOG it. That is a re-listing decision
+# based on the venue's answer, which is what the old REPLACE only ever did by
+# accident. Alternatively, skip the fetch entirely for canonicals whose only
+# rows are delisted, which removes both the repeated call and the false
+# freshness. Either is fine; doing neither is not.
 _LISTINGS_SQL = (
     "SELECT venue, venue_pair, asset_class, quote FROM venue_listings "
     "WHERE canonical = ? AND delisted_at IS NULL"

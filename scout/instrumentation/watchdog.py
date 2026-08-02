@@ -24,7 +24,9 @@ def _reset_dedup() -> None:
     _last_alert_reason = None
 
 
-async def check_dex_instrumentation_health(db, session, settings, log=None) -> list[str]:
+async def check_dex_instrumentation_health(
+    db, session, settings, log=None
+) -> list[str]:
     """Emit coverage metrics and return the list of fired quality alarms.
 
     Observe-only. Returns ``[]`` when disabled or healthy.
@@ -63,12 +65,18 @@ def _compute_alarms(stats: dict, cov: dict, settings) -> list[str]:
     is the silent-failure signature; an empty table is just "no data yet".
     """
     alarms: list[str] = []
-    if stats["entry_total"] > 0 and (stats["entry_nonzero_rate"] or 0.0) < settings.DEX_NONZERO_MCAP_FLOOR:
+    if (
+        stats["entry_total"] > 0
+        and (stats["entry_nonzero_rate"] or 0.0) < settings.DEX_NONZERO_MCAP_FLOOR
+    ):
         alarms.append(
             f"entry_mcap fresh-but-empty: {stats['entry_nonzero_rate']:.2f} finalized "
             f"of {stats['entry_total']} rows"
         )
-    if stats["txns_total"] > 0 and (stats["txns_nonnull_rate"] or 0.0) < settings.DEX_NONNULL_TXNS_FLOOR:
+    if (
+        stats["txns_total"] > 0
+        and (stats["txns_nonnull_rate"] or 0.0) < settings.DEX_NONNULL_TXNS_FLOOR
+    ):
         alarms.append(
             f"txns_h1_buys fresh-but-empty: {stats['txns_nonnull_rate']:.2f} non-null "
             f"of {stats['txns_total']} rows"
@@ -77,7 +85,10 @@ def _compute_alarms(stats: dict, cov: dict, settings) -> list[str]:
         alarms.append(
             f"resolver fresh-but-empty: {stats['map_total']} map rows, 0 resolved"
         )
-    if cov["listed_dex"] > 0 and cov["dex_resolution_health"] < settings.DEX_RESOLUTION_HEALTH_FLOOR:
+    if (
+        cov["listed_dex"] > 0
+        and cov["dex_resolution_health"] < settings.DEX_RESOLUTION_HEALTH_FLOOR
+    ):
         alarms.append(
             f"dex_resolution_health below floor: {cov['dex_resolution_health']:.2f} "
             f"< {settings.DEX_RESOLUTION_HEALTH_FLOOR}"

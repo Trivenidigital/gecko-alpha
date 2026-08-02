@@ -441,8 +441,7 @@ async def run_pattern_lifecycle(db: Database, settings: Settings) -> None:
 
         if (
             not disabled_by_operator_or_code
-            and
-            prio == "medium"
+            and prio == "medium"
             and s["total_evaluated"] >= settings.CHAIN_GRADUATION_MIN_TRIGGERS
             and s["hit_rate"] >= settings.CHAIN_GRADUATION_HIT_RATE
         ):

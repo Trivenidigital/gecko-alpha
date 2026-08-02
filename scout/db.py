@@ -9688,6 +9688,16 @@ class Database:
                 "'mandate_inactive','venue_capability_refused',"
                 "'no_adapter_for_venue'))"
             )
+            # Hoisted above the loop because Part 3's post-condition uses it to
+            # isolate the CHECK clause. Bound inside the loop body it would be
+            # UNBOUND whenever every table was already widened — the common
+            # fresh-install path, where each iteration `continue`s before reaching
+            # the assignment. A NameError there would turn the safest case into
+            # the only one that crashes.
+            pattern = _re.compile(
+                r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                _re.IGNORECASE | _re.DOTALL,
+            )
             for table in ("shadow_trades", "live_trades"):
                 cur = await conn.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
@@ -9706,10 +9716,6 @@ class Database:
                     continue
                 col_list = ", ".join(c[1] for c in cols)
 
-                pattern = _re.compile(
-                    r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
-                    _re.IGNORECASE | _re.DOTALL,
-                )
                 new_table_sql = pattern.sub(
                     f"reject_reason       TEXT {new_check}", table_sql
                 )
@@ -9888,7 +9894,16 @@ class Database:
                 row = await cur.fetchone()
                 if row is None:
                     continue  # table genuinely absent — nothing was claimed for it
-                missing = [r for r in new_reasons if r not in (row[0] or "")]
+                # *** LOOK INSIDE THE CHECK CLAUSE, NOT AT THE WHOLE DDL. ***
+                # A substring test over the full CREATE TABLE text shares its
+                # failure mode with the already-widened skip at the top of the
+                # loop: any occurrence of the three strings ANYWHERE in the DDL —
+                # a comment, a column name, another constraint — satisfies both
+                # while the CHECK itself stays narrow. A backstop that fails the
+                # same way as the thing it backstops is not a backstop.
+                check_clause = pattern.search(row[0] or "")
+                haystack = check_clause.group(0) if check_clause else ""
+                missing = [r for r in new_reasons if r not in haystack]
                 if missing:
                     raise RuntimeError(
                         f"{migration}: {table}.reject_reason CHECK still refuses "
@@ -9904,11 +9919,42 @@ class Database:
                     f"{ {'intent_hash', 'mandate_mode'} - live_cols }"
                 )
 
-            # Foreign keys were disabled for the rebuild; prove nothing was left
-            # dangling before committing. `foreign_key_check` returns one row per
-            # violation, so an empty result is the pass.
-            cur = await conn.execute("PRAGMA foreign_key_check")
-            violations = list(await cur.fetchall())
+            # Foreign keys were disabled for the rebuild; prove THIS rebuild left
+            # nothing dangling before committing.
+            #
+            # *** SCOPED TO THE TABLES THIS MIGRATION TOUCHES. ***
+            # `PRAGMA foreign_key_check` with no argument checks the ENTIRE
+            # database. One pre-existing dangling row in a table this migration
+            # never opens — and there are eleven FK-bearing tables it never
+            # opens — would raise here, roll back, leave the marker unwritten, and
+            # therefore fail EVERY boot from then on. Not hypothetical for this
+            # database: `dashboard/api.py::_build_alert_outcome` documents handling
+            # exactly that state in production ("FK set but the paper_trades row is
+            # gone — ON DELETE SET NULL race / manual delete").
+            #
+            # A migration's post-condition must be about the migration. Asserting a
+            # whole-database invariant here converts unrelated pre-existing data
+            # into a permanent boot failure — a strictly worse outcome than the one
+            # this check guards against.
+            #
+            # Worth being precise about what it can prove: `foreign_key_check(T)`
+            # validates the FKs DECLARED ON T, and ON DELETE SET NULL is a legal
+            # outcome rather than a violation — so this check could never have
+            # caught the severed-links defect. `foreign_keys=OFF` is what fixes
+            # that. This is belt-and-braces, and belt-and-braces must not have a
+            # larger blast radius than the thing it braces.
+            violations: list = []
+            for table in ("live_trades", "shadow_trades", "solana_executions"):
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                if await cur.fetchone() is None:
+                    continue
+                cur = await conn.execute(f"PRAGMA foreign_key_check({table})")
+                # `row_factory` is `aiosqlite.Row`, which reprs as an object
+                # address — useless in the error an operator has to act on.
+                violations.extend((table, tuple(r)) for r in await cur.fetchall())
             if violations:
                 raise RuntimeError(
                     f"{migration}: rebuild left {len(violations)} foreign-key "
@@ -9952,17 +9998,49 @@ class Database:
             # for the rest of its life. That is a strictly worse failure than the
             # severed-links defect this OFF exists to avoid, so it is checked
             # rather than assumed.
+            # *** CLOSE THE TRANSACTION FIRST — UNCONDITIONALLY. ***
+            # The `except` above rolls back inside its own try/except, because a
+            # failing rollback must not mask the original error. But swallowing it
+            # leaves the transaction OPEN, and an open transaction is exactly the
+            # condition under which the pragma below does nothing. So the rollback
+            # is repeated here without conditions: on every path where the
+            # transaction is already closed this is a harmless "no transaction is
+            # active", and on the one path where it is not, it is what makes the
+            # restore possible at all.
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass  # already committed or already rolled back — the normal case
+
             await conn.execute("PRAGMA foreign_keys=ON")
             _cur = await conn.execute("PRAGMA foreign_keys")
             _fk = await _cur.fetchone()
             if not (_fk and _fk[0]):
+                # A restore that is not verified is the same class of unchecked
+                # claim the post-condition above just replaced. Verified, and then
+                # ACTED ON: a connection with enforcement off is not safe to hand
+                # back, and callers cache it — `dashboard/api.py` assigns its
+                # module-level handle BEFORE `initialize()` and reuses it on every
+                # later request even when initialization raised, so "the process
+                # dies anyway" is not a safe assumption.
+                #
+                # Dropping the handle makes every subsequent use raise
+                # "Database not initialized" instead of writing unenforced. Not
+                # raising from `finally`: that would replace the in-flight
+                # exception, and the original migration failure is the more useful
+                # one to surface.
                 _log.error(
                     "FOREIGN_KEYS_LEFT_DISABLED",
                     migration=migration,
                     detail=(
-                        "PRAGMA foreign_keys=ON did not take effect, which means a "
-                        "transaction is still open on this connection. Every "
-                        "subsequent write in this process runs unenforced. Restart "
-                        "the service to get a clean connection."
+                        "PRAGMA foreign_keys=ON did not take effect even after an "
+                        "unconditional ROLLBACK, so a transaction is still open on "
+                        "this connection. The connection has been dropped rather "
+                        "than returned with enforcement off; restart the service."
                     ),
                 )
+                try:
+                    await conn.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
+                self._conn = None

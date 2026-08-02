@@ -208,9 +208,7 @@ class CandidateToken(BaseModel):
         # buy_pressure stays DexScreener-only (byte-identical scoring).
         gt_txns = attrs.get("transactions", {})
         gt_h1 = gt_txns.get("h1", {}) if isinstance(gt_txns, dict) else {}
-        gt_txns_h1_buys = (
-            int(gt_h1["buys"]) if gt_h1.get("buys") is not None else None
-        )
+        gt_txns_h1_buys = int(gt_h1["buys"]) if gt_h1.get("buys") is not None else None
         gt_txns_h1_sells = (
             int(gt_h1["sells"]) if gt_h1.get("sells") is not None else None
         )

@@ -35,7 +35,6 @@ from enum import Enum
 
 import structlog
 
-
 # --------------------------------------------------------------------------
 # Dataclasses + verdict enum (plan Task 1)
 # --------------------------------------------------------------------------
@@ -67,8 +66,8 @@ class WindowDiagnostics:
     net_pnl_usd: float
     per_trade_usd: float
     win_pct: float
-    win_pct_wilson_lb: float           # percent (0-100)
-    per_trade_bootstrap_lb: float      # dollars
+    win_pct_wilson_lb: float  # percent (0-100)
+    per_trade_bootstrap_lb: float  # dollars
     no_breakout_and_loss_rate: float
     stop_loss_frequency: float
     expired_loss_frequency: float
@@ -132,16 +131,12 @@ def compute_expired_loss_frequency(trades: list[ClosedTrade]) -> float:
     if not trades:
         return 0.0
     losses = sum(
-        1
-        for t in trades
-        if t.exit_reason in _EXPIRED_REASONS and t.pnl_usd < 0
+        1 for t in trades if t.exit_reason in _EXPIRED_REASONS and t.pnl_usd < 0
     )
     return losses / len(trades)
 
 
-_EXIT_MACHINERY_REASONS = frozenset(
-    {"peak_fade", "trailing_stop", "moonshot_trail"}
-)
+_EXIT_MACHINERY_REASONS = frozenset({"peak_fade", "trailing_stop", "moonshot_trail"})
 
 
 def compute_exit_machinery_contribution(trades: list[ClosedTrade]) -> float:
@@ -351,9 +346,7 @@ async def signal_type_exists(db, signal_type: str) -> bool:
     return row is not None
 
 
-async def find_existing_keep_verdict(
-    db, signal_type: str
-) -> tuple[str, str] | None:
+async def find_existing_keep_verdict(db, signal_type: str) -> tuple[str, str] | None:
     """Per design-review fold D#7: return most-recent soak_verdict audit row.
 
     Returns ``(applied_at_iso, new_value)`` or ``None``.
@@ -394,9 +387,7 @@ async def compute_recent_trade_rate(
 # --------------------------------------------------------------------------
 
 
-def _window_diagnostics(
-    trades: list[ClosedTrade], *, settings
-) -> WindowDiagnostics:
+def _window_diagnostics(trades: list[ClosedTrade], *, settings) -> WindowDiagnostics:
     n = len(trades)
     net = sum(t.pnl_usd for t in trades)
     wins = sum(1 for t in trades if t.pnl_usd > 0)
@@ -550,9 +541,7 @@ _SIGNAL_TYPE_RE = _re.compile(r"^[a-z_][a-z0-9_]*$")
 def _validate_signal_type(s: str) -> None:
     """Per design-review fold B#1: prevent SQL injection via input validation."""
     if not _SIGNAL_TYPE_RE.match(s):
-        raise ValueError(
-            f"signal_type must match {_SIGNAL_TYPE_RE.pattern}; got={s!r}"
-        )
+        raise ValueError(f"signal_type must match {_SIGNAL_TYPE_RE.pattern}; got={s!r}")
 
 
 def _sql_escape(s: str) -> str:
@@ -580,9 +569,7 @@ def _parse_cutover_iso(s: str) -> datetime:
     return dt
 
 
-async def _query_cool_off_status(
-    db, signal_type: str, settings
-) -> datetime | None:
+async def _query_cool_off_status(db, signal_type: str, settings) -> datetime | None:
     """Return timestamp until which cool-off is active, or None if cleared."""
     if db._conn is None:
         return None
@@ -659,15 +646,13 @@ def _print_verdict(
         )
         print(">>> To revoke (DO NOT PASTE WITHOUT REVIEWING:")
         # Per PR-stage reviewer #3 finding #2: safety comment ahead of revoke SQL
-        print(
-            "    - cycle-9 precedent for this signal class, AND"
-        )
+        print("    - cycle-9 precedent for this signal class, AND")
         print(
             "    - existing keep_value above (may be older verdict, not the one to revoke)"
         )
         print(">>> ):")
         revoke_sql = (
-            f"sqlite3 <db> \"INSERT INTO signal_params_audit"
+            f'sqlite3 <db> "INSERT INTO signal_params_audit'
             f"(signal_type, field_name, old_value, new_value, reason, applied_by, applied_at) "
             f"VALUES('{_sql_escape(result.signal_type)}', 'soak_verdict', "
             f"'{_sql_escape(keep_value)}', 'revoked', "
@@ -717,7 +702,8 @@ def _emit_soak_verdict_sql(
     # 30-day expiry is day-precision, and the watchdog will need to parse
     # this back. Microsecond noise makes value visually unscannable.
     expiry_at = (
-        result.evaluated_at + timedelta(days=settings.REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS)
+        result.evaluated_at
+        + timedelta(days=settings.REVIVAL_CRITERIA_VERDICT_EXPIRY_DAYS)
     ).replace(microsecond=0)
     verdict_str = f"keep_on_provisional_until_{expiry_at.isoformat()}"
     reason = _sql_escape(
@@ -814,7 +800,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             settings=settings,
         )
         if sql is not None:
-            print("\n--- Operator may paste the following SQL to write the audit row ---")
+            print(
+                "\n--- Operator may paste the following SQL to write the audit row ---"
+            )
             print(sql)
             # Per PR-stage reviewer #3 finding #11: advisory-verdict caveat —
             # the keep_on_provisional_until_<iso> verdict expires structurally

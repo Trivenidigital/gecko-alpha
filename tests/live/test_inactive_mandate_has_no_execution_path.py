@@ -602,33 +602,48 @@ class TestTheScopeOfTheClaim:
     )
 
     def _submit_sites(self) -> set[tuple[str, str]]:
-        """Every (file, method) that reaches a submit, including via getattr."""
+        """Every (file, method) that can REACH a submit — reference, not just call.
+
+        *** A BARE REFERENCE IS THE SIGNAL. INVOKING IT IS JUST WHAT COMES NEXT. ***
+        Matching only `ast.Call` whose func is the attribute missed five
+        indirections, three of them plausible refactors *in this codebase*:
+
+          submit = adapter.place_order_request; await submit(req)   # alias
+          table = {"binance": b.place_order_request}; await table[v](req)
+          await fire(self._adapter.place_order_request, req)        # injected callable
+
+        The third is the house style — `keypair_loader` in solana_lane and
+        `alert_hook` in live_evaluator are injected exactly that way — so a
+        reviewer following local convention could write it and this test would
+        have said nothing.
+
+        Getting a bound submit method OUT of an adapter object requires naming it,
+        so any `ast.Attribute` with one of these names is the thing to flag,
+        regardless of what happens to it afterwards. The false-positive cost is
+        near zero: the adapters DEFINE these as `FunctionDef`, docstring mentions
+        are `Constant`, and `super().place_order_request(...)` is an Attribute that
+        SHOULD be flagged. String-constant forms (`getattr`, `methodcaller`) are
+        matched separately since they never produce an Attribute node at all.
+        """
         import ast
 
         found: set[tuple[str, str]] = set()
         for path in sorted(_SCOUT.rglob("*.py")):
             rel = str(path.relative_to(_ROOT)).replace("\\", "/")
             for node in ast.walk(ast.parse(path.read_text("utf-8"))):
-                if not isinstance(node, ast.Call):
-                    continue
-                # a.place_order_request(...)
                 if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr in self._SUBMIT_METHODS
+                    isinstance(node, ast.Attribute)
+                    and node.attr in self._SUBMIT_METHODS
                 ):
-                    found.add((rel, node.func.attr))
-                # getattr(a, "place_order_request")(...) — indirection is still a
-                # call, and a test that only matches attribute access invites it.
-                inner = node.func if isinstance(node.func, ast.Call) else node
-                if (
-                    isinstance(inner, ast.Call)
-                    and isinstance(inner.func, ast.Name)
-                    and inner.func.id == "getattr"
-                    and len(inner.args) >= 2
-                    and isinstance(inner.args[1], ast.Constant)
-                    and inner.args[1].value in self._SUBMIT_METHODS
+                    found.add((rel, node.attr))
+                # `getattr(a, "place_order_request")`, `methodcaller("...")` — a
+                # method named by a string never appears as an Attribute.
+                elif (
+                    isinstance(node, ast.Constant)
+                    and isinstance(node.value, str)
+                    and node.value in self._SUBMIT_METHODS
                 ):
-                    found.add((rel, str(inner.args[1].value)))
+                    found.add((rel, node.value))
         return found
 
     def test_the_supervised_clis_are_the_only_uncovered_submit_sites(self):

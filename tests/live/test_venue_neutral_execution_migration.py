@@ -281,7 +281,7 @@ async def test_shadow_trades_check_was_widened_too(tmp_path):
 _PARENT_LIVE_TRADES_DDL = """
 CREATE TABLE "live_trades" (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    paper_trade_id      INTEGER NOT NULL,
+    paper_trade_id      INTEGER NOT NULL REFERENCES paper_trades(id) ON DELETE RESTRICT,
     coin_id             TEXT NOT NULL,
     symbol              TEXT NOT NULL,
     venue               TEXT NOT NULL,
@@ -310,7 +310,7 @@ CREATE TABLE "live_trades" (
     exit_fill_price     TEXT,
     realized_pnl_usd    TEXT,
     realized_pnl_pct    TEXT,
-    kill_event_id       INTEGER,
+    kill_event_id       INTEGER REFERENCES kill_events(id),
     created_at          TEXT NOT NULL,
     closed_at           TEXT,
     client_order_id     TEXT
@@ -552,3 +552,155 @@ async def test_a_rewrite_that_misses_refuses_to_record_itself_as_applied(tmp_pat
         assert await cur.fetchone() is None
     finally:
         await probe.close()
+
+
+# ---------------------------------------------------------------------------
+# The post-conditions must not have a larger blast radius than what they guard,
+# and the restore must actually restore.
+# ---------------------------------------------------------------------------
+
+
+async def _plant_dangling(path, table_sql):
+    probe = await aiosqlite.connect(str(path))
+    try:
+        await probe.execute("PRAGMA foreign_keys=OFF")
+        await probe.execute(table_sql)
+        await probe.commit()
+    finally:
+        await probe.close()
+
+
+async def test_a_dangling_fk_in_an_unrelated_table_does_not_block_the_migration(
+    tmp_path,
+):
+    """*** A MIGRATION'S POST-CONDITION MUST BE ABOUT THE MIGRATION. ***
+
+    `PRAGMA foreign_key_check` with no argument checks the ENTIRE database. One
+    pre-existing dangling row in a table this migration never opens would raise,
+    roll back, leave the marker unwritten — and therefore fail EVERY boot from
+    then on, permanently, over data the migration had nothing to do with. There
+    are eleven FK-bearing tables it never opens.
+
+    Not hypothetical for this database: `dashboard/api.py::_build_alert_outcome`
+    documents handling exactly that state in production ("FK set but the
+    paper_trades row is gone — ON DELETE SET NULL race / manual delete").
+    """
+    path = await _parent_shaped_db(tmp_path)
+    await _plant_dangling(
+        path,
+        "INSERT INTO tg_alert_log (paper_trade_id, signal_type, token_id, "
+        " alerted_at, outcome) "
+        "VALUES (999999,'first_signal','c','2026-07-01T00:00:00Z','sent')",
+    )
+
+    probe = await aiosqlite.connect(str(path))
+    try:
+        cur = await probe.execute("PRAGMA foreign_key_check")
+        assert list(await cur.fetchall()), "the fixture did not create a dangling FK"
+    finally:
+        await probe.close()
+
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT 1 FROM paper_migrations "
+            "WHERE name='bl_venue_neutral_execution_v1'"
+        )
+        assert await cur.fetchone() is not None, "unrelated data blocked the migration"
+        assert {"intent_hash", "mandate_mode"} <= await _columns(
+            db._conn, "live_trades"
+        )
+    finally:
+        await db.close()
+
+
+async def test_a_dangling_fk_on_a_migrated_table_still_blocks(tmp_path):
+    """Guard on the guard: scoping narrowed the check, it did not remove it."""
+    path = await _parent_shaped_db(tmp_path)
+    await _plant_dangling(
+        path,
+        "INSERT INTO live_trades (paper_trade_id, coin_id, symbol, venue, pair, "
+        "signal_type, size_usd, status, created_at, client_order_id) "
+        "VALUES (999999, 'c', 'SYM', 'binance', 'SYMUSDT', 'first_signal', "
+        "'100', 'open', '2026-07-01T00:00:00', 'dangling-cid')",
+    )
+    db = Database(path)
+    with pytest.raises(RuntimeError) as exc:
+        await db.initialize()
+    await db.close()
+    # And the diagnostic names the table and prints the row, not an object address.
+    assert "live_trades" in str(exc.value)
+    assert "sqlite3.Row object" not in str(exc.value)
+
+
+async def test_the_post_condition_reads_the_check_clause_not_the_whole_ddl():
+    """The post-condition backstops the already-widened skip at the top of the
+    loop. Both were the same substring test over the full CREATE TABLE text, so
+    any occurrence of the three strings ANYWHERE — a comment, a column name,
+    another constraint — satisfied both while the CHECK itself stayed narrow. A
+    backstop that fails the same way as the thing it backstops is not a backstop.
+    """
+    import inspect
+
+    src = inspect.getsource(Database._migrate_venue_neutral_execution_v1)
+    assert "check_clause = pattern.search" in src, (
+        "the post-condition no longer isolates the CHECK clause before testing "
+        "membership"
+    )
+    # And the pattern must be bound OUTSIDE the rewrite loop, or the fresh-install
+    # path (where every table `continue`s before the assignment) raises NameError.
+    assert src.index("pattern = _re.compile") < src.index(
+        'for table in ("shadow_trades", "live_trades")'
+    )
+
+
+async def test_the_scoped_check_covers_every_table_the_migration_rebuilds():
+    """If the rebuild grows a table, the check must grow with it — otherwise the
+    scoping that fixed the blast radius quietly stops covering the new one."""
+    import inspect
+
+    src = inspect.getsource(Database._migrate_venue_neutral_execution_v1)
+    # The pragma must be called WITH an argument — the bare form checks the whole
+    # database, which is the blast-radius defect.
+    assert "PRAGMA foreign_key_check({table})" in src
+    assert 'PRAGMA foreign_key_check"' not in src.replace(
+        "PRAGMA foreign_key_check({table})", ""
+    )
+    assert '("live_trades", "shadow_trades", "solana_executions")' in src
+
+
+async def test_enforcement_survives_a_failed_migration(tmp_path):
+    """The `finally` runs an UNCONDITIONAL rollback before restoring enforcement.
+
+    `PRAGMA foreign_keys` is a no-op inside a transaction — which is why OFF has
+    to precede BEGIN, and the same rule applies to the ON in `finally`. The
+    `except` block rolls back inside its own try/except so a failing rollback
+    cannot mask the original error; swallowing it leaves the transaction OPEN,
+    and then the restore silently does nothing.
+
+    Driven through a real failure: a post-condition violation on a migrated table
+    raises after the rebuild, so the transaction is live when `finally` runs.
+    """
+    path = await _parent_shaped_db(tmp_path)
+    await _plant_dangling(
+        path,
+        "INSERT INTO live_trades (paper_trade_id, coin_id, symbol, venue, pair, "
+        "signal_type, size_usd, status, created_at, client_order_id) "
+        "VALUES (999999, 'c', 'SYM', 'binance', 'SYMUSDT', 'first_signal', "
+        "'100', 'open', '2026-07-01T00:00:00', 'dangling-2')",
+    )
+    db = Database(path)
+    with pytest.raises(RuntimeError):
+        await db.initialize()
+    try:
+        # The connection either has enforcement back ON, or was dropped rather
+        # than handed back unenforced. Both are acceptable; "open and unenforced"
+        # is not.
+        if db._conn is not None:
+            cur = await db._conn.execute("PRAGMA foreign_keys")
+            assert (await cur.fetchone())[
+                0
+            ] == 1, "a connection with foreign keys OFF was returned to the caller"
+    finally:
+        await db.close()
