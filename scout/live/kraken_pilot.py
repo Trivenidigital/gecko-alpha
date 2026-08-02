@@ -10,6 +10,10 @@ Usage::
 
     python -m scout.live.kraken_pilot place --side buy --price 100000.0 \\
         --volume 0.0002 [--validate-only --yes-i-am-rehearsing]
+    python -m scout.live.kraken_pilot exit --live-trade-id 7 --price 101000.0 \\
+        [--validate-only --yes-i-am-rehearsing]
+    python -m scout.live.kraken_pilot exit-status --live-trade-id 7
+    python -m scout.live.kraken_pilot exit-cancel --live-trade-id 7
     python -m scout.live.kraken_pilot cancel --decision-id <uuid>
     python -m scout.live.kraken_pilot status
 
@@ -123,12 +127,100 @@ recorded — before the first gate runs. Its role is unchanged: it IS the
 ``idempotency.make_client_order_id`` targets Binance's 28 chars and does NOT
 fit Kraken, adapter fact 10) and the first 8 characters are what the operator
 types to authorize.
+
+The ``exit`` command — closing a position, not opening one
+----------------------------------------------------------
+``exit`` CLOSES one existing ``live_trades`` row, selected by id. It is a
+sibling of ``place``, not a mode of it: ``place --side sell`` is blocked by
+any open row and would book a SECOND row, which is the opposite of what
+closing a position means.
+
+Exit flow: envelope → row selection + eligibility → lane state → venue state
+(balance covers the sale, nothing already resting) → account fee tier →
+cost scenarios → MANUAL APPROVAL → durable intent → submit once → resolve →
+reconcile → close.
+
+**The exit is NOT gated on ``KRAKEN_PILOT_ENABLED`` or the kill switch.**
+Same reasoning that leaves ``cancel`` ungated: both are levers that REDUCE
+exposure, and a master switch able to strand an open position is a safety
+mechanism pointed the wrong way. Both states are recorded in the evidence
+either way. ``LIVE_USE_REAL_SIGNED_REQUESTS`` IS still checked, not as a
+policy choice but because ``place_limit_order`` refuses outright under it —
+catching that before the approval prompt beats discovering it after.
+
+**The exit client order id is deterministic**, not a uuid4:
+``idempotency.make_exit_client_order_id`` gives ``gecko-x-<live_trade_id>``,
+which fits Kraken's 18-character free-text form (adapter fact 10). Determinism
+is the crash-recovery mechanism — a rerun after an interrupted exit computes
+the SAME id, finds the order resting in ``OpenOrders``, and refuses instead of
+placing a second sale of the same coins. That check is why the venue-state
+step refuses on the exit id specifically as well as on the pair.
+
+**The typed authorization is bound to the order AND to the state it assumed.**
+``place`` has the operator type a decision-id prefix, which identifies the
+RUN; that is sufficient there because the run's parameters came from the same
+command line. An exit's quantity comes from the ledger and its cost screen
+comes from the venue, so the token is a digest over the order (row id, pair,
+side, volume, price, cl_ord_id) AND the state snapshot the screen was computed
+from (row status and venue, position quantity, base balance, resting-order
+fingerprint, maker and taker rates). Immediately before submission every one
+of those is re-read and the digest recomputed; a single differing field voids
+the authorization and refuses. The run does NOT rebuild the order around the
+new facts — the operator approved the old ones.
+
+**The approval must be typed by a human at a terminal.** ``read_authorization``
+refuses a non-TTY stdin on the exit path before it even prompts. EOF alone is
+not enough: ``echo <token> | kraken_pilot exit`` reads as a valid answer while
+being exactly the automation this boundary exists to exclude.
+
+**Reconciliation gates the close, and its two halves are kept apart.** The
+BASE-asset comparison — balance reduction against cumulative executed volume —
+is exact to one lot tick, because Kraken charges its fee in the quote asset
+and nothing on that side is uncertain. The QUOTE-asset comparison — proceeds,
+fees, and the fact that a limit SELL can never execute below its limit — is
+where a percentage legitimately applies. Quote-side fee variability is never
+allowed to widen the base-asset band; a percentage tolerance there would mark
+a materially short sale as fully reconciled. ``status``, ``exit_fill_price``,
+``realized_pnl_usd`` and ``closed_at`` are written only when both halves
+agree. When they do not, the row is marked ``needs_manual_review`` and left
+non-terminal: a closed row asserts the position is gone, and asserting that on
+unreconciled evidence is how a phantom position is created.
+
+**A partial fill never closes the row.** The row closes only when cumulative
+confirmed executed quantity covers the selected position to within one lot
+tick. Otherwise ``entry_fill_qty`` — the lane's held-quantity field — is
+reduced by what sold, the exit txid and fill price are recorded, the status
+stays ``open`` and the operator is told. A held quantity only ever falls: the
+write is clamped, and an order whose fills were already folded in escalates
+rather than subtracting the same coins twice.
+
+**An interrupted run blocks the lane until it is resolved read-only.** Every
+exit run appends ``run_completed`` in a ``finally``; its absence beside an
+``exit_intent_persisted`` record means the process died between authorizing an
+order and accounting for it, which is the one state where a sell may exist
+that nothing in the ledger names. ``exit`` refuses while such an intent is
+dangling. ``exit-status`` is the read-only recovery path: it reports what the
+venue holds and clears the intent ONLY on the resolver's ``not_accepted``
+verdict — the one verdict that means no such order exists. ``exit-cancel``
+pulls a resting exit order, keyed off the deterministic exit client id that
+``cancel --decision-id`` structurally cannot reach.
+
+**The close status is ``closed_via_reconciliation``.** The ``live_trades``
+CHECK enum has no operator-exit member and this module does not widen it (same
+discipline as ``reject_reason`` above). ``closed_tp`` / ``closed_sl`` would
+fabricate a threshold trigger that never fired and ``closed_duration`` a
+hold-time expiry that never elapsed; ``closed_via_reconciliation`` is the
+vocabulary's out-of-band close, and nothing in-tree writes it to
+``live_trades`` today, so the value is unambiguous there: it means a
+supervised pilot exit. The real economics live in ``realized_pnl_usd`` /
+``realized_pnl_pct`` and the evidence file.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -144,9 +236,17 @@ import structlog
 
 from scout.config import Settings, load_settings
 from scout.db import Database
-from scout.live.idempotency import lookup_existing_order_id, record_pending_order
+from scout.live.idempotency import (
+    lookup_existing_order_id,
+    make_exit_client_order_id,
+    record_pending_order,
+)
 from scout.live.kill_switch import KillSwitch
-from scout.live.kraken_adapter import KrakenAmbiguousSubmissionError, KrakenSpotAdapter
+from scout.live.kraken_adapter import (
+    KrakenAmbiguousSubmissionError,
+    KrakenSpotAdapter,
+    normalize_kraken_asset,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -188,6 +288,27 @@ _BLOCKING_STATUSES = ("open", "needs_manual_review")
 # Kraken's published default taker fee, used only when AssetPairs carries no
 # fee schedule for the pair. Always labelled ESTIMATE in the approval block.
 _DEFAULT_TAKER_FEE_PCT = Decimal("0.26")
+
+# What `exit` writes into live_trades.status on a reconciled close. See the
+# module docstring for why this member and not closed_tp / closed_sl.
+_EXIT_CLOSED_STATUS = "closed_via_reconciliation"
+
+# Characters of the authorization digest the operator retypes. Eight hex
+# characters is 32 bits — far beyond anything a slip of the hand reproduces,
+# and short enough to be copied off a screen without error.
+_EXIT_AUTH_TOKEN_CHARS = 8
+
+# Bound into the authorization digest so a token minted for the exit lane can
+# never authorize something else that happens to hash the same tuple.
+_EXIT_AUTH_DOMAIN = "kraken-pilot-exit-v1"
+
+# Lot ticks of slack allowed between the base-asset quantities the exit
+# reconciliation compares. ONE — the smallest unavoidable representation unit
+# in the venue's own published precision, and nothing above it. Deliberately
+# NOT a percentage of position size: Kraken takes its fee in the quote asset,
+# so the base-side move is exact, and a percentage band would mark a
+# materially short sale as fully reconciled. See _exit_market_rules.
+_EXIT_BASE_TOLERANCE_LOT_TICKS = Decimal("1")
 
 # Redacted before anything is written to the evidence file or the log. The
 # runner never handles credentials itself — the adapter owns signing — so this
@@ -337,6 +458,37 @@ def _dec_or_none(value: Any) -> Decimal | None:
 def _fmt(value: Decimal | None) -> str | None:
     """Fixed-point string; ``str(Decimal('1E-8'))`` would be exponential."""
     return None if value is None else format(value, "f")
+
+
+def _sum_fills(fills: list[dict[str, Any]]) -> dict[str, Any]:
+    """Cumulative executed quantity, gross quote cost and fee across fills.
+
+    ``fee_readable`` is tracked separately from the total because a fee of
+    zero and a fee that could not be parsed sum to the same number, and only
+    one of them is evidence.
+    """
+    qty = Decimal("0")
+    cost = Decimal("0")
+    fee = Decimal("0")
+    fee_readable = False
+    for fill in fills:
+        qty += _dec_or_none(fill.get("vol")) or Decimal("0")
+        cost += _dec_or_none(fill.get("cost")) or Decimal("0")
+        parsed = _dec_or_none(fill.get("fee"))
+        if parsed is not None:
+            fee_readable = True
+            fee += parsed
+    return {"qty": qty, "cost": cost, "fee": fee, "fee_readable": fee_readable}
+
+
+def _canonical_amount(value: Decimal) -> str:
+    """One spelling per numeric value: trailing zeros stripped, fixed-point.
+
+    ``normalize()`` collapses ``0.1500`` and ``0.15`` to the same Decimal but
+    renders integers exponentially (``Decimal('100').normalize()`` is
+    ``1E+2``), so the ``f`` format is still what puts it on the wire.
+    """
+    return format(value.normalize(), "f")
 
 
 def _first_fee_pct(field: Any) -> Decimal | None:
@@ -492,6 +644,49 @@ async def fetch_row_by_decision_id(
     }
 
 
+async def fetch_live_trade_row(
+    db: Database, live_trade_id: int
+) -> dict[str, Any] | None:
+    """One ``live_trades`` row by primary key, or ``None``.
+
+    Deliberately NOT filtered by venue. ``exit`` has to be able to tell "no
+    such row" apart from "that row belongs to another venue" — a venue filter
+    collapses both into ``None`` and the operator is told their row does not
+    exist when it does.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        "SELECT id, client_order_id, entry_order_id, status, venue, pair, symbol, "
+        "       size_usd, entry_fill_price, entry_fill_qty, exit_order_id, "
+        "       exit_fill_price, realized_pnl_usd, realized_pnl_pct, created_at, "
+        "       closed_at "
+        "FROM live_trades WHERE id = ?",
+        (live_trade_id,),
+    )
+    r = await cur.fetchone()
+    if r is None:
+        return None
+    return {
+        "live_trade_id": r[0],
+        "client_order_id": r[1],
+        "entry_order_id": r[2],
+        "status": r[3],
+        "venue": r[4],
+        "pair": r[5],
+        "symbol": r[6],
+        "size_usd": r[7],
+        "entry_fill_price": r[8],
+        "entry_fill_qty": r[9],
+        "exit_order_id": r[10],
+        "exit_fill_price": r[11],
+        "realized_pnl_usd": r[12],
+        "realized_pnl_pct": r[13],
+        "created_at": r[14],
+        "closed_at": r[15],
+    }
+
+
 async def daily_gross_usd(db: Database, day: str) -> Decimal:
     """Sum of today's kraken notionals, excluding rejected rows.
 
@@ -526,13 +721,244 @@ async def daily_gross_usd(db: Database, day: str) -> Decimal:
 # ----------------------------------------------------------------------
 # Operator I/O
 # ----------------------------------------------------------------------
-def read_authorization(expected: str) -> tuple[bool, str]:
+def open_order_fingerprint(orders: list[dict[str, Any]]) -> str:
+    """A stable digest of the account's resting-order SET.
+
+    Order-insensitive (the venue does not promise a listing order) and built
+    from the fields that decide whether an order competes with ours: its id,
+    its client id, its pair and its outstanding quantity. A new order, a
+    vanished order or one that partially filled all change it.
+
+    Empty set has its own token rather than the digest of an empty string, so
+    "no orders" is legible in the evidence rather than looking like a bug.
+    """
+    if not orders:
+        return "none"
+    parts = sorted(
+        "~".join(
+            [
+                str(order.get("txid") or ""),
+                str(order.get("client_order_id") or ""),
+                str(order.get("pair") or "").upper(),
+                str(order.get("vol") or ""),
+                str(order.get("vol_exec") or ""),
+            ]
+        )
+        for order in orders
+    )
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def exit_intent_digest(snapshot: dict[str, Any]) -> str:
+    """Digest of an exit intent AND the state the approval screen assumed.
+
+    The token the operator retypes is derived from this, and it is recomputed
+    from freshly-read state immediately before submission. A single differing
+    field means the screen the operator read no longer describes the world, so
+    the authorization is void — the run does NOT quietly rebuild the order
+    around the new facts, because the operator approved the old ones.
+
+    Bound fields, and what each one catches:
+
+    ``live_trade_id`` / ``pair`` / ``side`` / ``volume`` / ``price`` /
+    ``client_order_id``
+        the order itself — a different order is a different approval.
+    ``position_qty``
+        the ledger's held quantity. Sells the position, so a change means
+        the thing being closed is not the thing that was approved.
+    ``row_status`` / ``row_venue``
+        the row stopped being an open kraken position under us.
+    ``base_balance``
+        the account no longer holds what the screen said it held.
+    ``open_orders``
+        an order appeared, vanished or filled — including one placed from the
+        web UI, which takes no lock of ours.
+    ``maker_ceiling`` / ``taker_ceiling``
+        the MAXIMUM fee rates the operator authorized. Ceilings, not current
+        rates — see below.
+
+    **Fees are bound as ceilings, deliberately.** An earlier revision digested
+    the exact current ``maker_pct`` / ``taker_pct``, which made the contract
+    self-contradictory: a rate that IMPROVED also changed the digest and voided
+    an authorization the operator would obviously still give. Binding the
+    ceiling makes the rule single and monotone::
+
+        current fee <= approved ceiling  ->  remains authorized
+        current fee >  approved ceiling  ->  authorization invalidated
+
+    The ceiling is what the operator approves; the current rates are shown on
+    the screen and written to the evidence, but they are NOT digested, so only
+    a move against the operator can void the approval.
+
+    Numbers are canonicalized — trailing zeros stripped, then rendered
+    fixed-point — so ``0.1500`` and ``0.15`` are one value and not two. The
+    quantity arrives as free-form TEXT from the ledger, and without this a
+    difference in stored padding would void an economically identical
+    approval, which trains the operator to retype tokens without reading.
+    """
+    payload = "|".join(
+        f"{key}={snapshot[key]}" for key in sorted(snapshot) if key != "digest"
+    )
+    return hashlib.sha256(f"{_EXIT_AUTH_DOMAIN}|{payload}".encode("utf-8")).hexdigest()
+
+
+def build_exit_snapshot(
+    *,
+    live_trade_id: int,
+    pair: str,
+    side: str,
+    volume: Decimal,
+    price: Decimal,
+    client_order_id: str,
+    row_status: str,
+    row_venue: str,
+    position_qty: Decimal,
+    base_balance: Decimal,
+    open_orders: list[dict[str, Any]],
+    maker_ceiling_pct: Decimal,
+    taker_ceiling_pct: Decimal,
+) -> dict[str, Any]:
+    """The comparable state snapshot an exit authorization is bound to.
+
+    ``maker_ceiling_pct`` / ``taker_ceiling_pct`` are the MAXIMUM rates the
+    operator authorized, not the rates currently in force. They are carried
+    unchanged from the approval into the pre-submit rebuild, so a fee that
+    moved in the operator's favour leaves the digest identical.
+    """
+    return {
+        "live_trade_id": str(live_trade_id),
+        "pair": pair.strip().upper(),
+        "side": side.strip().lower(),
+        "volume": _canonical_amount(volume),
+        "price": _canonical_amount(price),
+        "client_order_id": client_order_id,
+        "row_status": row_status,
+        "row_venue": row_venue,
+        "position_qty": _canonical_amount(position_qty),
+        "base_balance": _canonical_amount(base_balance),
+        "open_orders": open_order_fingerprint(open_orders),
+        "maker_ceiling": _canonical_amount(maker_ceiling_pct),
+        "taker_ceiling": _canonical_amount(taker_ceiling_pct),
+    }
+
+
+def exit_authorization_token(snapshot: dict[str, Any]) -> str:
+    """The short token the operator retypes, derived from the bound digest."""
+    return exit_intent_digest(snapshot)[:_EXIT_AUTH_TOKEN_CHARS].upper()
+
+
+def snapshot_differences(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    """Human-readable field-by-field diff of two exit snapshots."""
+    return [
+        f"{key}: approved {before.get(key)!r}, now {after.get(key)!r}"
+        for key in sorted(set(before) | set(after))
+        if before.get(key) != after.get(key)
+    ]
+
+
+def exit_economics(
+    *,
+    entry_price: Decimal,
+    held_qty: Decimal,
+    exit_price: Decimal,
+    entry_fee: Decimal,
+    fee_pct: Decimal,
+) -> dict[str, Any]:
+    """Fees, break-even and P&L for ONE fee assumption (maker OR taker).
+
+    Called once per scenario rather than blended, because the two rates are
+    not two guesses at one number — they are two different things that can
+    happen to the same order, and averaging them would describe an outcome
+    that cannot occur.
+
+    ``entry_fee`` is a single historical number: it was already paid, and it
+    does not depend on how the EXIT executes. Only the exit fee varies with
+    ``fee_pct``.
+
+    Break-even is the exit price at which realised P&L is exactly zero::
+
+        proceeds = P * q * (1 - r)          cost_basis = entry_price * q + entry_fee
+        P_be     = cost_basis / (q * (1 - r))
+
+    i.e. the fee is paid on the exit notional, so the break-even sits above
+    the naive ``entry + fees / q`` by the fee charged on the fee.
+    """
+    rate = fee_pct / Decimal("100")
+    exit_notional = exit_price * held_qty
+    exit_fee = exit_notional * rate
+    cost_basis = entry_price * held_qty + entry_fee
+    denominator = held_qty * (Decimal("1") - rate)
+    break_even = cost_basis / denominator if denominator > 0 else None
+    proceeds = exit_notional - exit_fee
+    pnl = proceeds - cost_basis
+    pnl_pct = pnl / cost_basis * Decimal("100") if cost_basis > 0 else None
+    return {
+        "fee_pct": _fmt(fee_pct),
+        "exit_notional": _fmt(exit_notional),
+        "exit_fee": _fmt(exit_fee),
+        "entry_fee": _fmt(entry_fee),
+        "round_trip_fee": _fmt(entry_fee + exit_fee),
+        "cost_basis": _fmt(cost_basis),
+        "break_even_price": _fmt(break_even),
+        "proceeds": _fmt(proceeds),
+        "realized_pnl_usd": _fmt(pnl),
+        "realized_pnl_pct": _fmt(pnl_pct),
+    }
+
+
+def _next_tier_line(tier: dict[str, Any]) -> str:
+    """One line describing the fee tier below the current one, if any.
+
+    Decision-relevant on a small account: the pilot sits at tier zero and the
+    next band is a fixed amount of 30-day volume away, so an operator can see
+    what the trade in front of them is costing relative to what it would cost
+    a little later. ``None`` on the bottom tier, which is not an error.
+    """
+    maker = tier.get("next_maker_pct")
+    taker = tier.get("next_taker_pct")
+    volume = tier.get("next_volume")
+    if maker is None and taker is None:
+        return "none published (this is the best tier Kraken lists)"
+    rates = f"maker {maker or '?'}% / taker {taker or '?'}%"
+    if not volume:
+        return rates
+    return (
+        f"{rates} at {volume} {tier.get('currency') or ''} "
+        "of 30-day volume".replace("  ", " ")
+    )
+
+
+def stdin_is_interactive() -> bool:
+    """Whether stdin is a terminal a human could be typing at.
+
+    Defensive about the attribute: a replaced ``sys.stdin`` need not implement
+    ``isatty``, and the safe reading of "I cannot tell" is "not a terminal".
+    """
+    stream = sys.stdin
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def read_authorization(expected: str, *, require_tty: bool = False) -> tuple[bool, str]:
     """Read the operator's typed authorization from stdin.
 
     Returns ``(authorized, outcome)``. Every non-match is a refusal:
     a mismatch, an empty line, and EOF (a non-interactive stdin, a closed
     pipe, ``</dev/null``) all abort the run.
+
+    ``require_tty`` refuses BEFORE prompting when stdin is not a terminal.
+    EOF already catches ``</dev/null``, but a pipe carrying the right string —
+    ``echo A1B2C3D4 | kraken_pilot exit ...`` — reads as a valid answer while
+    being exactly the automation this approval boundary exists to exclude.
+    The prompt is a human checkpoint or it is nothing, so the sell side
+    requires a terminal and says so instead of silently accepting the pipe.
     """
+    if require_tty and not stdin_is_interactive():
+        return False, "not_interactive"
     try:
         typed = input("authorize> ")
     except (EOFError, KeyboardInterrupt, OSError):
@@ -1776,6 +2202,2564 @@ class PilotRunner:
             log.warning("kraken_pilot_reconciliation_review", mismatches=mismatches)
         return summary
 
+    # ---------------- exit ----------------
+    def _exit_evidence_dir(self) -> Path:
+        return Path(self._settings.KRAKEN_PILOT_EVIDENCE_DIR)
+
+    def _evidence_for_exit(self, live_trade_id: int, decision_id: str) -> EvidenceLog:
+        """Evidence file for one exit attempt.
+
+        The ROW ID leads the filename so every artifact for a position is one
+        glob away (``kraken_pilot_exit_7_*.json``, which also matches the
+        ``_cancel_`` and ``_status_`` runs). After a crash the operator knows
+        the row id — it is what they typed — and not the decision id, which
+        was minted inside the run that died.
+        """
+        return EvidenceLog(
+            self._exit_evidence_dir()
+            / f"kraken_pilot_exit_{live_trade_id}_{decision_id}.json"
+        )
+
+    def _evidence_for_exit_command(
+        self, command: str, live_trade_id: int, decision_id: str
+    ) -> EvidenceLog:
+        """Evidence file for an exit-adjacent command (cancel / status)."""
+        return EvidenceLog(
+            self._exit_evidence_dir()
+            / f"kraken_pilot_exit_{live_trade_id}_{command}_{decision_id}.json"
+        )
+
+    # -------- dangling-intent recovery --------
+    def _exit_intent_files(self, live_trade_id: int) -> list[Path]:
+        directory = self._exit_evidence_dir()
+        if not directory.exists():
+            return []
+        return sorted(directory.glob(f"kraken_pilot_exit_{live_trade_id}_*.json"))
+
+    @staticmethod
+    def _read_evidence_steps(path: Path) -> list[dict[str, Any]]:
+        """Parse one JSON-Lines evidence file, skipping unreadable lines.
+
+        A torn final line is expected — the file is appended to by a process
+        that may have been killed — and must not make the whole record
+        unreadable, because this is the reader that recovers from exactly that
+        kind of death.
+        """
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        steps: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                steps.append(entry)
+        return steps
+
+    def dangling_exit_intents(
+        self, live_trade_id: int, *, exclude_decision_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Exit runs for this row that recorded an intent and never finished.
+
+        Every exit run appends ``run_completed`` in a ``finally``, so its
+        absence beside an ``exit_intent_persisted`` means the process died
+        between authorizing an order and accounting for it — the one state in
+        which a sell order may exist that nothing in the ledger names.
+
+        A dangling intent BLOCKS a fresh exit. Placing a second sell while the
+        first may be resting is the failure the deterministic client id exists
+        to prevent, and the client-id check at the venue only covers the case
+        where the order actually landed; this covers the case where we cannot
+        yet tell. ``exit-status`` is the read-only path that clears it.
+        """
+        dangling: list[dict[str, Any]] = []
+        for path in self._exit_intent_files(live_trade_id):
+            steps = self._read_evidence_steps(path)
+            intent = next(
+                (s for s in steps if s.get("step") == "exit_intent_persisted"), None
+            )
+            if intent is None:
+                continue
+            if any(s.get("step") == "run_completed" for s in steps):
+                continue
+            if exclude_decision_id and intent.get("decision_id") == exclude_decision_id:
+                continue
+            dangling.append(
+                {
+                    "evidence_path": str(path),
+                    "decision_id": intent.get("decision_id"),
+                    "client_order_id": intent.get("client_order_id"),
+                    "pair": intent.get("pair"),
+                    "volume": intent.get("volume"),
+                    "price": intent.get("price"),
+                    "at": intent.get("at"),
+                    "submitted_txid": next(
+                        (
+                            s.get("txid")
+                            for s in steps
+                            if s.get("step") in ("submitted", "exit_txid_persisted")
+                        ),
+                        None,
+                    ),
+                }
+            )
+        return dangling
+
+    # -------- gates --------
+    def _check_exit_envelope(self, *, validate_only: bool) -> dict[str, Any]:
+        """Narrower than ``place``'s gate — see the module docstring.
+
+        Credentials are required (nothing can be signed without them) and
+        ``LIVE_USE_REAL_SIGNED_REQUESTS`` is required for a real order, because
+        ``place_limit_order`` raises under it regardless and a refusal is
+        clearer before the approval prompt than after.
+
+        ``KRAKEN_PILOT_ENABLED`` and ``KRAKEN_PILOT_PAIR`` are NOT checked. The
+        master gate exists to stop new exposure and must not be able to strand
+        an open position, and the approved-pair setting is irrelevant here —
+        the pair comes from the ledger row, which is the pair the account
+        actually holds.
+        """
+        self._check_credentials()
+        if not validate_only and not self._settings.LIVE_USE_REAL_SIGNED_REQUESTS:
+            raise PilotAbort(
+                "envelope_gate",
+                "LIVE_USE_REAL_SIGNED_REQUESTS is False — the emergency-revert "
+                "posture blocks every real order, including this exit. Use "
+                "--validate-only to rehearse, or flip the flag for the "
+                "supervised session.",
+            )
+        return {
+            "credentials_present": True,
+            "validate_only": validate_only,
+            "pilot_enabled": self._settings.KRAKEN_PILOT_ENABLED,
+            "note": "exit is not gated on KRAKEN_PILOT_ENABLED — it reduces "
+            "exposure, so the master gate must not be able to strand a position",
+        }
+
+    async def _load_exit_row(
+        self, live_trade_id: int, *, stage: str = "row_selection"
+    ) -> dict[str, Any]:
+        """Load the row and prove it is a closeable kraken position.
+
+        Run at selection AND again immediately before submission, because
+        every one of these facts can change while the approval prompt waits.
+        """
+        row = await fetch_live_trade_row(self._db, live_trade_id)
+        if row is None:
+            raise PilotAbort(stage, f"no live_trades row with id={live_trade_id}")
+        if row["venue"] != VENUE:
+            raise PilotAbort(
+                stage,
+                f"live_trades #{live_trade_id} is a {row['venue']!r} row, not "
+                f"{VENUE!r} — this command only closes kraken positions. A "
+                f"{row['venue']!r} position is closed through its own lane.",
+            )
+        if row["status"] != "open":
+            raise PilotAbort(
+                stage,
+                f"live_trades #{live_trade_id} status is {row['status']!r}, not "
+                "'open'. Only an open position can be closed; a "
+                "needs_manual_review row must be resolved by hand first, and a "
+                "terminal row is already closed.",
+            )
+        entry_price = _dec_or_none(row["entry_fill_price"])
+        held_qty = _dec_or_none(row["entry_fill_qty"])
+        if entry_price is None or held_qty is None:
+            raise PilotAbort(
+                stage,
+                f"live_trades #{live_trade_id} has no recorded entry fill "
+                f"(entry_fill_price={row['entry_fill_price']!r}, "
+                f"entry_fill_qty={row['entry_fill_qty']!r}). Without both there "
+                "is no proven position to sell and no basis to price it — "
+                "confirm the entry at the venue and record it before exiting.",
+            )
+        if entry_price <= 0 or held_qty <= 0:
+            raise PilotAbort(
+                stage,
+                f"live_trades #{live_trade_id} records a non-positive entry fill "
+                f"(price={_fmt(entry_price)} qty={_fmt(held_qty)}) — there is "
+                "nothing to sell",
+            )
+        if not row["pair"]:
+            raise PilotAbort(stage, f"live_trades #{live_trade_id} has no pair")
+        return {"row": row, "entry_price": entry_price, "held_qty": held_qty}
+
+    async def _check_exit_lane(
+        self, live_trade_id: int, *, decision_id: str, stage: str
+    ) -> dict[str, Any]:
+        """No other kraken row in flight, and no unfinished exit for this one."""
+        others = [
+            other
+            for other in await fetch_blocking_rows(self._db)
+            if other["live_trade_id"] != live_trade_id
+        ]
+        if others:
+            raise PilotAbort(
+                stage,
+                f"{len(others)} other non-terminal kraken ledger row(s) are in "
+                f"flight ({', '.join(str(o['live_trade_id']) for o in others)}) "
+                "— resolve them before closing this position",
+            )
+        dangling = self.dangling_exit_intents(
+            live_trade_id, exclude_decision_id=decision_id
+        )
+        if dangling:
+            raise PilotAbort(
+                stage,
+                f"{len(dangling)} earlier exit run(s) for this position recorded "
+                "an intent and never finished, so a sell order may exist that "
+                "nothing here can name. Resolve with `kraken_pilot exit-status "
+                f"--live-trade-id {live_trade_id}` before trying again. "
+                f"({', '.join(str(d['decision_id']) for d in dangling)})",
+            )
+        return {"other_blocking_rows": others, "dangling_exit_intents": dangling}
+
+    async def _check_exit_venue_state(
+        self,
+        *,
+        pair: str,
+        base_asset: str,
+        volume: Decimal,
+        client_order_id: str,
+        stage: str = "venue",
+        postscript: str = "",
+    ) -> dict[str, Any]:
+        """The account holds the coins and nothing is already resting.
+
+        Run TWICE per exit: once before the operator is asked, and again
+        immediately before submission. The second pass is not redundancy — the
+        approval prompt is unbounded operator time, and the pilot lock only
+        excludes another pilot process. The Kraken web UI, a phone app, or a
+        second person on the same account can all place an order or move the
+        balance in that window, and none of them take our lock.
+
+        Both halves fail CLOSED. An unreadable ``OpenOrders`` is a refusal
+        rather than an empty list, for the same reason it blocks ``place``:
+        "there is no order resting" is the fact that licenses placing one.
+        """
+        available = _dec(await self._adapter.fetch_account_balance(asset=base_asset))
+        if available < volume:
+            raise PilotAbort(
+                f"{stage}_balance",
+                f"available {base_asset} balance {_fmt(available)} does not cover "
+                f"the {_fmt(volume)} this row says is held. The ledger and the "
+                "account disagree about the position — confirm at the venue "
+                "before selling anything." + postscript,
+            )
+
+        try:
+            open_orders = await self._adapter.fetch_open_orders()
+        except Exception as exc:
+            raise PilotAbort(
+                f"{stage}_open_orders",
+                f"could not read the account's resting orders "
+                f"({type(exc).__name__}: {exc}) — refusing to treat an unreadable "
+                "listing as an empty one" + postscript,
+            ) from exc
+
+        conflicts = [
+            order
+            for order in open_orders
+            if order.get("client_order_id") == client_order_id
+            or str(order.get("pair") or "").upper() == pair.upper()
+        ]
+        if conflicts:
+            raise PilotAbort(
+                f"{stage}_open_orders",
+                f"{len(conflicts)} order(s) already rest for {pair} or for exit "
+                f"client id {client_order_id} "
+                f"({', '.join(str(o.get('txid')) for o in conflicts)}). An exit "
+                "for this position may already be working — never place a "
+                "second one. Check the venue, then cancel or let it fill." + postscript,
+            )
+        return {
+            "asset": base_asset,
+            "available": _fmt(available),
+            "required": _fmt(volume),
+            "venue_open_count": len(open_orders),
+            "venue_open_orders": open_orders,
+        }
+
+    async def _exit_market_rules(self, pair: str) -> dict[str, Any]:
+        """Lot precision and the quote asset for ``pair``.
+
+        Kraken charges the fee in the QUOTE asset, so a sell moves the base
+        balance by exactly the executed quantity — there is no slippage to
+        absorb on that side. A tolerance expressed as a fraction of position
+        size (which is what ``KRAKEN_PILOT_FEE_HEADROOM_PCT`` gives) is
+        therefore the wrong instrument entirely: at the 1% default it would
+        accept a balance that moved by 99% of the sale, i.e. it would mark a
+        materially short sale as fully reconciled.
+
+        One lot tick instead — the smallest unavoidable representation unit in
+        the venue's own published precision, and nothing above it. Fetched
+        BEFORE the approval so an unreadable pair refuses early;
+        ``place_limit_order`` reads the same row and would fail on it anyway.
+
+        The quote asset comes out of the same row because the recovery baseline
+        needs it: reconciling proceeds after a restart means comparing the
+        QUOTE balance too, and the pair is the only thing that says which asset
+        that is.
+
+        Returns ``{"base_epsilon", "lot_decimals", "quote_asset"}``.
+        """
+        try:
+            row = await self._adapter.fetch_exchange_info_row(pair)
+        except Exception as exc:
+            raise PilotAbort(
+                "market_rules",
+                f"could not read Kraken's market rules for {pair} "
+                f"({type(exc).__name__}: {exc}) — without the pair's lot "
+                "precision the sale cannot be reconciled afterwards",
+            ) from exc
+        lot_decimals = None if row is None else row.get("lot_decimals")
+        if lot_decimals is None:
+            raise PilotAbort(
+                "market_rules",
+                f"Kraken published no lot_decimals for {pair} — without the "
+                "pair's quantity precision there is no honest tolerance to "
+                "reconcile the sale against",
+            )
+        try:
+            places = int(lot_decimals)
+        except (TypeError, ValueError) as exc:
+            raise PilotAbort(
+                "market_rules",
+                f"Kraken returned a non-numeric lot_decimals {lot_decimals!r} "
+                f"for {pair}",
+            ) from exc
+        quote_raw = str((row or {}).get("quote") or "")
+        return {
+            "base_epsilon": Decimal(1).scaleb(-places) * _EXIT_BASE_TOLERANCE_LOT_TICKS,
+            "lot_decimals": places,
+            "quote_asset": normalize_kraken_asset(quote_raw) if quote_raw else None,
+        }
+
+    async def _exit_fee_tier(
+        self, pair: str
+    ) -> tuple[Decimal, Decimal, dict[str, Any]]:
+        """THIS account's maker/taker rates, or refuse.
+
+        No default and no fallback to the public AssetPairs schedule. Every
+        number on the approval screen is a number the operator is being asked
+        to accept; a guessed fee rate is worse than no screen at all, because
+        it is wrong in a way that looks authoritative.
+        """
+        try:
+            tier = await self._adapter.fetch_fee_tier(pair=pair)
+        except Exception as exc:
+            raise PilotAbort(
+                "fee_tier",
+                f"could not read this account's fee tier for {pair} "
+                f"({type(exc).__name__}: {exc}). Refusing rather than guessing — "
+                "an authorization screen carrying a made-up fee is worse than no "
+                "screen, and there is no hard-coded rate to fall back to.",
+            ) from exc
+        maker_pct = _dec_or_none(tier.get("maker_pct"))
+        taker_pct = _dec_or_none(tier.get("taker_pct"))
+        if maker_pct is None or taker_pct is None:
+            raise PilotAbort(
+                "fee_tier",
+                f"TradeVolume returned no usable rates for {pair} "
+                f"(maker={tier.get('maker_pct')!r} taker={tier.get('taker_pct')!r})",
+            )
+        if maker_pct < 0 or taker_pct < 0:
+            raise PilotAbort(
+                "fee_tier",
+                f"TradeVolume returned a negative rate for {pair} "
+                f"(maker={_fmt(maker_pct)} taker={_fmt(taker_pct)})",
+            )
+        return maker_pct, taker_pct, tier
+
+    async def _entry_fee(
+        self, *, row: dict[str, Any], entry_notional: Decimal, taker_pct: Decimal
+    ) -> tuple[Decimal, str]:
+        """What the ENTRY cost in fees — measured if possible, derived if not.
+
+        ``live_trades`` has no fee column, so the fee is recovered from the
+        entry order's own fills when the txid is on the row. That is a fact
+        rather than an estimate, and it matters: the pilot's first live trade
+        paid roughly double the headline rate, which a derived figure would
+        have hidden.
+
+        The fallback derives it from the row at the TAKER rate — the higher of
+        the two — so an unmeasurable entry fee understates P&L rather than
+        overstating it.
+        """
+        txid = row.get("entry_order_id")
+        if txid:
+            try:
+                fills = await self._adapter.fetch_order_fills(txid=str(txid))
+            except Exception as exc:
+                log.warning(
+                    "kraken_pilot_entry_fee_unreadable",
+                    live_trade_id=row.get("live_trade_id"),
+                    entry_order_id=txid,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            else:
+                parsed = [_dec_or_none(fill.get("fee")) for fill in fills]
+                if parsed and any(value is not None for value in parsed):
+                    return (
+                        sum(
+                            (value for value in parsed if value is not None),
+                            Decimal("0"),
+                        ),
+                        "actual_entry_fills",
+                    )
+        return entry_notional * taker_pct / Decimal("100"), "estimated_at_taker_rate"
+
+    # -------- the command --------
+    async def exit_position(
+        self,
+        *,
+        live_trade_id: int,
+        price: Decimal,
+        validate_only: bool = False,
+    ) -> int:
+        """Close ONE open kraken ``live_trades`` row with a supervised sell."""
+        decision_id = str(uuid4())
+        client_order_id = make_exit_client_order_id(live_trade_id)
+        evidence = self._evidence_for_exit(live_trade_id, decision_id)
+        code = EXIT_ESCALATE
+        try:
+            code = await self._exit_position_inner(
+                evidence=evidence,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                live_trade_id=live_trade_id,
+                price=price,
+                validate_only=validate_only,
+            )
+            return code
+        finally:
+            # ALWAYS, including on an abort or an unhandled error. Its absence
+            # beside an intent record is what marks a run as dangling, so it
+            # must be written on every path that returns — otherwise every
+            # ordinary refusal would look like a crashed run and block the lane.
+            evidence.record("run_completed", decision_id=decision_id, exit_code=code)
+
+    async def _exit_position_inner(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        client_order_id: str,
+        live_trade_id: int,
+        price: Decimal,
+        validate_only: bool,
+    ) -> int:
+        evidence.record(
+            "run_started",
+            command="exit",
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            client_order_id=client_order_id,
+            price=_fmt(price),
+            validate_only=validate_only,
+            evidence_path=str(evidence.path),
+            db_path=str(Path(self._settings.DB_PATH).resolve()),
+        )
+
+        try:
+            evidence.record(
+                "envelope_gate",
+                **self._check_exit_envelope(validate_only=validate_only),
+            )
+
+            # Observed, never gating — an exit reduces exposure (module
+            # docstring). Recorded so the evidence pack shows the kill state
+            # the sale was made under.
+            kill_state = await self._ks.is_active()
+            evidence.record(
+                "kill_switch_observed",
+                kill_active=kill_state is not None,
+                kill_event_id=None if kill_state is None else kill_state.kill_event_id,
+                note="exit is not gated on the kill switch — it reduces exposure",
+            )
+
+            selection = await self._load_exit_row(live_trade_id)
+            row = selection["row"]
+            entry_price: Decimal = selection["entry_price"]
+            held_qty: Decimal = selection["held_qty"]
+            pair = str(row["pair"])
+            base_asset = str(row["symbol"] or "").upper()
+            evidence.record(
+                "row_selected",
+                live_trade_id=live_trade_id,
+                status=row["status"],
+                venue=row["venue"],
+                pair=pair,
+                symbol=base_asset,
+                entry_client_order_id=row["client_order_id"],
+                entry_order_id=row["entry_order_id"],
+                entry_fill_price=_fmt(entry_price),
+                entry_fill_qty=_fmt(held_qty),
+                exit_client_order_id=client_order_id,
+            )
+
+            lane = await self._check_exit_lane(
+                live_trade_id, decision_id=decision_id, stage="lane_state"
+            )
+            evidence.record("lane_state", **lane)
+
+            venue_state = await self._check_exit_venue_state(
+                pair=pair,
+                base_asset=base_asset,
+                volume=held_qty,
+                client_order_id=client_order_id,
+            )
+            evidence.record("venue_state", **venue_state)
+
+            rules = await self._exit_market_rules(pair)
+            base_epsilon: Decimal = rules["base_epsilon"]
+            lot_decimals: int = rules["lot_decimals"]
+            quote_asset: str | None = rules["quote_asset"]
+            evidence.record(
+                "market_rules",
+                pair=pair,
+                lot_decimals=lot_decimals,
+                base_tolerance=_fmt(base_epsilon),
+                quote_asset=quote_asset,
+                note="one lot tick; the base-side move on a sell is exact "
+                "because Kraken takes its fee in the quote asset",
+            )
+
+            maker_pct, taker_pct, tier = await self._exit_fee_tier(pair)
+            evidence.record(
+                "fee_tier",
+                pair=pair,
+                maker_pct=_fmt(maker_pct),
+                taker_pct=_fmt(taker_pct),
+                volume=tier.get("volume"),
+                currency=tier.get("currency"),
+                next_maker_pct=tier.get("next_maker_pct"),
+                next_taker_pct=tier.get("next_taker_pct"),
+                next_volume=tier.get("next_volume"),
+                source="/0/private/TradeVolume (this account's tier)",
+            )
+
+            entry_notional = entry_price * held_qty
+            entry_fee, entry_fee_source = await self._entry_fee(
+                row=row, entry_notional=entry_notional, taker_pct=taker_pct
+            )
+            scenarios = {
+                assumption: exit_economics(
+                    entry_price=entry_price,
+                    held_qty=held_qty,
+                    exit_price=price,
+                    entry_fee=entry_fee,
+                    fee_pct=fee_pct,
+                )
+                for assumption, fee_pct in (("maker", maker_pct), ("taker", taker_pct))
+            }
+            # Best effort: a public Ticker outage must not stop a position
+            # being closed, so the mid decorates the screen rather than gating
+            # it. The taker warning is printed either way.
+            mid: Decimal | None = None
+            try:
+                mid = await self._adapter.fetch_price(pair)
+            except Exception as exc:
+                log.warning(
+                    "kraken_pilot_exit_mid_unavailable",
+                    pair=pair,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+            evidence.record(
+                "cost_scenarios",
+                entry_notional=_fmt(entry_notional),
+                entry_fee=_fmt(entry_fee),
+                entry_fee_source=entry_fee_source,
+                mid=_fmt(mid),
+                crosses_book=None if mid is None else price < mid,
+                maker=scenarios["maker"],
+                taker=scenarios["taker"],
+            )
+
+            # The rates in force at approval time BECOME the authorized
+            # ceilings. The operator is approving "at most this much fee", so a
+            # later improvement stays inside the approval and only a worsening
+            # breaks it. See exit_intent_digest for why binding the exact
+            # current rates instead was self-contradictory.
+            maker_ceiling, taker_ceiling = maker_pct, taker_pct
+            approved = build_exit_snapshot(
+                live_trade_id=live_trade_id,
+                pair=pair,
+                side="sell",
+                volume=held_qty,
+                price=price,
+                client_order_id=client_order_id,
+                row_status=str(row["status"]),
+                row_venue=str(row["venue"]),
+                position_qty=held_qty,
+                base_balance=_dec_or_none(venue_state["available"]) or Decimal("0"),
+                open_orders=venue_state["venue_open_orders"],
+                maker_ceiling_pct=maker_ceiling,
+                taker_ceiling_pct=taker_ceiling,
+            )
+            token = exit_authorization_token(approved)
+            evidence.record(
+                "authorization_bound",
+                token=token,
+                digest=exit_intent_digest(approved),
+                snapshot=approved,
+                maker_pct_at_approval=_fmt(maker_pct),
+                taker_pct_at_approval=_fmt(taker_pct),
+                note="the typed token is derived from this snapshot; it is "
+                "recomputed from freshly-read state immediately before "
+                "submission and any difference voids the authorization. Fees "
+                "are bound as CEILINGS: a rate at or below the ceiling stays "
+                "authorized, a rate above it does not.",
+            )
+
+            authorized, outcome = self._request_exit_authorization(
+                live_trade_id=live_trade_id,
+                decision_id=decision_id,
+                client_order_id=client_order_id,
+                pair=pair,
+                base_asset=base_asset,
+                entry_price=entry_price,
+                held_qty=held_qty,
+                price=price,
+                entry_notional=entry_notional,
+                entry_fee=entry_fee,
+                entry_fee_source=entry_fee_source,
+                maker_pct=maker_pct,
+                taker_pct=taker_pct,
+                tier=tier,
+                scenarios=scenarios,
+                mid=mid,
+                venue_state=venue_state,
+                token=token,
+                validate_only=validate_only,
+            )
+            evidence.record(
+                "authorization",
+                outcome="authorized" if authorized else "authorization_refused",
+                detail=outcome,
+                bound_fields=sorted(approved),
+            )
+            if not authorized:
+                raise PilotAbort(
+                    "authorization",
+                    f"operator did not authorize ({outcome}) — nothing was sent"
+                    + (
+                        ". stdin is not a terminal: this approval must be typed "
+                        "by a human, never piped."
+                        if outcome == "not_interactive"
+                        else ""
+                    ),
+                )
+
+            verified = await self._verify_snapshot_before_submit(
+                evidence=evidence,
+                approved=approved,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                client_order_id=client_order_id,
+                pair=pair,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                price=price,
+                held_qty=held_qty,
+            )
+            # The verified samples are the honest reconciliation baseline: taken
+            # seconds before the order rather than across the approval.
+            balance_before = verified["base_balance"]
+            quote_before = verified["quote_balance"]
+
+            # THE RECOVERY BASELINE. Written and fsynced immediately before the
+            # submission, and deliberately self-sufficient: a later process
+            # that has none of this run's memory must be able to reconcile the
+            # order from this record alone. That is why the balances, the lot
+            # precision and the fee ceilings are in it and not just the order
+            # parameters — without the pre-trade balances there is nothing to
+            # compare the post-restart balances against, and "the process
+            # exited" would become an excuse to escalate a perfectly
+            # reconcilable trade.
+            evidence.record(
+                "exit_intent_persisted",
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                pair=pair,
+                side="sell",
+                volume=_fmt(held_qty),
+                price=_fmt(price),
+                client_order_id=client_order_id,
+                digest=exit_intent_digest(approved),
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                base_balance_before=_fmt(balance_before),
+                quote_balance_before=_fmt(quote_before),
+                open_order_fingerprint=verified["open_orders"],
+                maker_ceiling_pct=_fmt(maker_ceiling),
+                taker_ceiling_pct=_fmt(taker_ceiling),
+                maker_pct_at_submit=_fmt(verified["maker_pct"]),
+                taker_pct_at_submit=_fmt(verified["taker_pct"]),
+                lot_decimals=lot_decimals,
+                base_tolerance=_fmt(base_epsilon),
+                entry_fill_price=_fmt(entry_price),
+                entry_fee=_fmt(entry_fee),
+                entry_fee_source=entry_fee_source,
+                authorized_at=verified["authorized_at"],
+                submission_state="about_to_submit",
+                validate_only=validate_only,
+                note="written and fsynced BEFORE submission; if the run dies "
+                "after this record the order may exist — resolve with "
+                "`kraken_pilot exit-status`, never resend",
+            )
+
+            return await self._submit_exit(
+                evidence=evidence,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                client_order_id=client_order_id,
+                pair=pair,
+                base_asset=base_asset,
+                quote_asset=quote_asset,
+                entry_price=entry_price,
+                entry_fee=entry_fee,
+                entry_fee_source=entry_fee_source,
+                held_qty=held_qty,
+                price=price,
+                taker_pct=taker_ceiling,
+                base_epsilon=base_epsilon,
+                balance_before=balance_before,
+                quote_before=quote_before,
+                validate_only=validate_only,
+            )
+
+        except PilotAbort as abort:
+            evidence.record(
+                "aborted",
+                stage=abort.stage,
+                reason=abort.reason,
+                exit_code=abort.exit_code,
+            )
+            print(f"REFUSED [{abort.stage}]: {abort.reason}")
+            print(f"evidence: {evidence.path}")
+            return abort.exit_code
+        except Exception as exc:
+            log.error(
+                "kraken_pilot_unexpected_error",
+                command="exit",
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                exc_info=True,
+            )
+            evidence.record(
+                "unexpected_error",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                live_trade_id=live_trade_id,
+            )
+            _print_block(
+                "ESCALATE — UNEXPECTED FAILURE DURING EXIT",
+                [
+                    f"  {type(exc).__name__}: {exc}",
+                    f"  decision ID     : {decision_id}",
+                    f"  live_trades row : {live_trade_id}",
+                    f"  exit client id  : {client_order_id}",
+                    "  A sell order may exist. Resolve read-only with",
+                    f"    python -m scout.live.kraken_pilot exit-status "
+                    f"--live-trade-id {live_trade_id}",
+                    "  before any further action, and NEVER resend.",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_ESCALATE
+
+    async def _verify_snapshot_before_submit(
+        self,
+        *,
+        evidence: EvidenceLog,
+        approved: dict[str, Any],
+        decision_id: str,
+        live_trade_id: int,
+        client_order_id: str,
+        pair: str,
+        base_asset: str,
+        quote_asset: str | None,
+        price: Decimal,
+        held_qty: Decimal,
+    ) -> dict[str, Any]:
+        """Re-read every assumption the approval screen rested on, then compare.
+
+        The approval prompt is unbounded operator time and the pilot lock only
+        excludes another pilot process — the web UI, a phone app and a second
+        person on the account all move this state without taking it. So the
+        row, the balance, the resting-order set and the fee schedule are read
+        again here and the digest is RECOMPUTED, not merely spot-checked.
+
+        A mismatch is a REFUSAL, never a warning and never a silent rebuild:
+        the operator approved a screen, and if the world no longer matches that
+        screen the only honest move is to show them a new one. The individual
+        checks below run first purely so the refusal can name what moved;
+        the digest comparison is the backstop that catches anything they miss.
+
+        Fees are the one asymmetric field: the snapshot carries CEILINGS, which
+        are carried across unchanged, so the digest cannot move when a rate
+        improves. Only the explicit ceiling comparison can refuse, and only
+        upward. See ``exit_intent_digest``.
+
+        Returns the freshly-sampled baseline the caller persists and later
+        reconciles against.
+        """
+        selection = await self._load_exit_row(live_trade_id, stage="pre_submit_recheck")
+        row = selection["row"]
+        current_qty: Decimal = selection["held_qty"]
+        if current_qty != held_qty:
+            raise PilotAbort(
+                "pre_submit_recheck",
+                f"the position quantity changed from {_fmt(held_qty)} to "
+                f"{_fmt(current_qty)} after the authorization was given — "
+                "nothing was sent. Re-run to see a fresh approval screen.",
+            )
+
+        lane = await self._check_exit_lane(
+            live_trade_id, decision_id=decision_id, stage="pre_submit_recheck"
+        )
+        venue_state = await self._check_exit_venue_state(
+            pair=pair,
+            base_asset=base_asset,
+            volume=held_qty,
+            client_order_id=client_order_id,
+            stage="pre_submit_recheck",
+            postscript=" This changed AFTER the authorization was given — "
+            "nothing was sent.",
+        )
+        maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
+
+        # The ONE-WAY fee gate. The ceilings came from the approval and are
+        # reused verbatim below, so a rate that improved cannot move the
+        # digest; only this comparison can refuse, and only when a rate rose
+        # above what the operator authorized.
+        maker_ceiling = _dec_or_none(approved["maker_ceiling"]) or Decimal("0")
+        taker_ceiling = _dec_or_none(approved["taker_ceiling"]) or Decimal("0")
+        if maker_pct > maker_ceiling or taker_pct > taker_ceiling:
+            raise PilotAbort(
+                "pre_submit_recheck",
+                f"the fee schedule rose ABOVE the authorized ceiling "
+                f"(maker {_fmt(maker_pct)}% vs ceiling {_fmt(maker_ceiling)}%, "
+                f"taker {_fmt(taker_pct)}% vs ceiling {_fmt(taker_ceiling)}%) — "
+                "every cost figure the operator approved is now understated. "
+                "Nothing was sent.",
+            )
+
+        quote_balance = await self._sample_quote_balance(quote_asset)
+        current = build_exit_snapshot(
+            live_trade_id=live_trade_id,
+            pair=pair,
+            side="sell",
+            volume=held_qty,
+            price=price,
+            client_order_id=client_order_id,
+            row_status=str(row["status"]),
+            row_venue=str(row["venue"]),
+            position_qty=current_qty,
+            base_balance=_dec_or_none(venue_state["available"]) or Decimal("0"),
+            open_orders=venue_state["venue_open_orders"],
+            # Carried, not re-derived: the ceiling is the operator's decision,
+            # not a fact about the venue, so it does not change under them.
+            maker_ceiling_pct=maker_ceiling,
+            taker_ceiling_pct=taker_ceiling,
+        )
+        differences = snapshot_differences(approved, current)
+        if differences:
+            evidence.record(
+                "pre_submit_recheck",
+                outcome="authorization_void",
+                approved_digest=exit_intent_digest(approved),
+                current_digest=exit_intent_digest(current),
+                differences=differences,
+                current_snapshot=current,
+            )
+            raise PilotAbort(
+                "pre_submit_recheck",
+                "the state the authorization was bound to has changed, so the "
+                "authorization is VOID and nothing was sent. Re-run to see a "
+                "fresh approval screen. Changed: " + "; ".join(differences),
+            )
+
+        authorized_at = datetime.now(timezone.utc).isoformat()
+        evidence.record(
+            "pre_submit_recheck",
+            outcome="clear",
+            digest=exit_intent_digest(current),
+            maker_pct=_fmt(maker_pct),
+            taker_pct=_fmt(taker_pct),
+            maker_ceiling_pct=_fmt(maker_ceiling),
+            taker_ceiling_pct=_fmt(taker_ceiling),
+            fee_verdict="at or below the authorized ceilings",
+            quote_asset=quote_asset,
+            quote_balance=_fmt(quote_balance),
+            authorized_at=authorized_at,
+            other_blocking_rows=lane["other_blocking_rows"],
+            dangling_exit_intents=lane["dangling_exit_intents"],
+            **venue_state,
+        )
+        return {
+            "base_balance": _dec_or_none(current["base_balance"]),
+            "quote_balance": quote_balance,
+            "open_orders": current["open_orders"],
+            "maker_pct": maker_pct,
+            "taker_pct": taker_pct,
+            "authorized_at": authorized_at,
+        }
+
+    async def _sample_quote_balance(self, quote_asset: str | None) -> Decimal | None:
+        """The quote-asset balance, best effort.
+
+        Part of the recovery baseline rather than a gate: proceeds land in the
+        quote asset, so a restart needs a pre-trade figure to compare against.
+        A failure here must NOT block a sale — the base-side checks are the
+        ones that decide whether the coins left — so it degrades to ``None``
+        and the reconciliation simply skips the quote-balance comparison and
+        says so.
+        """
+        if not quote_asset:
+            return None
+        try:
+            return _dec(await self._adapter.fetch_account_balance(asset=quote_asset))
+        except Exception as exc:
+            log.warning(
+                "kraken_pilot_quote_balance_unavailable",
+                asset=quote_asset,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return None
+
+    def _request_exit_authorization(
+        self,
+        *,
+        live_trade_id: int,
+        decision_id: str,
+        client_order_id: str,
+        pair: str,
+        base_asset: str,
+        entry_price: Decimal,
+        held_qty: Decimal,
+        price: Decimal,
+        entry_notional: Decimal,
+        entry_fee: Decimal,
+        entry_fee_source: str,
+        maker_pct: Decimal,
+        taker_pct: Decimal,
+        tier: dict[str, Any],
+        scenarios: dict[str, dict[str, Any]],
+        mid: Decimal | None,
+        venue_state: dict[str, Any],
+        token: str,
+        validate_only: bool,
+    ) -> tuple[bool, str]:
+        """Print BOTH cost scenarios, then require the bound token on a TTY.
+
+        Both rates are shown in full because a limit order does not choose
+        which one it pays: it pays maker if it rests and taker if it crosses,
+        and which of those happens is decided by the book at the instant the
+        order arrives, not by the order type. Showing one number would be
+        showing the operator a fee they may not be charged.
+
+        ASCII operators only (``->``), same reason as ``place``'s block: this
+        is read on whatever console the operator has.
+        """
+        entry_fee_label = (
+            "ACTUAL, from the entry order's fills"
+            if entry_fee_source == "actual_entry_fills"
+            else "ESTIMATE at the taker rate - the entry fills could not be read"
+        )
+        lines = [
+            f"  position            : live_trades #{live_trade_id} "
+            f"({base_asset} on {pair})",
+            "  side                : SELL (closing the position)",
+            f"  quantity            : {_fmt(held_qty)} {base_asset} "
+            f"(entry_fill_qty - the whole recorded position)",
+            f"  entry fill price    : {_fmt(entry_price)}",
+            f"  entry notional      : {_fmt(entry_notional)}",
+            f"  entry fee           : {_fmt(entry_fee)} ({entry_fee_label})",
+            f"  limit price         : {_fmt(price)}",
+            f"  exit notional       : {scenarios['maker']['exit_notional']} "
+            f"(price x quantity)",
+            "  current mid         : "
+            + (_fmt(mid) or "" if mid is not None else "unavailable"),
+            f"  account fee tier    : maker {_fmt(maker_pct)}% / "
+            f"taker {_fmt(taker_pct)}% (this account, from TradeVolume)",
+            f"  30-day volume       : {tier.get('volume') or 'unpublished'} "
+            f"{tier.get('currency') or ''}".rstrip(),
+            f"  next fee tier       : {_next_tier_line(tier)}",
+            f"  decision ID         : {decision_id}",
+            f"  exit client order ID: {client_order_id}",
+            f"  database            : {Path(self._settings.DB_PATH).resolve()}",
+            f"  available balance   : {venue_state['available']} "
+            f"{venue_state['asset']}",
+            f"  open kraken orders  : {venue_state['venue_open_count']} "
+            f"(from the venue's own OpenOrders listing)",
+        ]
+        headings = {
+            "maker": f"IF THIS FILLS AS MAKER (the limit rests and does not cross "
+            f"the book, {_fmt(maker_pct)}%):",
+            "taker": f"IF THIS FILLS AS TAKER (the limit crosses the book, "
+            f"{_fmt(taker_pct)}%):",
+        }
+        for assumption in ("maker", "taker"):
+            scenario = scenarios[assumption]
+            lines.extend(
+                [
+                    "",
+                    f"  {headings[assumption]}",
+                    f"    exit fee          : {scenario['exit_fee']} "
+                    f"(exit notional x {scenario['fee_pct']}%)",
+                    f"    round-trip fee    : {scenario['round_trip_fee']} "
+                    f"(entry {_fmt(entry_fee)} + this exit fee)",
+                    f"    break-even price  : {scenario['break_even_price']} "
+                    f"(the exit price at which realised P&L is zero, "
+                    f"{assumption} assumption)",
+                    f"    realised P&L      : {scenario['realized_pnl_usd']} "
+                    f"({scenario['realized_pnl_pct']}%) at the "
+                    f"{_fmt(price)} limit, {assumption} assumption",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "  ** WARNING          : a LIMIT order is not a MAKER guarantee. "
+                "If this",
+                "                        price crosses the book when it reaches "
+                "the matching",
+                "                        engine it executes immediately as TAKER, "
+                "at the taker",
+                "                        figures above.",
+            ]
+        )
+        if mid is not None and price < mid:
+            lines.append(
+                f"  ** WARNING          : limit {_fmt(price)} is BELOW the mid "
+                f"{_fmt(mid)} — this sell is marketable and will very likely pay "
+                "the TAKER rate"
+            )
+        if validate_only:
+            lines.append(
+                "  ** REHEARSAL        : validate=true — Kraken will parse and "
+                "check this order but NOT place it"
+            )
+        _print_block("KRAKEN SUPERVISED PILOT — EXIT APPROVAL REQUIRED", lines)
+        print(
+            f"Type this exact token to authorize:  {token}\n"
+            "It is derived from the order AND the account state above — the "
+            "position\n"
+            "quantity, the balance, the resting orders and the fee rates. All of "
+            "it is\n"
+            "re-read and re-derived immediately before the order is sent; if "
+            "anything\n"
+            "moved, this authorization is void and nothing is sent. Anything "
+            "else —\n"
+            "including an empty line, a pipe or a closed stdin — aborts."
+        )
+        return read_authorization(token, require_tty=True)
+
+    async def _submit_exit(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        client_order_id: str,
+        pair: str,
+        base_asset: str,
+        quote_asset: str | None,
+        entry_price: Decimal,
+        entry_fee: Decimal,
+        entry_fee_source: str,
+        held_qty: Decimal,
+        price: Decimal,
+        taker_pct: Decimal,
+        base_epsilon: Decimal,
+        balance_before: Decimal | None,
+        quote_before: Decimal | None,
+        validate_only: bool,
+    ) -> int:
+        """Submit exactly once, then decide what came back."""
+        txid: str | None = None
+        try:
+            result = await self._adapter.place_limit_order(
+                pair=pair,
+                side="sell",
+                price=price,
+                volume=held_qty,
+                client_order_id=client_order_id,
+                validate_only=validate_only,
+            )
+        except KrakenAmbiguousSubmissionError as exc:
+            evidence.record(
+                "submission_ambiguous",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                note="NEVER resend — resolving by client id instead",
+            )
+            code, txid = await self._resolve_exit_ambiguity(
+                evidence=evidence,
+                live_trade_id=live_trade_id,
+                client_order_id=client_order_id,
+                pair=pair,
+            )
+            if code is not None:
+                return code
+        except Exception as exc:
+            # Definitive refusal. Nothing was placed, so the position is
+            # untouched and the row stays exactly as it was — writing
+            # 'rejected' here would retire a row that still holds coins.
+            evidence.record(
+                "submission_refused",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                live_trade_id=live_trade_id,
+                ledger_status="open",
+                note="no order was created; the position is still held and the "
+                "row is unchanged",
+            )
+            print(f"REFUSED [submit]: {type(exc).__name__}: {exc}")
+            print(
+                f"  live_trades #{live_trade_id} is unchanged — you still hold "
+                f"{_fmt(held_qty)} {base_asset}."
+            )
+            print(f"evidence: {evidence.path}")
+            return EXIT_REFUSED
+        else:
+            if validate_only:
+                evidence.record(
+                    "validate_only_accepted",
+                    descr=result.get("descr"),
+                    price_sent=result.get("price"),
+                    volume_sent=result.get("volume"),
+                    note="Kraken validated the exit order and placed nothing; the "
+                    "ledger row is untouched by design",
+                )
+                _print_block(
+                    "EXIT REHEARSAL COMPLETE — no order was placed",
+                    [
+                        f"  live_trades row : {live_trade_id} (unchanged, still open)",
+                        f"  decision ID     : {decision_id}",
+                        f"  descr           : {result.get('descr')}",
+                        f"  evidence        : {evidence.path}",
+                    ],
+                )
+                return EXIT_OK
+            txids = result.get("txid") or []
+            txid = str(txids[0]) if txids else None
+            evidence.record(
+                "submitted",
+                txid=txid,
+                all_txids=txids,
+                descr=result.get("descr"),
+                price_sent=result.get("price"),
+                volume_sent=result.get("volume"),
+            )
+
+        if txid:
+            # Persisted the instant it is known: from here the ledger names the
+            # venue order even if everything after this line fails.
+            await update_live_trade(self._db, live_trade_id, exit_order_id=txid)
+            evidence.record(
+                "exit_txid_persisted", live_trade_id=live_trade_id, txid=txid
+            )
+
+        return await self._await_and_close(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            client_order_id=client_order_id,
+            txid=txid,
+            pair=pair,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            entry_price=entry_price,
+            entry_fee=entry_fee,
+            entry_fee_source=entry_fee_source,
+            held_qty=held_qty,
+            price=price,
+            taker_pct=taker_pct,
+            base_epsilon=base_epsilon,
+            balance_before=balance_before,
+            quote_before=quote_before,
+        )
+
+    async def _resolve_exit_ambiguity(
+        self,
+        *,
+        evidence: EvidenceLog,
+        live_trade_id: int,
+        client_order_id: str,
+        pair: str,
+    ) -> tuple[int | None, str | None]:
+        """Turn an ambiguous exit submission into a decided state. Never resends.
+
+        Returns ``(exit_code, txid)`` — a code when the run is over, or
+        ``(None, txid)`` when the order was adopted and the caller continues
+        into fill confirmation.
+        """
+        detail = await self._adapter.resolve_order_submission_detail(
+            client_order_id=client_order_id
+        )
+        verdict = detail.get("verdict")
+        evidence.record("ambiguity_resolution", **detail)
+
+        if verdict == "accepted":
+            txid = None
+            conf = await self._adapter.fetch_order_by_client_id(
+                pair=pair, client_order_id=client_order_id
+            )
+            if conf is not None and conf.venue_order_id:
+                txid = str(conf.venue_order_id)
+            elif detail.get("txid"):
+                txid = str(detail["txid"][0])
+            evidence.record(
+                "ambiguity_adopted",
+                txid=txid,
+                venue_status=None if conf is None else conf.status,
+                note="the sell DID land — adopting it rather than resending",
+            )
+            return None, txid
+
+        if verdict == "not_accepted":
+            evidence.record(
+                "ambiguity_not_accepted",
+                live_trade_id=live_trade_id,
+                ledger_status="open",
+                note="no sell order exists; the position is still held and the "
+                "row is unchanged",
+            )
+            _print_block(
+                "EXIT DID NOT LAND — no order exists",
+                [
+                    "  Two clean sweeps of OpenOrders + ClosedOrders found no",
+                    "  order carrying this exit client id. The position is still",
+                    f"  held and live_trades #{live_trade_id} is unchanged.",
+                    f"  evidence: {evidence.path}",
+                ],
+            )
+            return EXIT_REFUSED, None
+
+        # unresolved — STOP. Never resend a sell that may already be working.
+        await update_live_trade(self._db, live_trade_id, status="needs_manual_review")
+        evidence.record(
+            "ambiguity_unresolved",
+            live_trade_id=live_trade_id,
+            ledger_status="needs_manual_review",
+        )
+        _print_block(
+            "ESCALATE — EXIT SUBMISSION UNRESOLVED, DO NOT RESEND",
+            [
+                "  Kraken could not confirm whether this sell order exists.",
+                f"  exit client id  : {client_order_id}",
+                f"  live_trades row : {live_trade_id} (needs_manual_review)",
+                "",
+                "  Next steps, in order:",
+                "   1. python -m scout.live.kraken_pilot exit-status "
+                f"--live-trade-id {live_trade_id}",
+                "   2. If it is resting and you want it gone: exit-cancel "
+                f"--live-trade-id {live_trade_id}",
+                "   3. If it filled, re-run exit-status to reconcile it.",
+                f"   4. Evidence: {evidence.path}",
+            ],
+        )
+        return EXIT_ESCALATE, None
+
+    async def _await_and_close(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        client_order_id: str,
+        txid: str | None,
+        pair: str,
+        base_asset: str,
+        quote_asset: str | None,
+        entry_price: Decimal,
+        entry_fee: Decimal,
+        entry_fee_source: str,
+        held_qty: Decimal,
+        price: Decimal,
+        taker_pct: Decimal,
+        base_epsilon: Decimal,
+        balance_before: Decimal | None,
+        quote_before: Decimal | None,
+    ) -> int:
+        """Wait for the fill, then hand the outcome to the settlement path."""
+        timeout_sec = float(self._settings.KRAKEN_PILOT_FILL_TIMEOUT_SEC)
+        print(
+            f"exit order submitted; waiting for fill, up to {timeout_sec:g}s "
+            f"(polling every {self._settings.KRAKEN_FILL_POLL_INTERVAL_SEC:g}s) ..."
+        )
+        conf = await self._adapter.await_fill_confirmation(
+            venue_order_id=txid or "",
+            client_order_id=client_order_id,
+            timeout_sec=timeout_sec,
+        )
+        evidence.record(
+            "fill_confirmation",
+            status=conf.status,
+            txid=conf.venue_order_id,
+            filled_qty=conf.filled_qty,
+            fill_price=conf.fill_price,
+        )
+        return await self._settle_exit_outcome(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            conf=conf,
+            txid=txid,
+            pair=pair,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            entry_price=entry_price,
+            entry_fee=entry_fee,
+            entry_fee_source=entry_fee_source,
+            held_qty=held_qty,
+            price=price,
+            taker_pct=taker_pct,
+            base_epsilon=base_epsilon,
+            balance_before=balance_before,
+            quote_before=quote_before,
+            origin="exit",
+        )
+
+    async def _settle_exit_outcome(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        conf: Any,
+        txid: str | None,
+        pair: str,
+        base_asset: str,
+        quote_asset: str | None,
+        entry_price: Decimal,
+        entry_fee: Decimal,
+        entry_fee_source: str,
+        held_qty: Decimal,
+        price: Decimal,
+        taker_pct: Decimal,
+        base_epsilon: Decimal,
+        balance_before: Decimal | None,
+        quote_before: Decimal | None,
+        origin: str,
+    ) -> int:
+        """Decide what a terminal (or timed-out) exit order means for the row.
+
+        Shared by ``exit``, ``exit-cancel`` and ``exit-status`` so a fill is
+        accounted for identically however the operator arrived at it — three
+        code paths reconciling the same sale three ways is how ledgers drift.
+        """
+        lookup_txid = str(txid or conf.venue_order_id or "")
+
+        if conf.status == "timeout":
+            evidence.record(
+                "exit_order_resting",
+                live_trade_id=live_trade_id,
+                txid=lookup_txid or None,
+                origin=origin,
+            )
+            _print_block(
+                "EXIT ORDER STILL RESTING",
+                [
+                    f"  live_trades row : {live_trade_id} (still open — the "
+                    "position is unsold)",
+                    f"  exit txid       : {lookup_txid or '(unknown)'}",
+                    f"  limit price     : {_fmt(price)}",
+                    "",
+                    "  The order did not reach a terminal state inside the window.",
+                    "  It is working. To watch it or to pull it:",
+                    "    python -m scout.live.kraken_pilot exit-status "
+                    f"--live-trade-id {live_trade_id}",
+                    "    python -m scout.live.kraken_pilot exit-cancel "
+                    f"--live-trade-id {live_trade_id}",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_OK
+
+        if conf.status == "rejected":
+            evidence.record(
+                "exit_order_terminal_zero_fill",
+                live_trade_id=live_trade_id,
+                txid=lookup_txid or None,
+                ledger_status="open",
+                origin=origin,
+                note="the venue reported a terminal order with nothing executed; "
+                "the position is still held",
+            )
+            _print_block(
+                "EXIT ORDER ENDED WITHOUT SELLING ANYTHING",
+                [
+                    f"  live_trades row : {live_trade_id} (unchanged, still open)",
+                    f"  exit txid       : {lookup_txid or '(unknown)'}",
+                    f"  You still hold {_fmt(held_qty)} {base_asset}.",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_REFUSED
+
+        filled_qty = _dec_or_none(conf.filled_qty)
+        if filled_qty is None or filled_qty <= 0:
+            if conf.status == "pending":
+                # Not terminal and nothing executed — the order is working.
+                evidence.record(
+                    "exit_order_resting",
+                    live_trade_id=live_trade_id,
+                    txid=lookup_txid or None,
+                    origin=origin,
+                    venue_status=conf.status,
+                )
+                print(
+                    f"exit order {lookup_txid or '(unknown)'} is still working; "
+                    "nothing has executed."
+                )
+                return EXIT_OK
+            await update_live_trade(
+                self._db, live_trade_id, status="needs_manual_review"
+            )
+            evidence.record(
+                "exit_fill_unreadable",
+                live_trade_id=live_trade_id,
+                ledger_status="needs_manual_review",
+                filled_qty=conf.filled_qty,
+                origin=origin,
+            )
+            _print_block(
+                "ESCALATE — EXIT FILL COULD NOT BE READ",
+                [
+                    f"  The venue reported status {conf.status!r} but no usable",
+                    f"  filled quantity ({conf.filled_qty!r}).",
+                    f"  live_trades row : {live_trade_id} (needs_manual_review)",
+                    f"  exit txid       : {lookup_txid or '(unknown)'}",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_ESCALATE
+
+        fills: list[dict[str, Any]] = []
+        if lookup_txid:
+            fills = await self._adapter.fetch_order_fills(txid=lookup_txid)
+        evidence.record("fills", fill_count=len(fills), fills=fills, origin=origin)
+
+        totals = _sum_fills(fills)
+        exit_vwap = _dec_or_none(conf.fill_price)
+        if exit_vwap is None and totals["qty"] > 0:
+            exit_vwap = totals["cost"] / totals["qty"]
+
+        # "Covers the position within the lot-size tolerance" — one lot tick,
+        # never a percentage. A sale short by more than a representation unit
+        # is a partial, whatever the venue's status string says.
+        if filled_qty < held_qty - base_epsilon:
+            return await self._record_partial_exit(
+                evidence=evidence,
+                live_trade_id=live_trade_id,
+                txid=lookup_txid or None,
+                base_asset=base_asset,
+                held_qty=held_qty,
+                filled_qty=filled_qty,
+                exit_vwap=exit_vwap,
+                fills=fills,
+                origin=origin,
+            )
+
+        return await self._reconcile_and_close(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            txid=lookup_txid or None,
+            pair=pair,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            entry_price=entry_price,
+            entry_fee=entry_fee,
+            entry_fee_source=entry_fee_source,
+            held_qty=held_qty,
+            filled_qty=filled_qty,
+            exit_vwap=exit_vwap,
+            totals=totals,
+            fills=fills,
+            price=price,
+            taker_pct=taker_pct,
+            base_epsilon=base_epsilon,
+            balance_before=balance_before,
+            quote_before=quote_before,
+            origin=origin,
+        )
+
+    async def _record_partial_exit(
+        self,
+        *,
+        evidence: EvidenceLog,
+        live_trade_id: int,
+        txid: str | None,
+        base_asset: str,
+        held_qty: Decimal,
+        filled_qty: Decimal,
+        exit_vwap: Decimal | None,
+        fills: list[dict[str, Any]],
+        origin: str,
+    ) -> int:
+        """A partial fill leaves a real position. Never close on it.
+
+        ``entry_fill_qty`` is the lane's held-quantity field, so it is reduced
+        by what sold: the remainder is what the account still holds and what a
+        later ``exit`` run must sell. No P&L is written — the trade is not over,
+        and a realised figure on an unfinished position would be read as final.
+
+        The reduction is applied ONLY when this order's fills have not already
+        been folded in, which is what ``exit_order_id`` already naming this
+        txid would mean. Without a column recording how much of this order was
+        previously applied there is no way to subtract the remainder correctly,
+        and subtracting the whole thing twice would understate the position —
+        so that case escalates instead of guessing. The written value is also
+        clamped to never exceed the current one: a quantity may fall as coins
+        leave, never rise.
+        """
+        row = await fetch_live_trade_row(self._db, live_trade_id)
+        already_applied = bool(
+            row
+            and txid
+            and row.get("exit_order_id") == txid
+            and row.get("exit_fill_price")
+        )
+        if already_applied:
+            await update_live_trade(
+                self._db, live_trade_id, status="needs_manual_review"
+            )
+            evidence.record(
+                "exit_partial_already_applied",
+                live_trade_id=live_trade_id,
+                ledger_status="needs_manual_review",
+                txid=txid,
+                filled_qty=_fmt(filled_qty),
+                origin=origin,
+                note="this order's partial fill was already folded into the held "
+                "quantity by an earlier run; applying it twice would understate "
+                "the position, and there is no record of how much was applied",
+            )
+            _print_block(
+                "ESCALATE — PARTIAL FILL ALREADY ACCOUNTED FOR",
+                [
+                    f"  live_trades row : {live_trade_id} (needs_manual_review)",
+                    f"  exit txid       : {txid or '(unknown)'}",
+                    "  An earlier run already reduced the held quantity for this",
+                    "  order. Re-applying it would subtract the same coins twice,",
+                    "  so nothing was changed. Set the held quantity by hand from",
+                    "  the venue's own trade history.",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_ESCALATE
+
+        remaining = held_qty - filled_qty
+        if remaining < 0:
+            remaining = Decimal("0")
+        current = _dec_or_none((row or {}).get("entry_fill_qty"))
+        if current is not None and remaining > current:
+            # Never restore. A held quantity only ever falls.
+            remaining = current
+        await update_live_trade(
+            self._db,
+            live_trade_id,
+            exit_order_id=txid,
+            exit_fill_price=_fmt(exit_vwap),
+            entry_fill_qty=_fmt(remaining),
+        )
+        evidence.record(
+            "exit_partial_fill",
+            live_trade_id=live_trade_id,
+            ledger_status="open",
+            txid=txid,
+            requested_qty=_fmt(held_qty),
+            filled_qty=_fmt(filled_qty),
+            remaining_qty=_fmt(remaining),
+            exit_fill_price=_fmt(exit_vwap),
+            fill_count=len(fills),
+            origin=origin,
+            note="POSITION STILL EXISTS — row stays open with the remaining "
+            "quantity; no realised P&L is written for an unfinished exit",
+        )
+        _print_block(
+            "EXIT PARTIALLY FILLED — POSITION STILL OPEN",
+            [
+                f"  live_trades row : {live_trade_id} (still open)",
+                f"  exit txid       : {txid or '(unknown)'}",
+                f"  sold            : {_fmt(filled_qty)} {base_asset} @ "
+                f"{_fmt(exit_vwap)}",
+                f"  still held      : {_fmt(remaining)} {base_asset} "
+                "(entry_fill_qty has been reduced to this)",
+                "",
+                "  DECISION REQUIRED. The rest of the order may still be resting.",
+                "    python -m scout.live.kraken_pilot exit-status "
+                f"--live-trade-id {live_trade_id}",
+                "    python -m scout.live.kraken_pilot exit-cancel "
+                f"--live-trade-id {live_trade_id}",
+                f"  evidence        : {evidence.path}",
+            ],
+        )
+        return EXIT_REVIEW
+
+    async def _reconcile_and_close(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        txid: str | None,
+        pair: str,
+        base_asset: str,
+        quote_asset: str | None,
+        entry_price: Decimal,
+        entry_fee: Decimal,
+        entry_fee_source: str,
+        held_qty: Decimal,
+        filled_qty: Decimal,
+        exit_vwap: Decimal | None,
+        totals: dict[str, Any],
+        fills: list[dict[str, Any]],
+        price: Decimal,
+        taker_pct: Decimal,
+        base_epsilon: Decimal,
+        balance_before: Decimal | None,
+        quote_before: Decimal | None,
+        origin: str,
+    ) -> int:
+        """Reconcile, and close ONLY if the reconciliation confirms.
+
+        Two comparisons, deliberately kept apart:
+
+        **Base asset** — the balance reduction against the cumulative executed
+        volume, to within ONE lot tick. Kraken charges the fee in the quote
+        asset, so this side is exact and the tolerance is a representation
+        unit, not a fraction of anything. Quote-side variability is not
+        allowed anywhere near it: a fee that came in high must never widen the
+        band that decides whether the coins actually left.
+
+        **Quote asset** — proceeds and fees, where a percentage genuinely
+        applies. The fee is checked against the account's own taker rate (the
+        worst case) with ``KRAKEN_PILOT_FEE_HEADROOM_PCT`` of slack, the
+        executed price is checked against the limit (a limit SELL can never
+        execute below its limit, so a VWAP that did is not our order), and —
+        when a pre-trade quote balance was persisted — the proceeds are
+        checked to have actually ARRIVED in the quote asset.
+
+        This is the ONLY reconciliation predicate in the module. ``exit``,
+        ``exit-cancel`` and ``exit-status`` all reach it, so recovery cannot
+        drift to a looser standard than the path that placed the order.
+
+        A close asserts the position is gone. Asserting that on evidence we
+        could not corroborate is how a phantom position gets created, and the
+        row is the only durable claim about what the account holds.
+        """
+        base_mismatches: list[str] = []
+        quote_mismatches: list[str] = []
+
+        balance_after: Decimal | None = None
+        try:
+            balance_after = _dec(
+                await self._adapter.fetch_account_balance(asset=base_asset)
+            )
+        except Exception as exc:
+            base_mismatches.append(
+                f"could not re-read the {base_asset} balance after the sale "
+                f"({type(exc).__name__})"
+            )
+
+        observed_delta: Decimal | None = None
+        expected_delta = -filled_qty
+        if balance_before is None:
+            # No usable baseline — UNAVAILABLE EVIDENCE, which is a legitimate
+            # reason to withhold a close. Not reached merely because the
+            # originating process exited: that process persists the pre-trade
+            # balances in its intent record precisely so a later run can pass
+            # them back in here. This fires only when no such record survives.
+            base_mismatches.append(
+                "no pre-trade balance sample to compare the sale against, and "
+                "none was recoverable from a persisted exit intent — the coins "
+                "leaving cannot be independently corroborated here"
+            )
+        elif balance_after is not None:
+            observed_delta = balance_after - balance_before
+            if abs(observed_delta - expected_delta) > base_epsilon:
+                base_mismatches.append(
+                    f"{base_asset} balance fell by {_fmt(-observed_delta)} but the "
+                    f"cumulative executed volume is {_fmt(filled_qty)} — a "
+                    f"difference beyond the {_fmt(base_epsilon)} lot tolerance"
+                )
+
+        if not fills:
+            base_mismatches.append(
+                "the venue reported a completed fill but produced no per-fill "
+                "records to corroborate it"
+            )
+        elif abs(totals["qty"] - filled_qty) > base_epsilon:
+            base_mismatches.append(
+                f"per-fill quantities total {_fmt(totals['qty'])}, which does not "
+                f"match the order's reported {_fmt(filled_qty)} within the "
+                f"{_fmt(base_epsilon)} lot tolerance"
+            )
+
+        if fills and not totals["fee_readable"]:
+            quote_mismatches.append("no readable fee on any exit fill")
+        if exit_vwap is None or exit_vwap <= 0:
+            quote_mismatches.append("no usable exit fill price")
+        else:
+            headroom = _dec(self._settings.KRAKEN_PILOT_FEE_HEADROOM_PCT) / Decimal(
+                "100"
+            )
+            floor = price * (Decimal("1") - headroom)
+            if exit_vwap < floor:
+                quote_mismatches.append(
+                    f"executed price {_fmt(exit_vwap)} is below the {_fmt(price)} "
+                    "limit — a limit SELL cannot execute below its limit, so this "
+                    "is not the order we placed"
+                )
+            if totals["fee_readable"]:
+                fee_ceiling = (
+                    exit_vwap
+                    * filled_qty
+                    * taker_pct
+                    / Decimal("100")
+                    * (Decimal("1") + headroom)
+                )
+                if totals["fee"] > fee_ceiling:
+                    quote_mismatches.append(
+                        f"exit fee {_fmt(totals['fee'])} exceeds the account's own "
+                        f"taker rate of {_fmt(taker_pct)}% on the executed "
+                        f"notional ({_fmt(fee_ceiling)} including headroom)"
+                    )
+
+        proceeds = (
+            totals["cost"] - totals["fee"]
+            if totals["cost"] > 0
+            else (exit_vwap or Decimal("0")) * filled_qty - totals["fee"]
+        )
+
+        # Did the money actually ARRIVE? The base check proves the coins left;
+        # only this proves they were paid for. Available only when a pre-trade
+        # quote balance was persisted, which is the whole reason the intent
+        # record carries one. A percentage band is right here — the quote side
+        # is where fee and rounding variability legitimately lives.
+        quote_after: Decimal | None = None
+        quote_delta: Decimal | None = None
+        if quote_before is not None and quote_asset and proceeds > 0:
+            try:
+                quote_after = _dec(
+                    await self._adapter.fetch_account_balance(asset=quote_asset)
+                )
+            except Exception as exc:
+                quote_mismatches.append(
+                    f"could not re-read the {quote_asset} balance after the sale "
+                    f"({type(exc).__name__})"
+                )
+            else:
+                quote_delta = quote_after - quote_before
+                band = (
+                    proceeds
+                    * _dec(self._settings.KRAKEN_PILOT_FEE_HEADROOM_PCT)
+                    / Decimal("100")
+                )
+                if abs(quote_delta - proceeds) > band:
+                    quote_mismatches.append(
+                        f"{quote_asset} balance rose by {_fmt(quote_delta)} but the "
+                        f"sale's net proceeds are {_fmt(proceeds)} — the money did "
+                        f"not arrive as the fills describe (band {_fmt(band)})"
+                    )
+
+        mismatches = base_mismatches + quote_mismatches
+        cost_basis = entry_price * held_qty + entry_fee
+        pnl = proceeds - cost_basis
+        pnl_pct = pnl / cost_basis * Decimal("100") if cost_basis > 0 else None
+
+        summary = {
+            "verdict": "review" if mismatches else "pass",
+            "mismatches": mismatches,
+            "base_mismatches": base_mismatches,
+            "quote_mismatches": quote_mismatches,
+            "origin": origin,
+            "txid": txid,
+            "filled_qty": _fmt(filled_qty),
+            "exit_fill_price": _fmt(exit_vwap),
+            "exit_fee": _fmt(totals["fee"]),
+            "exit_gross_proceeds": _fmt(totals["cost"]),
+            "exit_proceeds_net": _fmt(proceeds),
+            "entry_fee": _fmt(entry_fee),
+            "entry_fee_source": entry_fee_source,
+            "cost_basis": _fmt(cost_basis),
+            "realized_pnl_usd": _fmt(pnl),
+            "realized_pnl_pct": _fmt(pnl_pct),
+            "base": {
+                "asset": base_asset,
+                "before": _fmt(balance_before),
+                "after": _fmt(balance_after),
+                "observed_delta": _fmt(observed_delta),
+                "expected_delta": _fmt(expected_delta),
+                "lot_tolerance": _fmt(base_epsilon),
+                "note": "exact comparison — Kraken takes its fee in the quote "
+                "asset, so no quote-side variability may widen this band",
+            },
+            "quote": {
+                "asset": quote_asset,
+                "before": _fmt(quote_before),
+                "after": _fmt(quote_after),
+                "observed_delta": _fmt(quote_delta),
+                "expected_delta": _fmt(proceeds),
+                "checked": quote_delta is not None,
+            },
+            "fill_count": len(fills),
+        }
+        evidence.record("exit_reconciliation", **summary)
+
+        if mismatches:
+            log.warning(
+                "kraken_pilot_exit_reconciliation_review",
+                live_trade_id=live_trade_id,
+                mismatches=mismatches,
+            )
+            await update_live_trade(
+                self._db,
+                live_trade_id,
+                status="needs_manual_review",
+                exit_order_id=txid,
+                exit_fill_price=_fmt(exit_vwap),
+            )
+            evidence.record(
+                "exit_not_closed",
+                live_trade_id=live_trade_id,
+                ledger_status="needs_manual_review",
+                note="reconciliation did not confirm the sale; the row is NOT "
+                "closed and no realised P&L is written",
+            )
+            _print_block(
+                "EXIT NOT CLOSED — RECONCILIATION DID NOT CONFIRM THE SALE",
+                [
+                    f"  live_trades row : {live_trade_id} (needs_manual_review)",
+                    f"  exit txid       : {txid or '(unknown)'}",
+                    "",
+                    "  The venue says the order filled, but the evidence does not",
+                    "  add up:",
+                ]
+                + [f"   - {m}" for m in mismatches]
+                + [
+                    "",
+                    "  The row has NOT been closed and no realised P&L has been",
+                    "  written. Money may have moved in a way this runner cannot",
+                    "  account for. Check the account before anything else.",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_REVIEW
+
+        closed_at = datetime.now(timezone.utc).isoformat()
+        await update_live_trade(
+            self._db,
+            live_trade_id,
+            status=_EXIT_CLOSED_STATUS,
+            exit_order_id=txid,
+            exit_fill_price=_fmt(exit_vwap),
+            realized_pnl_usd=_fmt(pnl),
+            realized_pnl_pct=_fmt(pnl_pct),
+            closed_at=closed_at,
+        )
+        evidence.record(
+            "exit_closed",
+            live_trade_id=live_trade_id,
+            ledger_status=_EXIT_CLOSED_STATUS,
+            exit_order_id=txid,
+            exit_fill_price=_fmt(exit_vwap),
+            realized_pnl_usd=_fmt(pnl),
+            realized_pnl_pct=_fmt(pnl_pct),
+            closed_at=closed_at,
+        )
+        _print_block(
+            "POSITION CLOSED",
+            [
+                f"  live_trades row : {live_trade_id} ({_EXIT_CLOSED_STATUS})",
+                f"  decision ID     : {decision_id}",
+                f"  exit txid       : {txid or '(unknown)'}",
+                f"  sold            : {_fmt(filled_qty)} {base_asset} @ "
+                f"{_fmt(exit_vwap)} on {pair}",
+                f"  exit fee        : {_fmt(totals['fee'])}",
+                f"  entry fee       : {_fmt(entry_fee)} ({entry_fee_source})",
+                f"  cost basis      : {_fmt(cost_basis)}",
+                f"  realised P&L    : {_fmt(pnl)} ({_fmt(pnl_pct)}%)",
+                "  reconcile       : pass (base exact to one lot tick; quote "
+                "proceeds and fees checked separately)",
+                f"  evidence        : {evidence.path}",
+            ],
+        )
+        return EXIT_OK
+
+    # -------- exit-cancel / exit-status --------
+    def latest_exit_intent(self, live_trade_id: int) -> dict[str, Any]:
+        """The most recent persisted exit intent for a position, if any.
+
+        This is the recovery baseline. The run that placed the order fsynced
+        it immediately before submitting, precisely so a process that shares
+        none of that run's memory can still reconcile the trade: the pre-trade
+        base and quote balances, the lot precision, the fee ceilings, the
+        entry economics and the limit price are all in it.
+
+        Returns ``{}`` when no intent was ever recorded for the row — which is
+        a real absence (nothing was ever authorized), not a read failure.
+        """
+        best: dict[str, Any] = {}
+        best_at = ""
+        for path in self._exit_intent_files(live_trade_id):
+            steps = self._read_evidence_steps(path)
+            intent = next(
+                (s for s in steps if s.get("step") == "exit_intent_persisted"), None
+            )
+            if intent is None:
+                continue
+            at = str(intent.get("at") or "")
+            if at >= best_at:
+                best_at, best = at, dict(intent)
+                best["evidence_path"] = str(path)
+                best["completed"] = any(s.get("step") == "run_completed" for s in steps)
+                best["submitted_txid"] = next(
+                    (
+                        s.get("txid")
+                        for s in steps
+                        if s.get("step") in ("submitted", "exit_txid_persisted")
+                    ),
+                    None,
+                )
+        return best
+
+    @staticmethod
+    def _baseline_from_intent(intent: dict[str, Any]) -> dict[str, Any]:
+        """Parse the numeric baseline out of a persisted intent record."""
+        return {
+            "base_balance_before": _dec_or_none(intent.get("base_balance_before")),
+            "quote_balance_before": _dec_or_none(intent.get("quote_balance_before")),
+            "base_epsilon": _dec_or_none(intent.get("base_tolerance")),
+            "price": _dec_or_none(intent.get("price")),
+            "taker_ceiling_pct": _dec_or_none(intent.get("taker_ceiling_pct")),
+            "entry_fee": _dec_or_none(intent.get("entry_fee")),
+            "entry_fee_source": intent.get("entry_fee_source"),
+        }
+
+    async def _exit_context(
+        self, live_trade_id: int, *, command: str
+    ) -> dict[str, Any]:
+        """Everything both recovery commands need about a position."""
+        selection = await self._load_exit_row(live_trade_id, stage=command)
+        row = selection["row"]
+        pair = str(row["pair"])
+        entry_price: Decimal = selection["entry_price"]
+        held_qty: Decimal = selection["held_qty"]
+        client_order_id = make_exit_client_order_id(live_trade_id)
+        intent = self.latest_exit_intent(live_trade_id)
+        conf = await self._adapter.fetch_order_by_client_id(
+            pair=pair, client_order_id=client_order_id
+        )
+        return {
+            "row": row,
+            "pair": pair,
+            "base_asset": str(row["symbol"] or "").upper(),
+            "entry_price": entry_price,
+            "held_qty": held_qty,
+            "client_order_id": client_order_id,
+            "intent": intent,
+            "baseline": self._baseline_from_intent(intent),
+            "conf": conf,
+        }
+
+    async def exit_cancel(self, *, live_trade_id: int) -> int:
+        """Cancel the resting EXIT order for one position, and account for it.
+
+        Separate from ``cancel --decision-id``, which keys off the ENTRY client
+        order id recorded on the row and therefore structurally cannot name an
+        exit order. Not gated on the kill switch or the pilot envelope — like
+        every other cancel, it reduces exposure.
+
+        The order's state is read BEFORE the cancel so a fill that already
+        happened is never mistaken for one the cancel caused, and read again
+        after so an ambiguous cancel response is settled by a read rather than
+        by a retry.
+        """
+        decision_id = str(uuid4())
+        evidence = self._evidence_for_exit_command("cancel", live_trade_id, decision_id)
+        evidence.record(
+            "run_started",
+            command="exit-cancel",
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            db_path=str(Path(self._settings.DB_PATH).resolve()),
+        )
+        try:
+            evidence.record("envelope_gate", **self._check_cancel_envelope())
+            kill_state = await self._ks.is_active()
+            evidence.record(
+                "kill_switch_observed",
+                kill_active=kill_state is not None,
+                note="exit-cancel is not gated on the kill switch — it reduces "
+                "exposure",
+            )
+
+            context = await self._exit_context(live_trade_id, command="exit_cancel")
+            conf = context["conf"]
+            client_order_id = context["client_order_id"]
+            pair = context["pair"]
+            evidence.record(
+                "pre_cancel_lookup",
+                live_trade_id=live_trade_id,
+                client_order_id=client_order_id,
+                found=conf is not None,
+                status=None if conf is None else conf.status,
+                txid=None if conf is None else conf.venue_order_id,
+                filled_qty=None if conf is None else conf.filled_qty,
+                fill_price=None if conf is None else conf.fill_price,
+            )
+            if conf is None:
+                raise PilotAbort(
+                    "exit_cancel",
+                    f"Kraken has no order carrying the exit client id "
+                    f"{client_order_id} for live_trades #{live_trade_id} — there "
+                    "is nothing to cancel. If you expected one, resolve with "
+                    f"`exit-status --live-trade-id {live_trade_id}` first.",
+                )
+
+            row = context["row"]
+            rules = await self._exit_market_rules(pair)
+            base_epsilon: Decimal = rules["base_epsilon"]
+            quote_asset = context["intent"].get("quote_asset") or rules["quote_asset"]
+
+            # A balance sampled AFTER the order already went terminal is not a
+            # pre-trade baseline — the coins left before we looked, so the
+            # delta it produces would be ~0 and would read as "nothing sold"
+            # for a sale that did happen. The PERSISTED intent is the honest
+            # source in that case: the run that placed the order recorded the
+            # balances immediately before submitting. Only when no such record
+            # survives is there genuinely no baseline.
+            already_terminal = conf.status in ("filled", "partial", "rejected")
+            persisted = context["baseline"]
+            if already_terminal:
+                balance_before = persisted["base_balance_before"]
+                quote_before = persisted["quote_balance_before"]
+            else:
+                balance_before = _dec(
+                    await self._adapter.fetch_account_balance(
+                        asset=context["base_asset"]
+                    )
+                )
+                quote_before = await self._sample_quote_balance(quote_asset)
+            evidence.record(
+                "recovery_baseline",
+                source=(
+                    "persisted_exit_intent"
+                    if already_terminal and balance_before is not None
+                    else "sampled_now" if not already_terminal else "unavailable"
+                ),
+                base_asset=context["base_asset"],
+                quote_asset=quote_asset,
+                base_balance_before=_fmt(balance_before),
+                quote_balance_before=_fmt(quote_before),
+                intent_decision_id=context["intent"].get("decision_id"),
+            )
+
+            if already_terminal:
+                # Already terminal. Cancelling is a no-op; the job here is to
+                # account for what happened, through the SAME settlement path
+                # the exit command uses.
+                evidence.record(
+                    "exit_cancel_already_terminal",
+                    venue_status=conf.status,
+                    txid=conf.venue_order_id,
+                    note="the order finished before the cancel; settling it "
+                    "rather than sending a pointless CancelOrder",
+                )
+                return await self._settle_terminal_from_recovery(
+                    evidence=evidence,
+                    decision_id=decision_id,
+                    live_trade_id=live_trade_id,
+                    context=context,
+                    conf=conf,
+                    base_epsilon=base_epsilon,
+                    quote_asset=quote_asset,
+                    balance_before=balance_before,
+                    quote_before=quote_before,
+                    origin="exit-cancel",
+                )
+
+            txid = conf.venue_order_id or row.get("exit_order_id")
+            try:
+                cancel_result = await self._adapter.cancel_order(
+                    txid=str(txid) if txid else None,
+                    client_order_id=None if txid else client_order_id,
+                )
+            except Exception as exc:
+                # Ambiguous cancel. NEVER retry — resolve by reading.
+                evidence.record(
+                    "cancel_ambiguous",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    note="resolving the cancel by a read-only lookup rather than "
+                    "sending it again",
+                )
+                after = await self._adapter.fetch_order_by_client_id(
+                    pair=pair, client_order_id=client_order_id
+                )
+                evidence.record(
+                    "cancel_ambiguity_resolution",
+                    found=after is not None,
+                    status=None if after is None else after.status,
+                    txid=None if after is None else after.venue_order_id,
+                    filled_qty=None if after is None else after.filled_qty,
+                )
+                if after is None or after.status == "pending":
+                    _print_block(
+                        "ESCALATE — CANCEL DID NOT RESOLVE",
+                        [
+                            f"  live_trades row : {live_trade_id}",
+                            f"  exit client id  : {client_order_id}",
+                            "  The cancel request failed and a follow-up read could",
+                            "  not settle what the order is doing. Check the Kraken",
+                            "  web UI. Do NOT send the cancel again from here until",
+                            "  you know.",
+                            f"  evidence        : {evidence.path}",
+                        ],
+                    )
+                    return EXIT_ESCALATE
+                conf = after
+            else:
+                evidence.record(
+                    "cancel_requested",
+                    by="txid" if txid else "client_order_id",
+                    count=cancel_result.get("count"),
+                    pending=cancel_result.get("pending"),
+                    already_gone=cancel_result.get("already_gone"),
+                )
+                after = await self._adapter.fetch_order_by_client_id(
+                    pair=pair, client_order_id=client_order_id
+                )
+                evidence.record(
+                    "post_cancel_lookup",
+                    found=after is not None,
+                    status=None if after is None else after.status,
+                    txid=None if after is None else after.venue_order_id,
+                    filled_qty=None if after is None else after.filled_qty,
+                    fill_price=None if after is None else after.fill_price,
+                )
+                if after is not None:
+                    conf = after
+
+            return await self._settle_terminal_from_recovery(
+                evidence=evidence,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                context=context,
+                conf=conf,
+                base_epsilon=base_epsilon,
+                quote_asset=quote_asset,
+                balance_before=balance_before,
+                quote_before=quote_before,
+                origin="exit-cancel",
+            )
+
+        except PilotAbort as abort:
+            evidence.record(
+                "aborted",
+                stage=abort.stage,
+                reason=abort.reason,
+                exit_code=abort.exit_code,
+            )
+            print(f"REFUSED [{abort.stage}]: {abort.reason}")
+            print(f"evidence: {evidence.path}")
+            return abort.exit_code
+        except Exception as exc:
+            log.error(
+                "kraken_pilot_unexpected_error",
+                command="exit-cancel",
+                live_trade_id=live_trade_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                exc_info=True,
+            )
+            evidence.record(
+                "unexpected_error", error_type=type(exc).__name__, error=str(exc)
+            )
+            _print_block(
+                "ESCALATE — EXIT CANCEL DID NOT COMPLETE",
+                [
+                    f"  {type(exc).__name__}: {exc}",
+                    f"  live_trades row : {live_trade_id}",
+                    "  The exit order may still be resting. Confirm in the Kraken",
+                    "  web UI before retrying.",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_ESCALATE
+
+    async def _settle_terminal_from_recovery(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        context: dict[str, Any],
+        conf: Any,
+        base_epsilon: Decimal,
+        quote_asset: str | None,
+        balance_before: Decimal | None,
+        quote_before: Decimal | None,
+        origin: str,
+    ) -> int:
+        """Account for an exit order found by a recovery command.
+
+        Every economic input is taken from the PERSISTED intent when one
+        exists and re-read only as a fallback. That ordering matters: the
+        persisted figures are the ones the authorization was given against, so
+        using them keeps a recovered settlement identical to the one the
+        original process would have produced. Only the entry fee and the fee
+        tier are re-read when absent, and a fee-tier failure refuses exactly as
+        it does on the way in.
+        """
+        row = context["row"]
+        held_qty: Decimal = context["held_qty"]
+        entry_price: Decimal = context["entry_price"]
+        pair = context["pair"]
+        persisted = context["baseline"]
+
+        taker_ceiling = persisted["taker_ceiling_pct"]
+        maker_pct = taker_pct = None
+        if taker_ceiling is None:
+            maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
+            taker_ceiling = taker_pct
+
+        entry_fee = persisted["entry_fee"]
+        entry_fee_source = persisted["entry_fee_source"] or "unknown"
+        if entry_fee is None:
+            if taker_pct is None:
+                maker_pct, taker_pct, _tier = await self._exit_fee_tier(pair)
+            entry_fee, entry_fee_source = await self._entry_fee(
+                row=row, entry_notional=entry_price * held_qty, taker_pct=taker_pct
+            )
+        evidence.record(
+            "recovery_economics",
+            taker_ceiling_pct=_fmt(taker_ceiling),
+            maker_pct=_fmt(maker_pct),
+            taker_pct=_fmt(taker_pct),
+            entry_fee=_fmt(entry_fee),
+            entry_fee_source=entry_fee_source,
+            economics_source=(
+                "persisted_exit_intent"
+                if persisted["entry_fee"] is not None
+                else "re-read"
+            ),
+        )
+        # The limit price the order actually carries. Persisted intent first —
+        # it is what the operator authorized — then the venue's own descr, so
+        # the "a sell cannot execute below its limit" check never compares
+        # against something this command invented.
+        limit_price = (
+            persisted["price"]
+            or _dec_or_none(
+                (conf.raw_response or {}).get("descr", {}).get("price")
+                if isinstance(conf.raw_response, dict)
+                else None
+            )
+            or _dec_or_none(conf.fill_price)
+        )
+        return await self._settle_exit_outcome(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            conf=conf,
+            txid=conf.venue_order_id,
+            pair=pair,
+            base_asset=context["base_asset"],
+            quote_asset=quote_asset,
+            entry_price=entry_price,
+            entry_fee=entry_fee,
+            entry_fee_source=entry_fee_source,
+            held_qty=held_qty,
+            price=limit_price or Decimal("0"),
+            taker_pct=taker_ceiling,
+            base_epsilon=persisted["base_epsilon"] or base_epsilon,
+            balance_before=balance_before,
+            quote_before=quote_before,
+            origin=origin,
+        )
+
+    async def exit_status(self, *, live_trade_id: int) -> int:
+        """Recover one position's exit WITHOUT the process that started it.
+
+        Sends nothing to the venue but reads, and settles the ledger from what
+        it finds. This is the crash-recovery path, and it is required to reach
+        a real verdict rather than parking everything as needs_manual_review —
+        "the process exited" is not evidence about the money.
+
+        It works because the originating run fsynced its baseline before
+        submitting: the pre-trade base AND quote balances, the lot precision,
+        the fee ceilings, the limit price and the entry economics. With those
+        in hand this command runs the SAME reconciliation predicate ``exit``
+        runs, so recovery cannot settle to a looser standard.
+
+        Outcomes:
+
+        - order fully filled            -> CLOSE the row (realised P&L written)
+        - order partially filled        -> REDUCE the held quantity, stay open
+        - order absent, resolver clean  -> RETAIN the position, clear the intent
+        - order still working           -> report and leave everything alone
+        - contradictory / unreadable    -> needs_manual_review, and only then
+
+        The three restart points are all covered by this one path: after
+        intent persistence (no order exists — retain), after submission (order
+        exists, may be working or terminal), and after the fill (terminal,
+        settle it).
+        """
+        decision_id = str(uuid4())
+        evidence = self._evidence_for_exit_command("status", live_trade_id, decision_id)
+        evidence.record(
+            "run_started",
+            command="exit-status",
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            db_path=str(Path(self._settings.DB_PATH).resolve()),
+        )
+        try:
+            evidence.record("envelope_gate", **self._check_cancel_envelope())
+            row = await fetch_live_trade_row(self._db, live_trade_id)
+            if row is None:
+                raise PilotAbort(
+                    "exit_status", f"no live_trades row with id={live_trade_id}"
+                )
+            client_order_id = make_exit_client_order_id(live_trade_id)
+            pair = str(row["pair"] or "")
+            intent = self.latest_exit_intent(live_trade_id)
+            baseline = self._baseline_from_intent(intent)
+
+            conf = await self._adapter.fetch_order_by_client_id(
+                pair=pair, client_order_id=client_order_id
+            )
+            open_orders: list[dict[str, Any]] = []
+            listing_error: dict[str, Any] | None = None
+            try:
+                open_orders = await self._adapter.fetch_open_orders()
+            except Exception as exc:
+                listing_error = {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            dangling = self.dangling_exit_intents(live_trade_id)
+
+            resolution: dict[str, Any] | None = None
+            resolved_paths: list[str] = []
+            if dangling and conf is None and listing_error is None:
+                resolution = await self._adapter.resolve_order_submission_detail(
+                    client_order_id=client_order_id
+                )
+                if resolution.get("verdict") == "not_accepted":
+                    resolved_paths = self._mark_intents_resolved(
+                        dangling,
+                        decision_id=decision_id,
+                        note="two clean sweeps of OpenOrders + ClosedOrders found "
+                        "no order carrying this exit client id, so the interrupted "
+                        "run never created one; the position is retained",
+                    )
+
+            evidence.record(
+                "exit_status",
+                live_trade_id=live_trade_id,
+                row_status=row["status"],
+                row_venue=row["venue"],
+                pair=pair,
+                entry_fill_qty=row["entry_fill_qty"],
+                exit_order_id=row["exit_order_id"],
+                exit_client_order_id=client_order_id,
+                venue_order_found=conf is not None,
+                venue_order_status=None if conf is None else conf.status,
+                venue_order_txid=None if conf is None else conf.venue_order_id,
+                venue_filled_qty=None if conf is None else conf.filled_qty,
+                open_order_count=len(open_orders),
+                listing_error=listing_error,
+                dangling_exit_intents=dangling,
+                persisted_intent=intent.get("decision_id"),
+                baseline_available=baseline["base_balance_before"] is not None,
+                resolution=resolution,
+                resolved_intent_files=resolved_paths,
+            )
+
+            lines = [
+                f"  live_trades row  : {live_trade_id} ({row['status']} on "
+                f"{row['venue']})",
+                f"  pair / held qty  : {pair} / {row['entry_fill_qty']}",
+                f"  exit client id   : {client_order_id}",
+                f"  exit_order_id    : {row['exit_order_id']}",
+                "  venue order      : "
+                + (
+                    "none found"
+                    if conf is None
+                    else f"{conf.venue_order_id} {conf.status} "
+                    f"filled={conf.filled_qty} @ {conf.fill_price}"
+                ),
+                "  open orders      : "
+                + (
+                    f"UNREADABLE ({listing_error['error_type']})"
+                    if listing_error
+                    else str(len(open_orders))
+                ),
+                f"  dangling intents : {len(dangling)}",
+                "  persisted baseline: "
+                + (
+                    f"yes (from {intent.get('decision_id')})"
+                    if baseline["base_balance_before"] is not None
+                    else "none — a settlement cannot be corroborated"
+                ),
+            ]
+            for item in dangling:
+                lines.append(
+                    f"    {item['decision_id']} vol={item['volume']} "
+                    f"price={item['price']} txid={item['submitted_txid']}"
+                )
+            if resolution is not None:
+                lines.append(f"  resolver verdict : {resolution.get('verdict')}")
+            if resolved_paths:
+                lines.append(
+                    f"  cleared          : {len(resolved_paths)} dangling intent(s) "
+                    "— the venue proved no such order exists; position RETAINED"
+                )
+            lines.append("")
+            lines.append("  This command sent NOTHING to the venue but reads.")
+            _print_block("KRAKEN PILOT EXIT STATUS", lines)
+
+            # ---- settlement ----
+            terminal = conf is not None and conf.status in (
+                "filled",
+                "partial",
+                "rejected",
+            )
+            if terminal and row["status"] == "open":
+                context = await self._exit_context(live_trade_id, command="exit_status")
+                rules = await self._exit_market_rules(pair)
+                quote_asset = intent.get("quote_asset") or rules["quote_asset"]
+                code = await self._settle_terminal_from_recovery(
+                    evidence=evidence,
+                    decision_id=decision_id,
+                    live_trade_id=live_trade_id,
+                    context=context,
+                    conf=conf,
+                    base_epsilon=rules["base_epsilon"],
+                    quote_asset=quote_asset,
+                    balance_before=baseline["base_balance_before"],
+                    quote_before=baseline["quote_balance_before"],
+                    origin="exit-status",
+                )
+                if code in (EXIT_OK, EXIT_REVIEW) and dangling:
+                    # The order has been accounted for either way — closed,
+                    # reduced, or explicitly parked for review with its numbers
+                    # recorded. Leaving the intent dangling after that would
+                    # block the lane on a run that IS now resolved.
+                    resolved_paths += self._mark_intents_resolved(
+                        dangling,
+                        decision_id=decision_id,
+                        note="the interrupted run's order was found terminal and "
+                        f"settled by exit-status (exit code {code})",
+                        exit_code=code,
+                    )
+                return code
+
+            if conf is not None and conf.status == "pending":
+                print(
+                    "  An exit order is WORKING. To pull it: exit-cancel "
+                    f"--live-trade-id {live_trade_id}"
+                )
+                return EXIT_BLOCKED
+            if terminal and row["status"] != "open":
+                print(f"  The row is already {row['status']} — nothing left to settle.")
+
+            blocked = bool(listing_error or (dangling and not resolved_paths))
+            return EXIT_BLOCKED if blocked else EXIT_OK
+
+        except PilotAbort as abort:
+            evidence.record(
+                "aborted",
+                stage=abort.stage,
+                reason=abort.reason,
+                exit_code=abort.exit_code,
+            )
+            print(f"REFUSED [{abort.stage}]: {abort.reason}")
+            print(f"evidence: {evidence.path}")
+            return abort.exit_code
+        except Exception as exc:
+            # A read-only report cannot have changed anything, but it must not
+            # exit 0 on a failure either: the operator is running it precisely
+            # because they do not know what the venue holds.
+            log.error(
+                "kraken_pilot_unexpected_error",
+                command="exit-status",
+                live_trade_id=live_trade_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                exc_info=True,
+            )
+            evidence.record(
+                "unexpected_error", error_type=type(exc).__name__, error=str(exc)
+            )
+            print(
+                f"ESCALATE [exit-status]: {type(exc).__name__}: {exc}\n"
+                "  Nothing was changed — this command only reads — but the venue "
+                "state is still unknown.\n"
+                f"  evidence: {evidence.path}"
+            )
+            return EXIT_ESCALATE
+
+    def _mark_intents_resolved(
+        self,
+        dangling: list[dict[str, Any]],
+        *,
+        decision_id: str,
+        note: str,
+        exit_code: int = EXIT_REFUSED,
+    ) -> list[str]:
+        """Append a completion record to intents that have been accounted for.
+
+        Writes only to OUR OWN evidence files — nothing at the venue, nothing
+        in the ledger. The append is what unblocks the lane, and it happens on
+        exactly two grounds: ``resolve_order_submission_detail`` returned
+        ``not_accepted`` (the adapter's hardest-to-reach verdict, meaning no
+        such order exists), or the order was found terminal and put through
+        the settlement path. Never merely because time passed.
+        """
+        resolved: list[str] = []
+        for item in dangling:
+            path = Path(str(item["evidence_path"]))
+            try:
+                EvidenceLog(path).record(
+                    "run_completed",
+                    decision_id=item.get("decision_id"),
+                    exit_code=exit_code,
+                    resolved_by="exit-status",
+                    resolver_decision_id=decision_id,
+                    note=note,
+                )
+            except OSError as exc:  # pragma: no cover - unwritable evidence dir
+                log.warning(
+                    "kraken_pilot_intent_not_marked",
+                    path=str(path),
+                    error=str(exc),
+                )
+                continue
+            resolved.append(str(path))
+        return resolved
+
     # ---------------- cancel ----------------
     async def cancel(self, *, decision_id: str) -> int:
         """Cancel the resting pilot order identified by ``decision_id``.
@@ -2176,6 +5160,24 @@ def _decision_id_arg(raw: str) -> str:
     return value
 
 
+def _live_trade_id_arg(raw: str) -> int:
+    """argparse converter for ``--live-trade-id``.
+
+    A ledger row is selected by exact primary key, so anything that is not a
+    positive integer is a typo that would otherwise become a "no such row"
+    refusal after several venue reads.
+    """
+    try:
+        value = int(raw.strip())
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not an integer live_trades id"
+        ) from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{raw!r} must be a positive live_trades id")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kraken_pilot",
@@ -2200,11 +5202,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="required with --validate-only; refused without it",
     )
 
-    cancel = sub.add_parser("cancel", help="cancel a resting pilot order")
+    exit_cmd = sub.add_parser(
+        "exit", help="close ONE open supervised kraken position by ledger row id"
+    )
+    exit_cmd.add_argument(
+        "--live-trade-id",
+        type=_live_trade_id_arg,
+        required=True,
+        help="live_trades.id of the open kraken position to close",
+    )
+    exit_cmd.add_argument(
+        "--price", type=_decimal_arg, required=True, help="limit price for the sell"
+    )
+    exit_cmd.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="venue-side dry run (Kraken validate=true); places nothing",
+    )
+    exit_cmd.add_argument(
+        "--yes-i-am-rehearsing",
+        action="store_true",
+        help="required with --validate-only; refused without it",
+    )
+
+    for name, help_text in (
+        ("exit-cancel", "cancel the resting EXIT order for one position"),
+        ("exit-status", "READ-ONLY exit report; clears an interrupted exit"),
+    ):
+        recovery = sub.add_parser(name, help=help_text)
+        target = recovery.add_mutually_exclusive_group(required=True)
+        target.add_argument(
+            "--live-trade-id",
+            type=_live_trade_id_arg,
+            help="live_trades.id of the position (the exit client order id is "
+            "derived from it)",
+        )
+        # A decision id names one ATTEMPT; several attempts share one exit
+        # order, so the row id is the durable handle. Accepted anyway because
+        # it is what an evidence file or an escalation message hands you, and
+        # it resolves to the row id by finding that run's evidence file.
+        target.add_argument(
+            "--decision-id",
+            type=_decision_id_arg,
+            help="decision id of an exit run; resolved to its live_trades id",
+        )
+
+    cancel = sub.add_parser(
+        "cancel", help="cancel a resting pilot ENTRY order (see exit-cancel for exits)"
+    )
     cancel.add_argument("--decision-id", type=_decision_id_arg, required=True)
 
     sub.add_parser("status", help="read-only lane report")
     return parser
+
+
+def resolve_exit_decision_id(evidence_dir: str | Path, decision_id: str) -> int | None:
+    """Find the ``live_trades`` id an exit decision id belongs to.
+
+    The evidence filename carries both — ``kraken_pilot_exit_<row>_<uuid>.json``
+    and the ``_cancel_`` / ``_status_`` variants — so the mapping is a glob
+    rather than a scan. ``None`` when no run by that id was ever recorded.
+    """
+    directory = Path(evidence_dir)
+    if not directory.exists():
+        return None
+    for path in sorted(directory.glob(f"kraken_pilot_exit_*{decision_id}.json")):
+        parts = path.stem.split("_")
+        # kraken pilot exit <row> [<command>] <uuid>
+        if len(parts) < 5:
+            continue
+        try:
+            return int(parts[3])
+        except ValueError:
+            continue
+    return None
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -2221,7 +5292,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
 
-    if args.command == "place":
+    if args.command in ("place", "exit"):
         if args.validate_only and not args.yes_i_am_rehearsing:
             print(
                 "REFUSED [args]: --validate-only requires --yes-i-am-rehearsing, "
@@ -2260,24 +5331,28 @@ async def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_REFUSED
 
-    # The lock guards PLACEMENT only, and is taken for `place` alone.
+    # The lock guards ORDER SUBMISSION, and is taken for `place` and `exit`.
     #
-    # It exists to stop two processes creating two live orders. `status` is
-    # read-only and `cancel` reduces exposure, so neither can do the thing the
-    # lock prevents — and gating them would be actively harmful: a stale lock
-    # arises exactly when an earlier run died with an order possibly resting,
-    # which is the moment the operator most needs to look and to pull it. A
-    # lock that blocks its own recovery path is worse than no lock.
+    # It exists to stop two processes creating two live orders. `exit` submits
+    # an AddOrder just as `place` does — two concurrent exits are two sells of
+    # the same coins, each clearing its own venue-state check before either
+    # submits — so it takes the same lock. `status` is read-only and `cancel`
+    # reduces exposure without placing anything, so neither can do the thing
+    # the lock prevents — and gating them would be actively harmful: a stale
+    # lock arises exactly when an earlier run died with an order possibly
+    # resting, which is the moment the operator most needs to look and to pull
+    # it. A lock that blocks its own recovery path is worse than no lock.
     lock_fd: int | None = None
     lock_path: Path | None = None
-    if args.command == "place":
+    if args.command in ("place", "exit"):
         try:
             lock_fd, lock_path = acquire_pilot_lock(db_path)
         except PilotLockHeld as held:
             print(
                 f"REFUSED [lock]: another pilot run holds {held.lock_path}\n"
                 f"  holder: {held.holder}\n"
-                "  Two runs are two live orders, so only `place` is blocked.\n"
+                "  Two runs are two live orders, so `place` and `exit` are "
+                "blocked.\n"
                 "  `status` and `cancel` still work — use them to see what is "
                 "resting\n"
                 "  and to pull it. Once the venue state is confirmed and that "
@@ -2306,6 +5381,31 @@ async def main(argv: list[str] | None = None) -> int:
                     volume=args.volume,
                     validate_only=args.validate_only,
                 )
+            if args.command == "exit":
+                return await runner.exit_position(
+                    live_trade_id=args.live_trade_id,
+                    price=args.price,
+                    validate_only=args.validate_only,
+                )
+            if args.command in ("exit-cancel", "exit-status"):
+                live_trade_id = args.live_trade_id
+                if live_trade_id is None:
+                    live_trade_id = resolve_exit_decision_id(
+                        settings.KRAKEN_PILOT_EVIDENCE_DIR, args.decision_id
+                    )
+                    if live_trade_id is None:
+                        print(
+                            f"REFUSED [lookup]: no exit run with decision id "
+                            f"{args.decision_id} was recorded in "
+                            f"{settings.KRAKEN_PILOT_EVIDENCE_DIR}. Pass "
+                            "--live-trade-id instead; the exit client order id is "
+                            "derived from the row, so the row id is the durable "
+                            "handle."
+                        )
+                        return EXIT_REFUSED
+                if args.command == "exit-cancel":
+                    return await runner.exit_cancel(live_trade_id=live_trade_id)
+                return await runner.exit_status(live_trade_id=live_trade_id)
             if args.command == "cancel":
                 return await runner.cancel(decision_id=args.decision_id)
             return await runner.status()

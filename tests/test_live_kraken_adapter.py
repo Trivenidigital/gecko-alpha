@@ -989,3 +989,232 @@ async def test_base_validation_still_accepts_kraken_alias_naming():
         )
         assert await adapter.resolve_pair_for_symbol("BTC") == "XBTUSD"
     await adapter.close()
+
+
+# ----------------------------------------------------------------------
+# Fee tier — POST /0/private/TradeVolume (PR-K4)
+# ----------------------------------------------------------------------
+_TRADE_VOLUME_URL = "https://api.kraken.com/0/private/TradeVolume"
+
+# Real TradeVolume shape, trimmed. Note the map is keyed by the AssetPairs
+# KEY (XXBTZUSD) while callers hold the altname (XBTUSD).
+_TRADE_VOLUME_PAYLOAD = {
+    "error": [],
+    "result": {
+        "currency": "ZUSD",
+        "volume": "3000.0000",
+        "fees": {"XXBTZUSD": {"fee": "0.2400", "minfee": "0.1000"}},
+        "fees_maker": {"XXBTZUSD": {"fee": "0.1400", "minfee": "0.0000"}},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_reads_this_accounts_rates():
+    """The rates must come from TradeVolume, not the public AssetPairs table —
+    that one is tier zero and is not what a volume-carrying account pays."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=_TRADE_VOLUME_PAYLOAD)
+        tier = await adapter.fetch_fee_tier(pair="XBTUSD")
+    assert tier["maker_pct"] == "0.1400"
+    assert tier["taker_pct"] == "0.2400"
+    assert tier["currency"] == "ZUSD"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_matches_on_the_exact_key_when_several_are_returned():
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    payload = {
+        "error": [],
+        "result": {
+            "currency": "ZUSD",
+            "fees": {
+                "XXBTZUSD": {"fee": "0.2400"},
+                "XETHZUSD": {"fee": "0.9900"},
+            },
+            "fees_maker": {
+                "XXBTZUSD": {"fee": "0.1400"},
+                "XETHZUSD": {"fee": "0.8800"},
+            },
+        },
+    }
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=payload)
+        tier = await adapter.fetch_fee_tier(pair="XXBTZUSD")
+    assert (tier["maker_pct"], tier["taker_pct"]) == ("0.1400", "0.2400")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"currency": "ZUSD"},
+        {"fees": {"XXBTZUSD": {"fee": "0.24"}}},
+        {"fees": {"XXBTZUSD": {}}, "fees_maker": {"XXBTZUSD": {}}},
+        {
+            "fees": {"A": {"fee": "0.24"}, "B": {"fee": "0.99"}},
+            "fees_maker": {"A": {"fee": "0.14"}, "B": {"fee": "0.88"}},
+        },
+    ],
+    ids=["no-maps", "maker-missing", "no-fee-field", "ambiguous-multi-key"],
+)
+async def test_fetch_fee_tier_fails_closed_on_an_unusable_payload(result):
+    """No default and no guess. The caller puts this number in front of an
+    operator authorizing a trade; a fabricated rate is worse than an error."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload={"error": [], "result": result})
+        with pytest.raises(KrakenAPIError):
+            await adapter.fetch_fee_tier(pair="XBTUSD")
+    await adapter.close()
+
+
+# The account's REAL TradeVolume reply, read live on 2026-08-02 and sanitized
+# only by keeping the fields the parser reads. Pinned as a fixture so the first
+# real invocation cannot be the first time this shape is exercised.
+_TRADE_VOLUME_LIVE_PAYLOAD = {
+    "error": [],
+    "result": {
+        "currency": "ZUSD",
+        "volume": "2039.93616",
+        "fees": {
+            "XXBTZUSD": {
+                "fee": "0.8000",
+                "minfee": "0.0500",
+                "maxfee": "0.8000",
+                "nextfee": "0.6000",
+                "nextvolume": "2500.00000",
+                "tiervolume": "0.00000",
+            }
+        },
+        "fees_maker": {
+            "XXBTZUSD": {
+                "fee": "0.4000",
+                "minfee": "0.0000",
+                "maxfee": "0.4000",
+                "nextfee": "0.3000",
+                "nextvolume": "2500.00000",
+                "tiervolume": "0.00000",
+            }
+        },
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_parses_the_live_account_payload():
+    """The exact shape the pilot account returns: percent strings, maps keyed
+    by the AssetPairs key, maker and taker in SEPARATE columns."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=_TRADE_VOLUME_LIVE_PAYLOAD)
+        tier = await adapter.fetch_fee_tier(pair="XBTUSD")
+    assert Decimal(tier["taker_pct"]) == Decimal("0.8")
+    assert Decimal(tier["maker_pct"]) == Decimal("0.4")
+    # Maker and taker must not be conflated — this account pays 2x on taker.
+    assert Decimal(tier["taker_pct"]) == 2 * Decimal(tier["maker_pct"])
+    assert Decimal(tier["volume"]) == Decimal("2039.93616")
+    assert tier["currency"] == "ZUSD"
+    assert Decimal(tier["next_taker_pct"]) == Decimal("0.6")
+    assert Decimal(tier["next_maker_pct"]) == Decimal("0.3")
+    assert Decimal(tier["next_volume"]) == Decimal("2500")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_tolerates_unrelated_extra_fields():
+    """Kraken adds response fields over time; unknown ones must not break the
+    parse, and must not be mistaken for the fee."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    payload = {
+        "error": [],
+        "result": {
+            "currency": "ZUSD",
+            "volume": "2039.93616",
+            "some_future_field": {"nested": [1, 2, 3]},
+            "fees": {
+                "XXBTZUSD": {
+                    "fee": "0.8000",
+                    "unheard_of": "9.9999",
+                    "tiervolume": "0.00000",
+                }
+            },
+            "fees_maker": {"XXBTZUSD": {"fee": "0.4000", "another": None}},
+        },
+    }
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=payload)
+        tier = await adapter.fetch_fee_tier(pair="XBTUSD")
+    assert (Decimal(tier["maker_pct"]), Decimal(tier["taker_pct"])) == (
+        Decimal("0.4"),
+        Decimal("0.8"),
+    )
+    assert tier["next_taker_pct"] is None and tier["next_volume"] is None
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"fees": {"XXBTZUSD": {"fee": "zero point eight"}}, "fees_maker": {}},
+        {
+            "fees": {"XXBTZUSD": {"fee": "0.8"}},
+            "fees_maker": {"XXBTZUSD": {"fee": ""}},
+        },
+        {
+            "fees": {"XXBTZUSD": {"fee": ["0.8"]}},
+            "fees_maker": {"XXBTZUSD": {"fee": "0.4"}},
+        },
+    ],
+    ids=["not-a-number", "empty-string", "wrong-type"],
+)
+async def test_fetch_fee_tier_rejects_malformed_percentages(result):
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload={"error": [], "result": result})
+        with pytest.raises(KrakenAPIError):
+            await adapter.fetch_fee_tier(pair="XBTUSD")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_never_falls_back_when_the_private_query_fails():
+    """A private-query failure must PROPAGATE. Returning a hard-coded rate here
+    would put a fabricated fee on the approval screen."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(
+            _TRADE_VOLUME_URL,
+            payload={"error": ["EGeneral:Permission denied"], "result": {}},
+        )
+        with pytest.raises(KrakenPermissionError):
+            await adapter.fetch_fee_tier(pair="XBTUSD")
+    await adapter.close()
+
+
+def test_fetch_fee_tier_has_no_hard_coded_fee_constant():
+    """A structural guard: no numeric literal in the method that could act as a
+    default rate. The refusal is the fallback."""
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(KrakenSpotAdapter.fetch_fee_tier))
+    tree = ast.parse(src)
+    numbers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+    ]
+    assert numbers == [], f"fetch_fee_tier carries numeric literals: {numbers}"

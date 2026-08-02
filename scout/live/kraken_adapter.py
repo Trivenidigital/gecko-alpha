@@ -15,6 +15,9 @@ Endpoints used
 - ``GET  /0/public/Depth``      — L2 orderbook snapshot
 - ``POST /0/private/BalanceEx`` — available balance, net of order holds
 - ``POST /0/private/Balance``   — auth liveness check (preflight step 1)
+- ``POST /0/private/TradeVolume`` — THIS account's maker/taker fee tier
+  (PR-K4; the public AssetPairs schedule is tier-zero and not what a
+  volume-carrying account actually pays)
 - ``POST /0/private/WithdrawMethods`` + ``POST /0/private/WithdrawStatus``
   — withdrawal-capability probes (preflight step 2; a SUCCESS on either is
   a hard reject)
@@ -1139,6 +1142,68 @@ class KrakenSpotAdapter(ExchangeAdapter):
                 return 0.0
             return available
         return 0.0
+
+    async def fetch_fee_tier(self, *, pair: str) -> dict[str, Any]:
+        """This ACCOUNT's maker and taker rates for ``pair``.
+
+        ``POST /0/private/TradeVolume`` with a ``pair`` filter returns
+        ``fees`` (taker) and ``fees_maker`` (maker) maps, each keyed by the
+        AssetPairs key and carrying a ``fee`` percent for the volume tier the
+        account is actually in.
+
+        Why this and not ``AssetPairs.fees`` / ``fees_maker``: those are the
+        PUBLIC schedule's tier-zero rates, i.e. what a brand-new account
+        pays. An account with traded volume, a fee-tier promotion or a
+        different fee currency pays something else, and a cost screen built
+        on the public table quietly shows the wrong number — which is worse
+        than showing none, because it looks authoritative.
+
+        Fails CLOSED: an unreadable rate raises rather than defaulting.
+        A caller that puts a guessed fee in front of an operator asking them
+        to authorize a trade has made the approval screen a liability.
+
+        The NEXT tier is returned alongside the current one because it is
+        decision-relevant and free to read: each fee row carries ``nextfee``
+        and ``nextvolume``, so an operator sizing a trade can see how far the
+        account is from a cheaper rate. Absent on the top tier, hence
+        optional — a missing next tier is not an error.
+
+        Returns:
+            ``{"pair", "maker_pct", "taker_pct", "volume", "currency",
+            "next_maker_pct", "next_taker_pct", "next_volume", "raw"}`` —
+            every rate a fixed-point percent STRING (``"0.16"`` means 0.16%),
+            matching how the rest of this adapter hands Kraken numerics to its
+            callers. The three ``next_*`` fields are ``None`` when Kraken
+            publishes no further tier.
+        """
+        body = await self._private_post("/0/private/TradeVolume", {"pair": pair})
+        taker = _fee_row_from_map(body.get("fees"), pair)
+        maker = _fee_row_from_map(body.get("fees_maker"), pair)
+        taker_pct = _decimal_str(taker.get("fee")) if taker else None
+        maker_pct = _decimal_str(maker.get("fee")) if maker else None
+        if taker_pct is None or maker_pct is None:
+            raise KrakenAPIError(
+                f"kraken /0/private/TradeVolume: no readable fee schedule for "
+                f"pair={pair!r} (maker={maker_pct!r} taker={taker_pct!r})"
+            )
+        log.info(
+            "kraken_fee_tier",
+            pair=pair,
+            maker_pct=maker_pct,
+            taker_pct=taker_pct,
+        )
+        return {
+            "pair": pair,
+            "maker_pct": maker_pct,
+            "taker_pct": taker_pct,
+            "volume": _decimal_str(body.get("volume")),
+            "currency": str(body.get("currency") or "") or None,
+            "next_maker_pct": _decimal_str((maker or {}).get("nextfee")),
+            "next_taker_pct": _decimal_str((taker or {}).get("nextfee")),
+            "next_volume": _decimal_str((taker or {}).get("nextvolume"))
+            or _decimal_str((maker or {}).get("nextvolume")),
+            "raw": body,
+        }
 
     async def preflight_credentials_check(self) -> dict[str, Any]:
         """Verify the API key authenticates AND cannot withdraw funds.
@@ -2281,6 +2346,31 @@ def _decimal_str(value: Any) -> str | None:
     """Kraken number → fixed-point string, or ``None`` if unparseable."""
     parsed = _to_decimal(value)
     return format(parsed, "f") if parsed is not None else None
+
+
+def _fee_row_from_map(fees: Any, pair: str) -> dict[str, Any] | None:
+    """Pull one pair's row out of a TradeVolume ``fees``/``fees_maker`` map.
+
+    The map is keyed by the AssetPairs KEY (``XXBTZUSD``) while callers hold
+    the altname (``XBTUSD``), so an exact-key hit is tried first and a
+    single-entry map is then accepted on its own — we asked about one pair,
+    so one entry is unambiguous. A multi-entry map with no exact hit returns
+    ``None`` rather than guessing which pair's rate to charge the operator.
+
+    The whole row is returned rather than just the rate: ``fee`` is the
+    current tier and ``nextfee`` / ``nextvolume`` describe the next one, and
+    both come from the same row.
+    """
+    if not isinstance(fees, dict) or not fees:
+        return None
+    entry = fees.get(pair)
+    if not isinstance(entry, dict):
+        if len(fees) != 1:
+            return None
+        entry = next(iter(fees.values()))
+        if not isinstance(entry, dict):
+            return None
+    return entry
 
 
 def _decimals_to_step(decimals: Any) -> float | None:

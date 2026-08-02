@@ -1883,7 +1883,9 @@ async def test_held_lock_blocks_place_but_not_status_or_cancel(
         assert code == EXIT_BLOCKED
         assert _calls(m) == []
     out = capsys.readouterr().out
-    assert "only `place` is blocked" in out
+    # `exit` submits an AddOrder too, so it takes the same lock; the recovery
+    # commands that place nothing still do not.
+    assert "`place` and `exit` are blocked" in out
     assert "`status` and `cancel` still work" in out
 
     # status: runs under the held lock.
