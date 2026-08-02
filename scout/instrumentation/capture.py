@@ -32,10 +32,7 @@ async def capture_txns(db, token, settings) -> None:
         return
     if token.txns_h1_buys is not None or token.txns_h1_sells is not None:
         await db.log_txns_snapshot(
-            token.contract_address,
-            token.txns_h1_buys,
-            token.txns_h1_sells,
-            "dexscreener",
+            token.contract_address, token.txns_h1_buys, token.txns_h1_sells, "dexscreener"
         )
     elif token.gt_txns_h1_buys is not None or token.gt_txns_h1_sells is not None:
         await db.log_txns_snapshot(

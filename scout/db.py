@@ -9905,11 +9905,19 @@ class Database:
                 haystack = check_clause.group(0) if check_clause else ""
                 missing = [r for r in new_reasons if r not in haystack]
                 if missing:
+                    # Two ways to arrive here, and the message must not assert the
+                    # wrong one: the rewrite ran and its pattern missed, OR the
+                    # skip-check at the top of the loop matched the reason strings
+                    # somewhere else in the DDL and never attempted a rewrite at
+                    # all. Both leave the CHECK narrow; only the second means no
+                    # rewrite was tried.
                     raise RuntimeError(
                         f"{migration}: {table}.reject_reason CHECK still refuses "
-                        f"{missing}; the rewrite did not match this table's DDL. "
-                        "Refusing to record the migration as applied — fix the "
-                        "rewrite rather than shipping a gate whose refusals raise."
+                        f"{missing}. Either the rewrite pattern did not match this "
+                        "table's DDL, or the already-widened skip matched those "
+                        "strings outside the CHECK clause and skipped the rebuild. "
+                        "Refusing to record the migration as applied — a gate whose "
+                        "refusals raise IntegrityError is worse than no gate."
                     )
             cur = await conn.execute("PRAGMA table_info(live_trades)")
             live_cols = {r[1] for r in await cur.fetchall()}
@@ -9943,6 +9951,17 @@ class Database:
             # caught the severed-links defect. `foreign_keys=OFF` is what fixes
             # that. This is belt-and-braces, and belt-and-braces must not have a
             # larger blast radius than the thing it braces.
+            #
+            # ONE FUTURE HAZARD, recorded because its symptom is opaque: the pragma
+            # RAISES `OperationalError: foreign key mismatch` — rather than
+            # reporting a violation — when a table declares an FK referencing a
+            # column that is not UNIQUE or a PRIMARY KEY. Unreachable today: every
+            # FK on these three points at an INTEGER PRIMARY KEY (`paper_trades.id`,
+            # `kill_events.id`, `live_trades.id`). A later migration adding an FK to
+            # a non-unique column on any of them turns this into a hard boot failure
+            # whose message names neither the migration nor the cause. It fails loud
+            # and un-marked, so it is correctness-preserving — just expensive to
+            # diagnose without this note.
             violations: list = []
             for table in ("live_trades", "shadow_trades", "solana_executions"):
                 cur = await conn.execute(

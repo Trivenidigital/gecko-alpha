@@ -417,6 +417,23 @@ class TestTheGateCannotBeBypassed:
         was pinned by NOTHING — not by this test, and not by the exclusion-list
         test, which allowlisted the whole file. A reviewer added exactly that and
         both tests passed.
+
+        Counts every ATTRIBUTE REFERENCE, not only Attributes that are a Call's
+        func — the same widening `_submit_sites()` needed, and for the last
+        vector that survived it:
+
+            await fire(self._adapter.place_order_request, req)
+
+        There the Attribute is an ARGUMENT, so a Call-func-only walk counts zero
+        and this assertion stays at 1. `_submit_sites()` does see it, but reports
+        `('engine.py', 'place_order_request')` — already allowlisted — so nothing
+        new appears there either. Between the two tests it was invisible, and it
+        is this codebase's own dependency-injection style (`keypair_loader`,
+        `alert_hook` are passed exactly that way).
+
+        Measured on the real tree: exactly one such Attribute exists in
+        engine.py, it is invoked, and it is inside `_dispatch_live` — so widening
+        costs no false positive and makes the smuggled reference a second site.
         """
         tree = _engine_tree()
         dispatch = _func(tree, "_dispatch_live")
@@ -426,19 +443,20 @@ class TestTheGateCannotBeBypassed:
             return [
                 node
                 for node in ast.walk(root)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr in submit_methods
+                if isinstance(node, ast.Attribute) and node.attr in submit_methods
             ]
 
         inside = {id(n) for n in _sites(dispatch)}
         everywhere = _sites(tree)
         assert len(everywhere) == 1, (
-            f"{len(everywhere)} submit sites in engine.py: "
-            f"{[n.func.attr for n in everywhere]}"
+            f"{len(everywhere)} references to a submit method in engine.py: "
+            f"{[n.attr for n in everywhere]}. Every one must be inside "
+            "_dispatch_live, downstream of the mandate — including a bare "
+            "reference handed to a helper, which reaches a venue just as surely "
+            "as calling it here would."
         )
         assert id(everywhere[0]) in inside
-        assert everywhere[0].func.attr == "place_order_request"
+        assert everywhere[0].attr == "place_order_request"
 
     def test_the_submit_happens_after_both_mandate_calls(self):
         """Ordering, read off the source. Both the cheap precheck and the full
@@ -649,9 +667,13 @@ class TestTheScopeOfTheClaim:
     def test_the_supervised_clis_are_the_only_uncovered_submit_sites(self):
         unexpected = self._submit_sites() - self._ALLOWED_SUBMIT_SITES
         assert unexpected == set(), (
-            f"new submit site(s) outside the mandate: {sorted(unexpected)}. Each "
-            "reaches a venue without consulting ExecutionMandate — adding one is a "
-            "decision, not an implementation detail."
+            f"new submit site(s): {sorted(unexpected)}.\n"
+            "A module that can name a submit method can reach a venue, so adding "
+            "one is a decision rather than an implementation detail. If this IS "
+            "the decision — a new adapter, or an adapter delegating to its own "
+            "method, neither of which reaches anything new — add the (file, "
+            "method) pair to _ALLOWED_SUBMIT_SITES with a one-line reason. Do not "
+            "delete this test; the pair is the record of the decision."
         )
 
     def test_the_allowlist_has_no_stale_entries(self):

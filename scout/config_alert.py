@@ -55,7 +55,7 @@ def _read_env_value(key: str, env_file: Path) -> str | None:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             stripped = line.lstrip()
             if stripped.startswith(f"{key}="):
-                val = stripped[len(key) + 1 :]
+                val = stripped[len(key) + 1:]
                 val = val.rstrip()
                 # Strip ONE layer of matching quotes
                 if len(val) >= 2 and (
@@ -99,7 +99,9 @@ def _send_validation_alert_best_effort(error_str: str) -> str:
                 "SETTINGS_VALIDATION_ALERT_STATE_DIR", str(DEFAULT_STATE_DIR)
             )
         )
-        env_file = Path(os.environ.get("GECKO_ENV_FILE", str(DEFAULT_ENV_FILE)))
+        env_file = Path(
+            os.environ.get("GECKO_ENV_FILE", str(DEFAULT_ENV_FILE))
+        )
 
         token, chat = _resolve_telegram_creds(env_file)
         if token is None or chat is None:

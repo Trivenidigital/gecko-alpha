@@ -561,7 +561,9 @@ async def _persist_message_with_watermark(
                 # Don't mask the outer write-failure via `raise` below,
                 # but emit a structured log so disk/lock/WAL failures
                 # during cleanup are observable. PR Round 4 sweep.
-                log.exception("tg_social_message_rollback_failed", err=str(rb_err))
+                log.exception(
+                    "tg_social_message_rollback_failed", err=str(rb_err)
+                )
             raise
 
 

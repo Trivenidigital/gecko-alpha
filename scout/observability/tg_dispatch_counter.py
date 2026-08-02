@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
-
 # V13 plan-review fold: threading.Lock not asyncio.Lock — hook is
 # sync-inside-async (record_dispatch is called BEFORE any await in
 # alerter.send_telegram_message). Must survive any future thread-spawn
