@@ -79,26 +79,31 @@ class VenueCapabilities:
     def permits_order(
         self,
         *,
+        venue_family: str,
         order_type: str,
         reduce_only: bool,
-        venue_family: str | None = None,
     ) -> tuple[bool, str | None]:
         """Whether an intent of this shape may be routed here.
 
         Returns ``(False, reason)`` rather than raising: the router needs to record
         why each venue was rejected, not abort on the first ineligible one.
+
+        ``venue_family`` is REQUIRED and has no default. An optional argument that
+        defaults to "don't check" is a fail-open path in a gate whose entire thesis
+        is fail-closed — a caller that simply omitted the kwarg would silently get
+        the pre-gate behaviour back. Making it required means a caller cannot opt
+        out without saying so.
         """
         # Family first. Without it a Kraken descriptor returns "permitted" for a
         # venue_family="dex", chain="solana" intent purely because the order type
         # matched — CEX/DEX separation belongs in the fail-closed gate, not above it.
-        if venue_family is not None:
-            if self.venue_family is None:
-                return False, f"{self.venue} does not declare a venue_family"
-            if self.venue_family != venue_family:
-                return (
-                    False,
-                    f"{self.venue} is {self.venue_family}, intent requires {venue_family}",
-                )
+        if self.venue_family is None:
+            return False, f"{self.venue} does not declare a venue_family"
+        if self.venue_family != venue_family:
+            return (
+                False,
+                f"{self.venue} is {self.venue_family}, intent requires {venue_family}",
+            )
         if order_type == "market" and not self.supports_market_orders:
             return False, f"{self.venue} does not declare market orders"
         if order_type == "limit" and not self.supports_limit_orders:
