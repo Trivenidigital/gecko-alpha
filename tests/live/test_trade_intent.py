@@ -9,17 +9,18 @@ the same identity. ``intent_hash`` closes that: any material change is a differe
 from __future__ import annotations
 
 import dataclasses
+import pickle
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
-from scout.live.intent import TradeIntent
+from scout.live.intent import TradeIntent, _canon_decimal
 
 _T0 = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _intent(**overrides) -> TradeIntent:
+def _intent_kwargs(**overrides) -> dict:
     base = dict(
         strategy_id="gainers_early",
         decision_id="dec-1",
@@ -41,7 +42,11 @@ def _intent(**overrides) -> TradeIntent:
         policy_version="v1",
     )
     base.update(overrides)
-    return TradeIntent(**base)
+    return base
+
+
+def _intent(**overrides) -> TradeIntent:
+    return TradeIntent(**_intent_kwargs(**overrides))
 
 
 class TestCanonicalHash:
@@ -207,3 +212,99 @@ class TestIdentityBinding:
             _intent().client_order_id
             != _intent(exact_quantity=Decimal("0.9")).client_order_id
         )
+
+
+class TestCanonicalizationIsContextIndependent:
+    """Regression for the two BLOCKERs found in adversarial review of PR #498.
+
+    `Decimal.normalize()` consults the ambient thread-local decimal context and
+    rounds to `prec` (default 28). It is neither value-preserving nor deterministic,
+    so it must never appear in canonicalization.
+    """
+
+    def test_29_digit_neighbours_do_not_collide(self):
+        """The confirmed collision: two wei quantities one unit apart both rounded
+        to ...680 at prec=28 and produced one intent_hash AND one client_order_id.
+        Reachable for any 18-decimal token above ~10 whole tokens."""
+        a = _intent(exact_quantity=Decimal("10000000000123456789012345678"))
+        b = _intent(exact_quantity=Decimal("10000000000123456789012345679"))
+        assert a.intent_hash != b.intent_hash
+        assert a.client_order_id != b.client_order_id
+
+    def test_canonical_value_is_not_rounded(self):
+        """The hash must bind the number the intent actually holds."""
+        q = Decimal("10000000000123456789012345678")
+        assert _canon_decimal(q) == "10000000000123456789012345678"
+
+    def test_high_precision_neighbours_do_not_collide(self):
+        a = _intent(exact_quantity=Decimal("1.000000000000000000000000000001"))
+        b = _intent(exact_quantity=Decimal("1.000000000000000000000000000002"))
+        assert a.intent_hash != b.intent_hash
+
+    @pytest.mark.parametrize("prec", [9, 28, 50, 60])
+    def test_hash_is_identical_under_every_decimal_context(self, prec):
+        """Construction AND later recomputation must both be context-blind, or a
+        verifier checking approved==signed gets a false mismatch."""
+        baseline = _intent(exact_quantity=Decimal("1.2345678901234567890123456789"))
+        with localcontext() as ctx:
+            ctx.prec = prec
+            under_ctx = _intent(exact_quantity=Decimal("1.2345678901234567890123456789"))
+            assert under_ctx.intent_hash == baseline.intent_hash
+            assert baseline.verify()
+
+    def test_trailing_zeros_and_signed_zero_still_converge(self):
+        assert _canon_decimal(Decimal("0.10")) == _canon_decimal(Decimal("0.1"))
+        assert _canon_decimal(Decimal("100.00")) == "100"
+        assert _canon_decimal(Decimal("1E+2")) == "100"
+        assert _canon_decimal(Decimal("-0")) == _canon_decimal(Decimal("0")) == "0"
+
+
+class TestNonFiniteRejected:
+    @pytest.mark.parametrize("raw", ["Infinity", "-Infinity", "NaN"])
+    @pytest.mark.parametrize(
+        "fieldname", ["exact_quantity", "maximum_notional", "minimum_output"]
+    )
+    def test_non_finite_decimal_is_rejected_as_valueerror(self, raw, fieldname):
+        """Decimal('Infinity') <= 0 is False, so it passed every positivity guard
+        and then compared greater than any size — maximum_notional imposed no
+        maximum. NaN raised InvalidOperation, not ValueError, escaping callers."""
+        with pytest.raises(ValueError, match="finite"):
+            _intent(**{fieldname: Decimal(raw)})
+
+    def test_bps_bounds_have_a_ceiling(self):
+        """A floored-only bound is not a bound: 10**9 bps was a valid 'limit'."""
+        with pytest.raises(ValueError, match="10000"):
+            _intent(maximum_slippage_bps=10**9)
+
+
+class TestValidationCannotBeBypassed:
+    def test_subclass_cannot_neuter_validation(self):
+        """A frozen subclass overriding _validate to a no-op previously minted a
+        well-formed hash over side='SELL_EVERYTHING', quantity=-1."""
+
+        @dataclasses.dataclass(frozen=True)
+        class Sneaky(TradeIntent):
+            def _validate(self) -> None:
+                return None
+
+        with pytest.raises(ValueError):
+            Sneaky(**{**_intent_kwargs(), "exact_quantity": Decimal("-1")})
+
+    def test_verify_detects_a_tampered_field(self):
+        """object.__setattr__ leaves intent_hash untouched; verify() must catch it."""
+        i = _intent()
+        assert i.verify()
+        object.__setattr__(i, "exact_quantity", Decimal("999999"))
+        assert not i.verify()
+
+    def test_verify_survives_pickle_roundtrip(self):
+        i = _intent()
+        assert pickle.loads(pickle.dumps(i)).verify()
+
+
+class TestDeadlineOrdering:
+    def test_execution_deadline_may_not_outlive_expiry(self):
+        """Otherwise is_expired() says True while a deadline-checking caller still
+        sees runway."""
+        with pytest.raises(ValueError, match="execution_deadline"):
+            _intent(execution_deadline=_T0 + timedelta(days=30))

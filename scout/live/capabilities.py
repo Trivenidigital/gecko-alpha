@@ -32,6 +32,11 @@ class VenueCapabilities:
 
     venue: str
 
+    # Which family this venue belongs to. None means undeclared, and an undeclared
+    # family matches no intent — a CEX descriptor must not silently approve a DEX
+    # intent just because the order type happens to line up.
+    venue_family: str | None = None
+
     # --- order forms ---------------------------------------------------------
     supports_market_orders: bool = False
     supports_limit_orders: bool = False
@@ -72,13 +77,28 @@ class VenueCapabilities:
         return any(getattr(self, name) for name in self.MONEY_MOVEMENT)
 
     def permits_order(
-        self, *, order_type: str, reduce_only: bool
+        self,
+        *,
+        order_type: str,
+        reduce_only: bool,
+        venue_family: str | None = None,
     ) -> tuple[bool, str | None]:
         """Whether an intent of this shape may be routed here.
 
         Returns ``(False, reason)`` rather than raising: the router needs to record
         why each venue was rejected, not abort on the first ineligible one.
         """
+        # Family first. Without it a Kraken descriptor returns "permitted" for a
+        # venue_family="dex", chain="solana" intent purely because the order type
+        # matched — CEX/DEX separation belongs in the fail-closed gate, not above it.
+        if venue_family is not None:
+            if self.venue_family is None:
+                return False, f"{self.venue} does not declare a venue_family"
+            if self.venue_family != venue_family:
+                return (
+                    False,
+                    f"{self.venue} is {self.venue_family}, intent requires {venue_family}",
+                )
         if order_type == "market" and not self.supports_market_orders:
             return False, f"{self.venue} does not declare market orders"
         if order_type == "limit" and not self.supports_limit_orders:

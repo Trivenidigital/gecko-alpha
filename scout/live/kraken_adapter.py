@@ -882,7 +882,8 @@ class KrakenSpotAdapter(ExchangeAdapter):
         ``KrakenWithdrawalCapabilityError``, and the descriptor agrees.
         """
         return VenueCapabilities(
-            venue="kraken",
+            venue=getattr(self, "venue_name", "kraken"),
+            venue_family="cex",
             supports_limit_orders=True,
             supports_cancel=True,
             supports_client_order_id=True,

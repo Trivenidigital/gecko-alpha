@@ -357,14 +357,20 @@ class BinanceSpotAdapter(ExchangeAdapter):
         ``place_exit_order`` and ``fetch_order_by_client_id`` (adapter_base
         comment), so a held-size-bounded exit is supported here.
 
-        Spot has no venue-side reduceOnly flag — the bound is enforced host-side
-        against the held position. Declared true because the *capability* exists
-        end to end, not because Binance carries a flag.
+        ``supports_reduce_only`` is deliberately NOT declared. Spot has no venue-side
+        reduceOnly flag, and ``place_exit_order`` takes ``base_qty`` from the caller and
+        fires a bare MARKET SELL — no position lookup, no clamp, no balance check. The
+        bound lives in exactly one caller (``live_evaluator.py``, which passes
+        ``entry_qty``); nothing in this adapter or in ``permits_order`` enforces it, and
+        ``TradeIntent.position_id`` has no plumbing to a held size. Declaring it here
+        would let the router approve a reduce-only intent and then land on
+        ``place_order_request`` — the unbounded entry path. Declare it once the clamp is
+        implemented in the adapter, not before.
         """
         return VenueCapabilities(
-            venue="binance",
+            venue=getattr(self, "venue_name", "binance"),
+            venue_family="cex",
             supports_market_orders=True,
-            supports_reduce_only=True,
             supports_client_order_id=True,
             supports_partial_fills=True,
         )
