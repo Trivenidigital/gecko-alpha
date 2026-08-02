@@ -211,15 +211,19 @@ class TradeIntent:
         # The 32-hex form is verified accepted by Kraken's own `_validate_cl_ord_id`
         # via `_CL_ORD_ID_SHORT_UUID_RE`.
         #
-        # UNRESOLVED, and deliberately recorded rather than papered over: this is 32
-        # chars, but `scout/live/idempotency.py` defines CLIENT_ORDER_ID_BINANCE_MAX_LEN
-        # = 28 and truncates defensively, and kraken_adapter.py / kraken_pilot.py repeat
-        # 28. Binance's documented newClientOrderId limit is larger than 28, so the
-        # in-tree 28 is likely self-imposed rather than a venue limit — but that is not
-        # verified against a cited Binance doc, and 32 > 28 either way. Until it is
-        # verified, a Binance caller must mint its id via idempotency.make_client_order_id
-        # rather than using this field. Nothing consumes this field yet, so no venue is
-        # currently at risk; wiring it to Binance requires resolving 28-vs-32 first.
+        # UNRESOLVED for Binance, deliberately recorded rather than papered over.
+        # `scout/live/idempotency.py:36` defines CLIENT_ORDER_ID_BINANCE_MAX_LEN = 28
+        # and truncates defensively; kraken_adapter.py:100 and kraken_pilot.py:127
+        # repeat 28. That constant carries NO cited source in tree — it sits above a
+        # comment reading only "Defensive truncation — should not happen at expected
+        # scales" — so whether 28 is a Binance limit or a self-imposed one is not
+        # established here, and this session did not verify it against a Binance doc.
+        #
+        # Consequence, stated plainly: 32 > 28, so IF 28 is a real venue limit then any
+        # Binance order keyed by this field is rejected. Nothing consumes this field
+        # today, so nothing is at risk now — but wiring it to Binance requires settling
+        # 28-vs-32 against a cited doc first. Until then Binance callers must mint ids
+        # via idempotency.make_client_order_id. Kraken is unaffected and verified.
         object.__setattr__(self, "client_order_id", digest[:32])
 
     # ------------------------------------------------------------------
@@ -316,7 +320,18 @@ class TradeIntent:
             "minimum_output",
         ):
             value = getattr(self, name)
-            if value is not None and not value.is_finite():
+            if value is None:
+                continue
+            # isinstance BEFORE .is_finite(): an int would raise AttributeError,
+            # which is the same leak class as the NaN/InvalidOperation case — a
+            # caller catching (ValueError, TypeError) to reject bad intents would
+            # not catch it. An int also canonicalizes to JSON 5 where Decimal("5")
+            # gives "5", so identical terms would get two identities.
+            if not isinstance(value, Decimal):
+                raise TypeError(
+                    f"{name} must be a Decimal, got {type(value).__name__}"
+                )
+            if not value.is_finite():
                 raise ValueError(f"{name} must be a finite Decimal, got {value!r}")
 
         if self.exact_quantity <= 0:

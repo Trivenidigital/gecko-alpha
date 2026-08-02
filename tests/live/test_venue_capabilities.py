@@ -91,31 +91,31 @@ class TestIntentCompatibility:
         return VenueCapabilities(venue="v", **kw)
 
     def test_market_intent_rejected_when_market_orders_undeclared(self):
-        ok, reason = self._caps(supports_limit_orders=True).permits_order(
-            order_type="market", reduce_only=False
-        )
+        ok, reason = self._caps(
+            venue_family="cex", supports_limit_orders=True
+        ).permits_order(venue_family="cex", order_type="market", reduce_only=False)
         assert not ok
         assert "market" in reason
 
     def test_limit_intent_rejected_when_limit_orders_undeclared(self):
-        ok, reason = self._caps(supports_market_orders=True).permits_order(
-            order_type="limit", reduce_only=False
-        )
+        ok, reason = self._caps(
+            venue_family="cex", supports_market_orders=True
+        ).permits_order(venue_family="cex", order_type="limit", reduce_only=False)
         assert not ok
         assert "limit" in reason
 
     def test_reduce_only_intent_rejected_when_undeclared(self):
         """Silently dropping reduce_only turns a bounded exit into a plain sell."""
-        ok, reason = self._caps(supports_market_orders=True).permits_order(
-            order_type="market", reduce_only=True
-        )
+        ok, reason = self._caps(
+            venue_family="cex", supports_market_orders=True
+        ).permits_order(venue_family="cex", order_type="market", reduce_only=True)
         assert not ok
         assert "reduce_only" in reason
 
     def test_permitted_when_all_declared(self):
         ok, reason = self._caps(
-            supports_market_orders=True, supports_reduce_only=True
-        ).permits_order(order_type="market", reduce_only=True)
+            venue_family="cex", supports_market_orders=True, supports_reduce_only=True
+        ).permits_order(venue_family="cex", order_type="market", reduce_only=True)
         assert ok
         assert reason is None
 
@@ -163,7 +163,7 @@ class TestVenueFamilySeparation:
             KrakenSpotAdapter.__new__(KrakenSpotAdapter)
         )
         ok, reason = caps.permits_order(
-            order_type="limit", reduce_only=False, venue_family="dex"
+            venue_family="dex", order_type="limit", reduce_only=False
         )
         assert not ok
         assert "dex" in reason
@@ -171,7 +171,7 @@ class TestVenueFamilySeparation:
     def test_undeclared_family_matches_nothing(self):
         ok, reason = VenueCapabilities(
             venue="v", supports_market_orders=True
-        ).permits_order(order_type="market", reduce_only=False, venue_family="cex")
+        ).permits_order(venue_family="cex", order_type="market", reduce_only=False)
         assert not ok
         assert "venue_family" in reason
 
@@ -186,7 +186,43 @@ class TestVenueFamilySeparation:
         )
         assert not caps.supports_reduce_only
         ok, reason = caps.permits_order(
-            order_type="market", reduce_only=True, venue_family="cex"
+            venue_family="cex", order_type="market", reduce_only=True
         )
         assert not ok
         assert "reduce_only" in reason
+
+
+class TestFamilyGateCannotBeSkipped:
+    def test_venue_family_is_a_required_keyword(self):
+        """An optional arg defaulting to 'don't check' was the last fail-open
+        path: omitting it silently restored the pre-gate behaviour."""
+        caps = VenueCapabilities(
+            venue="v", venue_family="cex", supports_market_orders=True
+        )
+        with pytest.raises(TypeError, match="venue_family"):
+            caps.permits_order(order_type="market", reduce_only=False)
+
+
+class TestDecimalTypeLeak:
+    def test_int_in_a_decimal_field_raises_typeerror_not_attributeerror(self):
+        """int has no .is_finite(); an AttributeError escapes callers catching
+        (ValueError, TypeError) — the same leak class as NaN/InvalidOperation."""
+        from datetime import datetime, timedelta, timezone
+        from decimal import Decimal as D
+
+        from scout.live.intent import TradeIntent
+
+        t0 = datetime(2026, 8, 2, 12, 0, 0, tzinfo=timezone.utc)
+        kw = dict(
+            strategy_id="s", decision_id="d", created_at=t0,
+            expires_at=t0 + timedelta(minutes=5),
+            execution_deadline=t0 + timedelta(minutes=5),
+            mode="SUPERVISED_LIVE", policy_version="v1", venue_family="cex",
+            preferred_venue="kraken", base_asset="BTC", quote_asset="USD",
+            side="buy", quantity_denomination="base",
+            maximum_notional=D("25"), order_type="market",
+            maximum_slippage_bps=100, maximum_price_impact_bps=100,
+        )
+        with pytest.raises(TypeError, match="must be a Decimal"):
+            TradeIntent(**kw, exact_quantity=5)
+        assert TradeIntent(**kw, exact_quantity=D("5")).verify()
