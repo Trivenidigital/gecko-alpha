@@ -183,6 +183,7 @@ def build_allowance_holder_artifact(
     expected_sell_token: str,
     expected_buy_token: str,
     expected_sell_amount: int,
+    expected_min_buy_amount: int,
     retrieved_at: datetime | None = None,
     max_fee_bps: Decimal = DEFAULT_MAX_ZEROEX_FEE_BPS,
     max_slippage_bps: Decimal = DEFAULT_MAX_SLIPPAGE_BPS,
@@ -319,6 +320,29 @@ def build_allowance_holder_artifact(
             f"calldata enforces minAmountOut {decoded.minimum_amount_out} but the "
             f"response advertises minBuyAmount {min_buy}. The number shown is not "
             "the number the chain will enforce."
+        )
+
+    # --- the ABSOLUTE floor, anchored OUTSIDE the response -------------------
+    # *** THE RATIO CHECK BELOW IS NOT A BOUND ON LOSS. ***
+    # `slippage = (buyAmount - minBuyAmount) / buyAmount` divides two numbers
+    # that both come from the same untrusted document and are anchored to
+    # nothing. Understate `buyAmount` and the RATIO stays small while the
+    # absolute floor goes anywhere: a response claiming `buyAmount=1`,
+    # `minBuyAmount=1` scores 0 bps of slippage while authorizing ~$188 of WETH
+    # for one millionth of a USDC. The ratio bounds the provider's internal
+    # self-consistency; only a figure the INTENT supplies can bound loss.
+    if expected_min_buy_amount <= 0:
+        raise ZeroExArtifactError(
+            "expected_min_buy_amount must be positive — without a floor derived "
+            "from our own price reference there is no bound on what this trade "
+            "may lose"
+        )
+    if min_buy < expected_min_buy_amount:
+        raise ZeroExArtifactError(
+            f"the quote's enforced minimum {min_buy} is below the intent's floor "
+            f"{expected_min_buy_amount}. The response's own buyAmount/minBuyAmount "
+            "ratio cannot detect this: understating buyAmount keeps that ratio "
+            "small while the absolute floor goes anywhere."
         )
 
     # --- slippage, bounded ---------------------------------------------------

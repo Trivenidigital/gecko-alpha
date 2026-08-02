@@ -81,14 +81,38 @@ class _RefusingMandate:
 
 
 class _PermittingMandate:
+    """Returns a REAL `MandateDecision`.
+
+    A dict used to be enough, because the boundary only checked truthiness — so
+    `True`, `object()` and `MagicMock()` all authorized. Only the object the
+    mandate mints on its permitted path counts now, and these doubles must mint
+    one too or they are not modelling a mandate.
+    """
+
     def __init__(self) -> None:
         self.calls = 0
         self.seen = []
 
     def authorize_bundle(self, bundle):
+        from decimal import Decimal
+
+        from scout.live.mandate import MandateDecision, MandateEnvelope
+
         self.calls += 1
         self.seen.append(bundle.bundle_hash)
-        return {"authorized": True, "bundle_hash": bundle.bundle_hash}
+        return MandateDecision(
+            mode="SUPERVISED_LIVE",
+            venue="zeroex-allowance-holder",
+            venue_family="dex",
+            intent_hash=bundle.intent_hash,
+            envelope=MandateEnvelope(
+                per_trade_max_notional_usd=Decimal("500"),
+                daily_max_notional_usd=Decimal("500"),
+                max_open_positions=1,
+            ),
+            supervised_reconciled=None,
+            decided_at=datetime.now(timezone.utc),
+        )
 
 
 def _bundle(**over) -> ExecutionSigningBundle:

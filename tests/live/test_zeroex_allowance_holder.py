@@ -78,6 +78,9 @@ def _request(**over) -> ZeroExQuoteRequest:
         buy_token=USDC,
         sell_amount=SELL_AMOUNT,
         taker=GECKO_TEST_TAKER,
+        # The floor the INTENT will accept, from our own price reference rather
+        # than from the 0x response. 1% under the fixture's real minimum.
+        expected_min_buy_amount=MIN_BUY_AMOUNT * 99 // 100,
     )
     kw.update(over)
     return ZeroExQuoteRequest(**kw)
@@ -885,6 +888,7 @@ class TestOnlyOneRouteToABundle:
         for path in self._production_sources():
             rel = str(path).replace("\\", "/")
             tree = ast.parse(path.read_text("utf-8"))
+            in_evm = rel.startswith("scout/live/evm/")
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
@@ -893,7 +897,42 @@ class TestOnlyOneRouteToABundle:
                     name = node.func.id
                 elif isinstance(node.func, ast.Attribute):
                     name = node.func.attr
-                if name not in ("build_bundle_from_artifact", "ExecutionSigningBundle"):
+                # `dataclasses.replace` produces a fully-verifying bundle with
+                # any field changed: `verify()` guards against tampering IN
+                # PLACE, not against RE-CONSTRUCTION, so a replaced bundle
+                # recomputes its own hash and validates while carrying
+                # minimum_output=1 beside a response_hash that still names the
+                # honest response. `getattr` is the same evasion by another name.
+                # Both are legitimate elsewhere in scout/, so they only count
+                # inside the evm package.
+                builders = ("build_bundle_from_artifact", "ExecutionSigningBundle")
+                flagged = name in builders
+                if in_evm and not flagged:
+                    # `dataclasses.replace(bundle, ...)` rebuilds a bundle that
+                    # recomputes its own hash, so it VERIFIES while carrying any
+                    # field changed — `verify()` guards tampering in place, not
+                    # re-construction. Matched narrowly: a bare `replace(...)`
+                    # (i.e. `from dataclasses import replace`) or an explicit
+                    # `dataclasses.replace(...)`. `str.replace` is an Attribute
+                    # on a non-`dataclasses` value and is not flagged.
+                    if name == "replace":
+                        func = node.func
+                        bare = isinstance(func, ast.Name)
+                        qualified = (
+                            isinstance(func, ast.Attribute)
+                            and isinstance(func.value, ast.Name)
+                            and func.value.id == "dataclasses"
+                        )
+                        flagged = bare or qualified
+                    elif name == "getattr":
+                        # Only when it NAMES a builder — `getattr(x, "close")`
+                        # is not an evasion.
+                        flagged = (
+                            len(node.args) >= 2
+                            and isinstance(node.args[1], ast.Constant)
+                            and node.args[1].value in builders
+                        )
+                if not flagged:
                     continue
                 enclosing = "<module>"
                 for fn in ast.walk(tree):
@@ -973,11 +1012,32 @@ class TestGuardsWithPreviouslyNoCoverage:
 
     def test_the_INNER_alignment_refusal_fires(self):
         """The original test appended bytes to the OUTER payload, so only the
-        outer check ran. This is the refusal cited as the whole reason Permit2
-        is disabled."""
-        inner = bytes.fromhex("1fff991f") + b"\x11" * 33  # 33 % 32 != 0
+        outer check ran.
+
+        It was also VACUOUS in a second way: 33 bytes of 0x11 fail eth_abi's
+        padding validation whether or not the guard exists, and the match string
+        "inner Settler" is a substring of BOTH the alignment refusal and the
+        generic decode failure — so it passed with the guard deleted. The inner
+        body here is a VALID encoding plus one byte, so with the guard removed
+        the payload decodes cleanly and only the alignment check can refuse it.
+        """
+        from eth_abi import encode as abi_encode
+
+        valid_inner_body = abi_encode(
+            ["(address,address,uint256)", "bytes[]", "bytes32"],
+            [
+                (
+                    bytes.fromhex(GECKO_TEST_TAKER[2:]),
+                    bytes.fromhex(USDC[2:]),
+                    MIN_BUY_AMOUNT,
+                ),
+                [b"\x11\x22\x33\x44"],
+                b"\x00" * 32,
+            ],
+        )
+        inner = bytes.fromhex("1fff991f") + valid_inner_body + b"\x00"
         payload = _wrap_outer(inner, operator=SETTLER_ADDRESS, target=SETTLER_ADDRESS)
-        with pytest.raises(CalldataError, match="inner Settler"):
+        with pytest.raises(CalldataError, match="32-byte boundary"):
             decode_allowance_holder_calldata(payload, chain_id=1)
 
     def test_an_unreviewed_inner_selector_is_refused(self):
@@ -1021,11 +1081,63 @@ class TestGuardsWithPreviouslyNoCoverage:
         """
         raw = allowance_holder_response()
         # minBuyAmount still matches the calldata (so the response/calldata
-        # comparison passes and is not what refuses), but buyAmount is 100x it —
-        # a ~99% advertised loss.
+        # comparison is not what refuses) and clears the intent floor, so the
+        # RATIO ceiling is isolated: buyAmount is 100x the minimum, a ~99%
+        # advertised loss.
         raw["buyAmount"] = str(MIN_BUY_AMOUNT * 100)
+        raw["fees"]["zeroExFee"] = None
         with pytest.raises(ZeroExArtifactError, match="slippage"):
             _artifact(raw)
+
+    def test_an_understated_buy_amount_cannot_evade_the_ratio_ceiling(self):
+        """*** THE RATIO IS NOT A BOUND ON LOSS. ***
+
+        `(buyAmount - minBuyAmount) / buyAmount` divides two numbers from the
+        same untrusted response. Understating `buyAmount` keeps the ratio small
+        while the absolute floor goes anywhere — `buyAmount=1, minBuyAmount=1`
+        scores 0 bps while authorising ~$188 of WETH for a millionth of a USDC.
+
+        The calldata must agree with the understated response, or the
+        response/calldata comparison refuses first and the intent floor is never
+        reached. That agreement is the realistic threat: a provider returning a
+        bad quote CONSISTENTLY, where nothing internal to the document is wrong.
+        """
+        raw = self._crafted(min_out=1, buy_amount=1)
+        with pytest.raises(ZeroExArtifactError, match="intent's floor"):
+            _artifact(raw)
+
+    def test_a_graded_understatement_is_also_refused(self):
+        """99% understated: a floor of ~1.87 USDC against ~188 USDC of value,
+        scoring only ~29 bps on the ratio."""
+        low = MIN_BUY_AMOUNT // 100
+        raw = self._crafted(min_out=low, buy_amount=low * 10029 // 10000)
+        with pytest.raises(ZeroExArtifactError, match="intent's floor"):
+            _artifact(raw)
+
+    def _crafted(self, *, min_out: int, buy_amount: int) -> dict:
+        """A self-consistent response whose calldata encodes `min_out`."""
+        from eth_abi import encode as abi_encode
+
+        inner_body = abi_encode(
+            ["(address,address,uint256)", "bytes[]", "bytes32"],
+            [
+                (
+                    bytes.fromhex(GECKO_TEST_TAKER[2:]),
+                    bytes.fromhex(USDC[2:]),
+                    min_out,
+                ),
+                [b"\x11\x22\x33\x44"],
+                b"\x00" * 32,
+            ],
+        )
+        inner = bytes.fromhex("1fff991f") + inner_body
+        payload = _wrap_outer(inner, operator=SETTLER_ADDRESS, target=SETTLER_ADDRESS)
+        raw = allowance_holder_response()
+        raw["transaction"]["data"] = payload
+        raw["buyAmount"] = str(buy_amount)
+        raw["minBuyAmount"] = str(min_out)
+        raw["fees"]["zeroExFee"] = None
+        return raw
 
 
 class TestSignerRefusesNonDecisions:
@@ -1159,3 +1271,232 @@ class TestSuccessfulSubmissionIsPersisted:
             ExecutionState.NOT_SUBMITTED,
             ExecutionState.PENDING,
         ], f"durable row after a successful submit: {written}"
+
+
+# ===========================================================================
+# The eight round-2 guards that mutation testing found unpinned
+# ===========================================================================
+#
+# Each of these was added in response to a review finding, and deleting it left
+# the suite green — the same shape as round one. Individually they are
+# fail-closed defensive guards; collectively, unpinned guards are guards the
+# next refactor reverts silently.
+
+
+class TestApprovalGuardsArePinned:
+    def _build(self, **over):
+        from scout.live.evm.approval import build_approval_intent
+
+        kw = dict(
+            chain_id=1,
+            owner=GECKO_TEST_TAKER,
+            token=WETH,
+            spender=ALLOWANCE_HOLDER_ADDRESS,
+            required_amount=SELL_AMOUNT,
+            inner_target=SETTLER_ADDRESS,
+        )
+        kw.update(over)
+        return build_approval_intent(**kw)
+
+    def test_the_headroom_cap_is_enforced(self):
+        """Without the cap, 'bounded, never unlimited' is a check on one magic
+        number: solving for UNLIMITED-1 yields ~1e60x the trade while still
+        reporting is_unlimited=False."""
+        from scout.live.evm.approval import MAX_HEADROOM_BPS, ApprovalRefused
+
+        with pytest.raises(ApprovalRefused, match="outside 0"):
+            self._build(headroom_bps=MAX_HEADROOM_BPS + 1)
+        # And the boundary is allowed.
+        assert self._build(headroom_bps=MAX_HEADROOM_BPS).amount > SELL_AMOUNT
+
+    @pytest.mark.parametrize("bad", [100.0, "100", None])
+    def test_a_non_integer_headroom_is_refused(self, bad):
+        """Basis points as a float re-introduces the precision problem integer
+        arithmetic was adopted to remove."""
+        from scout.live.evm.approval import ApprovalRefused
+
+        with pytest.raises(ApprovalRefused, match="must be an int"):
+            self._build(headroom_bps=bad)
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        [
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "0x0000000000000000000000000000000000000000",
+        ],
+    )
+    def test_a_native_asset_sentinel_is_refused(self, sentinel):
+        """ERC-20 approve does not exist for the chain's native asset — there is
+        no contract to call."""
+        from scout.live.evm.approval import ApprovalRefused
+
+        with pytest.raises(ApprovalRefused, match="native-asset"):
+            self._build(token=sentinel)
+
+    def test_an_approval_below_the_required_amount_is_refused(self):
+        """Floor division can only round down, so a zero headroom on a tiny
+        amount is the boundary case."""
+        from scout.live.evm.approval import ApprovalRefused
+
+        assert self._build(required_amount=1, headroom_bps=0).amount == 1
+        with pytest.raises(ApprovalRefused, match="positive"):
+            self._build(required_amount=0)
+
+    def test_the_granted_allowance_is_reconciled(self):
+        from scout.live.evm.approval import reconcile_approval
+
+        intent = self._build()
+        ok, why = reconcile_approval(intent=intent, allowance_after=intent.amount)
+        assert ok and why is None
+        # More than authorized is a standing grant nobody asked for.
+        bad, why = reconcile_approval(intent=intent, allowance_after=intent.amount * 2)
+        assert not bad and "revoke" in why
+        # Never re-read is not the same as reconciled.
+        unknown, why = reconcile_approval(intent=intent, allowance_after=None)
+        assert not unknown and "unverified" in why
+
+
+class TestCalldataAndReconcileGuardsArePinned:
+    def test_zero_length_actions_are_refused_per_element(self):
+        """Three zero-length elements produce ('0x','0x','0x'), which is truthy —
+        so an emptiness check passed a payload performing nothing."""
+        from eth_abi import encode as abi_encode
+
+        inner_body = abi_encode(
+            ["(address,address,uint256)", "bytes[]", "bytes32"],
+            [
+                (
+                    bytes.fromhex(GECKO_TEST_TAKER[2:]),
+                    bytes.fromhex(USDC[2:]),
+                    MIN_BUY_AMOUNT,
+                ),
+                [b"", b"", b""],
+                b"\x00" * 32,
+            ],
+        )
+        inner = bytes.fromhex("1fff991f") + inner_body
+        payload = _wrap_outer(inner, operator=SETTLER_ADDRESS, target=SETTLER_ADDRESS)
+        with pytest.raises(CalldataError, match="no selector"):
+            decode_allowance_holder_calldata(payload, chain_id=1)
+
+    @pytest.mark.parametrize("bad", ["0x2213bc0bZZ", "0x2213bc0b0", "not-hex-at-all"])
+    def test_malformed_hex_raises_the_declared_type(self, bad):
+        """`bytes.fromhex` raises a bare ValueError, which a caller writing
+        `except CalldataError` would miss."""
+        with pytest.raises(CalldataError):
+            decode_allowance_holder_calldata(bad, chain_id=1)
+
+    def test_the_settler_refusal_surfaces_as_the_adapters_declared_type(self):
+        """It escaped as a bare ValueError, so a caller catching
+        ZeroExArtifactError missed the single most important refusal."""
+        raw = allowance_holder_response()
+        raw["allowanceTarget"] = SETTLER_ADDRESS
+        raw["issues"]["allowance"]["spender"] = SETTLER_ADDRESS
+        raw["transaction"]["to"] = SETTLER_ADDRESS
+        with pytest.raises(ZeroExArtifactError, match="NEVER be approved"):
+            _artifact(raw)
+
+    def test_reconcile_refuses_to_call_nothing_checked_reconciled(self):
+        """With every delta None it reported reconciled=True, which reads in a
+        log as a clean settlement when no chain state was read at all."""
+        from scout.live.evm.execution import EvmReceipt, ExecutionState, reconcile
+
+        verdict = reconcile(
+            receipt=EvmReceipt(
+                intent_hash="i" * 64,
+                bundle_hash="b" * 64,
+                chain_id=1,
+                wallet=GECKO_TEST_TAKER,
+                expected_transaction_hash="0x" + "ab" * 32,
+                state=ExecutionState.FINALIZED,
+            ),
+            artifact=_artifact(),
+            buy_balance_delta=None,
+            sell_balance_delta=None,
+            allowance_after=None,
+            gas_used=None,
+        )
+        assert not verdict.reconciled and verdict.trips_breaker
+        assert any("nothing was checked" in d for d in verdict.discrepancies)
+
+
+class TestOnlyAMandateDecisionAuthorizes:
+    """`if not decision` refused None/False/0 but SIGNED for True, object() and
+    MagicMock() — the shape a partially-configured test double takes."""
+
+    def _boundary(self, mandate, loader, tmp_path):
+        import os
+
+        from scout.live.evm.signer import REQUIRED_MODE, EvmSignerBoundary
+
+        key = tmp_path / "evm.key"
+        key.write_text("0x" + "11" * 32, encoding="utf-8")
+        os.chmod(key, REQUIRED_MODE)
+        return EvmSignerBoundary(mandate=mandate, key_path=key, key_loader=loader)
+
+    def _fresh_bundle(self):
+        return build_bundle_from_artifact(
+            _artifact_now(), intent_hash="i" * 64, wallet=GECKO_TEST_TAKER
+        )
+
+    @pytest.mark.parametrize("shape", ["magicmock", "true", "object"])
+    def test_a_truthy_non_decision_does_not_authorize(self, tmp_path, shape):
+        from unittest.mock import MagicMock
+
+        from scout.live.evm.signer import SignerRefused
+
+        value = {"magicmock": MagicMock(), "true": True, "object": object()}[shape]
+        read = []
+
+        class _Truthy:
+            def authorize_bundle(self, bundle):
+                return value
+
+        def _tripwire(_p):
+            read.append(1)
+            raise AssertionError("the key was READ")
+
+        with pytest.raises(SignerRefused) as exc:
+            self._boundary(_Truthy(), _tripwire, tmp_path).sign_bundle(
+                self._fresh_bundle()
+            )
+        assert exc.value.gate == "mandate"
+        assert "not a MandateDecision" in exc.value.message
+        assert read == []
+
+    def test_a_real_mandate_decision_does_authorize(self, tmp_path):
+        """Guard on the guard: the boundary must still be able to sign."""
+        from datetime import datetime, timezone
+
+        from scout.live.mandate import MandateDecision, MandateEnvelope
+
+        loaded = []
+
+        class _Account:
+            address = GECKO_TEST_TAKER
+
+        class _Real:
+            def authorize_bundle(self, bundle):
+                return MandateDecision(
+                    mode="SUPERVISED_LIVE",
+                    venue="zeroex-allowance-holder",
+                    venue_family="dex",
+                    intent_hash=bundle.intent_hash,
+                    envelope=MandateEnvelope(
+                        per_trade_max_notional_usd=Decimal("500"),
+                        daily_max_notional_usd=Decimal("500"),
+                        max_open_positions=1,
+                    ),
+                    supervised_reconciled=None,
+                    decided_at=datetime.now(timezone.utc),
+                )
+
+        def _loader(_p):
+            loaded.append(1)
+            return _Account()
+
+        session = self._boundary(_Real(), _loader, tmp_path).sign_bundle(
+            self._fresh_bundle()
+        )
+        assert loaded == [1]
+        assert session.bundle.verify()

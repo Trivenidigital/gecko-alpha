@@ -53,6 +53,10 @@ class ZeroExQuoteRequest:
     buy_token: str
     sell_amount: int
     taker: str
+    #: The minimum output the INTENT will accept, from our own price reference.
+    #: Anchored outside the 0x response, which is the whole point — see
+    #: `build_allowance_holder_artifact`.
+    expected_min_buy_amount: int = 0
 
 
 class ZeroExAllowanceHolderAdapter:
@@ -153,6 +157,7 @@ class ZeroExAllowanceHolderAdapter:
             expected_sell_token=request.sell_token,
             expected_buy_token=request.buy_token,
             expected_sell_amount=request.sell_amount,
+            expected_min_buy_amount=request.expected_min_buy_amount,
             retrieved_at=retrieved_at,
         )
         if self._max_fee_bps is not None:

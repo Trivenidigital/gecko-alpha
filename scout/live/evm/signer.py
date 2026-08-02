@@ -45,6 +45,7 @@ from typing import Any, Callable, Protocol
 import structlog
 
 from scout.live.evm.signing_bundle import ExecutionSigningBundle
+from scout.live.mandate import MandateDecision
 
 log = structlog.get_logger(__name__)
 
@@ -247,10 +248,16 @@ class EvmSignerBoundary:
         # assumption about a component that does not exist yet, not a property
         # this boundary enforced.
         if inspect.isawaitable(decision):
-            try:  # pragma: no cover - defensive cleanup
-                decision.close()  # type: ignore[union-attr]
-            except Exception:
-                log.exception("evm_signer_coroutine_close_failed")
+            # `close` exists on coroutines but not on every awaitable
+            # (`asyncio.Future`, an `__await__`-only object), where the old
+            # unconditional call raised AttributeError and dumped a traceback
+            # through the handler on every occurrence.
+            close = getattr(decision, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # pragma: no cover - defensive cleanup
+                    log.exception("evm_signer_awaitable_close_failed")
             raise SignerRefused(
                 "mandate",
                 "authorize_bundle returned an awaitable that was never awaited, "
@@ -258,11 +265,19 @@ class EvmSignerBoundary:
                 "must be awaited by its caller before reaching the signer. The "
                 "key was not read.",
             )
-        if not decision:
+        # *** TRUTHY IS NOT AUTHORIZED. ***
+        # `if not decision` refused None/False/0/''/[] but SIGNED for `True`,
+        # `object()` and — the one that matters — `MagicMock()`, which is the
+        # shape a partially-configured test double takes. This project already
+        # has a standing rule about spec'd mocks for safety-critical code.
+        # `MandateDecision` documents itself as only ever constructed on the
+        # permitted path, which is exactly the property wanted here.
+        if not isinstance(decision, MandateDecision):
             raise SignerRefused(
                 "mandate",
-                f"authorize_bundle returned {decision!r} rather than a decision. "
-                "A falsy result is a refusal. The key was not read.",
+                f"authorize_bundle returned {type(decision).__name__}, not a "
+                "MandateDecision. Only the object the mandate mints on its "
+                "permitted path is an authorization. The key was not read.",
             )
 
         # 3. Custody, still without opening the file.
