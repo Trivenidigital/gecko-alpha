@@ -131,6 +131,35 @@ Verified facts (2026-07-31)
    it grants outlives the pilot entirely. Loss would NOT be bounded by trade
    size. Hence the permitted sets are deliberately minimal.
 
+9. **The instruction profile is DIRECTION-DEPENDENT, and "which account" is a
+   different question from "who is paid".** A SOL->USDC swap wraps SOL into a
+   temporary wrapped-SOL account and may create the USDC account it is paid
+   into. A USDC->SOL swap spends from a USDC account that ALREADY EXISTS and
+   is typically paid into a temporary wrapped-SOL account that the same
+   transaction closes again.
+
+   "Typically" is load-bearing in the other direction too: a reverse route
+   that never touches a wrapped-SOL account is legitimate, so the presence of
+   the wrap/unwrap pair must never become a REQUIREMENT. What this module does
+   instead is enumerate, per direction, the accounts a transaction is
+   PERMITTED to create and to close, and refuse everything outside that set.
+
+   The close side is where the two directions genuinely diverge. Before this,
+   ``CloseAccount`` was accepted on any account so long as the released rent
+   went to the signer — which is true of closing our own USDC account. In the
+   FORWARD direction that account has just been paid into, so an on-chain close
+   would fail on a non-empty account. In the REVERSE direction the same account
+   is EMPTY the instant the swap completes, so the close succeeds and
+   ~2,039,280 lamports of rent move as a side effect of a swap nobody
+   authorized to do that. ``permitted_close_accounts`` is the fix: an explicit
+   allowlist of addresses, supplied by the caller, checked against the account
+   at index 0 of every ``CloseAccount``.
+
+   Both allowlists are OPT-IN (``None`` means "no allowlist was supplied"), and
+   the check says so rather than silently passing — a standalone caller that
+   cannot derive the addresses gets an honest "not checked" rather than a
+   check that pretends to have run.
+
 What this module CANNOT verify statically
 ------------------------------------------
 These are real gaps, not oversights. They are why independent simulation
@@ -235,6 +264,15 @@ PERMITTED_TOKEN_INSTRUCTIONS: Final[dict[int, int]] = {
 # be us — otherwise closing our own wrapped-SOL account pays a stranger.
 TOKEN_CLOSE_ACCOUNT_DESTINATION_INDEX: Final = 1
 
+# ...and index 0 is the account being closed. Which account that is matters
+# independently of where its rent goes, and the two questions have different
+# answers in the two swap directions — see ``permitted_close_accounts``.
+TOKEN_CLOSE_ACCOUNT_TARGET_INDEX: Final = 0
+
+# The ATA program's account order is [payer, ata, owner, mint, ...], so the
+# account being CREATED is index 1.
+ATA_CREATE_ACCOUNT_INDEX: Final = 1
+
 # Associated Token Account program. NOTE the empty-data case: the ATA program
 # treats zero-length data as the legacy Create, so unlike the token programs
 # an empty ATA instruction is legitimate and must be permitted.
@@ -301,6 +339,14 @@ class VerificationReport:
     ata_rent_lamports: int
     ata_create_count: int
     total_fee_lamports: int
+    # Token accounts this transaction CLOSES, and the rent those closures
+    # release back to the signer. Reported separately from ``ata_rent_lamports``
+    # and deliberately NOT netted against it: the fee ceiling must keep bounding
+    # the gross outflow, while the post-trade reconciliation needs to know how
+    # much of it comes back. Netting them would turn a safety ceiling into an
+    # accounting convenience.
+    closed_accounts: tuple[str, ...] = ()
+    recovered_rent_lamports: int = 0
     program_ids: tuple[str, ...] = ()
     unresolved_lookup_tables: tuple[str, ...] = ()
     resolved_key_count: int | None = None
@@ -416,6 +462,8 @@ async def verify_swap_transaction(
     input_mint: str = SOL_MINT,
     output_mint: str = USDC_MINT,
     ata_rent_lamports: int = ATA_RENT_LAMPORTS_FALLBACK,
+    permitted_close_accounts: Collection[str] | None = None,
+    permitted_ata_create_accounts: Collection[str] | None = None,
 ) -> VerificationReport:
     """Verify a Jupiter-built transaction against intent. Never raises on a
     failed CHECK — it returns a report whose ``passed`` is False so the
@@ -435,6 +483,17 @@ async def verify_swap_transaction(
             ceiling. Defaults to the static fallback; a runner that has
             queried ``getMinimumBalanceForRentExemption`` should pass the
             live cluster figure.
+        permitted_close_accounts: addresses this transaction may ``CloseAccount``
+            (module docstring fact 9). The set is DIRECTION-DEPENDENT and is
+            the caller's to derive — a reverse swap must not be allowed to
+            close the input account it just emptied. ``None`` means no
+            allowlist was supplied and the check reports that rather than
+            passing silently; the destination rule still applies either way.
+        permitted_ata_create_accounts: addresses this transaction may create as
+            associated token accounts. Same opt-in semantics. Note this is
+            deliberately NOT an "owner must be us" rule (docstring fact 8) —
+            it is an explicit address enumeration, so a caller that cannot
+            enumerate passes ``None`` and relies on the rent ceiling alone.
     """
     checks: list[Check] = []
     allowed_tips = (
@@ -466,6 +525,8 @@ async def verify_swap_transaction(
             ata_rent_lamports=kw.get("ata_rent_lamports", 0),
             ata_create_count=kw.get("ata_create_count", 0),
             total_fee_lamports=kw.get("total_fee_lamports", 0),
+            closed_accounts=tuple(kw.get("closed_accounts", ())),
+            recovered_rent_lamports=kw.get("recovered_rent_lamports", 0),
             program_ids=tuple(kw.get("program_ids", ())),
             unresolved_lookup_tables=tuple(kw.get("unresolved_lookup_tables", ())),
             resolved_key_count=kw.get("resolved_key_count"),
@@ -598,6 +659,11 @@ async def verify_swap_transaction(
     ata_violations: list[str] = []
     system_violations: list[str] = []
     ata_create_count = 0
+    # Addresses this transaction actually creates / closes, in message order.
+    # Collected whatever the allowlists say, so the report describes the
+    # transaction even when a check refuses it.
+    created_ata_accounts: list[str | None] = []
+    closed_token_accounts: list[str | None] = []
 
     def _account_at(ix_accounts: list[int], position: int) -> str | None:
         if len(ix_accounts) <= position:
@@ -651,6 +717,9 @@ async def verify_swap_transaction(
                 destination = _account_at(
                     accounts, TOKEN_CLOSE_ACCOUNT_DESTINATION_INDEX
                 )
+                closed_token_accounts.append(
+                    _account_at(accounts, TOKEN_CLOSE_ACCOUNT_TARGET_INDEX)
+                )
                 if destination != expected_signer:
                     token_violations.append(
                         f"CloseAccount releases lamports to {destination}, "
@@ -673,6 +742,9 @@ async def verify_swap_transaction(
                 # the account, and an owner==signer rule would block
                 # legitimate PDA-owned intermediates (docstring fact 8).
                 ata_create_count += 1
+                created_ata_accounts.append(
+                    _account_at(accounts, ATA_CREATE_ACCOUNT_INDEX)
+                )
 
         # ---- System ------------------------------------------------
         elif program_id == SYSTEM_PROGRAM_ID:
@@ -724,6 +796,53 @@ async def verify_swap_transaction(
             else f"refused system instruction(s): {system_violations}"
         ),
     )
+
+    # ---- direction-aware account allowlists (docstring fact 9) ----------
+    # Enumeration, not pattern-matching: the transaction is checked against the
+    # set of accounts it is PERMITTED to touch, and anything else is refused.
+    # Neither check requires a wrap/unwrap pair to be present — a route that
+    # creates and closes nothing has an empty list and passes, which is what
+    # keeps one route shape from becoming load-bearing.
+    def _allowlist_check(
+        name: str,
+        observed: list[str | None],
+        permitted: Collection[str] | None,
+        noun: str,
+    ) -> None:
+        if permitted is None:
+            add(
+                name,
+                True,
+                f"NOT CHECKED — no allowlist supplied; {len(observed)} "
+                f"{noun}(s): {[a for a in observed]}",
+            )
+            return
+        allowed = set(permitted)
+        refused = [a for a in observed if a is None or a not in allowed]
+        add(
+            name,
+            not refused,
+            (
+                f"{len(observed)} {noun}(s), all inside the {len(allowed)}-address "
+                f"allowlist for this direction"
+                if not refused
+                else f"{noun}(s) outside the permitted set: {refused}"
+            ),
+        )
+
+    _allowlist_check(
+        "closed_accounts_permitted",
+        closed_token_accounts,
+        permitted_close_accounts,
+        "closed account",
+    )
+    _allowlist_check(
+        "created_ata_accounts_permitted",
+        created_ata_accounts,
+        permitted_ata_create_accounts,
+        "created account",
+    )
+
     add(
         "compute_budget_instructions_unique",
         unit_limit_count <= 1 and unit_price_count <= 1,
@@ -839,6 +958,11 @@ async def verify_swap_transaction(
 
     base_fee = LAMPORTS_PER_SIGNATURE * max(num_required, 1)
     ata_rent = ata_create_count * ata_rent_lamports
+    # Rent released by the closures above. NOT subtracted from `ata_rent`: the
+    # ceiling below bounds what LEAVES the wallet, and a recovery that depends
+    # on the close actually executing must not be allowed to buy headroom for
+    # a create that definitely does.
+    recovered_rent = len(closed_token_accounts) * ata_rent_lamports
     # ATA rent is included deliberately: it is not a fee, but it is money
     # leaving the wallet, and a ceiling that ignored it would not bound the
     # transaction's actual cost (module docstring fact 8).
@@ -867,6 +991,8 @@ async def verify_swap_transaction(
         ata_rent_lamports=ata_rent,
         ata_create_count=ata_create_count,
         total_fee_lamports=total_fee,
+        closed_accounts=tuple(a for a in closed_token_accounts if a is not None),
+        recovered_rent_lamports=recovered_rent,
         program_ids=tuple(dict.fromkeys(program_ids)),
         unresolved_lookup_tables=tuple(unresolved_tables),
         resolved_key_count=len(keys),
@@ -882,6 +1008,8 @@ async def verify_swap_transaction(
         priority_fee_lamports=report.priority_fee_lamports,
         ata_rent_lamports=report.ata_rent_lamports,
         ata_create_count=report.ata_create_count,
+        closed_account_count=len(report.closed_accounts),
+        recovered_rent_lamports=report.recovered_rent_lamports,
         total_fee_lamports=report.total_fee_lamports,
         failed_checks=[c.name for c in report.failures],
     )

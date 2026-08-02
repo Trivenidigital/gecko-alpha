@@ -67,6 +67,33 @@ STAGE_TRANSACTION = "transaction"
 STAGE_BALANCE = "balance"
 STAGE_FRESHNESS = "freshness"
 
+# The two directions the lane can trade the ONE approved pair in. Named here
+# rather than passed as a bare bool so a report reads as the direction it
+# judged, and so a third value can never appear by accident.
+#
+# The envelope is the SAME in both directions and is deliberately not
+# parameterised beyond what the direction genuinely changes:
+#
+#   * the mint allowlists SWAP. `SOLANA_ALLOWED_INPUT_MINTS` names what the
+#     lane may spend on the way in and `..._OUTPUT_MINTS` what it may hold;
+#     traversing the pair backwards exchanges those roles and nothing else. A
+#     mint that is on neither list is still refused in both directions, so this
+#     widens nothing.
+#   * the per-trade band and the daily cap follow the USDC leg, because USDC is
+#     the dollar-denominated one. Forward that is the OUTPUT, reverse it is the
+#     INPUT.
+#   * the open-position limit does not apply in reverse: an exit reduces
+#     exposure, and a limit of one open position would make the one position
+#     the lane can hold impossible to close.
+DIRECTION_SOL_TO_USDC = "sol_to_usdc"
+DIRECTION_USDC_TO_SOL = "usdc_to_sol"
+
+# The most associated token accounts a REVERSE swap can legitimately create:
+# the wrapped-SOL account the proceeds land in, plus an idempotent re-assert of
+# the USDC account the input is spent from. A tightening of
+# ``SOLANA_PILOT_MAX_ATA_CREATES``, never a widening — see ``check_transaction``.
+REVERSE_MAX_ATA_CREATES = 2
+
 
 def _dec(value: Any) -> Decimal:
     return Decimal(str(value))
@@ -253,6 +280,7 @@ class LimitsEngine:
         amount_lamports: int,
         price_impact_pct: Decimal,
         exposure: LaneExposure,
+        direction: str = DIRECTION_SOL_TO_USDC,
     ) -> LimitsReport:
         """Capital, concurrency, allowlists and the quote's own terms.
 
@@ -262,8 +290,15 @@ class LimitsEngine:
         The caller's converter is the single one, and it returns a 100%
         sentinel for a field it could not parse — which fails this check
         closed.
+
+        ``direction`` selects which leg the dollar-denominated limits read and
+        which way round the mint allowlists face — see the module constants.
+        ``amount_lamports`` is the RAW input amount whichever direction it is
+        (lamports of SOL forward, raw USDC reverse); the name is kept because
+        it is what the forward caller has always passed.
         """
         s = self._settings
+        reverse = direction == DIRECTION_USDC_TO_SOL
         b = _Builder(STAGE_QUOTE)
 
         b.add(
@@ -281,8 +316,14 @@ class LimitsEngine:
             f"inAmount {quote.in_amount} vs requested {amount_lamports} lamports",
         )
 
-        allowed_in = tuple(s.SOLANA_ALLOWED_INPUT_MINTS)
-        allowed_out = tuple(s.SOLANA_ALLOWED_OUTPUT_MINTS)
+        # Reverse traverses the same approved pair backwards, so the two
+        # allowlists exchange roles. Nothing is added to either.
+        allowed_in = tuple(
+            s.SOLANA_ALLOWED_OUTPUT_MINTS if reverse else s.SOLANA_ALLOWED_INPUT_MINTS
+        )
+        allowed_out = tuple(
+            s.SOLANA_ALLOWED_INPUT_MINTS if reverse else s.SOLANA_ALLOWED_OUTPUT_MINTS
+        )
         b.add(
             "input_mint_allowed",
             quote.input_mint in allowed_in,
@@ -311,12 +352,16 @@ class LimitsEngine:
             f"{_fmt(max_impact)}%",
         )
 
-        # The per-trade band is enforced on the QUOTE's USDC output, not on the
-        # SOL input: USDC is the dollar-denominated leg, so what a $5-$10
-        # envelope actually bounds is what comes back. A band on the SOL side
+        # The per-trade band is enforced on the QUOTE's USDC leg, not on the
+        # SOL one: USDC is the dollar-denominated leg, so what a $5-$10
+        # envelope actually bounds is the dollar side. A band on the SOL side
         # would need a price feed of its own and would drift out of the
         # envelope every time SOL moved.
-        out_usd = _usdc(quote.out_amount)
+        #
+        # Forward the USDC leg is the output; reverse it is the input. Reading
+        # `out_amount` in reverse would band the LAMPORTS against a dollar
+        # figure and pass or refuse for arithmetic reasons.
+        out_usd = _usdc(quote.in_amount if reverse else quote.out_amount)
         min_usd = _dec(s.SOLANA_PILOT_MIN_ORDER_USD)
         max_usd = _dec(s.SOLANA_PILOT_MAX_ORDER_USD)
         b.add(
@@ -337,12 +382,26 @@ class LimitsEngine:
         )
 
         max_open = int(s.SOLANA_MAX_OPEN_POSITIONS)
-        b.add(
-            "open_positions_within_limit",
-            exposure.open_positions < max_open,
-            f"{exposure.open_positions} open against limit {max_open} "
-            "(this trade would make one more)",
-        )
+        if reverse:
+            # A reverse swap CLOSES the position it is quoted for, so the limit
+            # on how many may be open cannot apply to it — with the deployed
+            # limit of one, applying it would make the single position the lane
+            # is allowed to hold impossible to unwind. The check is not skipped:
+            # it is replaced by the stricter statement that there is a position
+            # to close, which the caller has already proved by naming the row.
+            b.add(
+                "open_position_exists_to_close",
+                exposure.open_positions >= 1,
+                f"{exposure.open_positions} open position(s); a reverse swap "
+                "closes one rather than opening one",
+            )
+        else:
+            b.add(
+                "open_positions_within_limit",
+                exposure.open_positions < max_open,
+                f"{exposure.open_positions} open against limit {max_open} "
+                "(this trade would make one more)",
+            )
 
         max_active = int(s.SOLANA_MAX_CONCURRENT_EXECUTIONS)
         b.add(
@@ -392,16 +451,32 @@ class LimitsEngine:
         )
 
     # ---------------- stage: transaction ----------------
-    def check_transaction(self, report: Any) -> LimitsReport:
+    def check_transaction(
+        self, report: Any, *, direction: str = DIRECTION_SOL_TO_USDC
+    ) -> LimitsReport:
         """The fee ceilings, applied to what the BYTES actually carry.
 
         Every amount comes from ``tx_inspector``'s re-derivation of the
         compiled transaction, never from what was requested of Jupiter — the
         request is not a promise about what came back, and that gap is the
         whole reason the inspector exists.
+
+        ``direction`` only ever TIGHTENS the account-creation ceiling. The
+        configured ``SOLANA_PILOT_MAX_ATA_CREATES`` is sized for the forward
+        direction, where the wallet may have to open both the wrapped-SOL
+        account and the USDC account it is paid into. A reverse swap spends
+        from a USDC account that must already exist, so the most it can
+        legitimately need is that account re-asserted idempotently plus the
+        wrapped-SOL account — hence a ceiling of two, taken as the MINIMUM of
+        the two figures so a lowered configuration still wins.
         """
         c = self.fee_ceilings
         b = _Builder(STAGE_TRANSACTION)
+        max_ata_creates = (
+            min(c.max_ata_creates, REVERSE_MAX_ATA_CREATES)
+            if direction == DIRECTION_USDC_TO_SOL
+            else c.max_ata_creates
+        )
 
         b.add(
             "priority_fee_within_ceiling",
@@ -427,9 +502,9 @@ class LimitsEngine:
         )
         b.add(
             "ata_creates_within_limit",
-            report.ata_create_count <= c.max_ata_creates,
+            report.ata_create_count <= max_ata_creates,
             f"{report.ata_create_count} account create(s) against limit "
-            f"{c.max_ata_creates} ({report.ata_rent_lamports} lamports of rent)",
+            f"{max_ata_creates} ({report.ata_rent_lamports} lamports of rent)",
         )
         unknown = sorted(set(report.program_ids) - ALLOWED_PROGRAM_IDS)
         b.add(
@@ -472,6 +547,58 @@ class LimitsEngine:
                 f"of fees and rent + {_fmt(headroom_pct)}% headroom)"
                 if sol_lamports is not None
                 else "SOL balance could not be read, so cover cannot be shown"
+            ),
+        )
+        return b.report()
+
+    def check_reverse_balance(
+        self,
+        *,
+        sol_lamports: int | None,
+        usdc_raw: int | None,
+        amount_raw: int,
+        total_fee_lamports: int,
+    ) -> LimitsReport:
+        """The reverse direction's cover question, which has TWO legs.
+
+        Forward, one asset pays for everything: the SOL leaving is the swap
+        plus every fee, so one comparison answers it. Reverse splits them —
+        the USDC pays for the swap and the SOL pays for the fees and rent —
+        and collapsing that into the forward check would compare a raw USDC
+        amount against a lamport balance. That is not a loosened check, it is
+        an arithmetically meaningless one: at 6 vs 9 decimals a $7 input reads
+        as 7,000,000 "lamports", so a wallet with 0.008 SOL would appear to
+        cover a swap it cannot pay the rent for.
+
+        Both legs fail closed on an unreadable balance, same as forward.
+        """
+        headroom_pct = _dec(self._settings.SOLANA_BALANCE_HEADROOM_PCT)
+        required_sol = int(_dec(total_fee_lamports) * (1 + headroom_pct / 100))
+        b = _Builder(STAGE_BALANCE)
+        b.add(
+            "sol_covers_fees_and_headroom",
+            sol_lamports is not None and sol_lamports >= required_sol,
+            (
+                f"balance {_fmt(_sol(sol_lamports))} SOL against required "
+                f"{_fmt(_sol(required_sol))} SOL ({total_fee_lamports} lamports "
+                f"of fees and rent + {_fmt(headroom_pct)}% headroom; the swap "
+                "input is USDC and does not come out of this balance)"
+                if sol_lamports is not None
+                else "SOL balance could not be read, so cover cannot be shown"
+            ),
+        )
+        # No headroom on the token leg. The input amount is exact and the swap
+        # spends precisely it — headroom there would demand the wallet hold
+        # USDC it is not going to spend, which is the opposite of what a
+        # position-closing swap is for.
+        b.add(
+            "usdc_covers_swap_input",
+            usdc_raw is not None and usdc_raw >= amount_raw,
+            (
+                f"balance {_fmt(_usdc(usdc_raw))} USDC against the "
+                f"{_fmt(_usdc(amount_raw))} USDC this swap spends"
+                if usdc_raw is not None
+                else "USDC balance could not be read, so cover cannot be shown"
             ),
         )
         return b.report()

@@ -380,3 +380,129 @@ def build_swap_tx(
         tip_lamports=tip_lamports if tip_destination else 0,
         priority_fee_lamports=priority_fee,
     )
+
+
+def build_reverse_swap_tx(
+    *,
+    payer: Keypair = PAYER,
+    fee_payer_pubkey: str | None = None,
+    tip_destination: str | None = TIP_ACCOUNT,
+    tip_lamports: int = 100_000,
+    compute_unit_limit: int | None = 200_000,
+    compute_unit_price: int | None = 1_000,
+    mints: tuple[str, ...] = (USDC_MINT, SOL_MINT),
+    swap_program_id: str = JUPITER_V6_PROGRAM_ID,
+    extra_signer: str | None = None,
+    include_wsol_account: bool = True,
+    create_usdc_ata: bool = False,
+    close_usdc_ata: bool = False,
+    close_usdc_ata_to: str | None = None,
+    blockhash: str = BLOCKHASH,
+    sign: bool = False,
+    lookup_tables: list | None = None,
+    extra_instructions: list[Instruction] | None = None,
+    route_amount_raw: int = 6_899_618,
+    route_slippage_bps: int = 100,
+) -> BuiltTx:
+    """Compile a realistic USDC->SOL swap transaction.
+
+    Deliberately a SEPARATE builder rather than a flag on ``build_swap_tx``,
+    because the two directions emit genuinely different instruction lists and a
+    single function with six mutually-exclusive switches would obscure exactly
+    the thing these fixtures exist to pin down. What it does NOT do is assert
+    one canonical shape:
+
+    ``include_wsol_account``
+        The typical reverse route opens a wrapped-SOL account for the proceeds
+        and closes it again in the same transaction, unwrapping to native SOL.
+        A route that does neither is legitimate, so this defaults True and is
+        turned OFF in the tests that prove the shape is not load-bearing.
+    ``create_usdc_ata``
+        Jupiter may re-assert the input account idempotently. Also an allowed
+        shape, also not required.
+    ``close_usdc_ata``
+        The adversarial one, and the reason the close allowlist exists: with
+        the input account emptied by the swap, closing it succeeds on-chain and
+        moves its rent. Off by default here because it is off by default in the
+        lane.
+    """
+    payer_pubkey = fee_payer_pubkey or str(payer.pubkey())
+    instructions: list[Instruction] = []
+
+    if compute_unit_limit is not None:
+        instructions.append(_compute_unit_limit_ix(compute_unit_limit))
+    if compute_unit_price is not None:
+        instructions.append(_compute_unit_price_ix(compute_unit_price))
+
+    wsol_ata = derive_associated_token_address(payer_pubkey, SOL_MINT)
+    usdc_ata = derive_associated_token_address(payer_pubkey, USDC_MINT)
+
+    if create_usdc_ata:
+        instructions.append(
+            ata_create_ix(payer_pubkey, usdc_ata, payer_pubkey, USDC_MINT, b"\x01")
+        )
+    if include_wsol_account:
+        # The proceeds account. No system transfer and no SyncNative: nothing
+        # is being wrapped on the way IN — that is the forward direction's
+        # profile, and emitting it here would make the fixture assert a shape
+        # the reverse route does not have.
+        instructions.append(
+            ata_create_ix(payer_pubkey, wsol_ata, payer_pubkey, SOL_MINT, b"\x01")
+        )
+
+    if tip_destination is not None and tip_lamports:
+        instructions.append(
+            _system_transfer_ix(payer_pubkey, tip_destination, tip_lamports)
+        )
+
+    instructions.append(
+        _swap_ix(
+            payer_pubkey,
+            mints,
+            swap_program_id,
+            extra_signer,
+            route_amount_lamports=route_amount_raw,
+            route_slippage_bps=route_slippage_bps,
+        )
+    )
+
+    if include_wsol_account:
+        # Unwrap: closing the wrapped-SOL account releases its lamports to US.
+        instructions.append(
+            token_close_account_ix(wsol_ata, payer_pubkey, payer_pubkey)
+        )
+    if close_usdc_ata:
+        instructions.append(
+            token_close_account_ix(
+                usdc_ata, close_usdc_ata_to or payer_pubkey, payer_pubkey
+            )
+        )
+
+    if extra_instructions:
+        instructions.extend(extra_instructions)
+
+    message = MessageV0.try_compile(
+        _P(payer_pubkey),
+        instructions,
+        lookup_tables or [],
+        Hash.from_string(blockhash),
+    )
+
+    if sign:
+        transaction = VersionedTransaction(message, [payer])
+    else:
+        placeholders = [Signature.default()] * message.header.num_required_signatures
+        transaction = VersionedTransaction.populate(message, placeholders)
+
+    priority_fee = 0
+    if compute_unit_price is not None:
+        limit = compute_unit_limit if compute_unit_limit is not None else 1_400_000
+        priority_fee = -(-compute_unit_price * limit // 1_000_000)
+
+    return BuiltTx(
+        tx_b64=base64.b64encode(bytes(transaction)).decode(),
+        transaction=transaction,
+        payer_pubkey=payer_pubkey,
+        tip_lamports=tip_lamports if tip_destination else 0,
+        priority_fee_lamports=priority_fee,
+    )
