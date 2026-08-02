@@ -989,3 +989,87 @@ async def test_base_validation_still_accepts_kraken_alias_naming():
         )
         assert await adapter.resolve_pair_for_symbol("BTC") == "XBTUSD"
     await adapter.close()
+
+
+# ----------------------------------------------------------------------
+# Fee tier — POST /0/private/TradeVolume (PR-K4)
+# ----------------------------------------------------------------------
+_TRADE_VOLUME_URL = "https://api.kraken.com/0/private/TradeVolume"
+
+# Real TradeVolume shape, trimmed. Note the map is keyed by the AssetPairs
+# KEY (XXBTZUSD) while callers hold the altname (XBTUSD).
+_TRADE_VOLUME_PAYLOAD = {
+    "error": [],
+    "result": {
+        "currency": "ZUSD",
+        "volume": "3000.0000",
+        "fees": {"XXBTZUSD": {"fee": "0.2400", "minfee": "0.1000"}},
+        "fees_maker": {"XXBTZUSD": {"fee": "0.1400", "minfee": "0.0000"}},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_reads_this_accounts_rates():
+    """The rates must come from TradeVolume, not the public AssetPairs table —
+    that one is tier zero and is not what a volume-carrying account pays."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=_TRADE_VOLUME_PAYLOAD)
+        tier = await adapter.fetch_fee_tier(pair="XBTUSD")
+    assert tier["maker_pct"] == "0.1400"
+    assert tier["taker_pct"] == "0.2400"
+    assert tier["currency"] == "ZUSD"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_fee_tier_matches_on_the_exact_key_when_several_are_returned():
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    payload = {
+        "error": [],
+        "result": {
+            "currency": "ZUSD",
+            "fees": {
+                "XXBTZUSD": {"fee": "0.2400"},
+                "XETHZUSD": {"fee": "0.9900"},
+            },
+            "fees_maker": {
+                "XXBTZUSD": {"fee": "0.1400"},
+                "XETHZUSD": {"fee": "0.8800"},
+            },
+        },
+    }
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload=payload)
+        tier = await adapter.fetch_fee_tier(pair="XXBTZUSD")
+    assert (tier["maker_pct"], tier["taker_pct"]) == ("0.1400", "0.2400")
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"currency": "ZUSD"},
+        {"fees": {"XXBTZUSD": {"fee": "0.24"}}},
+        {"fees": {"XXBTZUSD": {}}, "fees_maker": {"XXBTZUSD": {}}},
+        {
+            "fees": {"A": {"fee": "0.24"}, "B": {"fee": "0.99"}},
+            "fees_maker": {"A": {"fee": "0.14"}, "B": {"fee": "0.88"}},
+        },
+    ],
+    ids=["no-maps", "maker-missing", "no-fee-field", "ambiguous-multi-key"],
+)
+async def test_fetch_fee_tier_fails_closed_on_an_unusable_payload(result):
+    """No default and no guess. The caller puts this number in front of an
+    operator authorizing a trade; a fabricated rate is worse than an error."""
+    reset_nonce_sources_for_tests()
+    adapter = _adapter()
+    with aioresponses() as m:
+        m.post(_TRADE_VOLUME_URL, payload={"error": [], "result": result})
+        with pytest.raises(KrakenAPIError):
+            await adapter.fetch_fee_tier(pair="XBTUSD")
+    await adapter.close()
