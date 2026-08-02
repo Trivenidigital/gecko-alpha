@@ -1,4 +1,4 @@
-"""The operator-invoked supervised Kraken EXIT command.
+"""The operator-invoked supervised Kraken EXIT command and its recovery paths.
 
 The load-bearing assertions here are negative, exactly as in the entry lane's
 suite: no ``AddOrder`` when a gate refuses, none when the operator does not
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -33,12 +34,15 @@ from scout.live.kraken_adapter import (
     KrakenSpotAdapter,
 )
 from scout.live.kraken_pilot import (
+    EXIT_BLOCKED,
     EXIT_ESCALATE,
     EXIT_OK,
     EXIT_REFUSED,
     EXIT_REVIEW,
     PilotRunner,
+    build_exit_snapshot,
     exit_authorization_token,
+    open_order_fingerprint,
 )
 
 _REQUIRED = dict(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k")
@@ -53,15 +57,31 @@ _ENTRY_TXID = "OENTRY-BW3P3-BUCMWZ"
 _EXIT_TXID = "OEXIT1-BW3P3-BUCMWZ"
 _PAIR = "XBTUSD"
 _SYMBOL = "BTC"
+_CID = "gecko-x-1"
 
 _ENTRY_PRICE = Decimal("100.0")
 _HELD_QTY = Decimal("0.15")
 _EXIT_PRICE = Decimal("110.0")
 
-_MAKER_PCT = "0.16"
-_TAKER_PCT = "0.26"
+# This account's real tier, from the live TradeVolume read on 2026-08-02.
+_MAKER_PCT = "0.4000"
+_TAKER_PCT = "0.8000"
+_LOT_DECIMALS = 8
 
-# Entry: 0.15 @ 100.0 = 15.00 cost, 0.039 fee (0.26% taker).
+# Real XXBTZUSD row, trimmed to what the exit path reads.
+_XBTUSD_ROW = {
+    "altname": "XBTUSD",
+    "base": "XXBT",
+    "quote": "ZUSD",
+    "pair_decimals": 1,
+    "lot_decimals": _LOT_DECIMALS,
+    "ordermin": "0.00005",
+    "costmin": "0.5",
+    "tick_size": "0.1",
+    "status": "online",
+}
+
+# Entry: 0.15 @ 100.0 = 15.00 cost, 0.12 fee (0.8% taker).
 _ENTRY_FILLS = [
     {
         "trade_id": "TENTRY-1",
@@ -71,12 +91,12 @@ _ENTRY_FILLS = [
         "ordertype": "limit",
         "price": "100.0",
         "cost": "15.00000",
-        "fee": "0.03900",
+        "fee": "0.12000",
         "vol": "0.15000000",
         "maker": False,
     }
 ]
-# Exit: 0.15 @ 110.0 = 16.50 gross, 0.0429 fee (0.26% taker).
+# Exit: 0.15 @ 110.0 = 16.50 gross, 0.132 fee (0.8% taker).
 _EXIT_FILLS = [
     {
         "trade_id": "TEXIT-1",
@@ -86,14 +106,14 @@ _EXIT_FILLS = [
         "ordertype": "limit",
         "price": "110.0",
         "cost": "16.50000",
-        "fee": "0.04290",
+        "fee": "0.13200",
         "vol": "0.15000000",
         "maker": False,
     }
 ]
 
-# proceeds 16.50 - 0.0429 = 16.4571 ; basis 15.00 + 0.039 = 15.039
-_EXPECTED_PNL = Decimal("1.4181")
+# proceeds 16.50 - 0.132 = 16.368 ; basis 15.00 + 0.12 = 15.12
+_EXPECTED_PNL = Decimal("1.248")
 
 
 # ----------------------------------------------------------------------
@@ -116,14 +136,18 @@ def _settings(tmp_path, **overrides) -> Settings:
     return Settings(_env_file=None, **_REQUIRED, **base)
 
 
-def _balance_sequence(*values: str):
-    """``fetch_account_balance`` side effect: walk ``values``, then hold."""
-    remaining = [float(v) for v in values]
+class _Balances:
+    """``fetch_account_balance`` side effect with a mutable current value."""
 
-    def _fetch(*, asset: str) -> float:
-        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+    def __init__(self, *values: str) -> None:
+        self.remaining = [Decimal(v) for v in values]
 
-    return _fetch
+    def __call__(self, *, asset: str) -> float:
+        value = self.remaining.pop(0) if len(self.remaining) > 1 else self.remaining[0]
+        return float(value)
+
+    def set(self, value: str) -> None:
+        self.remaining = [Decimal(value)]
 
 
 def _fills_by_txid(mapping: dict[str, list[dict]]):
@@ -133,31 +157,42 @@ def _fills_by_txid(mapping: dict[str, list[dict]]):
     return _fetch
 
 
-def _confirmation(status: str, *, filled_qty=0.15, fill_price=110.0):
+def _confirmation(status: str, *, filled_qty=0.15, fill_price=110.0, limit="110.0"):
     return OrderConfirmation(
         venue="kraken",
         venue_order_id=_EXIT_TXID,
-        client_order_id="gecko-x-1",
+        client_order_id=_CID,
         status=status,
         filled_qty=filled_qty,
         fill_price=fill_price,
-        raw_response={"status": "closed"},
+        raw_response={"status": "closed", "descr": {"price": limit, "pair": _PAIR}},
     )
 
 
-def _adapter(**overrides) -> MagicMock:
-    """A happy-path adapter double. Tests override one method at a time."""
-    adapter = MagicMock(spec=KrakenSpotAdapter)
-    adapter.fetch_account_balance.side_effect = _balance_sequence("1.0", "0.85")
-    adapter.fetch_open_orders.return_value = []
-    adapter.fetch_fee_tier.return_value = {
+def _fee_tier(**overrides) -> dict:
+    tier = {
         "pair": _PAIR,
         "maker_pct": _MAKER_PCT,
         "taker_pct": _TAKER_PCT,
-        "volume": "12345.0",
+        "volume": "2039.93616",
         "currency": "ZUSD",
+        "next_maker_pct": "0.3000",
+        "next_taker_pct": "0.6000",
+        "next_volume": "2500.00000",
         "raw": {},
     }
+    tier.update(overrides)
+    return tier
+
+
+def _adapter() -> MagicMock:
+    """A happy-path adapter double. Tests override one method at a time."""
+    adapter = MagicMock(spec=KrakenSpotAdapter)
+    adapter.balances = _Balances("1.0", "1.0", "0.85")
+    adapter.fetch_account_balance.side_effect = adapter.balances
+    adapter.fetch_open_orders.return_value = []
+    adapter.fetch_exchange_info_row.return_value = dict(_XBTUSD_ROW)
+    adapter.fetch_fee_tier.return_value = _fee_tier()
     adapter.fetch_order_fills.side_effect = _fills_by_txid(
         {_ENTRY_TXID: _ENTRY_FILLS, _EXIT_TXID: _EXIT_FILLS}
     )
@@ -169,8 +204,7 @@ def _adapter(**overrides) -> MagicMock:
         "volume": "0.15000000",
     }
     adapter.await_fill_confirmation.return_value = _confirmation("filled")
-    for name, value in overrides.items():
-        getattr(adapter, name).return_value = value
+    adapter.fetch_order_by_client_id.return_value = None
     return adapter
 
 
@@ -190,8 +224,17 @@ def _fix_decision_id(monkeypatch) -> None:
     monkeypatch.setattr(kraken_pilot, "uuid4", lambda: UUID(_DECISION))
 
 
-def _authorize(monkeypatch, typed: str | None) -> None:
-    """Feed the approval prompt. ``None`` raises EOF (non-interactive stdin)."""
+class _Tty:
+    """A stdin stand-in that claims to be a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _authorize(monkeypatch, typed: str | None, *, tty: bool = True) -> None:
+    """Feed the approval prompt. ``None`` raises EOF (a closed stdin)."""
+    if tty:
+        monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
 
     def _fake_input(_prompt: str = "") -> str:
         if typed is None:
@@ -201,27 +244,82 @@ def _authorize(monkeypatch, typed: str | None) -> None:
     monkeypatch.setattr("builtins.input", _fake_input)
 
 
-def _token(price: Decimal = _EXIT_PRICE, volume: Decimal = _HELD_QTY, row_id: int = 1):
-    return exit_authorization_token(
+def _snapshot(
+    *,
+    price: Decimal = _EXIT_PRICE,
+    volume: Decimal = _HELD_QTY,
+    row_id: int = 1,
+    balance: Decimal = Decimal("1.0"),
+    open_orders: list[dict] | None = None,
+    maker: str = _MAKER_PCT,
+    taker: str = _TAKER_PCT,
+) -> dict:
+    return build_exit_snapshot(
+        live_trade_id=row_id,
         pair=_PAIR,
         side="sell",
         volume=volume,
         price=price,
         client_order_id=f"gecko-x-{row_id}",
+        row_status="open",
+        row_venue="kraken",
+        position_qty=volume,
+        base_balance=balance,
+        open_orders=open_orders or [],
+        maker_pct=Decimal(maker),
+        taker_pct=Decimal(taker),
     )
 
 
-def _evidence_path(tmp_path, row_id: int = 1):
-    return tmp_path / "evidence" / f"kraken_pilot_exit_{row_id}_{_DECISION}.json"
+def _token(**kwargs) -> str:
+    return exit_authorization_token(_snapshot(**kwargs))
 
 
-def _steps(tmp_path, row_id: int = 1) -> list[dict]:
-    text = _evidence_path(tmp_path, row_id).read_text(encoding="utf-8")
+def _evidence_dir(tmp_path) -> Path:
+    return tmp_path / "evidence"
+
+
+def _evidence_path(tmp_path, row_id: int = 1, command: str | None = None) -> Path:
+    name = (
+        f"kraken_pilot_exit_{row_id}_{_DECISION}.json"
+        if command is None
+        else f"kraken_pilot_exit_{row_id}_{command}_{_DECISION}.json"
+    )
+    return _evidence_dir(tmp_path) / name
+
+
+def _steps(tmp_path, row_id: int = 1, command: str | None = None) -> list[dict]:
+    text = _evidence_path(tmp_path, row_id, command).read_text(encoding="utf-8")
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def _step(steps: list[dict], name: str) -> dict | None:
     return next((s for s in steps if s["step"] == name), None)
+
+
+def _write_dangling_intent(tmp_path, row_id: int = 1, decision_id: str = "dead-run"):
+    """An evidence file from a run that died between authorizing and finishing."""
+    directory = _evidence_dir(tmp_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"kraken_pilot_exit_{row_id}_{decision_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "step": "exit_intent_persisted",
+                "at": "2026-08-02T00:00:00+00:00",
+                "decision_id": decision_id,
+                "live_trade_id": row_id,
+                "pair": _PAIR,
+                "side": "sell",
+                "volume": "0.15",
+                "price": "110.0",
+                "client_order_id": f"gecko-x-{row_id}",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 # ----------------------------------------------------------------------
@@ -277,15 +375,17 @@ async def _row(db: Database, row_id: int) -> dict:
 
 
 # ======================================================================
-# Step 1 — row selection and eligibility
+# Row selection and eligibility
 # ======================================================================
 async def test_exit_refuses_when_the_row_does_not_exist(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     runner, db, adapter = await _make_runner(tmp_path)
     try:
-        code = await runner.exit_position(live_trade_id=1, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=1, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         abort = _step(_steps(tmp_path), "aborted")
         assert abort["stage"] == "row_selection"
@@ -294,48 +394,43 @@ async def test_exit_refuses_when_the_row_does_not_exist(tmp_path, monkeypatch):
         await db.close()
 
 
-async def test_exit_refuses_when_the_row_is_not_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["closed_tp", "needs_manual_review", "rejected"])
+async def test_exit_refuses_a_row_that_is_not_open(tmp_path, monkeypatch, status):
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     runner, db, adapter = await _make_runner(tmp_path)
     try:
-        row_id = await _seed_row(db, status="closed_tp")
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
-        adapter.place_limit_order.assert_not_called()
-        assert "'closed_tp'" in _step(_steps(tmp_path, row_id), "aborted")["reason"]
-    finally:
-        await db.close()
-
-
-async def test_exit_refuses_a_needs_manual_review_row(tmp_path, monkeypatch):
-    _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _token())
-    runner, db, adapter = await _make_runner(tmp_path)
-    try:
-        row_id = await _seed_row(db, status="needs_manual_review")
+        row_id = await _seed_row(db, status=status)
         assert (
             await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
             == EXIT_REFUSED
         )
         adapter.place_limit_order.assert_not_called()
+        assert f"'{status}'" in _step(_steps(tmp_path, row_id), "aborted")["reason"]
     finally:
         await db.close()
 
 
-async def test_exit_refuses_a_non_kraken_row(tmp_path, monkeypatch):
-    """A binance row must not be sold through the Kraken lane, and the operator
-    must be told WHY rather than being told the row does not exist."""
+@pytest.mark.parametrize(
+    ("venue", "pair"), [("binance", "BTCUSDT"), ("solana", "SOL/USDC")]
+)
+async def test_exit_refuses_a_row_from_another_venue(
+    tmp_path, monkeypatch, venue, pair
+):
+    """A Solana or Binance position is closed through its own lane. The refusal
+    must name the venue, not report the row as missing."""
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     runner, db, adapter = await _make_runner(tmp_path)
     try:
-        row_id = await _seed_row(db, venue="binance", pair="BTCUSDT")
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        row_id = await _seed_row(db, venue=venue, pair=pair)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         reason = _step(_steps(tmp_path, row_id), "aborted")["reason"]
-        assert "binance" in reason and "only closes kraken" in reason
+        assert venue in reason and "only closes kraken" in reason
     finally:
         await db.close()
 
@@ -357,8 +452,10 @@ async def test_exit_refuses_when_the_entry_fill_is_not_recorded(
     runner, db, adapter = await _make_runner(tmp_path)
     try:
         row_id = await _seed_row(db, **overrides)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         assert (
             "no recorded entry fill"
@@ -369,16 +466,16 @@ async def test_exit_refuses_when_the_entry_fill_is_not_recorded(
 
 
 async def test_exit_refuses_when_another_kraken_row_is_in_flight(tmp_path, monkeypatch):
-    """This row being open is the precondition. A SECOND non-terminal row means
-    the one-order-at-a-time invariant is already broken."""
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     runner, db, adapter = await _make_runner(tmp_path)
     try:
         row_id = await _seed_row(db)
         await _seed_row(db, status="needs_manual_review", client_order_id="other-cid")
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         assert _step(_steps(tmp_path, row_id), "aborted")["stage"] == "lane_state"
     finally:
@@ -386,18 +483,20 @@ async def test_exit_refuses_when_another_kraken_row_is_in_flight(tmp_path, monke
 
 
 # ======================================================================
-# Step 2 — venue state
+# Venue state
 # ======================================================================
 async def test_exit_refuses_when_the_venue_balance_is_short(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
-    adapter.fetch_account_balance.side_effect = _balance_sequence("0.05")
+    adapter.fetch_account_balance.side_effect = _Balances("0.05")
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         abort = _step(_steps(tmp_path, row_id), "aborted")
         assert abort["stage"] == "venue_balance"
@@ -426,8 +525,10 @@ async def test_exit_refuses_when_an_order_already_rests_for_the_pair(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         abort = _step(_steps(tmp_path, row_id), "aborted")
         assert abort["stage"] == "venue_open_orders"
@@ -448,7 +549,7 @@ async def test_exit_refuses_when_the_exit_client_id_is_already_resting(
     adapter.fetch_open_orders.return_value = [
         {
             "txid": _EXIT_TXID,
-            "client_order_id": "gecko-x-1",
+            "client_order_id": _CID,
             # A different pair string, so only the client id can match.
             "pair": "ETHUSD",
             "status": "open",
@@ -460,11 +561,13 @@ async def test_exit_refuses_when_the_exit_client_id_is_already_resting(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        assert row_id == 1  # the cid in the fixture above assumes it
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert row_id == 1
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
-        assert "gecko-x-1" in _step(_steps(tmp_path, row_id), "aborted")["reason"]
+        assert _CID in _step(_steps(tmp_path, row_id), "aborted")["reason"]
     finally:
         await db.close()
 
@@ -478,8 +581,10 @@ async def test_exit_refuses_when_open_orders_cannot_be_read(tmp_path, monkeypatc
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         abort = _step(_steps(tmp_path, row_id), "aborted")
         assert abort["stage"] == "venue_open_orders"
@@ -488,10 +593,29 @@ async def test_exit_refuses_when_open_orders_cannot_be_read(tmp_path, monkeypatc
         await db.close()
 
 
+async def test_exit_refuses_when_the_pair_has_no_lot_precision(tmp_path, monkeypatch):
+    """Without lot_decimals there is no honest reconciliation tolerance."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    adapter = _adapter()
+    adapter.fetch_exchange_info_row.return_value = {"altname": _PAIR}
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        assert _step(_steps(tmp_path, row_id), "aborted")["stage"] == "market_rules"
+    finally:
+        await db.close()
+
+
 # ======================================================================
-# Step 3 — fee tier
+# Fee tier
 # ======================================================================
-async def test_exit_refuses_when_the_fee_tier_cannot_be_read(tmp_path, monkeypatch):
+async def test_exit_refuses_when_the_fee_lookup_fails(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
@@ -499,27 +623,33 @@ async def test_exit_refuses_when_the_fee_tier_cannot_be_read(tmp_path, monkeypat
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         abort = _step(_steps(tmp_path, row_id), "aborted")
         assert abort["stage"] == "fee_tier"
-        assert "rather than guessing" in abort["reason"]
+        assert "no hard-coded rate to fall back to" in abort["reason"]
     finally:
         await db.close()
 
 
-async def test_exit_refuses_when_trade_volume_returns_unusable_rates(
-    tmp_path, monkeypatch
-):
+@pytest.mark.parametrize(
+    "tier",
+    [
+        {"maker_pct": None, "taker_pct": None},
+        {"maker_pct": _MAKER_PCT, "taker_pct": None},
+        {"maker_pct": "not-a-number", "taker_pct": _TAKER_PCT},
+        {"maker_pct": "-0.4", "taker_pct": _TAKER_PCT},
+    ],
+    ids=["both-missing", "taker-missing", "malformed", "negative"],
+)
+async def test_exit_refuses_unusable_fee_rates(tmp_path, monkeypatch, tier):
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
-    adapter.fetch_fee_tier.return_value = {
-        "pair": _PAIR,
-        "maker_pct": None,
-        "taker_pct": None,
-    }
+    adapter.fetch_fee_tier.return_value = _fee_tier(**tier)
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
@@ -534,9 +664,9 @@ async def test_exit_refuses_when_trade_volume_returns_unusable_rates(
 
 
 # ======================================================================
-# Step 4 — the cost screen shows BOTH assumptions
+# The cost screen shows BOTH assumptions
 # ======================================================================
-async def test_both_fee_scenarios_are_recorded_with_the_real_entry_fee(
+async def test_both_fee_scenarios_are_shown_with_the_real_entry_fee(
     tmp_path, monkeypatch, capsys
 ):
     _fix_decision_id(monkeypatch)
@@ -547,7 +677,7 @@ async def test_both_fee_scenarios_are_recorded_with_the_real_entry_fee(
         await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
         scenarios = _step(_steps(tmp_path, row_id), "cost_scenarios")
         assert scenarios["entry_fee_source"] == "actual_entry_fills"
-        assert scenarios["entry_fee"] == "0.03900"
+        assert Decimal(scenarios["entry_fee"]) == Decimal("0.12")
         assert scenarios["maker"]["fee_pct"] == _MAKER_PCT
         assert scenarios["taker"]["fee_pct"] == _TAKER_PCT
         # Maker is the cheaper exit, so it breaks even lower and nets more.
@@ -563,6 +693,8 @@ async def test_both_fee_scenarios_are_recorded_with_the_real_entry_fee(
         assert "IF THIS FILLS AS TAKER" in out
         assert "not a MAKER guarantee" in out
         assert "round-trip fee" in out
+        # The next tier is decision-relevant on a small account.
+        assert "next fee tier" in out and "2500.00000" in out
     finally:
         await db.close()
 
@@ -580,14 +712,13 @@ async def test_entry_fee_falls_back_to_a_labelled_estimate(tmp_path, monkeypatch
         await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
         scenarios = _step(_steps(tmp_path, row_id), "cost_scenarios")
         assert scenarios["entry_fee_source"] == "estimated_at_taker_rate"
-        # 15.00 * 0.26% = 0.039 — same number, different provenance.
-        assert Decimal(scenarios["entry_fee"]) == Decimal("0.039")
+        assert Decimal(scenarios["entry_fee"]) == Decimal("0.12")
     finally:
         await db.close()
 
 
 # ======================================================================
-# Step 5 — the typed authorization is bound to the ORDER
+# The typed authorization is bound to the order AND the state
 # ======================================================================
 async def test_exit_refuses_a_wrong_token(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
@@ -595,8 +726,10 @@ async def test_exit_refuses_a_wrong_token(tmp_path, monkeypatch):
     runner, db, adapter = await _make_runner(tmp_path)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         steps = _steps(tmp_path, row_id)
         assert _step(steps, "authorization")["detail"] == "mismatch"
@@ -621,16 +754,41 @@ async def test_exit_refuses_when_stdin_is_closed(tmp_path, monkeypatch):
         await db.close()
 
 
+async def test_exit_refuses_a_piped_authorization(tmp_path, monkeypatch, capsys):
+    """A non-TTY stdin carrying the RIGHT token is still a refusal. EOF alone
+    would not catch `echo <token> | kraken_pilot exit`, which is exactly the
+    automation this approval boundary exists to exclude."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token(), tty=False)
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        assert (
+            _step(_steps(tmp_path, row_id), "authorization")["detail"]
+            == "not_interactive"
+        )
+        assert "not a terminal" in capsys.readouterr().out
+    finally:
+        await db.close()
+
+
 async def test_a_token_for_one_price_does_not_authorize_another(tmp_path, monkeypatch):
-    """The core of the binding. An operator who read and approved a 110.0 sell
-    must not have that approval carried onto a 105.0 one."""
+    """An operator who read and approved a 110.0 sell must not have that
+    approval carried onto a 105.0 one."""
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token(price=Decimal("110.0")))
     runner, db, adapter = await _make_runner(tmp_path)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=Decimal("105.0"))
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=Decimal("105.0"))
+            == EXIT_REFUSED
+        )
         adapter.place_limit_order.assert_not_called()
         assert _step(_steps(tmp_path, row_id), "authorization")["detail"] == "mismatch"
     finally:
@@ -638,28 +796,195 @@ async def test_a_token_for_one_price_does_not_authorize_another(tmp_path, monkey
 
 
 def test_the_token_changes_with_every_bound_field():
-    base = dict(
-        pair=_PAIR,
-        side="sell",
-        volume=_HELD_QTY,
-        price=_EXIT_PRICE,
-        client_order_id="gecko-x-1",
-    )
-    baseline = exit_authorization_token(**base)
-    for field, value in (
-        ("pair", "ETHUSD"),
-        ("side", "buy"),
-        ("volume", Decimal("0.16")),
-        ("price", Decimal("110.1")),
-        ("client_order_id", "gecko-x-2"),
-    ):
-        assert exit_authorization_token(**{**base, field: value}) != baseline, field
+    baseline = _token()
+    variants = [
+        _token(price=Decimal("110.1")),
+        _token(volume=Decimal("0.16")),
+        _token(row_id=2),
+        _token(balance=Decimal("2.0")),
+        _token(maker="0.5000"),
+        _token(taker="0.9000"),
+        _token(open_orders=[{"txid": "OTHER", "pair": "ETHUSD", "vol": "1"}]),
+    ]
+    for variant in variants:
+        assert variant != baseline
     # Same economic order, differently-spelled Decimals — one approval.
-    assert exit_authorization_token(**{**base, "volume": Decimal("0.1500")}) == baseline
+    assert _token(volume=Decimal("0.1500")) == baseline
+
+
+def test_the_open_order_fingerprint_is_order_insensitive_and_change_sensitive():
+    a = {"txid": "A", "client_order_id": None, "pair": "XBTUSD", "vol": "1"}
+    b = {"txid": "B", "client_order_id": "x", "pair": "ETHUSD", "vol": "2"}
+    assert open_order_fingerprint([a, b]) == open_order_fingerprint([b, a])
+    assert open_order_fingerprint([]) == "none"
+    assert open_order_fingerprint([a]) != open_order_fingerprint([a, b])
+    assert open_order_fingerprint([a]) != open_order_fingerprint(
+        [{**a, "vol_exec": "0.5"}]
+    )
 
 
 # ======================================================================
-# Steps 6-8 — durable intent, exactly one submission, ambiguity resolution
+# Pre-submit verification — the approval is void if the world moved
+# ======================================================================
+async def test_a_balance_drop_after_approval_voids_the_authorization(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    balances = adapter.balances
+
+    def _typed(_prompt: str = "") -> str:
+        # The operator types the token; the world moves while they do.
+        balances.set("0.02")
+        return _token()
+
+    monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", _typed)
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        abort = _step(_steps(tmp_path, row_id), "aborted")
+        assert abort["stage"] == "pre_submit_recheck_balance"
+        assert "AFTER the authorization" in abort["reason"]
+    finally:
+        await db.close()
+
+
+async def test_an_order_appearing_after_approval_voids_the_authorization(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+
+    def _typed(_prompt: str = "") -> str:
+        adapter.fetch_open_orders.return_value = [
+            {
+                "txid": "OLATE-1",
+                "client_order_id": None,
+                "pair": _PAIR,
+                "status": "open",
+                "vol": "0.15",
+                "vol_exec": "0",
+                "price": "120.0",
+            }
+        ]
+        return _token()
+
+    monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", _typed)
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        assert (
+            _step(_steps(tmp_path, row_id), "aborted")["stage"]
+            == "pre_submit_recheck_open_orders"
+        )
+    finally:
+        await db.close()
+
+
+async def test_a_position_quantity_change_after_approval_voids_the_authorization(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    holder: dict = {}
+
+    def _typed(_prompt: str = "") -> str:
+        holder["ran"] = True
+        return _token()
+
+    monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", _typed)
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+
+        original = kraken_pilot.fetch_live_trade_row
+        calls = {"n": 0}
+
+        async def _mutating(database, live_trade_id):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                # Between the approval screen and the pre-submit read.
+                await kraken_pilot.update_live_trade(
+                    database, live_trade_id, entry_fill_qty="0.10"
+                )
+            return await original(database, live_trade_id)
+
+        monkeypatch.setattr(kraken_pilot, "fetch_live_trade_row", _mutating)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        assert holder["ran"] is True
+        adapter.place_limit_order.assert_not_called()
+        abort = _step(_steps(tmp_path, row_id), "aborted")
+        assert abort["stage"] == "pre_submit_recheck"
+        assert "position quantity changed" in abort["reason"]
+    finally:
+        await db.close()
+
+
+async def test_a_worsened_fee_after_approval_voids_the_authorization(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+
+    def _typed(_prompt: str = "") -> str:
+        adapter.fetch_fee_tier.return_value = _fee_tier(taker_pct="1.2000")
+        return _token()
+
+    monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+    monkeypatch.setattr("builtins.input", _typed)
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        abort = _step(_steps(tmp_path, row_id), "aborted")
+        assert abort["stage"] == "pre_submit_recheck"
+        assert "WORSENED" in abort["reason"]
+    finally:
+        await db.close()
+
+
+async def test_the_recheck_records_a_matching_digest_on_the_clean_path(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
+        steps = _steps(tmp_path, row_id)
+        bound = _step(steps, "authorization_bound")
+        recheck = _step(steps, "pre_submit_recheck")
+        assert recheck["outcome"] == "clear"
+        assert recheck["digest"] == bound["digest"]
+    finally:
+        await db.close()
+
+
+# ======================================================================
+# Durable intent, exactly one submission, ambiguity resolution
 # ======================================================================
 async def test_the_intent_is_persisted_before_the_order_is_submitted(
     tmp_path, monkeypatch
@@ -667,11 +992,10 @@ async def test_the_intent_is_persisted_before_the_order_is_submitted(
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
-    seen: dict[str, list[str]] = {}
+    seen: dict = {}
 
     def _place(**kwargs):
         seen["steps_at_submit"] = [s["step"] for s in _steps(tmp_path, 1)]
-        seen["kwargs"] = kwargs
         return {
             "txid": [_EXIT_TXID],
             "descr": {},
@@ -684,15 +1008,19 @@ async def test_the_intent_is_persisted_before_the_order_is_submitted(
     try:
         row_id = await _seed_row(db)
         await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert "exit_intent_persisted" in seen["steps_at_submit"]
-        assert "submitted" not in seen["steps_at_submit"]
+        order = seen["steps_at_submit"]
+        assert "exit_intent_persisted" in order
+        assert "submitted" not in order
+        # The recheck runs before the intent, so an approval voided by a state
+        # change never leaves an intent record behind.
+        assert order.index("pre_submit_recheck") < order.index("exit_intent_persisted")
         intent = _step(_steps(tmp_path, row_id), "exit_intent_persisted")
         assert intent["live_trade_id"] == row_id
         assert intent["pair"] == _PAIR
         assert intent["side"] == "sell"
         assert intent["volume"] == "0.15"
         assert intent["price"] == "110.0"
-        assert intent["client_order_id"] == "gecko-x-1"
+        assert intent["client_order_id"] == _CID
     finally:
         await db.close()
 
@@ -713,7 +1041,7 @@ async def test_exit_submits_exactly_one_sell_order(tmp_path, monkeypatch):
         assert kwargs["pair"] == _PAIR
         assert kwargs["volume"] == _HELD_QTY
         assert kwargs["price"] == _EXIT_PRICE
-        assert kwargs["client_order_id"] == "gecko-x-1"
+        assert kwargs["client_order_id"] == _CID
         assert kwargs["validate_only"] is False
     finally:
         await db.close()
@@ -726,11 +1054,11 @@ async def test_ambiguous_submission_adopts_a_landed_order_and_never_resends(
     _authorize(monkeypatch, _token())
     adapter = _adapter()
     adapter.place_limit_order.side_effect = KrakenAmbiguousSubmissionError(
-        "timeout", client_order_id="gecko-x-1"
+        "timeout", client_order_id=_CID
     )
     adapter.resolve_order_submission_detail.return_value = {
         "verdict": "accepted",
-        "client_order_id": "gecko-x-1",
+        "client_order_id": _CID,
         "txid": [_EXIT_TXID],
         "probes": [],
     }
@@ -738,12 +1066,15 @@ async def test_ambiguous_submission_adopts_a_landed_order_and_never_resends(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_OK
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
         assert adapter.place_limit_order.call_count == 1
         adapter.resolve_order_submission_detail.assert_awaited_once()
-        steps = _steps(tmp_path, row_id)
-        assert _step(steps, "ambiguity_adopted")["txid"] == _EXIT_TXID
+        assert (
+            _step(_steps(tmp_path, row_id), "ambiguity_adopted")["txid"] == _EXIT_TXID
+        )
         assert (await _row(db, row_id))["status"] == "closed_via_reconciliation"
     finally:
         await db.close()
@@ -756,19 +1087,21 @@ async def test_ambiguous_submission_that_did_not_land_leaves_the_row_untouched(
     _authorize(monkeypatch, _token())
     adapter = _adapter()
     adapter.place_limit_order.side_effect = KrakenAmbiguousSubmissionError(
-        "socket died", client_order_id="gecko-x-1"
+        "socket died", client_order_id=_CID
     )
     adapter.resolve_order_submission_detail.return_value = {
         "verdict": "not_accepted",
-        "client_order_id": "gecko-x-1",
+        "client_order_id": _CID,
         "txid": [],
         "probes": [],
     }
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         assert adapter.place_limit_order.call_count == 1
         row = await _row(db, row_id)
         assert row["status"] == "open"
@@ -783,19 +1116,21 @@ async def test_unresolved_ambiguity_escalates_and_never_resends(tmp_path, monkey
     _authorize(monkeypatch, _token())
     adapter = _adapter()
     adapter.place_limit_order.side_effect = KrakenAmbiguousSubmissionError(
-        "502", client_order_id="gecko-x-1"
+        "502", client_order_id=_CID
     )
     adapter.resolve_order_submission_detail.return_value = {
         "verdict": "unresolved",
-        "client_order_id": "gecko-x-1",
+        "client_order_id": _CID,
         "txid": [],
         "probes": [],
     }
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_ESCALATE
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_ESCALATE
+        )
         assert adapter.place_limit_order.call_count == 1
         assert (await _row(db, row_id))["status"] == "needs_manual_review"
     finally:
@@ -812,8 +1147,10 @@ async def test_a_definitive_venue_refusal_leaves_the_position_held(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         row = await _row(db, row_id)
         assert row["status"] == "open"
         assert row["exit_order_id"] is None
@@ -822,8 +1159,38 @@ async def test_a_definitive_venue_refusal_leaves_the_position_held(
         await db.close()
 
 
+async def test_an_interruption_after_submission_leaves_the_txid_recoverable(
+    tmp_path, monkeypatch
+):
+    """The order landed and the process then failed before reconciling. The
+    txid must already be on the row, and the row must stay non-terminal."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    adapter = _adapter()
+    adapter.await_fill_confirmation.side_effect = RuntimeError("process interrupted")
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_ESCALATE
+        )
+        row = await _row(db, row_id)
+        assert row["exit_order_id"] == _EXIT_TXID
+        assert row["status"] == "open"
+        assert row["closed_at"] is None
+        steps = _steps(tmp_path, row_id)
+        assert _step(steps, "exit_txid_persisted")["txid"] == _EXIT_TXID
+        # Completed, so it is not a dangling intent — the run accounted for
+        # itself even though it failed.
+        assert _step(steps, "run_completed")["exit_code"] == EXIT_ESCALATE
+        assert runner.dangling_exit_intents(row_id) == []
+    finally:
+        await db.close()
+
+
 # ======================================================================
-# Steps 9-10 — partial, close, review
+# Partial, close, review
 # ======================================================================
 async def test_a_partial_fill_leaves_the_row_open_with_the_remainder(
     tmp_path, monkeypatch
@@ -843,14 +1210,15 @@ async def test_a_partial_fill_leaves_the_row_open_with_the_remainder(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REVIEW
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REVIEW
+        )
         row = await _row(db, row_id)
         assert row["status"] == "open"
         assert Decimal(row["entry_fill_qty"]) == Decimal("0.10")
         assert row["exit_order_id"] == _EXIT_TXID
         assert Decimal(row["exit_fill_price"]) == Decimal("110.0")
-        # An unfinished exit has no realised P&L and is not closed.
         assert row["realized_pnl_usd"] is None
         assert row["realized_pnl_pct"] is None
         assert row["closed_at"] is None
@@ -867,61 +1235,132 @@ async def test_a_clean_fill_reconciles_and_closes_the_row(tmp_path, monkeypatch)
     runner, db, adapter = await _make_runner(tmp_path)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_OK
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
         row = await _row(db, row_id)
         assert row["status"] == "closed_via_reconciliation"
         assert row["exit_order_id"] == _EXIT_TXID
         assert Decimal(row["exit_fill_price"]) == Decimal("110.0")
-
-        cur = await db._conn.execute(
-            "SELECT realized_pnl_usd, realized_pnl_pct, closed_at "
-            "FROM live_trades WHERE id = ?",
-            (row_id,),
+        # 16.50 gross - 0.132 exit fee - (15.00 + 0.12 entry) = 1.248
+        assert Decimal(row["realized_pnl_usd"]) == _EXPECTED_PNL
+        assert Decimal(row["realized_pnl_pct"]).quantize(Decimal("0.0001")) == Decimal(
+            "8.2540"
         )
-        pnl_usd, pnl_pct, closed_at = await cur.fetchone()
-        # 16.50 gross - 0.0429 exit fee - (15.00 + 0.039 entry) = 1.4181
-        assert Decimal(pnl_usd) == _EXPECTED_PNL
-        assert Decimal(pnl_pct).quantize(Decimal("0.0001")) == Decimal("9.4295")
-        assert closed_at is not None
+        assert row["closed_at"] is not None
 
         recon = _step(_steps(tmp_path, row_id), "exit_reconciliation")
         assert recon["verdict"] == "pass"
         assert recon["mismatches"] == []
+        assert recon["base_mismatches"] == [] and recon["quote_mismatches"] == []
         assert recon["entry_fee_source"] == "actual_entry_fills"
+        # One lot tick at 8 decimals — not a percentage of position size.
+        assert Decimal(recon["base"]["lot_tolerance"]) == Decimal("0.00000001")
     finally:
         await db.close()
 
 
-async def test_a_balance_that_did_not_move_does_not_close_the_row(
-    tmp_path, monkeypatch
-):
-    """The venue says it sold; the account says otherwise. A close asserts the
-    position is gone, and that assertion is not available here."""
+async def test_a_balance_delta_one_lot_tick_out_still_closes(tmp_path, monkeypatch):
+    """The tolerance is a representation unit, so a last-place difference must
+    not block a genuine close."""
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
-    adapter.fetch_account_balance.side_effect = _balance_sequence("1.0", "1.0")
+    # 1.0 -> 0.85000001 : one lot tick short of the exact 0.15 move.
+    adapter.fetch_account_balance.side_effect = _Balances("1.0", "1.0", "0.85000001")
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REVIEW
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
+        assert (await _row(db, row_id))["status"] == "closed_via_reconciliation"
+    finally:
+        await db.close()
+
+
+async def test_a_materially_short_balance_move_does_not_close_the_row(
+    tmp_path, monkeypatch
+):
+    """The old percentage band would have accepted this: 0.0015 BTC is 1% of
+    the position, and the sale is short by exactly that."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    adapter = _adapter()
+    # Only 0.1485 actually left the account — 1% short of the 0.15 sold.
+    adapter.fetch_account_balance.side_effect = _Balances("1.0", "1.0", "0.8515")
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REVIEW
+        )
         row = await _row(db, row_id)
         assert row["status"] == "needs_manual_review"
-        # The txid and fill price ARE recorded — the sale is not denied, only
-        # unconfirmed — but nothing terminal is written.
         assert row["exit_order_id"] == _EXIT_TXID
-        cur = await db._conn.execute(
-            "SELECT realized_pnl_usd, closed_at FROM live_trades WHERE id = ?",
-            (row_id,),
-        )
-        pnl_usd, closed_at = await cur.fetchone()
-        assert pnl_usd is None
-        assert closed_at is None
+        assert row["realized_pnl_usd"] is None
+        assert row["closed_at"] is None
         recon = _step(_steps(tmp_path, row_id), "exit_reconciliation")
         assert recon["verdict"] == "review"
-        assert any("balance delta" in m for m in recon["mismatches"])
+        assert any("cumulative executed volume" in m for m in recon["base_mismatches"])
+    finally:
+        await db.close()
+
+
+async def test_a_high_exit_fee_does_not_widen_the_base_comparison(
+    tmp_path, monkeypatch
+):
+    """Quote-side variability must never loosen the base-asset check: the fee
+    lands in quote_mismatches and the base comparison is unaffected."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    adapter = _adapter()
+    adapter.fetch_order_fills.side_effect = _fills_by_txid(
+        {
+            _ENTRY_TXID: _ENTRY_FILLS,
+            # A fee far above the account's own taker rate on this notional.
+            _EXIT_TXID: [{**_EXIT_FILLS[0], "fee": "5.00000"}],
+        }
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REVIEW
+        )
+        recon = _step(_steps(tmp_path, row_id), "exit_reconciliation")
+        assert recon["base_mismatches"] == []
+        assert any("taker rate" in m for m in recon["quote_mismatches"])
+        assert (await _row(db, row_id))["status"] == "needs_manual_review"
+    finally:
+        await db.close()
+
+
+async def test_an_execution_below_the_limit_does_not_close_the_row(
+    tmp_path, monkeypatch
+):
+    """A limit SELL cannot execute below its limit, so a VWAP that did is not
+    the order we placed."""
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    adapter = _adapter()
+    adapter.await_fill_confirmation.return_value = _confirmation(
+        "filled", fill_price=90.0
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REVIEW
+        )
+        recon = _step(_steps(tmp_path, row_id), "exit_reconciliation")
+        assert any("below the" in m for m in recon["quote_mismatches"])
+        assert (await _row(db, row_id))["status"] == "needs_manual_review"
     finally:
         await db.close()
 
@@ -936,11 +1375,13 @@ async def test_a_fill_with_no_per_fill_records_does_not_close_the_row(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REVIEW
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REVIEW
+        )
         assert (await _row(db, row_id))["status"] == "needs_manual_review"
         recon = _step(_steps(tmp_path, row_id), "exit_reconciliation")
-        assert any("no per-fill records" in m for m in recon["mismatches"])
+        assert any("no per-fill records" in m for m in recon["base_mismatches"])
     finally:
         await db.close()
 
@@ -952,7 +1393,7 @@ async def test_a_resting_exit_order_leaves_the_row_open(tmp_path, monkeypatch):
     adapter.await_fill_confirmation.return_value = OrderConfirmation(
         venue="kraken",
         venue_order_id=_EXIT_TXID,
-        client_order_id="gecko-x-1",
+        client_order_id=_CID,
         status="timeout",
         filled_qty=None,
         fill_price=None,
@@ -961,8 +1402,10 @@ async def test_a_resting_exit_order_leaves_the_row_open(tmp_path, monkeypatch):
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_OK
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
         row = await _row(db, row_id)
         assert row["status"] == "open"
         assert row["exit_order_id"] == _EXIT_TXID
@@ -982,8 +1425,10 @@ async def test_a_terminal_zero_fill_leaves_the_position_held(tmp_path, monkeypat
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
-        assert code == EXIT_REFUSED
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
         row = await _row(db, row_id)
         assert row["status"] == "open"
         assert Decimal(row["entry_fill_qty"]) == _HELD_QTY
@@ -992,7 +1437,332 @@ async def test_a_terminal_zero_fill_leaves_the_position_held(tmp_path, monkeypat
 
 
 # ======================================================================
-# Rehearsal
+# Interrupted runs block the lane; exit-status clears them
+# ======================================================================
+async def test_a_dangling_intent_blocks_a_fresh_exit(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+        _write_dangling_intent(tmp_path, row_id)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_REFUSED
+        )
+        adapter.place_limit_order.assert_not_called()
+        abort = _step(_steps(tmp_path, row_id), "aborted")
+        assert abort["stage"] == "lane_state"
+        assert "exit-status" in abort["reason"]
+    finally:
+        await db.close()
+
+
+async def test_a_completed_run_is_not_dangling(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    _authorize(monkeypatch, _token())
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db)
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
+        assert runner.dangling_exit_intents(row_id) == []
+    finally:
+        await db.close()
+
+
+async def test_exit_status_clears_a_dangling_intent_only_on_proof(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.resolve_order_submission_detail.return_value = {
+        "verdict": "not_accepted",
+        "client_order_id": _CID,
+        "txid": [],
+        "probes": [],
+    }
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_dangling_intent(tmp_path, row_id)
+        assert runner.dangling_exit_intents(row_id) != []
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_OK
+        # Read-only at the venue: nothing was cancelled and nothing was placed.
+        adapter.place_limit_order.assert_not_called()
+        adapter.cancel_order.assert_not_called()
+        assert runner.dangling_exit_intents(row_id) == []
+    finally:
+        await db.close()
+
+
+async def test_exit_status_leaves_the_block_in_place_when_unresolved(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.resolve_order_submission_detail.return_value = {
+        "verdict": "unresolved",
+        "client_order_id": _CID,
+        "txid": [],
+        "probes": [],
+    }
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_dangling_intent(tmp_path, row_id)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_BLOCKED
+        assert runner.dangling_exit_intents(row_id) != []
+        adapter.cancel_order.assert_not_called()
+    finally:
+        await db.close()
+
+
+async def test_exit_status_reports_a_working_order_without_touching_it(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation(
+        "pending", filled_qty=0.0, fill_price=None
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_BLOCKED
+        adapter.cancel_order.assert_not_called()
+        adapter.place_limit_order.assert_not_called()
+        status = _step(_steps(tmp_path, row_id, "status"), "exit_status")
+        assert status["venue_order_status"] == "pending"
+    finally:
+        await db.close()
+
+
+async def test_exit_after_a_cleared_intent_proceeds(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.resolve_order_submission_detail.return_value = {
+        "verdict": "not_accepted",
+        "client_order_id": _CID,
+        "txid": [],
+        "probes": [],
+    }
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        _write_dangling_intent(tmp_path, row_id)
+        assert await runner.exit_status(live_trade_id=row_id) == EXIT_OK
+        _authorize(monkeypatch, _token())
+        assert (
+            await runner.exit_position(live_trade_id=row_id, price=_EXIT_PRICE)
+            == EXIT_OK
+        )
+    finally:
+        await db.close()
+
+
+# ======================================================================
+# exit-cancel
+# ======================================================================
+async def test_exit_cancel_refuses_when_no_exit_order_exists(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = None
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REFUSED
+        adapter.cancel_order.assert_not_called()
+        abort = _step(_steps(tmp_path, row_id, "cancel"), "aborted")
+        assert "nothing to cancel" in abort["reason"]
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_targets_the_exit_client_id(tmp_path, monkeypatch):
+    """`cancel --decision-id` keys off the ENTRY client id and structurally
+    cannot reach an exit order. This one is derived from the row."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    working = _confirmation("pending", filled_qty=0.0, fill_price=None)
+    cancelled = _confirmation("rejected", filled_qty=0.0, fill_price=None)
+    adapter.fetch_order_by_client_id.side_effect = [working, cancelled]
+    adapter.cancel_order.return_value = {
+        "count": 1,
+        "pending": False,
+        "already_gone": False,
+    }
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REFUSED
+        # The pre-cancel lookup used the exit cid, not the entry one.
+        lookup = adapter.fetch_order_by_client_id.call_args_list[0].kwargs
+        assert lookup["client_order_id"] == _CID
+        assert adapter.cancel_order.call_count == 1
+        assert adapter.cancel_order.call_args.kwargs["txid"] == _EXIT_TXID
+        row = await _row(db, row_id)
+        assert row["status"] == "open"
+        assert Decimal(row["entry_fill_qty"]) == _HELD_QTY
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_reconciles_a_partial_fill_and_reduces_the_position(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    working = _confirmation("pending", filled_qty=0.0, fill_price=None)
+    partial = _confirmation("partial", filled_qty=0.05, fill_price=110.0)
+    adapter.fetch_order_by_client_id.side_effect = [working, partial]
+    adapter.cancel_order.return_value = {
+        "count": 1,
+        "pending": False,
+        "already_gone": False,
+    }
+    adapter.fetch_order_fills.side_effect = _fills_by_txid(
+        {
+            _ENTRY_TXID: _ENTRY_FILLS,
+            _EXIT_TXID: [{**_EXIT_FILLS[0], "vol": "0.05", "cost": "5.5"}],
+        }
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REVIEW
+        row = await _row(db, row_id)
+        assert row["status"] == "open"
+        assert Decimal(row["entry_fill_qty"]) == Decimal("0.10")
+        assert row["exit_order_id"] == _EXIT_TXID
+        assert row["realized_pnl_usd"] is None
+        partial_step = _step(_steps(tmp_path, row_id, "cancel"), "exit_partial_fill")
+        assert partial_step["origin"] == "exit-cancel"
+        assert partial_step["remaining_qty"] == "0.10"
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_never_restores_a_reduced_position(tmp_path, monkeypatch):
+    """A held quantity only ever falls. Re-running the cancel against an order
+    whose fills were already folded in escalates rather than double-counting."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    partial = _confirmation("partial", filled_qty=0.05, fill_price=110.0)
+    adapter.fetch_order_by_client_id.return_value = partial
+    adapter.fetch_order_fills.side_effect = _fills_by_txid(
+        {
+            _ENTRY_TXID: _ENTRY_FILLS,
+            _EXIT_TXID: [{**_EXIT_FILLS[0], "vol": "0.05", "cost": "5.5"}],
+        }
+    )
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        # First pass folds the partial in.
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REVIEW
+        assert Decimal((await _row(db, row_id))["entry_fill_qty"]) == Decimal("0.10")
+
+        # Second pass on the SAME order must not subtract the same coins again.
+        monkeypatch.setattr(kraken_pilot, "uuid4", lambda: UUID(int=2))
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_ESCALATE
+        row = await _row(db, row_id)
+        assert Decimal(row["entry_fill_qty"]) == Decimal("0.10")
+        assert row["status"] == "needs_manual_review"
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_after_the_order_already_filled_does_not_close_the_row(
+    tmp_path, monkeypatch
+):
+    """Cancelling after a full fill must account for the sale without sending a
+    pointless CancelOrder — and must NOT close the row.
+
+    The coins left before this command sampled anything, so there is no
+    pre-trade balance to measure the sale against. The runner says so instead
+    of inventing a baseline: a balance read after the fact produces a ~0 delta,
+    which would read as "nothing sold" for a sale that did happen. The numbers
+    are all recorded; a human sets the outcome."""
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    adapter.fetch_order_by_client_id.return_value = _confirmation("filled")
+    # Already reduced when the command starts — the sale predates this run.
+    adapter.fetch_account_balance.side_effect = _Balances("0.85")
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REVIEW
+        adapter.cancel_order.assert_not_called()
+        row = await _row(db, row_id)
+        assert row["status"] == "needs_manual_review"
+        assert row["exit_order_id"] == _EXIT_TXID
+        assert row["realized_pnl_usd"] is None
+        assert row["closed_at"] is None
+        recon = _step(_steps(tmp_path, row_id, "cancel"), "exit_reconciliation")
+        assert recon["origin"] == "exit-cancel"
+        assert recon["verdict"] == "review"
+        assert any("no pre-trade balance sample" in m for m in recon["base_mismatches"])
+        # The fill IS recorded, in full — it is unconfirmed, not denied.
+        assert Decimal(recon["filled_qty"]) == _HELD_QTY
+        assert Decimal(recon["exit_fee"]) == Decimal("0.132")
+    finally:
+        await db.close()
+
+
+async def test_an_ambiguous_cancel_is_resolved_by_reading_not_resending(
+    tmp_path, monkeypatch
+):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    working = _confirmation("pending", filled_qty=0.0, fill_price=None)
+    settled = _confirmation("rejected", filled_qty=0.0, fill_price=None)
+    adapter.fetch_order_by_client_id.side_effect = [working, settled]
+    adapter.cancel_order.side_effect = KrakenAPIError("EService:Unavailable")
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REFUSED
+        # Exactly one cancel attempt, then a READ to settle it.
+        assert adapter.cancel_order.call_count == 1
+        steps = _steps(tmp_path, row_id, "cancel")
+        assert _step(steps, "cancel_ambiguous") is not None
+        assert _step(steps, "cancel_ambiguity_resolution")["status"] == "rejected"
+        assert (await _row(db, row_id))["status"] == "open"
+    finally:
+        await db.close()
+
+
+async def test_an_unresolvable_cancel_escalates(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    adapter = _adapter()
+    working = _confirmation("pending", filled_qty=0.0, fill_price=None)
+    adapter.fetch_order_by_client_id.side_effect = [working, None]
+    adapter.cancel_order.side_effect = KrakenAPIError("EService:Unavailable")
+    runner, db, adapter = await _make_runner(tmp_path, adapter)
+    try:
+        row_id = await _seed_row(db)
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_ESCALATE
+        assert adapter.cancel_order.call_count == 1
+    finally:
+        await db.close()
+
+
+async def test_exit_cancel_refuses_a_non_kraken_row(tmp_path, monkeypatch):
+    _fix_decision_id(monkeypatch)
+    runner, db, adapter = await _make_runner(tmp_path)
+    try:
+        row_id = await _seed_row(db, venue="solana", pair="SOL/USDC")
+        assert await runner.exit_cancel(live_trade_id=row_id) == EXIT_REFUSED
+        adapter.cancel_order.assert_not_called()
+    finally:
+        await db.close()
+
+
+# ======================================================================
+# Rehearsal and envelope
 # ======================================================================
 async def test_validate_only_places_nothing_and_leaves_the_row_open(
     tmp_path, monkeypatch
@@ -1009,10 +1779,12 @@ async def test_validate_only_places_nothing_and_leaves_the_row_open(
     runner, db, adapter = await _make_runner(tmp_path, adapter)
     try:
         row_id = await _seed_row(db)
-        code = await runner.exit_position(
-            live_trade_id=row_id, price=_EXIT_PRICE, validate_only=True
+        assert (
+            await runner.exit_position(
+                live_trade_id=row_id, price=_EXIT_PRICE, validate_only=True
+            )
+            == EXIT_OK
         )
-        assert code == EXIT_OK
         assert adapter.place_limit_order.call_args.kwargs["validate_only"] is True
         adapter.await_fill_confirmation.assert_not_called()
         row = await _row(db, row_id)
@@ -1025,8 +1797,6 @@ async def test_validate_only_places_nothing_and_leaves_the_row_open(
 async def test_validate_only_is_allowed_under_the_emergency_revert_posture(
     tmp_path, monkeypatch
 ):
-    """A rehearsal cannot trade, so the flag that blocks real orders must not
-    block it — otherwise the rehearsal exercises a different code path."""
     _fix_decision_id(monkeypatch)
     _authorize(monkeypatch, _token())
     adapter = _adapter()
@@ -1084,7 +1854,7 @@ async def test_exit_is_not_gated_on_the_master_pilot_switch(tmp_path, monkeypatc
 
 
 # ======================================================================
-# CLI flag pairing
+# CLI
 # ======================================================================
 async def test_validate_only_without_the_rehearsal_flag_is_refused(capsys):
     code = await kraken_pilot.main(
@@ -1104,14 +1874,36 @@ async def test_the_rehearsal_flag_without_validate_only_is_refused(capsys):
 
 def test_the_exit_subcommand_requires_a_row_id_and_a_price():
     parser = kraken_pilot.build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["exit", "--price", "110.0"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["exit", "--live-trade-id", "1"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["exit", "--live-trade-id", "0", "--price", "110.0"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["exit", "--live-trade-id", "1", "--price", "0"])
+    for argv in (
+        ["exit", "--price", "110.0"],
+        ["exit", "--live-trade-id", "1"],
+        ["exit", "--live-trade-id", "0", "--price", "110.0"],
+        ["exit", "--live-trade-id", "1", "--price", "0"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
     args = parser.parse_args(["exit", "--live-trade-id", "7", "--price", "110.0"])
     assert args.live_trade_id == 7
     assert args.price == Decimal("110.0")
+
+
+@pytest.mark.parametrize("command", ["exit-cancel", "exit-status"])
+def test_the_recovery_subcommands_need_exactly_one_target(command):
+    parser = kraken_pilot.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([command])
+    with pytest.raises(SystemExit):
+        parser.parse_args([command, "--live-trade-id", "1", "--decision-id", _DECISION])
+    assert parser.parse_args([command, "--live-trade-id", "7"]).live_trade_id == 7
+    assert (
+        parser.parse_args([command, "--decision-id", _DECISION]).decision_id
+        == _DECISION
+    )
+
+
+def test_a_decision_id_resolves_to_its_live_trade_id(tmp_path):
+    directory = _evidence_dir(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / f"kraken_pilot_exit_42_{_DECISION}.json").write_text("", "utf-8")
+    assert kraken_pilot.resolve_exit_decision_id(directory, _DECISION) == 42
+    assert kraken_pilot.resolve_exit_decision_id(directory, "no-such-run") is None

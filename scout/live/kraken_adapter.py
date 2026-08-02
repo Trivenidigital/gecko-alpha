@@ -1162,15 +1162,25 @@ class KrakenSpotAdapter(ExchangeAdapter):
         A caller that puts a guessed fee in front of an operator asking them
         to authorize a trade has made the approval screen a liability.
 
+        The NEXT tier is returned alongside the current one because it is
+        decision-relevant and free to read: each fee row carries ``nextfee``
+        and ``nextvolume``, so an operator sizing a trade can see how far the
+        account is from a cheaper rate. Absent on the top tier, hence
+        optional — a missing next tier is not an error.
+
         Returns:
             ``{"pair", "maker_pct", "taker_pct", "volume", "currency",
-            "raw"}`` — the two rates as fixed-point percent STRINGS
-            (``"0.16"`` means 0.16%), matching how the rest of this adapter
-            hands Kraken numerics to its callers.
+            "next_maker_pct", "next_taker_pct", "next_volume", "raw"}`` —
+            every rate a fixed-point percent STRING (``"0.16"`` means 0.16%),
+            matching how the rest of this adapter hands Kraken numerics to its
+            callers. The three ``next_*`` fields are ``None`` when Kraken
+            publishes no further tier.
         """
         body = await self._private_post("/0/private/TradeVolume", {"pair": pair})
-        taker_pct = _fee_pct_from_map(body.get("fees"), pair)
-        maker_pct = _fee_pct_from_map(body.get("fees_maker"), pair)
+        taker = _fee_row_from_map(body.get("fees"), pair)
+        maker = _fee_row_from_map(body.get("fees_maker"), pair)
+        taker_pct = _decimal_str(taker.get("fee")) if taker else None
+        maker_pct = _decimal_str(maker.get("fee")) if maker else None
         if taker_pct is None or maker_pct is None:
             raise KrakenAPIError(
                 f"kraken /0/private/TradeVolume: no readable fee schedule for "
@@ -1188,6 +1198,10 @@ class KrakenSpotAdapter(ExchangeAdapter):
             "taker_pct": taker_pct,
             "volume": _decimal_str(body.get("volume")),
             "currency": str(body.get("currency") or "") or None,
+            "next_maker_pct": _decimal_str((maker or {}).get("nextfee")),
+            "next_taker_pct": _decimal_str((taker or {}).get("nextfee")),
+            "next_volume": _decimal_str((taker or {}).get("nextvolume"))
+            or _decimal_str((maker or {}).get("nextvolume")),
             "raw": body,
         }
 
@@ -2334,14 +2348,18 @@ def _decimal_str(value: Any) -> str | None:
     return format(parsed, "f") if parsed is not None else None
 
 
-def _fee_pct_from_map(fees: Any, pair: str) -> str | None:
-    """Pull the ``fee`` percent out of a TradeVolume ``fees``/``fees_maker`` map.
+def _fee_row_from_map(fees: Any, pair: str) -> dict[str, Any] | None:
+    """Pull one pair's row out of a TradeVolume ``fees``/``fees_maker`` map.
 
     The map is keyed by the AssetPairs KEY (``XXBTZUSD``) while callers hold
     the altname (``XBTUSD``), so an exact-key hit is tried first and a
     single-entry map is then accepted on its own — we asked about one pair,
     so one entry is unambiguous. A multi-entry map with no exact hit returns
     ``None`` rather than guessing which pair's rate to charge the operator.
+
+    The whole row is returned rather than just the rate: ``fee`` is the
+    current tier and ``nextfee`` / ``nextvolume`` describe the next one, and
+    both come from the same row.
     """
     if not isinstance(fees, dict) or not fees:
         return None
@@ -2352,7 +2370,7 @@ def _fee_pct_from_map(fees: Any, pair: str) -> str | None:
         entry = next(iter(fees.values()))
         if not isinstance(entry, dict):
             return None
-    return _decimal_str(entry.get("fee"))
+    return entry
 
 
 def _decimals_to_step(decimals: Any) -> float | None:
