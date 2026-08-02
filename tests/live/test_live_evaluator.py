@@ -95,6 +95,10 @@ async def _seed_open_live(
 
 def _adapter(*, price=None, price_exc=None, exit_conf=None, exit_exc=None):
     adapter = MagicMock()
+    # Must match the venue on the rows _seed_open_live inserts. The evaluator
+    # filters by adapter venue and fails closed without a usable identity —
+    # see tests/live/test_live_evaluator_venue_isolation.py.
+    adapter.venue_name = "binance"
     if price_exc is not None:
         adapter.fetch_price = AsyncMock(side_effect=price_exc)
     else:

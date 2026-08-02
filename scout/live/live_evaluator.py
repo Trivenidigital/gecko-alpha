@@ -190,11 +190,30 @@ async def evaluate_open_live_trades(
     except Exception as exc:  # pragma: no cover — defensive
         log.error("live_stuck_open_check_failed", error=str(exc))
 
+    # Venue isolation. This function is handed exactly ONE adapter, so it must
+    # only ever consider rows belonging to that adapter's venue. Selecting on
+    # status alone made a Solana position eligible for a Kraken sell — the row
+    # would be priced and sold with a pair the venue has never heard of.
+    #
+    # Fail closed on a missing identity: an adapter that cannot say which venue
+    # it is does NOT get to fall back to scanning everything. That fallback is
+    # precisely the defect being removed, so it must not survive as an
+    # error path.
+    venue = getattr(adapter, "venue_name", None)
+    if not isinstance(venue, str) or not venue.strip():
+        raise ValueError(
+            "live_evaluator: adapter has no usable venue_name "
+            f"({venue!r}) — refusing to evaluate open positions rather than "
+            "scanning every venue's rows with one venue's adapter"
+        )
+    venue = venue.strip()
+
     now = datetime.now(timezone.utc)
     cur = await db._conn.execute(
         "SELECT id, pair, signal_type, size_usd, entry_fill_price, "
         " entry_fill_qty, created_at "
-        "FROM live_trades WHERE status='open'"
+        "FROM live_trades WHERE status='open' AND venue = ?",
+        (venue,),
     )
     rows = await cur.fetchall()
     closed_count = 0

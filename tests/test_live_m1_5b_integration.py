@@ -53,6 +53,11 @@ async def test_main_path_wires_routing_layer_when_flag_true(tmp_path):
         LIVE_TRADING_ENABLED=True,
         LIVE_USE_REAL_SIGNED_REQUESTS=True,
         LIVE_USE_ROUTING_LAYER=True,
+        # Explicit since 2026-08-01: LIVE_CLOSER_ENABLED now defaults False, and
+        # LiveEngine refuses to boot a routing engine without its closer (an
+        # autonomous buyer with no seller orphans real money). A test that wires
+        # routing must opt in to the closer exactly as an operator would.
+        LIVE_CLOSER_ENABLED=True,
         LIVE_SIGNAL_ALLOWLIST="first_signal",
         BINANCE_API_KEY="x",
         BINANCE_API_SECRET="x",
