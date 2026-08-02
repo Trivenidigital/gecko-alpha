@@ -10017,19 +10017,29 @@ class Database:
             # for the rest of its life. That is a strictly worse failure than the
             # severed-links defect this OFF exists to avoid, so it is checked
             # rather than assumed.
-            # *** CLOSE THE TRANSACTION FIRST — UNCONDITIONALLY. ***
+            # *** CLOSE THE TRANSACTION FIRST, IF ONE IS STILL OPEN. ***
             # The `except` above rolls back inside its own try/except, because a
             # failing rollback must not mask the original error. But swallowing it
             # leaves the transaction OPEN, and an open transaction is exactly the
-            # condition under which the pragma below does nothing. So the rollback
-            # is repeated here without conditions: on every path where the
-            # transaction is already closed this is a harmless "no transaction is
-            # active", and on the one path where it is not, it is what makes the
-            # restore possible at all.
-            try:
-                await conn.execute("ROLLBACK")
-            except Exception:
-                pass  # already committed or already rolled back — the normal case
+            # condition under which the pragma below does nothing.
+            #
+            # Guarded on `in_transaction` rather than attempted unconditionally.
+            # An unconditional ROLLBACK fails with "no transaction is active" on
+            # every NORMAL path, which forces the choice between swallowing that
+            # expected failure — banned in this module by
+            # `tests/test_db_rollback_observability.py`, and rightly, since a
+            # swallowed rollback hides disk/lock/WAL failures — and logging an
+            # exception on every successful boot. Asking first makes a failure
+            # here genuinely exceptional, so it can be logged loudly without noise.
+            if conn.in_transaction:
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception as rb_err:
+                    _log.exception(
+                        "schema_migration_finally_rollback_failed",
+                        migration=migration,
+                        err=str(rb_err),
+                    )
 
             await conn.execute("PRAGMA foreign_keys=ON")
             _cur = await conn.execute("PRAGMA foreign_keys")
@@ -10060,6 +10070,14 @@ class Database:
                 )
                 try:
                     await conn.close()
-                except Exception:  # pragma: no cover — defensive
-                    pass
+                except Exception as close_err:  # pragma: no cover — defensive
+                    # Logged, not swallowed: a close that fails here means the
+                    # connection is still open AND unenforced, which is the worst
+                    # of the states this branch exists to escape. Dropping the
+                    # handle below still happens either way.
+                    _log.exception(
+                        "schema_migration_unenforced_close_failed",
+                        migration=migration,
+                        err=str(close_err),
+                    )
                 self._conn = None
