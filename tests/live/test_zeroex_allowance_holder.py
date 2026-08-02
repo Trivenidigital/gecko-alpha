@@ -1500,3 +1500,38 @@ class TestOnlyAMandateDecisionAuthorizes:
         )
         assert loaded == [1]
         assert session.bundle.verify()
+
+
+class TestTheIntentFloorCannotBeForgotten:
+    """*** A FORGOTTEN FLOOR MUST NOT MEAN "NO FLOOR". ***
+
+    `ZeroExQuoteRequest.expected_min_buy_amount` carries a dataclass default of
+    0, so a caller can omit it. That default must refuse rather than disable the
+    only bound anchored outside the 0x response.
+    """
+
+    def test_the_default_of_zero_refuses(self):
+        req = ZeroExQuoteRequest(
+            chain_id=1,
+            sell_token=WETH,
+            buy_token=USDC,
+            sell_amount=SELL_AMOUNT,
+            taker=GECKO_TEST_TAKER,
+        )
+        assert req.expected_min_buy_amount == 0
+        with pytest.raises(ZeroExArtifactError, match="must be positive"):
+            ZeroExAllowanceHolderAdapter(chain_id=1).validate_response(
+                allowance_holder_response(), request=req
+            )
+
+    def test_a_floor_above_the_quote_refuses(self):
+        """The intent will not accept less than it asked for, even from an
+        otherwise perfectly consistent quote."""
+        with pytest.raises(ZeroExArtifactError, match="intent's floor"):
+            _artifact(expected_min_buy_amount=MIN_BUY_AMOUNT + 1)
+
+    def test_a_floor_at_or_below_the_quote_passes(self):
+        """Guard on the guard."""
+        assert _artifact(expected_min_buy_amount=MIN_BUY_AMOUNT).minimum_buy_amount == (
+            MIN_BUY_AMOUNT
+        )
