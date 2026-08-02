@@ -210,7 +210,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -252,6 +252,7 @@ from scout.live.solana.limits import (
     LaneExposure,
     LimitsEngine,
     LimitsReport,
+    OperatorExitBinding,
     notional_usd_today,
 )
 from scout.live.solana.resolver import ResolutionReport
@@ -2069,6 +2070,65 @@ def authorization_policy_for(mode: str) -> AuthorizationPolicy:
     return TypedOperatorAuthorization()
 
 
+# ----------------------------------------------------------------------
+# The exit's exemption from the daily ENTRY cap
+# ----------------------------------------------------------------------
+# ``SOLANA_MAX_DAILY_NOTIONAL_USD`` bounds how much this lane may COMMIT in a
+# UTC day. Pointed at a reverse swap it bounds something else: whether the lane
+# may CLOSE what it already holds. At the deployed figure that is not a
+# hypothetical — an entry plus its exit fits in a day and a second round trip
+# does not, so the check standing in front of the second exit would be the one
+# meant to bound the second ENTRY. A lane that can open a position it cannot
+# shut is a worse failure than a lane that spent more in a day than it meant to.
+#
+#     risk-increasing entry:
+#         subject to daily entry/notional cap
+#
+#     operator-authorized exit of an exact existing position:
+#         exempt from the entry cap
+#         subject to separate exit safety limits
+#
+# What this deliberately is NOT is a direction check. `if reverse: skip the cap`
+# exempts "a USDC->SOL swap" — something any caller can ask for by pointing the
+# swap the other way — rather than "the close of THIS position". The exemption
+# is instead PROVEN, and this function is the only place in the tree that mints
+# the proof.
+def operator_exit_binding(
+    *, selection: dict[str, Any], mode: str
+) -> OperatorExitBinding:
+    """Mint the exit binding from a row ``_load_reverse_row`` has already proved.
+
+    Every field is copied from that proof rather than derived again. By the time
+    this is called the row has been refused if it belongs to another venue, if
+    it is not ``open``, if it already carries an exit signature, or if it has no
+    recorded entry fill — and the same function is re-run immediately before
+    signing, so the facts underneath the binding are re-established after the
+    approval prompt rather than assumed to have held across it.
+
+    ``authorized_by`` is read from ``authorization_policy_for``, the SAME
+    mapping that decides who will actually be asked to authorize this run. That
+    is what keeps BOUNDED_AUTONOMOUS out of the exemption structurally: the
+    autonomous mode stamps the binding with its own policy's method, which the
+    limits engine does not honour, so an autonomous run falls through to the
+    ordinary daily cap. A literal here — or a boolean parameter — would make the
+    exemption something the caller states rather than something the run's own
+    configuration produces.
+    """
+    row = selection["row"]
+    scaled = selection["ledger_usdc"] * _dec(10**USDC_DECIMALS)
+    return OperatorExitBinding(
+        live_trade_id=int(row["live_trade_id"]),
+        venue=str(row["venue"]),
+        direction=DIRECTION_USDC_TO_SOL,
+        # ROUNDED DOWN, never to nearest. `ledger_usdc` is a product of two
+        # recorded decimals and can carry more precision than USDC has raw
+        # units; rounding up would hand the exemption a raw unit the row does
+        # not account for.
+        remaining_usdc_raw=int(scaled.to_integral_value(rounding=ROUND_DOWN)),
+        authorized_by=authorization_policy_for(mode).method,
+    )
+
+
 def _print_block(title: str, lines: list[str]) -> None:
     bar = "=" * 68
     print(bar)
@@ -2759,6 +2819,7 @@ class LaneRunner:
         amount_lamports: int,
         evidence: EvidenceLog,
         direction: SwapDirection = DIRECTION_FORWARD,
+        exit_binding: OperatorExitBinding | None = None,
     ) -> tuple[SolanaQuote, datetime]:
         """Steps 5-6 — quote, then the limits engine's verdict on it.
 
@@ -2775,6 +2836,10 @@ class LaneRunner:
         The evidence step is written BEFORE the limits are enforced, so a
         refusal leaves the same structured record a pass would — the run that
         gets refused is the one whose numbers an operator most needs.
+
+        ``exit_binding`` is passed straight through to the engine and recorded
+        alongside its verdict. Only the reverse command supplies one, and only
+        from a row it has already proved — see ``operator_exit_binding``.
         """
         quote = await self._jupiter.get_quote(
             amount=amount_lamports,
@@ -2790,6 +2855,7 @@ class LaneRunner:
             price_impact_pct=quote_price_impact_pct(quote),
             exposure=exposure,
             direction=direction.name,
+            exit_binding=exit_binding,
         )
 
         in_amount = amount_from_raw(quote.in_amount, direction.input_decimals)
@@ -2817,6 +2883,12 @@ class LaneRunner:
             "quoted_at": quoted_at.isoformat(),
             "exposure": exposure.as_evidence(),
             "limits": limits.as_evidence(),
+            # Recorded whether or not it was honoured. A run whose exemption
+            # was NOT granted is exactly the one whose binding an operator
+            # needs to read against the refusal.
+            "exit_binding": (
+                None if exit_binding is None else exit_binding.as_evidence()
+            ),
         }
         if not direction.is_reverse:
             # The forward run's evidence keeps the field names it has always
@@ -5352,8 +5424,17 @@ class LaneRunner:
                 "account for.",
             )
 
+        # Minted HERE and nowhere else: from the row `_load_reverse_row` proved,
+        # bounded by the amount check immediately above, and stamped with the
+        # policy that will be asked to authorize. The engine re-checks every
+        # field of it against the quote — this call cannot ASK for the
+        # exemption, only offer the proof of it.
+        exit_binding = operator_exit_binding(selection=selection, mode=mode)
         quote, quoted_at = await self._quote_and_check(
-            amount_lamports=amount_raw, evidence=evidence, direction=direction
+            amount_lamports=amount_raw,
+            evidence=evidence,
+            direction=direction,
+            exit_binding=exit_binding,
         )
         await self._reverse_state(
             decision_id,

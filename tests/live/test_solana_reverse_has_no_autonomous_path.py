@@ -204,6 +204,50 @@ def test_no_scheduler_artifact_invokes_the_reverse_swap(pattern):
     assert offenders == [], f"{offenders} schedule the supervised reverse swap"
 
 
+def test_the_exit_cap_exemption_cannot_be_stamped_autonomous():
+    """*** The exemption is minted once, and never from a literal. ***
+
+    ``OperatorExitBinding`` is what lifts the daily ENTRY cap off an exit. The
+    field the limits engine reads to decide whether to honour it is
+    ``authorized_by``, so the guarantee "BOUNDED_AUTONOMOUS cannot use the
+    exemption" reduces to one property of the tree: that field is never a
+    constant, and is only ever the method of whatever ``authorization_policy_
+    for`` returns for this run's mode. A string literal there — or a second
+    construction site somewhere with its own idea of the value — is how the
+    autonomous mode would acquire an exemption nobody granted it.
+
+    Structural rather than behavioural on purpose: a test that drove the
+    autonomous mode and watched it be refused would keep passing if a second,
+    unrefused construction site appeared beside the first.
+    """
+    sites: list[tuple[str, ast.Call]] = []
+    for path in _python_sources():
+        for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "OperatorExitBinding"
+            ):
+                sites.append((str(path.relative_to(_ROOT)), node))
+    assert [name for name, _ in sites] == [
+        str(_LANE_FILE.relative_to(_ROOT))
+    ], f"OperatorExitBinding is constructed at {[n for n, _ in sites]}"
+
+    keywords = {kw.arg: kw.value for kw in sites[0][1].keywords}
+    authorized_by = keywords["authorized_by"]
+    assert (
+        isinstance(authorized_by, ast.Attribute) and authorized_by.attr == "method"
+    ), (
+        "authorized_by must be the authorization policy's own method, not a "
+        f"{type(authorized_by).__name__}"
+    )
+    assert (
+        isinstance(authorized_by.value, ast.Call)
+        and isinstance(authorized_by.value.func, ast.Name)
+        and authorized_by.value.func.id == "authorization_policy_for"
+    ), "authorized_by must come from authorization_policy_for(mode)"
+
+
 def test_the_kraken_exit_implementation_is_untouched_by_this_change():
     """The Kraken lane is out of scope, and 'out of scope' is checkable.
 

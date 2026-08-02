@@ -48,6 +48,14 @@ from scout.live.solana.constants import (
 )
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient
+from scout.live.solana.limits import (
+    DIRECTION_SOL_TO_USDC,
+    DIRECTION_USDC_TO_SOL,
+    OPERATOR_EXIT_AUTHORIZATION,
+    LaneExposure,
+    LimitsEngine,
+    OperatorExitBinding,
+)
 from scout.live.solana.resolver_pool import ResolverPool
 from scout.live.solana.rpc_client import SolanaRpcClient
 from scout.live.solana.signer import SolanaKeypairError, sign_transaction
@@ -2132,6 +2140,377 @@ async def test_a_wallet_that_cannot_pay_the_fees_refuses_before_the_prompt(
     assert code == EXIT_REFUSED
     assert _step(_steps(tmp_path), "aborted")["stage"] == "balance"
     assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
+# ======================================================================
+# The daily cap is an ENTRY cap and must never gate the exit
+# ======================================================================
+# The whole section runs against the SMALLEST daily cap the configuration
+# permits, so the position being closed has by itself already exhausted the
+# day: 7.00 USD authorized against a 10 USD cap leaves 3.10 short of the
+# 6.899618 the exit quotes. Every "the exit is allowed" assertion below would
+# therefore fail without the exemption, and every "the exit is refused" one
+# would pass for the wrong reason if the exemption leaked.
+_CAP_EXHAUSTED = dict(SOLANA_MAX_DAILY_NOTIONAL_USD=10.0)
+
+# 0.1 SOL in at 70.0 USDC/SOL — what `_seed_position` records the row as
+# holding, in the raw units the binding carries it in.
+_REMAINING_RAW = 7_000_000
+
+
+class _ReverseQuote:
+    """The least a quote has to look like for ``check_quote`` to judge it."""
+
+    swap_mode = "ExactIn"
+    input_mint = USDC_MINT
+    output_mint = SOL_MINT
+    out_amount = _SOL_OUT
+    slippage_bps = 100
+    route_plan = ()
+
+    def __init__(self, in_amount: int = _USDC_IN_RAW) -> None:
+        self.in_amount = in_amount
+
+
+class _ForwardQuote:
+    """A legitimate ENTRY: SOL in, USDC out, inside the per-trade band."""
+
+    swap_mode = "ExactIn"
+    input_mint = SOL_MINT
+    output_mint = USDC_MINT
+    in_amount = 100_000_000
+    out_amount = _USDC_IN_RAW
+    slippage_bps = 100
+    route_plan = ()
+
+
+def _binding(**overrides) -> OperatorExitBinding:
+    base = dict(
+        live_trade_id=5,
+        venue="solana",
+        direction=DIRECTION_USDC_TO_SOL,
+        remaining_usdc_raw=_REMAINING_RAW,
+        authorized_by=OPERATOR_EXIT_AUTHORIZATION,
+    )
+    base.update(overrides)
+    return OperatorExitBinding(**base)
+
+
+def _cap_report(
+    tmp_path,
+    *,
+    binding,
+    quote=None,
+    direction: str = DIRECTION_USDC_TO_SOL,
+    open_positions: int = 1,
+    authorized_today: str = "7.0",
+):
+    """One quote-stage verdict with the day already spent."""
+    quote = quote or _ReverseQuote()
+    return LimitsEngine(_settings(tmp_path, **_CAP_EXHAUSTED)).check_quote(
+        quote,
+        amount_lamports=quote.in_amount,
+        price_impact_pct=Decimal("0.01"),
+        exposure=LaneExposure(
+            open_positions=open_positions,
+            notional_usd_today=Decimal(authorized_today),
+        ),
+        direction=direction,
+        exit_binding=binding,
+    )
+
+
+def _detail(report, name: str) -> str:
+    return next(c.detail for c in report.checks if c.name == name)
+
+
+async def test_an_exhausted_entry_cap_still_lets_the_position_close(
+    tmp_path, monkeypatch
+):
+    """*** The lane must never be able to open what it cannot shut. ***
+
+    The motivating case exactly: the day's entry allowance is gone, and the
+    thing that spent it is the very position this swap closes. Under the old
+    rule the exit was refused at 13.899618 against a 10 USD cap — a live
+    position with no way out of it short of editing config.
+    """
+    code, runner, db, session, row_id, tx, submissions = await _drive(
+        tmp_path, monkeypatch, **_CAP_EXHAUSTED
+    )
+    assert code == EXIT_OK
+    assert len(submissions) == 1
+    assert (await _row(db, row_id))["status"] == "closed_via_reconciliation"
+
+    quote = _step(_steps(tmp_path), "quote")
+    checks = {c["name"]: c for c in quote["limits"]["checks"]}
+    # The entry cap did not silently pass — it was REPLACED, and the check that
+    # replaced it says what it proved instead.
+    assert "daily_notional_within_cap" not in checks
+    granted = checks["operator_exit_within_bound_position"]
+    assert granted["passed"] is True
+    assert f"live_trades #{row_id}" in granted["detail"]
+    assert "REDUCES exposure" in granted["detail"]
+    assert quote["exit_binding"] == {
+        "live_trade_id": row_id,
+        "venue": "solana",
+        "direction": DIRECTION_USDC_TO_SOL,
+        "remaining_usdc_raw": _REMAINING_RAW,
+        "authorized_by": OPERATOR_EXIT_AUTHORIZATION,
+    }
+    await session.close()
+    await db.close()
+
+
+def test_an_exhausted_cap_permits_a_partial_reduction(tmp_path):
+    """A close does not have to be the whole position to reduce exposure."""
+    report = _cap_report(tmp_path, binding=_binding(), quote=_ReverseQuote(5_000_000))
+    assert report.passed, _failed(report)
+    assert "spends 5000000 of the 7000000 raw USDC" in _detail(
+        report, "operator_exit_within_bound_position"
+    )
+
+
+def test_selling_more_than_the_bound_position_earns_no_exemption(tmp_path):
+    """One raw unit past the row is exposure being ADDED, not closed.
+
+    The runner refuses this earlier still (see
+    ``test_reverse_refuses_selling_more_than_the_row_claims``); this is the
+    engine's own answer, so the bound holds even if that gate is ever moved.
+    """
+    report = _cap_report(tmp_path, binding=_binding(), quote=_ReverseQuote(7_000_001))
+    assert _failed(report) == ["daily_notional_within_cap"]
+    detail = _detail(report, "daily_notional_within_cap")
+    assert "the entry cap applies because" in detail
+    assert "INCREASE exposure" in detail
+
+
+def test_a_binding_for_another_venue_earns_no_exemption(tmp_path):
+    """Kraken positions close through the Kraken lane, and its rows prove
+    nothing about this lane's exposure."""
+    report = _cap_report(tmp_path, binding=_binding(venue="kraken"))
+    assert _failed(report) == ["daily_notional_within_cap"]
+    assert "'kraken' row" in _detail(report, "daily_notional_within_cap")
+
+
+async def test_a_kraken_row_never_reaches_the_exemption(tmp_path):
+    """And end to end, no binding is ever minted for one: the row is refused
+    before a quote exists, so the exemption cannot appear at all."""
+    runner, db, session = await _make_runner(tmp_path, **_CAP_EXHAUSTED)
+    row_id = await _seed_position(db, venue="kraken")
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc(SOLANA_MAINNET_GENESIS_HASH))
+        m.post(_RPC_URL, payload=_rpc("ok"))
+        code = await runner.reverse_place(live_trade_id=row_id, usdc=_USDC_IN)
+        assert _submissions(m) == []
+    assert code == EXIT_REFUSED
+    steps = _steps(tmp_path)
+    assert _step(steps, "aborted")["stage"] == "row_selection"
+    assert _step(steps, "quote") is None
+    assert "operator_exit_within_bound_position" not in json.dumps(steps)
+    await session.close()
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "status", ["rejected", "needs_manual_review", "closed_via_reconciliation"]
+)
+async def test_a_row_that_is_not_open_never_reaches_the_exemption(tmp_path, status):
+    """The binding carries no status because it never has to: a row that is not
+    open is refused before anything can be minted from it."""
+    runner, db, session = await _make_runner(tmp_path, **_CAP_EXHAUSTED)
+    row_id = await _seed_position(db, status=status)
+    with aioresponses() as m:
+        m.post(_RPC_URL, payload=_rpc(SOLANA_MAINNET_GENESIS_HASH))
+        m.post(_RPC_URL, payload=_rpc("ok"))
+        code = await runner.reverse_place(live_trade_id=row_id, usdc=_USDC_IN)
+        assert _submissions(m) == []
+    assert code == EXIT_REFUSED
+    steps = _steps(tmp_path)
+    assert _step(steps, "aborted")["stage"] == "row_selection"
+    assert _step(steps, "quote") is None
+    assert "operator_exit_within_bound_position" not in json.dumps(steps)
+    await session.close()
+    await db.close()
+
+
+def test_a_reverse_swap_with_nothing_to_close_stays_capped(tmp_path):
+    """*** The exemption is for CLOSING, not for the direction. ***
+
+    A USDC->SOL swap with no position behind it BUYS SOL: it increases the
+    lane's exposure exactly as a forward entry does, and the direction it
+    happens to point in must not buy it an exemption. Nothing proved it, so the
+    entry cap answers — and the position check answers too.
+    """
+    report = _cap_report(tmp_path, binding=None, open_positions=0)
+    assert _failed(report) == [
+        "daily_notional_within_cap",
+        "open_position_exists_to_close",
+    ]
+    # Nothing was offered, so nothing is explained away.
+    assert "the entry cap applies because" not in _detail(
+        report, "daily_notional_within_cap"
+    )
+
+
+def test_a_forward_entry_is_still_capped_while_holding_a_valid_binding(tmp_path):
+    """The regression that would prove the exemption leaked into the entry path.
+
+    A binding that would be honoured on the reverse leg is handed to a forward
+    ENTRY. The entry is risk-increasing whatever else is true of the day, so
+    the cap must be the check that answers.
+    """
+    report = _cap_report(
+        tmp_path,
+        binding=_binding(),
+        quote=_ForwardQuote(),
+        direction=DIRECTION_SOL_TO_USDC,
+        open_positions=0,
+    )
+    assert "operator_exit_within_bound_position" not in {c.name for c in report.checks}
+    assert "daily_notional_within_cap" in _failed(report)
+    assert "judged as 'sol_to_usdc'" in _detail(report, "daily_notional_within_cap")
+
+
+def test_bounded_autonomous_cannot_mint_an_exempting_binding(tmp_path):
+    """*** The autonomous mode is kept out by the value, not by a comment. ***
+
+    Both bindings are minted from the SAME proven row by the same function. The
+    only thing that differs is the authorization policy the mode maps to, and
+    that is the field the engine reads — so an autonomous run falls through to
+    the ordinary entry cap without the engine ever being told the mode.
+    """
+    selection = {
+        "row": {"live_trade_id": 5, "venue": "solana"},
+        "ledger_usdc": Decimal("7.0"),
+    }
+    supervised = solana_lane.operator_exit_binding(
+        selection=selection, mode="SUPERVISED_LIVE"
+    )
+    autonomous = solana_lane.operator_exit_binding(
+        selection=selection, mode="BOUNDED_AUTONOMOUS"
+    )
+    assert supervised.authorized_by == OPERATOR_EXIT_AUTHORIZATION
+    assert autonomous.authorized_by == "bounded_autonomous_policy"
+    assert supervised.remaining_usdc_raw == autonomous.remaining_usdc_raw
+
+    assert _cap_report(tmp_path, binding=supervised).passed
+    capped = _cap_report(tmp_path, binding=autonomous)
+    assert _failed(capped) == ["daily_notional_within_cap"]
+    assert "bounded_autonomous_policy" in _detail(capped, "daily_notional_within_cap")
+
+
+def test_the_engine_and_the_lane_agree_on_who_may_be_exempt():
+    """The one string the exemption turns on, spelled in two modules.
+
+    ``limits`` cannot import the lane (the lane imports it), so the method name
+    is restated there — the same shape as ``FeeCeilings`` restating the
+    inspector's ceilings, and pinned for the same reason. A rename on one side
+    alone would either wedge the exit shut or, far worse, hand the exemption to
+    whatever inherited the old spelling.
+    """
+    assert solana_lane.TypedOperatorAuthorization.method == OPERATOR_EXIT_AUTHORIZATION
+    assert (
+        solana_lane.BoundedAutonomousAuthorization.method != OPERATOR_EXIT_AUTHORIZATION
+    )
+
+
+def test_the_remaining_position_is_rounded_down_never_up(tmp_path):
+    """A ledger row's USDC claim can carry more precision than USDC has units.
+
+    Rounding to nearest would hand the exemption a raw unit the row does not
+    account for, which is the one direction this number must never move in.
+    """
+    binding = solana_lane.operator_exit_binding(
+        selection={
+            "row": {"live_trade_id": 9, "venue": "solana"},
+            # 0.0985 SOL at 70.0559 USDC/SOL — seven decimal places, which is
+            # one more than USDC has.
+            "ledger_usdc": Decimal("0.0985") * Decimal("70.0559"),
+        },
+        mode="SUPERVISED_LIVE",
+    )
+    assert binding.remaining_usdc_raw == 6_900_506  # .5 truncated, not rounded up
+    assert _failed(
+        _cap_report(tmp_path, binding=binding, quote=_ReverseQuote(6_900_507))
+    ) == ["daily_notional_within_cap"]
+
+
+async def test_the_exemption_does_not_soften_the_typed_authorization(
+    tmp_path, monkeypatch
+):
+    """*** Exempt from the CAP, and from nothing else. ***
+
+    The exemption is granted — the report below shows it — and the run is still
+    refused, because one hex digit of the bound digest was typed wrong. The
+    funded key is never read and the position stays open.
+    """
+    runner, db, session = await _make_runner(tmp_path, **_CAP_EXHAUSTED)
+    row_id = await _seed_position(db)
+    tx = build_reverse_swap_tx().tx_b64
+    typed: dict[str, str] = {}
+    original = solana_lane.EvidenceLog.record
+
+    def _record(self, step, **fields):
+        entry = original(self, step, **fields)
+        if step == "authorization_bound":
+            token = fields["token"]
+            typed["token"] = ("0" if token[0] != "0" else "1") + token[1:]
+        return entry
+
+    monkeypatch.setattr(solana_lane.EvidenceLog, "record", _record)
+    monkeypatch.setattr("builtins.input", lambda _p="": typed["token"])
+
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        code = await runner.reverse_place(live_trade_id=row_id, usdc=_USDC_IN)
+        assert _submissions(m) == []
+    assert code == EXIT_REFUSED
+
+    steps = _steps(tmp_path)
+    checks = {c["name"] for c in _step(steps, "quote")["limits"]["checks"]}
+    assert "operator_exit_within_bound_position" in checks  # the exemption held
+    assert _step(steps, "authorization")["outcome"] == "authorization_refused"
+    assert runner.loader_spy.calls == 0
+    assert (await _row(db, row_id))["status"] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_the_exempted_exit_still_dies_if_its_row_moves_before_signing(
+    tmp_path, monkeypatch
+):
+    """The exemption's whole proof is the row, so the row moving voids it.
+
+    Same guarantee as ``test_a_row_that_moved_between_approval_and_signing_
+    voids_it``, re-asserted under an exhausted cap: an exit that skipped the
+    entry cap must not also have skipped the re-read that establishes the row
+    is still the thing being closed.
+    """
+    runner, db, session = await _make_runner(tmp_path, **_CAP_EXHAUSTED)
+    row_id = await _seed_position(db)
+    moved = {"done": False}
+    original = solana_lane.LaneRunner._recheck_blockhash
+
+    async def _recheck(self, **kw):
+        if not moved["done"]:
+            moved["done"] = True
+            await solana_lane.update_live_trade(
+                db, row_id, status="needs_manual_review"
+            )
+        return await original(self, **kw)
+
+    monkeypatch.setattr(solana_lane.LaneRunner, "_recheck_blockhash", _recheck)
+    code, runner, db, session, row_id, _tx, submissions = await _drive(
+        tmp_path, monkeypatch, runner=runner, db=db, session=session, row_id=row_id
+    )
+    assert code == EXIT_REFUSED
+    assert submissions == []
+    assert runner.loader_spy.calls == 0
+    aborted = _step(_steps(tmp_path), "aborted")
+    assert aborted["stage"] == "pre_signing_recheck"
     await session.close()
     await db.close()
 
