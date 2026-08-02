@@ -168,5 +168,9 @@ class ZeroExAllowanceHolderAdapter:
             slippage_bps=str(artifact.slippage_bps()),
             requires_approval=artifact.requires_approval,
             block=artifact.block_number,
+            # Recorded AND reported: the decoder collects these and nothing read
+            # them, so "unknown actions are reported" was true of the dataclass
+            # and false of the system.
+            unknown_actions=list(artifact.decoded.unknown_action_selectors),
         )
         return artifact

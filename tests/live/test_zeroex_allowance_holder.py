@@ -91,6 +91,15 @@ def _artifact(raw=None, **over):
     )
 
 
+def _artifact_now(raw=None, **over):
+    """Artifact stamped with real current time, for paths that check expiry."""
+    return ZeroExAllowanceHolderAdapter(chain_id=1).validate_response(
+        raw if raw is not None else allowance_holder_response(),
+        request=_request(**over),
+        retrieved_at=datetime.now(timezone.utc),
+    )
+
+
 def _mutate(**changes) -> dict:
     raw = allowance_holder_response()
     for path, value in changes.items():
@@ -678,7 +687,7 @@ class TestInactiveMandateStopsTheZeroExPath:
                 inner.precheck()  # raises MandateRefused when inactive
                 return {"authorized": True}
 
-        artifact = _artifact()
+        artifact = _artifact_now()
         bundle = build_bundle_from_artifact(
             artifact, intent_hash="i" * 64, wallet=GECKO_TEST_TAKER
         )
@@ -728,3 +737,425 @@ class TestInactiveMandateStopsTheZeroExPath:
                     if any(k in name for k in ("web3", "requests", "urllib")):
                         offenders.append((str(path), name))
         assert offenders == [], f"a live transport is importable: {offenders}"
+
+
+# ===========================================================================
+# The orchestrated path: guards that are CALLED, not merely callable
+# ===========================================================================
+
+
+class TestPreparedExecutionEnforcesTheGuards:
+    """*** A GUARD NOTHING CALLS IS NOT A GUARD. ***
+
+    `assert_fresh` and `require_successful_simulation` were defined, tested, and
+    invoked by NO production path — a guarantee that lived in a docstring. These
+    assert they are now on the only route to a bundle.
+    """
+
+    def _funded(self, **over):
+        """The fixture taker is unfunded and has zero allowance, so the swap path
+        needs a response where the approval is already in place."""
+        raw = allowance_holder_response()
+        raw["issues"]["allowance"]["actual"] = str(SELL_AMOUNT * 2)
+        raw["issues"]["balance"] = None
+        for path, value in over.items():
+            parts = path.split(".")
+            node = raw
+            for p in parts[:-1]:
+                node = node[p]
+            node[parts[-1]] = value
+        return _artifact(raw)
+
+    async def test_a_stale_quote_never_reaches_simulation_or_a_bundle(self):
+        from scout.live.evm.execution import prepare_execution
+
+        sim = _Simulator(SimulationResult(True, 1, None, MIN_BUY_AMOUNT))
+        with pytest.raises(ZeroExArtifactError, match="old"):
+            await prepare_execution(
+                artifact=self._funded(),
+                intent_hash="i" * 64,
+                wallet=GECKO_TEST_TAKER,
+                simulator=sim,
+                current_block=QUOTE_BLOCK,
+                now=_T0 + timedelta(minutes=10),
+            )
+        assert sim.calls == [], "a stale quote was simulated"
+
+    async def test_block_drift_also_stops_it(self):
+        from scout.live.evm.execution import prepare_execution
+
+        sim = _Simulator(SimulationResult(True, 1, None, MIN_BUY_AMOUNT))
+        with pytest.raises(ZeroExArtifactError, match="blocks behind"):
+            await prepare_execution(
+                artifact=self._funded(),
+                intent_hash="i" * 64,
+                wallet=GECKO_TEST_TAKER,
+                simulator=sim,
+                current_block=QUOTE_BLOCK + 1000,
+                now=_T0 + timedelta(seconds=1),
+            )
+        assert sim.calls == []
+
+    async def test_a_failing_simulation_yields_no_bundle(self):
+        from scout.live.evm.execution import prepare_execution
+
+        sim = _Simulator(SimulationResult(False, None, "STF", None))
+        with pytest.raises(SimulationRefused):
+            await prepare_execution(
+                artifact=self._funded(),
+                intent_hash="i" * 64,
+                wallet=GECKO_TEST_TAKER,
+                simulator=sim,
+                current_block=QUOTE_BLOCK + 1,
+                now=_T0 + timedelta(seconds=1),
+            )
+
+    async def test_a_missing_allowance_refuses_rather_than_approving_inline(self):
+        """*** APPROVAL IS NEVER HIDDEN INSIDE A SWAP. ***"""
+        from scout.live.evm.execution import prepare_execution
+
+        sim = _Simulator(SimulationResult(True, 1, None, MIN_BUY_AMOUNT))
+        with pytest.raises(SimulationRefused, match="approval is required FIRST"):
+            await prepare_execution(
+                artifact=_artifact(),  # fixture has allowance 0
+                intent_hash="i" * 64,
+                wallet=GECKO_TEST_TAKER,
+                simulator=sim,
+                current_block=QUOTE_BLOCK + 1,
+                now=_T0 + timedelta(seconds=1),
+            )
+        assert sim.calls == []
+
+    async def test_the_happy_path_simulates_the_exact_final_calldata(self):
+        """Guard on the guard: it must still be possible to prepare."""
+        from scout.live.evm.execution import prepare_execution
+
+        art = self._funded()
+        sim = _Simulator(SimulationResult(True, 210000, None, MIN_BUY_AMOUNT + 5))
+        prepared = await prepare_execution(
+            artifact=art,
+            intent_hash="i" * 64,
+            wallet=GECKO_TEST_TAKER,
+            simulator=sim,
+            current_block=QUOTE_BLOCK + 1,
+            now=_T0 + timedelta(seconds=1),
+        )
+        assert sim.calls[0]["data"] == art.data
+        assert prepared.bundle.minimum_output == MIN_BUY_AMOUNT
+        assert prepared.bundle.verify()
+
+    def test_the_orchestrator_is_the_only_thing_that_calls_the_guards(self):
+        """Structural: if a future refactor drops a call, this fails rather than
+        the guarantee silently reverting to unenforced."""
+        import inspect
+
+        from scout.live.evm import execution
+
+        src = inspect.getsource(execution.prepare_execution)
+        assert "assert_fresh(" in src
+        assert "require_successful_simulation(" in src
+        assert "build_bundle_from_artifact(" in src
+        # And freshness precedes simulation, which precedes the bundle.
+        assert src.index("assert_fresh(") < src.index("require_successful_simulation(")
+        assert src.index("require_successful_simulation(") < src.index(
+            "build_bundle_from_artifact("
+        )
+
+
+# ===========================================================================
+# Structural pin: prepare_execution is the ONLY production route to a bundle
+# ===========================================================================
+
+
+class TestOnlyOneRouteToABundle:
+    """*** PINNED STRUCTURALLY, NOT BY A HAPPY-PATH ORDERING TEST. ***
+
+    An ordering test proves the orchestrator calls the guards in order. It proves
+    nothing about a SECOND route that skips them. These walk the AST of the whole
+    package so a new call site fails the build.
+    """
+
+    def _production_sources(self):
+        return sorted(Path("scout").rglob("*.py"))
+
+    def test_only_prepare_execution_builds_a_bundle(self):
+        import ast
+
+        callers: set[tuple[str, str]] = set()
+        for path in self._production_sources():
+            rel = str(path).replace("\\", "/")
+            tree = ast.parse(path.read_text("utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = None
+                if isinstance(node.func, ast.Name):
+                    name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    name = node.func.attr
+                if name not in ("build_bundle_from_artifact", "ExecutionSigningBundle"):
+                    continue
+                enclosing = "<module>"
+                for fn in ast.walk(tree):
+                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                        n is node for n in ast.walk(fn)
+                    ):
+                        enclosing = fn.name
+                callers.add((rel, enclosing))
+        assert callers == {
+            ("scout/live/evm/execution.py", "prepare_execution"),
+            ("scout/live/evm/execution.py", "build_bundle_from_artifact"),
+        }, (
+            f"a bundle can be built outside prepare_execution: {sorted(callers)}. "
+            "Freshness and simulation would be bypassed."
+        )
+
+    def test_no_production_module_imports_the_raw_builder(self):
+        """Importing it is how a second route starts."""
+        import ast
+
+        offenders = []
+        for path in self._production_sources():
+            rel = str(path).replace("\\", "/")
+            if rel in ("scout/live/evm/execution.py", "scout/live/evm/signer.py"):
+                continue
+            for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    for alias in node.names:
+                        if alias.name in (
+                            "build_bundle_from_artifact",
+                            "ExecutionSigningBundle",
+                        ):
+                            offenders.append((rel, alias.name))
+        assert offenders == [], f"raw bundle construction imported by {offenders}"
+
+
+# ===========================================================================
+# The four guards mutation testing proved had ZERO effective coverage
+# ===========================================================================
+
+
+def _wrap_outer(inner: bytes, *, operator: str, target: str) -> str:
+    from eth_abi import encode as abi_encode
+
+    body = abi_encode(
+        ["address", "address", "uint256", "address", "bytes"],
+        [
+            bytes.fromhex(operator[2:]),
+            bytes.fromhex(WETH[2:]),
+            SELL_AMOUNT,
+            bytes.fromhex(target[2:]),
+            inner,
+        ],
+    )
+    return "0x2213bc0b" + body.hex()
+
+
+class TestGuardsWithPreviouslyNoCoverage:
+    """Each kills a mutant that survived the original suite.
+
+    The existing tests exercised the harmless DIRECTION or the wrong BRANCH, so
+    deleting the guard entirely left them green.
+    """
+
+    def test_calldata_enforcing_LESS_than_advertised_is_refused(self):
+        """*** THE MONEY-LOSING DIRECTION, previously untested. ***
+
+        The original test set `minBuyAmount="1"` — calldata enforcing MORE than
+        advertised, which is harmless — so flipping `!=` to `>` survived. This is
+        the direction where the chain enforces a floor BELOW what was shown.
+        """
+        raw = allowance_holder_response()
+        raw["minBuyAmount"] = str(MIN_BUY_AMOUNT + 1000)
+        raw["buyAmount"] = str(MIN_BUY_AMOUNT + 1001)
+        with pytest.raises(ZeroExArtifactError, match="not the number the chain"):
+            _artifact(raw)
+
+    def test_the_INNER_alignment_refusal_fires(self):
+        """The original test appended bytes to the OUTER payload, so only the
+        outer check ran. This is the refusal cited as the whole reason Permit2
+        is disabled."""
+        inner = bytes.fromhex("1fff991f") + b"\x11" * 33  # 33 % 32 != 0
+        payload = _wrap_outer(inner, operator=SETTLER_ADDRESS, target=SETTLER_ADDRESS)
+        with pytest.raises(CalldataError, match="inner Settler"):
+            decode_allowance_holder_calldata(payload, chain_id=1)
+
+    def test_an_unreviewed_inner_selector_is_refused(self):
+        """Deleting ALLOWED_INNER_SELECTORS previously survived."""
+        inner = bytes.fromhex("deadbeef") + b"\x00" * 32
+        payload = _wrap_outer(inner, operator=SETTLER_ADDRESS, target=SETTLER_ADDRESS)
+        with pytest.raises(CalldataError, match="not a reviewed entrypoint"):
+            decode_allowance_holder_calldata(payload, chain_id=1)
+
+    def test_an_inner_target_outside_the_reviewed_settlers_is_refused(self):
+        """The original test only covered 'no Settlers declared for this chain',
+        never 'target not in the declared set'."""
+        from eth_abi import encode as abi_encode
+
+        rogue = "0x" + "cc" * 20
+        inner_body = abi_encode(
+            ["(address,address,uint256)", "bytes[]", "bytes32"],
+            [
+                (
+                    bytes.fromhex(GECKO_TEST_TAKER[2:]),
+                    bytes.fromhex(USDC[2:]),
+                    MIN_BUY_AMOUNT,
+                ),
+                [b"\x11\x22\x33\x44"],
+                b"\x00" * 32,
+            ],
+        )
+        inner = bytes.fromhex("1fff991f") + inner_body
+        payload = _wrap_outer(inner, operator=rogue, target=rogue)
+        with pytest.raises(CalldataError, match="not a reviewed Settler"):
+            decode_allowance_holder_calldata(payload, chain_id=1)
+
+    def test_an_excessive_slippage_quote_is_refused(self):
+        """*** THE BOUND THAT WAS MISSING ENTIRELY. ***
+
+        `minimum_buy_amount` was bound everywhere and bounded nowhere, so a
+        response advertising a 99.99% loss — with calldata enforcing the same
+        degenerate floor, satisfying the response/calldata comparison — validated
+        cleanly and cleared simulation, because simulation compares against that
+        same floor.
+        """
+        raw = allowance_holder_response()
+        # minBuyAmount still matches the calldata (so the response/calldata
+        # comparison passes and is not what refuses), but buyAmount is 100x it —
+        # a ~99% advertised loss.
+        raw["buyAmount"] = str(MIN_BUY_AMOUNT * 100)
+        with pytest.raises(ZeroExArtifactError, match="slippage"):
+            _artifact(raw)
+
+
+class TestSignerRefusesNonDecisions:
+    """A coroutine is not an authorization, and neither is None."""
+
+    def _boundary(self, mandate, loader, tmp_path):
+        import os
+
+        from scout.live.evm.signer import REQUIRED_MODE, EvmSignerBoundary
+
+        key = tmp_path / "evm.key"
+        key.write_text("0x" + "11" * 32, encoding="utf-8")
+        os.chmod(key, REQUIRED_MODE)
+        return EvmSignerBoundary(mandate=mandate, key_path=key, key_loader=loader)
+
+    def _fresh_bundle(self):
+        # Retrieved NOW: `sign_bundle` checks expiry against wall-clock time, so
+        # a bundle pinned to the fixture's historical timestamp would refuse at
+        # the expiry gate before reaching the one under test.
+        art = _artifact_now()
+        return build_bundle_from_artifact(
+            art, intent_hash="i" * 64, wallet=GECKO_TEST_TAKER
+        )
+
+    def test_an_async_mandate_that_is_never_awaited_does_not_authorize(self, tmp_path):
+        """*** THE BREACH. ***
+
+        An async `authorize_bundle` returns an un-awaited coroutine: truthy, no
+        exception, key read. The only mandate in this tree IS async.
+        """
+        from scout.live.evm.signer import SignerRefused
+
+        calls = []
+
+        class _AsyncMandate:
+            async def authorize_bundle(self, bundle):
+                raise RuntimeError("mandate is DISABLED")
+
+        def _tripwire(_p):
+            calls.append(1)
+            raise AssertionError("the key was READ")
+
+        with pytest.raises(SignerRefused) as exc:
+            self._boundary(_AsyncMandate(), _tripwire, tmp_path).sign_bundle(
+                self._fresh_bundle()
+            )
+        assert exc.value.gate == "mandate"
+        assert "never awaited" in exc.value.message
+        assert calls == []
+
+    @pytest.mark.parametrize("result", [None, False, 0, ""])
+    def test_a_falsy_return_is_a_refusal(self, tmp_path, result):
+        from scout.live.evm.signer import SignerRefused
+
+        calls = []
+
+        class _Falsy:
+            def authorize_bundle(self, bundle):
+                return result
+
+        def _tripwire(_p):
+            calls.append(1)
+            raise AssertionError("the key was READ")
+
+        with pytest.raises(SignerRefused) as exc:
+            self._boundary(_Falsy(), _tripwire, tmp_path).sign_bundle(
+                self._fresh_bundle()
+            )
+        assert exc.value.gate == "mandate"
+        assert calls == []
+
+    def test_an_expired_bundle_refuses_before_the_gate(self, tmp_path):
+        """`sign_bundle` accepts ANY bundle, so freshness cannot depend on the
+        caller having come through the orchestrator."""
+        from scout.live.evm.signer import SignerRefused
+
+        art = _artifact()
+        stale = build_bundle_from_artifact(
+            art, intent_hash="i" * 64, wallet=GECKO_TEST_TAKER, max_age_seconds=0.001
+        )
+        reached = []
+
+        class _Permitting:
+            def authorize_bundle(self, bundle):
+                reached.append(1)
+                return {"ok": True}
+
+        with pytest.raises(SignerRefused) as exc:
+            self._boundary(_Permitting(), lambda _p: None, tmp_path).sign_bundle(stale)
+        assert exc.value.gate == "expiry"
+        assert reached == [], "an expired bundle reached the mandate"
+
+
+class TestSuccessfulSubmissionIsPersisted:
+    async def test_the_pending_receipt_is_written_not_just_returned(self):
+        """*** THE DOUBLE-SPEND WINDOW. ***
+
+        The ambiguous path persisted; the success path returned without doing so,
+        leaving the durable row at `not_submitted` — the one state this module
+        defines as permitting a rebuild.
+        """
+        from scout.live.evm.execution import EvmReceipt, ExecutionState, submit_once
+
+        written: list = []
+
+        async def _persist(r):
+            written.append(r.state)
+
+        class _Ok:
+            async def submit(self, **kw):
+                return "0x" + "cc" * 32
+
+            async def lookup(self, **kw):
+                return None
+
+        out = await submit_once(
+            broadcaster=_Ok(),
+            receipt=EvmReceipt(
+                intent_hash="i" * 64,
+                bundle_hash="b" * 64,
+                chain_id=1,
+                wallet=GECKO_TEST_TAKER,
+                expected_transaction_hash="0x" + "ab" * 32,
+                state=ExecutionState.NOT_SUBMITTED,
+            ),
+            signed_raw_tx="0x",
+            persist=_persist,
+        )
+        assert out.state is ExecutionState.PENDING
+        assert written == [
+            ExecutionState.NOT_SUBMITTED,
+            ExecutionState.PENDING,
+        ], f"durable row after a successful submit: {written}"

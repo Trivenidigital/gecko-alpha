@@ -49,10 +49,29 @@ APPROVE_SELECTOR = "0x" + keccak(text="approve(address,uint256)")[:4].hex()
 #: The value this module exists to refuse.
 UNLIMITED = 2**256 - 1
 
-#: How much headroom over the exact swap amount is tolerated. Small and explicit:
-#: some tokens round on transfer, but a "bounded" approval an order of magnitude
-#: above the trade is not bounded in any sense that matters.
-DEFAULT_HEADROOM_BPS = Decimal("100")  # 1%
+#: How much headroom over the exact swap amount is tolerated, in BASIS POINTS as
+#: an INTEGER. Small and explicit: some tokens round on transfer, but a "bounded"
+#: approval an order of magnitude above the trade is not bounded in any sense
+#: that matters.
+DEFAULT_HEADROOM_BPS = 100  # 1%
+
+#: *** A CEILING ON THE HEADROOM ITSELF. ***
+#: Without it, "bounded, never unlimited" was a check on one magic number:
+#: solving `required * (1 + h/1e4) = UNLIMITED - 1` yields an approval ~1e60x the
+#: trade that still reports `is_unlimited: False`. The cap is what makes the
+#: bound a bound rather than a speed bump.
+MAX_HEADROOM_BPS = 500  # 5%
+
+#: Native-asset sentinels. ERC-20 `approve` does not exist for the chain's native
+#: asset — there is no contract to call — so an "approval" naming one is a
+#: category error, and the conventions below are what a caller would pass by
+#: mistake after copying a swap request.
+NATIVE_ASSET_SENTINELS = frozenset(
+    {
+        "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "0x0000000000000000000000000000000000000000",
+    }
+)
 
 
 class ApprovalRefused(ValueError):
@@ -76,6 +95,12 @@ class ApprovalIntent:
     created_at: datetime
     expires_at: datetime
 
+    # EXPLICIT in the intent, not implied by arithmetic: a reader must be able to
+    # see what was required and how much slack was granted over it, and both are
+    # hashed so a changed swap size invalidates the approval.
+    required_amount: int = 0
+    headroom_bps: int = 0
+
     intent_hash: str = field(init=False)
     calldata: str = field(init=False)
 
@@ -97,6 +122,8 @@ class ApprovalIntent:
             "token": self.token,
             "spender": self.spender,
             "amount": str(self.amount),
+            "required_amount": str(self.required_amount),
+            "headroom_bps": str(self.headroom_bps),
             "reason": self.reason,
             "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
             "expires_at": self.expires_at.astimezone(timezone.utc).isoformat(),
@@ -124,7 +151,7 @@ def build_approval_intent(
     spender: str,
     required_amount: int,
     inner_target: str | None,
-    headroom_bps: Decimal = DEFAULT_HEADROOM_BPS,
+    headroom_bps: int = DEFAULT_HEADROOM_BPS,
     now: datetime | None = None,
     ttl: timedelta = timedelta(minutes=10),
 ) -> ApprovalIntent:
@@ -142,22 +169,50 @@ def build_approval_intent(
     if required_amount <= 0:
         raise ApprovalRefused("required_amount must be positive")
 
+    # *** NEVER APPROVE A NATIVE ASSET. ***
+    if token in NATIVE_ASSET_SENTINELS:
+        raise ApprovalRefused(
+            f"{token} is a native-asset sentinel; ERC-20 approve does not exist "
+            "for the chain's native asset and there is no contract to call"
+        )
+
+    if not isinstance(headroom_bps, int) or isinstance(headroom_bps, bool):
+        raise ApprovalRefused(
+            f"headroom_bps must be an int in basis points, got "
+            f"{type(headroom_bps).__name__}"
+        )
+    if headroom_bps < 0 or headroom_bps > MAX_HEADROOM_BPS:
+        raise ApprovalRefused(
+            f"headroom_bps {headroom_bps} is outside 0..{MAX_HEADROOM_BPS}. "
+            "An uncapped headroom makes 'bounded, never unlimited' a check on one "
+            "magic number rather than a bound."
+        )
+
     # *** NEVER APPROVE SETTLER, and never an unlisted address. ***
     assert_spender_is_not_settler(
         chain_id=chain_id, spender=spender, inner_target=inner_target
     )
 
-    amount = int(
-        Decimal(required_amount) * (Decimal(10_000) + headroom_bps) / Decimal(10_000)
-    )
+    # *** INTEGER ARITHMETIC, NO Decimal AND NO float. ***
+    # `Decimal`'s default context is 28 significant digits, so the previous
+    # expression SILENTLY ROUNDED wei amounts above that width — demonstrated at
+    # 10**30 + 12345, where it lost 468 wei. Token base units cross 28 digits
+    # inside this project's cohort, and this is the same precision-context defect
+    # class as the canonicalization collision found earlier in this workstream.
+    # Integer math is exact at every width.
+    amount = required_amount * (10_000 + headroom_bps) // 10_000
     if amount >= UNLIMITED:
         raise ApprovalRefused(
             "unlimited approval is disabled: it converts a one-trade grant into a "
             "standing withdrawal right over the entire balance for as long as "
             "nobody remembers to revoke it"
         )
-    if amount < required_amount:  # pragma: no cover - arithmetic guard
-        raise ApprovalRefused("computed approval is below the amount required")
+    if amount < required_amount:
+        # Reachable in principle, and cheap to keep: floor division can only
+        # round DOWN, so a zero headroom on a tiny amount is the boundary case.
+        raise ApprovalRefused(
+            f"computed approval {amount} is below the required {required_amount}"
+        )
 
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
@@ -172,4 +227,30 @@ def build_approval_intent(
         reason=f"AllowanceHolder swap of {required_amount} {token}",
         created_at=moment,
         expires_at=moment + ttl,
+        required_amount=required_amount,
+        headroom_bps=headroom_bps,
     )
+
+
+def reconcile_approval(
+    *, intent: ApprovalIntent, allowance_after: int | None
+) -> tuple[bool, str | None]:
+    """Compare the granted allowance against what was authorized.
+
+    An approval that granted MORE than the intent is a standing withdrawal right
+    nobody agreed to; one that granted less will not clear the swap. Both are
+    discrepancies, and neither is visible without asking the chain afterwards.
+    """
+    if allowance_after is None:
+        return False, "allowance was never re-read; the grant is unverified"
+    if allowance_after > intent.amount:
+        return False, (
+            f"allowance is {allowance_after}, above the authorized {intent.amount} "
+            "— revoke it"
+        )
+    if allowance_after < intent.required_amount:
+        return False, (
+            f"allowance is {allowance_after}, below the {intent.required_amount} "
+            "the swap needs"
+        )
+    return True, None

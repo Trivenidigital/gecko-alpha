@@ -53,6 +53,16 @@ DEFAULT_MAX_QUOTE_AGE_BLOCKS = 5
 #: fee somebody has to have agreed to.
 DEFAULT_MAX_ZEROEX_FEE_BPS = Decimal("50")
 
+#: *** CEILING ON SLIPPAGE — the bound that was missing entirely. ***
+#: `minimum_buy_amount` was BOUND everywhere and BOUNDED nowhere: fees were
+#: capped at 50 bps while slippage was uncapped, so a response advertising
+#: `buyAmount=187886590` with `minBuyAmount=1` — and calldata enforcing 1, so the
+#: response/calldata comparison passed — validated cleanly, built a bundle and
+#: cleared simulation, because simulation compares against the same degenerate
+#: floor. A 99.99%-loss quote passed the entire orchestrated path.
+#: 300 bps is generous for the pairs in scope and still refuses that.
+DEFAULT_MAX_SLIPPAGE_BPS = Decimal("300")
+
 
 @dataclass(frozen=True)
 class AllowanceHolderArtifact:
@@ -175,6 +185,7 @@ def build_allowance_holder_artifact(
     expected_sell_amount: int,
     retrieved_at: datetime | None = None,
     max_fee_bps: Decimal = DEFAULT_MAX_ZEROEX_FEE_BPS,
+    max_slippage_bps: Decimal = DEFAULT_MAX_SLIPPAGE_BPS,
 ) -> AllowanceHolderArtifact:
     """Validate an AllowanceHolder response into an artifact, or raise.
 
@@ -272,9 +283,15 @@ def build_allowance_holder_artifact(
         raise ZeroExArtifactError(f"calldata refused: {exc}") from exc
 
     # *** NEVER APPROVE SETTLER. ***
-    assert_spender_is_not_settler(
-        chain_id=chain_id, spender=spender, inner_target=decoded.inner_target
-    )
+    # Re-raised as ZeroExArtifactError: it escaped as a bare ValueError, so a
+    # caller writing `except ZeroExArtifactError` missed the single most
+    # important refusal in the module.
+    try:
+        assert_spender_is_not_settler(
+            chain_id=chain_id, spender=spender, inner_target=decoded.inner_target
+        )
+    except ValueError as exc:
+        raise ZeroExArtifactError(str(exc)) from exc
 
     taker_norm = normalize_address(taker, field_name="taker")
     if decoded.recipient != taker_norm:
@@ -302,6 +319,19 @@ def build_allowance_holder_artifact(
             f"calldata enforces minAmountOut {decoded.minimum_amount_out} but the "
             f"response advertises minBuyAmount {min_buy}. The number shown is not "
             "the number the chain will enforce."
+        )
+
+    # --- slippage, bounded ---------------------------------------------------
+    # Computed from the two amounts rather than read from a field, because 0x
+    # publishes no slippage figure. This is the ONLY ceiling on what the trade
+    # may lose; without it `minimum_output > 0` was the entire protection.
+    slippage = ((Decimal(buy_amount - min_buy)) / Decimal(buy_amount)) * 10_000
+    if slippage > max_slippage_bps:
+        raise ZeroExArtifactError(
+            f"quote slippage is {slippage:.1f} bps (buyAmount {buy_amount}, "
+            f"minBuyAmount {min_buy}), ceiling {max_slippage_bps} bps. The "
+            "minimum output is the only on-chain bound on this trade's loss, and "
+            "this one bounds almost nothing."
         )
 
     # --- fees, bounded -------------------------------------------------------

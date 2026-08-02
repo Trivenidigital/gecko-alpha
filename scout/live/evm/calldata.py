@@ -132,7 +132,16 @@ def decode_allowance_holder_calldata(
     allowlist — an inner call to an unlisted contract is an unreviewed
     destination for the tokens this transaction moves.
     """
-    raw = bytes.fromhex(data[2:]) if isinstance(data, str) else bytes(data)
+    if isinstance(data, str):
+        # `bytes.fromhex` raises a bare ValueError on malformed input, which a
+        # caller writing `except CalldataError` would miss.
+        text = data[2:] if data.startswith(("0x", "0X")) else data
+        try:
+            raw = bytes.fromhex(text)
+        except ValueError as exc:
+            raise CalldataError(f"calldata is not valid hex: {exc}") from exc
+    else:
+        raw = bytes(data)
     if len(raw) < 4:
         raise CalldataError("calldata is shorter than a 4-byte selector")
     if raw[:4] != _OUTER_SELECTOR:
@@ -192,10 +201,13 @@ def decode_allowance_holder_calldata(
     action_selectors = tuple(
         "0x" + bytes(a)[:4].hex() if len(bytes(a)) >= 4 else "0x" for a in actions
     )
-    if not action_selectors:
+    # Per-ELEMENT, not list emptiness: three zero-length elements produce
+    # ('0x','0x','0x'), which is truthy, so an emptiness check passed a payload
+    # that performs nothing while claiming a minimum output.
+    if not action_selectors or any(len(bytes(a)) < 4 for a in actions):
         raise CalldataError(
-            "the inner call carries no actions — a swap that performs no action "
-            "cannot deliver the minimum output it claims"
+            "the inner call carries an action with no selector — a swap that "
+            "performs no action cannot deliver the minimum output it claims"
         )
 
     return DecodedAllowanceHolderCall(

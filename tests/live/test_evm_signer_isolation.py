@@ -108,7 +108,10 @@ def _bundle(**over) -> ExecutionSigningBundle:
         sell_amount=10**17,
         minimum_output=187310865,
         quote_block=25670103,
-        quote_expires_at=_T0 + timedelta(minutes=1),
+        # Relative to real NOW, not to the historical _T0: `sign_bundle` checks
+        # expiry itself now, so a bundle pinned to a past timestamp would refuse
+        # at the expiry gate before reaching whichever gate is under test.
+        quote_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         gas_ceiling=233965,
         gas_price_ceiling=73673518,
     )

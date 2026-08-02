@@ -34,9 +34,11 @@ irreversible capability the moment it exists, whether or not it was sent.
 
 from __future__ import annotations
 
+import inspect
 import os
 import stat as stat_module
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -209,8 +211,21 @@ class EvmSignerBoundary:
                 "key was not read.",
             )
 
-        # 2. THE GATE. Refusal raises, so there is no falsy-return path a caller
-        #    can forget to check on the way to the loader below.
+        # 1b. The bundle must not already be stale. `prepare_execution` checks
+        #     freshness against the chain, but `sign_bundle` accepts ANY bundle —
+        #     a caller holding one from thirty minutes ago could otherwise sign
+        #     it. Checked here so the guarantee does not depend on the caller
+        #     having come through the orchestrator.
+        now = datetime.now(timezone.utc)
+        if bundle.is_expired(at=now):
+            raise SignerRefused(
+                "expiry",
+                f"bundle {bundle.bundle_hash[:16]} expired at "
+                f"{bundle.quote_expires_at.isoformat()}; re-quote. The key was "
+                "not read.",
+            )
+
+        # 2. THE GATE.
         try:
             decision = self._mandate.authorize_bundle(bundle)
         except Exception as exc:
@@ -219,6 +234,36 @@ class EvmSignerBoundary:
                 f"the execution mandate refused this bundle: {exc}. The key was "
                 "not read.",
             ) from exc
+
+        # *** A COROUTINE IS NOT AN AUTHORIZATION. ***
+        # An earlier version trusted "it did not raise" as approval. An ASYNC
+        # `authorize_bundle` returns an un-awaited coroutine — truthy, no
+        # exception — and the key was read. That is not hypothetical: the only
+        # mandate in this tree, `ExecutionMandate.authorize`, IS async and awaits
+        # a database read, so an async implementation is the likely one.
+        #
+        # A falsy return is refused for the same reason: the previous comment
+        # asserted "refusal raises, so there is no falsy-return path" — an
+        # assumption about a component that does not exist yet, not a property
+        # this boundary enforced.
+        if inspect.isawaitable(decision):
+            try:  # pragma: no cover - defensive cleanup
+                decision.close()  # type: ignore[union-attr]
+            except Exception:
+                log.exception("evm_signer_coroutine_close_failed")
+            raise SignerRefused(
+                "mandate",
+                "authorize_bundle returned an awaitable that was never awaited, "
+                "so no authorization decision was ever made. An async mandate "
+                "must be awaited by its caller before reaching the signer. The "
+                "key was not read.",
+            )
+        if not decision:
+            raise SignerRefused(
+                "mandate",
+                f"authorize_bundle returned {decision!r} rather than a decision. "
+                "A falsy result is a refusal. The key was not read.",
+            )
 
         # 3. Custody, still without opening the file.
         self.precheck_custody()

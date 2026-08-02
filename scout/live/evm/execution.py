@@ -49,6 +49,8 @@ __all__ = [
     "BroadcastRefused",
     "ReconciliationVerdict",
     "reconcile",
+    "prepare_execution",
+    "PreparedExecution",
 ]
 
 #: Insertion is a no-op for AllowanceHolder — a single transaction signature and
@@ -312,7 +314,7 @@ async def submit_once(
         )
         await persist(unknown)
         return unknown
-    return EvmReceipt(
+    pending = EvmReceipt(
         **{
             **receipt.__dict__,
             "state": ExecutionState.PENDING,
@@ -320,6 +322,15 @@ async def submit_once(
             "submitted_at": datetime.now(timezone.utc),
         }
     )
+    # *** PERSIST THE SUCCESS TOO. ***
+    # The ambiguous branch above persisted; this one used to return without
+    # doing so, leaving the durable row at `not_submitted` after a SUCCESSFUL
+    # broadcast — and `not_submitted` is the one state this module defines as
+    # permitting a rebuild. A crash between here and the caller's next write
+    # would therefore invite exactly the double-spend the state machine exists
+    # to prevent.
+    await persist(pending)
+    return pending
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +390,104 @@ def reconcile(
     if gas_used is not None and gas_used > artifact.gas:
         problems.append(f"gas used {gas_used} exceeded the ceiling {artifact.gas}")
 
+    # *** "NOTHING WAS CHECKED" IS NOT "RECONCILED". ***
+    # With every delta None the function previously returned reconciled=True,
+    # which reads in a log as a clean settlement when in fact no chain state was
+    # ever read.
+    if buy_balance_delta is None and sell_balance_delta is None:
+        return ReconciliationVerdict(
+            reconciled=False,
+            discrepancies=("no balance deltas were supplied; nothing was checked",),
+            trips_breaker=True,
+        )
+
     return ReconciliationVerdict(
         reconciled=not problems,
         discrepancies=tuple(problems),
         trips_breaker=bool(problems),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The orchestrated path — the only supported way to reach a signature
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreparedExecution:
+    """A validated artifact that has passed every gate short of the mandate.
+
+    Returned only when freshness AND simulation both passed, so holding one is
+    the proof that they did. The guards were previously callable-but-uncalled:
+    `assert_fresh` and `require_successful_simulation` existed, were tested, and
+    nothing in the production path invoked them — a guarantee in the docstring
+    and nowhere else. This function is what makes them enforced.
+    """
+
+    artifact: AllowanceHolderArtifact
+    bundle: ExecutionSigningBundle
+    simulation: SimulationResult
+    current_block: int
+    prepared_at: datetime
+
+
+async def prepare_execution(
+    *,
+    artifact: AllowanceHolderArtifact,
+    intent_hash: str,
+    wallet: str,
+    simulator: Simulator,
+    current_block: int,
+    now: datetime | None = None,
+    max_age_seconds: float = DEFAULT_MAX_QUOTE_AGE_SECONDS,
+) -> PreparedExecution:
+    """Freshness, then simulation, then the bundle. In that order, always.
+
+    Order matters and is not incidental:
+
+    1. **Freshness first** — it is free, and simulating a quote that is already
+       stale spends a node round trip to learn something a subtraction knew.
+    2. **Simulation second** — against the EXACT final calldata, so what is
+       simulated is what would be signed.
+    3. **Bundle last** — it commits to the artifact that just passed both, so a
+       bundle can never describe a quote that failed one of them.
+
+    An approval requirement is REFUSED here rather than handled: it is a separate
+    signed operation with its own intent, authorization and receipt, and quietly
+    performing it inside a swap preparation is precisely the conflation
+    ``approval.py`` exists to prevent.
+    """
+    if artifact.requires_approval:
+        raise SimulationRefused(
+            f"the taker has allowance {artifact.allowance_actual} for "
+            f"{artifact.sell_amount} — an ERC-20 approval is required FIRST, as "
+            "its own authorized operation. Re-quote after it finalizes; this "
+            "quote will be stale by then."
+        )
+
+    artifact.assert_fresh(
+        current_block=current_block, now=now, max_age_seconds=max_age_seconds
+    )
+    simulation = await require_successful_simulation(simulator, artifact)
+    bundle = build_bundle_from_artifact(
+        artifact,
+        intent_hash=intent_hash,
+        wallet=wallet,
+        max_age_seconds=max_age_seconds,
+    )
+    log.info(
+        "evm_execution_prepared",
+        bundle_hash=bundle.bundle_hash,
+        intent_hash=intent_hash,
+        minimum_output=artifact.minimum_buy_amount,
+        quote_block=artifact.block_number,
+        current_block=current_block,
+        gas_used=simulation.gas_used,
+    )
+    return PreparedExecution(
+        artifact=artifact,
+        bundle=bundle,
+        simulation=simulation,
+        current_block=current_block,
+        prepared_at=now or datetime.now(timezone.utc),
     )
