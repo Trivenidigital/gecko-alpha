@@ -33,6 +33,18 @@ dependencies = [
     # tests/test_live_solana_signer.py before widening.
     "solders>=0.28,<0.29",
     "base58>=2.1,<3",
+    # EVM execution lane (0x adapter). `eth-account` supplies EIP-712 typed-data
+    # hashing/signing and transaction signing; `eth-abi` and `eth-utils` supply
+    # the ABI decoding and keccak used to VALIDATE 0x's calldata against the
+    # approved terms before anything is signed.
+    #
+    # Declared explicitly even though they were importable locally: they were in
+    # neither `pyproject.toml` nor `uv.lock`, so they existed only in the local
+    # interpreter. CI runs `uv sync --all-extras`, which would not have installed
+    # them — local green, CI red, for a dependency nobody declared.
+    "eth-account>=0.13,<0.14",
+    "eth-abi>=5.0,<7",
+    "eth-utils>=5.0,<6",
 ]
 
 [project.optional-dependencies]

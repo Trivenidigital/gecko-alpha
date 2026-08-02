@@ -222,6 +222,7 @@ from solders.pubkey import Pubkey
 
 from scout.config import Settings, load_settings
 from scout.db import Database
+from scout.db_path import UnsafeDatabase, assert_safe_database
 from scout.live.kill_switch import KillSwitch
 from scout.live.solana.constants import (
     ATA_RENT_LAMPORTS_FALLBACK,
@@ -7596,15 +7597,20 @@ async def main(argv: list[str] | None = None) -> int:
     # reads state finds nothing to object to: no kill switch, no prior
     # signature to reconcile. The lane would be wide open precisely because it
     # is looking at the wrong database.
-    db_path = Path(settings.DB_PATH)
-    if not db_path.exists():
+    # `.exists()` alone was NOT enough: a ZERO-BYTE file exists, so the old check
+    # passed and the lane read "no kill switch, no prior signature to reconcile"
+    # out of an empty file — the state this module's own docstring warns about.
+    # `assert_safe_database` also requires a real SQLite header, the core tables
+    # and recorded migrations, and resolves a relative DB_PATH against the
+    # DEPLOYMENT ROOT instead of the process working directory.
+    try:
+        db_path = assert_safe_database(
+            settings.DB_PATH, purpose="the Solana execution lane"
+        )
+    except UnsafeDatabase as exc:
         print(
-            f"REFUSED [database]: no database at {db_path.resolve()}\n"
-            "  DB_PATH resolves relative to the current directory, so this is "
-            "almost always\n"
-            "  the wrong working directory. Run the lane from the deployment "
-            "root.\n"
-            "  Creating one here would disable the kill switch and the startup "
+            f"REFUSED [database:{exc.reason}]: {exc.message}\n"
+            "  Proceeding would disable the kill switch and the startup "
             "reconciliation\n"
             "  at the same time, silently."
         )

@@ -128,10 +128,50 @@ def _fix_decision_id(monkeypatch) -> None:
     monkeypatch.setattr(kraken_pilot, "uuid4", lambda: UUID(_DECISION))
 
 
-def _authorize(monkeypatch, typed: str | None = None) -> None:
-    """Feed the approval prompt. ``None`` raises EOF (non-interactive stdin)."""
+class _Tty:
+    """A stdin stand-in that claims to be a terminal.
+
+    The entry approval now requires one, matching the exit side: EOF already
+    caught `</dev/null`, but a PIPE carrying the right token read as a valid
+    answer while being exactly the automation the boundary excludes.
+    """
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _authorize(
+    monkeypatch,
+    typed: str | None = None,
+    *,
+    tty: bool = True,
+    echo_token: bool = False,
+) -> None:
+    """Feed the approval prompt. ``None`` raises EOF (a closed stdin).
+
+    ``echo_token=True`` types back whatever token the pilot derived. The token is
+    now CONTENT-BOUND — a digest over the order and the account state — so a test
+    driving the happy path cannot hardcode it without restating the whole
+    snapshot, which would just be a second implementation of the digest. That the
+    token really is content-bound is asserted directly in
+    `TestEntryAuthorizationIsContentBound`, not smuggled in here.
+    """
+    if tty:
+        monkeypatch.setattr(kraken_pilot.sys, "stdin", _Tty())
+
+    seen: dict[str, str] = {}
+    if echo_token:
+        real = kraken_pilot.entry_authorization_token
+
+        def _spy(snapshot):
+            seen["token"] = real(snapshot)
+            return seen["token"]
+
+        monkeypatch.setattr(kraken_pilot, "entry_authorization_token", _spy)
 
     def _fake_input(_prompt: str = "") -> str:
+        if echo_token:
+            return seen.get("token", "")
         if typed is None:
             raise EOFError
         return typed
@@ -270,8 +310,12 @@ def _mock_full_happy_path(m: aioresponses) -> None:
     _mock_preflight(m)
     _mock_market(m)
     _mock_empty_order_lookups(m)
-    # Sampled twice: the pre-trade balance gate, then the reconciliation.
+    # Sampled THREE times now: the pre-trade balance gate, the pre-submit
+    # recheck that re-derives the approved snapshot, and finally the post-trade
+    # reconciliation. The middle one returns the SAME figure as the first —
+    # nothing moved while the operator typed, so the authorization stands.
     # 1000.00 - (15.00 cost + 0.039 fee) = 984.961.
+    m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
     m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
     m.post(_BALANCE_EX_URL, payload=_balance_payload("984.961"))
     m.post(
@@ -389,7 +433,7 @@ async def test_place_refuses_when_real_signed_requests_disabled(tmp_path, monkey
 )
 async def test_place_refuses_notional_outside_band(tmp_path, monkeypatch, volume):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -407,7 +451,7 @@ async def test_place_refuses_notional_outside_band(tmp_path, monkeypatch, volume
 
 async def test_place_refuses_when_daily_gross_would_exceed_cap(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     # 90 already today (terminal, so it does not block the lane) + 15 > 100.
     await _seed_kraken_row(db, size_usd="90.0", status="closed_tp")
@@ -443,7 +487,7 @@ async def test_daily_gross_ignores_rejected_and_other_days(tmp_path):
 
 async def test_place_refuses_when_price_violates_tick(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -464,7 +508,7 @@ async def test_place_refuses_when_price_violates_tick(tmp_path, monkeypatch):
 
 async def test_place_refuses_when_balance_does_not_cover(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -484,7 +528,7 @@ async def test_place_refuses_when_balance_does_not_cover(tmp_path, monkeypatch):
 # ======================================================================
 async def test_existing_open_kraken_row_blocks_the_lane(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     await _seed_kraken_row(
         db, size_usd="12.0", status="open", client_order_id="prior-cid-0001"
@@ -504,7 +548,7 @@ async def test_existing_open_kraken_row_blocks_the_lane(tmp_path, monkeypatch):
 
 async def test_needs_manual_review_row_blocks_the_lane(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     await _seed_kraken_row(
         db,
@@ -578,7 +622,7 @@ async def test_authorization_prefix_is_the_first_eight_chars(tmp_path, monkeypat
 # ======================================================================
 async def test_kill_switch_active_refuses_before_anything_else(tmp_path, monkeypatch):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     await runner._ks.trigger(
         triggered_by="manual", reason="ops halt", duration=timedelta(hours=4)
@@ -599,7 +643,7 @@ async def test_kill_switch_engaged_after_approval_aborts_before_submit(
     """The post-approval re-check is the one that matters: the intent row
     already exists, so the abort must also retire it."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
 
     real_is_active = runner._ks.is_active
@@ -683,7 +727,7 @@ async def test_validate_only_sends_validate_true_and_writes_no_ledger_row(
     tmp_path, monkeypatch
 ):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     # Deliberately under the emergency-revert posture: a venue-side dry run is
     # exempt, which is what makes the rehearsal exercise the real code path.
     runner, db, adapter = await _make_runner(
@@ -726,7 +770,7 @@ async def test_place_happy_path_persists_txid_fill_and_reconciles(
     tmp_path, monkeypatch
 ):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_full_happy_path(m)
@@ -775,12 +819,13 @@ async def test_place_reports_review_when_balance_delta_is_unexplained(
     """A balance that moved by something other than cost+fee is surfaced,
     never silently accepted."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
         _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("900.0"))  # -100, not -15.04
         m.post(
@@ -806,12 +851,13 @@ async def test_place_leaves_row_open_when_limit_order_is_still_resting(
     """A limit order that has not filled inside the window is FINE — the row
     stays open and the operator is told it is still working."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
         _mock_empty_order_lookups(m)
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("985.0"))
         m.post(
@@ -848,17 +894,22 @@ async def test_place_leaves_row_open_when_limit_order_is_still_resting(
 async def test_ambiguous_submission_resolved_accepted_is_adopted(tmp_path, monkeypatch):
     """The order DID land. Adopt it — never resend."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
         m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("984.961"))
         m.post(_ADD_ORDER_URL, exception=TimeoutError("connection dropped"))
         # Step 4 runs BEFORE the order exists, so the first OpenOrders read is
-        # an empty book; every later read (resolver probes, adoption lookup,
-        # post-trade listing) finds the order that landed.
+        # an empty book. The pre-submit recheck also runs before submission and
+        # must see the SAME empty book — a resting order appearing between the
+        # approval and the send is exactly what voids the authorization. Every
+        # later read (resolver probes, adoption lookup, post-trade listing) finds
+        # the order that landed.
+        m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}})
         m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}})
         m.post(
             _OPEN_ORDERS_URL,
@@ -889,7 +940,7 @@ async def test_ambiguous_submission_resolved_not_accepted_rejects_the_row(
     tmp_path, monkeypatch
 ):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -920,7 +971,7 @@ async def test_unresolved_submission_escalates_and_blocks_the_next_run(
 ):
     """Restart-cannot-forget: the block lives in the DB, not the process."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1113,7 +1164,7 @@ async def test_evidence_is_jsonlines_with_an_authorization_record_and_no_secrets
     tmp_path, monkeypatch
 ):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_full_happy_path(m)
@@ -1142,7 +1193,7 @@ async def test_evidence_survives_a_crash_mid_run(tmp_path, monkeypatch):
     """Every completed step is on disk before the next one starts, so an
     unexpected failure cannot cost the record of what already happened."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
 
     async def _boom(*_args, **_kwargs):
@@ -1295,7 +1346,7 @@ async def test_marketable_sell_is_capped_on_what_it_transacts_not_its_limit(
     into the book at ~mid. Bounding price*volume bounds nothing here: 1.5 units
     at a $10 limit reads as $15 while disposing of $150 at a $100 mid."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1320,7 +1371,7 @@ async def test_marketable_buy_is_capped_on_what_it_transacts(tmp_path, monkeypat
     """The same cap applies on the buy side — the check does not assume the
     fill price is the one field of an order that cannot surprise us."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1348,7 +1399,7 @@ async def test_ledger_records_exposure_taken_not_exposure_requested(
     """size_usd is the larger of the limit and market notionals, so the daily
     gross counts what the order can actually transact."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1356,6 +1407,7 @@ async def test_ledger_records_exposure_taken_not_exposure_requested(
         _mock_empty_order_lookups(m)
         # A resting limit BUY holds price*volume (18.0), not the mid-priced
         # figure — the hold follows the order, the cap follows the risk.
+        m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload("982.0"))
         m.post(
@@ -1400,7 +1452,7 @@ async def test_sell_checks_the_base_asset_balance(tmp_path, monkeypatch):
     """A sell is funded in BASE units, not quote — a full USD balance does not
     make an unfunded sell affordable."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1450,13 +1502,14 @@ async def test_sell_reconciliation_measures_the_base_asset(tmp_path, monkeypatch
     """The expected balance move on a sell is in BASE units — the tolerance
     band must be scaled to the sold quantity, not to a quote notional."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
         _mock_market(m)
         _mock_empty_order_lookups(m)
         # BTC balance before / after: 10.0 -> 9.85 (the 0.15 sold).
+        m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="10.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="10.0"))
         m.post(_BALANCE_EX_URL, payload=_balance_payload(xbt="9.85"))
         m.post(
@@ -1508,7 +1561,7 @@ async def test_resting_order_the_ledger_cannot_name_blocks_the_lane(
     web UI has no cl_ord_id we would think to ask about, so a ledger-driven
     check reports a clear lane while the account holds a live order."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1535,7 +1588,7 @@ async def test_venue_order_matching_a_blocking_row_is_not_counted_twice(
     tmp_path, monkeypatch
 ):
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     await _seed_kraken_row(
         db,
@@ -1570,7 +1623,7 @@ async def test_unreadable_open_order_listing_blocks_rather_than_reads_as_empty(
     """FAIL CLOSED: "no open orders" is what licenses a placement, so an
     unreadable listing must never stand in for an empty one."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_preflight(m)
@@ -1596,7 +1649,7 @@ async def test_post_trade_evidence_carries_the_venue_open_order_listing(
     """One-order-at-a-time is checkable from the evidence pack alone, without
     trusting the same ledger the run was writing."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
     with aioresponses() as m:
         _mock_full_happy_path(m)
@@ -1621,7 +1674,7 @@ async def test_row_appearing_during_the_approval_prompt_blocks_the_write(
     """Step 4 runs before an unbounded operator pause. A row that lands while
     the prompt is open must stop the write, not be overwritten by it."""
     _fix_decision_id(monkeypatch)
-    _authorize(monkeypatch, _DECISION[:8])
+    _authorize(monkeypatch, echo_token=True)
     runner, db, adapter = await _make_runner(tmp_path)
 
     real_fetch = kraken_pilot.fetch_blocking_rows
@@ -1949,3 +2002,220 @@ async def test_status_and_cancel_do_not_take_the_lock(tmp_path, monkeypatch):
 
     # No lock file was ever created — not created-and-removed, never taken.
     assert not kraken_pilot.pilot_lock_path(db_path).exists()
+
+
+# ======================================================================
+# Entry authorization: TTY, content binding, fresh-state recheck
+# ======================================================================
+#
+# The entry approval used to ask the operator to retype `decision_id[:8]` — the
+# prefix of a `uuid4()`. That token identified the RUN and bound none of its
+# TERMS, so retyping it asserted "I am here", not "I approve THIS order at THIS
+# price against THIS account state". It also accepted a PIPE, which is the
+# automation an approval boundary exists to exclude.
+
+
+class TestEntryAuthorizationRequiresATerminal:
+    async def test_a_pipe_carrying_the_correct_token_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """*** THE GAP THAT MADE THE ENTRY APPROVAL SCRIPTABLE. ***
+
+        EOF already caught `</dev/null`. A pipe is different: it carries the
+        right string and reads as a valid answer, so
+        `echo <token> | kraken_pilot place ...` authorized a real order with no
+        human anywhere. The entry OPENS exposure — there is no reading on which
+        it deserves a weaker gate than the exit that closes it.
+        """
+        _fix_decision_id(monkeypatch)
+        # tty=False: stdin is a pipe, not a terminal. echo_token still feeds the
+        # CORRECT token, so the only thing refusing here is the TTY requirement.
+        _authorize(monkeypatch, echo_token=True, tty=False)
+        runner, db, adapter = await _make_runner(tmp_path)
+        with aioresponses() as m:
+            _mock_full_happy_path(m)
+            code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_REFUSED
+        # Nothing reached the venue.
+        assert len(_posts_to(m, _ADD_ORDER_URL)) == 0
+        step = _step(_evidence_steps(tmp_path), "authorization")
+        assert step["outcome"] == "authorization_refused"
+        assert step["detail"] == "not_interactive"
+        await adapter.close()
+        await db.close()
+
+    async def test_a_closed_stdin_is_still_refused(self, tmp_path, monkeypatch):
+        _fix_decision_id(monkeypatch)
+        _authorize(monkeypatch, None)  # EOF
+        runner, db, adapter = await _make_runner(tmp_path)
+        with aioresponses() as m:
+            _mock_full_happy_path(m)
+            code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+        assert code == EXIT_REFUSED
+        assert len(_posts_to(m, _ADD_ORDER_URL)) == 0
+        await adapter.close()
+        await db.close()
+
+
+class TestEntryAuthorizationIsContentBound:
+    """The token is a digest over the order AND the state the screen showed."""
+
+    def _snap(self, **over):
+        base = dict(
+            decision_id="d-1",
+            pair="XBTUSD",
+            side="buy",
+            volume=Decimal("0.15"),
+            price=Decimal("100.0"),
+            client_order_id="c-1",
+            effective_notional=Decimal("15.0"),
+            available_balance=Decimal("1000.0"),
+            daily_gross_before=Decimal("0"),
+            daily_gross_cap=Decimal("50"),
+            venue_open_count=0,
+            maker_ceiling_pct=Decimal("0.16"),
+            taker_ceiling_pct=Decimal("0.26"),
+        )
+        base.update(over)
+        return kraken_pilot.build_entry_snapshot(**base)
+
+    def test_the_token_is_not_the_decision_id(self):
+        """*** THE DEFECT, NAMED. *** `decision_id[:8]` was a uuid4 prefix: it
+        bound no terms at all, which is the same defect class as the
+        `intent_uuid = str(uuid4())` this whole workstream began by closing."""
+        snap = self._snap(decision_id="6d1b345e-2821-40e2-ad83-4ecb18a06876")
+        token = kraken_pilot.entry_authorization_token(snap)
+        assert token != "6D1B345E"
+        assert token != "6d1b345e"
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("price", Decimal("101.0")),
+            ("volume", Decimal("0.16")),
+            ("side", "sell"),
+            ("pair", "ETHUSD"),
+            ("effective_notional", Decimal("16.0")),
+            ("available_balance", Decimal("999.0")),
+            ("daily_gross_before", Decimal("1")),
+            ("daily_gross_cap", Decimal("60")),
+            ("venue_open_count", 1),
+            ("maker_ceiling_pct", Decimal("0.17")),
+            ("taker_ceiling_pct", Decimal("0.27")),
+            ("client_order_id", "c-2"),
+            ("decision_id", "d-2"),
+        ],
+    )
+    def test_changing_any_bound_field_changes_the_token(self, field, value):
+        assert kraken_pilot.entry_authorization_token(
+            self._snap(**{field: value})
+        ) != kraken_pilot.entry_authorization_token(self._snap())
+
+    def test_representation_alone_does_not_change_the_token(self):
+        """`0.1500` and `0.15` are one price. Voiding an economically identical
+        approval trains the operator to retype tokens without reading them."""
+        assert kraken_pilot.entry_authorization_token(
+            self._snap(price=Decimal("100.000"), volume=Decimal("0.150"))
+        ) == kraken_pilot.entry_authorization_token(self._snap())
+
+    def test_an_entry_token_cannot_authorize_an_exit(self):
+        """Domain-separated, so a token minted for one lane can never authorize
+        the other even if the tuples were to collide."""
+        entry = kraken_pilot.entry_intent_digest({"a": "1"})
+        exit_ = kraken_pilot.exit_intent_digest({"a": "1"})
+        assert entry != exit_
+
+
+class TestEntryFreshStateRecheck:
+    """The state re-read immediately before submission must still match."""
+
+    async def _drive(self, tmp_path, monkeypatch, m_setup):
+        _fix_decision_id(monkeypatch)
+        _authorize(monkeypatch, echo_token=True)
+        runner, db, adapter = await _make_runner(tmp_path)
+        with aioresponses() as m:
+            m_setup(m)
+            code = await runner.place(side="buy", price=_PRICE, volume=_VOLUME)
+            posts = len(_posts_to(m, _ADD_ORDER_URL))
+        await adapter.close()
+        await db.close()
+        return code, posts
+
+    async def test_a_balance_that_moved_voids_the_authorization(
+        self, tmp_path, monkeypatch
+    ):
+        """The screen said the account held X. It no longer does, so the figures
+        the operator weighed are not the figures in force."""
+
+        def setup(m):
+            _mock_preflight(m)
+            _mock_market(m)
+            _mock_empty_order_lookups(m)
+            m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"))
+            # The recheck sees a DIFFERENT balance — something else spent.
+            m.post(_BALANCE_EX_URL, payload=_balance_payload("400.0"), repeat=True)
+            _mock_happy_fill(m)
+
+        code, posts = await self._drive(tmp_path, monkeypatch, setup)
+        assert code == EXIT_REFUSED
+        assert posts == 0, "an order was sent against state nobody approved"
+        step = _step(_evidence_steps(tmp_path), "pre_write_recheck")
+        assert step["outcome"] == "authorization_void"
+        assert any("available_balance" in d for d in step["differences"])
+
+    async def test_an_order_appearing_on_the_venue_voids_the_authorization(
+        self, tmp_path, monkeypatch
+    ):
+        """Including one placed from the web UI, which takes none of our locks."""
+
+        def setup(m):
+            _mock_preflight(m)
+            _mock_market(m)
+            m.post(_BALANCE_EX_URL, payload=_balance_payload("1000.0"), repeat=True)
+            m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}})
+            m.post(
+                _OPEN_ORDERS_URL,
+                payload={
+                    "error": [],
+                    "result": {"open": {_TXID: _filled_order_row()}},
+                },
+                repeat=True,
+            )
+            m.post(
+                _CLOSED_ORDERS_URL,
+                payload={"error": [], "result": {"closed": {}}},
+                repeat=True,
+            )
+            _mock_happy_fill(m)
+
+        code, posts = await self._drive(tmp_path, monkeypatch, setup)
+        assert code == EXIT_REFUSED
+        assert posts == 0
+
+    async def test_an_unchanged_world_still_places_the_order(
+        self, tmp_path, monkeypatch
+    ):
+        """*** GUARD ON THE GUARD. ***
+
+        Without this, every test above would pass on a recheck that refuses
+        unconditionally — which would be a pilot that can never trade.
+        """
+        code, posts = await self._drive(tmp_path, monkeypatch, _mock_full_happy_path)
+        assert code == EXIT_OK
+        assert posts == 1
+        step = _step(_evidence_steps(tmp_path), "pre_write_recheck")
+        assert step["outcome"] == "clear"
+        assert step["digest"]
+
+    async def test_the_evidence_records_the_approved_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """An evidence pack has to show WHAT was approved, not merely that
+        something was."""
+        await self._drive(tmp_path, monkeypatch, _mock_full_happy_path)
+        step = _step(_evidence_steps(tmp_path), "authorization")
+        assert step["outcome"] == "authorized"
+        snapshot = step["approved_snapshot"]
+        assert snapshot["price"] and snapshot["volume"]
+        assert snapshot["available_balance"]
+        assert step["approved_digest"]
