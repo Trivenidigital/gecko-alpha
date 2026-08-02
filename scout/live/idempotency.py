@@ -124,6 +124,37 @@ async def record_pending_order(
     """
     if db._conn is None or db._txn_lock is None:
         raise RuntimeError("Database not initialized.")
+
+    # *** REFUSE A BROKEN BINDING AT THE WRITE, NOT AT RECOVERY. ***
+    # `intent_hash` asserts that `client_order_id` was DERIVED from it at this
+    # venue. `OrderRequest`'s three binding fields are independently optional, so a
+    # caller that sets `intent_hash` and lets the adapter fall back to the legacy
+    # uuid-derived cid writes a row that is broken at birth — and boot
+    # reconciliation then terminalizes that healthy, filled position to
+    # `needs_manual_review` without ever asking the venue about it.
+    #
+    # Detecting it here turns a caller mistake into a refused write; detecting it
+    # at recovery turns the same mistake into an orphaned real position. Raising
+    # before the INSERT means no row exists to be misread.
+    if intent_hash is not None:
+        from scout.live.order_id import VENUE_ORDER_ID_FORMS
+
+        form = VENUE_ORDER_ID_FORMS.get(venue)
+        if form is None:
+            raise ValueError(
+                f"intent_hash was supplied for venue {venue!r}, which declares no "
+                "client-order-id form; the binding could never be verified"
+            )
+        expected = form.render(intent_hash)
+        if client_order_id != expected:
+            raise ValueError(
+                f"client_order_id {client_order_id!r} is not the id "
+                f"intent_hash {intent_hash[:12]}… mints at {venue!r}. Pass the id "
+                "from scout.live.order_id.client_order_id_for_venue, or omit "
+                "intent_hash — a row asserting a binding it does not have is worse "
+                "than a row asserting none."
+            )
+
     from datetime import datetime, timezone
 
     now_iso = datetime.now(timezone.utc).isoformat()

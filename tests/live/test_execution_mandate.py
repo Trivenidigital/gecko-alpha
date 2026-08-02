@@ -362,6 +362,71 @@ class TestSupervisedHistory:
         finally:
             await db.close()
 
+    async def test_rows_that_never_completed_do_not_count(self, tmp_path):
+        """*** A POSITION WHOSE ACCOUNTING IS UNRESOLVED IS NOT SUPERVISED HISTORY. ***
+
+        `entry_fill_qty IS NOT NULL` alone counts a row whose ENTRY filled and whose
+        EXIT then failed: `live_evaluator` sets such a row to
+        `needs_manual_review` and leaves `entry_fill_qty` and `mandate_mode` intact.
+        That is a trade that already paged the operator — the CEX analogue of a
+        Solana swap stuck at `finalized`, which the dex branch has always refused to
+        count. Reachable with no DB surgery at all.
+        """
+        db = Database(str(tmp_path / "s.db"))
+        await db.initialize()
+        try:
+            await _seed_supervised_cex(db, 3, status="needs_manual_review")
+            with pytest.raises(MandateRefused) as exc:
+                await _mandate(db, **self._AUTO).authorize(
+                    _intent(mode="BOUNDED_AUTONOMOUS"), at=_T0
+                )
+            assert "there are 0" in exc.value.message
+        finally:
+            await db.close()
+
+    async def test_open_rows_do_not_count(self, tmp_path):
+        db = Database(str(tmp_path / "s.db"))
+        await db.initialize()
+        try:
+            await _seed_supervised_cex(db, 3, status="open")
+            with pytest.raises(MandateRefused) as exc:
+                await _mandate(db, **self._AUTO).authorize(
+                    _intent(mode="BOUNDED_AUTONOMOUS"), at=_T0
+                )
+            assert "there are 0" in exc.value.message
+        finally:
+            await db.close()
+
+    async def test_history_earned_on_one_venue_does_not_promote_another(self, tmp_path):
+        """*** A FLAG MUST NOT MOVE EARNED AUTONOMY ONTO UNEARNED GROUND. ***
+
+        Counting per FAMILY means three supervised Binance fills promote Kraken —
+        a venue with no supervised history whatsoever — the moment an operator adds
+        "kraken" to the allowlist. The count would then be settled by the ledger for
+        a venue nobody traded, which is the precondition being satisfiable by
+        configuration after all.
+        """
+        db = Database(str(tmp_path / "s.db"))
+        await db.initialize()
+        try:
+            await _seed_supervised_cex(db, 3, venue="binance")
+            # Binance is promotable...
+            decision = await _mandate(db, **self._AUTO).authorize(
+                _intent(mode="BOUNDED_AUTONOMOUS", preferred_venue="binance"), at=_T0
+            )
+            assert decision.supervised_reconciled == 3
+            # ...and Kraken, on the same allowlist and the same family, is not.
+            with pytest.raises(MandateRefused) as exc:
+                await _mandate(db, **self._AUTO).authorize(
+                    _intent(mode="BOUNDED_AUTONOMOUS", preferred_venue="kraken"),
+                    at=_T0,
+                )
+            assert exc.value.gate == "supervised_history"
+            assert "there are 0" in exc.value.message
+            assert "'kraken'" in exc.value.message
+        finally:
+            await db.close()
+
     async def test_rows_with_no_entry_fill_do_not_count(self, tmp_path):
         """An order that never filled is not a completed supervised execution."""
         db = Database(str(tmp_path / "s.db"))
@@ -439,7 +504,7 @@ class TestSupervisedHistory:
             # reachable only through the private counter — asserted directly
             # rather than through a family the type system forbids.
             with pytest.raises(MandateRefused) as exc:
-                await mandate._count_supervised("futures")
+                await mandate._count_supervised("futures", venue="binance")
             assert exc.value.gate == "supervised_history"
         finally:
             await db.close()
@@ -467,6 +532,8 @@ async def _seed_supervised_cex(
     *,
     mandate_mode: str | None = "SUPERVISED_LIVE",
     entry_fill_qty: str | None = "1.0",
+    status: str = "closed_tp",
+    venue: str = "binance",
 ) -> None:
     """Seed `count` completed supervised CEX executions.
 
@@ -491,8 +558,8 @@ async def _seed_supervised_cex(
             "INSERT INTO live_trades (paper_trade_id, coin_id, symbol, venue, pair, "
             "signal_type, size_usd, status, created_at, client_order_id, "
             "entry_fill_qty, mandate_mode) "
-            "VALUES (?, 'c', 'SYM', 'binance', 'SYMUSDT', 'first_signal', '100', "
-            "'closed_tp', '2026-08-01T00:00:00', ?, ?, ?)",
-            (pt_id, f"cid-{i}", entry_fill_qty, mandate_mode),
+            "VALUES (?, 'c', 'SYM', ?, 'SYMUSDT', 'first_signal', '100', "
+            "?, '2026-08-01T00:00:00', ?, ?, ?)",
+            (pt_id, venue, status, f"cid-{venue}-{i}", entry_fill_qty, mandate_mode),
         )
     await db._conn.commit()

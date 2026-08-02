@@ -25,6 +25,21 @@ belong together. :meth:`ExecutionReceipt.verify_binding` re-derives the venue's 
 form from the intent and compares. A mismatch means the row and the order are about
 different trades, which is precisely the state a reconciler must not resume from.
 
+**What it establishes, and where it stops.** The CEX direction is real: the venue
+echoes back a ``client_order_id`` that must be the one the intent mints. The DEX
+direction is NOT yet establishable and this module says so by answering ``False``
+rather than by relaxing the standard — ``solana_executions`` carries no
+``intent_hash``, so a DEX receipt's hash is supplied by the caller, and comparing a
+value to the value the caller passed in verifies nothing. Closing that needs the
+hash recorded on the execution row at write time. Until then a DEX receipt is
+unverified, and unverified is what it reports.
+
+Even on the CEX side the guarantee is bounded, and the bound is worth stating: the
+id carries a PREFIX of the hash (22 hex at Binance, 32 at Kraken of 64), so the
+check establishes that the id and the hash agree — not that the hash matches the
+terms. ``TradeIntent.verify()`` is what checks terms against a hash, and it needs
+the terms, which no ledger row stores.
+
 Statuses are normalized, not reinterpreted
 ------------------------------------------
 Both providers' terminal vocabularies are mapped onto five words. The mapping is
@@ -164,10 +179,25 @@ class ExecutionReceipt:
         if self.intent_hash is None or self.intent_hash != intent.intent_hash:
             return False
         if self.client_order_id is None:
-            # Providers with no client-order-id concept (Solana) bind through the
-            # hash alone, which the check above already made. Requiring an id they
-            # cannot produce would make every DEX receipt unverifiable.
-            return self.venue_family == "dex"
+            # *** NO CLIENT ORDER ID MEANS NO BINDING THIS METHOD CAN ESTABLISH. ***
+            # An earlier version returned True here for `venue_family == "dex"`,
+            # reasoning that Solana has no client-order-id concept so the hash
+            # alone had to do. That was wrong, and an adversarial review broke it
+            # by executing the counterexample: `solana_executions` has no
+            # `intent_hash` column, so the hash on a DEX receipt is whatever the
+            # CALLER passed in — and `venue_ref`, the actual transaction
+            # signature, is compared to nothing. A receipt built from trade A's
+            # execution row and stamped with intent B's hash verified against
+            # intent B.
+            #
+            # Comparing a value to the value the caller supplied is not
+            # verification. So this answers False, which is the truth: the binding
+            # has not been established. Making it establishable needs evidence the
+            # ledger does not yet carry — an `intent_hash` recorded on
+            # `solana_executions` at `record_execution` time, so the hash is
+            # something the row asserts rather than something the caller claims.
+            # Recorded as the follow-up rather than papered over with a True.
+            return False
         return derives_from_intent(self.client_order_id, intent, self.venue)
 
 

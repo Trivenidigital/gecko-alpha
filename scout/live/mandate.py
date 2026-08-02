@@ -12,10 +12,26 @@ already the most autonomous execution surface in the tree, and the only things
 standing in front of it are three boolean flags whose job is "is live trading wired
 up", not "is autonomous execution authorized".
 
-So this module is the authority both families ask. Solana keeps its own three locks
-and gains this one on top (strictly additive: it can refuse a promotion the lane would
-have allowed, never permit one the lane would have refused). The CEX path gets its
-first autonomy gate.
+So this module is the authority both families ask **before executing autonomously**.
+Solana keeps its own three locks and gains this one on top (strictly additive: it can
+refuse a promotion the lane would have allowed, never permit one the lane would have
+refused). The signal-driven CEX path gets its first autonomy gate.
+
+*** WHAT THIS MANDATE DOES NOT COVER, STATED SO NOBODY INFERS OTHERWISE. ***
+Two operator-invoked CLIs place real orders and do NOT consult it:
+
+* ``scout/live/kraken_pilot.py`` — places a Kraken limit entry behind
+  ``KRAKEN_PILOT_ENABLED`` plus a typed per-trade authorization.
+* ``scout/live/solana_lane.py`` under ``SUPERVISED_LIVE`` — the lane consults this
+  mandate only on the ``BOUNDED_AUTONOMOUS`` branch, because that is the branch this
+  gate is about.
+
+That is deliberate, not an oversight: those paths have a human typing an
+authorization per trade, which is a stronger gate than any config value, and routing
+them through a mandate that ships DISABLED would break the very supervised
+executions the autonomous bar is counted from. The consequence to hold in mind is
+that "the mandate is inactive" means "nothing executes AUTONOMOUSLY", not "nothing
+executes".
 
 Every default refuses
 ---------------------
@@ -90,6 +106,19 @@ SOLANA_STATE_RECONCILED = "reconciled"
 #: absent from here cannot reach ``BOUNDED_AUTONOMOUS`` at all, because there would be
 #: no ledger to settle the claim "we did the supervised trades".
 _SUPERVISED_LEDGERS = ("cex", "dex")
+
+#: The ``live_trades.status`` values that mean a supervised CEX execution actually
+#: COMPLETED — entered and exited, with the money accounted for. Deliberately
+#: excludes ``open`` (not finished), ``rejected`` (never a position) and
+#: ``needs_manual_review`` (the exit failed or partialed; the accounting is exactly
+#: what nobody has resolved). Mirrors the dex branch's insistence on ``reconciled``
+#: rather than merely ``finalized``.
+CEX_COMPLETED_STATUSES = (
+    "closed_tp",
+    "closed_sl",
+    "closed_duration",
+    "closed_via_reconciliation",
+)
 
 
 class MandateRefused(Exception):
@@ -355,7 +384,9 @@ class ExecutionMandate:
         # -- 8. Recorded supervised history (BOUNDED_AUTONOMOUS only) ---------
         supervised: int | None = None
         if mode == MODE_BOUNDED_AUTONOMOUS:
-            supervised = await self._count_supervised(intent.venue_family)
+            supervised = await self._count_supervised(
+                intent.venue_family, venue=intent.preferred_venue
+            )
             required = int(
                 getattr(
                     self._s,
@@ -375,7 +406,8 @@ class ExecutionMandate:
                     "supervised_history",
                     f"BOUNDED_AUTONOMOUS requires {required} completed supervised "
                     f"execution(s) recorded for venue_family "
-                    f"{intent.venue_family!r}; there "
+                    f"{intent.venue_family!r} at venue "
+                    f"{intent.preferred_venue!r}; there "
                     f"{'is' if supervised == 1 else 'are'} {supervised}. Run under "
                     "SUPERVISED_LIVE until that many have reached a reconciled "
                     "terminal state. This is counted from the ledger and cannot be "
@@ -407,7 +439,14 @@ class ExecutionMandate:
             max_open = int(
                 getattr(self._s, "LIVE_EXECUTION_MANDATE_MAX_OPEN_POSITIONS", 0)
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, ArithmeticError):
+            # ArithmeticError is not decoration: int(float('inf')) raises
+            # OverflowError and int(Decimal('NaN')) raises InvalidOperation, both
+            # ArithmeticError subclasses and neither a ValueError. `settings` is
+            # typed Any — LiveEngine passes `config._s`, tests pass namespaces — so
+            # pydantic's own finite-number validation is not on every path here.
+            # An escaping OverflowError would leave the gate raising something the
+            # caller does not catch, which is a refusal that reads as a crash.
             max_open = 0
 
         missing = [
@@ -441,20 +480,39 @@ class ExecutionMandate:
         )
 
     # ------------------------------------------------------------------
-    async def _count_supervised(self, venue_family: str) -> int:
-        """Completed supervised executions recorded in the ledger for this family.
+    async def _count_supervised(self, venue_family: str, *, venue: str) -> int:
+        """Completed supervised executions recorded in the ledger, for this VENUE.
 
         The precondition a flag cannot fake. Each family reads its own ledger:
 
         * ``dex`` → ``solana_executions`` rows at ``state='reconciled'`` under
           ``mode='SUPERVISED_LIVE'``. Reconciled, not merely finalized: a swap that
           landed but whose accounting could not be explained is exactly the history
-          that should NOT count toward promotion.
+          that should NOT count toward promotion. That table has no venue column —
+          it is the Solana lane's own ledger and every row in it is that one lane —
+          so the dex count is necessarily lane-scoped rather than venue-scoped.
         * ``cex`` → ``live_trades`` rows written under ``mandate_mode='SUPERVISED_LIVE'``
-          that carry a real entry fill. There is no ``mandate_mode`` on any row that
+          that carry a real entry fill AND reached a CLOSED terminal status AND are on
+          the venue being promoted. There is no ``mandate_mode`` on any row that
           predates this module, so the count starts at zero and the only way to raise
-          it is to actually run supervised executions through this path. That is the
-          intended property, not a migration gap.
+          it is to actually run supervised executions through this path.
+
+        *** COUNTED PER VENUE, NOT PER FAMILY. ***
+        A family-wide count means three supervised Binance fills promote KRAKEN —
+        a venue with no supervised history at all — as soon as an operator adds
+        "kraken" to the allowlist. That would make a FLAG the thing that moves
+        earned autonomy onto unearned ground, which is exactly what "a precondition
+        configuration cannot fake" is supposed to rule out.
+
+        *** CLOSED, NOT MERELY FILLED. ***
+        ``entry_fill_qty IS NOT NULL`` alone counts a row whose ENTRY filled and
+        whose EXIT then failed: ``live_evaluator`` sets such a row to
+        ``needs_manual_review`` and leaves ``entry_fill_qty`` and ``mandate_mode``
+        intact. That is a position whose accounting is unresolved and which has
+        already paged the operator — the CEX analogue of a Solana swap stuck at
+        ``finalized``, and the dex branch has always refused to count those. The
+        status filter makes the two branches hold the same standard instead of the
+        docstring claiming they do.
 
         A missing table, an unreadable ledger or an unknown family all return a
         refusal rather than a zero-that-looks-like-a-count — "the database could not
@@ -482,11 +540,13 @@ class ExecutionMandate:
             )
             params: tuple[Any, ...] = (SOLANA_STATE_RECONCILED, MODE_SUPERVISED_LIVE)
         else:
+            placeholders = ",".join("?" for _ in CEX_COMPLETED_STATUSES)
             sql = (
                 "SELECT COUNT(*) FROM live_trades "
-                "WHERE mandate_mode = ? AND entry_fill_qty IS NOT NULL"
+                "WHERE mandate_mode = ? AND venue = ? AND entry_fill_qty IS NOT NULL "
+                f"AND status IN ({placeholders})"
             )
-            params = (MODE_SUPERVISED_LIVE,)
+            params = (MODE_SUPERVISED_LIVE, venue, *CEX_COMPLETED_STATUSES)
         try:
             cur = await db._conn.execute(sql, params)
             row = await cur.fetchone()

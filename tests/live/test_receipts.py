@@ -244,17 +244,50 @@ class TestBinding:
         )
         assert not receipt.verify_binding(_intent(side="sell"))
 
-    def test_a_dex_receipt_binds_through_the_hash_alone(self):
-        """Solana has no client-order-id concept. Requiring one it cannot produce
-        would make every DEX receipt unverifiable; inventing one would assert a
-        binding the chain cannot corroborate."""
+    def test_a_dex_receipt_reports_itself_unverified(self):
+        """*** COMPARING A VALUE TO THE VALUE THE CALLER SUPPLIED IS NOT
+        VERIFICATION. ***
+
+        An earlier version returned True here on hash equality alone, reasoning
+        that Solana has no client-order-id so the hash had to do. An adversarial
+        review broke it: `solana_executions` has no `intent_hash` column, so the
+        hash on a DEX receipt is whatever the caller passed in, and `venue_ref` —
+        the actual transaction signature — is compared to nothing. A receipt built
+        from trade A's execution row and stamped with intent B's hash verified
+        against intent B.
+
+        False is the truthful answer until the hash is recorded on the execution
+        row at write time, so it is something the row asserts rather than something
+        the caller claims.
+        """
         intent = _intent(venue_family="dex", chain="solana", preferred_venue="jupiter")
         receipt = receipt_from_solana_execution(
             {"state": "reconciled", "expected_signature": "sig"},
             intent_hash=intent.intent_hash,
         )
         assert receipt.client_order_id is None
-        assert receipt.verify_binding(intent)
+        assert not receipt.verify_binding(intent)
+
+    def test_the_counterexample_that_broke_the_old_dex_path(self):
+        """The exact refutation, kept as a regression: a receipt built from trade
+        A's execution row must not verify against intent B just because the caller
+        stamped B's hash on it."""
+        intent_a = _intent(
+            venue_family="dex", chain="solana", preferred_venue="jupiter"
+        )
+        intent_b = _intent(
+            venue_family="dex",
+            chain="solana",
+            preferred_venue="jupiter",
+            exact_quantity=D("999"),
+            maximum_notional=D("999"),
+        )
+        forged = receipt_from_solana_execution(
+            {"state": "reconciled", "expected_signature": "SIGNATURE_OF_TRADE_A"},
+            intent_hash=intent_b.intent_hash,
+        )
+        assert not forged.verify_binding(intent_b)
+        assert not forged.verify_binding(intent_a)
 
     def test_a_dex_receipt_with_the_wrong_hash_does_not_verify(self):
         intent = _intent(venue_family="dex", chain="solana", preferred_venue="jupiter")

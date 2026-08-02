@@ -1,6 +1,27 @@
-"""*** AN INACTIVE MANDATE CANNOT PLACE AN ORDER, LOAD A SIGNER, OR BROADCAST. ***
+"""*** AN INACTIVE MANDATE CANNOT PLACE AN ORDER *AUTONOMOUSLY*. ***
 
 Step 12 of the venue-neutral execution plan, and the test the whole gate is worth.
+
+THE SCOPE OF THE CLAIM, STATED EXACTLY
+--------------------------------------
+An earlier draft of this file claimed "no code path in this repository can place a
+CEX order". That is FALSE, and an adversarial review refuted it by executing a
+counterexample: ``scout/live/kraken_pilot.py`` reaches Kraken ``AddOrder`` with the
+mandate at its shipped default, because it never consults the mandate at all.
+
+The claim these tests actually establish, and the only one worth making:
+
+    With the mandate inactive, no AUTONOMOUS path — nothing that fires from a
+    signal without a human in the loop — can place a CEX order, and the mandate
+    cannot be opened from code.
+
+``kraken_pilot`` and the ``SUPERVISED_LIVE`` Solana lane are outside that scope on
+purpose: each requires a human to type a per-trade authorization, which is a
+stronger gate than any config value. See ``scout/live/mandate.py``'s module
+docstring for why routing them through a mandate that ships DISABLED would break
+the supervised executions the autonomous bar is counted from.
+``test_the_supervised_clis_are_the_only_uncovered_submit_sites`` below pins that
+exclusion list, so a THIRD uncovered submit site cannot appear quietly.
 
 Two halves, because either alone is defeatable:
 
@@ -528,6 +549,64 @@ class TestTheGateCannotBeBypassed:
             if "LIVE_EXECUTION_MANDATE_ENABLED" in text and "true" in text.lower():
                 offenders.append(str(path.relative_to(_ROOT)))
         assert offenders == [], f"{offenders} ship the mandate enabled"
+
+
+class TestTheScopeOfTheClaim:
+    """The exclusion list is pinned, so it cannot grow quietly."""
+
+    #: Modules that reach a CEX venue WITHOUT consulting the mandate. Each is an
+    #: operator-invoked CLI requiring a typed per-trade authorization — a stronger
+    #: gate than any config value, and the reason routing them through a mandate
+    #: that ships DISABLED would break the supervised executions the autonomous bar
+    #: is counted from. A THIRD entry appearing here is a new ungated path and
+    #: must be a deliberate decision, not a diff nobody read.
+    _EXPECTED_UNGATED = {"scout/live/kraken_pilot.py"}
+
+    def test_the_supervised_clis_are_the_only_uncovered_submit_sites(self):
+        import ast
+
+        # Direct calls to a Kraken/Binance order-placing method, anywhere in the
+        # package, outside the adapters that define them and the engine that is
+        # gated.
+        submit_methods = {
+            "place_limit_order",
+            "place_order_request",
+            "send_order",
+            "place_exit_order",
+        }
+        defining = {
+            "scout/live/adapter_base.py",
+            "scout/live/kraken_adapter.py",
+            "scout/live/binance_adapter.py",
+            "scout/live/ccxt_adapter.py",
+            "scout/live/engine.py",  # gated; asserted by the tests above
+            "scout/live/live_evaluator.py",  # exits only; never opens exposure
+        }
+        callers: set[str] = set()
+        for path in sorted(_SCOUT.rglob("*.py")):
+            rel = str(path.relative_to(_ROOT)).replace("\\", "/")
+            if rel in defining:
+                continue
+            for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in submit_methods
+                ):
+                    callers.add(rel)
+        assert callers == self._EXPECTED_UNGATED, (
+            f"submit sites outside the mandate changed: {callers}. Every module "
+            "here places real orders without consulting ExecutionMandate — adding "
+            "one is a decision, not an implementation detail."
+        )
+
+    def test_the_module_docstring_records_the_exclusions(self):
+        """The scope of the claim has to be readable where the claim is made."""
+        from scout.live import mandate as mandate_mod
+
+        doc = mandate_mod.__doc__ or ""
+        assert "kraken_pilot" in doc
+        assert "SUPERVISED_LIVE" in doc
 
 
 class TestTheShippedDefaultIsClosed:

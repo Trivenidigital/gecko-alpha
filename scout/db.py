@@ -9636,6 +9636,30 @@ class Database:
             "no_adapter_for_venue",
         )
 
+        # *** PRAGMA foreign_keys MUST BE SET BEFORE `BEGIN`. ***
+        # SQLite documents it as a no-op inside a transaction, so setting it after
+        # BEGIN would silently leave enforcement ON and the defect below live.
+        #
+        # WHY IT HAS TO BE OFF AT ALL: `DROP TABLE live_trades` performs an implicit
+        # DELETE of every row, which FIRES child foreign-key ACTIONS.
+        # `solana_executions.live_trade_id` is declared
+        # `REFERENCES live_trades(id) ON DELETE SET NULL` — so a rebuild with
+        # enforcement on permanently NULLs every Solana execution's link to its
+        # ledger row. Nothing detects it: `PRAGMA foreign_key_check` stays clean
+        # because SET NULL is a legal outcome, not a violation. The runtime cost is
+        # concrete — `_recover_interrupted_executions` calls `retire_row(...
+        # live_trade_id)`, which returns early on None, so an interrupted execution
+        # strands its `live_trades` row `open` forever, counting against the lane's
+        # exposure and concurrency caps.
+        #
+        # This is NEW to this migration and not a latent flaw in the pattern it
+        # copies: `_migrate_reject_reason_extend_v2` (20260514) predates
+        # `solana_executions` (20260801), so this is the first live_trades rebuild
+        # that has an FK child at all.
+        #
+        # This is SQLite's own documented 12-step ALTER TABLE procedure: disable
+        # enforcement, rebuild, verify with foreign_key_check, commit, re-enable.
+        await conn.execute("PRAGMA foreign_keys=OFF")
         try:
             await conn.execute("BEGIN EXCLUSIVE")
             await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
@@ -9719,6 +9743,32 @@ class Database:
                     )
                     continue
 
+                # *** CAPTURE EVERY INDEX, DO NOT ENUMERATE THEM. ***
+                # DROP TABLE takes the table's indexes with it. An enumerated
+                # recreate list is a list that goes stale the moment someone adds
+                # an index in another migration — and it goes stale SILENTLY: the
+                # rebuild still succeeds, the index is simply gone. Reading the
+                # CREATE statements out of sqlite_master and replaying them cannot
+                # drift. (`sql IS NULL` for auto-indexes backing UNIQUE/PK
+                # constraints; those come back with the table definition itself.)
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name=? AND sql IS NOT NULL",
+                    (table,),
+                )
+                index_ddl = [r[0] for r in await cur.fetchall()]
+
+                # AUTOINCREMENT's contract is that an id is never reused. The
+                # rebuild resets `sqlite_sequence`, so ids above the surviving
+                # max(id) become allocatable again — and live_trade ids are quoted
+                # in evidence files, Telegram messages and Solana execution rows,
+                # where a reused id names a different trade.
+                cur = await conn.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name=?", (table,)
+                )
+                seq_row = await cur.fetchone()
+                prior_seq = seq_row[0] if seq_row is not None else None
+
                 if table == "live_trades":
                     await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
                     await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
@@ -9731,11 +9781,30 @@ class Database:
                 await conn.execute(f"DROP TABLE {table}")
                 await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
 
+                for ddl in index_ddl:
+                    await conn.execute(ddl)
+
+                if prior_seq is not None:
+                    # UPDATE-then-INSERT rather than UPSERT: `sqlite_sequence` is an
+                    # internal table with NO primary key and NO unique constraint,
+                    # so `ON CONFLICT(name)` raises "does not match any PRIMARY KEY
+                    # or UNIQUE constraint".
+                    cur = await conn.execute(
+                        "UPDATE sqlite_sequence SET seq=? WHERE name=?",
+                        (prior_seq, table),
+                    )
+                    if cur.rowcount == 0:
+                        await conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                            (table, prior_seq),
+                        )
+
                 if table == "live_trades":
-                    # The UNIQUE partial index on client_order_id lives on the
-                    # table, so the rebuild dropped it. Recreating it is not
-                    # optional: it is the DB-layer backstop that stops a concurrent
-                    # retry double-submitting.
+                    # Belt to the capture-and-replay braces: v2's rebuild did NOT
+                    # recreate this index, so a database migrated by v2 may reach
+                    # here without it — in which case there was nothing to capture.
+                    # It is the DB-layer backstop that stops a concurrent retry
+                    # double-submitting, so it is recreated unconditionally.
                     await conn.execute(
                         "CREATE UNIQUE INDEX IF NOT EXISTS "
                         "idx_live_trades_client_order_id "
@@ -9794,6 +9863,58 @@ class Database:
                     "ON live_trades(mandate_mode) WHERE mandate_mode IS NOT NULL"
                 )
 
+            # ---- Part 3: POST-CONDITIONS, checked before the marker ------
+            #
+            # *** THE MARKER IS A CLAIM THAT THE MIGRATION WORKED. ***
+            # Every `continue` above is a path where a regex did not match the
+            # table's actual DDL — a quoted name shape, a NOT NULL before the
+            # CHECK, a named constraint, a COLLATE clause. Those log a warning and
+            # move on. Without this block the marker is still written, the
+            # migration is permanently recorded as applied, and it never retries:
+            # `reject_reason='mandate_inactive'` then raises IntegrityError forever
+            # and every mandate refusal becomes invisible. That is precisely the
+            # "fail-closed gate whose audit trail fails open" this widening exists
+            # to prevent — reintroduced by the migration meant to prevent it.
+            #
+            # So the post-condition is asserted against the DATABASE, not inferred
+            # from the fact that no exception was raised. A failure here rolls the
+            # whole transaction back, leaving the migration un-marked and therefore
+            # retried on the next boot with the operator holding a loud error.
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue  # table genuinely absent — nothing was claimed for it
+                missing = [r for r in new_reasons if r not in (row[0] or "")]
+                if missing:
+                    raise RuntimeError(
+                        f"{migration}: {table}.reject_reason CHECK still refuses "
+                        f"{missing}; the rewrite did not match this table's DDL. "
+                        "Refusing to record the migration as applied — fix the "
+                        "rewrite rather than shipping a gate whose refusals raise."
+                    )
+            cur = await conn.execute("PRAGMA table_info(live_trades)")
+            live_cols = {r[1] for r in await cur.fetchall()}
+            if live_cols and not {"intent_hash", "mandate_mode"} <= live_cols:
+                raise RuntimeError(
+                    f"{migration}: live_trades is missing "
+                    f"{ {'intent_hash', 'mandate_mode'} - live_cols }"
+                )
+
+            # Foreign keys were disabled for the rebuild; prove nothing was left
+            # dangling before committing. `foreign_key_check` returns one row per
+            # violation, so an empty result is the pass.
+            cur = await conn.execute("PRAGMA foreign_key_check")
+            violations = list(await cur.fetchall())
+            if violations:
+                raise RuntimeError(
+                    f"{migration}: rebuild left {len(violations)} foreign-key "
+                    f"violation(s), first={violations[0]}"
+                )
+
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                 "VALUES (?, ?)",
@@ -9817,3 +9938,8 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration)
             raise
+        finally:
+            # Restore enforcement on every exit path. Leaving it OFF would silently
+            # disable foreign keys for the entire process lifetime — every writer
+            # after this point, not just the migration.
+            await conn.execute("PRAGMA foreign_keys=ON")

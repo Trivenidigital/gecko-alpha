@@ -288,6 +288,78 @@ class TestFailClosed:
             await db.close()
 
 
+class TestTheOnDemandListingsPath:
+    """*** THE FIRST-EVER SIGNAL ON A TOKEN TAKES A DIFFERENT QUERY. ***
+
+    `get_candidates` reads `venue_listings`, and when that comes back empty it
+    fetches metadata from the adapters and RE-READS. The two reads were separate
+    string literals; widening the column list updated only the first, so the
+    re-read returned 3 columns into a 4-tuple unpack. Every first-ever signal on a
+    token raised ValueError out of routing — past `_dispatch_live`'s
+    NoRoutableVenue handler, so no reject row, no metric, and nothing in the log
+    for an operator auditing refusals to find.
+
+    No test covered this path before; it is the one branch a fixture that seeds
+    `venue_listings` upfront can never reach.
+    """
+
+    async def test_a_first_ever_signal_routes_through_the_on_demand_fetch(
+        self, tmp_path
+    ):
+        from scout.live.adapter_base import VenueMetadata as _VM
+
+        db = await _db_with_listings(tmp_path, [])  # deliberately EMPTY
+
+        class _FetchingAdapter(_Adapter):
+            async def fetch_venue_metadata(self, canonical):
+                return _VM(
+                    venue="binance",
+                    canonical=canonical,
+                    venue_pair=f"{canonical}USDT",
+                    quote="USDT",
+                    asset_class="spot",
+                    min_size=None,
+                    tick_size=None,
+                    lot_size=None,
+                )
+
+        try:
+            adapter = _FetchingAdapter("binance", _BINANCE_CAPS)
+            routed = await _select(_routing(db, {"binance": adapter}))
+            assert routed.venue == "binance"
+            assert routed.venue_pair == "SYMUSDT"
+            # The quote came back from the re-read, not from a default — an intent
+            # cannot be minted without it.
+            assert routed.candidate.quote == "USDT"
+            assert routed.candidate.asset_class == "spot"
+        finally:
+            await db.close()
+
+    async def test_the_two_listing_reads_are_the_same_query(self):
+        """Structural guard on the fix: the constant exists and is used at both
+        sites, so the column lists cannot drift apart again."""
+        import ast
+        import inspect
+
+        from scout.live import routing as routing_mod
+
+        src = inspect.getsource(routing_mod.RoutingLayer.get_candidates)
+        tree = ast.parse(inspect.cleandoc(src))
+        literals = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "venue_listings" in node.value
+            and "SELECT" in node.value.upper()
+        ]
+        assert literals == [], (
+            "get_candidates inlines a venue_listings SELECT again: "
+            f"{literals}. Use _LISTINGS_SQL so the two reads cannot diverge."
+        )
+        assert "quote" in routing_mod._LISTINGS_SQL
+
+
 class TestBackwardCompatibility:
     async def test_get_candidates_still_returns_ungated_candidates(self, tmp_path):
         """`select_route` is additive. The existing `get_candidates` contract —

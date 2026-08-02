@@ -28,6 +28,17 @@ from scout.live.capabilities import VenueCapabilities
 
 log = structlog.get_logger(__name__)
 
+# ONE query, used at both call sites in `get_candidates` — the initial read and
+# the re-read after the on-demand metadata fetch. They were two copies, and when
+# the column list was widened only the first was updated: the second returned 3
+# columns into a 4-tuple unpack, so the FIRST-EVER signal on any token raised
+# ValueError out of routing, past `_dispatch_live`'s NoRoutableVenue handler, and
+# produced no reject row and no log. A constant makes that divergence unstateable.
+_LISTINGS_SQL = (
+    "SELECT venue, venue_pair, asset_class, quote FROM venue_listings "
+    "WHERE canonical = ? AND delisted_at IS NULL"
+)
+
 
 @dataclass(frozen=True)
 class RouteCandidate:
@@ -152,22 +163,14 @@ class RoutingLayer:
             return []
 
         # Step 2 — fetch venue_listings rows for this canonical
-        cur = await self._db._conn.execute(
-            "SELECT venue, venue_pair, asset_class, quote FROM venue_listings "
-            "WHERE canonical = ? AND delisted_at IS NULL",
-            (canonical,),
-        )
+        cur = await self._db._conn.execute(_LISTINGS_SQL, (canonical,))
         listings = list(await cur.fetchall())
 
         # Step 3 — on-demand fetch if empty
         if not listings:
             log.info("venue_listings_miss", canonical=canonical)
             await self._on_demand_listings_fetch(canonical)
-            cur = await self._db._conn.execute(
-                "SELECT venue, venue_pair, asset_class FROM venue_listings "
-                "WHERE canonical = ? AND delisted_at IS NULL",
-                (canonical,),
-            )
+            cur = await self._db._conn.execute(_LISTINGS_SQL, (canonical,))
             listings = list(await cur.fetchall())
         if not listings:
             log.info(

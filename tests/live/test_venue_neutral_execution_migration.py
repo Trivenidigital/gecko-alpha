@@ -256,3 +256,299 @@ async def test_shadow_trades_check_was_widened_too(tmp_path):
             assert reason in sql
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# The rebuild path — exercised for real
+# ---------------------------------------------------------------------------
+#
+# *** EVERY TEST ABOVE STARTS FROM A FRESH DATABASE, AND ON A FRESH DATABASE THE
+# REBUILD NEVER RUNS. ***
+#
+# The base DDL in `_create_tables` already carries the three new reject reasons and
+# both new columns, so `_migrate_venue_neutral_execution_v1` takes its
+# already-widened `continue` and the rename-rebuild is never executed. An
+# adversarial review instrumented `aiosqlite.Connection.execute` and counted zero
+# rebuild statements across two `initialize()` calls — meaning the upgrade
+# assertions above (rows preserved, indexes survive, views survive) were passing
+# against a rebuild that had not happened.
+#
+# These tests construct the PRE-widening table shape by hand — the DDL the parent
+# commit ships — so the rebuild is forced to run. That is the only way to test an
+# upgrade path from a tmp_path fixture.
+
+
+_PARENT_LIVE_TRADES_DDL = """
+CREATE TABLE "live_trades" (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_trade_id      INTEGER NOT NULL,
+    coin_id             TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    venue               TEXT NOT NULL,
+    pair                TEXT NOT NULL,
+    signal_type         TEXT NOT NULL,
+    size_usd            TEXT NOT NULL,
+    entry_order_id      TEXT,
+    entry_fill_price    TEXT,
+    entry_fill_qty      TEXT,
+    mid_at_entry        TEXT,
+    entry_slippage_bps  INTEGER,
+    status              TEXT NOT NULL CHECK (status IN (
+        'open','closed_tp','closed_sl','closed_duration','closed_via_reconciliation',
+        'rejected','needs_manual_review'
+    )),
+    reject_reason       TEXT CHECK (reject_reason IS NULL OR reject_reason IN (
+        'no_venue','insufficient_depth','slippage_exceeds_cap','insufficient_balance',
+        'daily_cap_hit','kill_switch','exposure_cap','override_disabled',
+        'venue_unavailable',
+        'notional_cap_exceeded','signal_disabled','token_aggregate',
+        'dual_signal_aggregate','all_candidates_failed',
+        'master_kill','mode_paper',
+        'live_signed_disabled','api_key_lacks_trade_scope'
+    )),
+    exit_order_id       TEXT,
+    exit_fill_price     TEXT,
+    realized_pnl_usd    TEXT,
+    realized_pnl_pct    TEXT,
+    kill_event_id       INTEGER,
+    created_at          TEXT NOT NULL,
+    closed_at           TEXT,
+    client_order_id     TEXT
+)
+"""
+
+
+async def _parent_shaped_db(tmp_path, *, rows=3, with_solana_child=True):
+    """A database carrying the PRE-widening live_trades, so the rebuild must run.
+
+    Built by replacing the migrated table with the parent commit's DDL after
+    `initialize()` has created everything else — which keeps the surrounding schema
+    (paper_trades, solana_executions, the views) realistic while forcing the one
+    table under test back to its old shape.
+    """
+    path = tmp_path / "upgrade.db"
+    db = Database(path)
+    await db.initialize()
+    conn = db._conn
+
+    await conn.execute("PRAGMA foreign_keys=OFF")
+    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+    await conn.execute("DROP TABLE live_trades")
+    await conn.execute(_PARENT_LIVE_TRADES_DDL)
+    await conn.execute(
+        "CREATE UNIQUE INDEX idx_live_trades_client_order_id "
+        "ON live_trades(client_order_id) WHERE client_order_id IS NOT NULL"
+    )
+    # An index this migration has never heard of, to prove capture-and-replay
+    # rather than an enumerated recreate list.
+    await conn.execute(
+        "CREATE INDEX idx_live_trades_status_probe ON live_trades(status)"
+    )
+    await conn.execute("""CREATE VIEW cross_venue_exposure AS
+           SELECT 'binance' AS venue,
+                  COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                  COUNT(*) AS open_count
+           FROM live_trades WHERE status = 'open'""")
+    # Clear the marker so the migration runs again over the reverted table.
+    await conn.execute(
+        "DELETE FROM paper_migrations WHERE name = 'bl_venue_neutral_execution_v1'"
+    )
+    await conn.commit()
+
+    for i in range(rows):
+        await conn.execute(
+            "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
+            "signal_data, entry_price, amount_usd, quantity, tp_pct, sl_pct, "
+            "tp_price, sl_price, status, opened_at) "
+            "VALUES ('c','SYM','N','eth','first_signal','{}',1.0,100.0,100.0,"
+            "20.0,10.0,1.2,0.9,'open',?)",
+            (f"2026-07-01T00:00:{i:02d}",),
+        )
+        cur = await conn.execute("SELECT last_insert_rowid()")
+        pt_id = (await cur.fetchone())[0]
+        await conn.execute(
+            "INSERT INTO live_trades (paper_trade_id, coin_id, symbol, venue, pair, "
+            "signal_type, size_usd, status, created_at, client_order_id, "
+            "entry_fill_qty) "
+            "VALUES (?, 'c', 'SYM', 'binance', 'SYMUSDT', 'first_signal', '100', "
+            "'open', '2026-07-01T00:00:00', ?, '1.0')",
+            (pt_id, f"legacy-cid-{i}"),
+        )
+    # Push the AUTOINCREMENT high-water mark well past max(id). `sqlite_sequence`
+    # has no unique constraint, so UPSERT is unavailable — UPDATE, then INSERT if
+    # the row was not there.
+    cur = await conn.execute(
+        "UPDATE sqlite_sequence SET seq=9999 WHERE name='live_trades'"
+    )
+    if cur.rowcount == 0:
+        await conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('live_trades', 9999)"
+        )
+
+    if with_solana_child:
+        cur = await conn.execute("SELECT MIN(id) FROM live_trades")
+        first_id = (await cur.fetchone())[0]
+        now = "2026-07-01T00:00:00+00:00"
+        await conn.execute(
+            "INSERT INTO solana_executions "
+            "(decision_id, state, mode, live_trade_id, created_at, updated_at) "
+            "VALUES ('dec-1', 'transaction_built', 'SUPERVISED_LIVE', ?, ?, ?)",
+            (first_id, now, now),
+        )
+    await conn.commit()
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await db.close()
+    return path
+
+
+async def test_the_rebuild_actually_runs_on_a_pre_widening_database(tmp_path):
+    """Guard on every test below: the fixture really is pre-widening."""
+    path = await _parent_shaped_db(tmp_path)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='live_trades'"
+        )
+        sql = (await cur.fetchone())[0]
+        for reason in _NEW_REASONS:
+            assert reason in sql, "the rebuild did not widen the CHECK"
+        cols = await _columns(db._conn, "live_trades")
+        assert {"intent_hash", "mandate_mode"} <= cols
+    finally:
+        await db.close()
+
+
+async def test_the_rebuild_does_not_sever_solana_execution_links(tmp_path):
+    """*** DROP TABLE fires ON DELETE SET NULL on every child row. ***
+
+    `solana_executions.live_trade_id REFERENCES live_trades(id) ON DELETE SET NULL`
+    means a rebuild with foreign keys enforced permanently NULLs every execution's
+    link to its ledger row — silently, because SET NULL is a legal outcome and
+    `foreign_key_check` stays clean afterwards. The runtime cost is a stranded
+    position: `_recover_interrupted_executions` retires the ledger row via
+    `live_trade_id`, and `retire_row` returns early on None, so the row stays
+    `open` forever and counts against the lane's exposure and concurrency caps.
+    """
+    path = await _parent_shaped_db(tmp_path)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT live_trade_id FROM solana_executions WHERE decision_id='dec-1'"
+        )
+        link = (await cur.fetchone())[0]
+        assert link is not None, "the rebuild severed the Solana execution link"
+        cur = await db._conn.execute("SELECT MIN(id) FROM live_trades")
+        assert link == (await cur.fetchone())[0]
+    finally:
+        await db.close()
+
+
+async def test_the_rebuild_leaves_no_foreign_key_violations(tmp_path):
+    path = await _parent_shaped_db(tmp_path)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute("PRAGMA foreign_key_check")
+        assert list(await cur.fetchall()) == []
+        cur = await db._conn.execute("PRAGMA integrity_check")
+        assert (await cur.fetchone())[0] == "ok"
+    finally:
+        await db.close()
+
+
+async def test_foreign_key_enforcement_is_restored_after_the_rebuild(tmp_path):
+    """Leaving `PRAGMA foreign_keys=OFF` would disable enforcement for the whole
+    process, not just the migration — every writer after this point."""
+    path = await _parent_shaped_db(tmp_path)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute("PRAGMA foreign_keys")
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await db.close()
+
+
+async def test_the_rebuild_preserves_every_row_and_every_index(tmp_path):
+    path = await _parent_shaped_db(tmp_path, rows=4)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT client_order_id FROM live_trades ORDER BY id"
+        )
+        assert [r[0] for r in await cur.fetchall()] == [
+            f"legacy-cid-{i}" for i in range(4)
+        ]
+        idx = await _indexes(db._conn)
+        assert "idx_live_trades_status_probe" in idx
+        assert "idx_live_trades_client_order_id" in idx
+    finally:
+        await db.close()
+
+
+async def test_the_rebuild_preserves_the_autoincrement_high_water_mark(tmp_path):
+    """AUTOINCREMENT promises an id is never reused. The rebuild resets
+    `sqlite_sequence` to max(id), making every id above it allocatable again — and
+    live_trade ids are quoted in evidence files, Telegram messages and Solana
+    execution rows, where a reused id names a different trade."""
+    path = await _parent_shaped_db(tmp_path)
+    db = Database(path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='live_trades'"
+        )
+        assert (await cur.fetchone())[0] == 9999
+    finally:
+        await db.close()
+
+
+async def test_a_rewrite_that_misses_refuses_to_record_itself_as_applied(tmp_path):
+    """*** A marker is a claim that the migration worked. ***
+
+    On a table shape the rewrite does not match, the migration logs a warning and
+    moves on. Without the post-condition it would still write the marker, be
+    permanently recorded as applied, never retry — and every mandate refusal would
+    then raise IntegrityError forever, which is the exact failure the widening
+    exists to prevent. The refusal must be loud AND un-marked.
+    """
+    path = tmp_path / "odd.db"
+    db = Database(path)
+    await db.initialize()
+    conn = db._conn
+    await conn.execute("PRAGMA foreign_keys=OFF")
+    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+    await conn.execute("DROP TABLE live_trades")
+    # `NOT NULL` between TEXT and CHECK — a shape the rewrite pattern misses.
+    await conn.execute(
+        _PARENT_LIVE_TRADES_DDL.replace(
+            "reject_reason       TEXT CHECK", "reject_reason       TEXT NOT NULL CHECK"
+        ).replace("reject_reason IS NULL OR ", "")
+    )
+    await conn.execute(
+        "DELETE FROM paper_migrations WHERE name = 'bl_venue_neutral_execution_v1'"
+    )
+    await conn.commit()
+    await conn.execute("PRAGMA foreign_keys=ON")
+    await db.close()
+
+    db = Database(path)
+    with pytest.raises(RuntimeError, match="still refuses"):
+        await db.initialize()
+    await db.close()
+
+    # And the migration is NOT recorded, so the next boot retries it.
+    probe = await aiosqlite.connect(str(path))
+    try:
+        cur = await probe.execute(
+            "SELECT 1 FROM paper_migrations "
+            "WHERE name='bl_venue_neutral_execution_v1'"
+        )
+        assert await cur.fetchone() is None
+    finally:
+        await probe.close()

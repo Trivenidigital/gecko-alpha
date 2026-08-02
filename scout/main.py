@@ -2287,10 +2287,25 @@ async def main(argv: list[str] | None = None) -> int:
         from scout.live.mandate import ExecutionMandate
 
         live_mandate = ExecutionMandate(settings=settings, db=db)
+        # Report the answer to "is autonomy on?" by RUNNING the gate, not by reading
+        # the two flags. `is_active` checks mode+flag only; a deployment with both
+        # set and the envelope unset would log active=True while every dispatch
+        # refused at the envelope gate — the one line an operator reads to answer
+        # that question, saying the opposite of what the system does.
+        from scout.live.mandate import MandateRefused as _MandateRefused
+
+        try:
+            _envelope = live_mandate.precheck()
+            _gate, _envelope_detail = None, _envelope.as_dict()
+        except _MandateRefused as _exc:
+            _gate, _envelope_detail = _exc.gate, None
         logger.info(
             "execution_mandate_state",
             mode=live_mandate.mode,
-            active=live_mandate.is_active,
+            flags_set=live_mandate.is_active,
+            would_authorize=_gate is None,
+            refused_at_gate=_gate,
+            envelope=_envelope_detail,
             families=getattr(settings, "LIVE_EXECUTION_MANDATE_FAMILIES", ""),
             venues=getattr(settings, "LIVE_EXECUTION_MANDATE_VENUES", ""),
         )
