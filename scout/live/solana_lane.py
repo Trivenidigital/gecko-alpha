@@ -13,6 +13,56 @@ Usage::
     python -m scout.live.solana_lane status
     python -m scout.live.solana_lane resolve --decision-id <uuid>
 
+    python -m scout.live.solana_lane reverse --live-trade-id 5 --usdc 6.899618 \\
+        [--close-usdc-ata] [--simulate-only --yes-i-am-rehearsing]
+    python -m scout.live.solana_lane reverse-status
+    python -m scout.live.solana_lane reverse-resolve --decision-id <uuid>
+
+The reverse command — closing a position, not opening one
+---------------------------------------------------------
+``reverse`` runs the SAME pipeline in the other direction: Jupiter quote and
+build -> deterministic validation -> independent simulation -> typed
+authorization -> funded key loaded only after that -> expected signature
+persisted -> exactly-once Jito submission -> finality and balance
+reconciliation. It is a new command over proven internals, not a second lane;
+the gates, the limits engine, the state machine, the signer, the resolver pool
+and the evidence format are the ones ``place`` already uses.
+
+Four things genuinely differ, and each is a decision rather than an oversight:
+
+**It is named for a row.** The operator passes ``--live-trade-id``. A row at
+another venue is refused (Kraken positions are closed through the Kraken lane),
+and so is a row that is not ``open``. There is no "find the position" step: a
+command that guessed which position to sell would be a command that can sell
+the wrong one.
+
+**The authorization binds a DIGEST, not the message hash alone.** The message
+carries the amount, route, slippage, fees and blockhash — but not WHICH LEDGER
+ROW is being closed, nor whether the USDC account is to be closed with it. Both
+are in the digest, and the message hash is one of its inputs, so the binding is
+strictly stronger than the forward lane's. See "Reverse-swap authorization
+binding" below.
+
+**The row state and both balances are re-read immediately before SIGNING**, not
+merely before the approval screen. The prompt is unbounded operator time, the
+lane lock excludes only another lane process, and a wallet can be moved from a
+phone. Any difference voids the authorization and the run stops; it never
+rebuilds.
+
+**The row closes only on finality plus exact agreement.** A finalized
+transaction whose USDC debit is exactly the authorized amount and whose SOL
+credit falls inside the authorized band closes the row. Partial, ambiguous,
+timed-out, unfinalized or mismatched outcomes leave it OPEN — the position
+still exists, and a ledger that said otherwise would be the one thing every
+later decision is made against.
+
+Closing the wallet's USDC account and recovering its ~2,039,280 lamports of
+rent is a SEPARATE option, off by default, requiring both
+``SOLANA_REVERSE_CLOSE_USDC_ATA`` and ``--close-usdc-ata``. With it off the
+inspector REFUSES a build that closes that account, so "it was not bundled in
+quietly" is enforced rather than asserted. With it on, the closure and the
+exact rent get their own line on the approval screen.
+
 Place flow, in mechanical order — every step is printed, logged and appended
 to the evidence file before the next one starts:
 
@@ -151,6 +201,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -159,7 +210,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -177,9 +228,12 @@ from scout.live.solana.constants import (
     JITO_TIP_ACCOUNTS_FALLBACK,
     LAMPORTS_PER_SIGNATURE,
     LAMPORTS_PER_SOL,
+    SOL_DECIMALS,
     SOL_MINT,
     SOLANA_MAINNET_GENESIS_HASH,
+    TOKEN_2022_PROGRAM_ID,
     TOKEN_ACCOUNT_DATA_LENGTH,
+    TOKEN_PROGRAM_ID,
     USDC_DECIMALS,
     USDC_MINT,
 )
@@ -193,9 +247,12 @@ from scout.live.solana.exceptions import (
 from scout.live.solana.jito_client import JitoClient
 from scout.live.solana.jupiter_client import JupiterClient, SolanaQuote, SwapBuild
 from scout.live.solana.limits import (
+    DIRECTION_SOL_TO_USDC,
+    DIRECTION_USDC_TO_SOL,
     LaneExposure,
     LimitsEngine,
     LimitsReport,
+    OperatorExitBinding,
     notional_usd_today,
 )
 from scout.live.solana.resolver import ResolutionReport
@@ -213,7 +270,11 @@ from scout.live.solana.signer import (
     load_keypair,
     sign_transaction,
 )
-from scout.live.solana.tx_inspector import VerificationReport, verify_swap_transaction
+from scout.live.solana.tx_inspector import (
+    VerificationReport,
+    derive_associated_token_address,
+    verify_swap_transaction,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -239,6 +300,68 @@ EXIT_REVIEW = 4
 VENUE = "solana"
 PAIR = "SOL/USDC"
 BASE_SYMBOL = "SOL"
+
+# The ledger status a reverse swap writes when it closes the position it was
+# named for. Same value the Kraken pilot's exit uses and for the same reason:
+# the CHECK constraint's other closed_* members each assert a stop reason
+# ('closed_tp', 'closed_sl', 'closed_duration') that a supervised operator
+# close did not have, and widening the constraint for one lane would be a
+# migration in service of a label.
+_REVERSE_CLOSED_STATUS = "closed_via_reconciliation"
+
+
+# ----------------------------------------------------------------------
+# Swap direction
+# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class SwapDirection:
+    """One traversal of the ONE approved pair.
+
+    The lane trades SOL/USDC and nothing else; a direction says which way. It
+    exists so the gates that genuinely differ — the mints quoted, which leg is
+    the dollar-denominated one, which accounts a transaction may create and
+    close — are parameters of a single pipeline rather than a second copy of
+    it. Everything not named here (kill switch, custody, inspection, limits
+    engine, signer, state machine, resolver, evidence) is direction-blind on
+    purpose: a reverse swap that could take a different path through any of
+    those would be a second lane wearing this one's name.
+    """
+
+    name: str
+    input_mint: str
+    output_mint: str
+    input_symbol: str
+    output_symbol: str
+    input_decimals: int
+    output_decimals: int
+    label: str
+
+    @property
+    def is_reverse(self) -> bool:
+        return self.name == DIRECTION_USDC_TO_SOL
+
+
+DIRECTION_FORWARD = SwapDirection(
+    name=DIRECTION_SOL_TO_USDC,
+    input_mint=SOL_MINT,
+    output_mint=USDC_MINT,
+    input_symbol="SOL",
+    output_symbol="USDC",
+    input_decimals=SOL_DECIMALS,
+    output_decimals=USDC_DECIMALS,
+    label="SOL -> USDC",
+)
+
+DIRECTION_REVERSE = SwapDirection(
+    name=DIRECTION_USDC_TO_SOL,
+    input_mint=USDC_MINT,
+    output_mint=SOL_MINT,
+    input_symbol="USDC",
+    output_symbol="SOL",
+    input_decimals=USDC_DECIMALS,
+    output_decimals=SOL_DECIMALS,
+    label="USDC -> SOL",
+)
 
 # The lane anchor (see module docstring). Values are matched exactly on
 # lookup, so they are constants rather than anything derived at runtime.
@@ -999,19 +1122,52 @@ def _fmt(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
-def lamports_from_sol(sol: Decimal) -> int:
-    """Exact lamports for a SOL amount, or ``ValueError`` if inexact.
+def raw_units(amount: Decimal, *, decimals: int, symbol: str) -> int:
+    """Exact raw units for a decimal amount, or ``ValueError`` if inexact.
 
-    A fractional lamport is not a rounding question: the amount goes into the
-    quote as a raw integer, so anything below 1e-9 SOL would be silently
-    truncated into a swap the operator did not ask for.
+    A fractional raw unit is not a rounding question: the amount goes into the
+    quote as a raw integer, so anything below one unit would be silently
+    truncated into a swap the operator did not ask for. USDC's 6 decimals make
+    this MORE likely to bite than SOL's 9, not less — a price-derived amount
+    with seven decimal places is an ordinary thing to type.
     """
-    scaled = sol * LAMPORTS_PER_SOL
+    scaled = amount * (10**decimals)
     if scaled != scaled.to_integral_value():
         raise ValueError(
-            f"{sol} SOL is not a whole number of lamports (1 lamport = 1e-9 SOL)"
+            f"{amount} {symbol} is not a whole number of raw units "
+            f"(1 unit = 1e-{decimals} {symbol})"
         )
     return int(scaled)
+
+
+def amount_from_raw(raw: int | None, decimals: int) -> Decimal | None:
+    return None if raw is None else _dec(raw) / _dec(10**decimals)
+
+
+def lamports_from_sol(sol: Decimal) -> int:
+    """Exact lamports for a SOL amount, or ``ValueError`` if inexact."""
+    return raw_units(sol, decimals=SOL_DECIMALS, symbol="SOL")
+
+
+def raw_from_usdc(usdc: Decimal) -> int:
+    """Exact raw USDC units for a USDC amount, or ``ValueError`` if inexact."""
+    return raw_units(usdc, decimals=USDC_DECIMALS, symbol="USDC")
+
+
+def signer_token_accounts(owner: str, *mints: str) -> tuple[str, ...]:
+    """Every associated token account ``owner`` can hold for ``mints``.
+
+    Both token programs, because a mint can live under either and the address
+    differs. Used to build the inspector's per-direction create/close
+    allowlists: these are the only token accounts a swap for this wallet has
+    any business creating or closing, and naming them explicitly is what turns
+    "the route probably wraps SOL" into a checkable statement.
+    """
+    return tuple(
+        derive_associated_token_address(owner, mint, token_program=program)
+        for mint in mints
+        for program in (TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID)
+    )
 
 
 def sol_from_lamports(lamports: int | None) -> Decimal | None:
@@ -1536,6 +1692,81 @@ async def fetch_row_by_decision_id(
     return None if row is None else _row_dict(row)
 
 
+_REVERSE_ROW_COLUMNS = (
+    "id, client_order_id, entry_order_id, status, venue, pair, symbol, size_usd, "
+    "entry_fill_price, entry_fill_qty, exit_order_id, created_at"
+)
+
+
+def _reverse_row_dict(row: Any) -> dict[str, Any]:
+    return {
+        "live_trade_id": row[0],
+        "client_order_id": row[1],
+        "entry_order_id": row[2],
+        "status": row[3],
+        "venue": row[4],
+        "pair": row[5],
+        "symbol": row[6],
+        "size_usd": row[7],
+        "entry_fill_price": row[8],
+        "entry_fill_qty": row[9],
+        "exit_order_id": row[10],
+        "created_at": row[11],
+    }
+
+
+async def fetch_live_trade_row(
+    db: Database, live_trade_id: int
+) -> dict[str, Any] | None:
+    """One ``live_trades`` row by id, DELIBERATELY NOT FILTERED BY VENUE.
+
+    The reverse command has to be able to tell "no such row" apart from "that
+    row belongs to another venue", because those are different operator
+    mistakes with different fixes — and a venue filter here would collapse
+    naming a Kraken row into naming a row that does not exist. The venue
+    refusal happens in ``_load_reverse_row``, where it can say what the row
+    actually is.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    cur = await db._conn.execute(
+        f"SELECT {_REVERSE_ROW_COLUMNS} FROM live_trades WHERE id = ?",
+        (live_trade_id,),
+    )
+    row = await cur.fetchone()
+    return None if row is None else _reverse_row_dict(row)
+
+
+async def fetch_reverse_executions(
+    db: Database, *, include_terminal: bool = False
+) -> list[dict[str, Any]]:
+    """Reverse-swap executions, newest last. Read-only.
+
+    Identified by the direction recorded in ``detail`` rather than by a new
+    column: the execution table already stores a JSON detail blob per run, the
+    direction is written into it at the first transition, and a migration for
+    one discriminator on a table this small would be a schema change in service
+    of a query.
+    """
+    if db._conn is None:
+        raise RuntimeError("Database not initialized.")
+    sql = f"SELECT {_EXECUTION_COLUMNS} FROM solana_executions"
+    params: tuple[Any, ...] = ()
+    if not include_terminal:
+        placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+        sql += f" WHERE state NOT IN ({placeholders})"
+        params = TERMINAL_STATES
+    sql += " ORDER BY created_at"
+    cur = await db._conn.execute(sql, params)
+    rows = [_execution_row(row) for row in await cur.fetchall()]
+    return [
+        row
+        for row in rows
+        if isinstance(row.get("detail"), dict)
+        and row["detail"].get("direction") == DIRECTION_USDC_TO_SOL
+    ]
+
+
 async def retire_row(
     db: Database, live_trade_id: int | None, *, reject_reason: str | None = None
 ) -> None:
@@ -1555,6 +1786,114 @@ async def retire_row(
         reject_reason=reject_reason,
         closed_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+# ----------------------------------------------------------------------
+# Reverse-swap authorization binding
+# ----------------------------------------------------------------------
+# The forward lane binds its authorization to the transaction MESSAGE HASH and
+# nothing else, and that is sufficient there: the message carries the amount,
+# the route, the slippage, the fees and the blockhash, so any change to the
+# trade changes the hash.
+#
+# A reverse swap has two facts the message does NOT carry, and both are
+# load-bearing:
+#
+#   * WHICH LEDGER ROW is being closed, and what state that row was in. The
+#     message says "spend N USDC"; it does not say "and this is the position
+#     recorded as live_trades #5, which was open when you were shown it". A
+#     transaction that is byte-identical is still the wrong action if the row
+#     it is meant to close has since been closed, rejected or reassigned.
+#   * WHETHER THE USDC ACCOUNT IS TO BE CLOSED. That option changes what the
+#     inspector will accept, so leaving it out of the binding would let the
+#     option be flipped between the screen the operator read and the bytes
+#     that get signed.
+#
+# So the reverse authorization binds a DIGEST over the message hash plus the
+# economics the operator was shown plus the row identity. It is strictly
+# stronger than the message hash: the message hash is one of its inputs.
+_REVERSE_AUTH_DOMAIN = "gecko-alpha/solana-reverse-swap/v1"
+_REVERSE_AUTH_TOKEN_CHARS = 8
+
+# Evidence step carrying the durable pre-submission record for a reverse run.
+_REVERSE_INTENT_STEP = "reverse_intent_persisted"
+
+
+def build_reverse_snapshot(
+    *,
+    message_sha256: str,
+    wallet: str,
+    live_trade_id: int,
+    row_status: str,
+    usdc_in_raw: int,
+    expected_sol_out_raw: int,
+    minimum_sol_out_raw: int,
+    route: str,
+    slippage_bps: int,
+    price_impact_pct: Decimal,
+    total_fee_lamports: int,
+    priority_fee_lamports: int,
+    jito_tip_lamports: int,
+    blockhash: str | None,
+    close_usdc_ata: bool,
+) -> dict[str, str]:
+    """Every fact the reverse authorization is bound to, canonicalized.
+
+    Every value is rendered as a string here rather than at digest time, so
+    the digest cannot change because a caller passed ``100`` where it once
+    passed ``"100"``. Decimals are fixed-point (``format(d, "f")``) because
+    ``str(Decimal("1E-4"))`` is exponential and two spellings of one number
+    must not be two digests.
+    """
+    return {
+        "message_sha256": message_sha256,
+        "wallet": wallet,
+        "live_trade_id": str(live_trade_id),
+        "row_status": row_status,
+        "usdc_in_raw": str(usdc_in_raw),
+        "expected_sol_out_raw": str(expected_sol_out_raw),
+        "minimum_sol_out_raw": str(minimum_sol_out_raw),
+        "route": route,
+        "slippage_bps": str(slippage_bps),
+        "price_impact_pct": format(price_impact_pct, "f"),
+        "total_fee_lamports": str(total_fee_lamports),
+        "priority_fee_lamports": str(priority_fee_lamports),
+        "jito_tip_lamports": str(jito_tip_lamports),
+        "blockhash": str(blockhash),
+        "close_usdc_ata": "true" if close_usdc_ata else "false",
+    }
+
+
+def reverse_intent_digest(snapshot: dict[str, str]) -> str:
+    """sha256 over the whole snapshot, under a domain tag.
+
+    Sorted keys so field ORDER cannot change the digest, and a domain tag so
+    this digest can never collide with another one computed over a
+    similar-looking mapping elsewhere in the tree.
+    """
+    payload = "|".join(f"{key}={snapshot[key]}" for key in sorted(snapshot))
+    return hashlib.sha256(
+        f"{_REVERSE_AUTH_DOMAIN}|{payload}".encode("utf-8")
+    ).hexdigest()
+
+
+def reverse_authorization_token(snapshot: dict[str, str]) -> str:
+    """What the operator types: the first characters of the bound digest."""
+    return reverse_intent_digest(snapshot)[:_REVERSE_AUTH_TOKEN_CHARS]
+
+
+def snapshot_differences(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """Field-by-field diff of two snapshots, for the refusal message.
+
+    A refusal that says only "the state changed" makes the operator diff two
+    screens by eye; naming the field is what turns an invalidated
+    authorization into an understood one.
+    """
+    return [
+        f"{key}: approved {before.get(key)!r}, now {after.get(key)!r}"
+        for key in sorted(set(before) | set(after))
+        if before.get(key) != after.get(key)
+    ]
 
 
 # ----------------------------------------------------------------------
@@ -1603,6 +1942,21 @@ class AuthorizationRequest:
     total_fee_lamports: int
     last_valid_block_height: int
     render: Callable[[], Awaitable[None]]
+    # Which traversal of the pair this is. A policy that wanted to treat the
+    # two differently would have to say so; none does today, and the field
+    # exists so an evidence reader never has to infer it from the amounts.
+    direction: str = DIRECTION_SOL_TO_USDC
+    # What the operator is asked to retype, and what to call it. Forward binds
+    # to the message hash and nothing else; reverse binds to a digest that has
+    # the message hash inside it plus the row identity the message cannot
+    # carry (see "Reverse-swap authorization binding"). Defaulting to the
+    # message hash keeps the forward contract byte-identical.
+    binding_digest: str | None = None
+    binding_label: str = "MESSAGE SHA256"
+
+    @property
+    def expected_phrase(self) -> str:
+        return (self.binding_digest or self.message_sha256)[:8]
 
 
 @dataclass(frozen=True)
@@ -1649,11 +2003,11 @@ class TypedOperatorAuthorization(AuthorizationPolicy):
     async def authorize(self, request: AuthorizationRequest) -> AuthorizationDecision:
         await request.render()
         print(
-            "Type the first 8 characters of the MESSAGE SHA256 to authorize. "
-            "Anything else — including an empty line or a closed stdin — aborts. "
-            "The phrase is lowercase hex and is matched exactly."
+            f"Type the first 8 characters of the {request.binding_label} to "
+            "authorize. Anything else — including an empty line or a closed "
+            "stdin — aborts. The phrase is lowercase hex and is matched exactly."
         )
-        authorized, outcome = read_authorization(request.message_sha256[:8])
+        authorized, outcome = read_authorization(request.expected_phrase)
         return AuthorizationDecision(
             authorized=authorized,
             outcome=outcome,
@@ -1714,6 +2068,65 @@ def authorization_policy_for(mode: str) -> AuthorizationPolicy:
     if mode == MODE_BOUNDED_AUTONOMOUS:
         return BoundedAutonomousAuthorization()
     return TypedOperatorAuthorization()
+
+
+# ----------------------------------------------------------------------
+# The exit's exemption from the daily ENTRY cap
+# ----------------------------------------------------------------------
+# ``SOLANA_MAX_DAILY_NOTIONAL_USD`` bounds how much this lane may COMMIT in a
+# UTC day. Pointed at a reverse swap it bounds something else: whether the lane
+# may CLOSE what it already holds. At the deployed figure that is not a
+# hypothetical — an entry plus its exit fits in a day and a second round trip
+# does not, so the check standing in front of the second exit would be the one
+# meant to bound the second ENTRY. A lane that can open a position it cannot
+# shut is a worse failure than a lane that spent more in a day than it meant to.
+#
+#     risk-increasing entry:
+#         subject to daily entry/notional cap
+#
+#     operator-authorized exit of an exact existing position:
+#         exempt from the entry cap
+#         subject to separate exit safety limits
+#
+# What this deliberately is NOT is a direction check. `if reverse: skip the cap`
+# exempts "a USDC->SOL swap" — something any caller can ask for by pointing the
+# swap the other way — rather than "the close of THIS position". The exemption
+# is instead PROVEN, and this function is the only place in the tree that mints
+# the proof.
+def operator_exit_binding(
+    *, selection: dict[str, Any], mode: str
+) -> OperatorExitBinding:
+    """Mint the exit binding from a row ``_load_reverse_row`` has already proved.
+
+    Every field is copied from that proof rather than derived again. By the time
+    this is called the row has been refused if it belongs to another venue, if
+    it is not ``open``, if it already carries an exit signature, or if it has no
+    recorded entry fill — and the same function is re-run immediately before
+    signing, so the facts underneath the binding are re-established after the
+    approval prompt rather than assumed to have held across it.
+
+    ``authorized_by`` is read from ``authorization_policy_for``, the SAME
+    mapping that decides who will actually be asked to authorize this run. That
+    is what keeps BOUNDED_AUTONOMOUS out of the exemption structurally: the
+    autonomous mode stamps the binding with its own policy's method, which the
+    limits engine does not honour, so an autonomous run falls through to the
+    ordinary daily cap. A literal here — or a boolean parameter — would make the
+    exemption something the caller states rather than something the run's own
+    configuration produces.
+    """
+    row = selection["row"]
+    scaled = selection["ledger_usdc"] * _dec(10**USDC_DECIMALS)
+    return OperatorExitBinding(
+        live_trade_id=int(row["live_trade_id"]),
+        venue=str(row["venue"]),
+        direction=DIRECTION_USDC_TO_SOL,
+        # ROUNDED DOWN, never to nearest. `ledger_usdc` is a product of two
+        # recorded decimals and can carry more precision than USDC has raw
+        # units; rounding up would hand the exemption a raw unit the row does
+        # not account for.
+        remaining_usdc_raw=int(scaled.to_integral_value(rounding=ROUND_DOWN)),
+        authorized_by=authorization_policy_for(mode).method,
+    )
 
 
 def _print_block(title: str, lines: list[str]) -> None:
@@ -1806,8 +2219,16 @@ class LaneRunner:
             evidence_path_for(self._settings.SOLANA_PILOT_EVIDENCE_DIR, decision_id)
         )
 
-    async def _check_envelope(self, *, mode: str) -> dict[str, Any]:
-        """Step 1 — the lane is enabled, a key is configured, hosts are mainnet."""
+    async def _check_envelope(
+        self, *, mode: str, direction: SwapDirection = DIRECTION_FORWARD
+    ) -> dict[str, Any]:
+        """Step 1 — the lane is enabled, a key is configured, hosts are mainnet.
+
+        ``direction`` changes exactly one thing here: which mints the evidence
+        records as the ones this run is built around. Every refusal below is
+        direction-blind, which is the point — a reverse swap does not get a
+        softer envelope, it gets the same one pointed the other way.
+        """
         if mode not in ALL_MODES:
             raise LaneAbort(
                 "envelope_gate",
@@ -1896,8 +2317,10 @@ class LaneRunner:
         return {
             "keypair_path_configured": True,
             "declared_signer_pubkey": declared,
-            "input_mint": SOL_MINT,
-            "output_mint": USDC_MINT,
+            "direction": direction.name,
+            "pair_label": direction.label,
+            "input_mint": direction.input_mint,
+            "output_mint": direction.output_mint,
             # Labels, never URLs. The deployment's RPC endpoints carry their
             # API key in the path, and the evidence file is durable, copied
             # into review packages and read by people who are not the operator.
@@ -2391,7 +2814,12 @@ class LaneRunner:
 
     # ---------------- quote / build / inspect ----------------
     async def _quote_and_check(
-        self, *, amount_lamports: int, evidence: EvidenceLog
+        self,
+        *,
+        amount_lamports: int,
+        evidence: EvidenceLog,
+        direction: SwapDirection = DIRECTION_FORWARD,
+        exit_binding: OperatorExitBinding | None = None,
     ) -> tuple[SolanaQuote, datetime]:
         """Steps 5-6 — quote, then the limits engine's verdict on it.
 
@@ -2408,8 +2836,16 @@ class LaneRunner:
         The evidence step is written BEFORE the limits are enforced, so a
         refusal leaves the same structured record a pass would — the run that
         gets refused is the one whose numbers an operator most needs.
+
+        ``exit_binding`` is passed straight through to the engine and recorded
+        alongside its verdict. Only the reverse command supplies one, and only
+        from a row it has already proved — see ``operator_exit_binding``.
         """
-        quote = await self._jupiter.get_quote(amount=amount_lamports)
+        quote = await self._jupiter.get_quote(
+            amount=amount_lamports,
+            input_mint=direction.input_mint,
+            output_mint=direction.output_mint,
+        )
         quoted_at = datetime.now(timezone.utc)
 
         exposure = await fetch_lane_exposure(self._db, self._settings)
@@ -2418,26 +2854,56 @@ class LaneRunner:
             amount_lamports=amount_lamports,
             price_impact_pct=quote_price_impact_pct(quote),
             exposure=exposure,
+            direction=direction.name,
+            exit_binding=exit_binding,
         )
 
-        out_usd = usdc_from_raw(quote.out_amount) or Decimal("0")
+        in_amount = amount_from_raw(quote.in_amount, direction.input_decimals)
+        out_amount = amount_from_raw(quote.out_amount, direction.output_decimals)
+        min_out_amount = amount_from_raw(
+            quote.min_out_amount, direction.output_decimals
+        )
         detail = {
-            "in_amount_lamports": quote.in_amount,
-            "in_amount_sol": _fmt(sol_from_lamports(quote.in_amount)),
+            "direction": direction.name,
+            "in_amount_raw": quote.in_amount,
+            "in_amount": _fmt(in_amount),
+            "in_symbol": direction.input_symbol,
             "out_amount_raw": quote.out_amount,
-            "out_amount_usdc": _fmt(out_usd),
+            "out_amount": _fmt(out_amount),
+            "out_symbol": direction.output_symbol,
             "min_out_amount_raw": quote.min_out_amount,
-            "min_out_amount_usdc": _fmt(usdc_from_raw(quote.min_out_amount)),
+            "min_out_amount": _fmt(min_out_amount),
             "slippage_bps": quote.slippage_bps,
             "price_impact_pct": _fmt(quote_price_impact_pct(quote)),
             "price_impact_raw": quote.price_impact_pct,
             "swap_mode": quote.swap_mode,
             "route": _route_summary(quote),
+            "route_steps": route_fingerprint(quote),
             "context_slot": quote.context_slot,
             "quoted_at": quoted_at.isoformat(),
             "exposure": exposure.as_evidence(),
             "limits": limits.as_evidence(),
+            # Recorded whether or not it was honoured. A run whose exemption
+            # was NOT granted is exactly the one whose binding an operator
+            # needs to read against the refusal.
+            "exit_binding": (
+                None if exit_binding is None else exit_binding.as_evidence()
+            ),
         }
+        if not direction.is_reverse:
+            # The forward run's evidence keeps the field names it has always
+            # had. They are unit-specific ("_sol", "_usdc") and so cannot be
+            # reused for the other direction without lying about the unit —
+            # which is why the neutral names above exist rather than these
+            # being renamed under every existing reader.
+            detail.update(
+                {
+                    "in_amount_lamports": quote.in_amount,
+                    "in_amount_sol": _fmt(in_amount),
+                    "out_amount_usdc": _fmt(out_amount),
+                    "min_out_amount_usdc": _fmt(min_out_amount),
+                }
+            )
         evidence.record("quote", **detail)
         self._enforce(limits, "quote_envelope")
         return quote, quoted_at
@@ -2455,6 +2921,55 @@ class LaneRunner:
         except SolanaLimitBreached as exc:
             raise LaneAbort(stage, str(exc)) from exc
 
+    def _permitted_accounts(
+        self, *, signer_pubkey: str, direction: SwapDirection, close_input_ata: bool
+    ) -> dict[str, tuple[str, ...] | None]:
+        """Which token accounts this direction may CREATE and CLOSE.
+
+        *** ENUMERATION, NOT PATTERN-MATCHING. ***
+        Neither list requires anything to be present. A route that creates
+        nothing and closes nothing produces two empty observations and passes
+        both checks — the wrap/unwrap pair is an ALLOWED shape, never a
+        mandatory one, and making it mandatory would refuse a legitimate route
+        for not looking like the one we expected.
+
+        What the lists do is bound the damage of a shape we did not expect:
+
+        **Closes, both directions.** Only the signer's own associated token
+        accounts for the two mints in play. Before this the rule was "the rent
+        must be paid to us", which is true of closing our own USDC account —
+        harmless forward (the account has just been paid into, so an on-chain
+        close fails on a non-empty account) and NOT harmless in reverse, where
+        the same account is empty the instant the swap completes.
+
+        **Closes, reverse specifically.** The input account is REMOVED from
+        the set unless the operator has separately enabled its closure. That is
+        the whole of requirement "never silently bundled": with the option off,
+        a build that closes the USDC account is refused rather than signed.
+
+        **Creates, reverse only.** Restricted to the same own-account set. The
+        forward direction is deliberately left unrestricted (``None``): its
+        rent is already bounded by the fee ceiling, ``tx_inspector`` docstring
+        fact 8 argues explicitly against an owner rule there because a route
+        may legitimately open a PDA-owned intermediate, and tightening a proven
+        live path against no captured counter-example is a regression risk this
+        change has no reason to take. Reverse is new, so it starts narrow.
+        """
+        own_input = signer_token_accounts(signer_pubkey, direction.input_mint)
+        own_output = signer_token_accounts(signer_pubkey, direction.output_mint)
+        if not direction.is_reverse:
+            return {
+                "close": own_input + own_output,
+                "create": None,
+            }
+        return {
+            # Output first: the wrapped-SOL account a reverse route typically
+            # opens and closes again. The input (USDC) account joins it only
+            # on the explicit, separately-displayed option.
+            "close": own_output + (own_input if close_input_ata else ()),
+            "create": own_input + own_output,
+        }
+
     async def _inspect(
         self,
         *,
@@ -2462,6 +2977,8 @@ class LaneRunner:
         signer_pubkey: str,
         ata_rent_lamports: int,
         ata_rent_source: str,
+        direction: SwapDirection = DIRECTION_FORWARD,
+        close_input_ata: bool = False,
     ) -> tuple[VerificationReport, LimitsReport, dict[str, Any]]:
         """Step 8 — the inspector's verdict on the bytes Jupiter sent back.
 
@@ -2495,15 +3012,25 @@ class LaneRunner:
         )
         if tip_source == "static_fallback":
             log.warning("solana_lane_tip_accounts_degraded", count=len(tip_accounts))
+        permitted = self._permitted_accounts(
+            signer_pubkey=signer_pubkey,
+            direction=direction,
+            close_input_ata=close_input_ata,
+        )
         report = await verify_swap_transaction(
             tx_b64=build.swap_transaction_b64,
             expected_signer=signer_pubkey,
             settings=self._settings,
             rpc_client=self._rpc,
             tip_accounts=tip_accounts,
+            input_mint=direction.input_mint,
+            output_mint=direction.output_mint,
             ata_rent_lamports=ata_rent_lamports,
+            permitted_close_accounts=permitted["close"],
+            permitted_ata_create_accounts=permitted["create"],
         )
         detail = {
+            "direction": direction.name,
             "passed": report.passed,
             "checks": [
                 {"name": c.name, "passed": c.passed, "detail": c.detail}
@@ -2530,13 +3057,26 @@ class LaneRunner:
             "ata_rent_lamports": report.ata_rent_lamports,
             "ata_rent_per_account_lamports": ata_rent_lamports,
             "ata_rent_source": ata_rent_source,
+            "closed_accounts": list(report.closed_accounts),
+            "closed_account_count": len(report.closed_accounts),
+            "recovered_rent_lamports": report.recovered_rent_lamports,
+            "permitted_close_accounts": list(permitted["close"] or ()),
+            "permitted_ata_create_accounts": (
+                None if permitted["create"] is None else list(permitted["create"])
+            ),
+            "input_ata_closure_permitted": close_input_ata,
+            "input_ata_closed": any(
+                account
+                in set(signer_token_accounts(signer_pubkey, direction.input_mint))
+                for account in report.closed_accounts
+            ),
             "rpc_client_supplied": True,
         }
         # The fee ceilings, applied by the engine to what the inspector
         # re-derived from the bytes. The inspector enforces the same three on
         # its own — it has to be safe to use standalone — and both read them
         # from `FeeCeilings.from_settings`, so they cannot drift apart.
-        limits = self._limits.check_transaction(report)
+        limits = self._limits.check_transaction(report, direction=direction.name)
         detail["limits"] = limits.as_evidence()
         return report, limits, detail
 
@@ -4385,6 +4925,1952 @@ class LaneRunner:
             "matches": shortfall == 0,
         }
 
+    # ==================================================================
+    # Reverse swap: USDC -> SOL, closing ONE named ledger row
+    # ==================================================================
+    # Same pipeline, pointed the other way. Everything below composes the
+    # gates `place` already uses — envelope, kill switch, custody, execution
+    # recovery, resolver pool, quote, build, inspection, simulation, the
+    # authorization seam, the signer, the state machine, the resolver — and
+    # differs only where the ACTION differs: this one is named for a row that
+    # already exists, and it ends by closing that row rather than opening one.
+    #
+    # The two dispositional differences, spelled out because they are where a
+    # copied-from-`place` reflex would be wrong:
+    #
+    #   * A failed or never-submitted reverse swap leaves the row OPEN. The
+    #     position still exists; retiring the row (which is what `place` does
+    #     to its own intent row) would assert that the lane holds nothing.
+    #   * The execution row's ``live_trade_id`` is left NULL on purpose, and
+    #     the target row is carried in ``detail`` instead. `place`'s recovery
+    #     sweep RETIRES the ledger row of any execution it discards, and that
+    #     row here is a real position — a crashed rehearsal must not be able to
+    #     mark it rejected.
+    async def _load_reverse_row(
+        self, live_trade_id: int, *, stage: str = "row_selection"
+    ) -> dict[str, Any]:
+        """Load the named row and prove it is a closeable Solana position.
+
+        Run at selection AND again immediately before signing, because every
+        fact here can change while the approval prompt waits.
+        """
+        row = await fetch_live_trade_row(self._db, live_trade_id)
+        if row is None:
+            raise LaneAbort(stage, f"no live_trades row with id={live_trade_id}")
+        if row["venue"] != VENUE:
+            raise LaneAbort(
+                stage,
+                f"live_trades #{live_trade_id} is a {row['venue']!r} row, not "
+                f"{VENUE!r}. This command only closes Solana positions; a "
+                f"{row['venue']!r} position is closed through its own lane. "
+                "Naming the wrong row is the one mistake that cannot be undone "
+                "by refusing later, so it is refused here.",
+            )
+        if row["status"] != "open":
+            raise LaneAbort(
+                stage,
+                f"live_trades #{live_trade_id} status is {row['status']!r}, not "
+                "'open'. Only an open position can be closed: a "
+                "needs_manual_review row must be resolved by hand first, a "
+                "rejected row asserts no position, and a closed row is already "
+                "done.",
+            )
+        if row["exit_order_id"]:
+            raise LaneAbort(
+                stage,
+                f"live_trades #{live_trade_id} already carries exit_order_id "
+                f"{row['exit_order_id']!r}. A reverse swap for this position "
+                "has already been recorded — resolve it with `reverse-status` "
+                "before starting another. NEVER submit a second one.",
+            )
+        entry_price = _dec_or_none(row["entry_fill_price"])
+        entry_qty = _dec_or_none(row["entry_fill_qty"])
+        if entry_price is None or entry_qty is None:
+            raise LaneAbort(
+                stage,
+                f"live_trades #{live_trade_id} has no recorded entry fill "
+                f"(entry_fill_price={row['entry_fill_price']!r}, "
+                f"entry_fill_qty={row['entry_fill_qty']!r}). Without both there "
+                "is no proven position to sell and no basis to price the round "
+                "trip — reconcile the entry before reversing it.",
+            )
+        if entry_price <= 0 or entry_qty <= 0:
+            raise LaneAbort(
+                stage,
+                f"live_trades #{live_trade_id} records a non-positive entry fill "
+                f"(price={_fmt(entry_price)} qty={_fmt(entry_qty)}) — there is "
+                "nothing to sell",
+            )
+        # What the row says the lane HOLDS, in USDC: the SOL that went in
+        # multiplied by the price it executed at. `size_usd` is the AUTHORIZED
+        # figure from before the swap ran, so it is the weaker statement and is
+        # only a fallback for display.
+        return {
+            "row": row,
+            "entry_price": entry_price,
+            "entry_qty": entry_qty,
+            "ledger_usdc": entry_qty * entry_price,
+        }
+
+    async def _check_reverse_lane(
+        self, live_trade_id: int, *, stage: str = "lane_state"
+    ) -> dict[str, Any]:
+        """Nothing else in this lane is outstanding.
+
+        The named row is expected to be blocking — it is the position. Any
+        OTHER blocking row means a second thing is in flight, and closing one
+        position while another is unaccounted for is how two swaps end up
+        sharing one authorization's worth of attention.
+        """
+        others = [
+            row
+            for row in await fetch_blocking_rows(self._db)
+            if row["live_trade_id"] != live_trade_id
+        ]
+        if others:
+            raise LaneAbort(
+                stage,
+                f"{len(others)} other non-terminal Solana ledger row(s) are in "
+                f"flight ({', '.join(str(o['live_trade_id']) for o in others)}) "
+                "— resolve them before closing this position",
+                exit_code=EXIT_BLOCKED,
+            )
+        return {"other_blocking_rows": others}
+
+    async def _read_reverse_balances(self, signer_pubkey: str) -> dict[str, Any]:
+        """Both balances, read in the SAME order every time.
+
+        Order matters beyond tidiness: these are two JSON-RPC calls to one URL,
+        and the recovery record, the approval screen and the pre-signing
+        re-read all have to be describing the same pair of numbers.
+        """
+        sol_lamports = await self._rpc.get_balance(signer_pubkey)
+        usdc_raw = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
+        return {
+            "sol_balance_lamports": sol_lamports,
+            "sol_balance": _fmt(sol_from_lamports(sol_lamports)),
+            "usdc_balance_raw": usdc_raw,
+            "usdc_balance": _fmt(usdc_from_raw(usdc_raw)),
+        }
+
+    async def _check_reverse_balance(
+        self,
+        *,
+        signer_pubkey: str,
+        amount_raw: int,
+        report: VerificationReport,
+        evidence: EvidenceLog,
+        stage: str = "balance",
+    ) -> dict[str, Any]:
+        """The reverse cover question: USDC pays the swap, SOL pays the costs.
+
+        Recorded before it is enforced, so a refusal leaves the balances it
+        refused on — same contract as the forward gate.
+        """
+        balances = await self._read_reverse_balances(signer_pubkey)
+        limits = self._limits.check_reverse_balance(
+            sol_lamports=balances["sol_balance_lamports"],
+            usdc_raw=balances["usdc_balance_raw"],
+            amount_raw=amount_raw,
+            total_fee_lamports=report.total_fee_lamports,
+        )
+        detail = {
+            **balances,
+            "swap_usdc_raw": amount_raw,
+            "swap_usdc": _fmt(usdc_from_raw(amount_raw)),
+            "total_fee_lamports": report.total_fee_lamports,
+            "ata_rent_lamports": report.ata_rent_lamports,
+            "ata_create_count": report.ata_create_count,
+            "recovered_rent_lamports": report.recovered_rent_lamports,
+            "headroom_pct": self._settings.SOLANA_BALANCE_HEADROOM_PCT,
+            "limits": limits.as_evidence(),
+        }
+        evidence.record(stage, **detail)
+        self._enforce(limits, stage)
+        return detail
+
+    def _reverse_closure_lines(
+        self,
+        *,
+        close_usdc_ata: bool,
+        ata_rent_lamports: int,
+        report: VerificationReport | None,
+        signer_pubkey: str,
+    ) -> list[str]:
+        """The USDC-account closure option, as its OWN line on the screen.
+
+        Always printed, in both states. An option that only appears when it is
+        on teaches the operator that its absence means nothing, and the whole
+        point of this one is that the operator can see it did not happen.
+        """
+        rent_sol = _fmt(sol_from_lamports(ata_rent_lamports))
+        if not close_usdc_ata:
+            return [
+                "  USDC acct closure   : DISABLED (default) — the USDC account "
+                "stays open and",
+                f"                        its {ata_rent_lamports} lamports "
+                f"({rent_sol} SOL) of rent stay locked in it.",
+                "                        A build that tries to close it is "
+                "REFUSED, not signed.",
+            ]
+        closed = False
+        if report is not None:
+            own_input = set(signer_token_accounts(signer_pubkey, USDC_MINT))
+            closed = any(a in own_input for a in report.closed_accounts)
+        return [
+            "  USDC acct closure   : ENABLED — a SEPARATE decision from the "
+            "swap, permitted",
+            f"                        for this run only. Recovers exactly "
+            f"{ata_rent_lamports} lamports",
+            f"                        ({rent_sol} SOL) of rent to {signer_pubkey}.",
+            f"                        This build closes it: "
+            f"{'YES' if closed else 'NO (nothing to recover)'}",
+        ]
+
+    async def _render_reverse_decision_screen(
+        self,
+        *,
+        decision_id: str,
+        digest: str,
+        message_sha256: str,
+        signer_pubkey: str,
+        quote: SolanaQuote,
+        build: SwapBuild,
+        report: VerificationReport,
+        balance: dict[str, Any],
+        sim: Any,
+        mode: str,
+        selection: dict[str, Any],
+        amount_raw: int,
+        close_usdc_ata: bool,
+        ata_rent_lamports: int,
+    ) -> None:
+        """The reverse approval block. Rendering only — it decides nothing."""
+        row = selection["row"]
+        out_sol = sol_from_lamports(quote.out_amount)
+        min_out_sol = sol_from_lamports(quote.min_out_amount)
+        impact = quote_price_impact_pct(quote)
+        age = await self._blockhash_age(build)
+        limits = self._limits.declared_limits()
+        lines = [
+            f"  pair                : {DIRECTION_REVERSE.label}  "
+            "(CLOSING a position)",
+            f"  ledger row          : live_trades #{row['live_trade_id']} "
+            f"({row['status']}), venue {row['venue']}",
+            f"  row claims held     : {_fmt(selection['ledger_usdc'])} USDC "
+            f"({_fmt(selection['entry_qty'])} SOL in at "
+            f"{_fmt(selection['entry_price'])} USDC/SOL)",
+            f"  input mint          : {quote.input_mint}",
+            f"  output mint         : {quote.output_mint}",
+            f"  exact input         : {_fmt(usdc_from_raw(quote.in_amount))} USDC "
+            f"({quote.in_amount} raw)",
+            f"  expected output     : {_fmt(out_sol)} SOL "
+            f"({quote.out_amount} lamports)",
+            f"  minimum acceptable  : {_fmt(min_out_sol)} SOL "
+            f"({quote.min_out_amount} lamports, otherAmountThreshold; this is "
+            "the bound enforced on-chain)",
+            f"  slippage            : {quote.slippage_bps} bps",
+            f"  price impact        : {_fmt(impact)}%",
+            f"  route               : {_route_summary(quote)}",
+            f"  route (full)        : {route_fingerprint(quote)}",
+            f"  priority fee        : {report.priority_fee_lamports} lamports",
+            f"  jito tip            : {report.jito_tip_lamports} lamports "
+            f"-> {report.jito_tip_destination}",
+            f"  max total fee       : {report.total_fee_lamports} lamports "
+            f"(base + priority + tip + account rent, of "
+            f"{self._settings.SOLANA_PILOT_MAX_TOTAL_FEE_LAMPORTS} allowed)",
+            f"  accounts created    : {report.ata_create_count} "
+            f"({report.ata_rent_lamports} lamports of rent)",
+            f"  accounts closed     : {len(report.closed_accounts)} "
+            f"({report.recovered_rent_lamports} lamports of rent returned) "
+            f"{list(report.closed_accounts)}",
+        ]
+        lines += self._reverse_closure_lines(
+            close_usdc_ata=close_usdc_ata,
+            ata_rent_lamports=ata_rent_lamports,
+            report=report,
+            signer_pubkey=signer_pubkey,
+        )
+        lines += [
+            f"  blockhash           : {report.recent_blockhash}",
+            f"  blockhash age       : {age}",
+            f"  simulation          : err={sim.err}, "
+            f"{sim.units_consumed} compute units consumed",
+            f"  signer              : {signer_pubkey}",
+            f"  current SOL         : {balance['sol_balance']} SOL",
+            f"  current USDC        : {balance['usdc_balance']} USDC",
+            f"  envelope            : per-trade "
+            f"{limits['per_trade_usd'][0]}-{limits['per_trade_usd'][1]} USD on "
+            f"the USDC leg, max {limits['max_ata_creates']} account create(s)",
+            f"  MESSAGE SHA256      : {message_sha256}",
+            f"  APPROVAL DIGEST     : {digest}",
+            "                        (message hash + amounts + full route + "
+            "slippage + impact",
+            "                         + fees + priority fee + tip + blockhash + "
+            "wallet",
+            "                         + row id + row state + the closure option)",
+            f"  database            : {Path(self._settings.DB_PATH).resolve()}",
+            f"  decision ID         : {decision_id}",
+            "  signing status      : NOT SIGNED - the funded key is read only "
+            "after you authorize",
+        ]
+        if mode not in EXECUTING_MODES:
+            lines.append(
+                f"  ** REHEARSAL        : mode {mode} — the funded key is "
+                "never read, nothing is signed and nothing is sent"
+            )
+        _print_block(
+            "SOLANA REVERSE SWAP (USDC -> SOL) — MANUAL APPROVAL REQUIRED", lines
+        )
+
+    async def _reverse_state(
+        self,
+        decision_id: str,
+        state: str,
+        *,
+        mode: str,
+        detail: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> None:
+        """Record a transition, always carrying the reverse discriminator.
+
+        ``record_execution_state`` REPLACES the detail blob when one is passed,
+        so every reverse write merges rather than assigns — otherwise the run's
+        own recovery record would be erased by the next transition, which is
+        the one that matters.
+        """
+        merged: dict[str, Any] = {"direction": DIRECTION_USDC_TO_SOL}
+        existing = await load_execution(self._db, decision_id)
+        if existing is not None and isinstance(existing.get("detail"), dict):
+            merged.update(existing["detail"])
+        if detail:
+            merged.update(detail)
+        await self._state(decision_id, state, mode=mode, detail=merged, **fields)
+
+    async def reverse_place(
+        self,
+        *,
+        live_trade_id: int,
+        usdc: Decimal,
+        mode: str | None = None,
+        close_usdc_ata: bool = False,
+    ) -> int:
+        """Close ONE named Solana ledger row with a supervised USDC->SOL swap."""
+        mode = mode or self._settings.SOLANA_MODE
+        decision_id = str(uuid4())
+        evidence = self._evidence_for(decision_id)
+        try:
+            amount_raw = raw_from_usdc(usdc)
+            if amount_raw <= 0:
+                # The CLI converter already refuses this, but `reverse_place`
+                # is a public entry point and a zero amount would otherwise
+                # surface as an opaque ValueError from Jupiter three steps
+                # later, after the envelope had already been recorded as
+                # cleared.
+                raise ValueError(f"{usdc} USDC is not a swappable amount")
+        except ValueError as exc:
+            evidence.record("aborted", stage="args", reason=str(exc))
+            print(f"REFUSED [args]: {exc}")
+            return EXIT_REFUSED
+
+        evidence.record(
+            "run_started",
+            command="reverse",
+            direction=DIRECTION_USDC_TO_SOL,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            usdc=_fmt(usdc),
+            amount_raw=amount_raw,
+            close_usdc_ata=close_usdc_ata,
+            mode=mode,
+            evidence_path=str(evidence.path),
+            db_path=str(Path(self._settings.DB_PATH).resolve()),
+        )
+        try:
+            return await self._reverse_place_inner(
+                evidence=evidence,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                amount_raw=amount_raw,
+                mode=mode,
+                close_usdc_ata=close_usdc_ata,
+            )
+        except LaneAbort as abort:
+            evidence.record(
+                "aborted",
+                stage=abort.stage,
+                reason=abort.reason,
+                exit_code=abort.exit_code,
+            )
+            print(f"REFUSED [{abort.stage}]: {abort.reason}")
+            print(f"evidence: {evidence.path}")
+            return abort.exit_code
+        except Exception as exc:
+            log.error(
+                "solana_reverse_unexpected_error",
+                decision_id=decision_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                exc_info=True,
+            )
+            evidence.record(
+                "unexpected_error",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                live_trade_id=live_trade_id,
+            )
+            _print_block(
+                "ESCALATE — UNEXPECTED FAILURE",
+                [
+                    f"  {type(exc).__name__}: {exc}",
+                    f"  decision ID     : {decision_id}",
+                    f"  live_trades row : {live_trade_id} (left as it stands)",
+                    "  Confirm the on-chain state before any further action.",
+                    "  NEVER rebuild — resolve the persisted signature with",
+                    "    python -m scout.live.solana_lane reverse-resolve "
+                    f"--decision-id {decision_id}",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_ESCALATE
+
+    async def _reverse_place_inner(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        amount_raw: int,
+        mode: str,
+        close_usdc_ata: bool,
+    ) -> int:
+        direction = DIRECTION_REVERSE
+        executing = mode in EXECUTING_MODES
+
+        envelope = await self._check_envelope(mode=mode, direction=direction)
+        evidence.record("envelope_gate", **envelope)
+
+        # The closure option takes TWO deliberate acts. A CLI flag that could
+        # switch it on by itself would be a flag that widens a safety default,
+        # which is the same shape as `--simulate-only` being able to escalate a
+        # DISABLED lane — refused there, refused here.
+        if close_usdc_ata and not self._settings.SOLANA_REVERSE_CLOSE_USDC_ATA:
+            raise LaneAbort(
+                "usdc_ata_closure",
+                "--close-usdc-ata was passed but SOLANA_REVERSE_CLOSE_USDC_ATA "
+                "is False. Closing the USDC account is a separate decision "
+                "from the swap and takes two deliberate settings, on purpose. "
+                "Nothing was quoted.",
+            )
+        evidence.record(
+            "usdc_ata_closure_option",
+            requested=close_usdc_ata,
+            setting_enabled=bool(self._settings.SOLANA_REVERSE_CLOSE_USDC_ATA),
+            effective=close_usdc_ata,
+            note="OFF means a build that closes the USDC account is refused, "
+            "not silently accepted",
+        )
+
+        kill = await self._check_kill_switch("kill_switch_check")
+        evidence.record("kill_switch_check", **kill)
+
+        custody = self._custody_precheck()
+        signer_pubkey = custody["declared_signer_pubkey"]
+        evidence.record("keypair_custody", **custody)
+
+        recovery = await self._recover_interrupted_executions()
+        evidence.record("execution_recovery", **recovery)
+        if recovery["blockers"]:
+            raise LaneAbort(
+                "execution_recovery",
+                f"{recovery['blockers']} interrupted execution(s) may have "
+                "reached the block engine. The lane is blocked until each is "
+                "resolved. NEVER rebuild — run `reverse-resolve` (or `resolve` "
+                "for a forward run).",
+                exit_code=EXIT_BLOCKED,
+            )
+
+        await self._check_resolver_pool(mode=mode, evidence=evidence)
+
+        selection = await self._load_reverse_row(live_trade_id)
+        row = selection["row"]
+        evidence.record(
+            "row_selected",
+            live_trade_id=live_trade_id,
+            status=row["status"],
+            venue=row["venue"],
+            pair=row["pair"],
+            symbol=row["symbol"],
+            client_order_id=row["client_order_id"],
+            entry_order_id=row["entry_order_id"],
+            entry_fill_price=_fmt(selection["entry_price"]),
+            entry_fill_qty=_fmt(selection["entry_qty"]),
+            ledger_usdc=_fmt(selection["ledger_usdc"]),
+            size_usd=row["size_usd"],
+        )
+        evidence.record("lane_state", **await self._check_reverse_lane(live_trade_id))
+
+        # Selling MORE than the row claims would be selling USDC this lane did
+        # not buy. The claim is in USDC and USDC quantity does not move with
+        # price, so this is an exact bound rather than a tolerance.
+        requested_usdc = usdc_from_raw(amount_raw) or Decimal("0")
+        if requested_usdc > selection["ledger_usdc"]:
+            raise LaneAbort(
+                "amount",
+                f"{_fmt(requested_usdc)} USDC exceeds the "
+                f"{_fmt(selection['ledger_usdc'])} USDC that live_trades "
+                f"#{live_trade_id} records as held. A reverse swap closes THIS "
+                "position; selling more would be selling USDC the row does not "
+                "account for.",
+            )
+
+        # Minted HERE and nowhere else: from the row `_load_reverse_row` proved,
+        # bounded by the amount check immediately above, and stamped with the
+        # policy that will be asked to authorize. The engine re-checks every
+        # field of it against the quote — this call cannot ASK for the
+        # exemption, only offer the proof of it.
+        exit_binding = operator_exit_binding(selection=selection, mode=mode)
+        quote, quoted_at = await self._quote_and_check(
+            amount_lamports=amount_raw,
+            evidence=evidence,
+            direction=direction,
+            exit_binding=exit_binding,
+        )
+        await self._reverse_state(
+            decision_id,
+            STATE_QUOTE_CREATED,
+            mode=mode,
+            amount_lamports=amount_raw,
+            minimum_out_raw=quote.min_out_amount,
+            detail={"live_trade_id": live_trade_id, "amount_raw": amount_raw},
+        )
+
+        tip = int(self._settings.SOLANA_PILOT_JITO_TIP_LAMPORTS)
+        build = await self._jupiter.build_swap_transaction(
+            quote=quote, user_pubkey=signer_pubkey, jito_tip_lamports=tip
+        )
+        evidence.record(
+            "swap_built",
+            last_valid_block_height=build.last_valid_block_height,
+            requested_jito_tip_lamports=build.requested_jito_tip_lamports,
+            prioritization_fee_lamports=build.prioritization_fee_lamports,
+            compute_unit_limit=build.compute_unit_limit,
+            simulation_error=build.simulation_error,
+            tx_b64_len=len(build.swap_transaction_b64),
+        )
+        await self._reverse_state(
+            decision_id,
+            STATE_TRANSACTION_BUILT,
+            mode=mode,
+            last_valid_block_height=build.last_valid_block_height,
+        )
+        if build.simulation_error is not None:
+            raise LaneAbort(
+                "swap_built",
+                f"Jupiter reported a simulation error on its own build: "
+                f"{build.simulation_error}",
+            )
+
+        ata_rent, ata_rent_source = await self._ata_rent_lamports()
+        report, fee_limits, inspect_detail = await self._inspect(
+            build=build,
+            signer_pubkey=signer_pubkey,
+            ata_rent_lamports=ata_rent,
+            ata_rent_source=ata_rent_source,
+            direction=direction,
+            close_input_ata=close_usdc_ata,
+        )
+        evidence.record("tx_inspection", **inspect_detail)
+        if not report.passed:
+            raise LaneAbort(
+                "tx_inspection",
+                "; ".join(f"{c.name}: {c.detail}" for c in report.failures),
+            )
+        self._enforce(fee_limits, "tx_limits")
+
+        balance = await self._check_reverse_balance(
+            signer_pubkey=signer_pubkey,
+            amount_raw=amount_raw,
+            report=report,
+            evidence=evidence,
+        )
+
+        sim = await self._rpc.simulate_transaction(build.swap_transaction_b64)
+        evidence.record(
+            "simulation",
+            ok=sim.ok,
+            err=sim.err,
+            units_consumed=sim.units_consumed,
+            slot=sim.slot,
+            logs_tail=list(sim.logs[-20:]),
+        )
+        if not sim.ok:
+            raise LaneAbort(
+                "simulation",
+                f"independent simulation failed against current chain state: "
+                f"err={sim.err}. Submitting anyway would burn a fee to land "
+                "a failure.",
+            )
+        await self._reverse_state(decision_id, STATE_SIMULATION_PASSED, mode=mode)
+
+        message_sha256 = report.message_sha256
+        snapshot = build_reverse_snapshot(
+            message_sha256=message_sha256,
+            wallet=signer_pubkey,
+            live_trade_id=live_trade_id,
+            row_status=str(row["status"]),
+            usdc_in_raw=quote.in_amount,
+            expected_sol_out_raw=quote.out_amount,
+            minimum_sol_out_raw=quote.min_out_amount,
+            route=route_fingerprint(quote),
+            slippage_bps=quote.slippage_bps,
+            price_impact_pct=quote_price_impact_pct(quote),
+            total_fee_lamports=report.total_fee_lamports,
+            priority_fee_lamports=report.priority_fee_lamports,
+            jito_tip_lamports=report.jito_tip_lamports,
+            blockhash=report.recent_blockhash,
+            close_usdc_ata=close_usdc_ata,
+        )
+        digest = reverse_intent_digest(snapshot)
+        evidence.record(
+            "authorization_bound",
+            digest=digest,
+            token=reverse_authorization_token(snapshot),
+            snapshot=snapshot,
+            bound_fields=sorted(snapshot),
+            note="the typed token is derived from this snapshot; it is "
+            "recomputed from freshly-read state immediately before signing and "
+            "any difference voids the authorization. The message hash is one "
+            "of the bound fields, so a rebuilt transaction cannot be signed "
+            "under this approval.",
+        )
+        await self._reverse_state(
+            decision_id,
+            STATE_AWAITING_AUTHORIZATION,
+            mode=mode,
+            message_sha256=message_sha256,
+            detail={"approval_digest": digest},
+        )
+
+        policy = authorization_policy_for(mode)
+        request = AuthorizationRequest(
+            decision_id=decision_id,
+            mode=mode,
+            message_sha256=message_sha256,
+            signer_pubkey=signer_pubkey,
+            amount_lamports=amount_raw,
+            quoted_out_raw=quote.out_amount,
+            minimum_out_raw=quote.min_out_amount,
+            slippage_bps=quote.slippage_bps,
+            price_impact_pct=quote_price_impact_pct(quote),
+            total_fee_lamports=report.total_fee_lamports,
+            last_valid_block_height=build.last_valid_block_height,
+            direction=direction.name,
+            binding_digest=digest,
+            binding_label="APPROVAL DIGEST",
+            render=lambda: self._render_reverse_decision_screen(
+                decision_id=decision_id,
+                digest=digest,
+                message_sha256=message_sha256,
+                signer_pubkey=signer_pubkey,
+                quote=quote,
+                build=build,
+                report=report,
+                balance=balance,
+                sim=sim,
+                mode=mode,
+                selection=selection,
+                amount_raw=amount_raw,
+                close_usdc_ata=close_usdc_ata,
+                ata_rent_lamports=ata_rent,
+            ),
+        )
+        decision = await policy.authorize(request)
+        evidence.record(
+            "authorization",
+            outcome="authorized" if decision.authorized else "authorization_refused",
+            detail=decision.outcome,
+            method=decision.method,
+            mode=mode,
+            bound_to_digest=digest,
+            bound_to_message_sha256=message_sha256,
+            funded_signer_loaded=False,
+            **decision.detail,
+        )
+        if not decision.authorized:
+            # The row is left exactly as it was. Nothing was signed and nothing
+            # was sent, so the position is still open and still the operator's.
+            await self._terminalize_execution(
+                decision_id, reason="authorization_refused"
+            )
+            raise LaneAbort(
+                "authorization",
+                f"not authorized by {decision.method} ({decision.outcome}) — "
+                "nothing was signed, nothing was sent, and live_trades "
+                f"#{live_trade_id} is untouched",
+            )
+
+        await self._reverse_state(decision_id, STATE_AUTHORIZED, mode=mode)
+
+        if not executing:
+            evidence.record(
+                "rehearsal_complete",
+                message_sha256=message_sha256,
+                approval_digest=digest,
+                simulation_ok=sim.ok,
+                units_consumed=sim.units_consumed,
+                funded_signer_loaded=False,
+                note="--simulate-only: the funded key was never read and "
+                "nothing was signed, so no transaction exists to submit",
+            )
+            _print_block(
+                "REHEARSAL COMPLETE — nothing was signed, nothing was sent",
+                [
+                    f"  decision ID     : {decision_id}",
+                    f"  live_trades row : {live_trade_id} (still open)",
+                    f"  message sha256  : {message_sha256}",
+                    f"  approval digest : {digest}",
+                    f"  simulation      : ok, {sim.units_consumed} compute units",
+                    "  funded key      : NOT read (a rehearsal never signs)",
+                    f"  evidence        : {evidence.path}",
+                ],
+            )
+            return EXIT_OK
+
+        # ---- post-approval, pre-signing: re-ask everything perishable ----
+        kill_state = await self._ks.is_active()
+        if kill_state is not None:
+            await self._terminalize_execution(decision_id, reason="kill_switch")
+            evidence.record(
+                "kill_switch_recheck",
+                kill_active=True,
+                kill_event_id=kill_state.kill_event_id,
+                reason=kill_state.reason,
+                live_trade_id=live_trade_id,
+                ledger_status=row["status"],
+            )
+            raise LaneAbort(
+                "kill_switch_recheck",
+                f"kill switch engaged between approval and signing (event "
+                f"#{kill_state.kill_event_id}) — nothing was signed or sent",
+            )
+        evidence.record("kill_switch_recheck", kill_active=False)
+
+        freshness = await self._recheck_blockhash(build=build, quoted_at=quoted_at)
+        evidence.record("blockhash_recheck", **freshness)
+        if not freshness["valid"]:
+            await self._terminalize_execution(decision_id, reason="stale_build")
+            _print_block(
+                "AUTHORIZATION INVALIDATED — nothing was signed or sent",
+                [
+                    f"  {freshness['detail']}",
+                    "",
+                    "  The quote and the transaction you authorized are stale.",
+                    "  The funded key was never read, nothing was signed and",
+                    f"  nothing was submitted. live_trades #{live_trade_id} is",
+                    "  untouched and still open.",
+                    "",
+                    "  Rerun the command. The next run does the whole loop again:",
+                    "  a NEW quote, a NEW message hash, a NEW digest and a NEW",
+                    "  authorization bound to it.",
+                    f"  evidence: {evidence.path}",
+                ],
+            )
+            return EXIT_REFUSED
+
+        verified = await self._verify_reverse_before_signing(
+            evidence=evidence,
+            decision_id=decision_id,
+            snapshot=snapshot,
+            digest=digest,
+            live_trade_id=live_trade_id,
+            signer_pubkey=signer_pubkey,
+            amount_raw=amount_raw,
+            approved_balance=balance,
+            quote=quote,
+            report=report,
+            close_usdc_ata=close_usdc_ata,
+        )
+
+        # ---------------------------------------------------------------
+        # THE FUNDED KEY IS READ HERE, AND NOWHERE EARLIER.
+        # ---------------------------------------------------------------
+        keypair = self._load_funded_signer(expected=signer_pubkey)
+        evidence.record(
+            "funded_signer_loaded",
+            signer_pubkey=signer_pubkey,
+            after_authorization=True,
+            after_state_reverification=True,
+            note="read at call time, used once, dropped; never cached",
+        )
+
+        signed = sign_transaction(
+            build.swap_transaction_b64, keypair, expected_signer=signer_pubkey
+        )
+        if signed.message_sha256 != message_sha256:
+            await self._terminalize_execution(decision_id, reason="digest_mismatch")
+            raise LaneAbort(
+                "signed_in_memory",
+                f"signed message digest {signed.message_sha256} does not match "
+                f"the AUTHORIZED digest {message_sha256} — the transaction "
+                "changed after approval and will not be sent",
+            )
+
+        # ---- THE RECOVERY BASELINE, fsynced before anything is sent ----
+        # Self-sufficient by design: a process holding none of this run's
+        # memory must be able to reconcile from this record alone, which is why
+        # the pre-submit balances are in it and not only the order parameters.
+        intent = {
+            "decision_id": decision_id,
+            "direction": DIRECTION_USDC_TO_SOL,
+            "live_trade_id": live_trade_id,
+            "row_status_at_signing": verified["row_status"],
+            "approval_digest": digest,
+            "message_sha256": message_sha256,
+            "expected_signature": signed.signature,
+            "signer_pubkey": signer_pubkey,
+            "pre_submit_sol_lamports": verified["sol_balance_lamports"],
+            "pre_submit_usdc_raw": verified["usdc_balance_raw"],
+            "amount_raw": amount_raw,
+            "quoted_out_lamports": quote.out_amount,
+            "min_out_lamports": quote.min_out_amount,
+            "total_fee_lamports": report.total_fee_lamports,
+            "ata_rent_lamports": report.ata_rent_lamports,
+            "recovered_rent_lamports": report.recovered_rent_lamports,
+            "last_valid_block_height": build.last_valid_block_height,
+            "close_usdc_ata": close_usdc_ata,
+        }
+        evidence.record(
+            _REVERSE_INTENT_STEP,
+            **intent,
+            note="written and fsynced BEFORE submission; if the run dies after "
+            "this record a transaction may exist — resolve it by signature "
+            "with `reverse-resolve`, NEVER rebuild",
+        )
+        await self._reverse_state(
+            decision_id,
+            STATE_SIGNED,
+            mode=mode,
+            expected_signature=signed.signature,
+            detail=intent,
+        )
+        # Read back from the durable store rather than trusting the write, for
+        # the same reason `persist_expected_signature` does on the forward
+        # lane: submission that raced ahead of this would be a transaction
+        # nobody could resolve.
+        stored = await load_execution(self._db, decision_id)
+        if stored is None or stored.get("expected_signature") != signed.signature:
+            raise LaneAbort(
+                "signature_persisted",
+                "the expected signature did not persist to solana_executions "
+                f"{decision_id}: wrote {signed.signature!r}, read back "
+                f"{None if stored is None else stored.get('expected_signature')!r}. "
+                "Refusing to submit a transaction that could not be resolved "
+                "afterwards.",
+                exit_code=EXIT_ESCALATE,
+            )
+        evidence.record(
+            "signature_persisted",
+            decision_id=decision_id,
+            expected_signature=stored["expected_signature"],
+            confirmed_by_read_back=True,
+        )
+
+        return await self._submit_reverse(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            selection=selection,
+            signed=signed,
+            build=build,
+            quote=quote,
+            report=report,
+            intent=intent,
+            signer_pubkey=signer_pubkey,
+            mode=mode,
+        )
+
+    async def _verify_reverse_before_signing(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        snapshot: dict[str, str],
+        digest: str,
+        live_trade_id: int,
+        signer_pubkey: str,
+        amount_raw: int,
+        approved_balance: dict[str, Any],
+        quote: SolanaQuote,
+        report: VerificationReport,
+        close_usdc_ata: bool,
+    ) -> dict[str, Any]:
+        """Re-read the row and BOTH balances, then RECOMPUTE the digest.
+
+        *** THIS RUNS IMMEDIATELY BEFORE SIGNING, NOT BEFORE THE SCREEN. ***
+        The approval prompt is unbounded operator time and the lane lock only
+        excludes another lane process — a wallet can be moved from a phone, and
+        the row can be closed by hand in another terminal, and neither takes
+        our lock. Checking these before the screen would prove they were true
+        when the operator started reading.
+
+        Two comparisons, both refusals:
+
+        * the SNAPSHOT is REBUILT — from the quote, the inspection report and a
+          freshly-read row, every field derived again rather than copied — and
+          re-digested. Copying the approved snapshot and overwriting one field
+          would make the comparison hollow: it could only ever detect the field
+          that was overwritten, so a future change that re-quoted or rebuilt
+          before signing would slip straight through the check meant to catch
+          exactly that.
+        * the BALANCES must be unchanged AND must still cover. Balances are not
+          in the digest — they are not part of what the operator approves — but
+          a wallet that moved between approval and signing is a wallet whose
+          state nobody approved, and re-running the cover check on stale
+          numbers would be checking the wrong thing.
+
+        A mismatch NEVER rebuilds. The row is left open and untouched.
+        """
+        try:
+            selection = await self._load_reverse_row(
+                live_trade_id, stage="pre_signing_recheck"
+            )
+        except LaneAbort:
+            # The row stopped being a closeable open position while the
+            # operator was reading. Terminalize FIRST: leaving the execution
+            # non-terminal would block the lane on a run that provably never
+            # signed anything.
+            await self._terminalize_execution(
+                decision_id, reason="row_changed_before_signing"
+            )
+            raise
+        row = selection["row"]
+        balances = await self._read_reverse_balances(signer_pubkey)
+        rebuilt = build_reverse_snapshot(
+            message_sha256=report.message_sha256,
+            wallet=signer_pubkey,
+            live_trade_id=live_trade_id,
+            row_status=str(row["status"]),
+            usdc_in_raw=quote.in_amount,
+            expected_sol_out_raw=quote.out_amount,
+            minimum_sol_out_raw=quote.min_out_amount,
+            route=route_fingerprint(quote),
+            slippage_bps=quote.slippage_bps,
+            price_impact_pct=quote_price_impact_pct(quote),
+            total_fee_lamports=report.total_fee_lamports,
+            priority_fee_lamports=report.priority_fee_lamports,
+            jito_tip_lamports=report.jito_tip_lamports,
+            blockhash=report.recent_blockhash,
+            close_usdc_ata=close_usdc_ata,
+        )
+        rebuilt_digest = reverse_intent_digest(rebuilt)
+
+        limits = self._limits.check_reverse_balance(
+            sol_lamports=balances["sol_balance_lamports"],
+            usdc_raw=balances["usdc_balance_raw"],
+            amount_raw=amount_raw,
+            total_fee_lamports=report.total_fee_lamports,
+        )
+        balance_moves = [
+            f"{key}: approved {approved_balance.get(key)!r}, now {balances[key]!r}"
+            for key in ("sol_balance_lamports", "usdc_balance_raw")
+            if approved_balance.get(key) != balances[key]
+        ]
+        differences = snapshot_differences(snapshot, rebuilt)
+        detail = {
+            "digest_at_approval": digest,
+            "digest_now": rebuilt_digest,
+            "digest_matches": rebuilt_digest == digest,
+            "snapshot_differences": differences,
+            "balance_moves": balance_moves,
+            "row_status": str(row["status"]),
+            **balances,
+            "limits": limits.as_evidence(),
+        }
+        evidence.record("pre_signing_recheck", **detail)
+
+        if rebuilt_digest != digest or balance_moves or not limits.passed:
+            await self._terminalize_execution(
+                decision_id, reason="authorization_invalidated"
+            )
+            reasons = (
+                differences
+                + balance_moves
+                + [f"{c.name}: {c.detail}" for c in limits.failures]
+            )
+            evidence.record(
+                "authorization_invalidated",
+                live_trade_id=live_trade_id,
+                ledger_status=str(row["status"]),
+                reasons=reasons,
+                note="the state the authorization was given for is no longer "
+                "the state in front of us; the funded key was never read",
+            )
+            raise LaneAbort(
+                "pre_signing_recheck",
+                "the state changed between approval and signing, so the "
+                "authorization is void: "
+                + "; ".join(reasons)
+                + f". Nothing was signed, nothing was sent, and live_trades "
+                f"#{live_trade_id} is untouched. Rerun for a new quote and a "
+                "new authorization — this run will NOT rebuild.",
+            )
+        return detail
+
+    async def _submit_reverse(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        selection: dict[str, Any],
+        signed: SignedTransaction,
+        build: SwapBuild,
+        quote: SolanaQuote,
+        report: VerificationReport,
+        intent: dict[str, Any],
+        signer_pubkey: str,
+        mode: str,
+    ) -> int:
+        """Submit exactly once, then decide what happened. Never resubmits."""
+        await self._reverse_state(decision_id, STATE_SUBMISSION_ATTEMPTED, mode=mode)
+        bundle_id: str | None = None
+        try:
+            receipt = await self._jito.submit_transaction(
+                signed.signed_tx_b64,
+                expected_signature=signed.signature,
+                last_valid_block_height=build.last_valid_block_height,
+            )
+        except SolanaAmbiguousSubmissionError as exc:
+            evidence.record(
+                "submission_ambiguous",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                expected_signature=exc.expected_signature,
+                bundle_id=exc.bundle_id,
+                note="NEVER rebuild — resolving the persisted signature instead",
+            )
+            bundle_id = exc.bundle_id
+            code, _resolution = await self._handle_reverse_ambiguity(
+                evidence=evidence,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                signed=signed,
+                build=build,
+                signer_pubkey=signer_pubkey,
+                mode=mode,
+                bundle_id=bundle_id,
+            )
+            if code is not None:
+                return code
+        except SolanaAPIError as exc:
+            # The block engine DECIDED. Definitive: nothing was accepted, so
+            # the position is untouched and the lane is clear.
+            await self._terminalize_execution(decision_id, reason="submission_refused")
+            evidence.record(
+                "submission_refused",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                live_trade_id=live_trade_id,
+                ledger_status="open (unchanged — the position was not sold)",
+            )
+            print(f"REFUSED [submit]: {type(exc).__name__}: {exc}")
+            print(f"evidence: {evidence.path}")
+            return EXIT_REFUSED
+        else:
+            bundle_id = receipt.bundle_id
+            evidence.record(
+                "submitted",
+                expected_signature=receipt.signature,
+                returned_signature=receipt.returned_signature,
+                bundle_id=receipt.bundle_id,
+                bundle_only=receipt.bundle_only,
+            )
+
+        print(
+            "submitted; waiting for confirmation then finalization, up to "
+            f"{self._settings.SOLANA_PILOT_CONFIRM_TIMEOUT_SEC:g}s + "
+            f"{self._settings.SOLANA_PILOT_FINALIZE_TIMEOUT_SEC:g}s ..."
+        )
+        confirmation = await self._await_confirmation(signed.signature)
+        evidence.record("confirmation", **confirmation)
+        if confirmation["outcome"] == "finalized":
+            await self._reverse_state(decision_id, STATE_FINALIZED, mode=mode)
+        elif confirmation["known"]:
+            await self._reverse_state(decision_id, STATE_LANDED, mode=mode)
+
+        if confirmation["outcome"] == "failed_on_chain":
+            await self._reverse_state(
+                decision_id,
+                STATE_FAILED,
+                mode=mode,
+                detail={"reason": "failed_on_chain"},
+            )
+            evidence.record(
+                "failed_on_chain",
+                live_trade_id=live_trade_id,
+                ledger_status="open (unchanged — the position was not sold)",
+                err=confirmation["err"],
+            )
+            _print_block(
+                "TRANSACTION FAILED ON CHAIN — position NOT closed, fee paid",
+                [
+                    f"  signature   : {signed.signature}",
+                    f"  on-chain err: {confirmation['err']}",
+                    f"  slot        : {confirmation['slot']}",
+                    "  The swap did not execute. The transaction fee was still",
+                    f"  charged. live_trades #{live_trade_id} is STILL OPEN and",
+                    "  the USDC is still in the wallet.",
+                    f"  evidence    : {evidence.path}",
+                ],
+            )
+            return EXIT_REFUSED
+
+        if confirmation["outcome"] == "confirm_timeout":
+            evidence.record(
+                "confirmation_timeout",
+                note="signature not seen inside the confirmation window — "
+                "resolving rather than assuming",
+            )
+            code, resolution = await self._handle_reverse_ambiguity(
+                evidence=evidence,
+                decision_id=decision_id,
+                live_trade_id=live_trade_id,
+                signed=signed,
+                build=build,
+                signer_pubkey=signer_pubkey,
+                mode=mode,
+                bundle_id=bundle_id,
+            )
+            if code is not None:
+                return code
+            confirmation["outcome"] = "landed_after_resolution"
+            confirmation["slot"] = resolution.slot
+            confirmation["confirmation_status"] = resolution.confirmation_status
+            # The state machine has to catch up with what the resolver found
+            # before reconciliation can advance it to `reconciled`: the run is
+            # still at `submission_attempted`, from which `reconciled` is not
+            # reachable — and it must not be, because that would let a run
+            # reconcile without ever recording that its transaction landed.
+            await self._reverse_state(
+                decision_id,
+                (
+                    STATE_FINALIZED
+                    if resolution.confirmation_status == "finalized"
+                    else STATE_LANDED
+                ),
+                mode=mode,
+            )
+
+        transaction = None
+        try:
+            transaction = await self._rpc.get_transaction(signed.signature)
+        except Exception as exc:
+            evidence.record(
+                "get_transaction_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        meta = (transaction or {}).get("meta") or {}
+        evidence.record(
+            "transaction_record",
+            found=transaction is not None,
+            slot=(transaction or {}).get("slot"),
+            fee_lamports=meta.get("fee"),
+            on_chain_err=meta.get("err"),
+        )
+
+        summary = await self._reconcile_reverse(
+            evidence=evidence,
+            decision_id=decision_id,
+            live_trade_id=live_trade_id,
+            selection=selection,
+            signature=signed.signature,
+            quote=quote,
+            report=report,
+            intent=intent,
+            signer_pubkey=signer_pubkey,
+            confirmation=confirmation,
+            transaction=transaction,
+            mode=mode,
+        )
+        return summary["exit_code"]
+
+    async def _handle_reverse_ambiguity(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        signed: SignedTransaction,
+        build: SwapBuild,
+        signer_pubkey: str,
+        mode: str,
+        bundle_id: str | None = None,
+    ) -> tuple[int | None, ResolutionReport]:
+        """Turn an ambiguous reverse submission into a decided state.
+
+        Returns ``(exit_code, resolution)`` — or ``(None, resolution)`` when
+        the transaction turns out to have landed and the caller continues into
+        reconciliation.
+
+        NO branch here rebuilds, resubmits, or CLOSES the row. A rebuild is a
+        second signature and both can land: two sales where one was
+        authorized. Closing on anything short of proven finality would assert a
+        position was disposed of on the strength of not knowing.
+        """
+        pooled = await self._resolve(
+            signature=signed.signature,
+            last_valid_block_height=build.last_valid_block_height,
+            owner_pubkey=signer_pubkey,
+        )
+        resolution = pooled.report
+        evidence.record(
+            "ambiguity_resolution",
+            **_resolution_summary(resolution),
+            **pooled.as_evidence(),
+        )
+        await self._record_bundle_diagnostics(evidence, bundle_id)
+
+        if resolution.verdict == "landed":
+            evidence.record(
+                "ambiguity_adopted",
+                signature=signed.signature,
+                slot=resolution.slot,
+                confirmation_status=resolution.confirmation_status,
+                note="the transaction DID land — adopting it rather than " "rebuilding",
+            )
+            return None, resolution
+
+        if resolution.verdict in ("failed_on_chain", "definitively_not_submitted"):
+            ended = await self._terminalize_execution(
+                decision_id, reason=f"reverse:{resolution.verdict}"
+            )
+            evidence.record(
+                f"ambiguity_{resolution.verdict}",
+                live_trade_id=live_trade_id,
+                ledger_status="open (unchanged — the position was not sold)",
+                execution_state=ended,
+                on_chain_err=resolution.on_chain_err,
+            )
+            _print_block(
+                "REVERSE SWAP DID NOT EXECUTE — position still open",
+                [
+                    f"  signature   : {signed.signature}",
+                    f"  verdict     : {resolution.verdict}",
+                    f"  on-chain err: {resolution.on_chain_err}",
+                    f"  live_trades #{live_trade_id} is unchanged and STILL OPEN.",
+                    "  The USDC is still in the wallet."
+                    + (
+                        "  A fee was paid."
+                        if resolution.verdict == "failed_on_chain"
+                        else ""
+                    ),
+                    "",
+                    "  Rerunning builds a NEW transaction with a new signature",
+                    "  and asks for a new authorization.",
+                    f"  evidence    : {evidence.path}",
+                ],
+            )
+            return EXIT_REFUSED, resolution
+
+        # unresolved — the dangerous one. STOP. Never rebuild, never close.
+        await update_live_trade(self._db, live_trade_id, status="needs_manual_review")
+        await self._reverse_state(
+            decision_id,
+            STATE_SUBMISSION_UNKNOWN,
+            mode=mode,
+            detail={"reason": "resolver could not decide"},
+        )
+        evidence.record(
+            "ambiguity_unresolved",
+            live_trade_id=live_trade_id,
+            ledger_status="needs_manual_review",
+            note="a transaction may exist that sold this position; the row is "
+            "marked for a human rather than closed or left reading as clean",
+        )
+        _print_block(
+            "ESCALATE — REVERSE SUBMISSION UNRESOLVED, DO NOT REBUILD",
+            [
+                "  The cluster could not tell us whether this transaction",
+                "  exists. It may still be in flight, and it may have sold the",
+                "  position.",
+                f"  signature       : {signed.signature}",
+                f"  decision ID     : {decision_id}",
+                f"  live_trades row : {live_trade_id} (needs_manual_review)",
+                "",
+                "  *** DO NOT REBUILD AND DO NOT RESUBMIT. ***",
+                "  A rebuild produces a different blockhash and a different",
+                "  signature, and BOTH can land — two sales where one was",
+                "  authorized.",
+                "",
+                "  Next steps, in order:",
+                "   1. Re-run the resolver as the blockhash expires:",
+                "        python -m scout.live.solana_lane reverse-resolve "
+                f"--decision-id {decision_id}",
+                "   2. definitively_not_submitted -> the position was never",
+                "      sold; the row goes back to open by hand.",
+                "   3. landed -> the USDC was sold; the row closes only once",
+                "      finality and the balances agree.",
+                f"   4. Evidence: {evidence.path}",
+            ],
+        )
+        return EXIT_ESCALATE, resolution
+
+    async def _reconcile_reverse(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        live_trade_id: int,
+        selection: dict[str, Any],
+        signature: str,
+        quote: SolanaQuote,
+        report: VerificationReport,
+        intent: dict[str, Any],
+        signer_pubkey: str,
+        confirmation: dict[str, Any],
+        transaction: dict[str, Any] | None,
+        mode: str,
+    ) -> dict[str, Any]:
+        """Compare the chain, the balances and the row — then close, or not.
+
+        The two legs are asymmetric, and stating each as tightly as the facts
+        allow is what makes "exact agreement" mean something:
+
+        **USDC is EXACT.** The swap spends precisely the input amount; a token
+        transfer has no fee and no slippage on the amount debited. Anything
+        other than exactly ``amount_raw`` leaving is unexplained, full stop.
+
+        **SOL is a BAND, and the band's width is the slippage the operator
+        already approved.** The floor is the on-chain minimum output less every
+        lamport that unconditionally leaves (base fee + priority fee + tip) and
+        less any account rent that was spent and not returned. The ceiling
+        allows the fill to land as far ABOVE the quote as the approved slippage
+        allowed it to land below — a fill outside that in either direction is
+        not the trade that was authorized.
+
+        Rent is handled by counting rather than by assumption: the inspector
+        reports which accounts are created and which are closed, so a route
+        that opens and closes a wrapped-SOL account nets to zero and a route
+        that opens one and keeps it costs the rent, without either shape being
+        assumed.
+        """
+        sol_after = None
+        usdc_after = None
+        mismatches: list[str] = []
+        try:
+            sol_after = await self._rpc.get_balance(signer_pubkey)
+        except Exception as exc:
+            mismatches.append(f"get_balance: {type(exc).__name__}: {exc}")
+        try:
+            usdc_after = await self._rpc.get_token_balance(signer_pubkey, USDC_MINT)
+        except Exception as exc:
+            mismatches.append(f"get_token_balance: {type(exc).__name__}: {exc}")
+
+        sol_before = int(intent["pre_submit_sol_lamports"])
+        usdc_before = int(intent["pre_submit_usdc_raw"])
+        amount_raw = int(intent["amount_raw"])
+        rent_spent = int(report.ata_rent_lamports)
+        rent_recovered = int(report.recovered_rent_lamports)
+        unconditional = report.total_fee_lamports - rent_spent
+        slack = LAMPORTS_PER_SIGNATURE
+
+        usdc_spent = None if usdc_after is None else usdc_before - usdc_after
+        sol_received = None if sol_after is None else sol_after - sol_before
+
+        if usdc_spent is None:
+            mismatches.append("no post-trade USDC balance to compare against")
+        elif usdc_spent != amount_raw:
+            mismatches.append(
+                f"USDC spent {usdc_spent} raw is not the {amount_raw} raw this "
+                "swap was authorized to spend — a token debit is exact, so any "
+                "difference is a movement this run cannot account for"
+            )
+
+        # *** THIS COMPARISON IS THE SLIPPAGE GUARANTEE. ***
+        # `tx_inspector` cannot read Jupiter's encoded otherAmountThreshold, so
+        # what protects the trade is the on-chain program enforcing it and this
+        # check confirming afterwards that it did.
+        meets_minimum_output: bool | None = None
+        net_rent = rent_spent - rent_recovered
+        low = quote.min_out_amount - unconditional - net_rent - slack
+        upside = quote.out_amount - quote.min_out_amount
+        high = quote.out_amount + upside - unconditional - net_rent + slack
+        implied_gross_out = None
+        if sol_received is None:
+            mismatches.append("no post-trade SOL balance to compare against")
+        else:
+            implied_gross_out = sol_received + unconditional + net_rent
+            meets_minimum_output = implied_gross_out >= quote.min_out_amount
+            if not meets_minimum_output:
+                mismatches.append(
+                    f"implied gross output {implied_gross_out} lamports is below "
+                    f"the on-chain minimum {quote.min_out_amount} "
+                    "(otherAmountThreshold) — the slippage bound did not hold"
+                )
+            if not (low <= sol_received <= high):
+                mismatches.append(
+                    f"SOL received {sol_received} lamports is outside the "
+                    f"explained band [{low}, {high}] (minimum out "
+                    f"{quote.min_out_amount} / quoted {quote.out_amount}, less "
+                    f"{unconditional} of unconditional cost and {net_rent} of "
+                    f"net account rent, ±{slack})"
+                )
+
+        _meta = (transaction or {}).get("meta") or {}
+        on_chain_err = _meta.get("err")
+        if on_chain_err is not None:
+            mismatches.append(f"the finalized transaction carries err={on_chain_err}")
+        if confirmation["outcome"] == "finalize_timeout":
+            mismatches.append(
+                "the transaction confirmed but was not finalized inside the "
+                "window — it is landed but not yet rooted"
+            )
+
+        fresh = await fetch_live_trade_row(self._db, live_trade_id)
+        if fresh is None:
+            mismatches.append("the ledger row could not be re-read after the swap")
+        elif fresh["status"] != "open":
+            mismatches.append(
+                f"live_trades #{live_trade_id} is {fresh['status']!r} rather "
+                "than 'open' — something else moved it while this swap ran"
+            )
+
+        finalized = _is_finalized(confirmation)
+        if not finalized:
+            mismatches.append(
+                f"the transaction is {confirmation['outcome']} rather than "
+                "finalized; a position is closed only against a rooted "
+                "transaction"
+            )
+
+        verdict = "pass" if not mismatches else "review"
+        summary: dict[str, Any] = {
+            "verdict": verdict,
+            "mismatches": mismatches,
+            "finalized": finalized,
+            "chain": {
+                "signature": signature,
+                "slot": confirmation["slot"],
+                "confirmation_status": confirmation["confirmation_status"],
+                "fee_lamports": _meta.get("fee"),
+                "on_chain_err": on_chain_err,
+                "transaction_found": transaction is not None,
+            },
+            "balance": {
+                "sol_before_lamports": sol_before,
+                "sol_after_lamports": sol_after,
+                "sol_received_lamports": sol_received,
+                "sol_received": _fmt(sol_from_lamports(sol_received)),
+                "sol_received_explained_band": [low, high],
+                "implied_gross_out_lamports": implied_gross_out,
+                "usdc_before_raw": usdc_before,
+                "usdc_after_raw": usdc_after,
+                "usdc_spent_raw": usdc_spent,
+                "usdc_spent": _fmt(usdc_from_raw(usdc_spent)),
+                "sol_minimum_lamports": quote.min_out_amount,
+                "sol_quoted_lamports": quote.out_amount,
+                "unconditional_cost_lamports": unconditional,
+                "net_account_rent_lamports": net_rent,
+                "meets_minimum_output": meets_minimum_output,
+            },
+        }
+
+        # ---- close the row, or explain why not ----
+        closed = False
+        if verdict == "pass" and finalized:
+            closed = await self._close_reverse_row(
+                evidence=evidence,
+                live_trade_id=live_trade_id,
+                selection=selection,
+                signature=signature,
+                usdc_spent_raw=int(usdc_spent or 0),
+                gross_out_lamports=int(implied_gross_out or 0),
+                unconditional_cost_lamports=unconditional,
+            )
+            await self._reverse_state(
+                decision_id,
+                STATE_RECONCILED,
+                mode=mode,
+                detail={"reconciliation": "pass", "row_closed": closed},
+            )
+        summary["row_closed"] = closed
+        evidence.record("reconciliation", **summary)
+        if mismatches:
+            log.warning("solana_reverse_reconciliation_review", mismatches=mismatches)
+
+        lines = [
+            f"  decision ID  : {decision_id}",
+            f"  signature    : {signature}",
+            f"  status       : {confirmation['outcome']} "
+            f"({confirmation['confirmation_status']})",
+            f"  slot         : {confirmation['slot']}",
+            f"  USDC spent   : {summary['balance']['usdc_spent']} USDC",
+            f"  SOL received : {summary['balance']['sol_received']} SOL (net of "
+            f"{unconditional} lamports of fees)",
+            f"  reconcile    : {verdict}",
+            f"  ledger row   : {live_trade_id} "
+            + (
+                f"CLOSED ({_REVERSE_CLOSED_STATUS})"
+                if closed
+                else "left OPEN — see below"
+            ),
+            f"  evidence     : {evidence.path}",
+        ]
+        if not closed:
+            lines += (
+                [
+                    "",
+                    "  THE ROW WAS NOT CLOSED. A position is closed only against a",
+                    "  finalized transaction whose balances agree exactly:",
+                ]
+                + [f"   - {m}" for m in mismatches]
+                + [
+                    "  Check the wallet before running the lane again.",
+                ]
+            )
+        _print_block(f"SOLANA REVERSE SWAP {confirmation['outcome'].upper()}", lines)
+        summary["exit_code"] = EXIT_OK if closed else EXIT_REVIEW
+        return summary
+
+    async def _close_reverse_row(
+        self,
+        *,
+        evidence: EvidenceLog,
+        live_trade_id: int,
+        selection: dict[str, Any],
+        signature: str,
+        usdc_spent_raw: int,
+        gross_out_lamports: int,
+        unconditional_cost_lamports: int,
+    ) -> bool:
+        """Write the close. Called ONLY on finality plus exact agreement.
+
+        The round trip is denominated in SOL, because SOL is what the lane
+        actually put at risk: it bought USDC with SOL and has now bought SOL
+        back. Denominating in USD would report ~0 by construction — the
+        position WAS dollars — and would hide the only number that matters.
+
+        Two different SOL figures, and conflating them would misreport both:
+
+        ``exit_fill_price`` is priced off the GROSS output, because a price is
+        what the swap executed at and fees are not part of it. Same USDC/SOL
+        convention as ``mid_at_entry`` and ``entry_fill_price``.
+
+        ``realized_pnl_*`` is computed off the NET output — gross less the base
+        fee, priority fee and Jito tip — because P&L is what the wallet
+        actually ended up holding. Account rent is deliberately excluded from
+        that netting: rent is a refundable deposit rather than a cost, and
+        counting a recovered deposit as profit would flatter the number.
+
+        *** THE ENTRY LEG'S FEE IS NOT NETTED. *** ``live_trades`` records the
+        entry FILL but not what the entry transaction cost, so this figure is
+        optimistic by roughly one Solana transaction's fees (order 1e-4 SOL at
+        the pilot's tip). Stated here rather than silently absorbed, because a
+        P&L column that quietly means something different from the same column
+        at another venue is worse than one that is documented.
+        """
+        sol_back = sol_from_lamports(gross_out_lamports) or Decimal("0")
+        sol_net = sol_from_lamports(
+            gross_out_lamports - unconditional_cost_lamports
+        ) or Decimal("0")
+        usdc_out = usdc_from_raw(usdc_spent_raw) or Decimal("0")
+        entry_qty: Decimal = selection["entry_qty"]
+        exit_price = (usdc_out / sol_back) if sol_back else None
+        pnl_sol = sol_net - entry_qty
+        pnl_usd = (pnl_sol * exit_price) if exit_price is not None else None
+        pnl_pct = (pnl_sol / entry_qty * 100) if entry_qty else None
+        await update_live_trade(
+            self._db,
+            live_trade_id,
+            status=_REVERSE_CLOSED_STATUS,
+            exit_order_id=signature,
+            exit_fill_price=_fmt(exit_price),
+            realized_pnl_usd=_fmt(pnl_usd),
+            realized_pnl_pct=_fmt(pnl_pct),
+            closed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        evidence.record(
+            "row_closed",
+            live_trade_id=live_trade_id,
+            status=_REVERSE_CLOSED_STATUS,
+            exit_order_id=signature,
+            entry_sol=_fmt(entry_qty),
+            exit_sol_gross=_fmt(sol_back),
+            exit_sol_net=_fmt(sol_net),
+            unconditional_cost_lamports=unconditional_cost_lamports,
+            usdc_spent=_fmt(usdc_out),
+            exit_fill_price=_fmt(exit_price),
+            realized_pnl_sol=_fmt(pnl_sol),
+            realized_pnl_usd=_fmt(pnl_usd),
+            realized_pnl_pct=_fmt(pnl_pct),
+            note="closed against a FINALIZED transaction whose USDC debit was "
+            "exact and whose SOL credit fell inside the authorized band",
+        )
+        log.info(
+            "solana_reverse_row_closed",
+            live_trade_id=live_trade_id,
+            signature=signature,
+            realized_pnl_sol=_fmt(pnl_sol),
+        )
+        return True
+
+    # ---------------- reverse: read-only status ----------------
+    async def reverse_status(self) -> int:
+        """Read-only report on every reverse execution. Writes NOTHING.
+
+        Deliberately not gated on SOLANA_MODE or the kill switch, and for the
+        same reason ``status`` is not: turning the lane off is an operator's
+        first instinct when something looks wrong, and it must not also turn
+        off the thing that says what is wrong.
+
+        Every non-terminal execution is put to the cluster BY ITS EXPECTED
+        SIGNATURE and the verdict reported. Nothing is written on the strength
+        of it — ``reverse-resolve`` is where a verdict is acted on — so this is
+        safe to run at any point, including with a transaction in flight.
+        """
+        executions = await fetch_reverse_executions(self._db)
+        lines: list[str] = [
+            f"  SOLANA_MODE              : {self._settings.SOLANA_MODE}",
+            f"  USDC account closure     : "
+            f"{'ENABLED in config' if self._settings.SOLANA_REVERSE_CLOSE_USDC_ATA else 'DISABLED (default)'}",
+            f"  database                 : {Path(self._settings.DB_PATH).resolve()}",
+            f"  reverse executions open  : {len(executions)}",
+        ]
+        blockers = 0
+        for execution in executions:
+            detail = (
+                execution["detail"] if isinstance(execution["detail"], dict) else {}
+            )
+            disposition = recovery_disposition(execution["state"])
+            signature = execution.get("expected_signature")
+            lines += [
+                "",
+                f"    decision id   : {execution['decision_id']}",
+                f"    state         : {execution['state']}  ({disposition})",
+                f"    target row    : live_trades #{detail.get('live_trade_id')}",
+                f"    signature     : {signature or '(none — never signed)'}",
+                f"    approval      : {detail.get('approval_digest', '(not recorded)')}",
+                f"    pre-submit    : SOL {detail.get('pre_submit_sol_lamports')} "
+                f"lamports / USDC {detail.get('pre_submit_usdc_raw')} raw",
+            ]
+            if disposition == "discard":
+                lines.append(
+                    "    verdict       : nothing was ever sent — the position "
+                    "is untouched"
+                )
+                continue
+            blockers += 1
+            if not signature:
+                lines.append(
+                    "    verdict       : *** state says a transaction may exist "
+                    "but no signature was recorded — escalate ***"
+                )
+                continue
+            pooled = await self._resolve(
+                signature=str(signature),
+                last_valid_block_height=detail.get("last_valid_block_height"),
+            )
+            lane = apply_age_policy(
+                pooled.report,
+                age_seconds=row_age_seconds(execution.get("created_at")),
+                settings=self._settings,
+                had_evidence_height=detail.get("last_valid_block_height") is not None,
+                pool_downgrade=pooled.downgrade_reason,
+            )
+            lines += [
+                f"    cluster says  : {lane.verdict} "
+                f"(slot {pooled.report.slot}, "
+                f"{pooled.report.confirmation_status})",
+                f"    would do      : {_reverse_resolve_guidance(lane.verdict)}",
+            ]
+
+        row_lines: list[str] = []
+        for row in await fetch_blocking_rows(self._db):
+            row_lines.append(
+                f"    #{row['live_trade_id']} {row['status']} "
+                f"size={row['size_usd']} entry_sig={row['entry_order_id']}"
+            )
+        lines += ["", f"  blocking ledger rows     : {len(row_lines)}"] + row_lines
+        _print_block("SOLANA REVERSE SWAP STATUS (read-only)", lines)
+        return EXIT_BLOCKED if blockers else EXIT_OK
+
+    # ---------------- reverse: recovery ----------------
+    async def reverse_resolve(self, *, decision_id: str) -> int:
+        """Settle ONE interrupted reverse run, by its expected signature.
+
+        The recovery path for all three places a run can die:
+
+        ``after the intent was persisted, before submission``
+            The state is pre-submission, so nothing was sent — provable from
+            the record alone, without asking anyone. The run is retired and
+            the position is left open.
+        ``after submission``
+            A transaction may exist. Its signature is in
+            ``solana_executions``, so the cluster is asked about that one
+            signature. Never a rebuild, never a resubmission.
+        ``after finality, before the row was closed``
+            The transaction landed and the row is still open. The balances
+            recorded before submission are in the evidence file, so the same
+            reconciliation the run would have done is done here — and the row
+            closes only if it agrees exactly.
+        """
+        evidence = self._evidence_for(decision_id)
+        evidence.record(
+            "run_started", command="reverse-resolve", decision_id=decision_id
+        )
+        try:
+            execution = await load_execution(self._db, decision_id)
+            if execution is None:
+                raise LaneAbort(
+                    "lookup",
+                    f"no solana_executions row with decision_id={decision_id}",
+                )
+            detail = (
+                execution["detail"] if isinstance(execution["detail"], dict) else {}
+            )
+            if detail.get("direction") != DIRECTION_USDC_TO_SOL:
+                raise LaneAbort(
+                    "lookup",
+                    f"execution {decision_id} is a "
+                    f"{detail.get('direction') or 'forward'} run, not a reverse "
+                    "one. Use `resolve` for a forward placement — the two "
+                    "dispose of their ledger rows in opposite directions.",
+                )
+            evidence.record("execution_row", state=execution["state"], **detail)
+
+            live_trade_id = detail.get("live_trade_id")
+            state = execution["state"]
+            if state in TERMINAL_STATES:
+                _print_block(
+                    "NOTHING TO RESOLVE",
+                    [
+                        f"  decision ID : {decision_id}",
+                        f"  state       : {state} (terminal)",
+                        f"  evidence    : {evidence.path}",
+                    ],
+                )
+                return EXIT_OK
+
+            if recovery_disposition(state) == "discard":
+                ended = await self._terminalize_execution(
+                    decision_id, reason="interrupted before submission"
+                )
+                evidence.record(
+                    "discarded",
+                    execution_state=ended,
+                    live_trade_id=live_trade_id,
+                    note="the state proves nothing was sent, so the position "
+                    "is untouched and the lane is clear",
+                )
+                _print_block(
+                    "NOTHING WAS EVER SENT — position untouched",
+                    [
+                        f"  decision ID     : {decision_id}",
+                        f"  state           : {state} -> {ended}",
+                        f"  live_trades row : {live_trade_id} (still open)",
+                        "  The run died before submission. Rerunning `reverse`",
+                        "  is safe: it builds a NEW transaction and asks for a",
+                        "  new authorization.",
+                        f"  evidence        : {evidence.path}",
+                    ],
+                )
+                return EXIT_OK
+
+            signature = execution.get("expected_signature")
+            if not signature:
+                raise LaneAbort(
+                    "lookup",
+                    f"execution {decision_id} is in state {state} — which means "
+                    "a transaction may exist — but carries no expected "
+                    "signature, so there is nothing to ask the cluster about. "
+                    "This must be looked at by hand.",
+                    exit_code=EXIT_ESCALATE,
+                )
+
+            _resolver_url, pinned = resolver_endpoint(self._settings)
+            pool_health = await self._pool.check_health()
+            evidence.record(
+                "resolver_pool",
+                endpoints=[entry.as_evidence() for entry in pool_health],
+                usable_count=sum(1 for entry in pool_health if entry.usable),
+                configured_count=len(pool_health),
+                expected_genesis=SOLANA_MAINNET_GENESIS_HASH,
+            )
+            pooled = await self._resolve(
+                signature=str(signature),
+                last_valid_block_height=detail.get("last_valid_block_height"),
+            )
+            lane = apply_age_policy(
+                pooled.report,
+                age_seconds=row_age_seconds(execution.get("created_at")),
+                settings=self._settings,
+                had_evidence_height=detail.get("last_valid_block_height") is not None,
+                pool_downgrade=pooled.downgrade_reason,
+            )
+            evidence.record(
+                "resolution",
+                **_resolution_summary(pooled.report),
+                **pooled.as_evidence(),
+                lane_verdict=lane.verdict,
+                expiry_source=lane.expiry_source,
+                age_policy_reason=lane.reason,
+                resolver_endpoint_pinned=pinned,
+            )
+            return await self._apply_reverse_verdict(
+                evidence=evidence,
+                decision_id=decision_id,
+                execution=execution,
+                detail=detail,
+                lane=lane,
+                pooled=pooled,
+                pinned=pinned,
+                signature=str(signature),
+            )
+        except LaneAbort as abort:
+            evidence.record(
+                "aborted",
+                stage=abort.stage,
+                reason=abort.reason,
+                exit_code=abort.exit_code,
+            )
+            print(f"REFUSED [{abort.stage}]: {abort.reason}")
+            return abort.exit_code
+        except Exception as exc:
+            log.error(
+                "solana_reverse_resolve_error",
+                decision_id=decision_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+                exc_info=True,
+            )
+            evidence.record(
+                "unexpected_error", error_type=type(exc).__name__, error=str(exc)
+            )
+            print(f"ESCALATE [reverse-resolve]: {type(exc).__name__}: {exc}")
+            return EXIT_ESCALATE
+
+    async def _apply_reverse_verdict(
+        self,
+        *,
+        evidence: EvidenceLog,
+        decision_id: str,
+        execution: dict[str, Any],
+        detail: dict[str, Any],
+        lane: LaneVerdict,
+        pooled: PoolResolution,
+        pinned: bool,
+        signature: str,
+    ) -> int:
+        """What a resolved verdict licenses, and nothing more."""
+        live_trade_id = detail.get("live_trade_id")
+        row = (
+            None
+            if live_trade_id is None
+            else await fetch_live_trade_row(self._db, int(live_trade_id))
+        )
+        lines = [
+            f"  decision ID : {decision_id}",
+            f"  signature   : {signature}",
+            f"  target row  : live_trades #{live_trade_id} "
+            f"({None if row is None else row['status']})",
+            f"  verdict     : {lane.verdict}",
+            f"  expiry from : {lane.expiry_source or 'not established'}",
+            f"  resolver    : {pooled.endpoint}"
+            + ("" if pinned else "   ** NOT PINNED - verdict is advisory **"),
+            f"  corroborated: {_corroboration_line(pooled)}",
+        ]
+
+        if lane.verdict in ("definitively_not_submitted", "failed_on_chain"):
+            if lane.verdict == "definitively_not_submitted" and not pinned:
+                evidence.record(
+                    "auto_action_withheld",
+                    note="an absence read from a load-balanced endpoint can be "
+                    "manufactured; neither row is advanced on it",
+                )
+                lines += [
+                    "",
+                    "  NOTHING WAS CHANGED. This verdict came from a",
+                    "  load-balanced endpoint, where one node ahead on block",
+                    "  height and missing the signature is enough to invent it.",
+                    "  Point SOLANA_RESOLVER_RPC_URL at a dedicated node and",
+                    "  run this again before acting.",
+                ]
+                _print_block("SOLANA REVERSE RESOLUTION", lines)
+                return EXIT_BLOCKED
+            ended = await self._terminalize_execution(
+                decision_id, reason=f"reverse-resolve:{lane.verdict}"
+            )
+            # The position was NOT sold. If an earlier ambiguity marked the row
+            # for review, that marking is what this verdict retires — the row
+            # goes back to being an open position.
+            restored = False
+            if row is not None and row["status"] == "needs_manual_review":
+                await update_live_trade(self._db, int(live_trade_id), status="open")
+                restored = True
+            evidence.record(
+                "position_retained",
+                live_trade_id=live_trade_id,
+                execution_state=ended,
+                verdict=lane.verdict,
+                row_restored_to_open=restored,
+                note="the reverse swap did not execute, so the position the row "
+                "describes still exists",
+            )
+            lines += [
+                "",
+                "  The reverse swap did NOT execute"
+                + (" — a fee was paid." if lane.verdict == "failed_on_chain" else "."),
+                f"  live_trades #{live_trade_id} still holds the position"
+                + (" (restored to 'open')." if restored else "."),
+                "  Rerunning `reverse` is safe: it builds a NEW transaction and",
+                "  asks for a new authorization.",
+            ]
+            _print_block("SOLANA REVERSE RESOLUTION", lines)
+            return EXIT_OK
+
+        if lane.verdict == "landed":
+            finalized = pooled.report.confirmation_status == "finalized"
+            state = await self._terminalize_execution(
+                decision_id,
+                reason="reverse-resolve:landed",
+                target=STATE_FINALIZED if finalized else STATE_LANDED,
+            )
+            evidence.record(
+                "landed",
+                live_trade_id=live_trade_id,
+                execution_state=state,
+                confirmation_status=pooled.report.confirmation_status,
+                slot=pooled.report.slot,
+            )
+            lines += [
+                "",
+                "  The reverse swap EXECUTED. The USDC was sold.",
+                f"  execution   : {state}",
+                "",
+                "  This command does NOT close the ledger row. Closing a",
+                "  position requires the pre-submission balances to compare",
+                "  against, and reconciling them is a judgement about money",
+                "  that belongs to a human once a run has already been",
+                "  interrupted. The record it needs is in the evidence file:",
+                f"    {evidence_path_for(self._settings.SOLANA_PILOT_EVIDENCE_DIR, decision_id)}",
+                f"  Close live_trades #{live_trade_id} by hand once the wallet",
+                "  agrees with it.",
+            ]
+            _print_block("SOLANA REVERSE RESOLUTION", lines)
+            return EXIT_BLOCKED
+
+        lines += [
+            "",
+            "  UNRESOLVED — we could not tell what happened.",
+            "  *** DO NOT REBUILD AND DO NOT RERUN `reverse`. ***",
+            "  Run this again once the blockhash has had time to expire;",
+            "  absence only becomes definitive after that.",
+        ]
+        _print_block("SOLANA REVERSE RESOLUTION", lines)
+        return EXIT_ESCALATE
+
     # ---------------- watchdog ----------------
     async def watchdog(self, session: Any) -> int:
         """Alert on executions stuck in a non-terminal state. For cron.
@@ -4654,6 +7140,35 @@ def _route_summary(quote: SolanaQuote) -> str:
     )
 
 
+def route_fingerprint(quote: SolanaQuote) -> str:
+    """The FULL route, as a canonical string an authorization can bind to.
+
+    ``_route_summary`` is for humans and collapses a route to its AMM labels;
+    two different routes through the same two AMMs render identically there.
+    This one carries every field of every step, in order, so any change to how
+    the swap is actually executed changes the digest — which is the property
+    the approval is supposed to have.
+
+    An empty route plan renders as ``(none)`` rather than an empty string, so
+    "no steps were reported" and "the field was omitted" cannot digest alike.
+    """
+    if not quote.route_plan:
+        return "(none)"
+    return ";".join(
+        "|".join(
+            (
+                step.label or "(unlabelled)",
+                step.amm_key,
+                step.input_mint,
+                step.output_mint,
+                str(step.in_amount),
+                str(step.out_amount),
+            )
+        )
+        for step in quote.route_plan
+    )
+
+
 def _resolution_summary(report: ResolutionReport) -> dict[str, Any]:
     return {
         "verdict": report.verdict,
@@ -4722,6 +7237,36 @@ def _entry_economics(
         "transaction_fee_sol": _fmt(sol_from_lamports(fee_lamports)),
         "note": "entry economics, not realised P&L — the position is still open",
     }
+
+
+def _is_finalized(confirmation: dict[str, Any]) -> bool:
+    """Is this transaction ROOTED, as opposed to merely landed?
+
+    Two spellings of the same fact, and both are required to be explicit:
+    the confirmation poll reaching 'finalized' on its own, or the resolver
+    having adopted a transaction the poll missed AND reporting it finalized.
+    'landed', 'confirmed' and 'finalize_timeout' are all NOT this — a fork can
+    still take those back, and a position must not be recorded as disposed of
+    against something reversible.
+    """
+    outcome = confirmation.get("outcome")
+    if outcome == "finalized":
+        return True
+    return (
+        outcome == "landed_after_resolution"
+        and confirmation.get("confirmation_status") == "finalized"
+    )
+
+
+def _reverse_resolve_guidance(verdict: str) -> str:
+    """One line: what ``reverse-resolve`` would do with this verdict."""
+    if verdict == "landed":
+        return "the USDC was sold — the row closes only on finality + agreement"
+    if verdict == "failed_on_chain":
+        return "the swap failed; the position is retained and a fee was paid"
+    if verdict == "definitively_not_submitted":
+        return "nothing landed; the position is retained and the lane clears"
+    return "cannot tell — the row keeps blocking; NEVER rebuild"
 
 
 def _corroboration_line(pooled: PoolResolution) -> str:
@@ -4838,6 +7383,33 @@ def _sol_arg(raw: str) -> Decimal:
     return value
 
 
+def _usdc_arg(raw: str) -> Decimal:
+    """argparse converter for ``--usdc``. Same four rejections as ``--sol``.
+
+    The fractional-unit case bites HARDER here than on the SOL side: USDC has
+    6 decimals, so ``--usdc 6.8996185`` is an ordinary thing to type (it is
+    what a price calculation produces) and it is not expressible. Truncating it
+    would swap a different amount than the one the operator asked for and than
+    the one the approval screen showed.
+    """
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a decimal number") from exc
+    if not value.is_finite():
+        raise argparse.ArgumentTypeError(
+            f"{raw!r} is not a finite number — NaN and Infinity parse as Decimals "
+            "but compare false against every cap"
+        )
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"{raw!r} must be greater than zero")
+    try:
+        raw_from_usdc(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 _DECISION_ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -4886,11 +7458,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="required with --simulate-only; refused without it",
     )
 
+    reverse = sub.add_parser(
+        "reverse",
+        help="close ONE named Solana ledger row with a supervised USDC->SOL swap",
+    )
+    reverse.add_argument(
+        "--live-trade-id",
+        type=int,
+        required=True,
+        help="the live_trades row to close. Must be an OPEN solana row; a row "
+        "at any other venue is refused.",
+    )
+    reverse.add_argument(
+        "--usdc", type=_usdc_arg, required=True, help="exact USDC amount to swap"
+    )
+    reverse.add_argument(
+        "--close-usdc-ata",
+        action="store_true",
+        help="ALSO permit the swap to close the wallet's USDC account and "
+        "recover its rent. OFF by default and refused unless "
+        "SOLANA_REVERSE_CLOSE_USDC_ATA is also True. Shown on its own line of "
+        "the approval screen with the exact rent.",
+    )
+    reverse.add_argument(
+        "--simulate-only",
+        action="store_true",
+        help="force SIMULATION_ONLY for this run; can only NARROW SOLANA_MODE",
+    )
+    reverse.add_argument(
+        "--yes-i-am-rehearsing",
+        action="store_true",
+        help="required with --simulate-only; refused without it",
+    )
+
     resolve = sub.add_parser(
         "resolve", help="ask the cluster what a persisted signature did"
     )
     resolve.add_argument("--decision-id", type=_decision_id_arg, required=True)
 
+    reverse_resolve = sub.add_parser(
+        "reverse-resolve",
+        help="settle ONE interrupted reverse swap by its expected signature",
+    )
+    reverse_resolve.add_argument("--decision-id", type=_decision_id_arg, required=True)
+
+    sub.add_parser(
+        "reverse-status",
+        help="read-only report on every outstanding reverse swap",
+    )
     sub.add_parser("status", help="read-only lane report")
     sub.add_parser(
         "watchdog",
@@ -4913,7 +7528,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     args = build_parser().parse_args(argv)
 
-    if args.command == "place":
+    if args.command in ("place", "reverse"):
         if args.simulate_only and not args.yes_i_am_rehearsing:
             print(
                 "REFUSED [args]: --simulate-only requires --yes-i-am-rehearsing, "
@@ -4963,7 +7578,11 @@ async def main(argv: list[str] | None = None) -> int:
     # recovery path is worse than no lock.
     lock_fd: int | None = None
     lock_path: Path | None = None
-    if args.command == "place":
+    # `reverse` takes the SAME lock as `place`, not one of its own. The two are
+    # different actions but they draw on one wallet and one ledger, and two
+    # processes each holding "the other direction's" lock would submit two
+    # transactions from the same key against each other's assumptions.
+    if args.command in ("place", "reverse"):
         try:
             lock_fd, lock_path = acquire_lane_lock(db_path)
         except LaneLockHeld as held:
@@ -5020,8 +7639,20 @@ async def main(argv: list[str] | None = None) -> int:
                 # a DISABLED lane into a live one.
                 override = MODE_SIMULATION_ONLY if args.simulate_only else None
                 return await runner.place(sol=args.sol, mode=override)
+            if args.command == "reverse":
+                override = MODE_SIMULATION_ONLY if args.simulate_only else None
+                return await runner.reverse_place(
+                    live_trade_id=args.live_trade_id,
+                    usdc=args.usdc,
+                    mode=override,
+                    close_usdc_ata=args.close_usdc_ata,
+                )
             if args.command == "resolve":
                 return await runner.resolve(decision_id=args.decision_id)
+            if args.command == "reverse-resolve":
+                return await runner.reverse_resolve(decision_id=args.decision_id)
+            if args.command == "reverse-status":
+                return await runner.reverse_status()
             if args.command == "watchdog":
                 return await runner.watchdog(session)
             return await runner.status()

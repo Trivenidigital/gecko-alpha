@@ -38,6 +38,14 @@ only thing that differs between supervised and autonomous execution is which
 authorization policy answers. If a limit ever needs to know the mode, that is
 a change to this rule and not a detail — a test asserts the reports are
 identical across modes.
+
+``OperatorExitBinding`` does not weaken that. The engine still never receives
+the mode: it receives a binding that CARRIES the authorization method the run
+will be judged under, and honours exactly one of them. Under BOUNDED_AUTONOMOUS
+the binding arrives stamped with the autonomous policy's method and earns
+nothing, so the autonomous mode cannot reach the exit exemption — not because a
+comment forbids it, but because the value it would need is derived from the
+same mapping that decides who authorizes.
 """
 
 from __future__ import annotations
@@ -66,6 +74,46 @@ STAGE_QUOTE = "quote"
 STAGE_TRANSACTION = "transaction"
 STAGE_BALANCE = "balance"
 STAGE_FRESHNESS = "freshness"
+
+# The two directions the lane can trade the ONE approved pair in. Named here
+# rather than passed as a bare bool so a report reads as the direction it
+# judged, and so a third value can never appear by accident.
+#
+# The envelope is the SAME in both directions and is deliberately not
+# parameterised beyond what the direction genuinely changes:
+#
+#   * the mint allowlists SWAP. `SOLANA_ALLOWED_INPUT_MINTS` names what the
+#     lane may spend on the way in and `..._OUTPUT_MINTS` what it may hold;
+#     traversing the pair backwards exchanges those roles and nothing else. A
+#     mint that is on neither list is still refused in both directions, so this
+#     widens nothing.
+#   * the per-trade band and the daily cap follow the USDC leg, because USDC is
+#     the dollar-denominated one. Forward that is the OUTPUT, reverse it is the
+#     INPUT.
+#   * the open-position limit does not apply in reverse: an exit reduces
+#     exposure, and a limit of one open position would make the one position
+#     the lane can hold impossible to close.
+DIRECTION_SOL_TO_USDC = "sol_to_usdc"
+DIRECTION_USDC_TO_SOL = "usdc_to_sol"
+
+# The venue whose ledger an exit binding may name, and the ONE authorization
+# method that can mint one. Both are compared exactly.
+#
+# `OPERATOR_EXIT_AUTHORIZATION` is the string
+# ``solana_lane.TypedOperatorAuthorization.method`` carries. It is duplicated
+# here rather than imported because the runner imports this module and not the
+# other way round — the same shape as ``FeeCeilings`` re-stating the
+# inspector's ceilings — and a test pins the two spellings together so the
+# duplication cannot drift into a permanently ungranted (or, far worse, a
+# permanently granted) exemption.
+EXIT_BINDING_VENUE = "solana"
+OPERATOR_EXIT_AUTHORIZATION = "typed_operator_authorization"
+
+# The most associated token accounts a REVERSE swap can legitimately create:
+# the wrapped-SOL account the proceeds land in, plus an idempotent re-assert of
+# the USDC account the input is spent from. A tightening of
+# ``SOLANA_PILOT_MAX_ATA_CREATES``, never a widening — see ``check_transaction``.
+REVERSE_MAX_ATA_CREATES = 2
 
 
 def _dec(value: Any) -> Decimal:
@@ -199,6 +247,113 @@ class LaneExposure:
         }
 
 
+@dataclass(frozen=True)
+class OperatorExitBinding:
+    """Proof that a quote closes an EXACT, already-validated open position.
+
+    The rule this object exists to implement, and the whole of it::
+
+        risk-increasing entry:
+            subject to daily entry/notional cap
+
+        operator-authorized exit of an exact existing position:
+            exempt from the entry cap
+            subject to separate exit safety limits
+
+    *** THE EXEMPTION CANNOT BE REQUESTED, ONLY PROVEN. ***
+    A ``reverse=True`` argument, or an ``is_sell`` branch, would be an exemption
+    any caller could take by pointing the swap the other way — and what it would
+    exempt is "a USDC->SOL swap", not "the close of THIS position". Every field
+    below is instead copied from a ledger row the runner has already refused on
+    wrong venue, non-open status, an existing exit signature and a missing entry
+    fill, and ``authorized_by`` is read from the authorization policy that will
+    actually be asked rather than chosen. Constructing one of these by hand
+    proves nothing, because the engine re-checks every field against the quote
+    in front of it; a binding that does not match is not a refusal but a
+    fall-through — the daily entry cap applies exactly as it did before.
+
+    ``remaining_usdc_raw`` is what the row still accounts for, in raw USDC. It
+    bounds the input rather than equalling it, so a PARTIAL close is a normal
+    thing to authorize and an over-close is not an exemption at all.
+
+    The preconditions this object does NOT carry are the ones that are enforced
+    where they already live, and are not re-derived here because a second
+    derivation is a second thing to get wrong: the row's state and both
+    balances are re-read immediately before signing, the typed authorization
+    binds a digest over the row id and the economics, and the slippage, price
+    impact, priority-fee and Jito-tip ceilings are unchanged and still ANDed
+    into the same reports. The exemption is from the daily ENTRY cap and from
+    nothing else.
+    """
+
+    live_trade_id: int
+    venue: str
+    direction: str
+    remaining_usdc_raw: int
+    authorized_by: str
+
+    def unmet_preconditions(
+        self, *, direction: str, in_amount_raw: int | None
+    ) -> tuple[str, ...]:
+        """Every reason this binding does NOT earn the exemption. Empty = earned.
+
+        Reasons rather than a bool, because the caller records them: a cap that
+        applied when the operator expected it not to has to say which fact was
+        missing, or the operator is left diffing a ledger row against a quote by
+        eye.
+        """
+        unmet: list[str] = []
+        if self.authorized_by != OPERATOR_EXIT_AUTHORIZATION:
+            unmet.append(
+                f"the run is authorized by {self.authorized_by!r}, not "
+                f"{OPERATOR_EXIT_AUTHORIZATION!r} — only an explicit operator "
+                "exit command is exempt"
+            )
+        if self.venue != EXIT_BINDING_VENUE:
+            unmet.append(
+                f"the bound row is a {self.venue!r} row, not a "
+                f"{EXIT_BINDING_VENUE!r} one"
+            )
+        if (
+            self.direction != DIRECTION_USDC_TO_SOL
+            or direction != DIRECTION_USDC_TO_SOL
+        ):
+            unmet.append(
+                f"the binding is for {self.direction!r} and the quote is being "
+                f"judged as {direction!r}; only {DIRECTION_USDC_TO_SOL!r} "
+                "reduces this lane's exposure"
+            )
+        if self.live_trade_id <= 0:
+            unmet.append(f"live_trade_id {self.live_trade_id!r} does not name a row")
+        if self.remaining_usdc_raw <= 0:
+            unmet.append(
+                f"live_trades #{self.live_trade_id} has "
+                f"{self.remaining_usdc_raw} raw USDC left to close"
+            )
+        elif in_amount_raw is None or in_amount_raw <= 0:
+            unmet.append(
+                f"the quote's input amount {in_amount_raw!r} could not be read, "
+                "so it cannot be shown to be inside the position"
+            )
+        elif in_amount_raw > self.remaining_usdc_raw:
+            unmet.append(
+                f"the quote spends {in_amount_raw} raw USDC against the "
+                f"{self.remaining_usdc_raw} that live_trades "
+                f"#{self.live_trade_id} still accounts for, so it would "
+                "INCREASE exposure rather than reduce it"
+            )
+        return tuple(unmet)
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "live_trade_id": self.live_trade_id,
+            "venue": self.venue,
+            "direction": self.direction,
+            "remaining_usdc_raw": self.remaining_usdc_raw,
+            "authorized_by": self.authorized_by,
+        }
+
+
 class LimitsEngine:
     """Every limit the lane enforces, evaluated stage by stage.
 
@@ -253,6 +408,8 @@ class LimitsEngine:
         amount_lamports: int,
         price_impact_pct: Decimal,
         exposure: LaneExposure,
+        direction: str = DIRECTION_SOL_TO_USDC,
+        exit_binding: OperatorExitBinding | None = None,
     ) -> LimitsReport:
         """Capital, concurrency, allowlists and the quote's own terms.
 
@@ -262,8 +419,20 @@ class LimitsEngine:
         The caller's converter is the single one, and it returns a 100%
         sentinel for a field it could not parse — which fails this check
         closed.
+
+        ``direction`` selects which leg the dollar-denominated limits read and
+        which way round the mint allowlists face — see the module constants.
+        ``amount_lamports`` is the RAW input amount whichever direction it is
+        (lamports of SOL forward, raw USDC reverse); the name is kept because
+        it is what the forward caller has always passed.
+
+        ``exit_binding`` is the ONLY thing that can lift the daily notional cap,
+        and it lifts nothing else — see ``OperatorExitBinding`` for the rule and
+        for why it is proof rather than a flag. Absent, malformed, or
+        inconsistent with this quote, the cap applies exactly as before.
         """
         s = self._settings
+        reverse = direction == DIRECTION_USDC_TO_SOL
         b = _Builder(STAGE_QUOTE)
 
         b.add(
@@ -281,8 +450,14 @@ class LimitsEngine:
             f"inAmount {quote.in_amount} vs requested {amount_lamports} lamports",
         )
 
-        allowed_in = tuple(s.SOLANA_ALLOWED_INPUT_MINTS)
-        allowed_out = tuple(s.SOLANA_ALLOWED_OUTPUT_MINTS)
+        # Reverse traverses the same approved pair backwards, so the two
+        # allowlists exchange roles. Nothing is added to either.
+        allowed_in = tuple(
+            s.SOLANA_ALLOWED_OUTPUT_MINTS if reverse else s.SOLANA_ALLOWED_INPUT_MINTS
+        )
+        allowed_out = tuple(
+            s.SOLANA_ALLOWED_INPUT_MINTS if reverse else s.SOLANA_ALLOWED_OUTPUT_MINTS
+        )
         b.add(
             "input_mint_allowed",
             quote.input_mint in allowed_in,
@@ -311,12 +486,16 @@ class LimitsEngine:
             f"{_fmt(max_impact)}%",
         )
 
-        # The per-trade band is enforced on the QUOTE's USDC output, not on the
-        # SOL input: USDC is the dollar-denominated leg, so what a $5-$10
-        # envelope actually bounds is what comes back. A band on the SOL side
+        # The per-trade band is enforced on the QUOTE's USDC leg, not on the
+        # SOL one: USDC is the dollar-denominated leg, so what a $5-$10
+        # envelope actually bounds is the dollar side. A band on the SOL side
         # would need a price feed of its own and would drift out of the
         # envelope every time SOL moved.
-        out_usd = _usdc(quote.out_amount)
+        #
+        # Forward the USDC leg is the output; reverse it is the input. Reading
+        # `out_amount` in reverse would band the LAMPORTS against a dollar
+        # figure and pass or refuse for arithmetic reasons.
+        out_usd = _usdc(quote.in_amount if reverse else quote.out_amount)
         min_usd = _dec(s.SOLANA_PILOT_MIN_ORDER_USD)
         max_usd = _dec(s.SOLANA_PILOT_MAX_ORDER_USD)
         b.add(
@@ -326,23 +505,80 @@ class LimitsEngine:
             f"[{_fmt(min_usd)}, {_fmt(max_usd)}] USD",
         )
 
+        # *** THE DAILY CAP IS AN ENTRY CAP. ***
+        # It bounds how much this lane may COMMIT in a day, which is a bound on
+        # risk being TAKEN. Applied to the close of a position the lane already
+        # holds it bounds something else entirely — whether the lane may get
+        # OUT — and at the deployed figure that is not hypothetical: one entry
+        # plus its exit fits in a day, a second round trip does not, and the
+        # check standing in front of the second exit would be this one.
+        #
+        # So an exit that has PROVED itself against an exact open row is judged
+        # by a differently-named check instead. The cap does not vanish from the
+        # report: exactly one of the two is always evaluated and recorded, and
+        # when a binding was offered but not honoured the cap's own detail says
+        # which fact was missing. A reader must never have to infer from an
+        # absent check that a limit did not apply.
         daily_cap = _dec(s.SOLANA_MAX_DAILY_NOTIONAL_USD)
         projected = exposure.notional_usd_today + (out_usd or Decimal("0"))
-        b.add(
-            "daily_notional_within_cap",
-            out_usd is not None and projected <= daily_cap,
-            f"{_fmt(exposure.notional_usd_today)} already authorized today "
-            f"+ {_fmt(out_usd)} this trade = {_fmt(projected)} against cap "
-            f"{_fmt(daily_cap)} USD",
+        unmet = (
+            ("no operator exit binding was presented",)
+            if exit_binding is None
+            else exit_binding.unmet_preconditions(
+                direction=direction, in_amount_raw=getattr(quote, "in_amount", None)
+            )
         )
+        if not unmet:
+            b.add(
+                "operator_exit_within_bound_position",
+                True,
+                f"live_trades #{exit_binding.live_trade_id} on "
+                f"{exit_binding.venue}, authorized by "
+                f"{exit_binding.authorized_by}: this {direction} swap spends "
+                f"{quote.in_amount} of the {exit_binding.remaining_usdc_raw} "
+                "raw USDC the row still accounts for, so it REDUCES exposure "
+                f"rather than adding to the {_fmt(exposure.notional_usd_today)} "
+                f"USD authorized today. The {_fmt(daily_cap)} USD daily cap "
+                "bounds risk-increasing ENTRIES and does not gate the close of "
+                "an existing position; every other limit in this report, and "
+                "the ceilings in the transaction and balance stages, still "
+                "apply unchanged.",
+            )
+        else:
+            b.add(
+                "daily_notional_within_cap",
+                out_usd is not None and projected <= daily_cap,
+                f"{_fmt(exposure.notional_usd_today)} already authorized today "
+                f"+ {_fmt(out_usd)} this trade = {_fmt(projected)} against cap "
+                f"{_fmt(daily_cap)} USD"
+                + (
+                    ""
+                    if exit_binding is None
+                    else "; the entry cap applies because " + "; ".join(unmet)
+                ),
+            )
 
         max_open = int(s.SOLANA_MAX_OPEN_POSITIONS)
-        b.add(
-            "open_positions_within_limit",
-            exposure.open_positions < max_open,
-            f"{exposure.open_positions} open against limit {max_open} "
-            "(this trade would make one more)",
-        )
+        if reverse:
+            # A reverse swap CLOSES the position it is quoted for, so the limit
+            # on how many may be open cannot apply to it — with the deployed
+            # limit of one, applying it would make the single position the lane
+            # is allowed to hold impossible to unwind. The check is not skipped:
+            # it is replaced by the stricter statement that there is a position
+            # to close, which the caller has already proved by naming the row.
+            b.add(
+                "open_position_exists_to_close",
+                exposure.open_positions >= 1,
+                f"{exposure.open_positions} open position(s); a reverse swap "
+                "closes one rather than opening one",
+            )
+        else:
+            b.add(
+                "open_positions_within_limit",
+                exposure.open_positions < max_open,
+                f"{exposure.open_positions} open against limit {max_open} "
+                "(this trade would make one more)",
+            )
 
         max_active = int(s.SOLANA_MAX_CONCURRENT_EXECUTIONS)
         b.add(
@@ -392,16 +628,32 @@ class LimitsEngine:
         )
 
     # ---------------- stage: transaction ----------------
-    def check_transaction(self, report: Any) -> LimitsReport:
+    def check_transaction(
+        self, report: Any, *, direction: str = DIRECTION_SOL_TO_USDC
+    ) -> LimitsReport:
         """The fee ceilings, applied to what the BYTES actually carry.
 
         Every amount comes from ``tx_inspector``'s re-derivation of the
         compiled transaction, never from what was requested of Jupiter — the
         request is not a promise about what came back, and that gap is the
         whole reason the inspector exists.
+
+        ``direction`` only ever TIGHTENS the account-creation ceiling. The
+        configured ``SOLANA_PILOT_MAX_ATA_CREATES`` is sized for the forward
+        direction, where the wallet may have to open both the wrapped-SOL
+        account and the USDC account it is paid into. A reverse swap spends
+        from a USDC account that must already exist, so the most it can
+        legitimately need is that account re-asserted idempotently plus the
+        wrapped-SOL account — hence a ceiling of two, taken as the MINIMUM of
+        the two figures so a lowered configuration still wins.
         """
         c = self.fee_ceilings
         b = _Builder(STAGE_TRANSACTION)
+        max_ata_creates = (
+            min(c.max_ata_creates, REVERSE_MAX_ATA_CREATES)
+            if direction == DIRECTION_USDC_TO_SOL
+            else c.max_ata_creates
+        )
 
         b.add(
             "priority_fee_within_ceiling",
@@ -427,9 +679,9 @@ class LimitsEngine:
         )
         b.add(
             "ata_creates_within_limit",
-            report.ata_create_count <= c.max_ata_creates,
+            report.ata_create_count <= max_ata_creates,
             f"{report.ata_create_count} account create(s) against limit "
-            f"{c.max_ata_creates} ({report.ata_rent_lamports} lamports of rent)",
+            f"{max_ata_creates} ({report.ata_rent_lamports} lamports of rent)",
         )
         unknown = sorted(set(report.program_ids) - ALLOWED_PROGRAM_IDS)
         b.add(
@@ -472,6 +724,58 @@ class LimitsEngine:
                 f"of fees and rent + {_fmt(headroom_pct)}% headroom)"
                 if sol_lamports is not None
                 else "SOL balance could not be read, so cover cannot be shown"
+            ),
+        )
+        return b.report()
+
+    def check_reverse_balance(
+        self,
+        *,
+        sol_lamports: int | None,
+        usdc_raw: int | None,
+        amount_raw: int,
+        total_fee_lamports: int,
+    ) -> LimitsReport:
+        """The reverse direction's cover question, which has TWO legs.
+
+        Forward, one asset pays for everything: the SOL leaving is the swap
+        plus every fee, so one comparison answers it. Reverse splits them —
+        the USDC pays for the swap and the SOL pays for the fees and rent —
+        and collapsing that into the forward check would compare a raw USDC
+        amount against a lamport balance. That is not a loosened check, it is
+        an arithmetically meaningless one: at 6 vs 9 decimals a $7 input reads
+        as 7,000,000 "lamports", so a wallet with 0.008 SOL would appear to
+        cover a swap it cannot pay the rent for.
+
+        Both legs fail closed on an unreadable balance, same as forward.
+        """
+        headroom_pct = _dec(self._settings.SOLANA_BALANCE_HEADROOM_PCT)
+        required_sol = int(_dec(total_fee_lamports) * (1 + headroom_pct / 100))
+        b = _Builder(STAGE_BALANCE)
+        b.add(
+            "sol_covers_fees_and_headroom",
+            sol_lamports is not None and sol_lamports >= required_sol,
+            (
+                f"balance {_fmt(_sol(sol_lamports))} SOL against required "
+                f"{_fmt(_sol(required_sol))} SOL ({total_fee_lamports} lamports "
+                f"of fees and rent + {_fmt(headroom_pct)}% headroom; the swap "
+                "input is USDC and does not come out of this balance)"
+                if sol_lamports is not None
+                else "SOL balance could not be read, so cover cannot be shown"
+            ),
+        )
+        # No headroom on the token leg. The input amount is exact and the swap
+        # spends precisely it — headroom there would demand the wallet hold
+        # USDC it is not going to spend, which is the opposite of what a
+        # position-closing swap is for.
+        b.add(
+            "usdc_covers_swap_input",
+            usdc_raw is not None and usdc_raw >= amount_raw,
+            (
+                f"balance {_fmt(_usdc(usdc_raw))} USDC against the "
+                f"{_fmt(_usdc(amount_raw))} USDC this swap spends"
+                if usdc_raw is not None
+                else "USDC balance could not be read, so cover cannot be shown"
             ),
         )
         return b.report()

@@ -1703,6 +1703,19 @@ class Settings(BaseSettings):
     # SOLANA_SUBMISSION_SETTLE_SEC because that value is the resolver's
     # between-sweeps delay and the two are tuned against different questions.
     SOLANA_PILOT_POLL_INTERVAL_SEC: float = 2.0
+    # *** USDC ACCOUNT CLOSURE IS OFF, AND OFF IS THE ONLY DEFAULT. ***
+    # A reverse (USDC->SOL) swap empties the wallet's USDC account, at which
+    # point closing it would release its ~2,039,280 lamports of rent. That is a
+    # SEPARATE decision from the swap and it is never bundled into one: with
+    # this False, `solana_lane reverse` refuses any built transaction that
+    # closes the USDC account, so "it did not happen quietly" is enforced
+    # rather than assumed.
+    #
+    # Turning it on takes TWO deliberate acts — this setting AND the
+    # --close-usdc-ata flag on the command — and the approval screen then shows
+    # the closure and the exact rent on their own line. Leaving the account
+    # open costs the rent and keeps the wallet ready to receive USDC again.
+    SOLANA_REVERSE_CLOSE_USDC_ATA: bool = False
 
     # Feedback-loop (Sprint 1, spec 2026-04-18)
     FEEDBACK_SUPPRESSION_MIN_TRADES: int = 20
