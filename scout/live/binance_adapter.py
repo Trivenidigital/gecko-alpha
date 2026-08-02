@@ -526,7 +526,13 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 "place_order_request requires db wired into BinanceSpotAdapter"
             )
 
-        cid = make_client_order_id(request.paper_trade_id, request.intent_uuid)
+        # A caller that minted a content-bound id (scout/live/order_id.py, derived
+        # from TradeIntent.intent_hash) owns the id; the legacy uuid derivation is the
+        # fallback for callers that have not been wired to intents yet. Deriving here
+        # unconditionally would silently discard the binding the caller established.
+        cid = request.client_order_id or make_client_order_id(
+            request.paper_trade_id, request.intent_uuid
+        )
 
         # Step 1: cheap dedup
         existing = await lookup_existing_order_id(self._db, cid)
@@ -580,6 +586,8 @@ class BinanceSpotAdapter(ExchangeAdapter):
                 signal_type="",  # filled by engine layer
                 size_usd=str(request.size_usd),
                 mid_at_entry=mid_str,
+                intent_hash=request.intent_hash,
+                mandate_mode=request.mandate_mode,
             )
         except sqlite3.IntegrityError as exc:
             # UNIQUE constraint on client_order_id — another retry beat us.

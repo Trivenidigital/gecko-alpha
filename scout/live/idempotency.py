@@ -95,6 +95,8 @@ async def record_pending_order(
     signal_type: str,
     size_usd: str,
     mid_at_entry: str | None = None,
+    intent_hash: str | None = None,
+    mandate_mode: str | None = None,
 ) -> int:
     """Insert a `live_trades` row in 'open' status before venue submit.
 
@@ -111,6 +113,13 @@ async def record_pending_order(
     holding it (the only in-tree caller, ``binance_adapter.place_order_request``,
     takes the lock separately for its later UPDATE).
 
+    ``intent_hash`` and ``mandate_mode`` are written when the caller executed under
+    an intent binding. Both stay NULL for legacy callers, and that NULL is
+    load-bearing: ``ExecutionMandate`` counts supervised CEX history by
+    ``mandate_mode``, so rows written before this column existed correctly count for
+    nothing. The autonomous-promotion bar therefore starts at zero rather than being
+    retroactively satisfied by history that was never mandate-gated.
+
     Returns the inserted live_trades.id.
     """
     if db._conn is None or db._txn_lock is None:
@@ -122,8 +131,9 @@ async def record_pending_order(
         cur = await db._conn.execute(
             """INSERT INTO live_trades
                (paper_trade_id, coin_id, symbol, venue, pair, signal_type,
-                size_usd, mid_at_entry, status, client_order_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                size_usd, mid_at_entry, status, client_order_id, created_at,
+                intent_hash, mandate_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
             (
                 paper_trade_id,
                 coin_id,
@@ -135,6 +145,8 @@ async def record_pending_order(
                 mid_at_entry,
                 client_order_id,
                 now_iso,
+                intent_hash,
+                mandate_mode,
             ),
         )
         await db._conn.commit()

@@ -2281,6 +2281,20 @@ async def main(argv: list[str] | None = None) -> int:
             )
             logger.info("routing_layer_constructed", venues=["binance"])
 
+        # Cross-venue execution mandate. Constructed unconditionally and reported at
+        # boot: an operator needs to see "the autonomy gate is CLOSED" in the log,
+        # because the absence of a line is not evidence that a gate exists.
+        from scout.live.mandate import ExecutionMandate
+
+        live_mandate = ExecutionMandate(settings=settings, db=db)
+        logger.info(
+            "execution_mandate_state",
+            mode=live_mandate.mode,
+            active=live_mandate.is_active,
+            families=getattr(settings, "LIVE_EXECUTION_MANDATE_FAMILIES", ""),
+            venues=getattr(settings, "LIVE_EXECUTION_MANDATE_VENUES", ""),
+        )
+
         live_engine = LiveEngine(
             config=live_config,
             resolver=resolver,
@@ -2288,6 +2302,7 @@ async def main(argv: list[str] | None = None) -> int:
             db=db,
             kill_switch=live_kill_switch,
             routing=live_routing,
+            mandate=live_mandate,
         )
         # Boot-time drift reconciliation + startup status (Task 16).
         await reconcile_open_shadow_trades(

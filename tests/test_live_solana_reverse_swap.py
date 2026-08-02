@@ -582,15 +582,21 @@ async def test_reverse_refuses_when_another_solana_row_is_in_flight(tmp_path):
 async def test_bounded_autonomous_refuses_the_reverse_swap(tmp_path):
     """The mode is reachable, the envelope is real, the decision is absent.
 
-    Seeded with the supervised history and the enable flag the preconditions
-    require, so the refusal comes from the POLICY rather than from a gate in
-    front of it — which is the only way to show the policy is what refuses.
+    Seeded with the supervised history, the enable flag AND the cross-venue
+    execution mandate the preconditions require, so the refusal comes from the
+    POLICY rather than from a gate in front of it — which is the only way to show
+    the policy is what refuses.
     """
     runner, db, session = await _make_runner(
         tmp_path,
         SOLANA_MODE="BOUNDED_AUTONOMOUS",
         SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
         SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=1,
+        LIVE_EXECUTION_MANDATE_MODE="BOUNDED_AUTONOMOUS",
+        LIVE_EXECUTION_MANDATE_ENABLED=True,
+        LIVE_EXECUTION_MANDATE_PER_TRADE_MAX_USD=Decimal("25"),
+        LIVE_EXECUTION_MANDATE_DAILY_MAX_USD=Decimal("25"),
+        LIVE_EXECUTION_MANDATE_MAX_OPEN_POSITIONS=1,
     )
     row_id = await _seed_position(db)
     now = datetime.now(timezone.utc).isoformat()

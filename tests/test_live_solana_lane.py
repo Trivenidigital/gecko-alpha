@@ -1204,6 +1204,49 @@ async def test_bounded_autonomous_refuses_without_recorded_supervised_history(
     await db.close()
 
 
+#: The cross-venue mandate settings a promoted lane now additionally requires.
+#: Kept as one dict so a test that means "the lane's own locks are the subject"
+#: does not have to restate the mandate's, and so the coupling is visible in one
+#: place rather than copied into every promoted-path test.
+_MANDATE_SATISFIED = {
+    "LIVE_EXECUTION_MANDATE_MODE": "BOUNDED_AUTONOMOUS",
+    "LIVE_EXECUTION_MANDATE_ENABLED": True,
+    "LIVE_EXECUTION_MANDATE_PER_TRADE_MAX_USD": Decimal("25"),
+    "LIVE_EXECUTION_MANDATE_DAILY_MAX_USD": Decimal("25"),
+    "LIVE_EXECUTION_MANDATE_MAX_OPEN_POSITIONS": 1,
+}
+
+
+async def test_bounded_autonomous_refuses_without_the_cross_venue_mandate(tmp_path):
+    """*** A LANE CANNOT BE MORE AUTONOMOUS THAN THE MANDATE THAT COVERS IT. ***
+
+    Every lane-local lock satisfied — mode, second flag, recorded supervised
+    history, configured envelope — and the lane still refuses, because
+    autonomous execution is authorized once for every venue rather than per
+    lane. Without this, promoting Solana and promoting the CEX path would be two
+    independent decisions with two independent postures, and nothing would make
+    an operator reconcile them.
+    """
+    runner, db, session = await _make_runner(
+        tmp_path,
+        SOLANA_MODE="BOUNDED_AUTONOMOUS",
+        SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
+        SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=1,
+    )
+    await _seed_supervised_history(db, 1)
+    with aioresponses() as m:
+        assert await runner.place(sol=_SOL) == EXIT_REFUSED
+        assert list(m.requests) == []  # refused before anything was contacted
+
+    abort = _step(_steps(tmp_path), "aborted")
+    assert abort["stage"] == "envelope_gate"
+    assert "cross-venue execution mandate refuses" in abort["reason"]
+    # And the funded key was never opened.
+    assert runner.loader_spy.calls == 0
+    await session.close()
+    await db.close()
+
+
 async def test_the_autonomy_preconditions_are_recorded_in_the_evidence(tmp_path):
     """A promoted lane's evidence has to show WHY it was allowed to run."""
     tx = build_swap_tx().tx_b64
@@ -1212,6 +1255,7 @@ async def test_the_autonomy_preconditions_are_recorded_in_the_evidence(tmp_path)
         SOLANA_MODE="BOUNDED_AUTONOMOUS",
         SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
         SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=1,
+        **_MANDATE_SATISFIED,
     )
     await _seed_supervised_history(db, 1)
     with aioresponses() as m:
@@ -1224,6 +1268,8 @@ async def test_the_autonomy_preconditions_are_recorded_in_the_evidence(tmp_path)
     assert preconditions["enable_flag"] is True
     assert preconditions["supervised_reconciled"] == 1
     assert preconditions["supervised_required"] == 1
+    # The cross-venue lock is recorded alongside the lane's own three.
+    assert preconditions["cross_venue_mandate"] == "BOUNDED_AUTONOMOUS"
     # And the envelope it will trade inside, recorded with it.
     assert envelope["limits"]["daily_notional_usd"] == "25.0"
     await session.close()
@@ -1310,10 +1356,12 @@ async def test_bounded_autonomous_swaps_the_policy_and_nothing_else(tmp_path, ca
         SOLANA_MODE="BOUNDED_AUTONOMOUS",
         SOLANA_BOUNDED_AUTONOMOUS_ENABLED=True,
         SOLANA_AUTONOMY_MIN_SUPERVISED_EXECUTIONS=3,
+        **_MANDATE_SATISFIED,
     )
     # The mode and the flag are not enough on their own — the lane also
-    # requires recorded supervised history. See
-    # test_bounded_autonomous_refuses_without_recorded_supervised_history.
+    # requires recorded supervised history AND the cross-venue mandate. See
+    # test_bounded_autonomous_refuses_without_recorded_supervised_history and
+    # test_bounded_autonomous_refuses_without_the_cross_venue_mandate.
     await _seed_supervised_history(db, 3)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)

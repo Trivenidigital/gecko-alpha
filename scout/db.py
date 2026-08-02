@@ -221,6 +221,13 @@ class Database:
         # exist before any money does, so they cannot live on a money row.
         await self._migrate_solana_executions_v1()
 
+        # Venue-neutral execution binding. schema_version 20260802.
+        # Adds live_trades.intent_hash + live_trades.mandate_mode and widens the
+        # reject_reason CHECK with the three refusals the mandate + capability gate
+        # can produce. MUST run after `_migrate_reject_reason_extend_v2` so it
+        # operates on the already-widened CHECK and preserves every value.
+        await self._migrate_venue_neutral_execution_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -3086,7 +3093,9 @@ class Database:
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
                     'master_kill','mode_paper',
-                    'live_signed_disabled','api_key_lacks_trade_scope'
+                    'live_signed_disabled','api_key_lacks_trade_scope',
+                    'mandate_inactive','venue_capability_refused',
+                    'no_adapter_for_venue'
                 )),
                 exit_walked_vwap    TEXT,
                 realized_pnl_usd    TEXT,
@@ -3126,7 +3135,9 @@ class Database:
                     'notional_cap_exceeded','signal_disabled','token_aggregate',
                     'dual_signal_aggregate','all_candidates_failed',
                     'master_kill','mode_paper',
-                    'live_signed_disabled','api_key_lacks_trade_scope'
+                    'live_signed_disabled','api_key_lacks_trade_scope',
+                    'mandate_inactive','venue_capability_refused',
+                    'no_adapter_for_venue'
                 )),
                 exit_order_id       TEXT,
                 exit_fill_price     TEXT,
@@ -3134,7 +3145,13 @@ class Database:
                 realized_pnl_pct    TEXT,
                 kill_event_id       INTEGER REFERENCES kill_events(id),
                 created_at          TEXT NOT NULL,
-                closed_at           TEXT
+                closed_at           TEXT,
+                -- Venue-neutral execution binding (2026-08-02). Both nullable with
+                -- no DEFAULT: NULL means "written before intents were bound", which
+                -- is what makes the mandate's supervised-history count start at zero
+                -- instead of inheriting history that was never mandate-gated.
+                intent_hash         TEXT,
+                mandate_mode        TEXT
             )
             """,
             # 3. kill_events — append-only audit log of daily-loss-cap trips etc.
@@ -9565,3 +9582,238 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Venue-neutral execution binding (2026-08-02)
+    # ------------------------------------------------------------------
+    async def _migrate_venue_neutral_execution_v1(self) -> None:
+        """Venue-neutral execution binding: intent hash, mandate mode, refusals.
+
+        Three changes, all on ``live_trades`` (plus the CHECK on ``shadow_trades``,
+        which shares the constraint):
+
+        1. ``intent_hash TEXT`` — the SHA-256 that binds a submission to its TERMS.
+           ``client_order_id`` already gave a submission an identity; this is what
+           makes that identity mean "these exact terms" rather than "some submission".
+        2. ``mandate_mode TEXT`` — which execution mandate authorized the row.
+           ``ExecutionMandate`` counts supervised CEX history from this column, so a
+           NULL is load-bearing: every row that predates the mandate correctly counts
+           for NOTHING toward autonomous promotion. Backfilling it would hand the
+           promotion bar a history that was never mandate-gated, which is the exact
+           claim the count exists to refuse.
+        3. Widen the ``reject_reason`` CHECK with the three refusals the new gates
+           produce: ``mandate_inactive``, ``venue_capability_refused``,
+           ``no_adapter_for_venue``. Without this the engine's rejection INSERT would
+           raise IntegrityError and the refusal would be invisible — a fail-closed
+           gate whose audit trail fails open.
+
+        Both columns are nullable with NO DEFAULT, preserving absence-vs-value
+        semantics (the project-wide convention). The CHECK widening uses the
+        established rename-rebuild pattern from ``_migrate_reject_reason_extend_v2``,
+        including the ``cross_venue_exposure`` / ``cross_venue_pnl`` view
+        drop-and-recreate, because SQLite cannot ALTER a CHECK in place.
+
+        Idempotent on the ``paper_migrations`` marker AND on per-object inspection,
+        so a partially-applied run (crash between the rebuild and the marker) is safe
+        to re-run.
+
+        Migration ``bl_venue_neutral_execution_v1``, schema_version 20260802.
+        """
+        import re as _re
+
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        migration = "bl_venue_neutral_execution_v1"
+        new_reasons = (
+            "mandate_inactive",
+            "venue_capability_refused",
+            "no_adapter_for_venue",
+        )
+
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS paper_migrations (
+                    name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)""")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                    description TEXT NOT NULL)""")
+
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration,)
+            )
+            if (await cur.fetchone()) is not None:
+                await conn.commit()
+                return
+
+            # ---- Part 1: widen the reject_reason CHECK -------------------
+            new_check = (
+                "CHECK (reject_reason IS NULL OR reject_reason IN ("
+                "'no_venue','insufficient_depth','slippage_exceeds_cap',"
+                "'insufficient_balance','daily_cap_hit','kill_switch',"
+                "'exposure_cap','override_disabled','venue_unavailable',"
+                "'notional_cap_exceeded','signal_disabled','token_aggregate',"
+                "'dual_signal_aggregate','all_candidates_failed',"
+                "'master_kill','mode_paper',"
+                "'live_signed_disabled','api_key_lacks_trade_scope',"
+                "'mandate_inactive','venue_capability_refused',"
+                "'no_adapter_for_venue'))"
+            )
+            for table in ("shadow_trades", "live_trades"):
+                cur = await conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    continue
+                table_sql = row[0] or ""
+                if all(reason in table_sql for reason in new_reasons):
+                    continue  # already widened
+
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = await cur.fetchall()
+                if not cols:
+                    continue
+                col_list = ", ".join(c[1] for c in cols)
+
+                pattern = _re.compile(
+                    r"reject_reason\s+TEXT\s+CHECK\s*\([^)]*\)\s*\)",
+                    _re.IGNORECASE | _re.DOTALL,
+                )
+                new_table_sql = pattern.sub(
+                    f"reject_reason       TEXT {new_check}", table_sql
+                )
+                if new_table_sql == table_sql:
+                    _log.warning(
+                        "venue_neutral_reject_reason_pattern_miss",
+                        table=table,
+                        sql_excerpt=table_sql[:200],
+                    )
+                    continue
+
+                # Prod's sqlite_master.sql may carry the table name QUOTED after an
+                # earlier rebuild; the pattern covers quoted, unquoted and
+                # IF NOT EXISTS forms (hotfix lesson from the v2 migration).
+                name_pattern = (
+                    r"TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                    r'["\x60]?' + table + r'["\x60]?\s*\('
+                )
+                new_table_sql_renamed = _re.sub(
+                    name_pattern,
+                    f"TABLE {table}_new (",
+                    new_table_sql,
+                    count=1,
+                    flags=_re.IGNORECASE,
+                )
+                if new_table_sql_renamed == new_table_sql:
+                    _log.warning(
+                        "venue_neutral_reject_reason_rename_miss",
+                        table=table,
+                        sql_excerpt=new_table_sql[:200],
+                    )
+                    continue
+
+                if table == "live_trades":
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_exposure")
+                    await conn.execute("DROP VIEW IF EXISTS cross_venue_pnl")
+
+                await conn.execute(new_table_sql_renamed)
+                await conn.execute(
+                    f"INSERT INTO {table}_new ({col_list}) "
+                    f"SELECT {col_list} FROM {table}"
+                )
+                await conn.execute(f"DROP TABLE {table}")
+                await conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+
+                if table == "live_trades":
+                    # The UNIQUE partial index on client_order_id lives on the
+                    # table, so the rebuild dropped it. Recreating it is not
+                    # optional: it is the DB-layer backstop that stops a concurrent
+                    # retry double-submitting.
+                    await conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_live_trades_client_order_id "
+                        "ON live_trades(client_order_id) "
+                        "WHERE client_order_id IS NOT NULL"
+                    )
+                    await conn.execute(
+                        """CREATE VIEW IF NOT EXISTS cross_venue_exposure AS
+                           SELECT
+                               'binance' AS venue,
+                               COALESCE(SUM(CAST(size_usd AS REAL)), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM live_trades
+                           WHERE status = 'open'
+                           UNION ALL
+                           SELECT
+                               'minara_' || COALESCE(chain, 'unknown') AS venue,
+                               COALESCE(SUM(amount_usd), 0) AS open_exposure_usd,
+                               COUNT(*) AS open_count
+                           FROM paper_trades
+                           WHERE status = 'open'
+                             AND chain != 'coingecko'
+                             AND chain != ''
+                           GROUP BY chain"""
+                    )
+                    await conn.execute("""CREATE VIEW IF NOT EXISTS cross_venue_pnl AS
+                           SELECT
+                               'placeholder_m1' AS venue,
+                               0.0 AS realized_pnl_usd,
+                               0.0 AS unrealized_pnl_usd""")
+
+            # ---- Part 2: the two additive columns ------------------------
+            cur = await conn.execute("PRAGMA table_info(live_trades)")
+            existing_cols = {r[1] for r in await cur.fetchall()}
+            if existing_cols:
+                if "intent_hash" not in existing_cols:
+                    await conn.execute(
+                        "ALTER TABLE live_trades ADD COLUMN intent_hash TEXT"
+                    )
+                if "mandate_mode" not in existing_cols:
+                    await conn.execute(
+                        "ALTER TABLE live_trades ADD COLUMN mandate_mode TEXT"
+                    )
+                # Non-unique: two rows CAN legitimately share an intent_hash (a
+                # rejection row written before submission, then a submitted row for
+                # the same intent). Uniqueness lives on client_order_id, the
+                # per-submission key; this index only serves lookup.
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_live_trades_intent_hash "
+                    "ON live_trades(intent_hash) WHERE intent_hash IS NOT NULL"
+                )
+                # The mandate's supervised-history count filters on mandate_mode;
+                # without this it table-scans live_trades on every autonomy check.
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_live_trades_mandate_mode "
+                    "ON live_trades(mandate_mode) WHERE mandate_mode IS NOT NULL"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260802, now_iso, migration),
+            )
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration,)
+            )
+            if (await cur.fetchone()) is None:
+                raise RuntimeError(f"{migration} cutover row missing")
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            _log.error("SCHEMA_DRIFT_DETECTED", migration=migration)
+            raise
