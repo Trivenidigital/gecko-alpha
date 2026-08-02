@@ -335,6 +335,102 @@ class TestTheOnDemandListingsPath:
         finally:
             await db.close()
 
+    async def test_the_on_demand_fetch_does_not_resurrect_a_delisted_listing(
+        self, tmp_path
+    ):
+        """*** THE RESURRECTION PATH IS REACHABLE ONLY WHERE IT DOES DAMAGE. ***
+
+        `INSERT OR REPLACE` deletes the conflicting row and inserts a fresh one, so
+        `delisted_at` — a column no metadata fetch has an opinion about — reverts to
+        NULL. And `_LISTINGS_SQL` filters `delisted_at IS NULL`, so a token whose
+        only listing is DELISTED is exactly the token that falls through to the
+        on-demand fetch. The erasure therefore happens precisely in the case where
+        it un-delists a venue and then routes an order to it.
+
+        Latent since May only because the caller crashed at the 4-tuple unpack
+        before reaching this; repairing that crash is what made it live.
+        """
+        from scout.live.adapter_base import VenueMetadata as _VM
+
+        db = await _db_with_listings(tmp_path, [])
+        await db._conn.execute(
+            "INSERT INTO venue_listings (venue, canonical, venue_pair, quote, "
+            "asset_class, refreshed_at, delisted_at) VALUES ('binance','SYM',"
+            "'SYMUSDT','USDT','spot','2026-06-01T00:00:00Z','2026-07-01T00:00:00Z')"
+        )
+        await db._conn.commit()
+
+        class _FetchingAdapter(_Adapter):
+            async def fetch_venue_metadata(self, canonical):
+                return _VM(
+                    venue="binance",
+                    canonical=canonical,
+                    venue_pair=f"{canonical}USDT",
+                    quote="USDT",
+                    asset_class="spot",
+                    min_size=None,
+                    tick_size=None,
+                    lot_size=None,
+                )
+
+        try:
+            with pytest.raises(NoRoutableVenue):
+                await _select(
+                    _routing(
+                        db, {"binance": _FetchingAdapter("binance", _BINANCE_CAPS)}
+                    )
+                )
+            cur = await db._conn.execute(
+                "SELECT delisted_at FROM venue_listings WHERE venue='binance'"
+            )
+            assert (await cur.fetchone())[
+                0
+            ] == "2026-07-01T00:00:00Z", (
+                "the on-demand fetch erased the delisting marker"
+            )
+        finally:
+            await db.close()
+
+    async def test_the_on_demand_fetch_still_refreshes_a_live_listing(self, tmp_path):
+        """Guard on the guard: the UPSERT must still update what it is for."""
+        from scout.live.adapter_base import VenueMetadata as _VM
+
+        db = await _db_with_listings(tmp_path, [])
+        await db._conn.execute(
+            "INSERT INTO venue_listings (venue, canonical, venue_pair, quote, "
+            "asset_class, refreshed_at) VALUES ('binance','SYM','STALE','USD',"
+            "'spot','2026-06-01T00:00:00Z')"
+        )
+        await db._conn.commit()
+
+        class _FetchingAdapter(_Adapter):
+            async def fetch_venue_metadata(self, canonical):
+                return _VM(
+                    venue="binance",
+                    canonical=canonical,
+                    venue_pair="SYMUSDT",
+                    quote="USDT",
+                    asset_class="spot",
+                    min_size=None,
+                    tick_size=None,
+                    lot_size=None,
+                )
+
+        try:
+            # A live listing is found by the FIRST read, so drive the fetch directly.
+            await _routing(
+                db, {"binance": _FetchingAdapter("binance", _BINANCE_CAPS)}
+            )._on_demand_listings_fetch("SYM")
+            cur = await db._conn.execute(
+                "SELECT venue_pair, quote, refreshed_at FROM venue_listings "
+                "WHERE venue='binance'"
+            )
+            pair, quote, refreshed = tuple(await cur.fetchone())
+            assert (pair, quote) == ("SYMUSDT", "USDT")
+            assert refreshed != "2026-06-01T00:00:00Z"
+        finally:
+            await db.close()
+
     async def test_the_two_listing_reads_are_the_same_query(self):
         """Structural guard on the fix: the constant exists and is used at both
         sites, so the column lists cannot drift apart again."""

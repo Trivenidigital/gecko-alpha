@@ -387,13 +387,26 @@ class ExecutionMandate:
             supervised = await self._count_supervised(
                 intent.venue_family, venue=intent.preferred_venue
             )
-            required = int(
-                getattr(
-                    self._s,
-                    "LIVE_EXECUTION_MANDATE_MIN_SUPERVISED_EXECUTIONS",
-                    3,
-                )
+            # Same hazard as `_read_envelope`'s max_open conversion, and it went
+            # unfixed there first: `int()` raises OverflowError on float('inf') and
+            # InvalidOperation on Decimal('NaN') — both ArithmeticError, neither a
+            # ValueError — and plain ValueError on a non-numeric string, which is
+            # not exotic at all. `_dispatch_live` catches only `MandateRefused`
+            # around `authorize`, so any of these escapes `on_paper_trade_opened`
+            # with no reject row and no log: the gate reads as a crash rather than
+            # a refusal. Refusing is the only safe reading of an unusable bar.
+            raw_required = getattr(
+                self._s, "LIVE_EXECUTION_MANDATE_MIN_SUPERVISED_EXECUTIONS", 3
             )
+            try:
+                required = int(raw_required)
+            except (TypeError, ValueError, ArithmeticError) as exc:
+                raise MandateRefused(
+                    "supervised_history",
+                    "LIVE_EXECUTION_MANDATE_MIN_SUPERVISED_EXECUTIONS is not a "
+                    f"usable integer ({type(exc).__name__}). A bar that cannot be "
+                    "read is a bar nothing has cleared.",
+                ) from exc
             if required < 1:
                 raise MandateRefused(
                     "supervised_history",

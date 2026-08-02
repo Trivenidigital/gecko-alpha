@@ -375,7 +375,25 @@ class RoutingLayer:
         raise NoRoutableVenue(reject_reason, tuple(rejections))
 
     async def _on_demand_listings_fetch(self, canonical: str) -> None:
-        """Sync REST call per adapter to populate venue_listings rows."""
+        """Sync REST call per adapter to populate venue_listings rows.
+
+        *** UPSERT, NEVER `INSERT OR REPLACE`. ***
+        REPLACE deletes the conflicting row and inserts a fresh one, so every column
+        NOT in the statement reverts to its default. ``venue_listings.delisted_at``
+        is not in this statement and never could be — a metadata fetch has no opinion
+        about delisting — so REPLACE silently ERASES the delisting marker.
+
+        And the erasure lands exactly where it does damage. ``_LISTINGS_SQL`` filters
+        `delisted_at IS NULL`, so a token whose only listing is delisted is precisely
+        the token that reaches this fetch at all: the resurrection path is reachable
+        only in the case that resurrects a delisted venue and then routes an order to
+        it. Naming the columns in a DO UPDATE leaves everything else — including the
+        delisting — untouched.
+
+        This is the project's recorded UPSERT lesson, not a new discovery. It has
+        been latent since May only because the caller crashed before reaching it;
+        repairing that crash is what made this live, so it is fixed alongside.
+        """
         if self._db._conn is None:
             raise RuntimeError("Database not initialized.")
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -384,10 +402,14 @@ class RoutingLayer:
                 meta = await adapter.fetch_venue_metadata(canonical)
                 if meta is not None:
                     await self._db._conn.execute(
-                        """INSERT OR REPLACE INTO venue_listings
+                        """INSERT INTO venue_listings
                            (venue, canonical, venue_pair, quote, asset_class,
                             refreshed_at)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(venue, canonical, asset_class) DO UPDATE SET
+                               venue_pair   = excluded.venue_pair,
+                               quote        = excluded.quote,
+                               refreshed_at = excluded.refreshed_at""",
                         (
                             venue,
                             canonical,

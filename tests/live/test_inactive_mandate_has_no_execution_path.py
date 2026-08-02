@@ -409,27 +409,36 @@ def _func(tree: ast.AST, name: str):
 
 class TestTheGateCannotBeBypassed:
     def test_every_submit_site_in_the_engine_is_inside_the_gated_dispatch(self):
-        """``place_order_request`` must be called from exactly one place, and that
-        place must be ``_dispatch_live``. A second call site elsewhere in the
-        module would be an ungated path the behavioural tests never drive."""
+        """Every submit method must be called from exactly one place in engine.py,
+        and that place must be ``_dispatch_live``.
+
+        Widened from `place_order_request` alone: with only that name checked, a
+        bare `self._adapter.send_order(...)` dropped into `on_paper_trade_opened`
+        was pinned by NOTHING — not by this test, and not by the exclusion-list
+        test, which allowlisted the whole file. A reviewer added exactly that and
+        both tests passed.
+        """
         tree = _engine_tree()
         dispatch = _func(tree, "_dispatch_live")
-        inside = {
-            id(node)
-            for node in ast.walk(dispatch)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "place_order_request"
-        }
-        everywhere = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "place_order_request"
-        ]
-        assert len(everywhere) == 1, f"{len(everywhere)} submit sites in engine.py"
+        submit_methods = TestTheScopeOfTheClaim._SUBMIT_METHODS
+
+        def _sites(root):
+            return [
+                node
+                for node in ast.walk(root)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in submit_methods
+            ]
+
+        inside = {id(n) for n in _sites(dispatch)}
+        everywhere = _sites(tree)
+        assert len(everywhere) == 1, (
+            f"{len(everywhere)} submit sites in engine.py: "
+            f"{[n.func.attr for n in everywhere]}"
+        )
         assert id(everywhere[0]) in inside
+        assert everywhere[0].func.attr == "place_order_request"
 
     def test_the_submit_happens_after_both_mandate_calls(self):
         """Ordering, read off the source. Both the cheap precheck and the full
@@ -562,43 +571,89 @@ class TestTheScopeOfTheClaim:
     #: must be a deliberate decision, not a diff nobody read.
     _EXPECTED_UNGATED = {"scout/live/kraken_pilot.py"}
 
-    def test_the_supervised_clis_are_the_only_uncovered_submit_sites(self):
+    #: (file, method) pairs that are allowed to call a submit method, and WHICH one.
+    #:
+    #: *** ALLOWLISTING A WHOLE FILE IS HOW THIS TEST GOES BLIND. ***
+    #: An earlier version excluded `engine.py` and `live_evaluator.py` wholesale.
+    #: A reviewer mutated a copy of the tree three ways — a bare `send_order` added
+    #: to `on_paper_trade_opened` (ungated, outside `_dispatch_live`); a
+    #: `place_order_request` ENTRY added to `live_evaluator`, the file annotated
+    #: "exits only"; and a whole new `scout/live/rogue.py` reaching a submit via
+    #: `getattr` — and this test passed on all three. Pairs, not files.
+    #: CALL sites only. The adapters DEFINE these methods and do not invoke them,
+    #: so they need no entry — a definition is not a path to a venue. Listing them
+    #: was the first draft's error, and `test_the_allowlist_has_no_stale_entries`
+    #: is what caught it; an allowlist naming sites that do not exist reads as
+    #: covering more than it does and hides the day a real one appears under that
+    #: name.
+    _ALLOWED_SUBMIT_SITES = {
+        # The gated autonomous path — entries ONLY, and only this one method.
+        ("scout/live/engine.py", "place_order_request"),
+        # The closer — exits ONLY. A `place_order_request` here would be an entry
+        # on a path whose whole exemption rests on it never opening exposure.
+        ("scout/live/live_evaluator.py", "place_exit_order"),
+        # The operator-invoked Kraken pilot: outside the mandate by design, behind
+        # a typed per-trade authorization.
+        ("scout/live/kraken_pilot.py", "place_limit_order"),
+    }
+
+    _SUBMIT_METHODS = frozenset(
+        {"place_limit_order", "place_order_request", "send_order", "place_exit_order"}
+    )
+
+    def _submit_sites(self) -> set[tuple[str, str]]:
+        """Every (file, method) that reaches a submit, including via getattr."""
         import ast
 
-        # Direct calls to a Kraken/Binance order-placing method, anywhere in the
-        # package, outside the adapters that define them and the engine that is
-        # gated.
-        submit_methods = {
-            "place_limit_order",
-            "place_order_request",
-            "send_order",
-            "place_exit_order",
-        }
-        defining = {
-            "scout/live/adapter_base.py",
-            "scout/live/kraken_adapter.py",
-            "scout/live/binance_adapter.py",
-            "scout/live/ccxt_adapter.py",
-            "scout/live/engine.py",  # gated; asserted by the tests above
-            "scout/live/live_evaluator.py",  # exits only; never opens exposure
-        }
-        callers: set[str] = set()
+        found: set[tuple[str, str]] = set()
         for path in sorted(_SCOUT.rglob("*.py")):
             rel = str(path.relative_to(_ROOT)).replace("\\", "/")
-            if rel in defining:
-                continue
             for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                # a.place_order_request(...)
                 if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in submit_methods
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self._SUBMIT_METHODS
                 ):
-                    callers.add(rel)
-        assert callers == self._EXPECTED_UNGATED, (
-            f"submit sites outside the mandate changed: {callers}. Every module "
-            "here places real orders without consulting ExecutionMandate — adding "
-            "one is a decision, not an implementation detail."
+                    found.add((rel, node.func.attr))
+                # getattr(a, "place_order_request")(...) — indirection is still a
+                # call, and a test that only matches attribute access invites it.
+                inner = node.func if isinstance(node.func, ast.Call) else node
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "getattr"
+                    and len(inner.args) >= 2
+                    and isinstance(inner.args[1], ast.Constant)
+                    and inner.args[1].value in self._SUBMIT_METHODS
+                ):
+                    found.add((rel, str(inner.args[1].value)))
+        return found
+
+    def test_the_supervised_clis_are_the_only_uncovered_submit_sites(self):
+        unexpected = self._submit_sites() - self._ALLOWED_SUBMIT_SITES
+        assert unexpected == set(), (
+            f"new submit site(s) outside the mandate: {sorted(unexpected)}. Each "
+            "reaches a venue without consulting ExecutionMandate — adding one is a "
+            "decision, not an implementation detail."
         )
+
+    def test_the_allowlist_has_no_stale_entries(self):
+        """A pair that no longer exists makes the allowlist read as covering more
+        than it does, and hides the day a real site is added under that name."""
+        stale = self._ALLOWED_SUBMIT_SITES - self._submit_sites()
+        assert stale == set(), f"allowlist names sites that no longer exist: {stale}"
+
+    def test_only_kraken_pilot_submits_outside_the_gated_paths(self):
+        """The scope sentence in the module docstring, as an assertion: exactly one
+        module places orders without either the mandate or an exit-only role."""
+        gated_or_exit_only = {
+            "scout/live/engine.py",  # mandate-gated, asserted above
+            "scout/live/live_evaluator.py",  # exits only; cannot open exposure
+        }
+        outside = {f for f, _ in self._submit_sites() if f not in gated_or_exit_only}
+        assert outside == self._EXPECTED_UNGATED, outside
 
     def test_the_module_docstring_records_the_exclusions(self):
         """The scope of the claim has to be readable where the claim is made."""

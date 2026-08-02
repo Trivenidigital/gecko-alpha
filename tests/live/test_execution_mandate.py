@@ -441,6 +441,37 @@ class TestSupervisedHistory:
         finally:
             await db.close()
 
+    @pytest.mark.parametrize("bad", [float("inf"), D("NaN"), "three", None, [3]])
+    async def test_an_unreadable_threshold_refuses_rather_than_escaping(
+        self, tmp_path, bad
+    ):
+        """*** THE SIBLING OF THE ENVELOPE FIX, WHICH THE ENVELOPE FIX MISSED. ***
+
+        `int()` raises OverflowError on inf and InvalidOperation on NaN — both
+        ArithmeticError, neither a ValueError — and plain ValueError on a
+        non-numeric string, which is not exotic. `_dispatch_live` catches only
+        `MandateRefused` around `authorize`, so any of these escapes
+        `on_paper_trade_opened` with no reject row and no log: the gate reads as a
+        crash rather than a refusal.
+        """
+        db = Database(str(tmp_path / "s.db"))
+        await db.initialize()
+        try:
+            cfg = SimpleNamespace(
+                **{
+                    **_OPEN,
+                    "LIVE_EXECUTION_MANDATE_MODE": "BOUNDED_AUTONOMOUS",
+                    "LIVE_EXECUTION_MANDATE_MIN_SUPERVISED_EXECUTIONS": bad,
+                }
+            )
+            mandate = ExecutionMandate(settings=cfg, db=db)
+            mandate.precheck()  # the envelope is fine; only the bar is unreadable
+            with pytest.raises(MandateRefused) as exc:
+                await mandate.authorize(_intent(mode="BOUNDED_AUTONOMOUS"), at=_T0)
+            assert exc.value.gate == "supervised_history"
+        finally:
+            await db.close()
+
     async def test_a_threshold_below_one_is_refused(self, tmp_path):
         """Autonomous promotion with no recorded history at all is not a
         configuration anyone may choose."""
