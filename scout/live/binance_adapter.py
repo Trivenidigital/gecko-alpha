@@ -29,6 +29,7 @@ from scout.live.adapter_base import (
     VenueMetadata,
 )
 from scout.live.exceptions import RateLimitError, VenueTransientError
+from scout.live.capabilities import VenueCapabilities
 from scout.live.types import Depth, DepthLevel
 
 log = structlog.get_logger(__name__)
@@ -351,6 +352,29 @@ class BinanceSpotAdapter(ExchangeAdapter):
     # ------------------------------------------------------------------
     # Public API (ExchangeAdapter)
     # ------------------------------------------------------------------
+    def describe_capabilities(self) -> VenueCapabilities:
+        """Binance is the v1 live implementation and overrides both
+        ``place_exit_order`` and ``fetch_order_by_client_id`` (adapter_base
+        comment), so a held-size-bounded exit is supported here.
+
+        ``supports_reduce_only`` is deliberately NOT declared. Spot has no venue-side
+        reduceOnly flag, and ``place_exit_order`` takes ``base_qty`` from the caller and
+        fires a bare MARKET SELL — no position lookup, no clamp, no balance check. The
+        bound lives in exactly one caller (``live_evaluator.py``, which passes
+        ``entry_qty``); nothing in this adapter or in ``permits_order`` enforces it, and
+        ``TradeIntent.position_id`` has no plumbing to a held size. Declaring it here
+        would let the router approve a reduce-only intent and then land on
+        ``place_order_request`` — the unbounded entry path. Declare it once the clamp is
+        implemented in the adapter, not before.
+        """
+        return VenueCapabilities(
+            venue=getattr(self, "venue_name", "binance"),
+            venue_family="cex",
+            supports_market_orders=True,
+            supports_client_order_id=True,
+            supports_partial_fills=True,
+        )
+
     async def fetch_exchange_info_row(self, pair: str) -> dict | None:
         """Fetch the single-symbol exchangeInfo row.
 

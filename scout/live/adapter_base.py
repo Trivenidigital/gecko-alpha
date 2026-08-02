@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from scout.live.capabilities import VenueCapabilities
 from scout.live.types import Depth
 
 
@@ -56,6 +57,17 @@ class OrderConfirmation:
 
 class ExchangeAdapter(ABC):
     venue_name: str
+
+    # ------------------------------------------------------------------
+    # Capability declaration. Deliberately concrete rather than abstract: an
+    # adapter that forgets to override must still construct, and what it gets
+    # is a descriptor that permits NOTHING. Undeclared is absent, not assumed.
+    # Making this @abstractmethod would break every existing subclass; making
+    # it default-permissive would be the inference bug this exists to kill.
+    # ------------------------------------------------------------------
+    def describe_capabilities(self) -> VenueCapabilities:
+        """What this venue is declared to support. Override in each adapter."""
+        return VenueCapabilities(venue=getattr(self, "venue_name", "unknown"))
 
     @abstractmethod
     async def fetch_exchange_info_row(self, pair: str) -> dict | None:
