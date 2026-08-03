@@ -1,0 +1,200 @@
+# Why every signal is suspended — it is the exit path, not the signals
+
+**Date:** 2026-08-03
+**Status:** ANALYSIS COMPLETE — no code changed, nothing revived.
+**Trigger:** operator on the signal-evidence board: *"Lot of these categories used
+produce lot of good signals. Why all these are suspended?"*
+
+---
+
+## Verdict in one line
+
+**Every suspension was justified on its own evidence, but the cause is common to all
+signals: the exit path loses money uniformly, so each signal crosses the PnL
+threshold on schedule regardless of detection quality.** 7 of 7 signals are net
+positive on managed exits and net negative on unmanaged ones.
+
+**Operational consequence: reviving any signal without changing exits will simply
+re-suspend it.**
+
+---
+
+## 1. The suspensions are real, not spurious
+
+All auto-suspend except `tg_social` (operator). Each fired on genuine rolling-window
+losses (`signal_params_audit`):
+
+| Signal | Reason | Evidence at kill | When |
+|---|---|---|---|
+| chain_completed | hard_loss | −$1,714, dd −$2,856, n=144 | 2026-06-06 |
+| gainers_early | pnl_threshold | −$204, n=129 | 2026-07-27 |
+| losers_contrarian | hard_loss | −$208, dd −$1,412, n=121 | 2026-05-17 |
+| slow_burn | hard_loss | −$544, dd −$578, n=32 | 2026-06-17 |
+| trending_catch | hard_loss | −$317, dd −$626, n=108 | 2026-05-11 |
+| volume_spike | hard_loss | −$554, dd −$686, n=35 | 2026-07-18 |
+| first_signal | hard_loss | −$597, dd −$597, n=19 | 2026-06-29 |
+| tg_social | **operator** GA-01 containment | −$488.93 / 19 priced closes, 33% WR | 2026-07-03 |
+
+Thresholds (`scout/config.py:1816-1818`): `PNL_THRESHOLD −$200` (requires
+`MIN_TRADES 50`), `HARD_LOSS −$500` (**bypasses the trade floor by design**). That
+bypass is why `first_signal` was killed at n=19 — working as specified, but a thin
+sample.
+
+**The `—` columns on the board are not a defect.** Those signals have been off for
+weeks, so their 7/14/30d closed-paper windows are genuinely empty.
+
+## 2. The cause is structural — managed vs unmanaged exits
+
+Split every close into **managed** (`closed_peak_fade`, `closed_trailing_stop`,
+`closed_moonshot_trail`, `closed_tp`, `closed_floor`) vs **unmanaged**
+(`closed_stop_loss`, `closed_expired`, `closed_time_death`):
+
+| Signal | n managed | net managed | n unmanaged | net unmanaged |
+|---|---|---|---|---|
+| gainers_early | 342 | **+$10,300** | 330 | −$13,776 |
+| chain_completed | 98 | **+$4,718** | 87 | −$7,736 |
+| losers_contrarian | 130 | **+$5,368** | 200 | −$6,501 |
+| narrative_prediction | 82 | **+$3,332** | 243 | −$4,161 |
+| first_signal | 53 | **+$2,243** | 224 | −$2,992 |
+| volume_spike | 48 | **+$1,954** | 78 | −$2,844 |
+| trending_catch | 21 | **+$695** | 92 | −$1,252 |
+| **Total** | **774** | **+$28,610** | **1,054** | **−$39,262** |
+
+**7/7 positive managed, 7/7 negative unmanaged.** If detection were the problem,
+managed exits would lose money too. They do not. This corroborates the earlier
+trader-persona review finding ("peak_fade only profit lane") on a wider basis.
+
+## 3. Where the money actually goes
+
+| Exit reason | n | net | avg pnl_pct |
+|---|---|---|---|
+| **stop_loss** | 342 | **−$26,667** | **−26.5%** |
+| expired | 753 | −$11,873 | −5.4% |
+| expired_stale_price | 129 | −$1,204 | −3.1% |
+| expired_stale_no_price | 14 | **$0** | 0.0% |
+
+Two things this rules out:
+
+- **Fabricated closes are not the cause.** `expired_stale_no_price` is n=14 at
+  exactly $0 (closed at entry price by design). The dashboard's exclusion notice is
+  honest and the excluded volume is negligible.
+- **Stops are not gapping.** Realized ≈ configured per signal (gainers_early
+  configured 25.0 → realized −25.4; chain_completed 30.0 → −31.5). 319 of 342
+  stop-outs land in the −20 to −40 band. The stop is doing exactly what it is set
+  to do.
+
+Note `signal_params.sl_pct` is **25–30%** per signal, while `PAPER_SL_PCT` defaults
+to **15.0** (`scout/config.py:720`, itself widened from 10.0 under BL-061). The
+table overrides the default upward.
+
+## 4. The arithmetic that makes every signal breakeven-negative
+
+gainers_early, lifetime: 55.3% win × +12.6% avg win − 44.7% × −15.6% avg loss
+≈ **0.00**. Its observed `avg_realized_pct` is **0.0**.
+
+Winners ~+12–17%, stop-outs −25%: a payoff ratio near 0.5, which needs ~67% win rate
+to break even. No signal reaches that. Win rates are otherwise healthy —
+chain_completed 56.0%, gainers_early 55.3%, narrative_prediction 54.6%,
+losers_contrarian 53.1%.
+
+**Giveback**, avg peak vs avg realized (subset with `peak_pct` present):
+
+| Signal | avg peak % | avg realized % | giveback pp |
+|---|---|---|---|
+| long_hold | 22.1 | 3.4 | 18.6 |
+| chain_completed | 15.3 | −2.5 | 17.8 |
+| slow_burn | 13.2 | −4.0 | 17.1 |
+| gainers_early | 16.9 | 0.0 | 16.9 |
+| volume_spike | 14.4 | −0.7 | 15.1 |
+| losers_contrarian | 13.2 | 0.4 | 12.8 |
+| trending_catch | 10.0 | −0.6 | 10.6 |
+| first_signal | 10.6 | 0.6 | 10.0 |
+| narrative_prediction | 8.8 | 0.6 | 8.2 |
+
+Every signal reaches a usable peak and keeps ~none of it.
+
+## 5. This is the same story as the board entry-basis defect
+
+See `findings_gainers_board_entry_basis_2026_08_03.md` (PR #503). Entering a token
+after it has already run — which the board actively promotes, since run-up is scored
+as a positive with no ceiling — produces exactly this profile: little upside left
+after entry, then a −25% stop. The two findings are the same problem observed from
+the entry side and the exit side.
+
+---
+
+## What to evaluate next (nothing here is a recommendation to revive)
+
+Ordered by strength of evidence:
+
+1. **Stop width.** 25–30% against +12–17% winners. Backtest tighter `sl_pct` against
+   existing closed trades — the data to do this is already in `paper_trades`
+   (`peak_pct`, `pnl_pct`, entry/exit). Cheap, no forward soak needed, per §11b.
+2. **The `expired` bucket.** 753 trades, −$11,873, timing out at −5.4% inside
+   `PAPER_MAX_DURATION_HOURS=48`. These are positions that never resolved either way.
+   Worth asking whether a non-resolving position should be cut earlier and smaller.
+3. **Peak capture.** +16.9% reached, 0.0% kept. Note the known constraint: per memory
+   `project_session_2026_05_05_high_peak_park`, per-signal `trail_pct` is dominated
+   by the global `MOONSHOT_TRAIL=30` floor at peak ≥40%, so a `trail_pct` change may
+   not reach the lever (§9c). Verify before scoping.
+
+**Do not revive a signal as a first move.** The auto-suspend measures net PnL, which
+is dominated by an exit path common to every signal; a revived signal will re-cross
+the threshold. Fix the mechanics, then revive with a fresh drawdown baseline.
+
+---
+
+## Exact repro
+
+```sql
+-- why each is suspended, with the evidence string
+SELECT signal_type, field_name, old_value, new_value, reason, applied_by, applied_at
+FROM signal_params_audit WHERE field_name='enabled' ORDER BY applied_at DESC;
+
+-- managed vs unmanaged exits per signal
+SELECT signal_type,
+ SUM(CASE WHEN status IN ('closed_peak_fade','closed_trailing_stop',
+     'closed_moonshot_trail','closed_tp','closed_floor') THEN 1 ELSE 0 END) n_managed,
+ ROUND(SUM(CASE WHEN status IN ('closed_peak_fade','closed_trailing_stop',
+     'closed_moonshot_trail','closed_tp','closed_floor') THEN pnl_usd ELSE 0 END),0) net_managed,
+ SUM(CASE WHEN status IN ('closed_expired','closed_sl','closed_time_death') THEN 1 ELSE 0 END) n_unmanaged,
+ ROUND(SUM(CASE WHEN status IN ('closed_expired','closed_sl','closed_time_death') THEN pnl_usd ELSE 0 END),0) net_unmanaged
+FROM paper_trades WHERE status LIKE 'closed%' AND pnl_usd IS NOT NULL
+GROUP BY signal_type HAVING (n_managed+n_unmanaged) >= 50 ORDER BY net_unmanaged;
+
+-- where the money goes
+SELECT status, COALESCE(exit_reason,'(null)') er, COUNT(*) n,
+       ROUND(SUM(pnl_usd),0) net, ROUND(AVG(pnl_pct),1) avg_pct
+FROM paper_trades WHERE status IN ('closed_expired','closed_sl') AND pnl_usd IS NOT NULL
+GROUP BY status, er ORDER BY status, net;
+
+-- configured vs realized stop
+SELECT p.signal_type, sp.sl_pct configured, COUNT(*) n,
+       ROUND(AVG(p.pnl_pct),1) realized_avg, ROUND(MIN(p.pnl_pct),1) worst
+FROM paper_trades p LEFT JOIN signal_params sp ON sp.signal_type=p.signal_type
+WHERE p.status='closed_sl' AND p.pnl_pct IS NOT NULL GROUP BY p.signal_type;
+```
+
+## Correction made mid-analysis — read this before trusting any subset
+
+I first computed per-signal lifetime PnL on rows filtered by `peak_pct IS NOT NULL`,
+and got **first_signal +$238** and **losers_contrarian +$228** — which would have
+argued for immediate revival of two suspended signals. Both are wrong. That filter
+silently drops `closed_sl` / `closed_expired` rows (7–25 per signal) which carry the
+losses. Unfiltered: **first_signal −$749.61 (n=277)**, **losers_contrarian
+−$1,132.86 (n=330)**.
+
+`peak_pct IS NULL` correlates with the worst outcomes, so filtering on it is not
+neutral — it is a selection on the dependent variable. Use it only for peak-vs-
+realized giveback (where the column is required), never for PnL totals.
+
+Same family as `feedback_evidence_that_does_not_discriminate`: the filtered number
+was plausible, quotable, and pointed the opposite way from the truth.
+
+## Not verified in this session
+
+- Whether `closed_expired` positions were unresolvable (illiquid / no price) or
+  simply flat. Would change whether the fix is "cut earlier" or "do not enter."
+- Whether the giveback is recoverable in practice — `MOONSHOT_TRAIL=30` may dominate
+  any `trail_pct` change (§9c). Verify the lever is reachable before scoping.
+- Fee/slippage share of the gap between `avg_realized_pct ≈ 0` and `net < 0`.
