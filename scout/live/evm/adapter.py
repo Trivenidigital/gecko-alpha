@@ -84,6 +84,37 @@ class ZeroExAllowanceHolderAdapter:
         self._max_fee_bps = max_fee_bps
 
     # ------------------------------------------------------------------
+    async def fetch_venue_metadata(self, canonical: str):
+        """Declared so the router SKIPS this venue instead of erroring on it.
+
+        ``RoutingLayer._on_demand_listings_fetch`` calls this on every registered
+        adapter when a canonical misses the ``venue_listings`` cache. It already
+        has a sanctioned branch for "this adapter does not do listings" —
+        ``except NotImplementedError`` logs at info level and continues the loop.
+
+        A DEX swap venue genuinely has no listing row: there is no
+        exchange-listed pair to discover, no venue_pair, and no asset_class to
+        record. So the honest answer is the declared "not implemented", not a
+        fabricated row.
+
+        Without this method the call raises ``AttributeError``, which falls to
+        the broad ``except Exception`` and logs an ERROR-level traceback for
+        every canonical that misses the cache. Routing still completes — but a
+        recurring ERROR that is actually expected behaviour is how operators
+        learn to skim past routing errors, and then miss a real one.
+
+        This is NOT an attempt to satisfy ``ExchangeAdapter``: the class still
+        implements none of the order-placement surface, deliberately (see the
+        class docstring). It implements exactly the one method ``RoutingLayer``
+        calls on an arbitrary adapter.
+        """
+        raise NotImplementedError(
+            f"{self.venue_name} is a DEX swap venue and has no venue_listings "
+            "row: there is no exchange-listed pair to resolve. Routing reaches "
+            "it through describe_capabilities(), not through listings."
+        )
+
+    # ------------------------------------------------------------------
     def describe_capabilities(self) -> VenueCapabilities:
         spec = FLOW_SPECS[ZeroExFlow.ALLOWANCE_HOLDER]
         supported = spec.supports_unsigned_transaction and self.supports_chain(
