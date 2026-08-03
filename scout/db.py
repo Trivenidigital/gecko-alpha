@@ -228,6 +228,24 @@ class Database:
         # operates on the already-widened CHECK and preserves every value.
         await self._migrate_venue_neutral_execution_v1()
 
+        # Adverse-excursion instrumentation. schema_version 20260803.
+        # Bare-additive: paper_trades gains `trough_price` + `mae_pct`, the
+        # low-water mark since entry, maintained symmetrically to peak_price /
+        # peak_pct on the same evaluator tick.
+        #
+        # Why this exists: the 2026-08-03 exit-mechanics analysis could not
+        # evaluate stop width at all. For the 342 rows that closed at stop_loss
+        # the SAVING from a tighter stop is computable, but for the other 1,768
+        # closes the COST -- trades a tighter stop would newly convert into
+        # losses -- is not, because nothing recorded how far a position dipped
+        # before recovering. A backtest on peak_pct alone yields a one-sided
+        # estimate that makes tightening look strictly beneficial.
+        #
+        # Forward-only by construction: the low-water mark of a closed trade is
+        # unrecoverable. Existing rows stay NULL and MUST be excluded from any
+        # MAE analysis rather than treated as zero.
+        await self._migrate_trade_adverse_excursion_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -5621,6 +5639,99 @@ class Database:
             except Exception as rb_err:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             _log.error("SCHEMA_DRIFT_DETECTED", migration=migration_name)
+            raise
+
+    async def _migrate_trade_adverse_excursion_v1(self) -> None:
+        """Add ``trough_price`` + ``mae_pct`` to paper_trades.
+
+        Maximum adverse excursion: the low-water mark since entry, the mirror of
+        the existing ``peak_price`` / ``peak_pct`` high-water mark. Both nullable
+        with NO DEFAULT -- absence means "never measured", which is NOT the same
+        as "never dipped", and a DEFAULT 0 would silently assert the latter for
+        every historical row.
+
+        Anti-scope: NO backfill. A closed trade's low-water mark cannot be
+        reconstructed -- `paper_trades` keeps no price path and
+        `paper_trade_entry_snapshots` is entry-context only. Any MAE analysis
+        must filter `mae_pct IS NOT NULL`, and must not read NULL as 0.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_trade_adverse_excursion_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            expected_cols = {"trough_price": "REAL", "mae_pct": "REAL"}
+            cur_pragma = await conn.execute("PRAGMA table_info(paper_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration=migration_name,
+                        col=col,
+                        action="skip_exists",
+                    )
+                    continue
+                await conn.execute(
+                    f"ALTER TABLE paper_trades ADD COLUMN {col} {coltype}"
+                )
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col=col,
+                    action="added",
+                )
+            # Verify presence -- fail loud on drift rather than at first UPDATE.
+            cur_pragma = await conn.execute("PRAGMA table_info(paper_trades)")
+            post_cols = {row[1] for row in await cur_pragma.fetchall()}
+            missing = sorted(set(expected_cols) - post_cols)
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: " + ", ".join(missing)
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260803, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "bl_trade_adverse_excursion_v1_migration_complete",
+                table="paper_trades",
+            )
+        except BaseException as e:
+            _log.exception(
+                "bl_trade_adverse_excursion_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration=migration_name,
+                )
             raise
 
     async def _migrate_entry_snapshot_liquidity_provenance_v1(self) -> None:
