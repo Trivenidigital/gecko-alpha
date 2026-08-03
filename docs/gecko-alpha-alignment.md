@@ -119,6 +119,42 @@ realized quant score to ~54, below `MIN_SCORE=65`. Consequence over the followin
 threshold), then flip `CONVICTION_GATE_ENABLED=True`. No code needs to be
 restored; the gate and MiroFish blend are intact.
 
+### Live-execution primitives — DEPLOYED INACTIVE (2026-08-03, PRs #500 `ffe6eab3` / #501 `cfd96c41`)
+
+Deployed and importable, but gated off. **Do not reinvent these.**
+
+| Primitive | Location | What it owns |
+|---|---|---|
+| `ExecutionMandate` | `scout/live/mandate.py` | the single authority over whether an intent may execute; `precheck()` (mode + flag + envelope) and `authorize()` (adds intent verify, venue/family allowlists, expiry, supervised history). **Entry-only** — `reduce_only` is refused at gate `scope`. |
+| `select_route` / `RoutedVenue` | `scout/live/routing.py` | returns the adapter **with** the venue, closing the §9c defect where a non-Binance selection placed a Binance order |
+| `client_order_id_for_venue` | `scout/live/order_id.py` | per-venue id derived from `intent_hash`; Kraken 32 hex, Binance `gecko-`+22 hex |
+| `resolve_db_path` / `assert_safe_database` | `scout/db_path.py` | relative paths resolve to the **deployment root, not the cwd**; refuses missing / empty / non-SQLite / unmigrated rather than letting SQLite silently CREATE an empty database where every safety check then passes vacuously |
+| `ZeroExFlow` + `FLOW_SPECS` | `scout/live/evm/flows.py` | the two 0x flows modelled as **distinct** artifact types |
+| `EvmSignerBoundary` | `scout/live/evm/signer.py` | the only route to a signature; refuses any awaitable and anything that is not a `MandateDecision` **before** loading the key |
+| `DisabledBroadcaster` | `scout/live/evm/execution.py` | the only transport wired in the build; `submit()` always raises `BroadcastRefused` |
+
+**Facts that cost real effort to establish — check here before re-deriving:**
+
+- The 0x **AllowanceHolder** is the ERC-20 approval target
+  (`0x0000000000001ff3684f28c67538d4d072c22734` mainnet). **Never approve the
+  Settler contract** (`0x0889e9327b98d7d1be3c301a4585ff3330502c9a`) — 0x warns
+  against it explicitly. Read the spender off `allowanceTarget`, *not* off the
+  calldata.
+- **Permit2 ships fail-closed** (`supports_unsigned_transaction=False`): no
+  proven calldata decoder exists for it. Do not "enable" it without one.
+- Loss is bounded by `expected_min_buy_amount` supplied by the **intent**. The
+  response's own `buyAmount`/`minBuyAmount` ratio bounds only the provider's
+  internal self-consistency — understating `buyAmount` keeps the ratio small
+  while the absolute floor goes anywhere.
+- **Deploy gotcha:** `ExecStart` is `uv run` and `scout/main.py` imports the 0x
+  adapter, so `eth-account`/`eth-abi`/`eth-utils` must be installed
+  (`uv sync --frozen`) and the import proved **before** `systemctl restart`, or
+  the pipeline crash-loops. `uv sync` also **prunes** anything absent from the
+  lockfile — dry-run first.
+
+Reversal is a flag, not a revert: everything is inert while
+`LIVE_EXECUTION_MANDATE_MODE=DISABLED`.
+
 ### Test pattern
 
 pytest-asyncio auto mode (`asyncio_mode = "auto"` in `pyproject.toml`). `tmp_path` for DB fixtures. `tests/conftest.py` ships `settings_factory(**overrides)` and `token_factory(**overrides)`. HTTP mocks via `aioresponses`. Every public function gets a corresponding test; existing scaffold tests must never regress.
