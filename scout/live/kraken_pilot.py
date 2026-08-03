@@ -236,6 +236,7 @@ import structlog
 
 from scout.config import Settings, load_settings
 from scout.db import Database
+from scout.db_path import UnsafeDatabase, assert_safe_database
 from scout.live.idempotency import (
     lookup_existing_order_id,
     make_exit_client_order_id,
@@ -747,6 +748,117 @@ def open_order_fingerprint(orders: list[dict[str, Any]]) -> str:
         for order in orders
     )
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+# ----------------------------------------------------------------------
+# Entry authorization binding
+# ----------------------------------------------------------------------
+# The ENTRY approval used to ask the operator to retype `decision_id[:8]` —
+# the prefix of a `uuid4()`. That token was random: it identified the RUN and
+# bound none of its TERMS. Retyping it asserted "I am here", not "I approve
+# THIS order at THIS price against THIS account state", so nothing downstream
+# could tell an authorized order from one whose price, size or surrounding
+# state had moved after the screen was printed.
+#
+# This is the same defect class the whole venue-neutral workstream began with
+# (`intent_uuid = str(uuid4())`), and the EXIT lane already solved it. The
+# entry side now mirrors that solution exactly rather than inventing a second
+# one, so a reader who understands one understands both.
+
+_ENTRY_AUTH_TOKEN_CHARS = 8
+
+# Bound into the digest so a token minted for an ENTRY can never authorize an
+# exit that happens to hash the same tuple, and vice versa.
+_ENTRY_AUTH_DOMAIN = "kraken-pilot-entry-v1"
+
+
+def entry_intent_digest(snapshot: dict[str, Any]) -> str:
+    """Digest of an entry intent AND the state the approval screen assumed.
+
+    Recomputed from freshly-read state immediately before the order is written
+    and sent. A single differing field means the screen the operator read no
+    longer describes the world, so the authorization is void — the run does NOT
+    quietly rebuild the order around the new facts, because the operator
+    approved the old ones.
+
+    **The live mid is deliberately NOT bound**, matching the exit lane. This is a
+    LIMIT order: its economics are fully determined by the price being sent, and
+    the mid only informs the operator's judgement about whether to send it. The
+    mid moves continuously, so binding it would void almost every authorization
+    over a value that cannot change what gets transmitted — and an approval that
+    routinely fails for no material reason trains the operator to retype tokens
+    without reading them, which costs more safety than it buys.
+
+    Fees are bound as CEILINGS for the same reason they are on the exit side: a
+    rate that IMPROVED must not void an authorization the operator would still
+    give. The rule stays single and monotone — current <= approved remains
+    authorized, current > approved is void.
+    """
+    payload = "|".join(
+        f"{key}={snapshot[key]}" for key in sorted(snapshot) if key != "digest"
+    )
+    return hashlib.sha256(f"{_ENTRY_AUTH_DOMAIN}|{payload}".encode("utf-8")).hexdigest()
+
+
+def build_entry_snapshot(
+    *,
+    decision_id: str,
+    pair: str,
+    side: str,
+    volume: Decimal,
+    price: Decimal,
+    client_order_id: str,
+    effective_notional: Decimal,
+    available_balance: Decimal,
+    daily_gross_before: Decimal,
+    daily_gross_cap: Decimal,
+    venue_open_count: int,
+    maker_ceiling_pct: Decimal,
+    taker_ceiling_pct: Decimal,
+) -> dict[str, Any]:
+    """The comparable state snapshot an entry authorization is bound to.
+
+    Each field, and what its change would mean:
+
+    ``decision_id`` / ``client_order_id``
+        this run and this venue order. Also stops a token from one run being
+        replayed into another.
+    ``pair`` / ``side`` / ``volume`` / ``price``
+        the order itself — a different order is a different approval.
+    ``effective_notional``
+        the exposure the ledger will record, which is what the daily cap
+        governs. Not always ``price * volume`` on the marketable side.
+    ``available_balance``
+        the account no longer holds what the screen said it held.
+    ``daily_gross_before`` / ``daily_gross_cap``
+        the cap headroom the operator read. Another fill or a config change
+        moved it, so the "this leaves X of Y" line is no longer true.
+    ``venue_open_count``
+        an order appeared, vanished or filled — including one placed from the
+        web UI, which takes none of our locks.
+    ``maker_ceiling`` / ``taker_ceiling``
+        the MAXIMUM fee rates the operator authorized (see the digest note).
+    """
+    return {
+        "decision_id": decision_id,
+        "pair": pair.strip().upper(),
+        "side": side.strip().lower(),
+        "volume": _canonical_amount(volume),
+        "price": _canonical_amount(price),
+        "client_order_id": client_order_id,
+        "effective_notional": _canonical_amount(effective_notional),
+        "available_balance": _canonical_amount(available_balance),
+        "daily_gross_before": _canonical_amount(daily_gross_before),
+        "daily_gross_cap": _canonical_amount(daily_gross_cap),
+        "venue_open_count": str(venue_open_count),
+        "maker_ceiling": _canonical_amount(maker_ceiling_pct),
+        "taker_ceiling": _canonical_amount(taker_ceiling_pct),
+    }
+
+
+def entry_authorization_token(snapshot: dict[str, Any]) -> str:
+    """The short token the operator retypes, derived from the bound digest."""
+    return entry_intent_digest(snapshot)[:_ENTRY_AUTH_TOKEN_CHARS].upper()
 
 
 def exit_intent_digest(snapshot: dict[str, Any]) -> str:
@@ -1503,6 +1615,30 @@ class PilotRunner:
                 taker_pct = _DEFAULT_TAKER_FEE_PCT
             estimated_fee = notional * taker_pct / Decimal("100")
 
+            # The state the operator is about to approve, captured as ONE
+            # comparable object. The token they retype is derived from it, and it
+            # is re-derived from freshly-read state below — so authorization binds
+            # the order and the account state it was granted against, not merely
+            # the fact that somebody was at the keyboard.
+            maker_ceiling_pct = (
+                maker_pct if maker_pct is not None else _DEFAULT_TAKER_FEE_PCT
+            )
+            approved_snapshot = build_entry_snapshot(
+                decision_id=decision_id,
+                pair=meta.venue_pair,
+                side=side,
+                volume=volume,
+                price=price,
+                client_order_id=client_order_id,
+                effective_notional=effective_notional,
+                available_balance=_dec_or_none(balance["available"]) or Decimal("0"),
+                daily_gross_before=_dec_or_none(caps["daily_gross_before"])
+                or Decimal("0"),
+                daily_gross_cap=_dec_or_none(caps["daily_gross_cap"]) or Decimal("0"),
+                venue_open_count=int(reconciliation["venue_open_count"]),
+                maker_ceiling_pct=maker_ceiling_pct,
+                taker_ceiling_pct=taker_pct,
+            )
             authorized, outcome = self._request_authorization(
                 decision_id=decision_id,
                 client_order_id=client_order_id,
@@ -1519,12 +1655,14 @@ class PilotRunner:
                 caps=caps,
                 venue_open_count=reconciliation["venue_open_count"],
                 validate_only=validate_only,
+                snapshot=approved_snapshot,
             )
             evidence.record(
                 "authorization",
                 outcome="authorized" if authorized else "authorization_refused",
                 detail=outcome,
-                expected_prefix_len=8,
+                approved_digest=entry_intent_digest(approved_snapshot),
+                approved_snapshot=approved_snapshot,
             )
             if not authorized:
                 raise PilotAbort(
@@ -1552,7 +1690,97 @@ class PilotRunner:
                         "approval was pending — nothing was sent",
                         exit_code=EXIT_BLOCKED,
                     )
-                evidence.record("pre_write_recheck", outcome="clear")
+
+                # *** RE-DERIVE THE APPROVED STATE, NOT JUST THE LEDGER SCAN. ***
+                # The ledger check above catches a competing row. It does not
+                # catch the balance dropping, another fill eating the daily-cap
+                # headroom, an order appearing on the venue, or the fee schedule
+                # rising — all of which were ON the screen the operator read, and
+                # all of which can move during the unbounded time a human takes to
+                # type a token. Re-reading them and comparing the digest is what
+                # makes the authorization bind STATE and not just intent.
+                fresh_reconciliation = await self._reconcile_open_rows()
+                fresh_balance = await self._check_balance(
+                    side=side, meta=meta, notional=notional, volume=volume
+                )
+                fresh_caps = await self._check_caps(
+                    notional=notional,
+                    price=price,
+                    volume=volume,
+                    side=side,
+                    venue_pair=meta.venue_pair,
+                )
+                current_snapshot = build_entry_snapshot(
+                    decision_id=decision_id,
+                    pair=meta.venue_pair,
+                    side=side,
+                    volume=volume,
+                    price=price,
+                    client_order_id=client_order_id,
+                    effective_notional=_dec_or_none(fresh_caps["effective_notional"])
+                    or notional,
+                    available_balance=_dec_or_none(fresh_balance["available"])
+                    or Decimal("0"),
+                    daily_gross_before=_dec_or_none(fresh_caps["daily_gross_before"])
+                    or Decimal("0"),
+                    daily_gross_cap=_dec_or_none(fresh_caps["daily_gross_cap"])
+                    or Decimal("0"),
+                    venue_open_count=int(fresh_reconciliation["venue_open_count"]),
+                    # CARRIED, not re-derived: a ceiling is the operator's
+                    # decision, not a fact about the venue, so it cannot move
+                    # under them. The live rates are compared against it below.
+                    maker_ceiling_pct=_dec_or_none(approved_snapshot["maker_ceiling"])
+                    or Decimal("0"),
+                    taker_ceiling_pct=_dec_or_none(approved_snapshot["taker_ceiling"])
+                    or Decimal("0"),
+                )
+                differences = snapshot_differences(approved_snapshot, current_snapshot)
+                if differences:
+                    evidence.record(
+                        "pre_write_recheck",
+                        outcome="authorization_void",
+                        approved_digest=entry_intent_digest(approved_snapshot),
+                        current_digest=entry_intent_digest(current_snapshot),
+                        differences=differences,
+                        current_snapshot=current_snapshot,
+                    )
+                    raise PilotAbort(
+                        "pre_write_recheck",
+                        "the state the authorization was bound to has changed, so "
+                        "the authorization is VOID and nothing was sent. Re-run to "
+                        "see a fresh approval screen. Changed: "
+                        + "; ".join(differences),
+                    )
+
+                # Fees are bound as ceilings, so they are compared rather than
+                # digested — a rate that IMPROVED must not void an approval the
+                # operator would obviously still give.
+                fresh_pair_row = (await self._resolve_market_rules(canonical))[1]
+                live_taker = _first_fee_pct(fresh_pair_row.get("fees"))
+                live_maker = _first_fee_pct(fresh_pair_row.get("fees_maker"))
+                taker_ceiling = _dec_or_none(
+                    approved_snapshot["taker_ceiling"]
+                ) or Decimal("0")
+                maker_ceiling = _dec_or_none(
+                    approved_snapshot["maker_ceiling"]
+                ) or Decimal("0")
+                if (live_taker is not None and live_taker > taker_ceiling) or (
+                    live_maker is not None and live_maker > maker_ceiling
+                ):
+                    raise PilotAbort(
+                        "pre_write_recheck",
+                        "the fee schedule rose ABOVE the authorized ceiling "
+                        f"(taker {_fmt(live_taker)}% vs ceiling "
+                        f"{_fmt(taker_ceiling)}%, maker {_fmt(live_maker)}% vs "
+                        f"ceiling {_fmt(maker_ceiling)}%) — every cost figure the "
+                        "operator approved is now understated. Nothing was sent.",
+                    )
+
+                evidence.record(
+                    "pre_write_recheck",
+                    outcome="clear",
+                    digest=entry_intent_digest(current_snapshot),
+                )
 
                 # size_usd here is the AUTHORIZED CEILING — the larger of the
                 # limit and market notionals, i.e. the most this order was
@@ -1705,8 +1933,9 @@ class PilotRunner:
         caps: dict[str, Any],
         venue_open_count: int,
         validate_only: bool,
+        snapshot: dict[str, Any],
     ) -> tuple[bool, str]:
-        """Step 9 — print the decision block and require the typed prefix.
+        """Step 9 — print the decision block and require the typed token.
 
         Every figure here is one the operator is being asked to accept, so
         each is a value read this run, not a constant. In particular the
@@ -1757,11 +1986,28 @@ class PilotRunner:
                 "check this order but NOT place it"
             )
         _print_block("KRAKEN SUPERVISED PILOT — MANUAL APPROVAL REQUIRED", lines)
+        token = entry_authorization_token(snapshot)
         print(
-            "Type the first 8 characters of the decision ID to authorize. "
-            "Anything else — including an empty line or a closed stdin — aborts."
+            f"Type this exact token to authorize:  {token}\n"
+            "It is derived from the order AND the account state above — the "
+            "price, the\n"
+            "volume, the exposure recorded, the available balance, the daily-cap "
+            "headroom,\n"
+            "the resting-order count and the fee ceilings. All of it is re-read "
+            "and\n"
+            "re-derived immediately before the order is sent; if anything moved, "
+            "this\n"
+            "authorization is void and nothing is sent. Anything else — including "
+            "an\n"
+            "empty line, a pipe or a closed stdin — aborts."
         )
-        return read_authorization(decision_id[:8])
+        # `require_tty=True`, matching the exit side. EOF already caught
+        # `</dev/null`, but a PIPE carrying the right string —
+        # `echo 8CDBF4D3 | kraken_pilot place ...` — read as a valid answer while
+        # being exactly the automation this boundary exists to exclude. The entry
+        # path opens exposure; there is no reading on which it deserves a weaker
+        # gate than the exit that closes it.
+        return read_authorization(token, require_tty=True)
 
     async def _submit_and_resolve(
         self,
@@ -5331,17 +5577,23 @@ async def main(argv: list[str] | None = None) -> int:
     # reads state finds nothing to object to: no kill switch, no prior rows to
     # reconcile, zero daily gross. The lane would be wide open precisely
     # because it is looking at the wrong database.
-    db_path = Path(settings.DB_PATH)
-    if not db_path.exists():
+    # `.exists()` alone was NOT enough, and the gap is the case that occurred: a
+    # ZERO-BYTE file exists, so the old check passed and the lane proceeded to
+    # read "no kill switch, no open rows, zero daily gross" out of an empty file.
+    # `assert_safe_database` additionally requires a real SQLite header, the core
+    # tables and recorded migrations — and resolves a relative DB_PATH against the
+    # DEPLOYMENT ROOT rather than the process working directory, so the answer
+    # stops depending on how the pilot was invoked.
+    try:
+        db_path = assert_safe_database(
+            settings.DB_PATH, purpose="the supervised Kraken pilot"
+        )
+    except UnsafeDatabase as exc:
         print(
-            f"REFUSED [database]: no database at {db_path.resolve()}\n"
-            "  DB_PATH resolves relative to the current directory, so this is "
-            "almost always\n"
-            "  the wrong working directory. Run the pilot from the deployment "
-            "root.\n"
-            "  Creating one here would disable the kill switch, the startup "
-            "reconciliation\n"
-            "  and the daily-gross cap all at once, silently."
+            f"REFUSED [database:{exc.reason}]: {exc.message}\n"
+            "  Proceeding would disable the kill switch, the startup "
+            "reconciliation and\n"
+            "  the daily-gross cap all at once, silently."
         )
         return EXIT_REFUSED
 

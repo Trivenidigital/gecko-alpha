@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 import structlog
 
 from scout.db import Database
+from scout.db_path import UnsafeDatabase, assert_safe_database
 from scout.live.kill_switch import KillSwitch, compute_kill_duration
 
 log = structlog.get_logger(__name__)
@@ -47,7 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_db_path() -> str:
-    """Return the DB path from env or fall back to the Settings default."""
+    """Return the configured DB path from env, or the Settings default."""
     env_path = os.environ.get("DB_PATH")
     if env_path:
         return env_path
@@ -56,7 +57,27 @@ def _resolve_db_path() -> str:
 
 async def main() -> int:
     args = _build_parser().parse_args()
-    db = Database(_resolve_db_path())
+
+    # *** THIS TOOL HAD THE TRAP IN ITS PUREST FORM. ***
+    # It resolved a RELATIVE default against the process working directory and
+    # then called `initialize()`, which CREATES the database. Run from the wrong
+    # directory, `--status` therefore created an empty file and reported the kill
+    # switch clear — from the one command an operator reaches for when they most
+    # need the truth, and precisely when something upstream is already broken.
+    #
+    # It refuses now instead. A kill CLI that cannot prove which database it is
+    # reading must not answer "clear", and `--on` writing a kill event into a file
+    # nobody reads is worse than an error. The fix is to point DB_PATH at the real
+    # database, which the message says.
+    try:
+        db_path = str(
+            assert_safe_database(_resolve_db_path(), purpose="the live kill-switch CLI")
+        )
+    except UnsafeDatabase as exc:
+        print(f"REFUSED [database:{exc.reason}]: {exc.message}", file=sys.stderr)
+        return 2
+
+    db = Database(db_path)
     await db.initialize()
     try:
         ks = KillSwitch(db)

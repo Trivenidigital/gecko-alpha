@@ -2075,7 +2075,35 @@ async def main(argv: list[str] | None = None) -> int:
 
     _cg_ratelimit_configure(settings)
 
-    db = Database(settings.DB_PATH, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
+    # Resolve the database ONCE, absolutely, before anything opens it. A relative
+    # DB_PATH (the default, and what production actually sets) otherwise resolves
+    # against the process working directory — so which database the pipeline runs
+    # on is a property of how systemd or a shell invoked it, not of configuration.
+    # `assert_creatable_database` anchors it to the deployment root and refuses a
+    # file that exists but is not a database (zero bytes, no SQLite header), while
+    # still permitting a genuinely absent one so a fresh install can create it.
+    from scout.db_path import (
+        UnsafeDatabase as _UnsafeDatabase,
+    )
+    from scout.db_path import (
+        assert_creatable_database as _assert_creatable_database,
+    )
+    from scout.db_path import (
+        describe_database as _describe_database,
+    )
+
+    try:
+        resolved_db_path = _assert_creatable_database(
+            settings.DB_PATH, purpose="pipeline startup"
+        )
+    except _UnsafeDatabase as exc:
+        logger.error(
+            "boot_refused_unsafe_database", reason=exc.reason, detail=exc.message
+        )
+        raise
+    logger.info("database_resolved", **_describe_database(settings.DB_PATH))
+
+    db = Database(resolved_db_path, busy_timeout_ms=settings.SQLITE_BUSY_TIMEOUT_MS)
     # RETIRE_DEAD_TABLES_ENABLED gates the opt-in-destructive
     # retire_dead_tables_v1 migration (NAR-06 + INF-07); default-off so the
     # irreversible DROPs stay dormant until the operator flips it at a deploy.
@@ -2274,12 +2302,34 @@ async def main(argv: list[str] | None = None) -> int:
         if getattr(settings, "LIVE_USE_ROUTING_LAYER", False):
             from scout.live.routing import RoutingLayer
 
+            # The 0x AllowanceHolder adapter is registered so its DECLARED
+            # capabilities are reachable through the provider-neutral router
+            # rather than only from its own tests. It cannot be selected for a
+            # swap by the signal-driven path: `_dispatch_live` builds
+            # `venue_family="cex"` intents and `permits_order` refuses a `dex`
+            # descriptor on family alone — so registration exposes the capability
+            # without creating a route to it. Execution beyond capability
+            # reporting additionally requires the mandate (inactive) and a funded
+            # EVM signer (absent).
+            from scout.live.evm.adapter import ZeroExAllowanceHolderAdapter
+
+            zeroex_adapter = ZeroExAllowanceHolderAdapter(chain_id=1)
             live_routing = RoutingLayer(
                 db=db,
                 settings=settings,
-                adapters={"binance": live_adapter},
+                adapters={
+                    "binance": live_adapter,
+                    zeroex_adapter.venue_name: zeroex_adapter,
+                },
             )
-            logger.info("routing_layer_constructed", venues=["binance"])
+            zeroex_caps = zeroex_adapter.describe_capabilities()
+            logger.info(
+                "routing_layer_constructed",
+                venues=["binance", zeroex_adapter.venue_name],
+                zeroex_family=zeroex_caps.venue_family,
+                zeroex_unsigned_tx=zeroex_caps.supports_unsigned_transaction,
+                zeroex_money_movement=zeroex_caps.grants_money_movement(),
+            )
 
         # Cross-venue execution mandate. Constructed unconditionally and reported at
         # boot: an operator needs to see "the autonomy gate is CLOSED" in the log,

@@ -9,6 +9,7 @@ WITH the candidate, so there is no second place to get one from.
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
@@ -553,5 +554,126 @@ class TestTheDelistingFilterHasNoWriter:
                 size_usd=100.0,
             )
             assert candidates == []
+        finally:
+            await db.close()
+
+
+class TestZeroExAdapterThroughTheRealRouter:
+    """*** THE CAPABILITY MUST BE REACHABLE THROUGH THE ROUTER, NOT ONLY ITS
+    OWN TESTS. ***
+
+    An adapter with zero production importers is an adapter the system does not
+    have. These drive the REAL `RoutingLayer.select_route` against the 0x
+    adapter, and assert both that a dex intent reaches it and that the
+    signal-driven cex path cannot.
+    """
+
+    def _zeroex(self):
+        from scout.live.evm.adapter import ZeroExAllowanceHolderAdapter
+
+        return ZeroExAllowanceHolderAdapter(chain_id=1)
+
+    async def test_a_dex_intent_routes_to_the_zeroex_adapter(self, tmp_path):
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            routed = await _select(
+                _routing(db, {adapter.venue_name: adapter}), venue_family="dex"
+            )
+            assert routed.adapter is adapter
+            assert routed.capabilities.supports_unsigned_transaction is True
+        finally:
+            await db.close()
+
+    async def test_the_signal_driven_cex_path_cannot_select_it(self, tmp_path):
+        """`_dispatch_live` builds `venue_family="cex"` intents, so the family
+        gate alone keeps a DEX descriptor off the autonomous path. Registration
+        exposes the capability without creating a route to it."""
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            with pytest.raises(NoRoutableVenue) as exc:
+                await _select(
+                    _routing(db, {adapter.venue_name: adapter}), venue_family="cex"
+                )
+            assert "intent requires cex" in exc.value.rejections[0][1]
+        finally:
+            await db.close()
+
+    async def test_it_declares_no_money_movement_through_the_router(self, tmp_path):
+        adapter = self._zeroex()
+        db = await _db_with_listings(
+            tmp_path, [(adapter.venue_name, "WETH-USDC", "USDC", "spot")]
+        )
+        try:
+            routed = await _select(
+                _routing(db, {adapter.venue_name: adapter}), venue_family="dex"
+            )
+            assert routed.capabilities.grants_money_movement() is False
+        finally:
+            await db.close()
+
+
+class TestTheZeroExAdapterSkipsListingsInsteadOfErroring:
+    """*** AN EXPECTED ERROR-LEVEL TRACEBACK IS A REAL COST. ***
+
+    `_on_demand_listings_fetch` calls `fetch_venue_metadata` on EVERY registered
+    adapter. The 0x adapter is deliberately not an `ExchangeAdapter`, so before
+    this it had no such method and the call raised `AttributeError` — caught by
+    the broad `except Exception` and logged as an ERROR-level traceback for
+    every canonical that missed the listings cache.
+
+    Routing completed either way, so this was never a functional break. It is a
+    logging defect, and the reason it matters is that a recurring ERROR which is
+    actually expected behaviour is exactly how operators learn to skim past
+    routing errors — and then miss one that isn't expected.
+    """
+
+    def _adapter(self):
+        from scout.live.evm.adapter import ZeroExAllowanceHolderAdapter
+
+        return ZeroExAllowanceHolderAdapter(chain_id=1)
+
+    async def test_it_raises_not_implemented_not_attribute_error(self):
+        """`NotImplementedError` is the router's SANCTIONED skip branch (info
+        level, loop continues). `AttributeError` is not — it falls through to
+        the error branch."""
+        with pytest.raises(NotImplementedError, match="no venue_listings row"):
+            await self._adapter().fetch_venue_metadata("SYM")
+
+    async def test_the_on_demand_fetch_skips_it_quietly_and_writes_no_row(
+        self, tmp_path
+    ):
+        """End-to-end through the real router: registering the 0x adapter must
+        not write a listing (there is no exchange-listed pair to record) and
+        must not log at error level."""
+        db = await _db_with_listings(tmp_path, [])
+        try:
+            adapter = self._adapter()
+            with patch("scout.live.routing.log") as mock_log:
+                await _routing(
+                    db, {adapter.venue_name: adapter}
+                )._on_demand_listings_fetch("SYM")
+
+            assert mock_log.exception.call_args_list == [], (
+                "the 0x adapter produced an ERROR-level traceback during a "
+                "routine listings miss"
+            )
+            skipped = [
+                c
+                for c in mock_log.info.call_args_list
+                if c.args and c.args[0] == "on_demand_listing_fetch_not_implemented"
+            ]
+            assert len(skipped) == 1, "expected exactly one info-level skip"
+            assert skipped[0].kwargs["venue"] == adapter.venue_name
+
+            cur = await db._conn.execute("SELECT COUNT(*) FROM venue_listings")
+            assert (await cur.fetchone())[
+                0
+            ] == 0, "a DEX swap venue must not fabricate a venue_listings row"
         finally:
             await db.close()

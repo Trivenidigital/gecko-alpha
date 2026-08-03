@@ -1,0 +1,212 @@
+"""``ZeroExAllowanceHolderAdapter`` — the flow wired into the neutral router.
+
+Declared, not inferred
+----------------------
+``describe_capabilities`` reports what THIS adapter implements, which is the same
+discipline every other adapter follows. It declares ``venue_family="dex"``,
+``supports_unsigned_transaction=True`` and ``supports_simulation=True``, and it
+declares NO money movement: withdrawal, transfer and sweep stay false because
+this adapter cannot do them and must never be the reason something thinks it can.
+
+The Permit2 flow is a SEPARATE adapter that does not exist. Its spec is declared
+in ``flows.py`` with ``supports_unsigned_transaction=False``, and
+:meth:`ZeroExAllowanceHolderAdapter.reject_flow` refuses any response that
+identifies it — an adapter for a flow whose calldata has not been decoded would
+be an adapter that cannot validate what it signs.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+import structlog
+
+from scout.live.capabilities import VenueCapabilities
+from scout.live.evm.allowance_holder import (
+    AllowanceHolderArtifact,
+    build_allowance_holder_artifact,
+)
+from scout.live.evm.artifact import ZeroExArtifactError
+from scout.live.evm.flows import (
+    ALLOWANCE_HOLDER_BY_CHAIN,
+    FLOW_SPECS,
+    FlowNotSupported,
+    UnknownFlow,
+    ZeroExFlow,
+    flow_for_endpoint,
+)
+
+log = structlog.get_logger(__name__)
+
+__all__ = ["ZeroExAllowanceHolderAdapter", "ZeroExQuoteRequest"]
+
+
+@dataclass(frozen=True)
+class ZeroExQuoteRequest:
+    """What the intent asks for. Compared against what 0x returns."""
+
+    chain_id: int
+    sell_token: str
+    buy_token: str
+    sell_amount: int
+    taker: str
+    #: The minimum output the INTENT will accept, from our own price reference.
+    #: Anchored outside the 0x response, which is the whole point — see
+    #: `build_allowance_holder_artifact`.
+    expected_min_buy_amount: int = 0
+
+
+class ZeroExAllowanceHolderAdapter:
+    """Validates 0x AllowanceHolder artifacts for the routing layer.
+
+    Deliberately NOT an ``ExchangeAdapter``: that ABC is shaped around CEX order
+    placement (``place_order_request`` / ``await_fill_confirmation`` / venue
+    pairs), and forcing a DEX signing flow through it would mean implementing
+    half its surface as ``NotImplementedError`` — the "declared capability that
+    raises" shape ``VenueCapabilities`` exists to prevent. It exposes
+    ``describe_capabilities`` so the same fail-closed gate applies.
+    """
+
+    venue_name = "zeroex-allowance-holder"
+
+    def __init__(
+        self,
+        *,
+        chain_id: int,
+        http_fetch=None,
+        max_fee_bps: Decimal | None = None,
+    ) -> None:
+        self.chain_id = chain_id
+        self._fetch = http_fetch
+        self._max_fee_bps = max_fee_bps
+
+    # ------------------------------------------------------------------
+    async def fetch_venue_metadata(self, canonical: str):
+        """Declared so the router SKIPS this venue instead of erroring on it.
+
+        ``RoutingLayer._on_demand_listings_fetch`` calls this on every registered
+        adapter when a canonical misses the ``venue_listings`` cache. It already
+        has a sanctioned branch for "this adapter does not do listings" —
+        ``except NotImplementedError`` logs at info level and continues the loop.
+
+        A DEX swap venue genuinely has no listing row: there is no
+        exchange-listed pair to discover, no venue_pair, and no asset_class to
+        record. So the honest answer is the declared "not implemented", not a
+        fabricated row.
+
+        Without this method the call raises ``AttributeError``, which falls to
+        the broad ``except Exception`` and logs an ERROR-level traceback for
+        every canonical that misses the cache. Routing still completes — but a
+        recurring ERROR that is actually expected behaviour is how operators
+        learn to skim past routing errors, and then miss a real one.
+
+        This is NOT an attempt to satisfy ``ExchangeAdapter``: the class still
+        implements none of the order-placement surface, deliberately (see the
+        class docstring). It implements exactly the one method ``RoutingLayer``
+        calls on an arbitrary adapter.
+        """
+        raise NotImplementedError(
+            f"{self.venue_name} is a DEX swap venue and has no venue_listings "
+            "row: there is no exchange-listed pair to resolve. Routing reaches "
+            "it through describe_capabilities(), not through listings."
+        )
+
+    # ------------------------------------------------------------------
+    def describe_capabilities(self) -> VenueCapabilities:
+        spec = FLOW_SPECS[ZeroExFlow.ALLOWANCE_HOLDER]
+        supported = spec.supports_unsigned_transaction and self.supports_chain(
+            self.chain_id
+        )
+        return VenueCapabilities(
+            venue=self.venue_name,
+            venue_family="dex",
+            supports_market_orders=supported,
+            supports_limit_orders=False,
+            supports_reduce_only=False,
+            supports_cancel=False,
+            supports_client_order_id=False,
+            supports_partial_fills=False,
+            supports_unsigned_transaction=supported,
+            supports_host_owned_signing=supported,
+            supports_private_broadcast=False,
+            supports_simulation=True,
+            supports_testnet=False,
+            supports_cross_chain=False,
+            # Money movement: NOT declared, and this adapter cannot do it.
+            supports_withdrawal=False,
+            supports_transfer=False,
+            supports_sweep=False,
+        )
+
+    @staticmethod
+    def supports_chain(chain_id: int) -> bool:
+        """A chain with no reviewed AllowanceHolder is a chain we cannot verify."""
+        return bool(ALLOWANCE_HOLDER_BY_CHAIN.get(chain_id))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def reject_flow(endpoint_or_flow: str) -> ZeroExFlow:
+        """Resolve to exactly one reviewed flow, refusing unsupported ones."""
+        flow = flow_for_endpoint(endpoint_or_flow)
+        spec = FLOW_SPECS[flow]
+        if not spec.supports_unsigned_transaction:
+            raise FlowNotSupported(flow, spec.refusal_reason or "not supported")
+        return flow
+
+    # ------------------------------------------------------------------
+    def validate_response(
+        self,
+        raw: dict[str, Any],
+        *,
+        request: ZeroExQuoteRequest,
+        retrieved_at: datetime | None = None,
+    ) -> AllowanceHolderArtifact:
+        """Every refusal the adapter is required to make, in one place."""
+        if not self.supports_chain(request.chain_id):
+            raise ZeroExArtifactError(
+                f"chain {request.chain_id} has no reviewed AllowanceHolder address; "
+                "refusing to validate an artifact we cannot check the spender of"
+            )
+        if request.chain_id != self.chain_id:
+            raise ZeroExArtifactError(
+                f"request is for chain {request.chain_id}, adapter is bound to "
+                f"{self.chain_id}"
+            )
+        # A permit2 payload here is a different flow wearing this one's clothes.
+        if isinstance(raw, dict) and "permit2" in raw:
+            spec = FLOW_SPECS[ZeroExFlow.PERMIT2]
+            raise FlowNotSupported(
+                ZeroExFlow.PERMIT2, spec.refusal_reason or "not supported"
+            )
+
+        kwargs: dict[str, Any] = dict(
+            chain_id=request.chain_id,
+            taker=request.taker,
+            expected_sell_token=request.sell_token,
+            expected_buy_token=request.buy_token,
+            expected_sell_amount=request.sell_amount,
+            expected_min_buy_amount=request.expected_min_buy_amount,
+            retrieved_at=retrieved_at,
+        )
+        if self._max_fee_bps is not None:
+            kwargs["max_fee_bps"] = self._max_fee_bps
+        artifact = build_allowance_holder_artifact(raw, **kwargs)
+        log.info(
+            "zeroex_artifact_validated",
+            venue=self.venue_name,
+            chain_id=artifact.chain_id,
+            spender=artifact.allowance_spender,
+            inner_target=artifact.decoded.inner_target,
+            minimum_output=artifact.minimum_buy_amount,
+            slippage_bps=str(artifact.slippage_bps()),
+            requires_approval=artifact.requires_approval,
+            block=artifact.block_number,
+            # Recorded AND reported: the decoder collects these and nothing read
+            # them, so "unknown actions are reported" was true of the dataclass
+            # and false of the system.
+            unknown_actions=list(artifact.decoded.unknown_action_selectors),
+        )
+        return artifact
