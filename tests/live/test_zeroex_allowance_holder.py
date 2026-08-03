@@ -1535,3 +1535,30 @@ class TestTheIntentFloorCannotBeForgotten:
         assert _artifact(expected_min_buy_amount=MIN_BUY_AMOUNT).minimum_buy_amount == (
             MIN_BUY_AMOUNT
         )
+
+    @pytest.mark.parametrize("truthy", [True, False])
+    def test_a_bool_floor_is_refused(self, truthy):
+        """*** `True` IS AN `int`, AND IT MEANS NO FLOOR. ***
+
+        `bool` subclasses `int`, so `True > 0` and a positivity check alone
+        admits it — as a floor of ONE BASE UNIT, which bounds nothing. The
+        realistic route in is a caller writing `expected_min_buy_amount=bool(...)`
+        or passing a truthiness test's result where a quantity was wanted; the
+        value then reads as "yes, we have a floor" in every log while permitting
+        a swap of ~$188 of WETH for a millionth of a USDC.
+
+        `False` is caught by the positivity check either way; it is parametrized
+        so that deleting the `isinstance` clause fails on `True` alone rather
+        than being masked.
+        """
+        with pytest.raises(ZeroExArtifactError, match="must not be a bool"):
+            _artifact(expected_min_buy_amount=truthy)
+
+    def test_the_bool_refusal_is_not_masked_by_the_ordinary_floor_check(self):
+        """`True` must be refused for BEING a bool, not for being too small — a
+        floor of 1 is below the quote's minimum, so an implementation that only
+        compared magnitudes would let it through."""
+        assert MIN_BUY_AMOUNT > 1  # the ordinary comparison would not fire
+        with pytest.raises(ZeroExArtifactError) as exc:
+            _artifact(expected_min_buy_amount=True)
+        assert "intent's floor" not in str(exc.value)

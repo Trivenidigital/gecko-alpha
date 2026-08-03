@@ -331,11 +331,19 @@ def build_allowance_holder_artifact(
     # `minBuyAmount=1` scores 0 bps of slippage while authorizing ~$188 of WETH
     # for one millionth of a USDC. The ratio bounds the provider's internal
     # self-consistency; only a figure the INTENT supplies can bound loss.
-    if expected_min_buy_amount <= 0:
+    #
+    # `bool` is rejected explicitly because it is an `int` subclass: `True`
+    # passes `<= 0` and then means a floor of ONE BASE UNIT, i.e. no floor at
+    # all — the precise hole this check exists to close, reachable by a caller
+    # passing a truthiness test's result where a quantity was wanted. Every
+    # neighbouring quantity guard rejects bools the same way (`_uint` here and
+    # in `artifact.py`, `_canon` in `signing_bundle.py`, `headroom_bps` in
+    # `approval.py`); this one was the odd man out.
+    if isinstance(expected_min_buy_amount, bool) or expected_min_buy_amount <= 0:
         raise ZeroExArtifactError(
-            "expected_min_buy_amount must be positive — without a floor derived "
-            "from our own price reference there is no bound on what this trade "
-            "may lose"
+            "expected_min_buy_amount must be positive, and must not be a bool — "
+            "without a floor derived from our own price reference there is no "
+            "bound on what this trade may lose"
         )
     if min_buy < expected_min_buy_amount:
         raise ZeroExArtifactError(

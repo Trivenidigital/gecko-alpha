@@ -208,8 +208,16 @@ def build_approval_intent(
             "nobody remembers to revoke it"
         )
     if amount < required_amount:
-        # Reachable in principle, and cheap to keep: floor division can only
-        # round DOWN, so a zero headroom on a tiny amount is the boundary case.
+        # Currently UNREACHABLE, and kept deliberately. Under the integer
+        # arithmetic above — `required * (10_000 + headroom_bps) // 10_000` with
+        # `headroom_bps >= 0` — the result is never below `required`; at
+        # `headroom_bps == 0` it is exactly `required`. (Exhaustively checked
+        # over headroom 0..500 and ten magnitudes up to the uint256 ceiling: no
+        # case.) It WAS reachable under the earlier `Decimal` formulation, where
+        # the ambient precision context could round a large product down. The
+        # guard stays as a standing assertion that any future change to this
+        # expression — a different rounding mode, a re-introduced float, a
+        # signed headroom — cannot silently approve less than the swap needs.
         raise ApprovalRefused(
             f"computed approval {amount} is below the required {required_amount}"
         )
