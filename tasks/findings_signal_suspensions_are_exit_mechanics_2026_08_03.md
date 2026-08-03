@@ -93,9 +93,36 @@ gainers_early, lifetime: 55.3% win × +12.6% avg win − 44.7% × −15.6% avg l
 ≈ **0.00**. Its observed `avg_realized_pct` is **0.0**.
 
 Winners ~+12–17%, stop-outs −25%: a payoff ratio near 0.5, which needs ~67% win rate
-to break even. No signal reaches that. Win rates are otherwise healthy —
-chain_completed 56.0%, gainers_early 55.3%, narrative_prediction 54.6%,
-losers_contrarian 53.1%.
+to break even. No signal comes close.
+
+**Authoritative unfiltered lifetime figures** (use these, not any `peak_pct`-filtered
+subset — see the correction in §"Correction made mid-analysis"):
+
+| Signal | n | win % | lifetime net | per trade |
+|---|---|---|---|---|
+| long_hold | 14 | 57.1 | +$13 | +$0.93 |
+| tg_social | 24 | 16.7 | −$475 | −$19.77 |
+| trending_catch | 113 | 40.7 | −$557 | −$4.93 |
+| slow_burn | 39 | 35.9 | −$572 | −$14.68 |
+| first_signal | 277 | 40.1 | −$750 | −$2.71 |
+| **narrative_prediction** | 325 | 43.7 | **−$829** | −$2.55 |
+| volume_spike | 130 | 37.7 | −$877 | −$6.74 |
+| losers_contrarian | 330 | 48.8 | −$1,133 | −$3.43 |
+| chain_completed | 185 | 50.3 | −$3,018 | −$16.32 |
+| gainers_early | 673 | 50.7 | −$3,198 | −$4.75 |
+
+**Every signal is lifetime negative** except `long_hold` at n=14 (+$13 — noise).
+Total −$11,396 across 2,110 closes. Note this includes **`narrative_prediction`, the
+only signal currently ENABLED**, at −$829 / 43.7%. The live configuration is losing
+money too; this is not a situation where good signals are being unfairly held back.
+
+The `peak_pct`-filtered subset overstated every win rate by roughly 5pp
+(gainers_early 55.3 → 50.7, narrative_prediction 54.6 → 43.7), which is what made
+several signals look near-viable when none are.
+
+Exit-status mix across all 2,110 closes: `expired` 896 (**42%**), managed 800 (38%),
+`stop_loss` 342 (16%), `time_death` 67 (3%). **The expired bucket is larger than the
+managed-exit bucket.**
 
 **Giveback**, avg peak vs avg realized (subset with `peak_pct` present):
 
@@ -127,20 +154,59 @@ the entry side and the exit side.
 
 Ordered by strength of evidence:
 
-1. **Stop width.** 25–30% against +12–17% winners. Backtest tighter `sl_pct` against
-   existing closed trades — the data to do this is already in `paper_trades`
-   (`peak_pct`, `pnl_pct`, entry/exit). Cheap, no forward soak needed, per §11b.
-2. **The `expired` bucket.** 753 trades, −$11,873, timing out at −5.4% inside
-   `PAPER_MAX_DURATION_HOURS=48`. These are positions that never resolved either way.
-   Worth asking whether a non-resolving position should be cut earlier and smaller.
-3. **Peak capture.** +16.9% reached, 0.0% kept. Note the known constraint: per memory
+1. **Instrument adverse excursion (MAE) — first, and blocking.** One column on
+   `paper_trades`, updated on the same evaluator tick that already maintains
+   `peak_pct`. Additive, no behaviour change, accumulates immediately. **This is a
+   prerequisite for any stop-width work** — see the correction below.
+2. **The `expired` bucket — the largest and answerable today.** 896 trades (**42% of
+   all closes**, larger than the managed-exit bucket), −$11,873 at −5.4%, timing out
+   inside `PAPER_MAX_DURATION_HOURS=48`. Two explanations with opposite fixes:
+   (a) entries into tokens that were never going to move → fix entry criteria;
+   (b) 48h too short for the thesis → extend duration. Distinguishable **now** from
+   entry-context data without MAE.
+3. **Stop width — blocked on (1).** 25–30% against +12–17% winners is a ~0.5 payoff
+   ratio. But it cannot be evaluated on existing data (correction below).
+4. **Peak capture.** +16.9% reached, 0.0% kept. Known constraint: per memory
    `project_session_2026_05_05_high_peak_park`, per-signal `trail_pct` is dominated
    by the global `MOONSHOT_TRAIL=30` floor at peak ≥40%, so a `trail_pct` change may
    not reach the lever (§9c). Verify before scoping.
 
-**Do not revive a signal as a first move.** The auto-suspend measures net PnL, which
-is dominated by an exit path common to every signal; a revived signal will re-cross
-the threshold. Fix the mechanics, then revive with a fresh drawdown baseline.
+### CORRECTION (2026-08-03, same day) — the stop-width backtest is NOT runnable
+
+An earlier revision of this document listed the stop-width backtest as the cheap
+first move, "no forward soak needed." **That was wrong.** `paper_trades` carries
+`peak_pct` but **no adverse-excursion / trough / MAE column**, and there is no
+per-trade price path anywhere (`paper_trade_entry_snapshots` is entry-context only,
+n=543; `price_cache` is current-value only; `gainers_snapshots` covers only
+gainers-tracked coins and only from the point tracking began).
+
+Consequence, and the reason this matters more than a normal erratum:
+
+- For the 342 rows that closed at `stop_loss` we know they reached −25%, so the
+  **saving** from a tighter stop is computable.
+- For the other 1,768 closes we cannot know which dipped below −15% en route, so the
+  **cost** — trades a tighter stop would newly convert into losses — is *not*
+  computable.
+
+A backtest on this data would therefore produce a **one-sided estimate that makes
+tightening the stop look strictly beneficial.** Do not run it and do not act on any
+number produced that way. Instrument MAE first.
+
+Same family as [[feedback-evidence-that-does-not-discriminate]]: the available half
+of the evidence points confidently in one direction, and the missing half is the
+half that would argue against.
+
+**Do not revive a signal as a first move — "which one to revive" is the wrong
+question.** Every signal is lifetime negative (§4), including the one already
+enabled. The auto-suspend measures net PnL, which is dominated by an exit path
+common to every signal, so a revived signal re-crosses the threshold on schedule.
+There is no good signal being unfairly held back. Fix the mechanics, then revive
+with a fresh drawdown baseline.
+
+**What would change the ordering above:** if MAE data (item 1) shows most trades
+never approach −25%, the stop is nearly irrelevant and the problem is entry quality
+plus expiry — which promotes item 2 above item 3 permanently and de-scopes stop work
+entirely.
 
 ---
 
