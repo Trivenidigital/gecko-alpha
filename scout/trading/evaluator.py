@@ -229,7 +229,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                   remaining_qty, floor_armed, realized_pnl_usd,
                   checkpoint_6h_pct, checkpoint_24h_pct,
                   moonshot_armed_at, conviction_locked_at,
-                  checkpoint_1h_pct
+                  checkpoint_1h_pct,
+                  trough_price, mae_pct
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -277,6 +278,9 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             cp_48h = row[11]
             peak_price = float(row[12]) if row[12] is not None else None
             peak_pct = float(row[13]) if row[13] is not None else None
+            # Appended at the END of the SELECT (indices 32/33) so the existing
+            # positional reads above keep their meaning.
+            trough_price = float(row[32]) if row[32] is not None else None
             symbol_row = row[15]
             signal_type_row = row[20]
 
@@ -594,6 +598,42 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                 await conn.execute(
                     "UPDATE paper_trades SET peak_price = ?, peak_pct = ? WHERE id = ?",
                     (peak_price, round(peak_pct, 4), trade_id),
+                )
+
+            # Maximum adverse excursion -- the exact mirror of the high-water
+            # mark above. Without it, stop-width cannot be evaluated: for trades
+            # that already stopped out we know they reached the stop, but for
+            # every other close we cannot know whether it dipped past a tighter
+            # stop before recovering. That asymmetry makes a tighter stop look
+            # strictly beneficial on the available data, which is why this is
+            # measured rather than inferred.
+            #
+            # `mae_pct` is <= 0 by construction once set (a position that only
+            # ever rose keeps its entry price as the low-water mark, giving 0.0).
+            # NULL means never measured -- pre-migration rows and any trade that
+            # closed before this shipped. Never read NULL as 0.
+            #
+            # The None branch is NOT the same as `reference = entry_price`. A
+            # position that only ever rises never goes below entry, so a bare
+            # `current < reference` comparison would leave mae_pct NULL for its
+            # whole life -- indistinguishable from "never measured", which is
+            # precisely the ambiguity this column exists to remove. Seeding on
+            # the first tick makes "never dipped" record as 0.0, so NULL keeps
+            # exactly one meaning: closed before this shipped.
+            if trough_price is None:
+                trough_price = min(entry_price, current_price)
+                _write_trough = True
+            elif current_price < trough_price:
+                trough_price = current_price
+                _write_trough = True
+            else:
+                _write_trough = False
+            if _write_trough:
+                mae_pct = ((trough_price - entry_price) / entry_price) * 100
+                await conn.execute(
+                    "UPDATE paper_trades SET trough_price = ?, mae_pct = ? "
+                    "WHERE id = ?",
+                    (trough_price, round(mae_pct, 4), trade_id),
                 )
 
             updates: dict[str, object] = {}
