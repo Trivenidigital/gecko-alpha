@@ -181,6 +181,59 @@ Nullable, no DEFAULT: absence stays distinguishable from "written empty".
 No `.env` change is part of this PR. Nothing signs, broadcasts, or trades.
 Positions untouched.
 
+### FINAL STATUS — SHIPPED (2026-08-03)
+
+Delivered across two PRs, both squash-merged and deployed to srilu-vps with
+execution inactive:
+
+| PR | Commit | Deployed | Scope |
+|---|---|---|---|
+| #500 | `ffe6eab3` | 2026-08-02 | Steps 9–12: `ExecutionMandate`, `RoutedVenue`/`select_route`, `client_order_id_for_venue`, `ExecutionReceipt`, `live_trades.intent_hash` |
+| #501 | `cfd96c41` | 2026-08-03T00:38:31Z | 0x AllowanceHolder artifact + signing bundle, `scout/db_path.py` guard, Kraken entry TTY/content binding |
+
+**Runtime-effective state verified on the deployed process** (not inferred from
+source), 13 min uptime, `NRestarts: 0`, zero error-level lines since restart:
+
+- boot log `execution_mandate_state`: `mode=DISABLED, flags_set=false,
+  would_authorize=false, refused_at_gate=mode`
+- `DisabledBroadcaster.submit()` → `BroadcastRefused` — "Nothing was sent"; it is
+  the only broadcaster wired in the build
+- no EVM key on disk, `EVM_SIGNER_KEY_PATH` unset; test identity
+  `0x2dB703e30C186474B43Fa1dBF004655160e7Ef42` at **nonce 0**, 0 ETH, 0 WETH
+  allowance to AllowanceHolder
+- `LIVE_USE_ROUTING_LAYER=False`, so the adapter registration in `main.py` does
+  not execute as deployed
+- 0 EVM/0x rows in `live_trades`; positions unchanged
+
+**Gates:** full suite run on the final commit *and* on `origin/master` in
+parallel — 5616 vs 5382 passed with a **per-test failure diff empty in both
+directions** (30 failed / 8 errors identical; the errors are Windows-environmental
+— `fcntl`, `freezegun`, `telethon`). CI green. Four rounds of adversarial review
+with mutation testing.
+
+**Non-goals below still hold.** The Minara adapter remains blocked on
+`MINARA_API_KEY`; no `.env` or flag was changed on the VPS.
+
+### Follow-up debt carried out of this plan
+
+Blocking the wiring PR, in order:
+
+1. `TradeIntent.minimum_output` is `Decimal | None` in **human units** while the
+   0x artifact takes an `int` in **base units**. That conversion is unwritten and
+   is where a bug will live — a wrong decimals figure is off by 10^n either way.
+   Too low is silent and unbounded; too high is loud and misreads as a venue
+   problem, so the cheap failure gets diagnosed and the expensive one looks like
+   a clean fill. Test at a non-18-decimals token (USDC=6 against WETH=18).
+2. The intent floor is recorded on neither the artifact nor the bundle, so "what
+   did we require?" is recoverable only by dereferencing the intent.
+
+Then: rotate the 0x API key before any live use; `approval_for_artifact` for the
+unbounded `required_amount`; `sign_bundle(PreparedExecution)` instead of a bare
+bundle (the AST pin is a smoke alarm, not a boundary — `type(x)(**kw)` and
+`x.__class__` evade it, and the name list was deliberately not extended); the
+`adapters` map is typed `dict[str, ExchangeAdapter]` but holds an object that is
+not one; Permit2 calldata decoding; `venue_listings.delisted_at` has no writer.
+
 ## Named non-goals
 
 - Minara adapter (blocked on `MINARA_API_KEY`).

@@ -379,3 +379,61 @@ a message nor a table row — nothing to notice).
    and return an explicit one-liner so silence is never ambiguous between "no
    activity" and "the job didn't run" (cousin to §12b's silent-success
    problem).
+
+## 2026-08-03 — Evidence that does not discriminate (PR #501)
+
+**Lesson:** an observation is evidence for a claim only if it would read
+*differently* when the claim is false. Four instances in one PR, all the same
+shape, all producing a plausible number or a green check that was evidence for
+something adjacent:
+
+1. **A ratio of two untrusted numbers.** The 0x slippage ceiling used
+   `(buyAmount - minBuyAmount) / buyAmount` — both from the *same* provider
+   response. It bounds the provider's internal self-consistency, not loss:
+   understate `buyAmount` and the ratio stays small while the absolute floor goes
+   anywhere. Fixed by anchoring to a floor the *intent* supplies.
+2. **A log window spanning the boundary being compared across.** Post-deploy I
+   read "22 error-level lines since restart" from `journalctl --since "-20 min"`
+   — a window reaching back *before* the restart. Anchored to the restart
+   timestamp the count was **0**. The wrong window still returns a quotable
+   number.
+3. **A `match=` substring shared with the branch it excludes.** A refusal test
+   passed with its guard deleted: the payload failed an adjacent check anyway and
+   the pattern matched both messages. Green for the wrong reason.
+4. **A flag-gated prod counter.** I cited "0 `on_demand_listing_fetch_failed` in
+   prod" as confirming a routing fix — but `LIVE_USE_ROUTING_LAYER=False`, so the
+   registration never runs and the count is zero with the fix, without it, and
+   with the adapter unregistered. Caught by the reviewer, not by me.
+
+**How to apply:** before citing anything as proof, ask *what would this read if
+the claim were false?* If the answer is "the same", either find the observation
+that discriminates or state the weaker true thing ("nothing is erroring")
+instead of the stronger inference ("the fix is working"). Prefer a **symmetric
+A/B diff** to an absolute count — "5616 passed" cannot separate a regression from
+environmental noise, but a failure-set diff against the base branch that is empty
+in *both* directions can. Check the gate before reading a counter, and anchor log
+windows to the event rather than to a relative offset that can span it.
+
+## 2026-08-03 — Guards added under review ship unpinned; `bool` is an `int`
+
+**Lesson:** a guard written to close a review finding is the least-tested code in
+the PR. Two mutation rounds on #501 found **12 surviving mutants**, nearly all
+guards added in response to an earlier finding in the same session — the fix and
+its test get written in the same breath, so the test asserts the behaviour just
+implemented rather than the failure the guard prevents, and passes identically
+with the guard gone.
+
+The defect this caught last: `bool` subclasses `int`, so
+`expected_min_buy_amount=True` passed a `<= 0` positivity check and meant a floor
+of **one base unit** — no floor at all, on the only loss bound anchored outside
+the untrusted quote. Every *neighbouring* guard already rejected bools; that
+inconsistency across sibling validators is the smell.
+
+**How to apply:** after adding any guard under review, **delete it and re-run**.
+If the suite stays green the guard is a comment. Assert the refusal fires for the
+right *reason* — `True` must be refused for being a bool, not for being too
+small, or a magnitude-only implementation looks identical from outside. When a
+surviving mutant turns out genuinely unreachable, keep the guard and fix the
+*comment*: an `amount < required_amount` check here was unreachable under integer
+floor division but **had** been reachable under the earlier `Decimal`
+formulation, so the comment asserting reachability had silently become false.
