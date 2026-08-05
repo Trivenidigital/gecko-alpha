@@ -240,3 +240,90 @@ class TestSchedulerTelemetry:
         assert "last_daily_learn_success_at" in src
         assert "last_daily_learn_failure_at" in src
         assert "narrative.daily_learn_failed" in src
+
+
+class TestWeeklyRequiredPathIsAnthropicFree:
+    """The weekly path was the last required Anthropic caller.
+
+    `weekly_consolidate` is commentary only — it rewrites `lessons_learned`
+    prose and calls no `Strategy.set`, controlling none of the 14 parameters.
+    So it is DISABLED rather than rebuilt deterministically: there is no
+    parameter logic to preserve.
+    """
+
+    def test_weekly_commentary_is_disabled_by_default(self):
+        from scout.config import Settings
+
+        s = Settings(
+            TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="c", ANTHROPIC_API_KEY="k"
+        )
+        assert s.NARRATIVE_WEEKLY_COMMENTARY_ENABLED is False
+
+    def test_the_scheduler_gates_weekly_behind_the_flag(self):
+        """With the flag off, `weekly_consolidate` is unreachable, so no
+        Anthropic client can be constructed on the required weekly path."""
+        from pathlib import Path
+
+        import scout.narrative.agent as agent
+
+        src = Path(agent.__file__).read_text("utf-8")
+        gate = "if not settings.NARRATIVE_WEEKLY_COMMENTARY_ENABLED:"
+        assert gate in src
+        # the provider call sits in the else-branch, after the gate
+        assert src.index(gate) < src.index("await weekly_consolidate(")
+
+    def test_disabled_commentary_is_not_a_learner_failure(self):
+        """*** ABSENT COMMENTARY MUST NOT LOOK LIKE BROKEN LEARNING. ***
+
+        The skip emits OPTIONAL_COMMENTARY_DISABLED at info with
+        critical_to_learning=False, and must NOT write a failure timestamp.
+        """
+        from pathlib import Path
+
+        import scout.narrative.agent as agent
+
+        src = Path(agent.__file__).read_text("utf-8")
+        block = src[src.index("if not settings.NARRATIVE_WEEKLY_COMMENTARY_ENABLED:") :]
+        block = block[: block.index("else:")]
+        assert "OPTIONAL_COMMENTARY_DISABLED" in block
+        assert "critical_to_learning=False" in block
+        assert "last_weekly_learn_failure_at" not in block
+        assert "narrative.weekly_learn_skipped" in block
+
+    def test_no_unconditional_weekly_success_timestamp_or_event(self):
+        """Same false-success defect the daily path had."""
+        from pathlib import Path
+
+        import scout.narrative.agent as agent
+
+        src = Path(agent.__file__).read_text("utf-8")
+        assert 'set_timestamp("last_weekly_learn_at", now)' not in src
+        assert 'logger.info("narrative.weekly_learn_complete")' not in src
+        for required in (
+            "last_weekly_learn_attempt_at",
+            "last_weekly_learn_success_at",
+            "last_weekly_learn_failure_at",
+        ):
+            assert required in src
+
+    def test_commentary_failure_does_not_claim_learner_failure(self):
+        """If commentary is ever re-enabled and fails, it is tagged
+        OPTIONAL_COMMENTARY_FAILED with critical_to_learning=False — it must not
+        be reported as deterministic learning failing."""
+        from pathlib import Path
+
+        import scout.narrative.agent as agent
+
+        src = Path(agent.__file__).read_text("utf-8")
+        assert "OPTIONAL_COMMENTARY_FAILED" in src
+        idx = src.index("OPTIONAL_COMMENTARY_FAILED")
+        assert "critical_to_learning=False" in src[idx : idx + 200]
+
+
+class TestLongHoldCannotEnterSignalDispatch:
+    def test_long_hold_is_not_a_dispatchable_signal_type(self):
+        """`long_hold` is the residual 30% label after partial take-profit, not a
+        signal. Its absence from the registry is intentional, not a gap."""
+        from scout.trading.params import DEFAULT_SIGNAL_TYPES
+
+        assert "long_hold" not in DEFAULT_SIGNAL_TYPES

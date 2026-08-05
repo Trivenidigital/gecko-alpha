@@ -393,6 +393,14 @@ class Settings(BaseSettings):
     NARRATIVE_EVAL_INTERVAL: int = Field(default=21_600, ge=60, le=604_800)
     NARRATIVE_DIGEST_HOUR_UTC: int = 0
     NARRATIVE_LEARN_HOUR_UTC: int = 1
+    # Weekly lesson consolidation is COMMENTARY ONLY — it rewrites the
+    # `lessons_learned` prose and calls no Strategy.set, so it controls none of
+    # the 14 strategy parameters. Default OFF: the owner ruling removed paid
+    # model access from the learning path, and this was its last required
+    # Anthropic caller. Historical lessons remain readable; nothing is deleted.
+    # Set True only if a provider is funded and commentary is wanted again.
+    NARRATIVE_WEEKLY_COMMENTARY_ENABLED: bool = False
+
     NARRATIVE_WEEKLY_LEARN_DAY: int = 6
     NARRATIVE_ENABLED: bool = False
     NARRATIVE_SNAPSHOT_RETENTION_DAYS: int = 7

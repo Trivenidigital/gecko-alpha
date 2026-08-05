@@ -779,18 +779,50 @@ async def narrative_agent_loop(
                 and now.hour == (settings.NARRATIVE_LEARN_HOUR_UTC + 1) % 24
                 and (now - last_weekly_learn_at).total_seconds() >= 6.9 * 86400
             ):
-                try:
-                    await weekly_consolidate(
-                        db,
-                        strategy,
-                        api_key=settings.ANTHROPIC_API_KEY,
-                        model=settings.NARRATIVE_LEARN_MODEL,
+                await strategy.set_timestamp("last_weekly_learn_attempt_at", now)
+                last_weekly_learn_at = now
+                if not settings.NARRATIVE_WEEKLY_COMMENTARY_ENABLED:
+                    # DISABLED BY DEFAULT — the owner ruling removed paid model
+                    # access from learning. `weekly_consolidate` is COMMENTARY
+                    # ONLY: it rewrites the `lessons_learned` prose from recent
+                    # daily reflections. It calls no Strategy.set and controls
+                    # none of the 14 parameters, so disabling it removes an
+                    # Anthropic dependency without losing any parameter logic.
+                    #
+                    # Deliberately NOT a failure: absent commentary must not make
+                    # deterministic learning look broken. Historical lessons stay
+                    # readable — nothing is deleted.
+                    logger.info(
+                        "narrative.weekly_learn_skipped",
+                        outcome="OPTIONAL_COMMENTARY_DISABLED",
+                        critical_to_learning=False,
+                        reason="paid model access removed from the learning path",
                     )
-                    last_weekly_learn_at = now
-                    await strategy.set_timestamp("last_weekly_learn_at", now)
-                    logger.info("narrative.weekly_learn_complete")
-                except Exception:
-                    logger.exception("narrative.weekly_learn_error")
+                else:
+                    try:
+                        await weekly_consolidate(
+                            db,
+                            strategy,
+                            api_key=settings.ANTHROPIC_API_KEY,
+                            model=settings.NARRATIVE_LEARN_MODEL,
+                        )
+                        await strategy.set_timestamp(
+                            "last_weekly_learn_success_at", now
+                        )
+                        logger.info(
+                            "narrative.weekly_learn_success",
+                            outcome="OPTIONAL_COMMENTARY_SUCCESS",
+                        )
+                    except Exception:
+                        # Commentary failure is NOT learner failure.
+                        await strategy.set_timestamp(
+                            "last_weekly_learn_failure_at", now
+                        )
+                        logger.exception(
+                            "narrative.weekly_learn_failed",
+                            outcome="OPTIONAL_COMMENTARY_FAILED",
+                            critical_to_learning=False,
+                        )
 
         except Exception:
             logger.exception("narrative.loop_error")
