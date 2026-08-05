@@ -243,12 +243,29 @@ async def _rw_db(db_path: str):
 
     Same try-block guard as ``_ro_db`` — connection acquired inside try
     so exceptions during ``connect()`` or ``row_factory`` cannot leak.
+
+    On an exception the open transaction is rolled back EXPLICITLY before the
+    close. ``close()`` already discards an uncommitted transaction, so this
+    changes no observable behaviour today — it states the guarantee in the code
+    rather than leaving callers depending on a driver detail. Writers here pair
+    a state change with its audit row in one transaction
+    (:func:`update_narrative_strategy`, :func:`set_strategy_lock`), and that
+    pairing is only atomic if the failure path definitely unwinds.
     """
     conn = None
     try:
         conn = await aiosqlite.connect(db_path)
         conn.row_factory = aiosqlite.Row
         yield conn
+    except BaseException:
+        if conn is not None:
+            try:
+                await conn.rollback()
+            except Exception:
+                # Never let cleanup replace the original exception — that would
+                # substitute a rollback error for the real cause.
+                structlog.get_logger().warning("rw_db_rollback_failed", exc_info=True)
+        raise
     finally:
         if conn is not None:
             await conn.close()
@@ -447,10 +464,14 @@ async def _audit_strategy_change(
     record commit together. Schema creation is `_ensure_audit_table`, called
     before the transaction begins.
 
-    Atomicity is guaranteed by rollback failure-injection tests, not by this
-    function's structure. (An earlier revision justified the split with an
-    implicit-commit-on-DDL claim that was measured and is false on this stack;
-    see the commit history.)
+    Atomicity is proven by the failure-injection tests in
+    `tests/test_strategy_audit_atomicity.py`, not by this function's structure.
+    (An earlier revision justified the split with an implicit-commit-on-DDL
+    claim that was measured and is false on this stack; the DDL hoist is
+    retained as clean separation only. Mutation-checked 2026-08-05: putting a
+    `CREATE TABLE` back inside this function does NOT break the rollback —
+    confirming the retraction empirically — but it is still refused, because
+    schema work does not belong in a business transaction.)
     """
     await conn.execute(
         """INSERT INTO agent_strategy_audit

@@ -32,10 +32,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Sequence
+
+from scout.narrative.learn_outcome import LearnCycleOutcome, redact, safe_traceback
 
 ALGORITHM_VERSION = "deterministic-v1"
 
@@ -56,9 +60,43 @@ SENSITIVITY_TOLERANCE = Decimal("0.50")
 
 
 class ProposalVerdict(str, Enum):
+    """INTERNAL evaluator verdict. Not the scheduler vocabulary.
+
+    Callers outside this module should read
+    :attr:`LearnProposal.cycle_outcome`, which maps these onto the shared
+    :class:`~scout.narrative.learn_outcome.LearnCycleOutcome`.
+
+    ``INSUFFICIENT_EVIDENCE`` and ``UNSTABLE_EVIDENCE`` were one conflated
+    member. Splitting them matters because they are opposite situations: the
+    first is "not enough data to search", the second is "the search produced a
+    winner and the stability gates threw it out". Conflated, a rejected-as-
+    overfit result reported as an empty sample — and an operator waiting for
+    more data would have waited forever.
+    """
+
     NO_CHANGE = "NO_CHANGE"
     PROPOSED_CHANGE_FOR_OWNER_REVIEW = "PROPOSED_CHANGE_FOR_OWNER_REVIEW"
-    INSUFFICIENT_OR_UNSTABLE_EVIDENCE = "INSUFFICIENT_OR_UNSTABLE_EVIDENCE"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    UNSTABLE_EVIDENCE = "UNSTABLE_EVIDENCE"
+    # The evaluation did not complete. A returned value, never an escaping
+    # exception: an exception at this boundary reaches the scheduler's bare
+    # `except`, which has no result object to report and so degrades to a log
+    # line with no outcome field — the ambiguity this delivery removes.
+    FAILED = "FAILED"
+
+
+# Total, explicit map. `dict[...]` lookup, never `.get(..., default)`: a new
+# verdict member with no mapping must raise KeyError in the test suite, not
+# silently inherit a plausible-looking default.
+_VERDICT_TO_CYCLE_OUTCOME: dict[ProposalVerdict, LearnCycleOutcome] = {
+    ProposalVerdict.NO_CHANGE: LearnCycleOutcome.DETERMINISTIC_NO_CHANGE,
+    ProposalVerdict.PROPOSED_CHANGE_FOR_OWNER_REVIEW: (
+        LearnCycleOutcome.DETERMINISTIC_PROPOSAL
+    ),
+    ProposalVerdict.INSUFFICIENT_EVIDENCE: LearnCycleOutcome.INSUFFICIENT_EVIDENCE,
+    ProposalVerdict.UNSTABLE_EVIDENCE: LearnCycleOutcome.UNSTABLE_EVIDENCE,
+    ProposalVerdict.FAILED: LearnCycleOutcome.FAILED,
+}
 
 
 @dataclass(frozen=True)
@@ -114,40 +152,68 @@ class LearnProposal:
     commentary: str | None = None
     commentary_status: str = "NOT_ATTEMPTED"
 
-    @property
-    def is_success(self) -> bool:
-        """A completed evaluation. NO_CHANGE is a success — the learner ran and
-        correctly concluded nothing should move."""
-        return self.verdict in (
-            ProposalVerdict.NO_CHANGE,
-            ProposalVerdict.PROPOSED_CHANGE_FOR_OWNER_REVIEW,
-        )
+    # -- runtime envelope --------------------------------------------------
+    # Deliberately OUTSIDE `as_record()`: these vary run-to-run, and the
+    # determinism guarantee ("same snapshot yields byte-identical output") is
+    # what makes `snapshot_sha256` meaningful as provenance. They are persisted
+    # under a separate `runtime` key by `run_deterministic_daily_learn`.
+    correlation_id: str | None = None
+    elapsed_ms: int | None = None
+    failing_step: str | None = None
+    exception_type: str | None = None
+    exception_message: str | None = None
+    traceback_text: str | None = None
 
     @property
-    def is_skipped(self) -> bool:
-        return self.verdict is ProposalVerdict.INSUFFICIENT_OR_UNSTABLE_EVIDENCE
+    def cycle_outcome(self) -> LearnCycleOutcome:
+        """The scheduler-facing outcome. Explicit total map, no default."""
+        return _VERDICT_TO_CYCLE_OUTCOME[self.verdict]
 
     def log_fields(self) -> dict[str, Any]:
-        """Secret-safe structured fields. Contains no credential and no prompt —
-        this learner never handles either."""
+        """Secret-safe structured fields.
+
+        Every key is present on every path — success, no-evidence and failure —
+        with ``None`` where a value genuinely does not exist. A key that appears
+        only on some outcomes makes absence ambiguous between "not applicable"
+        and "the emitting branch forgot", which is how the original failure path
+        got away with logging nothing.
+
+        Contains no credential, no prompt and no provider payload: this learner
+        handles none of them, and the two free-text fields it does carry
+        (``exception_message``, ``traceback``) are passed through
+        :func:`~scout.narrative.learn_outcome.redact` and length-bounded anyway.
+        """
         return {
-            "outcome": self.verdict.value,
+            "outcome": self.cycle_outcome.value,
+            "verdict": self.verdict.value,
             "algorithm_version": self.algorithm_version,
-            "snapshot_sha256": self.snapshot_sha256[:16],
-            "population_size": self.population_size,
+            "snapshot_hash": self.snapshot_sha256[:16] or None,
+            "prediction_count": self.population_size,
             "train_n": self.train_n,
             "validation_n": self.validation_n,
             "candidates_tested": len(self.candidates),
             "proposed_count": len(self.proposed),
             "rejection_count": len(self.rejections),
             "commentary_status": self.commentary_status,
+            "elapsed_ms": self.elapsed_ms,
+            "correlation_id": self.correlation_id,
+            "failing_step": self.failing_step,
+            "exception_type": self.exception_type,
+            "exception_message": redact(self.exception_message),
+            "traceback": self.traceback_text,
             "dry_run": True,
         }
 
     def as_record(self) -> dict[str, Any]:
-        """Durable provenance record. Persisted verbatim by the caller."""
+        """Durable provenance record of the EVALUATION. Deterministic.
+
+        Contains only content derived from the snapshot, so two runs over an
+        identical population produce identical bytes. Run-varying metadata lives
+        in the ``runtime`` envelope written alongside it.
+        """
         return {
             "verdict": self.verdict.value,
+            "outcome": self.cycle_outcome.value,
             "algorithm_version": self.algorithm_version,
             "snapshot_sha256": self.snapshot_sha256,
             "population_size": self.population_size,
@@ -161,6 +227,45 @@ class LearnProposal:
             "commentary_status": self.commentary_status,
             "commentary": self.commentary,
         }
+
+    def runtime_envelope(self) -> dict[str, Any]:
+        """Run-varying metadata. Never part of the determinism guarantee."""
+        return {
+            "correlation_id": self.correlation_id,
+            "elapsed_ms": self.elapsed_ms,
+            "failing_step": self.failing_step,
+            "exception_type": self.exception_type,
+            "exception_message": redact(self.exception_message),
+            "traceback": self.traceback_text,
+        }
+
+    @classmethod
+    def failed(
+        cls,
+        exc: BaseException,
+        *,
+        failing_step: str,
+        correlation_id: str | None = None,
+        elapsed_ms: int | None = None,
+        population_size: int = 0,
+        snapshot_sha256: str = "",
+    ) -> "LearnProposal":
+        """Build the FAILED result the scheduler logs.
+
+        Carries the same secret-safe field set as every other outcome, so a
+        failure is a fully-described event rather than a bare error line.
+        """
+        return cls(
+            verdict=ProposalVerdict.FAILED,
+            snapshot_sha256=snapshot_sha256,
+            population_size=population_size,
+            correlation_id=correlation_id,
+            elapsed_ms=elapsed_ms,
+            failing_step=failing_step,
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            traceback_text=safe_traceback(exc),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -374,11 +479,11 @@ def evaluate(
 ) -> LearnProposal:
     """Produce a dry-run proposal. Applies nothing.
 
-    Returns ``INSUFFICIENT_OR_UNSTABLE_EVIDENCE`` rather than a weak proposal
-    whenever the population cannot support a conclusion — no-change is always a
-    valid, and usually the correct, answer.
+    Returns ``INSUFFICIENT_EVIDENCE`` or ``UNSTABLE_EVIDENCE`` rather than a
+    weak proposal whenever the population cannot support a conclusion —
+    no-change is always a valid, and usually the correct, answer.
     """
-    proposal = LearnProposal(verdict=ProposalVerdict.INSUFFICIENT_OR_UNSTABLE_EVIDENCE)
+    proposal = LearnProposal(verdict=ProposalVerdict.INSUFFICIENT_EVIDENCE)
     proposal.population_size = len(records)
     proposal.snapshot_sha256 = snapshot_hash(records)
 
@@ -451,6 +556,11 @@ def evaluate(
                     best_by_key[key] = cand
 
     # Sensitivity: a winner whose neighbours collapse is a spike, not an optimum.
+    # `stability_rejected` is what separates UNSTABLE_EVIDENCE from
+    # INSUFFICIENT_EVIDENCE below: it records that the search DID find a winner
+    # and the stability gates threw it out, which is a different operator
+    # situation from having nothing to search.
+    stability_rejected = False
     for key, cand in sorted(best_by_key.items()):
         neighbours = [
             c
@@ -458,6 +568,7 @@ def evaluate(
             if c.key == key and c.value != cand.value and c.rejected_reason is None
         ]
         if not neighbours:
+            stability_rejected = True
             proposal.rejections.append(
                 f"{key}={cand.value}: rejected — no surviving neighbour, "
                 "result is a single-point spike (likely overfit)"
@@ -465,6 +576,7 @@ def evaluate(
             continue
         worst_neighbour = min(n.improvement for n in neighbours)
         if (cand.improvement - worst_neighbour) > SENSITIVITY_TOLERANCE * Decimal(4):
+            stability_rejected = True
             proposal.rejections.append(
                 f"{key}={cand.value}: rejected — unstable neighbourhood "
                 f"(best {cand.improvement} vs worst neighbour {worst_neighbour})"
@@ -482,12 +594,34 @@ def evaluate(
             }
         )
 
+    # Explicit, ordered terminal classification. Each branch states which
+    # situation it means; none of them infers from a bare truthiness test alone
+    # without saying what the test stands for.
     if proposal.proposed:
         proposal.verdict = ProposalVerdict.PROPOSED_CHANGE_FOR_OWNER_REVIEW
+    elif stability_rejected:
+        # A winner existed and the sensitivity/neighbourhood gates rejected it.
+        # NOT the same as "nothing to search" — previously both landed on the
+        # conflated member and, when candidates existed, this case even fell
+        # through to NO_CHANGE with the note "no candidate beat the current
+        # configuration", which was false.
+        proposal.verdict = ProposalVerdict.UNSTABLE_EVIDENCE
+        proposal.notes.append(
+            "a candidate beat the current configuration but failed the "
+            "stability gates; treated as overfit, not as a proposal"
+        )
     elif proposal.candidates:
         proposal.verdict = ProposalVerdict.NO_CHANGE
         proposal.notes.append(
             "no candidate beat the current configuration on held-out data"
+        )
+    else:
+        # Sample was large enough, but no candidate grid could be built at all
+        # (every searchable key locked, or missing a current value / bounds).
+        proposal.verdict = ProposalVerdict.INSUFFICIENT_EVIDENCE
+        proposal.rejections.append(
+            "no evaluable candidate: every searchable parameter was locked or "
+            "had no current value and bounds"
         )
     return proposal
 
@@ -500,43 +634,22 @@ async def load_records(conn: Any) -> list[PredictionRecord]:
 
 
 def proposal_json(proposal: LearnProposal) -> str:
-    return json.dumps(proposal.as_record(), indent=2, sort_keys=True, default=str)
+    """Persisted JSON: deterministic evaluation plus the runtime envelope.
 
-
-async def run_deterministic_daily_learn(db: Any, strategy: Any) -> LearnProposal:
-    """THE RUNTIME LEARNING PATH. Scheduled daily; mutates no parameter.
-
-    This is the function the scheduler calls. It deliberately takes no API key
-    and constructs no provider client, so the runtime learning path has no
-    provider dependency at all — the property the previous architecture lacked,
-    which is why a billing outage stopped learning for ~34 days.
-
-    Writes exactly one row to ``learn_logs`` as a durable provenance record
-    (snapshot hash, algorithm version, baseline, candidates, rejections). That
-    is a history row, NOT a parameter mutation: no ``Strategy.set`` is called
-    and no value or lock state changes.
+    The two are separate keys so the determinism guarantee stays checkable —
+    ``json["evaluation"]`` is byte-identical across runs on an identical
+    population; ``json["runtime"]`` is expected to vary.
     """
-    conn = db._conn
-    if conn is None:
-        raise RuntimeError("Database not initialized.")
+    return json.dumps(
+        {"evaluation": proposal.as_record(), "runtime": proposal.runtime_envelope()},
+        indent=2,
+        sort_keys=True,
+        default=str,
+    )
 
-    from scout.narrative.strategy import STRATEGY_BOUNDS
 
-    records = await load_records(conn)
-
-    cursor = await conn.execute("SELECT key, value, locked FROM agent_strategy")
-    params: dict[str, Any] = {}
-    locked: list[str] = []
-    for key, raw, is_locked in await cursor.fetchall():
-        try:
-            params[key] = json.loads(raw)
-        except Exception:
-            params[key] = raw
-        if is_locked:
-            locked.append(key)
-
-    proposal = evaluate(records, params, STRATEGY_BOUNDS, locked_keys=locked)
-
+async def _persist_learn_log(conn: Any, proposal: LearnProposal) -> None:
+    """Append one ``learn_logs`` provenance row. History, not a mutation."""
     cursor = await conn.execute("SELECT MAX(cycle_number) FROM learn_logs")
     row = await cursor.fetchone()
     cycle_number = (row[0] or 0) + 1
@@ -557,4 +670,92 @@ async def run_deterministic_daily_learn(db: Any, strategy: Any) -> LearnProposal
         ),
     )
     await conn.commit()
-    return proposal
+
+
+async def run_deterministic_daily_learn(db: Any, strategy: Any) -> LearnProposal:
+    """THE RUNTIME LEARNING PATH. Scheduled daily; mutates no parameter.
+
+    This is the function the scheduler calls. It deliberately takes no API key
+    and constructs no provider client, so the runtime learning path has no
+    provider dependency at all — the property the previous architecture lacked,
+    which is why a billing outage stopped learning for ~34 days.
+
+    Writes exactly one row to ``learn_logs`` as a durable provenance record
+    (snapshot hash, algorithm version, baseline, candidates, rejections). That
+    is a history row, NOT a parameter mutation: no ``Strategy.set`` is called
+    and no value or lock state changes.
+
+    **Always returns a LearnProposal. Never returns None, never raises.**
+    Every failure becomes a ``FAILED`` proposal carrying ``failing_step``,
+    ``exception_type``, a redacted ``exception_message`` and a safe traceback.
+    The caller therefore has an outcome to report on every path and never has
+    to infer one from a missing return value or a bare log line.
+    """
+    correlation_id = uuid.uuid4().hex[:16]
+    started = time.monotonic()
+
+    def _elapsed() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    # `step` names the stage a failure happened in. Assigned before each stage
+    # rather than derived from the traceback so the label survives redaction,
+    # truncation and any future logging change.
+    step = "acquire_connection"
+    records: list[PredictionRecord] = []
+    snapshot = ""
+    try:
+        conn = db._conn
+        if conn is None:
+            raise RuntimeError("Database not initialized.")
+
+        step = "load_bounds"
+        from scout.narrative.strategy import STRATEGY_BOUNDS
+
+        step = "load_records"
+        records = await load_records(conn)
+        snapshot = snapshot_hash(records)
+
+        step = "load_strategy"
+        cursor = await conn.execute("SELECT key, value, locked FROM agent_strategy")
+        params: dict[str, Any] = {}
+        locked: list[str] = []
+        for key, raw, is_locked in await cursor.fetchall():
+            try:
+                params[key] = json.loads(raw)
+            except Exception:
+                # A non-JSON stored value is legitimate on older rows; keep the
+                # raw string rather than dropping the parameter from the search.
+                params[key] = raw
+            if is_locked:
+                locked.append(key)
+
+        step = "evaluate"
+        proposal = evaluate(records, params, STRATEGY_BOUNDS, locked_keys=locked)
+        proposal.correlation_id = correlation_id
+
+        step = "persist_learn_log"
+        proposal.elapsed_ms = _elapsed()
+        await _persist_learn_log(conn, proposal)
+        return proposal
+    except Exception as exc:
+        failure = LearnProposal.failed(
+            exc,
+            failing_step=step,
+            correlation_id=correlation_id,
+            elapsed_ms=_elapsed(),
+            population_size=len(records),
+            snapshot_sha256=snapshot,
+        )
+        # Best-effort provenance for the failure itself. A learn_logs row that
+        # records WHY a cycle failed is worth more than a clean stack, and this
+        # write must never replace the original exception in the returned
+        # result — hence the swallow, with the reason recorded in-band.
+        try:
+            conn = getattr(db, "_conn", None)
+            if conn is not None:
+                await _persist_learn_log(conn, failure)
+        except Exception as persist_exc:
+            failure.notes.append(
+                f"failure record could not be persisted: {type(persist_exc).__name__}"
+            )
+        return failure

@@ -33,11 +33,123 @@ from enum import Enum
 from typing import Any
 
 
+class LearnCycleOutcome(str, Enum):
+    """THE scheduler-facing outcome vocabulary. Daily and weekly share it.
+
+    One enum for both cadences so an operator reading ``learn`` events never has
+    to know which code path produced a line to know what it means. Every value
+    a scheduler emits is a member of this enum, and every member is reached by
+    an explicit mapping — never by testing ``None``, a boolean, truthiness, or
+    the presence of a log line. That inference is exactly what let ~34 days of
+    hard provider failures read as quiet no-ops.
+
+    ``INSUFFICIENT_EVIDENCE`` and ``UNSTABLE_EVIDENCE`` are separate members on
+    purpose. Both mean "no proposal", but the operator actions differ: the first
+    says *wait for more resolved predictions*, the second says *the search found
+    a winner and the stability gates rejected it*. The internal verdict used to
+    conflate them, so a rejected-as-overfit result was indistinguishable from an
+    empty sample.
+    """
+
+    # --- daily deterministic learner -------------------------------------
+    DETERMINISTIC_NO_CHANGE = "DETERMINISTIC_NO_CHANGE"
+    DETERMINISTIC_PROPOSAL = "DETERMINISTIC_PROPOSAL"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    UNSTABLE_EVIDENCE = "UNSTABLE_EVIDENCE"
+    FAILED = "FAILED"
+
+    # --- weekly optional commentary --------------------------------------
+    OPTIONAL_COMMENTARY_DISABLED = "OPTIONAL_COMMENTARY_DISABLED"
+    OPTIONAL_COMMENTARY_FAILED = "OPTIONAL_COMMENTARY_FAILED"
+    # Not in the originally-specified seven. Added because the weekly branch
+    # has a third reachable state — commentary enabled AND succeeding — and
+    # mapping it onto any of the seven would misreport it. Reachable only when
+    # NARRATIVE_WEEKLY_COMMENTARY_ENABLED is turned on, which is off by default.
+    OPTIONAL_COMMENTARY_SUCCESS = "OPTIONAL_COMMENTARY_SUCCESS"
+
+    @property
+    def is_learning_success(self) -> bool:
+        """True when the deterministic learner completed an evaluation.
+
+        ``DETERMINISTIC_NO_CHANGE`` counts: the learner ran and correctly
+        concluded nothing should move. Commentary outcomes never count — weekly
+        commentary controls no parameter, so its success is not learning.
+        """
+        return self in (
+            LearnCycleOutcome.DETERMINISTIC_NO_CHANGE,
+            LearnCycleOutcome.DETERMINISTIC_PROPOSAL,
+        )
+
+    @property
+    def is_critical_to_learning(self) -> bool:
+        """False for every optional-commentary member.
+
+        Absent or broken commentary must not make deterministic learning look
+        broken — that misdirection is what this whole delivery exists to remove.
+        """
+        return not self.name.startswith("OPTIONAL_COMMENTARY")
+
+
+@dataclass(frozen=True)
+class CycleReporting:
+    """How the scheduler reports one outcome: which clock, which event, which level.
+
+    ``state_key`` is ``None`` where the outcome is genuinely neither a success
+    nor a failure (disabled optional commentary), so no success/failure clock
+    moves and a freshness watchdog on either one is not misled.
+    """
+
+    state_key: str | None
+    event: str
+    level: str  # "info" | "error"
+
+
+# Total over LearnCycleOutcome. Looked up with `[...]`, never `.get(..., dflt)`:
+# a new member with no entry must fail the totality test rather than quietly
+# inherit someone else's reporting.
+#
+# INSUFFICIENT_EVIDENCE / UNSTABLE_EVIDENCE move `last_daily_learn_failure_at`
+# because they are *not successes* and a freshness watchdog on
+# `last_daily_learn_success_at` should notice a learner that never concludes.
+# They are logged at info with a distinct event name — the clock says "no
+# success", the event says which of the two situations produced it.
+CYCLE_REPORTING: dict[LearnCycleOutcome, CycleReporting] = {
+    LearnCycleOutcome.DETERMINISTIC_NO_CHANGE: CycleReporting(
+        "last_daily_learn_success_at", "narrative.daily_learn_success", "info"
+    ),
+    LearnCycleOutcome.DETERMINISTIC_PROPOSAL: CycleReporting(
+        "last_daily_learn_success_at", "narrative.daily_learn_success", "info"
+    ),
+    LearnCycleOutcome.INSUFFICIENT_EVIDENCE: CycleReporting(
+        "last_daily_learn_failure_at", "narrative.daily_learn_no_result", "info"
+    ),
+    LearnCycleOutcome.UNSTABLE_EVIDENCE: CycleReporting(
+        "last_daily_learn_failure_at", "narrative.daily_learn_no_result", "info"
+    ),
+    LearnCycleOutcome.FAILED: CycleReporting(
+        "last_daily_learn_failure_at", "narrative.daily_learn_failed", "error"
+    ),
+    LearnCycleOutcome.OPTIONAL_COMMENTARY_DISABLED: CycleReporting(
+        None, "narrative.weekly_learn_skipped", "info"
+    ),
+    LearnCycleOutcome.OPTIONAL_COMMENTARY_SUCCESS: CycleReporting(
+        "last_weekly_learn_success_at", "narrative.weekly_learn_success", "info"
+    ),
+    LearnCycleOutcome.OPTIONAL_COMMENTARY_FAILED: CycleReporting(
+        "last_weekly_learn_failure_at", "narrative.weekly_learn_failed", "error"
+    ),
+}
+
+
 class LearnOutcome(str, Enum):
     """Explicit result of a learn cycle. Replaces bare ``None``.
 
     ``None`` was ambiguous between "nothing to do" and "crashed", which is
     precisely how a hard provider failure passed for a quiet no-op.
+
+    Scope note: this is the *provider-era* result enum, retained for the
+    Anthropic commentary path's error classification. It is NOT the
+    scheduler-facing vocabulary — that is :class:`LearnCycleOutcome`.
     """
 
     SUCCESS = "SUCCESS"
@@ -80,7 +192,10 @@ class ProviderHealth(str, Enum):
 # module emits, because provider errors sometimes echo request context back.
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]+"), "sk-ant-<redacted>"),
-    (re.compile(r"(?i)(authorization|x-api-key)\s*[:=]\s*\S+"), r"\1: <redacted>"),
+    # Consume to end-of-line, not just the next token. `\S+` stopped at the
+    # scheme in the standard `Authorization: Bearer <token>` form and left the
+    # token itself in the log — the single most likely shape to appear.
+    (re.compile(r"(?i)(authorization|x-api-key)\s*[:=]\s*[^\r\n]+"), r"\1: <redacted>"),
     (re.compile(r"(?i)\"api_key\"\s*:\s*\"[^\"]*\""), '"api_key": "<redacted>"'),
 )
 
@@ -99,6 +214,47 @@ def redact(text: str | None) -> str | None:
     for pattern, replacement in _REDACTIONS:
         out = pattern.sub(replacement, out)
     return out[:_MAX_MESSAGE_CHARS]
+
+
+_MAX_TRACEBACK_FRAMES = 8
+_MAX_TRACEBACK_CHARS = 4000
+
+
+def safe_traceback(exc: BaseException) -> str | None:
+    """Formatted traceback, redacted and bounded. Frames only — no values.
+
+    ``structlog``'s JSONRenderer is configured without ``format_exc_info``, so
+    ``logger.exception`` emits an event with no traceback content at all. That
+    is defect #2 of the four that hid a hard provider failure for ~34 days: the
+    error events existed and carried nothing diagnostic.
+
+    Rather than reconfigure process-wide logging (deferred — it changes every
+    module's output shape at once), this renders the traceback into an ordinary
+    string field the JSON renderer will carry.
+
+    Safety: ``traceback.format_exception`` prints source lines and the exception
+    message, never local variable values, so no credential, header, prompt,
+    provider payload or wallet key can enter through a frame. The message is
+    still passed through :func:`redact` because provider errors sometimes echo
+    request context back, and the tail is bounded so a deep recursion cannot
+    flood the log.
+    """
+    import traceback
+
+    try:
+        frames = traceback.format_exception(
+            type(exc), exc, exc.__traceback__, limit=_MAX_TRACEBACK_FRAMES
+        )
+    except Exception:  # pragma: no cover - formatting must never mask the error
+        return None
+    rendered = "".join(frames)
+    for pattern, replacement in _REDACTIONS:
+        rendered = pattern.sub(replacement, rendered)
+    if len(rendered) > _MAX_TRACEBACK_CHARS:
+        # Keep the TAIL: the innermost frame and the exception line are where
+        # the cause is, and they are last.
+        rendered = "...<truncated>...\n" + rendered[-_MAX_TRACEBACK_CHARS:]
+    return rendered
 
 
 def classify_provider_error(exc: BaseException) -> tuple[LearnOutcome, ProviderHealth]:

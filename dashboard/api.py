@@ -556,7 +556,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 )
             return result
         except Exception:
-            logger.exception("strategy_lock_update_failed", key=key)
+            # `_log`, not `logger` — this module binds only `_log` (top of file).
+            # As written, a DB error raised NameError from inside the handler,
+            # so the operator got an unhandled exception instead of the clean
+            # 500 this block exists to produce — on the recovery path itself.
+            _log.exception("strategy_lock_update_failed", key=key)
             return JSONResponse(
                 status_code=500, content={"detail": "lock update failed"}
             )

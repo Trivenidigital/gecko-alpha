@@ -118,7 +118,7 @@ class TestProviderDeathDoesNotStopLearning:
         try:
             result = await run_deterministic_daily_learn(_Db(conn), _Strategy())
             assert result.verdict in set(ProposalVerdict)
-            assert result.is_success or result.is_skipped
+            assert result.verdict is not ProposalVerdict.FAILED
             assert result.population_size > 0
             assert result.snapshot_sha256
         finally:
@@ -181,7 +181,11 @@ class TestNoParameterMutation:
             rows = await cur.fetchall()
             assert len(rows) == 1
             assert rows[0]["cycle_type"] == "daily_deterministic"
-            rec = json.loads(rows[0]["reflection_text"])
+            payload = json.loads(rows[0]["reflection_text"])
+            # Two subtrees: the deterministic evaluation, and the run-varying
+            # envelope. Split so the determinism guarantee stays checkable —
+            # `evaluation` is byte-identical across runs on one population.
+            rec = payload["evaluation"]
             # Provenance the owner can audit a proposal against.
             for required in (
                 "snapshot_sha256",
@@ -190,9 +194,13 @@ class TestNoParameterMutation:
                 "candidates",
                 "rejections",
                 "verdict",
+                "outcome",
             ):
                 assert required in rec, f"provenance record missing {required}"
             assert rec["verdict"] == result.verdict.value
+            assert rec["outcome"] == result.cycle_outcome.value
+            for required in ("correlation_id", "elapsed_ms", "failing_step"):
+                assert required in payload["runtime"]
         finally:
             await conn.close()
 
@@ -235,11 +243,33 @@ class TestSchedulerTelemetry:
         src = Path(agent.__file__).read_text("utf-8")
         assert 'set_timestamp("last_daily_learn_at", now)' not in src
         assert 'logger.info("narrative.daily_learn_complete")' not in src
-        # and the replacements exist
-        assert "last_daily_learn_attempt_at" in src
-        assert "last_daily_learn_success_at" in src
-        assert "last_daily_learn_failure_at" in src
-        assert "narrative.daily_learn_failed" in src
+        # The only unconditional strategy write in the daily block is the
+        # ATTEMPT stamp; success and failure clocks are chosen by outcome.
+        assert 'set_timestamp("last_daily_learn_attempt_at", now)' in src
+
+    def test_every_daily_clock_is_selected_by_outcome_not_by_branch(self):
+        """Success/failure clocks live in the outcome table, not in the agent.
+
+        Previously the agent chose a clock inline from `is_success` /
+        `is_skipped` / else — three branches, one of which was reached by
+        elimination. A table keyed on the outcome cannot have an
+        else-branch.
+        """
+        from scout.narrative.learn_outcome import CYCLE_REPORTING, LearnCycleOutcome
+
+        daily = {
+            o: CYCLE_REPORTING[o]
+            for o in LearnCycleOutcome
+            if o.is_critical_to_learning
+        }
+        assert {r.state_key for r in daily.values()} == {
+            "last_daily_learn_success_at",
+            "last_daily_learn_failure_at",
+        }
+        # only a completed evaluation moves the success clock
+        for outcome, reporting in daily.items():
+            moves_success = reporting.state_key == "last_daily_learn_success_at"
+            assert moves_success is outcome.is_learning_success, outcome
 
 
 class TestWeeklyRequiredPathIsAnthropicFree:
@@ -286,9 +316,21 @@ class TestWeeklyRequiredPathIsAnthropicFree:
         block = src[src.index("if not settings.NARRATIVE_WEEKLY_COMMENTARY_ENABLED:") :]
         block = block[: block.index("else:")]
         assert "OPTIONAL_COMMENTARY_DISABLED" in block
-        assert "critical_to_learning=False" in block
         assert "last_weekly_learn_failure_at" not in block
-        assert "narrative.weekly_learn_skipped" in block
+
+        # Behavioural, not textual: the outcome the disabled branch selects
+        # must itself be non-critical and must move NO success/failure clock.
+        from scout.narrative.learn_outcome import CYCLE_REPORTING, LearnCycleOutcome
+
+        disabled = LearnCycleOutcome.OPTIONAL_COMMENTARY_DISABLED
+        assert disabled.is_critical_to_learning is False
+        reporting = CYCLE_REPORTING[disabled]
+        assert reporting.state_key is None, (
+            "disabled commentary must not move a success or failure clock — "
+            "either one would misreport a deliberate configuration as an event"
+        )
+        assert reporting.event == "narrative.weekly_learn_skipped"
+        assert reporting.level == "info"
 
     def test_no_unconditional_weekly_success_timestamp_or_event(self):
         """Same false-success defect the daily path had."""
@@ -299,25 +341,38 @@ class TestWeeklyRequiredPathIsAnthropicFree:
         src = Path(agent.__file__).read_text("utf-8")
         assert 'set_timestamp("last_weekly_learn_at", now)' not in src
         assert 'logger.info("narrative.weekly_learn_complete")' not in src
-        for required in (
-            "last_weekly_learn_attempt_at",
-            "last_weekly_learn_success_at",
-            "last_weekly_learn_failure_at",
-        ):
-            assert required in src
+        assert 'set_timestamp("last_weekly_learn_attempt_at", now)' in src
+
+        from scout.narrative.learn_outcome import CYCLE_REPORTING, LearnCycleOutcome
+
+        assert (
+            CYCLE_REPORTING[LearnCycleOutcome.OPTIONAL_COMMENTARY_SUCCESS].state_key
+            == "last_weekly_learn_success_at"
+        )
+        assert (
+            CYCLE_REPORTING[LearnCycleOutcome.OPTIONAL_COMMENTARY_FAILED].state_key
+            == "last_weekly_learn_failure_at"
+        )
 
     def test_commentary_failure_does_not_claim_learner_failure(self):
         """If commentary is ever re-enabled and fails, it is tagged
-        OPTIONAL_COMMENTARY_FAILED with critical_to_learning=False — it must not
-        be reported as deterministic learning failing."""
+        OPTIONAL_COMMENTARY_FAILED and marked non-critical — it must not be
+        reported as deterministic learning failing."""
         from pathlib import Path
 
         import scout.narrative.agent as agent
 
         src = Path(agent.__file__).read_text("utf-8")
         assert "OPTIONAL_COMMENTARY_FAILED" in src
-        idx = src.index("OPTIONAL_COMMENTARY_FAILED")
-        assert "critical_to_learning=False" in src[idx : idx + 200]
+
+        from scout.narrative.learn_outcome import LearnCycleOutcome
+
+        failed = LearnCycleOutcome.OPTIONAL_COMMENTARY_FAILED
+        assert failed.is_critical_to_learning is False
+        assert failed.is_learning_success is False
+        # and it is a DIFFERENT member from the deterministic failure, so the
+        # two can never be confused in a log query
+        assert failed is not LearnCycleOutcome.FAILED
 
 
 class TestLongHoldCannotEnterSignalDispatch:

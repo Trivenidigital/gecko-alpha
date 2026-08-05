@@ -988,64 +988,20 @@ class TestSystemHealth:
 
 
 class TestStrategyAuditAtomicity:
-    """Structural checks on the mutation/audit write path.
+    """Endpoint-level checks on the mutation/audit write path.
 
-    These verify ordering, a single commit, and a shared connection. They do NOT
-    prove atomicity — rollback failure-injection tests (force the audit INSERT to
-    raise; assert the state change reverted, and the converse) are the real proof
-    and remain outstanding.
+    The structural grep tests that used to live here — source ordering, one
+    `commit()`, no `CREATE TABLE` in the audit writer — have been REMOVED, not
+    relocated. Source order says nothing about what the database does when a
+    statement between two writes raises, so they could not prove the property
+    they were named after.
+
+    The proof is now `tests/test_strategy_audit_atomicity.py`: failure injected
+    at the audit INSERT, at the UPDATE, and at the SQL layer, asserting the
+    committed end state through a separate connection. It was verified against
+    three deliberate mutants (intervening commit, DDL inside the audit writer,
+    audit on its own connection), each of which turns it red.
     """
-
-    def test_the_audit_writer_contains_no_ddl(self):
-        """DDL inside the audit writer silently breaks atomicity."""
-        import inspect
-
-        import dashboard.db as ddb
-
-        # Strip the docstring first: it *describes* the hazard by name, and a
-        # naive substring check would match the explanation rather than code —
-        # the self-referential-grep trap.
-        import ast
-
-        tree = ast.parse(inspect.getsource(ddb._audit_strategy_change).lstrip())
-        fn = tree.body[0]
-        if (
-            fn.body
-            and isinstance(fn.body[0], ast.Expr)
-            and isinstance(fn.body[0].value, ast.Constant)
-        ):
-            fn.body = fn.body[1:]
-        src = ast.unparse(fn)
-        assert "CREATE TABLE" not in src, (
-            "DDL in the audit writer implicitly COMMITs and splits the "
-            "state change from its audit row"
-        )
-
-    def test_ddl_is_hoisted_and_committed_before_the_state_change(self):
-        import inspect
-
-        import dashboard.db as ddb
-
-        assert "CREATE TABLE" in inspect.getsource(ddb._ensure_audit_table)
-        for fn in (ddb.update_narrative_strategy, ddb.set_strategy_lock):
-            src = inspect.getsource(fn)
-            assert "_ensure_audit_table(conn)" in src
-            # DDL must precede the mutation
-            assert src.index("_ensure_audit_table(conn)") < src.index(
-                "UPDATE agent_strategy"
-            )
-
-    def test_update_and_audit_share_one_commit(self):
-        """Exactly one commit after both the UPDATE and the audit INSERT."""
-        import inspect
-
-        import dashboard.db as ddb
-
-        src = inspect.getsource(ddb.update_narrative_strategy)
-        i_update = src.index("UPDATE agent_strategy")
-        i_audit = src.index("_audit_strategy_change(")
-        i_commit = src.index("conn.commit()", i_audit)
-        assert i_update < i_audit < i_commit
 
     async def test_a_value_update_writes_a_matching_audit_row(self, client):
         await client.put(

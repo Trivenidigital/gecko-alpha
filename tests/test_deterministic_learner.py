@@ -115,7 +115,7 @@ class TestProposalOnly:
 class TestOverfittingGuards:
     def test_insufficient_sample_refuses_to_propose(self):
         p = evaluate([_rec(1, "1.0") for _ in range(10)], CURRENT, BOUNDS)
-        assert p.verdict is ProposalVerdict.INSUFFICIENT_OR_UNSTABLE_EVIDENCE
+        assert p.verdict is ProposalVerdict.INSUFFICIENT_EVIDENCE
         assert any("insufficient sample" in r for r in p.rejections)
 
     def test_split_is_chronological_not_random(self):
@@ -143,7 +143,8 @@ class TestOverfittingGuards:
         p = evaluate(_population(300, "1.0"), CURRENT, BOUNDS)
         assert p.verdict in (
             ProposalVerdict.NO_CHANGE,
-            ProposalVerdict.INSUFFICIENT_OR_UNSTABLE_EVIDENCE,
+            ProposalVerdict.INSUFFICIENT_EVIDENCE,
+            ProposalVerdict.UNSTABLE_EVIDENCE,
         )
         assert p.proposed == []
 
