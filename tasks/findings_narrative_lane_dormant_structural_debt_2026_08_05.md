@@ -13,12 +13,60 @@ not lifted, learner not run.
 ```
 NARRATIVE_PREDICTION_CURRENT_STATE: QUARANTINED
 LEARNER_SCHEDULING: ACTIVE
-QUALIFYING_SAMPLE: 5 / 100
+QUALIFYING_SAMPLE: 932 / 100  (MET — 9.3x; see CORRECTION below)
 LAST PARAMETER CHANGE: 2026-06-02
 RESTRICTIVE_BOUND PARAMETERS: 2 / 14
 CURRENT BEHAVIORAL IMPACT: NONE WHILE QUARANTINED
-REVIVAL STATUS: BLOCKED_PENDING_LEARNER_RESEED_OR_EXPLORATION_PLAN
+REVIVAL STATUS: BLOCKED_PENDING_LEARNER_FIX
 ```
+
+---
+
+## *** CORRECTION (2026-08-05, post-publication) — the sample gate was measured on the wrong table ***
+
+An earlier revision of this document, and the status block it was built from,
+recorded `QUALIFYING_SAMPLE: 5 / 100`. **That is wrong**, and the error is mine —
+it propagated from an in-session claim into the status block.
+
+**5** was the count of *narrative paper trades* since 2026-07-01. The learner does
+not read `paper_trades`. Its sample gate is inside `apply_adjustments`
+(`scout/narrative/learner.py:104-127`) and reads the **`predictions`** table:
+
+```sql
+SELECT COUNT(*) FROM predictions
+ WHERE is_control = 0 AND outcome_class IS NOT NULL AND outcome_class != 'UNRESOLVED'
+```
+
+Actual value: **932**, against `min_sample = 100`. The requirement is **met by
+9.3x**, and **877 already qualified before 2026-06-02** — the last successful
+parameter change. The sample has *never* been the constraint.
+
+`predictions` accumulate independently of paper-trade dispatch (3-33/day through
+2026-08-04, resolving normally), so **the quarantine does not starve the learner.**
+
+### What this invalidates
+
+1. **There is no bootstrap paradox.** Gate G4 below was built on the premise that
+   revival would require 100 outcomes generated through the frozen filter. That
+   premise is false. No exploration phase, no lowered `min_sample`, and no staged
+   widening is required. **G4 is withdrawn.**
+2. **The two-condition claim in §5 is wrong.** It stated that restoring adaptation
+   needs *both* a working learner *and* a sample the quarantine prevents
+   accumulating. Only the first condition is real.
+3. **The failure is upstream of the sample check entirely.** `learn.skip_adjustments`
+   (INFO, step 6) fired **0 times in 7 days** while `learn.daily_error` fired **7**.
+   The run crashes before `apply_adjustments` is reached — consistent with the
+   retired-model hypothesis at step 4.
+
+### Corrected conclusion
+
+**Fix the learner and adaptation resumes immediately.** 932 qualifying predictions
+are waiting; the next successful cycle can act on them. This is a materially
+simpler and cheaper remediation than the document originally described.
+
+The 7-day evidence window also supersedes the 3-day counts in §2:
+`learn.daily_error` **7 / 7 days**, `learn.daily_complete` **0**,
+`learn.weekly_complete` **0**.
 
 ---
 
@@ -173,8 +221,9 @@ Accurate statement:
 > adaptation additionally requires ≥100 qualifying outcomes, which the dispatch
 > quarantine currently prevents accumulating.
 
-Two independent conditions, not one: **the learner is broken** *and* **the
-sample is unavailable**. Fixing either alone does not restore adaptation.
+**CORRECTED:** one condition, not two. **The learner is broken.** The sample is
+*not* unavailable — 932 qualifying predictions exceed the 100 required. Fixing the
+learner alone restores adaptation.
 
 ## 6. Mandatory revival gate
 
@@ -205,7 +254,12 @@ written justification for retaining them. Retaining `laggard_min_volume` at its
 ceiling must be a **decision**, not an inheritance from a dead learner. Record
 the chosen values and the reason in the revival record.
 
-**G4 — Bootstrap plan for the 100-outcome sample.** State up front how the
+**G4 — WITHDRAWN.** See the CORRECTION at the top: the 932-prediction sample
+already exceeds `min_sample=100` by 9.3x and accumulates independently of the
+quarantine. No bootstrap plan is required. The original text is retained below,
+struck through, only so the reasoning error remains auditable.
+
+~~**G4 — Bootstrap plan for the 100-outcome sample.**~~ State up front how the
 sample will be produced without the frozen filter biasing it. Acceptable
 approaches, operator's choice:
   - **Exploration phase** — deliberately widened params for a bounded period to
