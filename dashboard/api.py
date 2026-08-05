@@ -505,6 +505,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     class StrategyUpdate(BaseModel):
         value: str
+        # None = leave lock state untouched. Editing a value must not silently
+        # lock the key — that one-way door removed parameters from both the
+        # learner and this endpoint with no exposed recovery.
+        lock: bool | None = None
+        reason: str | None = None
+
+    class StrategyLockUpdate(BaseModel):
+        lock: bool
+        reason: str
 
     STRATEGY_BOUNDS = {
         "category_accel_threshold": (2.0, 15.0),
@@ -521,6 +530,36 @@ def create_app(db_path: str | None = None) -> FastAPI:
         "min_learn_sample": (50, 500),
         "min_trigger_count": (1, 10),
     }
+
+    @app.put("/api/narrative/strategy/{key}/lock")
+    async def set_narrative_strategy_lock(key: str, body: StrategyLockUpdate):
+        """Explicitly lock or unlock a parameter WITHOUT changing its value.
+
+        The recovery path the previous design lacked: locking was an unavoidable
+        side effect of editing and there was no unlock route at all, so a manual
+        edit was irreversible without direct SQL. `reason` is required.
+        """
+        from fastapi.responses import JSONResponse
+
+        if not (body.reason or "").strip():
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "reason is required for a lock state change"},
+            )
+        try:
+            result = await db.set_strategy_lock(
+                _db_path, key, lock=body.lock, operator="manual", reason=body.reason
+            )
+            if result is None:
+                return JSONResponse(
+                    status_code=404, content={"detail": f"Key '{key}' not found"}
+                )
+            return result
+        except Exception:
+            logger.exception("strategy_lock_update_failed", key=key)
+            return JSONResponse(
+                status_code=500, content={"detail": "lock update failed"}
+            )
 
     @app.put("/api/narrative/strategy/{key}")
     async def update_narrative_strategy(key: str, body: StrategyUpdate):
@@ -564,7 +603,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         },
                     )
 
-            result = await db.update_narrative_strategy(_db_path, key, body.value)
+            result = await db.update_narrative_strategy(
+                _db_path,
+                key,
+                body.value,
+                lock=body.lock,
+                operator="manual",
+                reason=body.reason,
+            )
             if result is None:
                 return JSONResponse(
                     status_code=404, content={"detail": f"Key '{key}' not found"}

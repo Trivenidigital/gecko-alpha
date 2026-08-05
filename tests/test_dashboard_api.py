@@ -774,7 +774,17 @@ class TestNarrativeStrategy:
         keys = [r["key"] for r in data]
         assert "top_n" in keys
 
-    async def test_update_strategy(self, client):
+    async def test_update_strategy_preserves_lock_state(self, client):
+        """*** THE ONE-WAY DOOR, CORRECTED. ***
+
+        This previously asserted `locked == 1` — it pinned the defect as
+        expected behaviour. Editing a value hard-set locked=1, and no unlock
+        route existed, so one manual edit removed the key from BOTH the learner
+        (Strategy.set raises on locked) and this endpoint (which rejects locked
+        keys), recoverable only by direct SQL.
+
+        Value editing and locking are now separate decisions.
+        """
         resp = await client.put(
             "/api/narrative/strategy/top_n",
             json={"value": "10"},
@@ -782,8 +792,49 @@ class TestNarrativeStrategy:
         assert resp.status_code == 200
         data = resp.json()
         assert data["value"] == "10"
-        assert data["locked"] == 1
+        assert data["locked"] == 0, "editing a value must not silently lock the key"
         assert data["updated_by"] == "manual"
+
+    async def test_update_can_lock_explicitly(self, client):
+        resp = await client.put(
+            "/api/narrative/strategy/top_n",
+            json={"value": "11", "lock": True, "reason": "operator freeze"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["locked"] == 1
+
+    async def test_lock_route_requires_a_reason(self, client):
+        """A lock with no recorded rationale is indistinguishable from an
+        accident months later."""
+        resp = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "   "},
+        )
+        assert resp.status_code == 400
+
+    async def test_unlock_route_exists_and_reverses_a_lock(self, client):
+        """The recovery path the previous design lacked entirely."""
+        locked = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "freeze for review"},
+        )
+        assert locked.status_code == 200 and locked.json()["locked"] == 1
+        unlocked = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": False, "reason": "review complete"},
+        )
+        assert unlocked.status_code == 200
+        assert unlocked.json()["locked"] == 0
+
+    async def test_lock_change_does_not_alter_the_value(self, client):
+        before = (await client.get("/api/narrative/strategy")).json()
+        original = [r for r in before if r["key"] == "top_n"][0]["value"]
+        await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "value must not move"},
+        )
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] == original
 
     async def test_update_nonexistent_key_returns_404(self, client):
         resp = await client.put(
