@@ -114,6 +114,36 @@ class LearnProposal:
     commentary: str | None = None
     commentary_status: str = "NOT_ATTEMPTED"
 
+    @property
+    def is_success(self) -> bool:
+        """A completed evaluation. NO_CHANGE is a success — the learner ran and
+        correctly concluded nothing should move."""
+        return self.verdict in (
+            ProposalVerdict.NO_CHANGE,
+            ProposalVerdict.PROPOSED_CHANGE_FOR_OWNER_REVIEW,
+        )
+
+    @property
+    def is_skipped(self) -> bool:
+        return self.verdict is ProposalVerdict.INSUFFICIENT_OR_UNSTABLE_EVIDENCE
+
+    def log_fields(self) -> dict[str, Any]:
+        """Secret-safe structured fields. Contains no credential and no prompt —
+        this learner never handles either."""
+        return {
+            "outcome": self.verdict.value,
+            "algorithm_version": self.algorithm_version,
+            "snapshot_sha256": self.snapshot_sha256[:16],
+            "population_size": self.population_size,
+            "train_n": self.train_n,
+            "validation_n": self.validation_n,
+            "candidates_tested": len(self.candidates),
+            "proposed_count": len(self.proposed),
+            "rejection_count": len(self.rejections),
+            "commentary_status": self.commentary_status,
+            "dry_run": True,
+        }
+
     def as_record(self) -> dict[str, Any]:
         """Durable provenance record. Persisted verbatim by the caller."""
         return {
@@ -471,3 +501,60 @@ async def load_records(conn: Any) -> list[PredictionRecord]:
 
 def proposal_json(proposal: LearnProposal) -> str:
     return json.dumps(proposal.as_record(), indent=2, sort_keys=True, default=str)
+
+
+async def run_deterministic_daily_learn(db: Any, strategy: Any) -> LearnProposal:
+    """THE RUNTIME LEARNING PATH. Scheduled daily; mutates no parameter.
+
+    This is the function the scheduler calls. It deliberately takes no API key
+    and constructs no provider client, so the runtime learning path has no
+    provider dependency at all — the property the previous architecture lacked,
+    which is why a billing outage stopped learning for ~34 days.
+
+    Writes exactly one row to ``learn_logs`` as a durable provenance record
+    (snapshot hash, algorithm version, baseline, candidates, rejections). That
+    is a history row, NOT a parameter mutation: no ``Strategy.set`` is called
+    and no value or lock state changes.
+    """
+    conn = db._conn
+    if conn is None:
+        raise RuntimeError("Database not initialized.")
+
+    from scout.narrative.strategy import STRATEGY_BOUNDS
+
+    records = await load_records(conn)
+
+    cursor = await conn.execute("SELECT key, value, locked FROM agent_strategy")
+    params: dict[str, Any] = {}
+    locked: list[str] = []
+    for key, raw, is_locked in await cursor.fetchall():
+        try:
+            params[key] = json.loads(raw)
+        except Exception:
+            params[key] = raw
+        if is_locked:
+            locked.append(key)
+
+    proposal = evaluate(records, params, STRATEGY_BOUNDS, locked_keys=locked)
+
+    cursor = await conn.execute("SELECT MAX(cycle_number) FROM learn_logs")
+    row = await cursor.fetchone()
+    cycle_number = (row[0] or 0) + 1
+    await conn.execute(
+        """INSERT INTO learn_logs
+           (cycle_number, cycle_type, reflection_text, changes_made,
+            hit_rate_before, hit_rate_after)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            cycle_number,
+            "daily_deterministic",
+            proposal_json(proposal),
+            # changes_made records the PROPOSAL, not an application. Applying is
+            # an owner-gated decision this delivery does not implement.
+            json.dumps(proposal.proposed),
+            None,
+            None,
+        ),
+    )
+    await conn.commit()
+    return proposal

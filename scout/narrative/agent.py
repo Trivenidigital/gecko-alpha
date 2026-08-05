@@ -28,7 +28,10 @@ from scout.heartbeat import _heartbeat_stats
 from scout.losers.tracker import compare_losers_with_signals
 from scout.narrative.digest import format_heating_alert
 from scout.narrative.evaluator import evaluate_pending
-from scout.narrative.learner import daily_learn, weekly_consolidate
+from scout.narrative.deterministic_learner import (
+    run_deterministic_daily_learn,
+)
+from scout.narrative.learner import weekly_consolidate
 from scout.narrative.models import NarrativePrediction
 from scout.narrative.observer import (
     compute_acceleration,
@@ -670,13 +673,17 @@ async def narrative_agent_loop(
                 now.hour == settings.NARRATIVE_LEARN_HOUR_UTC
                 and (now - last_daily_learn_at).total_seconds() >= 23 * 3600
             ):
+                # Attempt timestamp is stamped BEFORE the work, and is the only
+                # unconditional one. Previously `last_daily_learn_at` was written
+                # after the call regardless of outcome, so ~34 days of hard
+                # provider failures recorded state that looked like success.
+                await strategy.set_timestamp("last_daily_learn_attempt_at", now)
+                learn_result = None
                 try:
-                    await daily_learn(
-                        db,
-                        strategy,
-                        api_key=settings.ANTHROPIC_API_KEY,
-                        model=settings.NARRATIVE_LEARN_MODEL,
-                    )
+                    # DETERMINISTIC learner. No provider, no credentials, no
+                    # network — so it cannot fail for billing reasons, which is
+                    # exactly how the previous Anthropic-only path died silently.
+                    learn_result = await run_deterministic_daily_learn(db, strategy)
                     await prune_old_snapshots(
                         db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS
                     )
@@ -707,11 +714,34 @@ async def narrative_agent_loop(
                     # directly. Other daily-learn operations (daily_learn LLM,
                     # tracker prunes, strategy.set_timestamp, paper-trade digest)
                     # remain intact above and below this comment.
+                    # Advance the cadence clock either way — a failed cycle must
+                    # not retry every tick — but record SUCCESS only on a real
+                    # success, and emit the event that matches the outcome.
                     last_daily_learn_at = now
-                    await strategy.set_timestamp("last_daily_learn_at", now)
-                    logger.info("narrative.daily_learn_complete")
+                    if learn_result is not None and learn_result.is_success:
+                        await strategy.set_timestamp("last_daily_learn_success_at", now)
+                        logger.info(
+                            "narrative.daily_learn_success", **learn_result.log_fields()
+                        )
+                    elif learn_result is not None and learn_result.is_skipped:
+                        await strategy.set_timestamp("last_daily_learn_failure_at", now)
+                        logger.info(
+                            "narrative.daily_learn_skipped", **learn_result.log_fields()
+                        )
+                    else:
+                        await strategy.set_timestamp("last_daily_learn_failure_at", now)
+                        logger.error(
+                            "narrative.daily_learn_failed",
+                            **(
+                                learn_result.log_fields()
+                                if learn_result is not None
+                                else {"outcome": "FAILED_INTERNAL"}
+                            ),
+                        )
                 except Exception:
-                    logger.exception("narrative.daily_learn_error")
+                    last_daily_learn_at = now
+                    await strategy.set_timestamp("last_daily_learn_failure_at", now)
+                    logger.exception("narrative.daily_learn_failed")
 
                 # Paper trading daily digest
                 if trading_engine:
