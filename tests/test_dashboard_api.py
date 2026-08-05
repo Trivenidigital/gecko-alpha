@@ -988,18 +988,12 @@ class TestSystemHealth:
 
 
 class TestStrategyAuditAtomicity:
-    """A state change and its audit row must commit together.
+    """Structural checks on the mutation/audit write path.
 
-    These are STRUCTURAL checks only — ordering, single commit, same
-    connection. They do not by themselves prove atomicity; failure-injection
-    tests (forcing the audit INSERT to raise and asserting the UPDATE rolled
-    back) are the real proof and are still outstanding.
-
-    A retracted claim, kept visible so it is not re-derived: an earlier revision
-    said SQLite implicitly COMMITs before DDL. Measured on this stack
-    (Python 3.14.3 / SQLite 3.50.4 / aiosqlite 0.22.1, isolation_level "") the
-    sequence UPDATE → execute("CREATE TABLE …") → ROLLBACK rolls the UPDATE
-    back. Ordinary DDL does NOT commit a pending transaction here.
+    These verify ordering, a single commit, and a shared connection. They do NOT
+    prove atomicity — rollback failure-injection tests (force the audit INSERT to
+    raise; assert the state change reverted, and the converse) are the real proof
+    and remain outstanding.
     """
 
     def test_the_audit_writer_contains_no_ddl(self):

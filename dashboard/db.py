@@ -416,12 +416,10 @@ async def get_narrative_strategy(db_path: str) -> list[dict]:
 
 
 async def _ensure_audit_table(conn) -> None:
-    """Create the audit table, separately from any business transaction.
+    """Create the audit table, outside any business transaction.
 
-    Kept out of `_audit_strategy_change` so that writer does only its INSERT and
-    stays inside the caller's transaction. This is organisational separation —
-    it is NOT a workaround for implicit-commit-on-DDL, which was measured and
-    does not occur on this stack.
+    Kept separate from `_audit_strategy_change` so that writer performs only its
+    INSERT and stays within the caller's transaction.
     """
     await conn.execute("""CREATE TABLE IF NOT EXISTS agent_strategy_audit (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -443,22 +441,16 @@ async def _audit_strategy_change(
     reason: str | None,
     at: str,
 ) -> None:
-    """Durable audit row. INSERT ONLY — schema creation lives elsewhere.
+    """Write the audit row for a strategy change. INSERT only.
 
-    This function must run inside the caller's open transaction so the state
-    change and its audit record commit together. It therefore does only the
-    INSERT; table creation is in `_ensure_audit_table`, called beforehand.
+    Must run inside the caller's open transaction so the state change and this
+    record commit together. Schema creation is `_ensure_audit_table`, called
+    before the transaction begins.
 
-    NOTE ON A RETRACTED CLAIM: an earlier revision justified this split by
-    asserting that SQLite implicitly COMMITs before DDL. That was measured and
-    is FALSE on this stack — Python 3.14.3 / SQLite 3.50.4 / aiosqlite 0.22.1
-    with isolation_level "". The sequence UPDATE → execute("CREATE TABLE …") →
-    ROLLBACK rolls the UPDATE back, so ordinary DDL does not commit a pending
-    transaction here.
-
-    The split is retained as clean separation of schema initialisation from the
-    transaction-critical writer path, NOT as a workaround for driver behaviour.
-    Atomicity is established by failure-injection tests, not by this structure.
+    Atomicity is guaranteed by rollback failure-injection tests, not by this
+    function's structure. (An earlier revision justified the split with an
+    implicit-commit-on-DDL claim that was measured and is false on this stack;
+    see the commit history.)
     """
     await conn.execute(
         """INSERT INTO agent_strategy_audit
