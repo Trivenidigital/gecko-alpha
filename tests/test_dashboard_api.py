@@ -985,3 +985,89 @@ class TestSystemHealth:
         data = resp.json()
         assert data["candidates"]["count"] == 0
         assert data["candidates"]["latest"] is None
+
+
+class TestStrategyAuditAtomicity:
+    """A state change and its audit row must commit together.
+
+    These are STRUCTURAL checks only — ordering, single commit, same
+    connection. They do not by themselves prove atomicity; failure-injection
+    tests (forcing the audit INSERT to raise and asserting the UPDATE rolled
+    back) are the real proof and are still outstanding.
+
+    A retracted claim, kept visible so it is not re-derived: an earlier revision
+    said SQLite implicitly COMMITs before DDL. Measured on this stack
+    (Python 3.14.3 / SQLite 3.50.4 / aiosqlite 0.22.1, isolation_level "") the
+    sequence UPDATE → execute("CREATE TABLE …") → ROLLBACK rolls the UPDATE
+    back. Ordinary DDL does NOT commit a pending transaction here.
+    """
+
+    def test_the_audit_writer_contains_no_ddl(self):
+        """DDL inside the audit writer silently breaks atomicity."""
+        import inspect
+
+        import dashboard.db as ddb
+
+        # Strip the docstring first: it *describes* the hazard by name, and a
+        # naive substring check would match the explanation rather than code —
+        # the self-referential-grep trap.
+        import ast
+
+        tree = ast.parse(inspect.getsource(ddb._audit_strategy_change).lstrip())
+        fn = tree.body[0]
+        if (
+            fn.body
+            and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)
+        ):
+            fn.body = fn.body[1:]
+        src = ast.unparse(fn)
+        assert "CREATE TABLE" not in src, (
+            "DDL in the audit writer implicitly COMMITs and splits the "
+            "state change from its audit row"
+        )
+
+    def test_ddl_is_hoisted_and_committed_before_the_state_change(self):
+        import inspect
+
+        import dashboard.db as ddb
+
+        assert "CREATE TABLE" in inspect.getsource(ddb._ensure_audit_table)
+        for fn in (ddb.update_narrative_strategy, ddb.set_strategy_lock):
+            src = inspect.getsource(fn)
+            assert "_ensure_audit_table(conn)" in src
+            # DDL must precede the mutation
+            assert src.index("_ensure_audit_table(conn)") < src.index(
+                "UPDATE agent_strategy"
+            )
+
+    def test_update_and_audit_share_one_commit(self):
+        """Exactly one commit after both the UPDATE and the audit INSERT."""
+        import inspect
+
+        import dashboard.db as ddb
+
+        src = inspect.getsource(ddb.update_narrative_strategy)
+        i_update = src.index("UPDATE agent_strategy")
+        i_audit = src.index("_audit_strategy_change(")
+        i_commit = src.index("conn.commit()", i_audit)
+        assert i_update < i_audit < i_commit
+
+    async def test_a_value_update_writes_a_matching_audit_row(self, client):
+        await client.put(
+            "/api/narrative/strategy/top_n",
+            json={"value": "77", "reason": "atomicity check"},
+        )
+        # the audit row must exist alongside the committed value
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] == "77"
+
+    async def test_a_locked_key_cannot_be_changed_by_an_ordinary_update(self, client):
+        await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "freeze"},
+        )
+        resp = await client.put("/api/narrative/strategy/top_n", json={"value": "999"})
+        assert resp.status_code == 403
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] != "999"

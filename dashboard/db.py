@@ -415,6 +415,22 @@ async def get_narrative_strategy(db_path: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+async def _ensure_audit_table(conn) -> None:
+    """Create the audit table, separately from any business transaction.
+
+    Kept out of `_audit_strategy_change` so that writer does only its INSERT and
+    stays inside the caller's transaction. This is organisational separation —
+    it is NOT a workaround for implicit-commit-on-DDL, which was measured and
+    does not occur on this stack.
+    """
+    await conn.execute("""CREATE TABLE IF NOT EXISTS agent_strategy_audit (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             key TEXT NOT NULL, old_value TEXT, new_value TEXT,
+             old_locked INTEGER, new_locked INTEGER,
+             operator TEXT NOT NULL, reason TEXT, changed_at TEXT NOT NULL)""")
+    await conn.commit()
+
+
 async def _audit_strategy_change(
     conn,
     *,
@@ -427,12 +443,23 @@ async def _audit_strategy_change(
     reason: str | None,
     at: str,
 ) -> None:
-    """Durable audit row for every value and/or lock-state change."""
-    await conn.execute("""CREATE TABLE IF NOT EXISTS agent_strategy_audit (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             key TEXT NOT NULL, old_value TEXT, new_value TEXT,
-             old_locked INTEGER, new_locked INTEGER,
-             operator TEXT NOT NULL, reason TEXT, changed_at TEXT NOT NULL)""")
+    """Durable audit row. INSERT ONLY — schema creation lives elsewhere.
+
+    This function must run inside the caller's open transaction so the state
+    change and its audit record commit together. It therefore does only the
+    INSERT; table creation is in `_ensure_audit_table`, called beforehand.
+
+    NOTE ON A RETRACTED CLAIM: an earlier revision justified this split by
+    asserting that SQLite implicitly COMMITs before DDL. That was measured and
+    is FALSE on this stack — Python 3.14.3 / SQLite 3.50.4 / aiosqlite 0.22.1
+    with isolation_level "". The sequence UPDATE → execute("CREATE TABLE …") →
+    ROLLBACK rolls the UPDATE back, so ordinary DDL does not commit a pending
+    transaction here.
+
+    The split is retained as clean separation of schema initialisation from the
+    transaction-critical writer path, NOT as a workaround for driver behaviour.
+    Atomicity is established by failure-injection tests, not by this structure.
+    """
     await conn.execute(
         """INSERT INTO agent_strategy_audit
            (key, old_value, new_value, old_locked, new_locked, operator,
@@ -453,6 +480,9 @@ async def set_strategy_lock(
     indistinguishable from an accident months later.
     """
     async with _rw_db(db_path) as conn:
+        # DDL first, committed alone, so the state change below shares a single
+        # transaction with its audit row.
+        await _ensure_audit_table(conn)
         now = datetime.now(timezone.utc).isoformat()
         cur = await conn.execute(
             "SELECT value, locked FROM agent_strategy WHERE key = ?", (key,)
@@ -506,6 +536,9 @@ async def update_narrative_strategy(
     timestamp and reason.
     """
     async with _rw_db(db_path) as conn:
+        # DDL first, committed alone, so the state change below shares a single
+        # transaction with its audit row.
+        await _ensure_audit_table(conn)
         now = datetime.now(timezone.utc).isoformat()
         cur = await conn.execute(
             "SELECT value, locked FROM agent_strategy WHERE key = ?", (key,)
