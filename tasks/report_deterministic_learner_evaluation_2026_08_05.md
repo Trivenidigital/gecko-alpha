@@ -90,19 +90,21 @@ decision, not a side effect of an observability delivery.
 
 Telemetry for the remaining 11 is explicitly **deferred**, not delivered.
 
-**Named residual finding — two bounds tables have drifted.** `STRATEGY_BOUNDS` is
-defined twice: `scout/narrative/strategy.py:38` (14 keys) and a separate copy
-inside `dashboard/api.py:517` (13 keys). The API copy is missing
-`counter_suppress_threshold`, so the operator-facing PUT endpoint applies **no
-bounds validation** to that parameter — any numeric value is accepted, and the
-learner would then build its candidate grid clamped around an out-of-bounds
-current value.
+**~~Named residual finding — two bounds tables have drifted.~~ CLOSED
+2026-08-06.** `STRATEGY_BOUNDS` was defined twice —
+`scout/narrative/strategy.py` (14 keys) and a hand-maintained copy inside
+`dashboard/api.py` (13 keys). The API copy was missing
+`counter_suppress_threshold`, so the operator-facing PUT endpoint applied **no
+bounds validation** to that parameter, and the learner would then build its
+candidate grid clamped around a possibly out-of-bounds current value.
 
-Pre-existing; the API dict predates this delivery. **Not fixed here**: adding a
-bound changes what an operator-facing endpoint accepts, which is a behaviour
-change on a validation path and an owner call, not a side effect of an
-observability delivery. Recorded with file:line so it is not rediscovered. The
-durable fix is one shared table, not a third copy.
+Now one authoritative registry at `scout/narrative/strategy_bounds.py`, a
+zero-dependency leaf module so the dashboard can consume it without importing
+`scout.db`. Four consumers import it: `Strategy.set`, the deterministic
+evaluator, the dashboard PUT endpoint, and a validation test that fails if a
+second literal definition reappears anywhere under `scout/` or `dashboard/`.
+Manual updates to `counter_suppress_threshold` are now bounds-checked to
+`(0, 100)`.
 
 ---
 
@@ -117,8 +119,10 @@ All 27 candidates were rejected. No candidate cleared the promotion gates:
 | Post-filter sample | train ≥ 30, validation ≥ 20 | A filter that keeps 4 rows proves nothing |
 | Neighbourhood stability | surviving neighbour required, within tolerance | A single-point optimum is a spike, i.e. overfit |
 
-The verdict is therefore `NO_CHANGE` — recorded here in its fuller form,
-`NO_CHANGE_WITHIN_VERIFIED_SEARCH_SPACE`, because the qualifier is load-bearing.
+The verdict is `NO_CHANGE_WITHIN_VERIFIED_SEARCH_SPACE` — since 2026-08-06 that
+qualifier is the enum's actual value, not just prose in this report, and the
+telemetry carries `searched_parameters: 3` and `unidentifiable_parameters: 11`
+alongside it. The qualifier is load-bearing.
 The learner searched 3 of 14 parameters. "No change" is a statement about those
 three and about the 27 candidate values inside their clamped grids. It is **not**
 evidence that the other 11 parameters are correctly set, and must not be cited as

@@ -74,6 +74,79 @@ from scout.trending.tracker import (
 
 logger = structlog.get_logger()
 
+# Cadence gaps. Named rather than inline so the predicates below and the tests
+# that drive them cannot drift apart.
+DAILY_LEARN_MIN_GAP_SEC = 23 * 3600
+WEEKLY_LEARN_MIN_GAP_SEC = 6.9 * 86400
+
+# (anchor key this loop writes, pre-cutover fallback key)
+DAILY_ANCHOR_KEYS = ("last_daily_learn_attempt_at", "last_daily_learn_at")
+WEEKLY_ANCHOR_KEYS = ("last_weekly_learn_attempt_at", "last_weekly_learn_at")
+
+
+def resolve_cadence_anchor(
+    strategy: Strategy, primary: str, legacy: str, default: datetime
+) -> datetime:
+    """Read one cadence anchor, preferring the key that is still written.
+
+    ``primary`` is the attempt stamp this loop writes on every cycle. ``legacy``
+    is the pre-cutover key, consulted ONLY when the attempt stamp is absent — on
+    the first run after upgrading, where it is the last true record of when a
+    cycle ran. Once an attempt stamp exists the legacy key is never consulted
+    again, so its frozen value cannot leak back into the decision.
+
+    Reading the legacy key unconditionally is what let a restart re-fire an
+    already-completed cycle: nothing writes it any more, so ``now - anchor``
+    grew without bound and the gap check could never fail.
+
+    ``Strategy.get_timestamp`` cannot distinguish "absent" from "epoch" — it
+    substitutes its own default — so presence is checked through ``get`` first.
+    """
+    for key in (primary, legacy):
+        try:
+            raw = strategy.get(key)
+        except KeyError:
+            continue
+        if raw:
+            return strategy.get_timestamp(key, default=default)
+    return default
+
+
+def load_cadence_anchors(
+    strategy: Strategy, default: datetime
+) -> tuple[datetime, datetime]:
+    """Both learn anchors, as the loop consumes them at startup.
+
+    This is the wiring, not just the helper — a test that drives the loop's
+    actual anchor selection has to go through here. Returns
+    ``(last_daily_learn_at, last_weekly_learn_at)``.
+    """
+    return (
+        resolve_cadence_anchor(strategy, *DAILY_ANCHOR_KEYS, default),
+        resolve_cadence_anchor(strategy, *WEEKLY_ANCHOR_KEYS, default),
+    )
+
+
+def daily_learn_due(
+    now: datetime, last_attempt_at: datetime, *, learn_hour: int
+) -> bool:
+    """Whether the daily learn cycle should run on this tick."""
+    return (
+        now.hour == learn_hour
+        and (now - last_attempt_at).total_seconds() >= DAILY_LEARN_MIN_GAP_SEC
+    )
+
+
+def weekly_learn_due(
+    now: datetime, last_attempt_at: datetime, *, learn_hour: int, learn_day: int
+) -> bool:
+    """Whether the weekly commentary cycle should run on this tick."""
+    return (
+        now.weekday() == learn_day
+        and now.hour == (learn_hour + 1) % 24
+        and (now - last_attempt_at).total_seconds() >= WEEKLY_LEARN_MIN_GAP_SEC
+    )
+
 
 async def narrative_agent_loop(
     session: aiohttp.ClientSession,
@@ -91,10 +164,12 @@ async def narrative_agent_loop(
     # Load scheduling timestamps from strategy
     _epoch = datetime.min.replace(tzinfo=timezone.utc)
     last_eval_at = strategy.get_timestamp("last_eval_at", default=_epoch)
-    last_daily_learn_at = strategy.get_timestamp("last_daily_learn_at", default=_epoch)
-    last_weekly_learn_at = strategy.get_timestamp(
-        "last_weekly_learn_at", default=_epoch
-    )
+    # Anchored on the ATTEMPT stamps, which are the keys this loop still writes.
+    # The legacy `last_daily_learn_at` / `last_weekly_learn_at` keys stopped
+    # being written when attempt/success/failure stamps replaced them, so
+    # reading them made the cross-restart gap check trivially true forever and a
+    # restart inside the eligible hour re-fired a completed cycle.
+    last_daily_learn_at, last_weekly_learn_at = load_cadence_anchors(strategy, _epoch)
 
     while True:
         try:
@@ -676,9 +751,10 @@ async def narrative_agent_loop(
             # ----------------------------------------------------------
             # LEARN daily (gated by hour + 23h gap)
             # ----------------------------------------------------------
-            if (
-                now.hour == settings.NARRATIVE_LEARN_HOUR_UTC
-                and (now - last_daily_learn_at).total_seconds() >= 23 * 3600
+            if daily_learn_due(
+                now,
+                last_daily_learn_at,
+                learn_hour=settings.NARRATIVE_LEARN_HOUR_UTC,
             ):
                 # Attempt timestamp is stamped BEFORE the work, and is the only
                 # unconditional one. Previously `last_daily_learn_at` was written
@@ -775,10 +851,11 @@ async def narrative_agent_loop(
             # ----------------------------------------------------------
             # LEARN weekly (gated by weekday + hour + 6.9-day gap)
             # ----------------------------------------------------------
-            if (
-                now.weekday() == settings.NARRATIVE_WEEKLY_LEARN_DAY
-                and now.hour == (settings.NARRATIVE_LEARN_HOUR_UTC + 1) % 24
-                and (now - last_weekly_learn_at).total_seconds() >= 6.9 * 86400
+            if weekly_learn_due(
+                now,
+                last_weekly_learn_at,
+                learn_hour=settings.NARRATIVE_LEARN_HOUR_UTC,
+                learn_day=settings.NARRATIVE_WEEKLY_LEARN_DAY,
             ):
                 await strategy.set_timestamp("last_weekly_learn_attempt_at", now)
                 last_weekly_learn_at = now

@@ -515,21 +515,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         lock: bool
         reason: str
 
-    STRATEGY_BOUNDS = {
-        "category_accel_threshold": (2.0, 15.0),
-        "category_volume_growth_min": (5.0, 50.0),
-        "laggard_max_mcap": (50_000_000, 1_000_000_000),
-        "laggard_max_change": (5.0, 30.0),
-        "laggard_min_change": (-50.0, 0.0),
-        "laggard_min_volume": (10_000, 1_000_000),
-        "hit_threshold_pct": (5.0, 50.0),
-        "miss_threshold_pct": (-30.0, -5.0),
-        "max_picks_per_category": (3, 10),
-        "max_heating_per_cycle": (1, 10),
-        "signal_cooldown_hours": (1, 12),
-        "min_learn_sample": (50, 500),
-        "min_trigger_count": (1, 10),
-    }
+    # Imported, NOT redefined. This was a hand-maintained copy that had drifted:
+    # it omitted `counter_suppress_threshold`, so this endpoint accepted any
+    # value for a parameter that `Strategy.set` and the deterministic learner
+    # both bound to (0, 100). A value written here could land outside the range
+    # the learner assumes when clamping a candidate grid around it.
+    from scout.narrative.strategy_bounds import STRATEGY_BOUNDS
 
     @app.put("/api/narrative/strategy/{key}/lock")
     async def set_narrative_strategy_lock(key: str, body: StrategyLockUpdate):
