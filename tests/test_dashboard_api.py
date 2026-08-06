@@ -774,7 +774,17 @@ class TestNarrativeStrategy:
         keys = [r["key"] for r in data]
         assert "top_n" in keys
 
-    async def test_update_strategy(self, client):
+    async def test_update_strategy_preserves_lock_state(self, client):
+        """*** THE ONE-WAY DOOR, CORRECTED. ***
+
+        This previously asserted `locked == 1` — it pinned the defect as
+        expected behaviour. Editing a value hard-set locked=1, and no unlock
+        route existed, so one manual edit removed the key from BOTH the learner
+        (Strategy.set raises on locked) and this endpoint (which rejects locked
+        keys), recoverable only by direct SQL.
+
+        Value editing and locking are now separate decisions.
+        """
         resp = await client.put(
             "/api/narrative/strategy/top_n",
             json={"value": "10"},
@@ -782,8 +792,49 @@ class TestNarrativeStrategy:
         assert resp.status_code == 200
         data = resp.json()
         assert data["value"] == "10"
-        assert data["locked"] == 1
+        assert data["locked"] == 0, "editing a value must not silently lock the key"
         assert data["updated_by"] == "manual"
+
+    async def test_update_can_lock_explicitly(self, client):
+        resp = await client.put(
+            "/api/narrative/strategy/top_n",
+            json={"value": "11", "lock": True, "reason": "operator freeze"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["locked"] == 1
+
+    async def test_lock_route_requires_a_reason(self, client):
+        """A lock with no recorded rationale is indistinguishable from an
+        accident months later."""
+        resp = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "   "},
+        )
+        assert resp.status_code == 400
+
+    async def test_unlock_route_exists_and_reverses_a_lock(self, client):
+        """The recovery path the previous design lacked entirely."""
+        locked = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "freeze for review"},
+        )
+        assert locked.status_code == 200 and locked.json()["locked"] == 1
+        unlocked = await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": False, "reason": "review complete"},
+        )
+        assert unlocked.status_code == 200
+        assert unlocked.json()["locked"] == 0
+
+    async def test_lock_change_does_not_alter_the_value(self, client):
+        before = (await client.get("/api/narrative/strategy")).json()
+        original = [r for r in before if r["key"] == "top_n"][0]["value"]
+        await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "value must not move"},
+        )
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] == original
 
     async def test_update_nonexistent_key_returns_404(self, client):
         resp = await client.put(
@@ -934,3 +985,39 @@ class TestSystemHealth:
         data = resp.json()
         assert data["candidates"]["count"] == 0
         assert data["candidates"]["latest"] is None
+
+
+class TestStrategyAuditAtomicity:
+    """Endpoint-level checks on the mutation/audit write path.
+
+    The structural grep tests that used to live here — source ordering, one
+    `commit()`, no `CREATE TABLE` in the audit writer — have been REMOVED, not
+    relocated. Source order says nothing about what the database does when a
+    statement between two writes raises, so they could not prove the property
+    they were named after.
+
+    The proof is now `tests/test_strategy_audit_atomicity.py`: failure injected
+    at the audit INSERT, at the UPDATE, and at the SQL layer, asserting the
+    committed end state through a separate connection. It was verified against
+    three deliberate mutants (intervening commit, DDL inside the audit writer,
+    audit on its own connection), each of which turns it red.
+    """
+
+    async def test_a_value_update_writes_a_matching_audit_row(self, client):
+        await client.put(
+            "/api/narrative/strategy/top_n",
+            json={"value": "77", "reason": "atomicity check"},
+        )
+        # the audit row must exist alongside the committed value
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] == "77"
+
+    async def test_a_locked_key_cannot_be_changed_by_an_ordinary_update(self, client):
+        await client.put(
+            "/api/narrative/strategy/top_n/lock",
+            json={"lock": True, "reason": "freeze"},
+        )
+        resp = await client.put("/api/narrative/strategy/top_n", json={"value": "999"})
+        assert resp.status_code == 403
+        after = (await client.get("/api/narrative/strategy")).json()
+        assert [r for r in after if r["key"] == "top_n"][0]["value"] != "999"

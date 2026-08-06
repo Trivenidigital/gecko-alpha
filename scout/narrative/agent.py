@@ -28,7 +28,17 @@ from scout.heartbeat import _heartbeat_stats
 from scout.losers.tracker import compare_losers_with_signals
 from scout.narrative.digest import format_heating_alert
 from scout.narrative.evaluator import evaluate_pending
-from scout.narrative.learner import daily_learn, weekly_consolidate
+from scout.narrative.deterministic_learner import (
+    run_deterministic_daily_learn,
+)
+from scout.narrative.learn_outcome import (
+    CYCLE_REPORTING,
+    LearnCycleOutcome,
+    classify_provider_error,
+    redact,
+    safe_traceback,
+)
+from scout.narrative.learner import weekly_consolidate
 from scout.narrative.models import NarrativePrediction
 from scout.narrative.observer import (
     compute_acceleration,
@@ -670,13 +680,37 @@ async def narrative_agent_loop(
                 now.hour == settings.NARRATIVE_LEARN_HOUR_UTC
                 and (now - last_daily_learn_at).total_seconds() >= 23 * 3600
             ):
+                # Attempt timestamp is stamped BEFORE the work, and is the only
+                # unconditional one. Previously `last_daily_learn_at` was written
+                # after the call regardless of outcome, so ~34 days of hard
+                # provider failures recorded state that looked like success.
+                await strategy.set_timestamp("last_daily_learn_attempt_at", now)
+
+                # DETERMINISTIC learner. No provider, no credentials, no
+                # network — so it cannot fail for billing reasons, which is
+                # exactly how the previous Anthropic-only path died silently.
+                #
+                # It returns a LearnProposal on EVERY path and never raises, so
+                # the outcome below is read from the result, never inferred from
+                # `None`, a boolean, truthiness or which log line appeared.
+                learn_result = await run_deterministic_daily_learn(db, strategy)
+                learn_outcome = learn_result.cycle_outcome
+                reporting = CYCLE_REPORTING[learn_outcome]
+
+                # Advance the cadence clock unconditionally — a failed cycle must
+                # not retry every tick — but move a success/failure clock only as
+                # the outcome dictates.
+                last_daily_learn_at = now
+                if reporting.state_key is not None:
+                    await strategy.set_timestamp(reporting.state_key, now)
+                getattr(logger, reporting.level)(
+                    reporting.event, **learn_result.log_fields()
+                )
+
+                # Pruning is NOT part of learning. It ran inside the learn
+                # try-block before, so a prune error was reported as a learn
+                # failure — the same category error, one layer down.
                 try:
-                    await daily_learn(
-                        db,
-                        strategy,
-                        api_key=settings.ANTHROPIC_API_KEY,
-                        model=settings.NARRATIVE_LEARN_MODEL,
-                    )
                     await prune_old_snapshots(
                         db, settings.NARRATIVE_SNAPSHOT_RETENTION_DAYS
                     )
@@ -704,14 +738,11 @@ async def narrative_agent_loop(
                     # from scout.main._run_hourly_maintenance via Settings
                     # retention. The previous _run_extra_table_prune(db) helper
                     # is deleted; the daily-learn block no longer prunes tables
-                    # directly. Other daily-learn operations (daily_learn LLM,
-                    # tracker prunes, strategy.set_timestamp, paper-trade digest)
-                    # remain intact above and below this comment.
-                    last_daily_learn_at = now
-                    await strategy.set_timestamp("last_daily_learn_at", now)
-                    logger.info("narrative.daily_learn_complete")
+                    # directly. Other daily-learn operations (deterministic
+                    # learn, tracker prunes, strategy.set_timestamp, paper-trade
+                    # digest) remain intact above and below this comment.
                 except Exception:
-                    logger.exception("narrative.daily_learn_error")
+                    logger.exception("narrative.daily_prune_error")
 
                 # Paper trading daily digest
                 if trading_engine:
@@ -749,18 +780,57 @@ async def narrative_agent_loop(
                 and now.hour == (settings.NARRATIVE_LEARN_HOUR_UTC + 1) % 24
                 and (now - last_weekly_learn_at).total_seconds() >= 6.9 * 86400
             ):
-                try:
-                    await weekly_consolidate(
-                        db,
-                        strategy,
-                        api_key=settings.ANTHROPIC_API_KEY,
-                        model=settings.NARRATIVE_LEARN_MODEL,
-                    )
-                    last_weekly_learn_at = now
-                    await strategy.set_timestamp("last_weekly_learn_at", now)
-                    logger.info("narrative.weekly_learn_complete")
-                except Exception:
-                    logger.exception("narrative.weekly_learn_error")
+                await strategy.set_timestamp("last_weekly_learn_attempt_at", now)
+                last_weekly_learn_at = now
+                # The weekly outcome is decided here, explicitly, and reported
+                # through the SAME table the daily path uses — one vocabulary
+                # for both cadences, so an operator reading `outcome=` never has
+                # to know which branch emitted the line.
+                weekly_fields: dict = {}
+                if not settings.NARRATIVE_WEEKLY_COMMENTARY_ENABLED:
+                    # DISABLED BY DEFAULT — the owner ruling removed paid model
+                    # access from learning. `weekly_consolidate` is COMMENTARY
+                    # ONLY: it rewrites the `lessons_learned` prose from recent
+                    # daily reflections. It calls no Strategy.set and controls
+                    # none of the 14 parameters, so disabling it removes an
+                    # Anthropic dependency without losing any parameter logic.
+                    #
+                    # Deliberately NOT a failure: absent commentary must not make
+                    # deterministic learning look broken. Historical lessons stay
+                    # readable — nothing is deleted.
+                    weekly_outcome = LearnCycleOutcome.OPTIONAL_COMMENTARY_DISABLED
+                    weekly_fields = {
+                        "reason": "paid model access removed from the learning path"
+                    }
+                else:
+                    try:
+                        await weekly_consolidate(
+                            db,
+                            strategy,
+                            api_key=settings.ANTHROPIC_API_KEY,
+                            model=settings.NARRATIVE_LEARN_MODEL,
+                        )
+                        weekly_outcome = LearnCycleOutcome.OPTIONAL_COMMENTARY_SUCCESS
+                    except Exception as exc:
+                        # Commentary failure is NOT learner failure.
+                        weekly_outcome = LearnCycleOutcome.OPTIONAL_COMMENTARY_FAILED
+                        health = classify_provider_error(exc)[1]
+                        weekly_fields = {
+                            "exception_type": type(exc).__name__,
+                            "exception_message": redact(str(exc)),
+                            "traceback": safe_traceback(exc),
+                            "provider_health": health.value,
+                        }
+
+                weekly_reporting = CYCLE_REPORTING[weekly_outcome]
+                if weekly_reporting.state_key is not None:
+                    await strategy.set_timestamp(weekly_reporting.state_key, now)
+                getattr(logger, weekly_reporting.level)(
+                    weekly_reporting.event,
+                    outcome=weekly_outcome.value,
+                    critical_to_learning=weekly_outcome.is_critical_to_learning,
+                    **weekly_fields,
+                )
 
         except Exception:
             logger.exception("narrative.loop_error")

@@ -243,12 +243,29 @@ async def _rw_db(db_path: str):
 
     Same try-block guard as ``_ro_db`` — connection acquired inside try
     so exceptions during ``connect()`` or ``row_factory`` cannot leak.
+
+    On an exception the open transaction is rolled back EXPLICITLY before the
+    close. ``close()`` already discards an uncommitted transaction, so this
+    changes no observable behaviour today — it states the guarantee in the code
+    rather than leaving callers depending on a driver detail. Writers here pair
+    a state change with its audit row in one transaction
+    (:func:`update_narrative_strategy`, :func:`set_strategy_lock`), and that
+    pairing is only atomic if the failure path definitely unwinds.
     """
     conn = None
     try:
         conn = await aiosqlite.connect(db_path)
         conn.row_factory = aiosqlite.Row
         yield conn
+    except BaseException:
+        if conn is not None:
+            try:
+                await conn.rollback()
+            except Exception:
+                # Never let cleanup replace the original exception — that would
+                # substitute a rollback error for the real cause.
+                structlog.get_logger().warning("rw_db_rollback_failed", exc_info=True)
+        raise
     finally:
         if conn is not None:
             await conn.close()
@@ -415,15 +432,156 @@ async def get_narrative_strategy(db_path: str) -> list[dict]:
         return [dict(row) for row in rows]
 
 
-async def update_narrative_strategy(db_path: str, key: str, value: str) -> dict | None:
-    """Update a strategy row: set value, locked=1, updated_by='manual'."""
+async def _ensure_audit_table(conn) -> None:
+    """Create the audit table, outside any business transaction.
+
+    Kept separate from `_audit_strategy_change` so that writer performs only its
+    INSERT and stays within the caller's transaction.
+    """
+    await conn.execute("""CREATE TABLE IF NOT EXISTS agent_strategy_audit (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             key TEXT NOT NULL, old_value TEXT, new_value TEXT,
+             old_locked INTEGER, new_locked INTEGER,
+             operator TEXT NOT NULL, reason TEXT, changed_at TEXT NOT NULL)""")
+    await conn.commit()
+
+
+async def _audit_strategy_change(
+    conn,
+    *,
+    key: str,
+    old_value,
+    new_value,
+    old_locked: int,
+    new_locked: int,
+    operator: str,
+    reason: str | None,
+    at: str,
+) -> None:
+    """Write the audit row for a strategy change. INSERT only.
+
+    Must run inside the caller's open transaction so the state change and this
+    record commit together. Schema creation is `_ensure_audit_table`, called
+    before the transaction begins.
+
+    Atomicity is proven by the failure-injection tests in
+    `tests/test_strategy_audit_atomicity.py`, not by this function's structure.
+    (An earlier revision justified the split with an implicit-commit-on-DDL
+    claim that was measured and is false on this stack; the DDL hoist is
+    retained as clean separation only. Mutation-checked 2026-08-05: putting a
+    `CREATE TABLE` back inside this function does NOT break the rollback —
+    confirming the retraction empirically — but it is still refused, because
+    schema work does not belong in a business transaction.)
+    """
+    await conn.execute(
+        """INSERT INTO agent_strategy_audit
+           (key, old_value, new_value, old_locked, new_locked, operator,
+            reason, changed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (key, old_value, new_value, old_locked, new_locked, operator, reason, at),
+    )
+
+
+async def set_strategy_lock(
+    db_path: str, key: str, *, lock: bool, operator: str, reason: str
+) -> dict | None:
+    """Explicitly lock or unlock a key WITHOUT touching its value.
+
+    The counterpart the previous design lacked entirely: locking was an
+    unavoidable side effect of editing, and unlocking was impossible through any
+    exposed route. ``reason`` is required — a lock with no recorded rationale is
+    indistinguishable from an accident months later.
+    """
     async with _rw_db(db_path) as conn:
+        # DDL first, committed alone, so the state change below shares a single
+        # transaction with its audit row.
+        await _ensure_audit_table(conn)
         now = datetime.now(timezone.utc).isoformat()
+        cur = await conn.execute(
+            "SELECT value, locked FROM agent_strategy WHERE key = ?", (key,)
+        )
+        before = await cur.fetchone()
+        if before is None:
+            return None
+        old_value, old_locked = before[0], before[1]
+        new_locked = int(bool(lock))
         await conn.execute(
+            "UPDATE agent_strategy SET locked = ?, updated_by = ?, updated_at = ? "
+            "WHERE key = ?",
+            (new_locked, operator, now, key),
+        )
+        await _audit_strategy_change(
+            conn,
+            key=key,
+            old_value=old_value,
+            new_value=old_value,
+            old_locked=old_locked,
+            new_locked=new_locked,
+            operator=operator,
+            reason=reason,
+            at=now,
+        )
+        await conn.commit()
+        cur = await conn.execute("SELECT * FROM agent_strategy WHERE key = ?", (key,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def update_narrative_strategy(
+    db_path: str,
+    key: str,
+    value: str,
+    *,
+    lock: bool | None = None,
+    operator: str = "manual",
+    reason: str | None = None,
+) -> dict | None:
+    """Update a strategy value. Lock state is PRESERVED unless explicitly changed.
+
+    Previously this hard-set ``locked = 1`` on every edit, and no unlock route
+    was exposed — so a single manual value change removed that key from both the
+    learner (``Strategy.set`` raises on locked) and this endpoint (which rejects
+    locked keys) permanently, recoverable only by direct SQL.
+
+    Value editing and locking are now separate decisions: ``lock=None`` leaves
+    the existing state untouched, ``lock=True``/``False`` sets it explicitly.
+    Every change is audited with old/new value, old/new lock state, operator,
+    timestamp and reason.
+    """
+    async with _rw_db(db_path) as conn:
+        # DDL first, committed alone, so the state change below shares a single
+        # transaction with its audit row.
+        await _ensure_audit_table(conn)
+        now = datetime.now(timezone.utc).isoformat()
+        cur = await conn.execute(
+            "SELECT value, locked FROM agent_strategy WHERE key = ?", (key,)
+        )
+        before = await cur.fetchone()
+        if before is None:
+            return None
+        old_value, old_locked = before[0], before[1]
+        new_locked = old_locked if lock is None else int(bool(lock))
+        await conn.execute(
+            # `reason` deliberately NOT written to agent_strategy: the column is
+            # absent on some schema versions, and the audit row is the durable
+            # record of WHY a change happened. Keeping rationale in the
+            # append-only audit rather than a mutable column also means a later
+            # edit cannot silently overwrite the previous justification.
             """UPDATE agent_strategy
-               SET value = ?, locked = 1, updated_by = 'manual', updated_at = ?
+               SET value = ?, locked = ?, updated_by = ?, updated_at = ?
                WHERE key = ?""",
-            (value, now, key),
+            (value, new_locked, operator, now, key),
+        )
+        await _audit_strategy_change(
+            conn,
+            key=key,
+            old_value=old_value,
+            new_value=value,
+            old_locked=old_locked,
+            new_locked=new_locked,
+            operator=operator,
+            reason=reason,
+            at=now,
         )
         await conn.commit()
         cursor = await conn.execute(
