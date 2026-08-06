@@ -74,7 +74,12 @@ class ProposalVerdict(str, Enum):
     more data would have waited forever.
     """
 
-    NO_CHANGE = "NO_CHANGE"
+    # The qualifier is load-bearing and now travels with the value. A bare
+    # "NO_CHANGE" reads as a statement about all 14 tunable parameters; it is
+    # only ever a statement about the 3 the evaluator can reconstruct from
+    # stored prediction columns. `searched_parameters` /
+    # `unidentifiable_parameters` in the telemetry give the exact scope.
+    NO_CHANGE = "NO_CHANGE_WITHIN_VERIFIED_SEARCH_SPACE"
     PROPOSED_CHANGE_FOR_OWNER_REVIEW = "PROPOSED_CHANGE_FOR_OWNER_REVIEW"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
     UNSTABLE_EVIDENCE = "UNSTABLE_EVIDENCE"
@@ -152,6 +157,13 @@ class LearnProposal:
     commentary: str | None = None
     commentary_status: str = "NOT_ATTEMPTED"
 
+    # -- search scope ------------------------------------------------------
+    # Which parameters the verdict actually covers. Reported alongside every
+    # outcome so "no change" is never read as a claim about the whole
+    # parameter set.
+    searched_parameters: list[str] = field(default_factory=list)
+    unidentifiable_parameters: list[str] = field(default_factory=list)
+
     # -- runtime envelope --------------------------------------------------
     # Deliberately OUTSIDE `as_record()`: these vary run-to-run, and the
     # determinism guarantee ("same snapshot yields byte-identical output") is
@@ -194,6 +206,9 @@ class LearnProposal:
             "candidates_tested": len(self.candidates),
             "proposed_count": len(self.proposed),
             "rejection_count": len(self.rejections),
+            "searched_parameters": len(self.searched_parameters),
+            "unidentifiable_parameters": len(self.unidentifiable_parameters),
+            "searched_parameter_names": sorted(self.searched_parameters),
             "commentary_status": self.commentary_status,
             "elapsed_ms": self.elapsed_ms,
             "correlation_id": self.correlation_id,
@@ -224,6 +239,8 @@ class LearnProposal:
             "proposed": self.proposed,
             "rejections": self.rejections,
             "notes": self.notes,
+            "searched_parameters": sorted(self.searched_parameters),
+            "unidentifiable_parameters": sorted(self.unidentifiable_parameters),
             "commentary_status": self.commentary_status,
             "commentary": self.commentary,
         }
@@ -487,6 +504,18 @@ def evaluate(
     proposal.population_size = len(records)
     proposal.snapshot_sha256 = snapshot_hash(records)
 
+    # Scope of this verdict, computed before any early return so an
+    # insufficient-sample result still reports what it WOULD have covered.
+    #
+    # searched      = has a reconstruction predicate AND a current value AND bounds
+    # unidentifiable = in the bounds registry but no predicate over stored
+    #                  prediction columns — cannot be evaluated offline, and is
+    #                  excluded rather than guessed at
+    proposal.searched_parameters = sorted(
+        k for k in SEARCHABLE if k in current_params and k in bounds
+    )
+    proposal.unidentifiable_parameters = sorted(set(bounds) - set(SEARCHABLE))
+
     train, validation = chronological_split(records)
     proposal.train_n = len(train)
     proposal.validation_n = len(validation)
@@ -709,7 +738,9 @@ async def run_deterministic_daily_learn(db: Any, strategy: Any) -> LearnProposal
             raise RuntimeError("Database not initialized.")
 
         step = "load_bounds"
-        from scout.narrative.strategy import STRATEGY_BOUNDS
+        # From the leaf registry, the same object `Strategy.set` and the
+        # dashboard endpoint enforce. One definition, no drift.
+        from scout.narrative.strategy_bounds import STRATEGY_BOUNDS
 
         step = "load_records"
         records = await load_records(conn)

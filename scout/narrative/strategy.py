@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 
 from scout.db import Database
+from scout.narrative.strategy_bounds import STRATEGY_BOUNDS as _STRATEGY_BOUNDS
 
 STRATEGY_DEFAULTS: dict[str, object] = {
     "category_accel_threshold": 5.0,
@@ -35,22 +36,11 @@ STRATEGY_DEFAULTS: dict[str, object] = {
     "user_alert_mode": "all",
 }
 
-STRATEGY_BOUNDS: dict[str, tuple[float, float]] = {
-    "category_accel_threshold": (2.0, 15.0),
-    "category_volume_growth_min": (5.0, 50.0),
-    "laggard_max_mcap": (50_000_000, 1_000_000_000),
-    "laggard_max_change": (5.0, 30.0),
-    "laggard_min_change": (-50.0, 0.0),
-    "laggard_min_volume": (10_000, 1_000_000),
-    "hit_threshold_pct": (5.0, 50.0),
-    "miss_threshold_pct": (-30.0, -5.0),
-    "max_picks_per_category": (3, 10),
-    "max_heating_per_cycle": (1, 10),
-    "signal_cooldown_hours": (1, 12),
-    "min_learn_sample": (50, 500),
-    "min_trigger_count": (1, 10),
-    "counter_suppress_threshold": (0, 100),
-}
+# Re-exported, not redefined. The single definition lives in the leaf module
+# `strategy_bounds` so `dashboard.api` can consume the same object without
+# importing `scout.db` through this module. This alias keeps every existing
+# `from scout.narrative.strategy import STRATEGY_BOUNDS` caller working.
+STRATEGY_BOUNDS = _STRATEGY_BOUNDS
 
 
 class Strategy:
