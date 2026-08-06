@@ -2619,6 +2619,25 @@ class Database:
                 "peak_gain_pct",
                 "ALTER TABLE gainers_comparisons ADD COLUMN peak_gain_pct REAL",
             ),
+            # THE ANCHORED ENTRY BASIS. Established once from the earliest
+            # surviving `gainers_snapshots` row and never overwritten.
+            #
+            # Persisted rather than recomputed because `gainers_snapshots` is
+            # pruned at 7 days: "earliest surviving snapshot" is a MOVING
+            # target, so a read-time MIN(snapshot_at) silently rebases the
+            # entry onto the next row once the original is pruned. Per-row
+            # immutability does not make the SELECTION immutable.
+            #
+            # Forward-only: nullable, never backfilled. A coin whose history
+            # was already pruned has no basis and reads as unknown.
+            (
+                "entry_basis_price",
+                "ALTER TABLE gainers_comparisons ADD COLUMN entry_basis_price REAL",
+            ),
+            (
+                "entry_basis_at",
+                "ALTER TABLE gainers_comparisons ADD COLUMN entry_basis_at TEXT",
+            ),
         ):
             if col not in gc_cols:
                 await self._conn.execute(ddl)

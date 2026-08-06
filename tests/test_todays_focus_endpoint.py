@@ -126,16 +126,28 @@ async def _insert_gainer(
     detected_price: float | None = 100.0,
     current_price: float | None = 104.0,
     price_change_24h: float = 24.0,
+    snapshot_price: float | None = -1.0,
 ):
+    """Insert a tracker row as production shapes it.
+
+    A coin the tracker currently reports has BOTH a `gainers_comparisons` row
+    and `gainers_snapshots` history; the board's entry basis is the earliest
+    surviving snapshot. `snapshot_price` mirrors `detected_price` by default so
+    existing call sites keep their meaning; pass None to model the retention
+    case where the snapshot history has been pruned and no basis survives.
+    """
     now = datetime.now(timezone.utc)
     appeared = appeared_at or (now - timedelta(hours=1)).isoformat()
     sym = symbol or coin_id.upper()[:8]
+    if snapshot_price == -1.0:
+        snapshot_price = detected_price
     await conn.execute(
         """INSERT INTO gainers_comparisons
            (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
             detected_by_narrative, detected_by_pipeline, detected_by_chains,
-            detected_by_spikes, is_gap, detected_price)
-           VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 1, ?)""",
+            detected_by_spikes, is_gap, detected_price,
+            entry_basis_price, entry_basis_at)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 1, ?, ?, ?)""",
         (
             coin_id,
             sym,
@@ -143,8 +155,29 @@ async def _insert_gainer(
             price_change_24h,
             appeared,
             detected_price,
+            # The anchor the writer would establish from that snapshot.
+            snapshot_price,
+            appeared if snapshot_price is not None else None,
         ),
     )
+    if snapshot_price is not None:
+        await conn.execute(
+            """INSERT INTO gainers_snapshots
+               (coin_id, symbol, name, price_change_24h, market_cap,
+                volume_24h, snapshot_at, created_at, price_at_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                coin_id,
+                sym,
+                coin_id.title(),
+                price_change_24h,
+                75_000_000.0,
+                1_000_000.0,
+                appeared,
+                appeared,
+                snapshot_price,
+            ),
+        )
     if current_price is not None:
         await conn.execute(
             """INSERT OR REPLACE INTO price_cache

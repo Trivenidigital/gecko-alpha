@@ -312,6 +312,16 @@ class TradeInboxRow(BaseModel):
     opened_at: str | None = None
     opened_age_hours: float | None = None
     pct_from_entry: float | None = None
+    # Provenance for `pct_from_entry`. Declared here or the response_model
+    # silently drops them and the board keeps rendering a percentage with no
+    # way to tell a defensible entry from an absent one.
+    #   entry_basis_source: "gainers_snapshot" | "paper_entry" | "unavailable"
+    #   entry_basis_at:     timestamp OF that same observation
+    #   first_listed_at:    rolling-24h-window artifact; context only, NOT an entry
+    entry_price: float | None = None
+    entry_basis_source: str | None = None
+    entry_basis_at: str | None = None
+    first_listed_at: str | None = None
     price_change_24h: float | None = None
     market_cap: float | None = None
     current_price: float | None = None

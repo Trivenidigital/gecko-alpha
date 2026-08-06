@@ -291,7 +291,9 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
     for comp in comparisons:
         cid = comp["coin_id"]
         old_cursor = await db._conn.execute(
-            "SELECT detected_price, peak_price, peak_gain_pct FROM gainers_comparisons WHERE coin_id = ?",
+            "SELECT detected_price, peak_price, peak_gain_pct, "
+            "entry_basis_price, entry_basis_at "
+            "FROM gainers_comparisons WHERE coin_id = ?",
             (cid,),
         )
         old_row = await old_cursor.fetchone()
@@ -309,6 +311,42 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             )
             comp["peak_price"] = None
             comp["peak_gain_pct"] = None
+
+        # ANCHOR THE ENTRY BASIS — establish once, never overwrite.
+        #
+        # An already-established basis is carried forward verbatim, so neither
+        # this rewrite (DELETE + INSERT on every run), nor re-enrollment, nor
+        # retention pruning the snapshot it came from can move it. Recomputing
+        # it here would rebase the entry onto the next surviving snapshot the
+        # moment the original aged out — silently, with no event.
+        #
+        # FAIL CLOSED on a partial pair. If EITHER persisted component exists
+        # the pair is carried forward verbatim — including when it is
+        # incomplete. Re-establishing from a later surviving snapshot would
+        # "repair" the row by silently rebasing it onto a different
+        # observation, which is the very move this anchoring prevents. An
+        # incomplete pair reads as unavailable downstream; that is correct and
+        # recoverable, whereas a wrong anchor is neither.
+        if old_row is not None and (old_row[3] is not None or old_row[4] is not None):
+            comp["entry_basis_price"] = old_row[3]
+            comp["entry_basis_at"] = old_row[4]
+        else:
+            # First establishment: the earliest snapshot row that still exists
+            # AND carries a usable price. Price and timestamp are taken from
+            # the SAME row so they describe one observation.
+            basis_cursor = await db._conn.execute(
+                """SELECT price_at_snapshot, snapshot_at
+                     FROM gainers_snapshots
+                    WHERE coin_id = ?
+                      AND price_at_snapshot IS NOT NULL
+                      AND price_at_snapshot > 0
+                    ORDER BY snapshot_at ASC
+                    LIMIT 1""",
+                (cid,),
+            )
+            basis_row = await basis_cursor.fetchone()
+            comp["entry_basis_price"] = basis_row[0] if basis_row else None
+            comp["entry_basis_at"] = basis_row[1] if basis_row else None
 
     # Store comparisons (delete old for same coin_id then insert)
     for comp in comparisons:
@@ -328,9 +366,10 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 detected_by_momentum, momentum_lead_minutes,
                 detected_by_slow_burn, slow_burn_lead_minutes,
                 detected_by_velocity, velocity_lead_minutes,
-                is_gap, detected_price, peak_price, peak_gain_pct)
+                is_gap, detected_price, peak_price, peak_gain_pct,
+                entry_basis_price, entry_basis_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -357,6 +396,8 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 comp["detected_price"],
                 comp["peak_price"],
                 comp["peak_gain_pct"],
+                comp["entry_basis_price"],
+                comp["entry_basis_at"],
             ),
         )
     await db._conn.commit()

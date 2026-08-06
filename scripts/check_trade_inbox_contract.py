@@ -77,6 +77,13 @@ EXPECTED_ROW_KEYS = frozenset(
         "opened_at",
         "opened_age_hours",
         "pct_from_entry",
+        # Provenance for pct_from_entry: which observation the entry came from
+        # and when. `first_listed_at` is a rolling-24h-window artifact kept for
+        # context and explicitly NOT an entry event.
+        "entry_price",
+        "entry_basis_source",
+        "entry_basis_at",
+        "first_listed_at",
         "price_change_24h",
         "market_cap",
         "current_price",
@@ -488,6 +495,7 @@ def _check_row_types(row: dict, path: str, result: Result) -> None:
         "trade_score",
         "opened_age_hours",
         "pct_from_entry",
+        "entry_price",
         "price_change_24h",
         "market_cap",
         "current_price",
