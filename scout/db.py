@@ -8151,6 +8151,7 @@ class Database:
         operator: str = "operator",
         force: bool = False,
         settings: "Settings | None" = None,
+        restore_tg_alert_eligible: bool | None = None,
     ) -> None:
         """Atomic operator revival: enabled=1, stamp drawdown_baseline_at=NOW(),
         write audit row.
@@ -8178,6 +8179,13 @@ class Database:
             settings: optional Settings instance for dependency injection
                 (per CLAUDE.md "no global state"). Falls back to
                 ``get_settings()`` if not passed.
+            restore_tg_alert_eligible: controls the joint TG-eligibility
+                restore. ``None`` (default) keeps the historical behaviour —
+                restore to 1 for signals in ``DEFAULT_ALLOW_SIGNALS``, 0
+                otherwise. **A paper-only or instrumentation revival must pass
+                ``False``**: it authorises ``enabled=1`` and nothing else, and
+                the default would silently re-enable operator alerting.
+                Restoring to 1 always logs at WARNING.
 
         Raises:
             ValueError: if signal_type is unknown, OR if the cool-off
@@ -8285,16 +8293,37 @@ class Database:
             # cleared both flags; revive restores both for default-allow
             # signals so operator doesn't have to manually re-enable
             # alerting after a Tier 1b cycle.
+            #
+            # `restore_tg_alert_eligible` overrides that default. A paper-only
+            # or instrumentation revival authorises `enabled=1` and NOTHING
+            # else, so it must pass False — otherwise this fold silently turns
+            # operator-facing alerting back on for any default-allow signal.
+            # That happened to `gainers_early` on 2026-08-03: the run was
+            # authorised paper-only with tg_alert_eligible=0 and came back with
+            # it at 1, unnoticed until a state reconciliation caught it.
             from scout.trading.tg_alert_dispatch import DEFAULT_ALLOW_SIGNALS
 
-            restore_eligible = 1 if signal_type in DEFAULT_ALLOW_SIGNALS else 0
+            in_default_allow = signal_type in DEFAULT_ALLOW_SIGNALS
+            if restore_tg_alert_eligible is None:
+                restore_eligible = 1 if in_default_allow else 0
+                explicit = False
+            else:
+                restore_eligible = 1 if restore_tg_alert_eligible else 0
+                explicit = True
+
             # V3-I3 PR-stage fold: log decision so operator sees why
             # non-default-allow opt-in wasn't restored after revive.
-            _db_log.info(
+            #
+            # Restoring to 1 logs at WARNING, never info: turning alerting back
+            # on is an operator-visible state change and must not be inferable
+            # only from an absent log line.
+            _log_tg = _db_log.warning if restore_eligible == 1 else _db_log.info
+            _log_tg(
                 "signal_revived_tg_eligible",
                 signal_type=signal_type,
                 restored_to=restore_eligible,
-                in_default_allow=signal_type in DEFAULT_ALLOW_SIGNALS,
+                in_default_allow=in_default_allow,
+                explicitly_requested=explicit,
             )
             await conn.execute(
                 """UPDATE signal_params
