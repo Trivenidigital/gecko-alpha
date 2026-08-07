@@ -149,16 +149,32 @@ async def _insert_gainers_comparison(
     detected_price: float | None = 100.0,
     current_price: float | None = 103.0,
     price_updated_at: str | None = None,
+    snapshot_price: float | None = -1.0,
 ):
+    """Insert a tracker row as production actually shapes it.
+
+    A coin the tracker is currently reporting has BOTH a `gainers_comparisons`
+    row and `gainers_snapshots` history. The board's entry basis comes from the
+    earliest surviving snapshot (one row = one price + one timestamp), NOT from
+    `detected_price`, which is resampled from `price_cache` on a later run.
+
+    `snapshot_price` defaults to mirroring `detected_price` so existing call
+    sites keep their original meaning. Pass `snapshot_price=None` to model the
+    retention case — comparison row alive, snapshot history pruned — where the
+    row has no defensible basis and must read as unknown, not fresh.
+    """
     now = datetime.now(timezone.utc)
     appeared = appeared_at or (now - timedelta(hours=1)).isoformat()
     sym = symbol or coin_id.upper()[:8]
+    if snapshot_price == -1.0:
+        snapshot_price = detected_price
     await conn.execute(
         """INSERT INTO gainers_comparisons
            (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
             detected_by_narrative, detected_by_pipeline, detected_by_chains,
-            detected_by_spikes, is_gap, detected_price)
-           VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 1, ?)""",
+            detected_by_spikes, is_gap, detected_price,
+            entry_basis_price, entry_basis_at)
+           VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, 1, ?, ?, ?)""",
         (
             coin_id,
             sym,
@@ -166,8 +182,29 @@ async def _insert_gainers_comparison(
             price_change_24h,
             appeared,
             detected_price,
+            # The anchor the writer would establish from that snapshot.
+            snapshot_price,
+            appeared if snapshot_price is not None else None,
         ),
     )
+    if snapshot_price is not None:
+        await conn.execute(
+            """INSERT INTO gainers_snapshots
+               (coin_id, symbol, name, price_change_24h, market_cap,
+                volume_24h, snapshot_at, created_at, price_at_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                coin_id,
+                sym,
+                name or coin_id.title(),
+                price_change_24h,
+                75_000_000.0,
+                1_000_000.0,
+                appeared,
+                appeared,
+                snapshot_price,
+            ),
+        )
     if current_price is not None:
         await conn.execute(
             """INSERT OR REPLACE INTO price_cache
@@ -521,9 +558,16 @@ async def test_trade_inbox_tracker_row_without_price_is_data_missing(client):
     assert payload["meta"]["tracker_rows_promoted"] == 1
 
 
-async def test_trade_inbox_tracker_row_with_current_price_but_no_detected_price_is_data_missing(
+async def test_trade_inbox_tracker_row_with_current_price_but_no_entry_basis_is_data_missing(
     client,
 ):
+    """A price but no defensible entry is DATA_MISSING, never tradeable.
+
+    Previously keyed on `detected_price`; the basis is now the earliest
+    surviving `gainers_snapshots` row, so the absent-basis case is expressed by
+    having no snapshot history — which is also what retention produces in
+    production for 893 of 1115 tracked coins.
+    """
     c, db = client
     await _insert_gainers_comparison(
         db._conn,
@@ -545,7 +589,9 @@ async def test_trade_inbox_tracker_row_with_current_price_but_no_detected_price_
     assert row["block_reason_primary"] == "DATA_INSUFFICIENT"
     assert row["entry_quality"] == "data_insufficient"
     assert row["pct_from_entry"] is None
-    assert "detected_price_missing_or_invalid" in row["risk_reasons"]
+    assert "entry_basis_unavailable" in row["risk_reasons"]
+    assert row["entry_basis_source"] == "unavailable"
+    assert row["entry_price"] is None
 
 
 async def test_trade_inbox_broad_cohort_surfaces_toes_beyond_raw_limit(client):

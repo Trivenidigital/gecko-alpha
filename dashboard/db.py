@@ -1397,11 +1397,13 @@ def _trade_window_state(row: dict) -> str:
 
 def _trade_block_reason(row: dict) -> str | None:
     if row.get("current_price") is None or row.get("pct_from_entry") is None:
-        if row.get(
-            "current_price"
-        ) is not None and "detected_price_missing_or_invalid" in set(
-            row.get("risk_reasons") or []
-        ):
+        if row.get("current_price") is not None and {
+            "detected_price_missing_or_invalid",
+            # A tracker row whose immutable entry basis did not survive
+            # retention. It has a current price but no defensible entry, so it
+            # is DATA_INSUFFICIENT — never a tradeable state.
+            "entry_basis_unavailable",
+        } & set(row.get("risk_reasons") or []):
             return "DATA_INSUFFICIENT"
         return "NO_PRICE"
     if "price_timestamp_unparseable" in set(row.get("risk_reasons") or []):
@@ -1653,7 +1655,8 @@ async def get_trade_inbox(
         try:
             cursor = await db.execute(
                 """SELECT id, coin_id, symbol, name, price_change_24h,
-                          appeared_on_gainers_at, detected_price
+                          appeared_on_gainers_at, detected_price,
+                          entry_basis_price, entry_basis_at
                      FROM gainers_comparisons
                     WHERE appeared_on_gainers_at >= ?
                       AND COALESCE(coin_id, '') != ''
@@ -1695,6 +1698,7 @@ async def get_trade_inbox(
                 }
             except aiosqlite.OperationalError:
                 tracker_price_by_coin = {}
+
         else:
             tracker_price_by_coin = {}
 
@@ -1811,6 +1815,16 @@ async def get_trade_inbox(
             "opened_at": opened_at,
             "opened_age_hours": opened_age_hours,
             "pct_from_entry": pct_from_entry,
+            # A paper trade's basis is genuinely one event: `entry_price` is
+            # the price it was opened at and `opened_at` is when. Stated
+            # explicitly so both cohorts declare their provenance in the same
+            # shape and a reader never has to infer which is which.
+            "entry_price": entry_price,
+            "entry_basis_source": (
+                "paper_entry" if entry_price is not None else "unavailable"
+            ),
+            "entry_basis_at": opened_at,
+            "first_listed_at": None,
             "current_price": current_price,
             "market_cap": price.get("market_cap") if price else None,
             "price_change_24h": price.get("price_change_24h") if price else None,
@@ -1882,10 +1896,51 @@ async def get_trade_inbox(
         price = tracker_price_by_coin.get(token_id)
         risk_reasons: list[str] = ["tracker_only_no_paper_trade"]
         inclusion_reasons: list[str] = ["tracker_promotion", "top_gainers_tracker"]
-        opened_dt = _parse_iso_dt(base.get("appeared_on_gainers_at"))
+
+        # `opened_at` is the timestamp OF THE ENTRY BASIS, so the percentage
+        # below and the age beside it describe one event. When no basis was
+        # ever anchored, `appeared_on_gainers_at` is still shown for context
+        # but is NOT treated as an entry: it is a rolling-window artifact.
+        #
+        # Read STRICTLY from the persisted anchor. Deriving it here — even from
+        # immutable snapshot rows — would reintroduce the defect this fixes:
+        # retention prunes snapshots at 7 days, so any read-time "earliest
+        # surviving row" query silently rebases the entry onto the next row
+        # once the original ages out. The anchor is written once by
+        # `compare_gainers_with_signals` and never overwritten.
+        entry_price = None
+        entry_price_missing = False
+        entry_basis_source = "unavailable"
+
+        # The pair is ATOMIC: a basis exists only when BOTH a positive price and
+        # a parseable timestamp are present. Half a pair is not a weaker
+        # entry — it is no entry, because a price with no time (or a time with
+        # no price) cannot describe an observation.
+        try:
+            candidate = float(base.get("entry_basis_price"))
+        except (TypeError, ValueError):
+            candidate = 0.0
+        basis_dt = _parse_iso_dt(base.get("entry_basis_at"))
+
+        if candidate > 0 and basis_dt is not None:
+            entry_price = candidate
+            entry_basis_source = "gainers_snapshot"
+        else:
+            entry_price_missing = True
+            basis_dt = None
+            # Either no anchor was ever established (the coin's snapshot history
+            # was already pruned when the tracker first wrote its row), or the
+            # persisted pair is incomplete. Both are UNKNOWN, never "fresh".
+            risk_reasons.append("entry_basis_unavailable")
+
+        # `opened_at` is the entry observation's timestamp or NOTHING. It is
+        # deliberately NOT backfilled from `appeared_on_gainers_at`: that is a
+        # rolling-24h-window artifact, and surfacing it here would give an
+        # unknown row an "opened" time bound to no entry price — the exact
+        # confusion this provenance contract removes. It remains available,
+        # clearly labelled, as `first_listed_at`.
+        opened_dt = basis_dt
         opened_at = opened_dt.isoformat() if opened_dt else None
-        if opened_dt is None:
-            risk_reasons.append("opened_at_unparseable")
         opened_age_hours = (
             round((now - opened_dt).total_seconds() / 3600, 2) if opened_dt else None
         )
@@ -1895,23 +1950,6 @@ async def get_trade_inbox(
             if price and price.get("current_price") is not None
             else None
         )
-        detected_price = base.get("detected_price")
-        entry_price = None
-        entry_price_missing = False
-        if detected_price is not None:
-            try:
-                detected_price = float(detected_price)
-                if detected_price > 0:
-                    entry_price = detected_price
-                else:
-                    risk_reasons.append("detected_price_missing_or_invalid")
-                    entry_price_missing = True
-            except (TypeError, ValueError):
-                risk_reasons.append("detected_price_missing_or_invalid")
-                entry_price_missing = True
-        else:
-            risk_reasons.append("detected_price_missing_or_invalid")
-            entry_price_missing = True
         pct_from_entry = None
         if current_price is not None and entry_price and entry_price > 0:
             pct_from_entry = round((current_price - entry_price) / entry_price * 100, 2)
@@ -1977,6 +2015,15 @@ async def get_trade_inbox(
             "opened_at": opened_at,
             "opened_age_hours": opened_age_hours,
             "pct_from_entry": pct_from_entry,
+            # Provenance for the number above: which source the entry came
+            # from, and the timestamp of that same observation. "unavailable"
+            # means no defensible entry exists — the row is unknown, not fresh.
+            "entry_price": entry_price,
+            "entry_basis_source": entry_basis_source,
+            "entry_basis_at": (basis_dt.isoformat() if basis_dt else None),
+            # Kept for context and explicitly NOT an entry event: this is
+            # MIN(snapshot_at) over a rolling 24h window, recomputed each run.
+            "first_listed_at": base.get("appeared_on_gainers_at"),
             "current_price": current_price,
             "market_cap": price.get("market_cap") if price else None,
             "price_change_24h": (
@@ -2178,6 +2225,7 @@ TODAYS_FOCUS_DATA_QUALITY_REASONS = {
     "opened_at_unparseable",
     "price_timestamp_unparseable",
     "detected_price_missing_or_invalid",
+    "entry_basis_unavailable",
     "entry_price_missing_or_invalid",
     "no_price_snapshot_for_token_id",
 }
