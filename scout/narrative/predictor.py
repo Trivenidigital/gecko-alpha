@@ -243,13 +243,36 @@ async def score_token(
     """Call Claude to score a single token's narrative fit.
 
     Returns parsed dict or None on any error.
+
+    Failure behaviour is deliberately unchanged: ANY exception yields ``None``,
+    the caller counts it toward the 3-consecutive-failure breaker, and control
+    rows keep being stored. What changed is that the failure now says WHY.
+
+    The previous handler emitted ``score_token_error`` with only ``coin_id`` and
+    ``symbol``. ``structlog``'s JSONRenderer is configured without
+    ``format_exc_info``, so ``log.exception`` rendered no traceback at all —
+    billing, auth, rate-limit, model-rejection and response-parsing failures
+    were indistinguishable from one another. 63 such events in two days carried
+    zero diagnostic content between them, and scored output had decayed to zero
+    while control rows continued, so nothing looked broken from the outside.
+
+    ``failing_step`` distinguishes a provider failure from a parse failure —
+    the one split the classifier cannot make on its own, since a malformed
+    response raises inside our code, not the SDK's.
+
+    Secret-safe: the scoring prompt, the system prompt, the API key and the raw
+    response are never logged. The message and traceback pass through
+    ``redact`` / ``safe_traceback``, which strip credential shapes and bound
+    length.
     """
+    step = "build_client"
     try:
         import anthropic
 
         if client is None:
             client = anthropic.AsyncAnthropic(api_key=api_key)
 
+        step = "build_prompt"
         prompt = build_scoring_prompt(
             token,
             accel,
@@ -258,6 +281,7 @@ async def score_token(
             lessons,
             watchlist_users=watchlist_users,
         )
+        step = "provider_call"
         response = await client.messages.create(  # type: ignore[union-attr]
             model=model,
             max_tokens=300,
@@ -265,10 +289,48 @@ async def score_token(
             system=NARRATIVE_FIT_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         )
+        step = "parse_response"
         raw = response.content[0].text  # type: ignore[index]
         return parse_scoring_response(raw)
-    except Exception:
-        log.exception("score_token_error", coin_id=token.coin_id, symbol=token.symbol)
+    except Exception as exc:
+        from scout.narrative.learn_outcome import (
+            LearnOutcome,
+            ProviderHealth,
+            classify_provider_error,
+            redact,
+            safe_traceback,
+        )
+
+        # The outcome must agree with `failing_step`. `classify_provider_error`
+        # falls back to FAILED_PROVIDER/UNKNOWN for anything it does not
+        # recognise, so running EVERY exception through it would label a
+        # malformed-response failure `FAILED_PROVIDER` while `failing_step` said
+        # `parse_response` — two fields contradicting each other in the same
+        # event, which is worse than the silence this handler replaced.
+        if step == "provider_call":
+            outcome, health = classify_provider_error(exc)
+        elif step == "parse_response":
+            # A response was received and decoded far enough to reach parsing,
+            # so the provider demonstrably worked. The fault is ours.
+            outcome, health = LearnOutcome.FAILED_PARSING, ProviderHealth.AVAILABLE
+        else:
+            # build_client / build_prompt: the provider was never contacted, so
+            # its health is genuinely unknown rather than healthy or degraded.
+            outcome, health = LearnOutcome.FAILED_INTERNAL, ProviderHealth.UNKNOWN
+        log.error(
+            "score_token_error",
+            coin_id=token.coin_id,
+            symbol=token.symbol,
+            failing_step=step,
+            exception_type=type(exc).__name__,
+            exception_message=redact(str(exc)),
+            status_code=getattr(exc, "status_code", None),
+            provider_request_id=getattr(exc, "request_id", None),
+            provider_health=health.value,
+            outcome=outcome.value,
+            model_identifier=model,
+            traceback=safe_traceback(exc),
+        )
         return None
 
 
