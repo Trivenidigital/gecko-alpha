@@ -65,8 +65,28 @@ fi
 # (e.g., find permission-denied → empty mapfile → silent green-when-broken).
 TMP_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST" "$TMP_LIST.err"' EXIT
+# Retention set = COMPLETED backups only, matched by exact filename shape:
+#   scout.db.bak.YYYYMMDDTHHMMSSZ   (current producer)
+#   scout.db.bak-YYYYMMDDTHHMMSSZ   (historical form, still honoured)
+#
+# `-regex` anchors against the WHOLE path and must match to the end, so any
+# suffix after the trailing Z is excluded: `.partial`, `.partial-journal`,
+# `.partial-wal`, `.partial-shm`.
+#
+# Why this is strict rather than a glob. The previous set was
+# `-name 'scout.db.bak.*' -o -name 'scout.db.bak-*'`, which also matched every
+# in-progress and orphaned artifact. Because rotation sorts by mtime descending
+# and keeps the first $KEEP, artifacts NEWER than the real backups took the
+# retention slots and the completed backups fell into the delete list.
+#
+# 2026-08-08, prod: five 1 KB `*.partial-journal` files (one per failed run)
+# sat newer than all three completed backups. Rotation had not yet destroyed
+# them only because create kept failing and aborted the unit before rotate ran.
+# Simulated against the live directory, the next successful create would have
+# pruned all three real backups and retained three 1 KB journals.
 if ! find "$GECKO_BACKUP_DIR" -maxdepth 1 -type f \
-        \( -name 'scout.db.bak.*' -o -name 'scout.db.bak-*' \) \
+        -regextype posix-extended \
+        -regex '.*/scout\.db\.bak[.-][0-9]{8}T[0-9]{6}Z' \
         -printf '%T@ %p\n' 2>"$TMP_LIST.err" \
     | sort -rn \
     | cut -d' ' -f2- > "$TMP_LIST"; then

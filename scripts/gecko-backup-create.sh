@@ -77,6 +77,24 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 DEST="$GECKO_BACKUP_DIR/scout.db.bak.$TS"
 DEST_TMP="$DEST.partial"
 
+# Remove the temp backup AND every SQLite sidecar it can leave behind.
+#
+# `sqlite3 .backup` opens the destination as a database, so a failed or
+# interrupted run can leave `-journal`, `-wal` and `-shm` companions next to
+# the main file. Removing only "$DEST_TMP" leaves those behind forever: nothing
+# else ever cleans them, and until the rotation glob was tightened they counted
+# toward KEEP and could evict a completed backup.
+#
+# Observed 2026-08-08 on prod: five orphaned `*.partial-journal` files from five
+# consecutive failed runs, which had to be removed by hand.
+_cleanup_partial() {
+    rm -f -- \
+        "$DEST_TMP" \
+        "$DEST_TMP-journal" \
+        "$DEST_TMP-wal" \
+        "$DEST_TMP-shm"
+}
+
 echo "gecko-backup-create: source=$DB_PATH dest=$DEST"
 
 # Online backup — copies pages incrementally; safe against concurrent
@@ -84,7 +102,7 @@ echo "gecko-backup-create: source=$DB_PATH dest=$DEST"
 # half-written file if this script is SIGKILLed mid-backup.
 if ! "$SQLITE_BIN" "$DB_PATH" ".backup '$DEST_TMP'" 2>&1; then
     echo "ERROR: sqlite3 .backup failed" >&2
-    rm -f "$DEST_TMP"
+    _cleanup_partial
     exit 4
 fi
 
@@ -95,12 +113,17 @@ INTEGRITY="$("$SQLITE_BIN" "$DEST_TMP" "PRAGMA integrity_check;" 2>&1 || true)"
 if [[ "$INTEGRITY" != "ok" ]]; then
     echo "ERROR: integrity check failed for $DEST_TMP:" >&2
     printf '%s\n' "$INTEGRITY" >&2
-    rm -f "$DEST_TMP"
+    _cleanup_partial
     exit 5
 fi
 
 # Promote .partial → final name. atomic-rename within same filesystem.
 mv -f "$DEST_TMP" "$DEST"
+
+# Sidecars should not survive a clean backup, but sweep them anyway: `mv`
+# promotes only the main file, so anything left beside it would linger under a
+# `.partial-*` name that no later run ever revisits.
+rm -f -- "$DEST_TMP-journal" "$DEST_TMP-wal" "$DEST_TMP-shm"
 
 # Size sanity-check (visible in journal for postmortem).
 SIZE="$(stat -c '%s' "$DEST" 2>/dev/null || echo unknown)"
