@@ -13,9 +13,10 @@ have been crossed while the initial stop was actually eligible to fire, using
 separate stop-width experiment," never "the geometry is proven better." See the
 retraction in §4 and the scope correction in §7.6.
 
-**Blocked on:** #516 **and** #517 merged and **deployed** before activation —
-#516 for provenance-safe measurement, #517 for the entry cap that makes this
-pilot's stated bounds real rather than descriptive.
+**Blocked on:** #516 (`398c32a7`) and #517 (`e6b8f741`) are **merged**. Both must
+still be **deployed** before activation — #516 for provenance-safe measurement,
+#517 for the entry cap that makes this pilot's stated bounds real rather than
+descriptive. Merge is not deploy (§8 step 3).
 
 ---
 
@@ -89,7 +90,8 @@ Every assumption checked against prod before proposing anything.
 | 7 | Revival primitive exists | `Database.revive_signal_with_baseline` — atomic `enabled=1` + `drawdown_baseline_at` + audit row, 7-day cool-off | ✅ |
 | 8 | Whole-life MAE available | **0 rows before 2026-08**; 70/70 in August | ❌ |
 | 9 | Whole-life MAE *sufficient* for the stop-width question | **No** — it keeps deepening after the SL stops being eligible; 7/7 armed winners misread as damage | ❌ **blocking, see §4** |
-| 10 | Eligibility-window MAE exists | `pre_leg1_mae_pct` — **PR #516, not yet merged/deployed** | ❌ **blocking** |
+| 10 | Eligibility-window MAE exists | `pre_leg1_mae_pct` — #516 **merged** `398c32a7`; **not yet deployed** | ⚠️ **blocking until deployed** |
+| 11 | Entry cap enforceable | `PAPER_LOSERS_PILOT_MAX_ENTRIES` — #517 **merged** `e6b8f741`; **not yet deployed**, and unset in prod `.env` (default 0 = no cap) | ⚠️ **blocking until deployed + configured** |
 
 **Assumption 2 is a stale-comment trap.** `scout/main.py:985-986` states the
 lane is *"disabled by default in prod via
@@ -740,14 +742,18 @@ signal · no registry edit.
 | Author this plan | doc | operator: "prepare, do not execute" | 2026-08-08 |
 | Revise this plan per review ruling | doc | operator: `CHANGES_REQUIRED_BEFORE_MERGE` (7-item list) | 2026-08-08 |
 | Ship `pre_leg1_mae_pct` (PR #516) | code + migration | operator item 3: "establish a temporally valid measurement… prove with tests" | 2026-08-08 |
-| Merge #516 | merge | **NOT YET REQUESTED** — per-PR only | — |
-| Deploy #516 to testbed | deploy | **NOT YET REQUESTED** | — |
+| Ship the entry cap (PR #517) | code + config | operator: "I prefer the real guard if this is going to be called a bounded pilot" | 2026-08-08 |
+| Merge #516 | merge | operator: `#516 APPROVED_TO_MERGE` | 2026-08-08 — merged `398c32a7` |
+| Merge #517 | merge | operator: `CONTENT APPROVED — rebase after #516 + fresh exact-head CI` | 2026-08-08 — rebased, CI green, merged `e6b8f741` |
+| Merge #515 | merge | operator: `APPROVED_TO_MERGE` conditional on truth-maintenance edits + fresh exact-head CI | pending this revision |
+| Deploy #516 + #517 to testbed (single combined deploy) | deploy | operator: "I also authorize the single combined deployment of the already-merged #516 + #517" | pending #515 merge |
 | **Revive `losers_contrarian` (paper)** | **runtime state change** | **NOT YET REQUESTED** — operator: `LOSERS_CONTRARIAN_REVIVAL_NOT_AUTHORIZED` | — |
 | Registry self-description / coverage correction | code + config | NOT YET REQUESTED — separate item | — |
 
-No action in the last four rows has been taken. #516 is authored and pushed but
-**not merged**; the revival is **not authorized** and nothing in prod has
-changed.
+#516 and #517 are **merged**; nothing is **deployed** yet. The revival is
+explicitly **not authorized** — the deployment authorization above does not
+extend to it. No `revive_signal_with_baseline` call has been made, no `PILOT_T0`
+stamped, and no pilot trade opened.
 
 ### Review-ruling conformance
 
@@ -765,7 +771,7 @@ changed.
 | R3-1 | Provenance across migration cutover | #516 — pre-cutover rows stay NULL, fail-closed, 3 tests |
 | R3-2 | Real admission cap, not a monitored cutoff | **#517** — pre-open guard, 8 tests, 3 mutants killed |
 | R3-3 | Remove remaining "net-beneficial" claim | §7.6 verdict wording; "can/cannot" list |
-| R3-4 | Quantify "materially exceeds" | §7.6 — `C−D ≥ 20pp` **and** `C ≥ 2×D`, all three thresholds |
+| R3-4 | Quantify "materially exceeds" | ~~§7.6 — `C−D ≥ 20pp` and `C ≥ 2×D`~~ **superseded by R4-2**: those criteria were removable because `C(X)` is structurally 100%, so they could never bind. The surviving quantified gate is `D(−10) ≤ 15%`. |
 | R3-5 | Define size-normalisation formula | §7.6 — `R_pilot = mean(pnl_pct)`, absolute gate ≤ −2.00% |
 | R4-1 | Cap guarantee scoped to one admission writer | §7.2 concurrency block; K6 |
 | R4-2 | `C(X)` is structurally 100% — not a discriminator | §7.6 correction; repurposed as a sanity check with a `NO_VERDICT` floor |
