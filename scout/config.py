@@ -1140,8 +1140,16 @@ class Settings(BaseSettings):
     # Why this exists: an operator watching for "entry 200 happened" and then
     # disabling the row is a monitored cutoff, not a cap — `trade_losers`
     # iterates the full fresh-losers batch and can admit more entries before the
-    # disable write lands. A pilot that calls a number a hard bound must be able
-    # to refuse the entry that would exceed it.
+    # disable write lands. A pilot that states a bound must be able to refuse
+    # the entry that would exceed it.
+    #
+    # Scope of the guarantee: EXACT under one active admission writer (asyncio
+    # runs one coroutine at a time and `trade_losers` awaits each open). It is
+    # check-then-act, not an atomic reservation, so concurrent writers can
+    # overshoot by the number of racers — the same property `engine.open_trade`
+    # documents for its own duplicate/exposure checks. Overshoot is detected and
+    # logged at error level (`pilot_entry_cap_exceeded`) rather than silently
+    # tolerated.
     PAPER_LOSERS_PILOT_MAX_ENTRIES: int = 0
     # BL-063 moonshot exit upgrade: when peak_pct crosses MOONSHOT_THRESHOLD_PCT,
     # widen the BL-061 ladder trail from PAPER_LADDER_TRAIL_PCT to

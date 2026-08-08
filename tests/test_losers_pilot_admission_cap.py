@@ -142,6 +142,54 @@ class TestFailClosed:
         assert await _pilot_admission_allowed(db, s) is True
 
 
+class TestOvershootDetection:
+    """The cap is check-then-act, not an atomic reservation. Concurrent writers
+    can push the cohort past the cap. That must SURFACE, because a
+    silently-oversized cohort invalidates the n the analysis is registered
+    against — it must not be quietly absorbed."""
+
+    async def test_an_over_cap_cohort_is_reported_not_silently_accepted(
+        self, db, settings_factory
+    ):
+        from structlog.testing import capture_logs
+
+        s = settings_factory(PAPER_LOSERS_PILOT_MAX_ENTRIES=5)
+        await _set_baseline(db, "2026-08-08T00:00:00+00:00")
+        await _add_entries(db, 7, opened_at="2026-08-08T01:00:00+00:00")  # 2 over
+
+        with capture_logs() as logs:
+            assert await _pilot_admission_allowed(db, s) is False
+
+        exceeded = [e for e in logs if e.get("event") == "pilot_entry_cap_exceeded"]
+        assert len(exceeded) == 1, (
+            "an over-cap cohort must be reported exactly once at error level, "
+            "not merely refused — refusal alone is indistinguishable from a "
+            f"normal stop. got: {[e.get('event') for e in logs]}"
+        )
+        assert exceeded[0]["log_level"] == "error"
+        assert exceeded[0]["overshoot"] == 2
+        assert exceeded[0]["entries"] == 7
+
+    async def test_exactly_at_cap_is_NOT_reported_as_overshoot(
+        self, db, settings_factory
+    ):
+        """Discriminating control: at the cap is the normal terminal state and
+        must not raise a false alarm. Without this, the test above passes even
+        if the error fires on every refusal."""
+        from structlog.testing import capture_logs
+
+        s = settings_factory(PAPER_LOSERS_PILOT_MAX_ENTRIES=5)
+        await _set_baseline(db, "2026-08-08T00:00:00+00:00")
+        await _add_entries(db, 5, opened_at="2026-08-08T01:00:00+00:00")
+
+        with capture_logs() as logs:
+            assert await _pilot_admission_allowed(db, s) is False
+
+        events = [e.get("event") for e in logs]
+        assert "pilot_entry_cap_exceeded" not in events
+        assert "pilot_entry_cap_reached" in events
+
+
 class TestWiring:
     def test_the_guard_runs_before_open_trade_in_trade_losers(self):
         """Structural: the check is worthless if it sits after the open."""

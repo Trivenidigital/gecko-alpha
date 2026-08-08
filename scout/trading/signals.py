@@ -531,6 +531,29 @@ async def _pilot_admission_allowed(db: Database, settings) -> bool:
     Fails CLOSED on a missing anchor: a cap configured with no baseline stamped
     means the pilot was never properly activated, and admitting uncapped trades
     in that state is precisely the unbounded run the cap exists to prevent.
+
+    CONCURRENCY -- the exact guarantee, stated precisely
+    ----------------------------------------------------
+    This is check-then-act: ``COUNT(*)`` here, ``INSERT`` later inside
+    ``engine.open_trade``. They are NOT one atomic reservation. With a single
+    admission writer the bound is exact, because asyncio runs one coroutine at a
+    time and ``trade_losers`` awaits each open before evaluating the next
+    candidate. With two overlapping writers, both can observe ``cap - 1``, both
+    pass, and the cohort can reach ``cap + 1``.
+
+    This is the SAME property every other admission gate in the engine has --
+    ``engine.open_trade`` carries the identical note about its duplicate and
+    exposure checks. A multi-writer interval already breaks those invariants
+    too, so the correct systemic response is to treat process overlap as a pilot
+    stop condition rather than to special-case this one gate. Making only this
+    check atomic would wrap ``open_trade`` -- shared by every signal -- in an
+    externally-held transaction, in a codebase that has already had a
+    transaction-scope deadlock. That trade is not worth it for a paper pilot.
+
+    So: the bound is exact under one active admission writer, and may overshoot
+    by the number of concurrent writers otherwise. Overshoot is DETECTED and
+    logged at error level below, so it surfaces as a stop condition instead of
+    silently invalidating the cohort size.
     """
     cap = getattr(settings, "PAPER_LOSERS_PILOT_MAX_ENTRIES", 0) or 0
     if cap <= 0:
@@ -558,6 +581,23 @@ async def _pilot_admission_allowed(db: Database, settings) -> bool:
         (baseline,),
     )
     entries = (await cur.fetchone())[0]
+    if entries > cap:
+        # The bound was already breached before this call. Under a single
+        # admission writer this is unreachable; reaching it means concurrent
+        # writers raced the check-then-act window (see the docstring), so the
+        # cohort size is no longer the pre-registered one. Error level, because
+        # a silently-oversized cohort invalidates the n it is analysed against.
+        logger.error(
+            "pilot_entry_cap_exceeded",
+            signal_type="losers_contrarian",
+            entries=entries,
+            cap=cap,
+            overshoot=entries - cap,
+            cohort_anchor=baseline,
+            detail="cohort exceeds the pre-registered cap — concurrent "
+            "admission writers suspected; treat as a pilot stop condition",
+        )
+        return False
     if entries >= cap:
         logger.info(
             "pilot_entry_cap_reached",
