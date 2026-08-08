@@ -168,10 +168,18 @@ class TestEvaluatorWiring:
         body = src[sel_start:sel_end].replace("SELECT", "", 1)
         cols = [c.strip() for c in body.split(",") if c.strip()]
 
-        assert cols[32] == "trough_price", f"trough_price moved to {cols.index('trough_price')}"
+        assert cols[32] == "trough_price", (
+            f"trough_price moved to {cols.index('trough_price')}"
+        )
         assert cols[33] == "mae_pct", f"mae_pct moved to {cols.index('mae_pct')}"
         assert "row[32]" in src, "trough_price must be read at its appended index"
-        assert "row[33]" in src or "mae_pct" in src
+        # NO row[33] assertion, deliberately. `mae_pct` is SELECTed to keep the
+        # positional contract contiguous, but it is never read positionally --
+        # the evaluator recomputes it from trough_price. An earlier revision
+        # wrote `assert "row[33]" in src or "mae_pct" in src`, whose second
+        # disjunct is satisfied by the SELECT text itself and can therefore
+        # never fail. A guard that cannot fail is worse than no guard: it
+        # reports coverage that does not exist.
 
     # Indices 0..33 are load-bearing: each is read somewhere as `row[N]`.
     # Reordering, renaming or inserting into this list silently repoints a read.
