@@ -422,7 +422,8 @@ is why **#516 must deploy before activation, not alongside it**.
 > that is 240–260 entries already deployed, i.e. **$36,000–$39,000**, before
 > counting rows excluded by §7.1. The stated cap was not a cap.
 
-**The cohort is bounded by entries, and the bound is enforced in code.**
+**The cohort is bounded by entries, enforced in code — under one admission
+writer.**
 `PAPER_LOSERS_PILOT_MAX_ENTRIES = 200` (**PR #517**). `trade_losers` refuses the
 entry that would exceed it, counting the cohort from
 `signal_params.drawdown_baseline_at` — the same anchor `auto_suspend` uses, so
@@ -442,7 +443,7 @@ force-closed — that would truncate the very excursions being measured.
 | Bound | Value | Nature |
 |---|---|---|
 | Position size | **$150** (`PAPER_TRADE_AMOUNT_USD=300` × experimental 0.5) | enforced by `resolve_paper_trust_size` |
-| **Max cohort entries** | **200** | **hard, enforced pre-open** (#517) — entry 201 is refused |
+| **Max cohort entries** | **200** | **enforced pre-open** (#517) — exact under a single admission writer; see the concurrency scope below |
 | Max cumulative pilot notional | **$30,000** (200 × $150) | follows from the enforced entry cap |
 | Simultaneous open pilot positions | **60** | **monitored abort threshold (K5), not an admission cap** |
 | Peak instantaneous notional | ~$9,000 at 60 open | consequence of the above, not a guarantee |
@@ -508,6 +509,7 @@ not the date.
 | K3 | `pre_leg1_mae_pct` NULL rate > 5% on new eligible closes | halt — instrumentation broken, the only deliverable is void |
 | K4 | entry rate < 3/day for 5 consecutive days | halt — 200 entries unreachable in a sane window |
 | K5 | simultaneous open pilot positions > 60 | halt + rollback — **monitored tripwire, not a hard cap** (§7.2); firing is a pre-registered outcome, not a failure |
+| K6 | `pilot_entry_cap_exceeded` logged, **or** overlapping pipeline processes observed during the pilot | halt + rollback — the entry cap is exact only under one admission writer (§7.2); a raced cohort is not the pre-registered `n` |
 
 **Explicitly NOT a kill criterion:** negative P&L within the gates.
 Break-even-minus is the *prior*, not a surprise. Killing the pilot for
