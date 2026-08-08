@@ -35,13 +35,12 @@ WATCHDOG_SCRIPT = REPO_ROOT / "scripts" / "gecko-backup-watchdog.sh"
 
 
 def _ts(i: int) -> str:
-    """A COMPLETED-backup filename for index *i*.
+    """A producer-shaped COMPLETED-backup filename for index *i*.
 
-    Rotation matches only `scout.db.bak[.-]YYYYMMDDTHHMMSSZ` — anything else
-    (in-progress `.partial`, SQLite sidecars, ad-hoc tags) is deliberately
-    outside the retention set. These tests used synthetic names like
-    `scout.db.bak.tag0`, which the tightened matcher correctly ignores, so they
-    had to move to real timestamps to keep testing rotation at all.
+    Convenience only. Rotation does NOT require this shape: arbitrary operator
+    tags (`cp scout.db scout.db.bak.<tag>`, spaces included) are a supported
+    workflow and remain in the retention set. What is excluded is the reserved
+    in-progress namespace, `*.partial*`.
     """
     return f"scout.db.bak.2026010{i % 10}T0000{i % 6}{i % 10}Z"
 
@@ -359,15 +358,11 @@ def test_heartbeat_atomic_write_via_rename(tmp_path):
 
 
 def test_symlink_not_followed(tmp_path):
-    # Both names must be inside the retention set for this test to exercise
-    # anything — with the tightened matcher, `scout.db.bak.real` /
-    # `scout.db.bak.symlink` are ignored entirely and nothing would be deleted,
-    # so the test would pass while proving nothing about symlink handling.
-    real = tmp_path / _ts(0)
+    real = tmp_path / "scout.db.bak.real"
     real.write_text("x")
     target_outside = tmp_path / "outside.db"
     target_outside.write_text("important")
-    symlink = tmp_path / _ts(1)
+    symlink = tmp_path / "scout.db.bak.symlink"
     symlink.symlink_to(target_outside)
     hb = tmp_path / "hb"
     res = _run(

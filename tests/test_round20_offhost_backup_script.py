@@ -259,3 +259,56 @@ def test_offhost_rsync_binary_missing_exit_6(tmp_path):
         }
     )
     assert proc.returncode == 6, f"stderr: {proc.stderr}"
+
+
+@pytest.mark.parametrize(
+    "suffix", [".partial", ".partial-journal", ".partial-wal", ".partial-shm"]
+)
+def test_offhost_skips_every_partial_sidecar_not_just_dot_partial(tmp_path, suffix):
+    """*** THE OFF-HOST HALF OF THE 2026-08-08 INCIDENT. ***
+
+    The skip was `[[ "$f" == *.partial ]]` — exact suffix only. But this loop
+    selects NEWEST by mtime, and a SQLite sidecar is always newer than the
+    completed backup it failed to become. So a `.partial-journal` could be
+    chosen as NEWEST and shipped off-host as though it were a backup, quietly
+    replacing the real off-site copy with a 1 KB journal.
+
+    Five such files accumulated on prod before this was noticed.
+    """
+    if shutil.which("rsync") is None:
+        pytest.skip("rsync not installed")
+
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    real = _make_bak(
+        backup_dir / "scout.db.bak.20260524T030000Z",
+        age_seconds=7200,
+        payload=b"REAL-BACKUP-PAYLOAD",
+    )
+    # Newer than the real backup — must still lose.
+    _make_bak(
+        backup_dir / f"scout.db.bak.20260525T030000Z{suffix}",
+        age_seconds=60,
+        payload=b"SIDECAR",
+    )
+
+    proc = _run(
+        {
+            "GECKO_OFFHOST_BACKUP_DEST": str(dest) + "/",
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_OFFHOST_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    assert (dest / real.name).exists(), (
+        f"the genuine backup was not shipped; {suffix} won NEWEST selection"
+    )
+    assert (dest / real.name).read_bytes() == b"REAL-BACKUP-PAYLOAD"
+    shipped = sorted(p.name for p in dest.iterdir())
+    assert not any(".partial" in n for n in shipped), (
+        f"shipped an in-progress artifact off-host: {shipped}"
+    )

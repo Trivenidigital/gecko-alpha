@@ -11,6 +11,7 @@ Skipped on Windows: bash + flock semantics are Linux-specific.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -247,7 +248,7 @@ def test_create_exits_5_on_integrity_failure(tmp_path):
 # ---------------------------------------------------------------------
 
 
-def _sidecar_stub(path: Path, *, mode: str) -> Path:
+def _sidecar_stub(path: Path, *, mode: str, witness: Path | None = None) -> Path:
     """A stub sqlite3 that writes the .partial AND its SQLite sidecars.
 
     `sqlite3 .backup` opens the destination as a database, so an interrupted or
@@ -257,6 +258,13 @@ def _sidecar_stub(path: Path, *, mode: str) -> Path:
 
     mode="backup_fail"    -> create all four, then fail the .backup   (exit 4)
     mode="integrity_fail" -> create all four, report corruption       (exit 5)
+
+    *witness*, when given, receives one line per artifact the stub actually
+    created, written OUTSIDE the backup directory so cleanup cannot erase it.
+    Without it, `leftovers == []` passes just as happily when the stub created
+    nothing at all — which is precisely the vacuous-negative shape this file
+    exists to eliminate. The witness turns "nothing left behind" into "these
+    four existed, and then they were removed".
     """
     body = [
         "#!/usr/bin/env bash",
@@ -267,6 +275,12 @@ def _sidecar_stub(path: Path, *, mode: str) -> Path:
         '  echo "w" > "$dest-wal"',
         '  echo "s" > "$dest-shm"',
     ]
+    if witness is not None:
+        body += [
+            f'  for a in "$dest" "$dest-journal" "$dest-wal" "$dest-shm"; do',
+            f'    [[ -f "$a" ]] && echo "$a" >> {shlex.quote(str(witness))}',
+            "  done",
+        ]
     if mode == "backup_fail":
         body += ['  echo "stub: disk full" >&2', "  exit 1"]
     else:
@@ -305,7 +319,9 @@ def test_failure_removes_partial_AND_every_sidecar(tmp_path, mode, expected_rc):
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
     _make_seed_db(db)
-    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode=mode)
+    # Witness lives OUTSIDE backup_dir so cleanup cannot erase the evidence.
+    witness = tmp_path / "created-artifacts.txt"
+    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode=mode, witness=witness)
 
     proc = _run(
         {
@@ -318,6 +334,23 @@ def test_failure_removes_partial_AND_every_sidecar(tmp_path, mode, expected_rc):
     )
     assert proc.returncode == expected_rc, proc.stderr
 
+    # POSITIVE WITNESS FIRST. Without this, `leftovers == []` passes just as
+    # happily when the stub created nothing — the vacuous negative this file
+    # exists to eliminate. Assert existence AND count, not `if witness:`.
+    assert witness.exists(), (
+        "stub never ran or never created artifacts — the cleanup assertion "
+        "below would pass for the wrong reason"
+    )
+    created = [ln for ln in witness.read_text().splitlines() if ln.strip()]
+    assert len(created) == 4, f"expected all 4 artifacts created, got {created}"
+    assert sorted(Path(c).name.split(".partial")[1] for c in created) == [
+        "",
+        "-journal",
+        "-shm",
+        "-wal",
+    ], created
+
+    # ...and only now is "nothing left behind" meaningful.
     leftovers = sorted(p.name for p in backup_dir.iterdir())
     assert leftovers == [], (
         f"failure path left artifacts behind: {leftovers}. Every one of these "
@@ -331,7 +364,8 @@ def test_success_leaves_no_sidecars_beside_the_promoted_backup(tmp_path):
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
     _make_seed_db(db)
-    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode="ok")
+    witness = tmp_path / "created-artifacts.txt"
+    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode="ok", witness=witness)
 
     proc = _run(
         {
@@ -343,6 +377,9 @@ def test_success_leaves_no_sidecars_beside_the_promoted_backup(tmp_path):
         }
     )
     assert proc.returncode == 0, proc.stderr
+
+    assert witness.exists(), "stub never created the sidecars it was asked to"
+    assert len([ln for ln in witness.read_text().splitlines() if ln.strip()]) == 4
 
     names = sorted(p.name for p in backup_dir.iterdir())
     assert len(names) == 1, f"expected exactly the promoted backup, got {names}"

@@ -1653,6 +1653,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # rotate-script glob is `scout.db.bak.*` and `scout.db.bak-*`;
         # match both. If GECKO_BACKUP_DIR is unset, fall back to the
         # production default.
+        #
+        # `.partial` and its SQLite sidecars (`-journal`, `-wal`, `-shm`) are
+        # the RESERVED IN-PROGRESS NAMESPACE owned by gecko-backup-create.sh and
+        # are NOT completed backups. Counting them here made backup health look
+        # healthy while the newest real backup was stale: this list is sorted
+        # newest-first, and a failed run's sidecar is always newer than the
+        # backup it failed to become. On prod 2026-08-08 five such files sat
+        # newer than three completed backups, so `latest_backup_age_sec` would
+        # have reported minutes while the true newest backup was seven days old.
+        #
+        # Same definition as gecko-backup-rotate.sh and gecko-backup-offhost.sh
+        # — "completed backup" must mean one thing across every reader.
         backup_dir = Path(os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha"))
         try:
             files = sorted(
@@ -1660,7 +1672,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     p
                     for pattern in ("scout.db.bak.*", "scout.db.bak-*")
                     for p in backup_dir.glob(pattern)
-                    if p.is_file()
+                    if p.is_file() and ".partial" not in p.name
                 ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
