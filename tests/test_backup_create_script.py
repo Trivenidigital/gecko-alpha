@@ -211,7 +211,11 @@ def test_create_exits_5_on_integrity_failure(tmp_path):
         "#!/usr/bin/env bash\n"
         'if [[ "$2" == .backup* ]]; then\n'
         '  # extract dest from `.backup \'path\'`\n'
-        r'  dest=$(echo "$2" | sed "s/^.backup \'\(.*\)\'$/\1/")',
+        # Raw triple-quoted: `\(` and `\1` must reach sed literally. In a plain
+        # string `"\1"` is chr(1), which silently made `dest` garbage — no
+        # .partial was ever written and `assert partials == []` passed for the
+        # wrong reason.
+        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
         '  echo "stub-backup-data" > "$dest"\n'
         "  exit 0\n"
         'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then\n'
@@ -257,7 +261,7 @@ def _sidecar_stub(path: Path, *, mode: str) -> Path:
     body = [
         "#!/usr/bin/env bash",
         'if [[ "$2" == .backup* ]]; then',
-        r'  dest=$(echo "$2" | sed "s/^.backup \'\(.*\)\'$/\1/")',
+        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''',
         '  echo "stub-backup-data" > "$dest"',
         '  echo "j" > "$dest-journal"',
         '  echo "w" > "$dest-wal"',

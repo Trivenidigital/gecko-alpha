@@ -89,11 +89,13 @@ def test_keeps_top_n_by_mtime(tmp_path):
     surviving = sorted(
         p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
     )
-    assert any("tag0" in n for n in surviving)
-    assert any("tag1" in n for n in surviving)
-    assert any("tag2" in n for n in surviving)
-    assert not any("tag3" in n for n in surviving)
-    assert not any("tag4" in n for n in surviving)
+    # Identity assertions, not substring probes: the files are now real
+    # timestamped names, so `_ts(i)` is the exact expected filename.
+    assert _ts(0) in surviving
+    assert _ts(1) in surviving
+    assert _ts(2) in surviving
+    assert _ts(3) not in surviving
+    assert _ts(4) not in surviving
     assert len(surviving) == 3
 
 
@@ -357,11 +359,15 @@ def test_heartbeat_atomic_write_via_rename(tmp_path):
 
 
 def test_symlink_not_followed(tmp_path):
-    real = tmp_path / "scout.db.bak.real"
+    # Both names must be inside the retention set for this test to exercise
+    # anything — with the tightened matcher, `scout.db.bak.real` /
+    # `scout.db.bak.symlink` are ignored entirely and nothing would be deleted,
+    # so the test would pass while proving nothing about symlink handling.
+    real = tmp_path / _ts(0)
     real.write_text("x")
     target_outside = tmp_path / "outside.db"
     target_outside.write_text("important")
-    symlink = tmp_path / "scout.db.bak.symlink"
+    symlink = tmp_path / _ts(1)
     symlink.symlink_to(target_outside)
     hb = tmp_path / "hb"
     res = _run(
