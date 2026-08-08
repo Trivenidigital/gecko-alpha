@@ -145,14 +145,26 @@ parameter change. The sample has *never* been the constraint.
    accumulating. Only the first condition is real.
 3. **The failure is upstream of the sample check entirely.** `learn.skip_adjustments`
    (INFO, step 6) fired **0 times in 7 days** while `learn.daily_error` fired **7**.
-   The run crashes before `apply_adjustments` is reached — consistent with the
-   retired-model hypothesis at step 4.
+   The run crashes before `apply_adjustments` is reached — consistent with a
+   provider failure at step 4. (The observation stands; the attribution to a
+   *retired model* does not. Proven cause is `400 BILLING_BLOCKED` — see the
+   superseding block at the top.)
 
-### Corrected conclusion
+### ~~Corrected conclusion~~ — **ALSO SUPERSEDED 2026-08-07**
 
-**Fix the learner and adaptation resumes immediately.** 932 qualifying predictions
-are waiting; the next successful cycle can act on them. This is a materially
-simpler and cheaper remediation than the document originally described.
+~~**Fix the learner and adaptation resumes immediately.** 932 qualifying
+predictions are waiting; the next successful cycle can act on them. This is a
+materially simpler and cheaper remediation than the document originally
+described.~~
+
+> Same false claim as §5's, in different words. The replacement learner
+> (`run_deterministic_daily_learn`, #510) is **proposal-only** — it writes a
+> `learn_logs` row and calls no `Strategy.set`. No learner fix resumes adaptation
+> by itself; applying a proposal is a separate owner-gated decision that is
+> deliberately not implemented. The 932-prediction count remains correct, and the
+> deterministic evaluator has since consumed that population: verdict
+> `NO_CHANGE_WITHIN_VERIFIED_SEARCH_SPACE` over 27 candidates across 3 of 14
+> parameters (`tasks/report_deterministic_learner_evaluation_2026_08_05.md`).
 
 The 7-day evidence window also supersedes the 3-day counts in §2:
 `learn.daily_error` **7 / 7 days**, `learn.daily_complete` **0**,
