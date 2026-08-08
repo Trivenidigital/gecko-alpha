@@ -95,6 +95,42 @@ _cleanup_partial() {
         "$DEST_TMP-shm"
 }
 
+# Signal cleanup. Installed immediately after _cleanup_partial() and DEST_TMP
+# exist, so there is no window in which the temp file can be created while
+# uncovered.
+#
+# The ordinary error paths below call _cleanup_partial directly. They cannot
+# help when the script is SIGNALLED rather than allowed to fail: systemd sends
+# SIGTERM on TimeoutStartSec expiry, and without a trap the shell dies with the
+# partial and every sidecar left on disk.
+#
+# 2026-08-08: TimeoutStartSec=600 expired mid-`.backup` on a 6.82 GB database.
+# systemd terminated the unit (status=15/TERM) and orphaned a 6.8 GB `.partial`
+# plus its -shm/-wal. Nothing else ever revisits a `.partial-*` name, so it sat
+# there consuming capacity until removed by hand. Two earlier orphans of the
+# same shape (2026-08-02, 2026-08-03) are strongly corroborated as the same
+# mechanism — matching near-complete sizes under the same unchanged 600s limit
+# — though their systemd records had already aged out of journal retention, so
+# that attribution is inference rather than log evidence.
+#
+# Exit 143 = 128 + SIGTERM, the conventional shell encoding, so the unit still
+# reports failure rather than a spurious success.
+#
+# SIGKILL is deliberately NOT handled: it is uncatchable. An orphan can still
+# result from `kill -9`, OOM, or power loss. After PR #518 such an orphan can
+# no longer masquerade as a completed backup or evict one, but reclaiming its
+# disk space remains a separate, unsolved problem.
+_on_signal() {
+    local sig="$1"
+    echo "gecko-backup-create: received SIG${sig} — removing partial artifacts" >&2
+    _cleanup_partial
+    trap - "$sig"
+    exit $((128 + $(kill -l "$sig")))
+}
+trap '_on_signal TERM' TERM
+trap '_on_signal INT' INT
+trap '_on_signal HUP' HUP
+
 echo "gecko-backup-create: source=$DB_PATH dest=$DEST"
 
 # Online backup — copies pages incrementally; safe against concurrent
