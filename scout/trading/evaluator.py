@@ -215,7 +215,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
         raise RuntimeError("Database not initialized.")
 
     # 1. Get all open trades. Rows are unpacked positionally; column order
-    # below maps to row[0]..row[29]. `original_trail_drawdown_pct` is
+    # below maps to row[0]..row[34]. New columns are APPENDED at the end so
+    # existing positional reads keep their meaning. `original_trail_drawdown_pct` is
     # intentionally NOT selected — it is written at arm time for post-mortem
     # queries on closed trades but is never consumed on the evaluator hot
     # path; pulling it here would just bloat each pass.
@@ -230,7 +231,8 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                   checkpoint_6h_pct, checkpoint_24h_pct,
                   moonshot_armed_at, conviction_locked_at,
                   checkpoint_1h_pct,
-                  trough_price, mae_pct
+                  trough_price, mae_pct,
+                  pre_leg1_trough_price
            FROM paper_trades
            WHERE status = 'open'""")
     rows = await cursor.fetchall()
@@ -278,9 +280,12 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             cp_48h = row[11]
             peak_price = float(row[12]) if row[12] is not None else None
             peak_pct = float(row[13]) if row[13] is not None else None
-            # Appended at the END of the SELECT (indices 32/33) so the existing
-            # positional reads above keep their meaning.
+            # Appended at the END of the SELECT (indices 32/33/34) so the
+            # existing positional reads above keep their meaning.
             trough_price = float(row[32]) if row[32] is not None else None
+            pre_leg1_trough_price = (
+                float(row[34]) if len(row) > 34 and row[34] is not None else None
+            )
             symbol_row = row[15]
             signal_type_row = row[20]
 
@@ -636,6 +641,55 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
                     (trough_price, round(mae_pct, 4), trade_id),
                 )
 
+            # Hoisted here from the leg/floor unpack below: the pre-leg-1
+            # excursion window and the SL's eligibility test must read ONE
+            # value, or the measurement window can drift away from the window
+            # the stop actually fires in -- which is the entire defect this
+            # column exists to fix.
+            floor_armed = (
+                bool(row[25]) if len(row) > 25 and row[25] is not None else False
+            )
+
+            # Pre-leg-1 adverse excursion -- the same low-water mark, but only
+            # over the window where the INITIAL stop is eligible to fire.
+            #
+            # The SL below is gated `if not floor_armed and ... <= sl_price`;
+            # once leg 1 arms the floor the downside rule becomes a breakeven
+            # floor at entry instead. So the whole-life `mae_pct` above keeps
+            # deepening after the stop stopped being the operative rule, and a
+            # counterfactual built on it reads post-arm dips as winners a
+            # tighter stop would have killed. It would not have killed them.
+            #
+            # `floor_armed` here is the value read at the top of THIS tick --
+            # the same value the SL branch below tests -- so the measurement
+            # window and the stop's eligibility window cannot drift apart.
+            #
+            # Freezing (not nulling) at arm time is deliberate: a frozen value
+            # is a measurement of the pre-arm window, and NULL must keep its
+            # single meaning of "never measured".
+            if not floor_armed:
+                if pre_leg1_trough_price is None:
+                    pre_leg1_trough_price = min(entry_price, current_price)
+                    _write_pre_leg1 = True
+                elif current_price < pre_leg1_trough_price:
+                    pre_leg1_trough_price = current_price
+                    _write_pre_leg1 = True
+                else:
+                    _write_pre_leg1 = False
+                if _write_pre_leg1:
+                    pre_leg1_mae_pct = (
+                        (pre_leg1_trough_price - entry_price) / entry_price
+                    ) * 100
+                    await conn.execute(
+                        "UPDATE paper_trades SET pre_leg1_trough_price = ?, "
+                        "pre_leg1_mae_pct = ? WHERE id = ?",
+                        (
+                            pre_leg1_trough_price,
+                            round(pre_leg1_mae_pct, 4),
+                            trade_id,
+                        ),
+                    )
+
             updates: dict[str, object] = {}
 
             if cp_1h is None and elapsed >= timedelta(hours=1):
@@ -668,9 +722,6 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             leg_2_filled = row[23] if len(row) > 23 else None
             remaining_qty = (
                 float(row[24]) if len(row) > 24 and row[24] is not None else None
-            )
-            floor_armed = (
-                bool(row[25]) if len(row) > 25 and row[25] is not None else False
             )
 
             # BL-061 eligibility via datetime compare: SQLite datetime('now')
