@@ -181,8 +181,12 @@ class TestEvaluatorWiring:
         # never fail. A guard that cannot fail is worse than no guard: it
         # reports coverage that does not exist.
 
-    # Indices 0..33 are load-bearing: each is read somewhere as `row[N]`.
-    # Reordering, renaming or inserting into this list silently repoints a read.
+    # Indices 0..33 are the frozen positional contract. Most are read somewhere
+    # as `row[N]`; index 33 (`mae_pct`) deliberately is NOT -- it is SELECTed to
+    # keep the contract contiguous and recomputed from trough_price instead.
+    # The invariant is that NO index in this range may shift, whether or not a
+    # given one is currently consumed: a shift silently repoints every read
+    # after it, and a column that is unread today may be read tomorrow.
     FROZEN_PREFIX = [
         "id", "token_id", "entry_price", "opened_at",
         "tp_price", "sl_price", "tp_pct", "sl_pct",

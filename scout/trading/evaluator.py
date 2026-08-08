@@ -38,6 +38,30 @@ async def _load_bl061_cutover_ts(conn) -> str | None:
     return row[0] if row else None
 
 
+async def _load_pre_leg1_mae_cutover_ts(conn) -> str | None:
+    """Load the pre-leg-1 MAE instrumentation cutover from paper_migrations.
+
+    Rows opened BEFORE this instant can never have a complete pre-leg-1 adverse
+    path — the ticks that would have measured it happened before the column
+    existed. Writing to them on the first post-deploy tick would produce a row
+    that is non-NULL and therefore looks measured, while silently omitting
+    everything before the deploy. That third state is worse than either NULL or
+    a real value, because `pre_leg1_mae_pct IS NOT NULL` is exactly the
+    eligibility filter every downstream analysis is told to use.
+
+    Returns None if the migration row is missing. Callers MUST treat None as
+    "cutover unknown -> write nothing", not as "no cutover -> write everything":
+    failing open here would reintroduce the partial-observation rows this guard
+    exists to prevent.
+    """
+    cur = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations "
+        "WHERE name = 'bl_pre_leg1_adverse_excursion_v1'"
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
 async def _load_bl062_cutover_ts(conn) -> str | None:
     """Load BL-062 peak-fade cutover timestamp from paper_migrations.
 
@@ -256,6 +280,10 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
 
     _trader = PaperTrader()
     cutover_ts = await _load_bl061_cutover_ts(conn)
+    # Loaded once per pass, not per row: the pre-leg-1 MAE write is gated on it
+    # so that a trade already open at deploy time never receives a partial
+    # measurement. See _load_pre_leg1_mae_cutover_ts.
+    pre_leg1_cutover_dt = _parse_ts(await _load_pre_leg1_mae_cutover_ts(conn))
     # BL-062 peak-fade is gated by is_bl061 + PEAK_FADE_ENABLED only; its
     # own cutover row exists solely for the 30-day review query (see
     # _load_bl062_cutover_ts), so we intentionally do NOT load it here.
@@ -667,7 +695,23 @@ async def evaluate_paper_trades(db: Database, settings, *, session=None) -> None
             # Freezing (not nulling) at arm time is deliberate: a frozen value
             # is a measurement of the pre-arm window, and NULL must keep its
             # single meaning of "never measured".
-            if not floor_armed:
+            # Provenance gate. A trade already open when this shipped cannot
+            # have a complete pre-arm path -- the ticks that would have measured
+            # it predate the column. Writing to it would yield a non-NULL row
+            # that LOOKS measured while silently missing everything before the
+            # deploy, defeating the `IS NOT NULL` eligibility filter every
+            # downstream analysis is told to use.
+            #
+            # Fails CLOSED: an unknown cutover writes nothing. Failing open
+            # would recreate exactly the partial rows this prevents.
+            opened_dt = _parse_ts(row[3])
+            pre_leg1_measurable = (
+                pre_leg1_cutover_dt is not None
+                and opened_dt is not None
+                and opened_dt >= pre_leg1_cutover_dt
+            )
+
+            if pre_leg1_measurable and not floor_armed:
                 if pre_leg1_trough_price is None:
                     pre_leg1_trough_price = min(entry_price, current_price)
                     _write_pre_leg1 = True

@@ -24,9 +24,21 @@ from scout.db import Database
 
 
 async def _open_trade(db: Database, **overrides) -> int:
-    """Insert one open paper trade and return its id."""
+    """Insert one open paper trade and return its id.
+
+    `opened_at` defaults to the pre-leg-1 migration's own cutover_ts, so the
+    default trade is post-cutover and therefore measurable. Hardcoding a literal
+    date here would silently make every test a pre-cutover case the moment the
+    provenance gate landed — which is exactly what happened on the first run.
+    """
     conn = db._conn
     assert conn is not None
+    cur_c = await conn.execute(
+        "SELECT cutover_ts FROM paper_migrations "
+        "WHERE name = 'bl_pre_leg1_adverse_excursion_v1'"
+    )
+    row_c = await cur_c.fetchone()
+    default_opened_at = row_c[0] if row_c else "2026-08-08T00:00:00+00:00"
     cols = {
         "token_id": "tok-1",
         "symbol": "TOK",
@@ -42,8 +54,8 @@ async def _open_trade(db: Database, **overrides) -> int:
         "tp_price": 150.0,
         "sl_price": 75.0,
         "status": "open",
-        "opened_at": "2026-08-08T00:00:00+00:00",
-        "created_at": "2026-08-08T00:00:00+00:00",
+        "opened_at": default_opened_at,
+        "created_at": default_opened_at,
     }
     cols.update(overrides)
     names = ", ".join(cols)
@@ -184,6 +196,98 @@ class TestMeasurementWindow:
         got = await _read(db, tid)
         assert got["pre_leg1_mae_pct"] == pytest.approx(0.0, abs=0.01)
         assert got["pre_leg1_mae_pct"] is not None
+
+
+class TestCutoverProvenance:
+    """*** THE THIRD STATE IS THE DANGEROUS ONE. ***
+
+    NULL means never measured. A real value means fully measured. A trade that
+    was ALREADY OPEN when this shipped would otherwise get a value covering only
+    the post-deploy remainder of its pre-arm window — non-NULL, so it passes the
+    `IS NOT NULL` eligibility filter, while silently missing everything before
+    the deploy. That is worse than either other state, because the filter is
+    precisely what every downstream analysis is told to trust.
+    """
+
+    @staticmethod
+    async def _cutover(db) -> str:
+        cur = await db._conn.execute(
+            "SELECT cutover_ts FROM paper_migrations "
+            "WHERE name = 'bl_pre_leg1_adverse_excursion_v1'"
+        )
+        return (await cur.fetchone())[0]
+
+    async def test_a_trade_open_BEFORE_cutover_stays_NULL_forever(
+        self, db, settings_factory
+    ):
+        from scout.trading import evaluator
+
+        tid = await _open_trade(
+            db, floor_armed=0, opened_at="2026-01-01T00:00:00+00:00"
+        )
+        # Several valid ticks, all dipping, all while the floor is unarmed.
+        for px in (90.0, 80.0, 70.0):
+            await _tick(db, evaluator, settings_factory(), tid, price=px)
+
+        got = await _read(db, tid)
+        assert got["pre_leg1_mae_pct"] is None, (
+            "a pre-cutover trade must never receive a partial pre-leg-1 "
+            "measurement — its earlier adverse path is unrecoverable"
+        )
+        assert got["pre_leg1_trough_price"] is None
+        # The whole-life column is unaffected: it was always partial for these
+        # rows and is documented as such.
+        assert got["mae_pct"] is not None
+
+    async def test_a_trade_open_AFTER_cutover_DOES_populate(
+        self, db, settings_factory
+    ):
+        """The control. Without it, the test above passes if the write is
+        broken for every row, which is how the first version of this file
+        passed while nothing was written at all."""
+        from scout.trading import evaluator
+
+        cutover = await self._cutover(db)
+        tid = await _open_trade(db, floor_armed=0, opened_at=cutover)
+        await _tick(db, evaluator, settings_factory(), tid, price=85.0)
+
+        got = await _read(db, tid)
+        assert got["pre_leg1_mae_pct"] == pytest.approx(-15.0, abs=0.01)
+
+    async def test_it_fails_CLOSED_when_the_cutover_row_is_missing(
+        self, db, settings_factory
+    ):
+        """Unknown cutover must write nothing, and must do so BY THE GUARD.
+
+        The NULL assertion alone is not enough. A mutant that drops the
+        `is not None` check makes `opened_dt >= None` raise TypeError, which the
+        per-trade `except Exception: ... continue` swallows -- so the column is
+        still NULL and a NULL-only test passes while the evaluator has actually
+        stopped processing that trade entirely (no TP, no SL, no expiry).
+
+        Price is set below sl_price so the SL branch -- which lives AFTER the
+        pre-leg-1 block -- must still fire. That distinguishes "the guard
+        declined to write" from "the loop blew up before getting there".
+        """
+        from scout.trading import evaluator
+
+        await db._conn.execute(
+            "DELETE FROM paper_migrations "
+            "WHERE name = 'bl_pre_leg1_adverse_excursion_v1'"
+        )
+        await db._conn.commit()
+        tid = await _open_trade(db, floor_armed=0)
+        await _tick(db, evaluator, settings_factory(), tid, price=70.0)  # < sl 75
+
+        got = await _read(db, tid)
+        assert got["pre_leg1_mae_pct"] is None
+        cur = await db._conn.execute(
+            "SELECT status FROM paper_trades WHERE id = ?", (tid,)
+        )
+        assert (await cur.fetchone())[0] == "closed_sl", (
+            "the rest of the tick must still run — a swallowed exception would "
+            "leave this open and silently disable every downstream exit path"
+        )
 
 
 async def _tick(db, evaluator, settings, trade_id: int, *, price: float) -> None:
