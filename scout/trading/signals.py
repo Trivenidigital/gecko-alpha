@@ -516,6 +516,60 @@ async def trade_slow_burn(
     logger.info("trade_slow_burn_filtered", new=len(new_rows), opened=opened)
 
 
+async def _pilot_admission_allowed(db: Database, settings) -> bool:
+    """Is there room for one more entry in the losers_contrarian pilot cohort?
+
+    ``PAPER_LOSERS_PILOT_MAX_ENTRIES = 0`` (the default) means no cap and this
+    returns True without touching the DB.
+
+    The cohort is anchored on ``signal_params.drawdown_baseline_at`` — stamped
+    atomically by ``revive_signal_with_baseline`` at revival, and immutable for
+    that revival's lifetime. Reusing it means the cap and the auto-suspend
+    rolling window measure the same cohort, so they cannot disagree about which
+    trades belong to the pilot.
+
+    Fails CLOSED on a missing anchor: a cap configured with no baseline stamped
+    means the pilot was never properly activated, and admitting uncapped trades
+    in that state is precisely the unbounded run the cap exists to prevent.
+    """
+    cap = getattr(settings, "PAPER_LOSERS_PILOT_MAX_ENTRIES", 0) or 0
+    if cap <= 0:
+        return True
+
+    cur = await db._conn.execute(
+        "SELECT drawdown_baseline_at FROM signal_params "
+        "WHERE signal_type = 'losers_contrarian'"
+    )
+    row = await cur.fetchone()
+    baseline = row[0] if row else None
+    if baseline is None:
+        logger.warning(
+            "pilot_entry_cap_no_baseline",
+            signal_type="losers_contrarian",
+            cap=cap,
+            detail="cap configured but drawdown_baseline_at is unset; "
+            "refusing admission (fail closed)",
+        )
+        return False
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_trades "
+        "WHERE signal_type = 'losers_contrarian' AND opened_at >= ?",
+        (baseline,),
+    )
+    entries = (await cur.fetchone())[0]
+    if entries >= cap:
+        logger.info(
+            "pilot_entry_cap_reached",
+            signal_type="losers_contrarian",
+            entries=entries,
+            cap=cap,
+            cohort_anchor=baseline,
+        )
+        return False
+    return True
+
+
 async def trade_losers(
     engine,
     db: Database,
@@ -641,6 +695,28 @@ async def trade_losers(
                     )
                     price_row = await pc.fetchone()
                     loser_price = price_row[0] if price_row else None
+
+                # Bounded-pilot admission cap. Re-counted per candidate rather
+                # than computed once for the batch: `open_trade` can decline for
+                # its own reasons (exposure, dedup, unpriceable), so a
+                # pre-computed remaining-capacity number would drift from the
+                # real entry count within a single pass.
+                #
+                # A cap enforced only by an operator noticing "entry 200 landed"
+                # and then disabling the row is a monitored cutoff, not a cap:
+                # this loop iterates the whole fresh-losers batch, so further
+                # entries can be admitted before the disable write lands.
+                if not await _pilot_admission_allowed(db, settings):
+                    await _emit_dispatch_decision(
+                        db,
+                        row=l,
+                        signal_type="losers_contrarian",
+                        decision="blocked",
+                        reason="pilot_entry_cap_reached",
+                        signal_combo=combo_key,
+                    )
+                    continue
+
                 await engine.open_trade(
                     token_id=l["coin_id"],
                     symbol=l["symbol"],
