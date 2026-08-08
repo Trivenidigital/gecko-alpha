@@ -1127,6 +1127,30 @@ class Settings(BaseSettings):
     # code — flip via .env when the underlying market behavior changes.
     PAPER_SIGNAL_LOSERS_CONTRARIAN_ENABLED: bool = True
     PAPER_SIGNAL_TRENDING_CATCH_ENABLED: bool = True
+    # Bounded-pilot admission cap for losers_contrarian. 0 = no cap (current
+    # behaviour, and the default). When > 0, `trade_losers` refuses to open the
+    # (N+1)th trade of the current pilot cohort.
+    #
+    # The cohort is anchored on `signal_params.drawdown_baseline_at`, which
+    # `revive_signal_with_baseline` stamps atomically at revival — an existing
+    # persisted anchor, not a new primitive, and immutable for the life of a
+    # revival. Trades opened before that instant belong to an earlier cohort and
+    # are not counted.
+    #
+    # Why this exists: an operator watching for "entry 200 happened" and then
+    # disabling the row is a monitored cutoff, not a cap — `trade_losers`
+    # iterates the full fresh-losers batch and can admit more entries before the
+    # disable write lands. A pilot that states a bound must be able to refuse
+    # the entry that would exceed it.
+    #
+    # Scope of the guarantee: EXACT under one active admission writer (asyncio
+    # runs one coroutine at a time and `trade_losers` awaits each open). It is
+    # check-then-act, not an atomic reservation, so concurrent writers can
+    # overshoot by the number of racers — the same property `engine.open_trade`
+    # documents for its own duplicate/exposure checks. Overshoot is detected and
+    # logged at error level (`pilot_entry_cap_exceeded`) rather than silently
+    # tolerated.
+    PAPER_LOSERS_PILOT_MAX_ENTRIES: int = 0
     # BL-063 moonshot exit upgrade: when peak_pct crosses MOONSHOT_THRESHOLD_PCT,
     # widen the BL-061 ladder trail from PAPER_LADDER_TRAIL_PCT to
     # PAPER_MOONSHOT_TRAIL_DRAWDOWN_PCT so big runners aren't clipped early.

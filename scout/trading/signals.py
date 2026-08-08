@@ -516,6 +516,100 @@ async def trade_slow_burn(
     logger.info("trade_slow_burn_filtered", new=len(new_rows), opened=opened)
 
 
+async def _pilot_admission_allowed(db: Database, settings) -> bool:
+    """Is there room for one more entry in the losers_contrarian pilot cohort?
+
+    ``PAPER_LOSERS_PILOT_MAX_ENTRIES = 0`` (the default) means no cap and this
+    returns True without touching the DB.
+
+    The cohort is anchored on ``signal_params.drawdown_baseline_at`` — stamped
+    atomically by ``revive_signal_with_baseline`` at revival, and immutable for
+    that revival's lifetime. Reusing it means the cap and the auto-suspend
+    rolling window measure the same cohort, so they cannot disagree about which
+    trades belong to the pilot.
+
+    Fails CLOSED on a missing anchor: a cap configured with no baseline stamped
+    means the pilot was never properly activated, and admitting uncapped trades
+    in that state is precisely the unbounded run the cap exists to prevent.
+
+    CONCURRENCY -- the exact guarantee, stated precisely
+    ----------------------------------------------------
+    This is check-then-act: ``COUNT(*)`` here, ``INSERT`` later inside
+    ``engine.open_trade``. They are NOT one atomic reservation. With a single
+    admission writer the bound is exact, because asyncio runs one coroutine at a
+    time and ``trade_losers`` awaits each open before evaluating the next
+    candidate. With two overlapping writers, both can observe ``cap - 1``, both
+    pass, and the cohort can reach ``cap + 1``.
+
+    This is the SAME property every other admission gate in the engine has --
+    ``engine.open_trade`` carries the identical note about its duplicate and
+    exposure checks. A multi-writer interval already breaks those invariants
+    too, so the correct systemic response is to treat process overlap as a pilot
+    stop condition rather than to special-case this one gate. Making only this
+    check atomic would wrap ``open_trade`` -- shared by every signal -- in an
+    externally-held transaction, in a codebase that has already had a
+    transaction-scope deadlock. That trade is not worth it for a paper pilot.
+
+    So: the bound is exact under one active admission writer, and may overshoot
+    by the number of concurrent writers otherwise. Overshoot is DETECTED and
+    logged at error level below, so it surfaces as a stop condition instead of
+    silently invalidating the cohort size.
+    """
+    cap = getattr(settings, "PAPER_LOSERS_PILOT_MAX_ENTRIES", 0) or 0
+    if cap <= 0:
+        return True
+
+    cur = await db._conn.execute(
+        "SELECT drawdown_baseline_at FROM signal_params "
+        "WHERE signal_type = 'losers_contrarian'"
+    )
+    row = await cur.fetchone()
+    baseline = row[0] if row else None
+    if baseline is None:
+        logger.warning(
+            "pilot_entry_cap_no_baseline",
+            signal_type="losers_contrarian",
+            cap=cap,
+            detail="cap configured but drawdown_baseline_at is unset; "
+            "refusing admission (fail closed)",
+        )
+        return False
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM paper_trades "
+        "WHERE signal_type = 'losers_contrarian' AND opened_at >= ?",
+        (baseline,),
+    )
+    entries = (await cur.fetchone())[0]
+    if entries > cap:
+        # The bound was already breached before this call. Under a single
+        # admission writer this is unreachable; reaching it means concurrent
+        # writers raced the check-then-act window (see the docstring), so the
+        # cohort size is no longer the pre-registered one. Error level, because
+        # a silently-oversized cohort invalidates the n it is analysed against.
+        logger.error(
+            "pilot_entry_cap_exceeded",
+            signal_type="losers_contrarian",
+            entries=entries,
+            cap=cap,
+            overshoot=entries - cap,
+            cohort_anchor=baseline,
+            detail="cohort exceeds the pre-registered cap — concurrent "
+            "admission writers suspected; treat as a pilot stop condition",
+        )
+        return False
+    if entries >= cap:
+        logger.info(
+            "pilot_entry_cap_reached",
+            signal_type="losers_contrarian",
+            entries=entries,
+            cap=cap,
+            cohort_anchor=baseline,
+        )
+        return False
+    return True
+
+
 async def trade_losers(
     engine,
     db: Database,
@@ -641,6 +735,28 @@ async def trade_losers(
                     )
                     price_row = await pc.fetchone()
                     loser_price = price_row[0] if price_row else None
+
+                # Bounded-pilot admission cap. Re-counted per candidate rather
+                # than computed once for the batch: `open_trade` can decline for
+                # its own reasons (exposure, dedup, unpriceable), so a
+                # pre-computed remaining-capacity number would drift from the
+                # real entry count within a single pass.
+                #
+                # A cap enforced only by an operator noticing "entry 200 landed"
+                # and then disabling the row is a monitored cutoff, not a cap:
+                # this loop iterates the whole fresh-losers batch, so further
+                # entries can be admitted before the disable write lands.
+                if not await _pilot_admission_allowed(db, settings):
+                    await _emit_dispatch_decision(
+                        db,
+                        row=l,
+                        signal_type="losers_contrarian",
+                        decision="blocked",
+                        reason="pilot_entry_cap_reached",
+                        signal_combo=combo_key,
+                    )
+                    continue
+
                 await engine.open_trade(
                     token_id=l["coin_id"],
                     symbol=l["symbol"],
