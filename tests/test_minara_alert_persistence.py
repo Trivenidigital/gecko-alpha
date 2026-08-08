@@ -426,9 +426,30 @@ async def test_minara_alert_emissions_migration_cancel_rolls_back(
     monkeypatch.setattr(db, "_assert_minara_alert_emissions_schema", _cancel_assert)
     with pytest.raises(asyncio.CancelledError):
         await db.initialize()
-    assert db._conn is not None
-    assert db._conn.in_transaction is False
-    await db.close()
+
+    # CONTRACT CHANGED 2026-08-08. This previously asserted the connection was
+    # still OPEN with `in_transaction is False`. `initialize()` now closes and
+    # clears `_conn` on any exception OR cancellation, because a caller that
+    # cannot reach `db.close()` otherwise leaks the aiosqlite worker thread —
+    # the Solana watchdog called `initialize()` outside the try/finally that
+    # owned `close()`, and 74 `database is locked` failures leaked a connection
+    # each.
+    #
+    # The property this test protects is UNCHANGED and now strictly stronger:
+    # closing rolls back any open transaction by definition, so instead of
+    # inspecting `in_transaction` we prove no writer is left holding a lock —
+    # a dangling transaction would make this write block until busy_timeout.
+    assert db._conn is None, "a cancelled initialize must not leak the connection"
+
+    probe = await aiosqlite.connect(tmp_path / "scout.db")
+    try:
+        await probe.execute("PRAGMA busy_timeout = 2000")
+        await probe.execute("CREATE TABLE _cancel_probe (x INTEGER)")
+        await probe.commit()
+    finally:
+        await probe.close()
+
+    await db.close()  # idempotent — must tolerate an already-closed connection
 
 
 def test_parse_minara_emission_json_line():

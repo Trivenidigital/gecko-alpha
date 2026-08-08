@@ -216,6 +216,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import aiohttp
+import aiosqlite
 import structlog
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -7558,6 +7559,73 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+class _ReadOnlyDB:
+    """Duck-typed stand-in exposing only what the watchdog reads.
+
+    `find_stuck_executions` touches exactly one attribute -- `db._conn` -- and
+    only ever calls `.execute()` with a SELECT. Handing it a real `Database`
+    would drag in `initialize()` and its ~40 schema migrations; handing it this
+    gives it precisely the surface it uses and nothing that can write.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+
+async def _run_watchdog_readonly(db_path: Path, settings: Settings) -> int:
+    """The cron watchdog path: read-only connection, deterministic close.
+
+    Opened `mode=ro` so schema writes are refused by SQLite rather than merely
+    avoided by us. Both the connection and the HTTP session are closed in
+    `finally` blocks that this function owns, so no failure can leave an
+    aiosqlite worker thread behind and keep the process resident.
+    """
+    conn = await aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(f"PRAGMA busy_timeout = {settings.SQLITE_BUSY_TIMEOUT_MS}")
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
+        )
+        try:
+            summary = await check_stuck_executions(
+                _ReadOnlyDB(conn), session, settings
+            )
+        finally:
+            await session.close()
+    finally:
+        await conn.close()
+
+    # Reporting is identical to the pre-existing runner path -- same strings,
+    # same exit codes -- so cron wrappers and operator habits are unaffected.
+    if not summary["enabled"]:
+        print("SOLANA_EXECUTION_WATCHDOG_ENABLED is False — nothing checked.")
+        return EXIT_OK
+    stuck = summary["stuck"]
+    if not stuck:
+        print("solana lane: no stuck executions.")
+        return EXIT_OK
+    _print_block(
+        f"SOLANA LANE: {len(stuck)} STUCK EXECUTION(S)",
+        [
+            f"  {e['decision_id']} {e['state']} "
+            f"{e['age_seconds'] / 60:.0f}m (threshold "
+            f"{e['threshold_seconds'] / 60:.0f}m)"
+            + ("  ** A TRANSACTION MAY EXIST **" if e["blocks_the_lane"] else "")
+            for e in stuck
+        ]
+        + [
+            "",
+            f"  operator alerts sent this run: {summary['alerted']}",
+            "  For anything marked above: NEVER rebuild. Run",
+            "    python -m scout.live.solana_lane resolve --decision-id <id>",
+        ],
+    )
+    return EXIT_BLOCKED
+
+
 async def main(argv: list[str] | None = None) -> int:
     # The approval block carries money figures, and a console that cannot
     # encode a character raises UnicodeEncodeError mid-print — losing the rest
@@ -7615,6 +7683,40 @@ async def main(argv: list[str] | None = None) -> int:
             "  at the same time, silently."
         )
         return EXIT_REFUSED
+
+    # `watchdog` returns here, before the write-heavy initializer.
+    #
+    # It runs from cron every two minutes and is READ-ONLY: `find_stuck_executions`
+    # issues one indexed SELECT per monitored state and writes nothing. Routing it
+    # through `Database.initialize()` made it execute `_create_tables` plus ~40
+    # migrations against a live 6.8 GB scout.db that the pipeline is concurrently
+    # writing -- 720 times a day, for a read.
+    #
+    # That collided. The watchdog log carried 74 `database is locked` failures
+    # raised out of `initialize()`, and because `initialize()` is called OUTSIDE
+    # the try/finally that owns `db.close()`, each failure leaked its aiosqlite
+    # connection and worker thread with no reference left able to close them.
+    #
+    # Separately, 35 watchdog invocations (70 processes counting shell wrappers)
+    # were found resident, ~1.5 GB RSS on a 3.8 GB box, oldest 5.45 days. That
+    # is consistent with this leak but NOT explained by it: aiosqlite 0.22.1
+    # reaps a leaked worker via `Connection.__del__` once the connection becomes
+    # unreachable, so persistence requires some further retention mechanism that
+    # was never captured -- the processes were killed during containment. The
+    # collision below is measured; the residency mechanism is not.
+    #
+    # `initialize()` is now exception-safe too, so the leak is closed at both
+    # ends. This branch removes the collision itself: a read-only consumer has no
+    # business running schema writes. `mode=ro` makes that structural rather than
+    # careful -- the same pattern `dashboard/db.py` and the narrative resolver use.
+    #
+    # `assert_safe_database` above still ran, so the file is a real SQLite
+    # database with the core tables and recorded migrations. What is deliberately
+    # NOT done is creating or migrating anything: if `solana_executions` is
+    # missing, this fails loudly rather than quietly self-migrating a table the
+    # lane depends on.
+    if args.command == "watchdog":
+        return await _run_watchdog_readonly(db_path, settings)
 
     # The lock guards PLACEMENT only, and is taken for `place` alone.
     #

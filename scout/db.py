@@ -85,202 +85,247 @@ class Database:
     async def initialize(self, *, retire_dead_tables: bool = False) -> None:
         """Open connection and create tables."""
         self._conn = await aiosqlite.connect(self._db_path)
-        self._conn.row_factory = aiosqlite.Row
-        self._txn_lock = asyncio.Lock()
-        await self._conn.execute("PRAGMA journal_mode=WAL")
-        # GA-22: explicit connection-level busy_timeout at bootstrap. Before
-        # this, the 90s timeout existed only as an incidental side-effect of
-        # four migration-site PRAGMAs — a connection whose migrations were
-        # all no-ops ran with timeout 0. The migration-site PRAGMAs are kept
-        # (re-asserting is harmless) but now source the same configured value
-        # so they can't clobber an operator override.
-        await self._conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-        # BL-055 spec §3.2: foreign_keys=ON is REQUIRED on every connection.
-        # Default is OFF in SQLite; without it, ON DELETE RESTRICT is a no-op.
-        await self._conn.execute("PRAGMA foreign_keys=ON")
-        await self._create_tables()
-        await self._migrate_feedback_loop_schema()
-        await self._migrate_live_trading_schema()
-        await self._migrate_signal_params_schema()
-        await self._migrate_high_peak_fade_columns_and_audit_table()
-        await self._migrate_autosuspend_baseline_column()
-        await self._migrate_moonshot_opt_out_column()
-        await self._migrate_live_eligible_column()
-        await self._migrate_per_venue_services()
-        await self._migrate_live_trades_telemetry()
-        await self._migrate_live_client_order_id()
-        await self._migrate_reject_reason_extend()
-        await self._migrate_bl_quote_pair_v1()
-        await self._migrate_reject_reason_extend_v2()
-        await self._migrate_bl_slow_burn_v1()
-        await self._migrate_tg_alert_eligible_v1()
-        await self._migrate_tg_alert_log_m1_5c_outcome()
-        # BL-NEW-TG-ALERT-NOISE-DEDUP: widen outcome CHECK with
-        # 'blocked_dedup_24h'. MUST run AFTER the m1_5c widening so it
-        # operates on the already-widened CHECK and preserves all values.
-        await self._migrate_tg_alert_log_dedup_outcome()
-        await self._migrate_tg_alert_operator_actions_v1()
-        await self._migrate_narrative_scanner_v1()
-        await self._migrate_minara_alert_emissions_v1()
-        # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (2026-05-20):
-        # ordered AFTER minara_alert_emissions so the paper_trades FK target
-        # is guaranteed to exist + already-migrated (Vector A I4).
-        await self._migrate_actionability_entry_snapshot_v1()
-        await self._migrate_source_calls_v1()
-        await self._migrate_chain_pattern_provenance_v1()
-        await self._migrate_score_history_scanned_at_index()
-        await self._migrate_volume_snapshots_scanned_at_index()
-        # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
-        # tables. Same pattern as cycle 1, parameterized via _migrate_scanned_at_index
-        # `column` kwarg (D3 plan-review fold). Order: alphabetical by table.
-        # V12 PR-review SHOULD-FIX #1: chain_matches index promoted from
-        # deferred (V9 NICE-TO-HAVE) — 5-line cost vs structural table-scan
-        # on every hourly prune.
-        await self._migrate_chain_matches_completed_at_index()
-        await self._migrate_holder_snapshots_scanned_at_index()
-        await self._migrate_learn_logs_created_at_index()
-        await self._migrate_momentum_7d_detected_at_index()
-        await self._migrate_trending_snapshots_snapshot_at_index()
-        await self._migrate_volume_spikes_detected_at_index()
-        # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5): cohort_digest_state
-        # singleton + paper_trades(closed_at) partial index.
-        await self._migrate_cohort_digest_state_v1()
-        # BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-INDEX: functional indexes on
-        # UPPER(symbol) for volume_history_cg + gainers_snapshots so the
-        # x_alerts symbol resolver stops scanning 2.5M-row table.
-        await self._migrate_symbol_upper_indexes_v1()
-        await self._migrate_gainers_comparisons_appeared_idx_v1()
-        await self._migrate_trade_decision_events_v1()
-        await self._migrate_predictions_coin_predicted_id_idx_v1()
-        # Gap-fill 2026-06-02: gainer_acceleration table + gainers_comparisons
-        # surface columns (acceleration/momentum/slow_burn/velocity).
-        await self._migrate_gainer_acceleration_v1()
-        # BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
-        # 4 nullable enrichment columns on `candidates` + paper_migrations
-        # marker. Read-only writer (cron) populates later in Phase 1a-ii.
-        # No DEFAULT clauses — preserves absence-vs-zero semantics so the
-        # dashboard read path can distinguish "never written" from "written
-        # but resolved to no-match".
-        await self._migrate_liquidity_enrichment_v1()
-        # DEX-outcome instrumentation substrate (observe-only; I1/I2/I3).
-        await self._migrate_dex_instrumentation_v1()
-        # Narrative resolution observability: resolution_status column + backfill.
-        await self._migrate_narrative_resolution_status_v1()
-        # REC-02: durable narrative CA-resolver error counter so the pipeline
-        # watchdog can feed a REAL count into narrative_resolution_alarms'
-        # resolver_error branch (previously fed a hardcoded 0 — silent §12a).
-        await self._migrate_narrative_resolver_errors_v1()
-        # DEX-first Phase 1: GT new-pools discovery record (research-only).
-        await self._migrate_dex_discovery_v1()
-        # C2 (#392): forward-only price snapshots for CA-keyed source calls.
-        # Additive table; the snapshot-writer cron populates it. No source_calls
-        # columns are added. The (separate) C3 pricing hookup reads it.
-        await self._migrate_source_call_price_snapshots_v1()
-        # C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
-        await self._migrate_source_call_price_snapshot_runs_v1()
-        # GA-19: durable per-source consecutive-miss counters so the
-        # ingest-starvation watchdog survives gecko-pipeline restarts.
-        await self._migrate_ingest_watchdog_state_v1()
-        # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
-        # (candidate alert / paper-trade dispatch / sampled gate-block)
-        # self-labels with forward returns from in-DB price sources.
-        await self._migrate_signal_outcome_ledger_v1()
-        # Phase 6 slices 2+3: price_source at open + exit_provenance at close
-        # + stale-onset mark-provenance columns on paper_trades.
-        await self._migrate_price_provenance_v1()
-        # Entry-snapshot liquidity provenance (PR #381): 2 nullable columns on
-        # paper_trade_entry_snapshots. Runs AFTER the actionability snapshot
-        # migration (its ALTER target table) — additive, idempotent.
-        await self._migrate_entry_snapshot_liquidity_provenance_v1()
-        # BL-NEW-LEDGER-EVICTION-DB-MARKER (#406 ruling): durable per-token
-        # record of cap evictions from ledger_enrollments, so evicted-truncated
-        # vs liquidity-death separates via DB state alone (surviving journald
-        # rotation). New table only — additive, idempotent.
-        await self._migrate_ledger_enrollment_evictions_v1()
-
-        # DASH-05 moved-already/too-late postmortem substrate: one bare-additive
-        # table (#424-style). schema_version 20260713 — 20260710 (#448), 20260711
-        # (ddl-retire) and 20260712 (#400-renumber) are claimed in-flight, so this
-        # takes the next free literal.
-        await self._migrate_moved_already_postmortems_v1()
-
-        # ALR-02 decision-receipt audit substrate: one bare-additive table
-        # (#424-style). schema_version 20260726. Forward-only observability that
-        # records one receipt per evaluated detection-lane candidate so the
-        # gate-FAILER comparison cohort is recoverable (behavior-neutral).
-        await self._migrate_detection_decision_receipts_v1()
-
-        # Receipt lifecycle-archive substrate (hot cohort/manifest tables) for
-        # the approved hot+cold storage architecture. schema_version 20260727.
-        await self._migrate_detection_receipt_archive_v1()
-
-        # Solana DEX lane execution state machine. schema_version 20260801.
-        # Bare-additive new table: the 13 execution states are a lane-specific
-        # LIFECYCLE axis, orthogonal to live_trades.status which means "what
-        # happened to the trade" and is read cross-venue. Four of the states
-        # exist before any money does, so they cannot live on a money row.
-        await self._migrate_solana_executions_v1()
-
-        # Venue-neutral execution binding. schema_version 20260802.
-        # Adds live_trades.intent_hash + live_trades.mandate_mode and widens the
-        # reject_reason CHECK with the three refusals the mandate + capability gate
-        # can produce. MUST run after `_migrate_reject_reason_extend_v2` so it
-        # operates on the already-widened CHECK and preserves every value.
-        await self._migrate_venue_neutral_execution_v1()
-
-        # Adverse-excursion instrumentation. schema_version 20260803.
-        # Bare-additive: paper_trades gains `trough_price` + `mae_pct`, the
-        # low-water mark since entry, maintained symmetrically to peak_price /
-        # peak_pct on the same evaluator tick.
+        # Own the connection from the moment it exists. Every line below can
+        # raise -- `_create_tables` and ~40 migrations all execute against a
+        # live database that the pipeline is concurrently writing, and a
+        # migration that exceeds busy_timeout raises OperationalError.
         #
-        # Why this exists: the 2026-08-03 exit-mechanics analysis could not
-        # evaluate stop width at all. For the 342 rows that closed at stop_loss
-        # the SAVING from a tighter stop is computable, but for the other 1,768
-        # closes the COST -- trades a tighter stop would newly convert into
-        # losses -- is not, because nothing recorded how far a position dipped
-        # before recovering. A backtest on peak_pct alone yields a one-sided
-        # estimate that makes tightening look strictly beneficial.
+        # Before this, such a failure left `_conn` open with its aiosqlite
+        # worker thread still running. A short-lived caller then had no way to
+        # close it: `solana_lane.main()` calls `initialize()` OUTSIDE the
+        # try/finally that owns `db.close()`, so the exception skipped straight
+        # past it. That is a resource-ownership defect on its own terms: this
+        # method opened the connection, so this method must not lose it.
         #
-        # Forward-only by construction: the low-water mark of a closed trade is
-        # unrecoverable. Existing rows stay NULL and MUST be excluded from any
-        # MAE analysis rather than treated as zero.
-        await self._migrate_trade_adverse_excursion_v1()
+        # 2026-08-08: the Solana watchdog log carried 74 `database is locked`
+        # failures raised out of this path, and 35 of its invocations (70
+        # processes counting shell wrappers) were found resident, ~1.5 GB RSS on
+        # a 3.8 GB box, the oldest 5.45 days old.
+        #
+        # Those resident processes are CONSISTENT with this leak but not
+        # explained by it alone. On the pinned aiosqlite 0.22.1,
+        # `Connection.__del__` calls `stop()`, so a leaked connection that
+        # becomes unreachable has its worker thread reaped by GC and the process
+        # exits -- confirmed by mutation: a subprocess that leaks this way still
+        # terminates. Persistence therefore needs some additional mechanism
+        # keeping the connection REACHABLE (a retained traceback frame holding
+        # main()'s locals is the obvious candidate), and that link is unproven:
+        # the specimens were terminated during containment before capture.
+        #
+        # The original exception is re-raised; a failure to close is logged and
+        # swallowed so it can never mask the real cause.
+        try:
+            self._conn.row_factory = aiosqlite.Row
+            self._txn_lock = asyncio.Lock()
+            await self._conn.execute("PRAGMA journal_mode=WAL")
+            # GA-22: explicit connection-level busy_timeout at bootstrap. Before
+            # this, the 90s timeout existed only as an incidental side-effect of
+            # four migration-site PRAGMAs — a connection whose migrations were
+            # all no-ops ran with timeout 0. The migration-site PRAGMAs are kept
+            # (re-asserting is harmless) but now source the same configured value
+            # so they can't clobber an operator override.
+            await self._conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            # BL-055 spec §3.2: foreign_keys=ON is REQUIRED on every connection.
+            # Default is OFF in SQLite; without it, ON DELETE RESTRICT is a no-op.
+            await self._conn.execute("PRAGMA foreign_keys=ON")
+            await self._create_tables()
+            await self._migrate_feedback_loop_schema()
+            await self._migrate_live_trading_schema()
+            await self._migrate_signal_params_schema()
+            await self._migrate_high_peak_fade_columns_and_audit_table()
+            await self._migrate_autosuspend_baseline_column()
+            await self._migrate_moonshot_opt_out_column()
+            await self._migrate_live_eligible_column()
+            await self._migrate_per_venue_services()
+            await self._migrate_live_trades_telemetry()
+            await self._migrate_live_client_order_id()
+            await self._migrate_reject_reason_extend()
+            await self._migrate_bl_quote_pair_v1()
+            await self._migrate_reject_reason_extend_v2()
+            await self._migrate_bl_slow_burn_v1()
+            await self._migrate_tg_alert_eligible_v1()
+            await self._migrate_tg_alert_log_m1_5c_outcome()
+            # BL-NEW-TG-ALERT-NOISE-DEDUP: widen outcome CHECK with
+            # 'blocked_dedup_24h'. MUST run AFTER the m1_5c widening so it
+            # operates on the already-widened CHECK and preserves all values.
+            await self._migrate_tg_alert_log_dedup_outcome()
+            await self._migrate_tg_alert_operator_actions_v1()
+            await self._migrate_narrative_scanner_v1()
+            await self._migrate_minara_alert_emissions_v1()
+            # BL-NEW-ACTIONABILITY-ENTRY-SNAPSHOT-FOUNDATION (2026-05-20):
+            # ordered AFTER minara_alert_emissions so the paper_trades FK target
+            # is guaranteed to exist + already-migrated (Vector A I4).
+            await self._migrate_actionability_entry_snapshot_v1()
+            await self._migrate_source_calls_v1()
+            await self._migrate_chain_pattern_provenance_v1()
+            await self._migrate_score_history_scanned_at_index()
+            await self._migrate_volume_snapshots_scanned_at_index()
+            # BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION (cycle 2): 6 narrative-owned
+            # tables. Same pattern as cycle 1, parameterized via _migrate_scanned_at_index
+            # `column` kwarg (D3 plan-review fold). Order: alphabetical by table.
+            # V12 PR-review SHOULD-FIX #1: chain_matches index promoted from
+            # deferred (V9 NICE-TO-HAVE) — 5-line cost vs structural table-scan
+            # on every hourly prune.
+            await self._migrate_chain_matches_completed_at_index()
+            await self._migrate_holder_snapshots_scanned_at_index()
+            await self._migrate_learn_logs_created_at_index()
+            await self._migrate_momentum_7d_detected_at_index()
+            await self._migrate_trending_snapshots_snapshot_at_index()
+            await self._migrate_volume_spikes_detected_at_index()
+            # BL-NEW-LIVE-ELIGIBLE-WEEKLY-DIGEST (cycle 5): cohort_digest_state
+            # singleton + paper_trades(closed_at) partial index.
+            await self._migrate_cohort_digest_state_v1()
+            # BL-NEW-DASHBOARD-X-ALERTS-RESOLVER-INDEX: functional indexes on
+            # UPPER(symbol) for volume_history_cg + gainers_snapshots so the
+            # x_alerts symbol resolver stops scanning 2.5M-row table.
+            await self._migrate_symbol_upper_indexes_v1()
+            await self._migrate_gainers_comparisons_appeared_idx_v1()
+            await self._migrate_trade_decision_events_v1()
+            await self._migrate_predictions_coin_predicted_id_idx_v1()
+            # Gap-fill 2026-06-02: gainer_acceleration table + gainers_comparisons
+            # surface columns (acceleration/momentum/slow_burn/velocity).
+            await self._migrate_gainer_acceleration_v1()
+            # BL-NEW-TODAYS-FOCUS-LIQUIDITY-VENUE-FACTS Phase 1a-i (2026-05-29):
+            # 4 nullable enrichment columns on `candidates` + paper_migrations
+            # marker. Read-only writer (cron) populates later in Phase 1a-ii.
+            # No DEFAULT clauses — preserves absence-vs-zero semantics so the
+            # dashboard read path can distinguish "never written" from "written
+            # but resolved to no-match".
+            await self._migrate_liquidity_enrichment_v1()
+            # DEX-outcome instrumentation substrate (observe-only; I1/I2/I3).
+            await self._migrate_dex_instrumentation_v1()
+            # Narrative resolution observability: resolution_status column + backfill.
+            await self._migrate_narrative_resolution_status_v1()
+            # REC-02: durable narrative CA-resolver error counter so the pipeline
+            # watchdog can feed a REAL count into narrative_resolution_alarms'
+            # resolver_error branch (previously fed a hardcoded 0 — silent §12a).
+            await self._migrate_narrative_resolver_errors_v1()
+            # DEX-first Phase 1: GT new-pools discovery record (research-only).
+            await self._migrate_dex_discovery_v1()
+            # C2 (#392): forward-only price snapshots for CA-keyed source calls.
+            # Additive table; the snapshot-writer cron populates it. No source_calls
+            # columns are added. The (separate) C3 pricing hookup reads it.
+            await self._migrate_source_call_price_snapshots_v1()
+            # C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
+            await self._migrate_source_call_price_snapshot_runs_v1()
+            # GA-19: durable per-source consecutive-miss counters so the
+            # ingest-starvation watchdog survives gecko-pipeline restarts.
+            await self._migrate_ingest_watchdog_state_v1()
+            # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
+            # (candidate alert / paper-trade dispatch / sampled gate-block)
+            # self-labels with forward returns from in-DB price sources.
+            await self._migrate_signal_outcome_ledger_v1()
+            # Phase 6 slices 2+3: price_source at open + exit_provenance at close
+            # + stale-onset mark-provenance columns on paper_trades.
+            await self._migrate_price_provenance_v1()
+            # Entry-snapshot liquidity provenance (PR #381): 2 nullable columns on
+            # paper_trade_entry_snapshots. Runs AFTER the actionability snapshot
+            # migration (its ALTER target table) — additive, idempotent.
+            await self._migrate_entry_snapshot_liquidity_provenance_v1()
+            # BL-NEW-LEDGER-EVICTION-DB-MARKER (#406 ruling): durable per-token
+            # record of cap evictions from ledger_enrollments, so evicted-truncated
+            # vs liquidity-death separates via DB state alone (surviving journald
+            # rotation). New table only — additive, idempotent.
+            await self._migrate_ledger_enrollment_evictions_v1()
 
-        # Pre-leg-1 adverse excursion. schema_version 20260808.
-        # Bare-additive: paper_trades gains `pre_leg1_trough_price` +
-        # `pre_leg1_mae_pct` -- the low-water mark restricted to the window in
-        # which the INITIAL stop-loss is actually eligible to fire.
-        #
-        # Why `mae_pct` alone is not enough. `mae_pct` above is a whole-life
-        # low-water mark: the evaluator updates it on every valid tick until
-        # close, unconditionally. But the initial SL is gated
-        # `if not floor_armed and ... current_price <= sl_price` -- once leg 1
-        # arms the floor, the SL is structurally out of the picture and the
-        # downside protection becomes a breakeven floor at entry instead.
-        #
-        # So a trade that runs entry -> +10% (leg 1 arms) -> -15% -> closes
-        # profitable records mae_pct = -15%, and a naive counterfactual reads
-        # that as "a -12% stop would have killed this winner". It would not
-        # have: the -12% stop was no longer eligible when the dip happened.
-        # Measured on the only cohort that has the column (2026-08), 7 of 47
-        # floor-armed closes dipped past -12% and ALL SEVEN were winners, while
-        # 0 of the 19 not-yet-armed trades that dipped past -12% won. The bias
-        # is not marginal and it runs in the direction that makes tightening
-        # look worse than it is.
-        #
-        # This column freezes at arm time, so it answers the question the
-        # whole-life column cannot: how far did this position dip while the
-        # initial stop could still have fired?
-        #
-        # Forward-only, same NULL discipline as mae_pct: NULL means never
-        # measured, 0.0 means never dipped below entry while the SL was live.
-        await self._migrate_pre_leg1_adverse_excursion_v1()
+            # DASH-05 moved-already/too-late postmortem substrate: one bare-additive
+            # table (#424-style). schema_version 20260713 — 20260710 (#448), 20260711
+            # (ddl-retire) and 20260712 (#400-renumber) are claimed in-flight, so this
+            # takes the next free literal.
+            await self._migrate_moved_already_postmortems_v1()
 
-        # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
-        # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
-        # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
-        # LAST so every additive migration above has already settled.
-        await self._migrate_retire_dead_tables_v1(enabled=retire_dead_tables)
+            # ALR-02 decision-receipt audit substrate: one bare-additive table
+            # (#424-style). schema_version 20260726. Forward-only observability that
+            # records one receipt per evaluated detection-lane candidate so the
+            # gate-FAILER comparison cohort is recoverable (behavior-neutral).
+            await self._migrate_detection_decision_receipts_v1()
+
+            # Receipt lifecycle-archive substrate (hot cohort/manifest tables) for
+            # the approved hot+cold storage architecture. schema_version 20260727.
+            await self._migrate_detection_receipt_archive_v1()
+
+            # Solana DEX lane execution state machine. schema_version 20260801.
+            # Bare-additive new table: the 13 execution states are a lane-specific
+            # LIFECYCLE axis, orthogonal to live_trades.status which means "what
+            # happened to the trade" and is read cross-venue. Four of the states
+            # exist before any money does, so they cannot live on a money row.
+            await self._migrate_solana_executions_v1()
+
+            # Venue-neutral execution binding. schema_version 20260802.
+            # Adds live_trades.intent_hash + live_trades.mandate_mode and widens the
+            # reject_reason CHECK with the three refusals the mandate + capability gate
+            # can produce. MUST run after `_migrate_reject_reason_extend_v2` so it
+            # operates on the already-widened CHECK and preserves every value.
+            await self._migrate_venue_neutral_execution_v1()
+
+            # Adverse-excursion instrumentation. schema_version 20260803.
+            # Bare-additive: paper_trades gains `trough_price` + `mae_pct`, the
+            # low-water mark since entry, maintained symmetrically to peak_price /
+            # peak_pct on the same evaluator tick.
+            #
+            # Why this exists: the 2026-08-03 exit-mechanics analysis could not
+            # evaluate stop width at all. For the 342 rows that closed at stop_loss
+            # the SAVING from a tighter stop is computable, but for the other 1,768
+            # closes the COST -- trades a tighter stop would newly convert into
+            # losses -- is not, because nothing recorded how far a position dipped
+            # before recovering. A backtest on peak_pct alone yields a one-sided
+            # estimate that makes tightening look strictly beneficial.
+            #
+            # Forward-only by construction: the low-water mark of a closed trade is
+            # unrecoverable. Existing rows stay NULL and MUST be excluded from any
+            # MAE analysis rather than treated as zero.
+            await self._migrate_trade_adverse_excursion_v1()
+
+            # Pre-leg-1 adverse excursion. schema_version 20260808.
+            # Bare-additive: paper_trades gains `pre_leg1_trough_price` +
+            # `pre_leg1_mae_pct` -- the low-water mark restricted to the window in
+            # which the INITIAL stop-loss is actually eligible to fire.
+            #
+            # Why `mae_pct` alone is not enough. `mae_pct` above is a whole-life
+            # low-water mark: the evaluator updates it on every valid tick until
+            # close, unconditionally. But the initial SL is gated
+            # `if not floor_armed and ... current_price <= sl_price` -- once leg 1
+            # arms the floor, the SL is structurally out of the picture and the
+            # downside protection becomes a breakeven floor at entry instead.
+            #
+            # So a trade that runs entry -> +10% (leg 1 arms) -> -15% -> closes
+            # profitable records mae_pct = -15%, and a naive counterfactual reads
+            # that as "a -12% stop would have killed this winner". It would not
+            # have: the -12% stop was no longer eligible when the dip happened.
+            # Measured on the only cohort that has the column (2026-08), 7 of 47
+            # floor-armed closes dipped past -12% and ALL SEVEN were winners, while
+            # 0 of the 19 not-yet-armed trades that dipped past -12% won. The bias
+            # is not marginal and it runs in the direction that makes tightening
+            # look worse than it is.
+            #
+            # This column freezes at arm time, so it answers the question the
+            # whole-life column cannot: how far did this position dip while the
+            # initial stop could still have fired?
+            #
+            # Forward-only, same NULL discipline as mae_pct: NULL means never
+            # measured, 0.0 means never dipped below entry while the SL was live.
+            await self._migrate_pre_leg1_adverse_excursion_v1()
+
+            # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
+            # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
+            # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
+            # LAST so every additive migration above has already settled.
+            await self._migrate_retire_dead_tables_v1(enabled=retire_dead_tables)
+        except BaseException:
+            conn, self._conn = self._conn, None
+            try:
+                await conn.close()
+            except Exception:
+                # `_db_log`, not `_log`: this module binds the logger under that
+                # name at module scope, and several methods below shadow it with
+                # a local `_log`. A wrong name here raises NameError from inside
+                # the handler that exists to contain errors, replacing the real
+                # OperationalError with a confusing one.
+                _db_log.exception(
+                    "db_initialize_cleanup_close_failed",
+                    db_path=str(self._db_path),
+                )
+            raise
 
     async def connect(self) -> None:
         """Alias for :meth:`initialize` — preferred in tests and async context managers."""
