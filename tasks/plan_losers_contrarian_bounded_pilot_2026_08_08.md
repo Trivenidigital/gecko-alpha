@@ -13,7 +13,9 @@ have been crossed while the initial stop was actually eligible to fire, using
 separate stop-width experiment," never "the geometry is proven better." See the
 retraction in §4 and the scope correction in §7.6.
 
-**Blocked on:** #516 merged **and deployed** before activation.
+**Blocked on:** #516 **and** #517 merged and **deployed** before activation —
+#516 for provenance-safe measurement, #517 for the entry cap that makes this
+pilot's stated bounds real rather than descriptive.
 
 ---
 
@@ -420,17 +422,28 @@ is why **#516 must deploy before activation, not alongside it**.
 > that is 240–260 entries already deployed, i.e. **$36,000–$39,000**, before
 > counting rows excluded by §7.1. The stated cap was not a cap.
 
-**The cohort is bounded by entries.** `PILOT_MAX_ENTRIES = 200`. When the 200th
-pilot entry is created, `losers_contrarian` admission is closed
-(`enabled = 0`) and the already-open positions are allowed to resolve normally.
-No position is force-closed — force-closing would truncate the very excursions
-being measured.
+**The cohort is bounded by entries, and the bound is enforced in code.**
+`PAPER_LOSERS_PILOT_MAX_ENTRIES = 200` (**PR #517**). `trade_losers` refuses the
+entry that would exceed it, counting the cohort from
+`signal_params.drawdown_baseline_at` — the same anchor `auto_suspend` uses, so
+the two cannot disagree about which trades are "the pilot". Refusals emit a
+`pilot_entry_cap_reached` decision row.
+
+> **Why this needed code.** A previous revision called 200 a hard cap while
+> relying on an operator noticing "entry 200 landed" and then disabling the row.
+> That is a **monitored cutoff, not a cap**: `trade_losers` iterates the whole
+> fresh-losers batch, so further entries can be admitted before the disable write
+> lands. Calling a monitored cutoff a bound is the same species of error as
+> calling a mark a fill price.
+
+Already-open positions resolve normally once admission closes. No position is
+force-closed — that would truncate the very excursions being measured.
 
 | Bound | Value | Nature |
 |---|---|---|
 | Position size | **$150** (`PAPER_TRADE_AMOUNT_USD=300` × experimental 0.5) | enforced by `resolve_paper_trust_size` |
-| **Max cohort entries** | **200** | **hard** — admission closes at the 200th entry |
-| Max cumulative pilot notional | **$30,000** (200 × $150) | follows from the entry cap, and now actually holds |
+| **Max cohort entries** | **200** | **hard, enforced pre-open** (#517) — entry 201 is refused |
+| Max cumulative pilot notional | **$30,000** (200 × $150) | follows from the enforced entry cap |
 | Simultaneous open pilot positions | **60** | **monitored abort threshold (K5), not an admission cap** |
 | Peak instantaneous notional | ~$9,000 at 60 open | consequence of the above, not a guarantee |
 
@@ -556,12 +569,40 @@ Computed on the eligible cohort (§7.1) only. For each candidate stop
 
 | Outcome | Condition | Verdict |
 |---|---|---|
-| **REVISE** | `D(X) ≤ 15%` **and** `C(X)` materially exceeds `D(X)`, for all three of −10/−12/−15% | **authorize a separate, bounded stop-width experiment** — with a pre-registered fill model — as its own proposal and approval. **Not** "the geometry is proven net-beneficial." |
+| **REVISE** | `D(X) ≤ 15%` **and** `C(X) − D(X) ≥ 20 pp` **and** `C(X) ≥ 2 × D(X)`, at **all three** of −10/−12/−15% | **authorize a separate, bounded stop-width experiment** — with a pre-registered fill model — as its own proposal and approval. **Not** "the geometry is proven better." |
 | **KEEP** | `D(X) > 15%` at any candidate, or the `C(X)` vs `D(X)` ordering flips across candidates | leave geometry unchanged; record the incidence table; signal stays disabled |
-| **RE-SUSPEND** | the cohort's own P&L is worse than the historical −$1,133 / 330 trades on a size-normalised basis | signal stays disabled; write the result up as a retirement argument |
+| **RE-SUSPEND** | `R_pilot ≤ −2.00%` (definition below) | signal stays disabled; write the result up as a retirement argument |
 
-Requiring the ordering to hold at all three thresholds is deliberate: a result
-that appears only at one is a threshold artifact, not a finding.
+**Every number above is fixed now, before activation.** "Materially exceeds" and
+"size-normalised" were undefined in the previous revision, which left the
+criterion selectable after seeing the data — the precise failure pre-registration
+exists to prevent.
+
+- **`C(X) − D(X) ≥ 20 pp` and `C(X) ≥ 2 × D(X)` together.** The absolute gap
+  alone passes on large, similar rates (70% vs 50%); the ratio alone passes on
+  tiny ones (2% vs 1%). Both must hold.
+- **All three thresholds.** A result at one only is a threshold artifact.
+- **`D(X) ≤ 15%`** caps acceptable winner damage regardless of capture.
+
+**Size-normalisation, stated as a formula.** Compare mean *percentage* return per
+trade, never USD — the pilot runs at $150 and the historical cohort at $300, so
+USD totals are not comparable (§5).
+
+```
+R_pilot      = mean(pnl_pct) over the eligible cohort (§7.1)
+R_historical = mean(pnl_pct) over the 330 closed losers_contrarian trades
+               opened 2026-04-21 .. 2026-05-17  =  −0.99%
+```
+
+`pnl_pct` is already per-trade percentage return, so it is size-invariant by
+construction and no rescaling is applied. The RE-SUSPEND threshold is the
+**absolute** value `R_pilot ≤ −2.00%`, not a comparison to `R_historical`:
+anchoring to a moving historical figure would let the criterion drift as the
+reference cohort is re-filtered. −2.00% is set roughly 1pp below the historical
+−0.99% so ordinary variation around the prior does not trigger retirement, while
+a materially worse cohort does.
+
+`R_historical` is retained as context in the write-up, not as a gate.
 
 All three verdicts end with the signal **disabled** (§7.5). REVISE authorizes a
 *further experiment*, never an application and never a geometry change — the
@@ -575,8 +616,12 @@ None of that is answerable from stored columns today.
 
 **What the pilot can and cannot conclude:**
 
-- ✅ *Can*: whether a tighter **initial** stop is net-beneficial, using a window
-  that matches the stop's actual eligibility.
+- ✅ *Can*: measure **threshold-crossing incidence** while the initial stop is
+  eligible — how often each candidate stop would have been touched, split by
+  eventual outcome, using a window that matches the stop's real eligibility.
+- ❌ *Cannot*: establish that a tighter initial stop is **net-beneficial**. That
+  needs a fill model this pilot does not define (§7.6). The strongest available
+  verdict is "authorize a separate experiment".
 - ✅ *Can*: whether the 2026-04/05 peak distribution is stable three months on.
 - ❌ *Cannot*: whether the signal is profitable at $300 — USD results do not
   transfer across a 2× size change (§5).
@@ -591,12 +636,17 @@ Ordering is load-bearing: steps 1–3 must complete **before** step 4, or the
 cohort accumulates rows that can never satisfy §7.1.
 
 1. **This plan reviewed and approved** ← current state
-2. **#516 merged** (`pre_leg1_mae_pct` + the discriminating test pair)
-3. **#516 deployed and verified in prod** — confirm a freshly-opened trade gets a
-   non-NULL `pre_leg1_mae_pct`. Merge is not deploy; a plan gated on a column
-   that exists only on master would collect 200 unusable rows.
+2. **#516 + #517 merged** (`pre_leg1_mae_pct` with its cutover guard; the
+   enforced entry cap)
+3. **Both deployed and verified in prod** — confirm a freshly-opened trade gets
+   a non-NULL `pre_leg1_mae_pct`, and that `PAPER_LOSERS_PILOT_MAX_ENTRIES=200`
+   is set in `.env`. Merge is not deploy; a plan gated on a column that exists
+   only on master would collect 200 unusable rows, and an unset cap silently
+   reverts the bound to descriptive.
 4. Record `PILOT_T0`, then the single `revive_signal_with_baseline` call —
-   `restore_tg_alert_eligible=False`, logged in the approvals table
+   `restore_tg_alert_eligible=False`, logged in the approvals table. The
+   baseline it stamps is also the cap's cohort anchor, so activation order
+   matters: cap configured BEFORE revival.
 5. Verify within 24h: trades opening with `signal_type='losers_contrarian'`,
    `amount_usd = 150`, `pre_leg1_mae_pct` non-NULL on first close,
    `tg_alert_eligible` still `0`, open positions ≤ 60
@@ -650,5 +700,10 @@ changed.
 | R2-2 | No exact net-P&L claim from a mark | §7.6 scope correction — incidence screen |
 | R2-3 | Entry-capped cohort; 60 labelled as tripwire | §7.2 rewrite; §7.3 admission-vs-completion split |
 | R2-4 | "every winner arms" corrected; vacuous assert removed | §4 precision note; #516 `row[33]` disjunct deleted |
+| R3-1 | Provenance across migration cutover | #516 — pre-cutover rows stay NULL, fail-closed, 3 tests |
+| R3-2 | Real admission cap, not a monitored cutoff | **#517** — pre-open guard, 8 tests, 3 mutants killed |
+| R3-3 | Remove remaining "net-beneficial" claim | §7.6 verdict wording; "can/cannot" list |
+| R3-4 | Quantify "materially exceeds" | §7.6 — `C−D ≥ 20pp` **and** `C ≥ 2×D`, all three thresholds |
+| R3-5 | Define size-normalisation formula | §7.6 — `R_pilot = mean(pnl_pct)`, absolute gate ≤ −2.00% |
 | 6 | Reclassify §5 per #455 | §5 reclassification block |
 | 7 | No production revival | §9 anti-scope; approvals log above |
