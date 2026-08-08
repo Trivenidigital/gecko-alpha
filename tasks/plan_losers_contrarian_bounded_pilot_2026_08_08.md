@@ -6,8 +6,13 @@
 **Status:** plan only. No DB row changed, no flag flipped, no trade opened.
 **Author's headline:** the pilot is cheap and safe to run, but its purpose is
 **not** "see if the signal makes money." Its purpose is to collect the one
-measurement (`mae_pct`) that every exit-geometry decision depends on and that
-**does not exist for any trade before 2026-08**.
+measurement every stop-width decision depends on — **`pre_leg1_mae_pct`**, the
+adverse excursion over the window in which the initial stop is actually eligible
+to fire. That column does not exist yet (PR #516), and the whole-life `mae_pct`
+this plan originally proposed to use **cannot answer the question** — see the
+retraction in §4.
+
+**Blocked on:** #516 merged **and deployed** before activation.
 
 ---
 
@@ -16,7 +21,7 @@ measurement (`mae_pct`) that every exit-geometry decision depends on and that
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
 | Trading-signal backtesting / counterfactual replay | none found | build from scratch — n/a here; this plan proposes no new analysis code, only a pre-registered read of existing columns |
-| Max-adverse-excursion / stop-width analysis | none found | n/a — `mae_pct` / `trough_price` already shipped in-tree (`scout/trading/evaluator.py:603-625`) |
+| Max-adverse-excursion / stop-width analysis | none found | n/a — built in-tree; `mae_pct` shipped earlier, `pre_leg1_mae_pct` in PR #516 |
 | SQLite cohort analysis | none found | use existing `sqlite3` + in-tree query patterns |
 | Statistical bootstrap / confidence intervals | none found | standard proportion CI, no dependency needed |
 
@@ -33,11 +38,11 @@ this plan needs already exists in-tree.
 
 ## 1. Recommendation
 
-**Run the pilot. Do not run it as a profitability test, and do not touch exit
-geometry first.**
+**Run the pilot — but not yet, and not as a profitability test.** It is blocked
+on #516 merging and deploying, and it must not touch exit geometry first.
 
-Three things changed my initial framing while gathering evidence, and each is
-load-bearing:
+Four things changed my framing, each load-bearing. The fourth came from review
+and is the reason this plan is not executable as first written:
 
 1. The standing thesis — *"suspensions are an exit problem, not a signal
    problem"* — **cannot be supported by the decomposition that produced it.**
@@ -48,7 +53,16 @@ load-bearing:
    changes for any signal since 2026-05-17. The precondition "fix exits before
    reviving" was never met by anything.
 3. The decisive counterfactual is **structurally unanswerable on existing
-   data**, and the codebase already says so in a comment (§4).
+   data**, and the codebase already says so in a comment (§4). A first revision
+   of this plan proposed answering it with `mae_pct`; that was wrong, because
+   `mae_pct` summarises the wrong window. Retracted in §4 and replaced by
+   `pre_leg1_mae_pct` (#516).
+4. **The measurement this pilot exists to collect was itself mis-specified.**
+   The first revision would have spent ~16 days accumulating 200 trades of a
+   metric that cannot answer the stop-width question, because `mae_pct` keeps
+   deepening after the initial stop stops being eligible to fire. Caught in
+   review before any data was collected. §4 carries the retraction; #516 carries
+   the fix.
 
 ---
 
@@ -65,7 +79,9 @@ Every assumption checked against prod before proposing anything.
 | 5 | Exit geometry unchanged since the loss | zero geometry rows in `signal_params_audit` since 2026-05-17; last write to the row was the suspension itself | ✅ |
 | 6 | Position size on revival | **$150** — absent from trust registry → `experimental` → 0.5 × `PAPER_TRADE_AMOUNT_USD=300` | ⚠️ **accidental** |
 | 7 | Revival primitive exists | `Database.revive_signal_with_baseline` — atomic `enabled=1` + `drawdown_baseline_at` + audit row, 7-day cool-off | ✅ |
-| 8 | MAE available for the decision | **0 rows before 2026-08**; 70/70 in August | ❌ **blocking** |
+| 8 | Whole-life MAE available | **0 rows before 2026-08**; 70/70 in August | ❌ |
+| 9 | Whole-life MAE *sufficient* for the stop-width question | **No** — it keeps deepening after the SL stops being eligible; 7/7 armed winners misread as damage | ❌ **blocking, see §4** |
+| 10 | Eligibility-window MAE exists | `pre_leg1_mae_pct` — **PR #516, not yet merged/deployed** | ❌ **blocking** |
 
 **Assumption 2 is a stale-comment trap.** `scout/main.py:985-986` states the
 lane is *"disabled by default in prod via
@@ -129,6 +145,57 @@ signal that is being destroyed by its exits.
 
 ## 4. Why the obvious fix cannot be evaluated today
 
+> ### ⚠️ RETRACTION 2026-08-08 — `mae_pct` alone cannot do this either
+>
+> **An earlier revision of this section claimed that `n = 200` MAE-bearing
+> closes would settle the stop-width question. That claim is withdrawn.** It
+> was wrong for a reason that would have destroyed the pilot's entire output.
+>
+> `mae_pct` is a **whole-life** low-water mark — the evaluator updates it on
+> every valid tick until close, unconditionally
+> (`evaluator.py:623-637`, no guard). The initial stop is **not** whole-life; it
+> is gated `if not floor_armed and sl_price > 0 and current_price <= sl_price`
+> (`evaluator.py:780`). Once leg 1 arms the floor, the SL is structurally out of
+> the picture and the downside rule becomes a breakeven floor at entry
+> (`evaluator.py:812`).
+>
+> So `entry → +10% (leg 1 arms) → −15% → closes profitable` records
+> `mae_pct = −15%`, and the proposed counterfactual would read that as *"a −12%
+> stop would have killed this winner."* **It would not have** — the stop was no
+> longer eligible when the dip occurred.
+>
+> Worse, the contamination lands **exactly on the population the pilot needed to
+> measure**. Arming requires `change_pct >= leg_1_pct` (+10%), so every winner
+> arms the floor, and every post-arm dip pollutes its `mae_pct`. On the only
+> cohort carrying the column (2026-08):
+>
+> | population | n | dipped past −12% | of those, **won** |
+> |---|---|---|---|
+> | floor **ARMED** (SL ineligible) | 47 | 7 | **7** |
+> | not armed (SL eligible) | 23 | 19 | **0** |
+>
+> All 7 would have been miscounted as damage from tightening — a **14.9%
+> false-damage rate** on the armed population, biased in the direction that
+> makes a tighter stop look worse than it is.
+>
+> **Correct measurement, now required before any revival:**
+> `pre_leg1_mae_pct` — the low-water mark restricted to the window in which the
+> initial stop is eligible, frozen when leg 1 arms. Shipped in **PR #516** with
+> the discriminating test pair (dip before leg 1 → counted; dip only after leg 1
+> → not counted) and mutation-tested: removing the eligibility guard kills two
+> tests, changing the trough seeding kills a third.
+>
+> **The pilot is blocked on #516 merging and deploying.** Rows opened before
+> that deploy carry `pre_leg1_mae_pct IS NULL` and are **not** eligible for the
+> n-gate — same forward-only discipline as `mae_pct`, no backfill, and NULL must
+> never be read as 0.
+>
+> This is the same failure class the project keeps hitting: **having the right
+> value without its relevant timing/state axis is not enough.** The value was
+> real; the window it summarised was the wrong one.
+
+
+
 The tempting change is a tighter stop: `sl_pct` 25 → ~12. On available data it
 looks strictly beneficial. It is not evaluable, and the codebase already
 documents exactly why (`scout/trading/evaluator.py:603-609`):
@@ -161,7 +228,40 @@ MAE-bearing trades on a signal with a known prior.
 
 ---
 
-## 5. Blocking finding — the sizing registry contradicts itself, in production
+## 5. The paper-sizing contract is intentional; the registry's self-description and coverage have drifted
+
+> **RECLASSIFIED 2026-08-08.** An earlier revision titled this *"blocking
+> finding — the sizing registry contradicts itself, in production"* and
+> presented registry-derived paper sizing as an undiscovered contract violation.
+> **That framing is wrong and is withdrawn.**
+>
+> Merged **PR #455** (`01daa849`, 2026-07-11, *"trust-weighted paper sizing,
+> flag-gated (SIG-10) — carries a contract decision"*) surfaced this exact
+> decision for operator approval in its own body:
+>
+> > *"The registry is stamped `not_for_sizing: true` … This PR consumes its
+> > maturity_state as DATA for a paper-only, default-OFF knob and relaxes no
+> > gate … **Approve as-is** if that reading is acceptable (my recommendation: it
+> > is — the stamp guards live/production sizing automation, and this knob
+> > generates the evidence for that future decision), **or say 'redirect'**…"*
+>
+> It was approved and merged. `trust_sizing.py` documents the same reading. The
+> consumer is deliberate, flag-gated (`PAPER_TRUST_SIZING_ENABLED`), paper-only,
+> and defaults unknown signals to `experimental` on purpose. There is no hidden
+> production consumer and no undiscovered violation.
+
+What survives — and still matters:
+
+- The registry's **self-description is stale and misleading**. `"not_for_sizing":
+  true` and *"not consumed by production logic"* now read as false to anyone who
+  greps the file without finding #455. The stamp means *live* sizing; the text
+  does not say so.
+- **Coverage has drifted.** `gainers_early` — the only signal currently trading —
+  is absent, so it takes the `experimental` default. The registry also carries
+  entries for `tg` and `x`, which are not real `signal_type` values (the real one
+  is `tg_social`); those never match.
+- The **$150-vs-$300 cohort confounding is real** and is the operationally
+  important part.
 
 Independent of this pilot, and larger than it.
 
@@ -176,9 +276,11 @@ header:
           auto-disable, sizing, or live execution decisions."
 ```
 
-`scout/trading/trust_sizing.py` consumes it for sizing, `engine.py:436` calls it
-at open time, and **`PAPER_TRUST_SIZING_ENABLED=true` in prod.** Verified
-empirically, not inferred:
+`scout/trading/trust_sizing.py` consumes it for **paper** sizing, `engine.py:436`
+calls it at open time, and **`PAPER_TRUST_SIZING_ENABLED=true` in prod** — all of
+which was authorized by #455 (above). The text is what is stale, not the
+behaviour. What the flag being on *does* mean is that sizing now varies by
+registry membership, verified empirically rather than inferred:
 
 | signal | registry entry | tier | size | n |
 |---|---|---|---|---|
@@ -192,8 +294,10 @@ entries that never match.
 
 Three consequences that touch conclusions already drawn:
 
-1. **The only signal currently trading is silently half-sized** because it is
-   *absent* from a file that says it is not used for sizing.
+1. **The only signal currently trading is half-sized** because it is *absent*
+   from the registry and therefore takes the `experimental` default. That
+   default is intentional (#455); the surprise is the coverage gap, not the
+   mechanism.
 2. **Cross-signal USD comparisons are 2× confounded.** `gainers_early` at $150
    against `volume_spike` at $300 is not a like-for-like P&L comparison.
 3. **The auto-suspend gates are USD-denominated** (`hard_loss −$500`,
@@ -266,53 +370,143 @@ document rather than a nice-to-have.
 
 ## 7. Pre-registered gates (§11a — data-bound, not calendar-bound)
 
-Written before execution. Not to be revised after seeing results.
+Written before execution. **Not to be revised after seeing results.**
 
-**Primary completion gate:** `n = 200` closed `losers_contrarian` trades with
-non-NULL `mae_pct`.
+### 7.1 Cohort boundary
 
-Rationale: at the historical 48.8% win rate that yields ~98 profitable trades,
-enough to estimate *P(dipped below candidate stop | ended profitable)* to about
-±10pp at 95% — the quantity that decides the stop-width question. Interim
-read at `n = 100` (±15pp) is **descriptive only** and may not trigger a change.
+The pilot cohort is defined by a persisted timestamp, not by "trades that look
+recent". At activation, record `PILOT_T0` = the `applied_at` of the
+`revive_signal_with_baseline` audit row — an immutable row, not a recomputed
+`MIN()`.
 
-**Calendar estimate, not a target:** historical rate was 330 trades / 26 days
-≈ 12.7/day → ~16 days. Per §11c, halt at n=200 whenever it arrives; if the rate
-collapses, extend rather than concluding on a short sample.
+A row is **eligible** only if all four hold:
 
-**Kill criteria (any one ends the pilot early):**
+1. `signal_type = 'losers_contrarian'`
+2. `opened_at >= PILOT_T0`
+3. `status LIKE 'closed%'`
+4. `pre_leg1_mae_pct IS NOT NULL`
+
+Condition 4 excludes every row opened before #516 deploys. NULL is *never* read
+as 0. Conditions 2 and 4 are separate on purpose: a row can satisfy the cohort
+boundary and still be uninstrumented if the deploy lands after activation, which
+is why **#516 must deploy before activation, not alongside it**.
+
+### 7.2 Exposure bounds (explicit, not implied)
+
+| Bound | Value | Enforced by |
+|---|---|---|
+| Position size | **$150** (`PAPER_TRADE_AMOUNT_USD=300` × experimental 0.5) | `resolve_paper_trust_size` |
+| Max simultaneous open pilot positions | **60** | monitored; breach = K5 |
+| Max aggregate pilot notional at any instant | **$9,000** (60 × $150) | derived from the above |
+| Max cumulative pilot notional deployed | **$30,000** (200 × $150) | n-gate terminates the pilot |
+
+The concurrency figure is derived, not invented: at the historical ~12.7
+trades/day and a 168h (7-day) max duration, steady-state open positions are
+≈ 89 — so **60 is a real constraint** and the pilot is expected to press against
+it. It is set deliberately below the natural steady state to cap instantaneous
+notional; the cost is a slower fill rate, which the n-gate absorbs.
+
+Paper only. `PAPER_MAX_EXPOSURE_USD=200,000` is the global backstop; the pilot's
+$9,000 ceiling is 4.5% of it.
+
+### 7.3 Completion gate
+
+**Primary:** `n = 200` **eligible** rows (per §7.1).
+
+At the historical 48.8% win rate that yields ~98 profitable trades — enough to
+estimate *P(dipped below candidate stop while the stop was eligible | ended
+profitable)* to about ±10pp at 95%. That conditional is the quantity the
+stop-width decision turns on, and §4's retraction is why it must be computed
+from `pre_leg1_mae_pct`, never `mae_pct`.
+
+**Interim read at n = 100** (±15pp) is **descriptive only** and may not trigger
+any change.
+
+**Calendar estimate, not a target:** ~16 days at the historical rate, longer
+under the 60-position cap. Per §11c, halt at n=200 whenever it arrives; if the
+rate collapses, extend rather than concluding on a short sample.
+
+### 7.4 Kill criteria
 
 | # | Condition | Action |
 |---|---|---|
-| K1 | auto-suspend fires | let it. Do **not** re-revive; record `n` reached |
-| K2 | net ≤ −$400 at n<200 | halt, report; below the −$500 gate by design |
-| K3 | `mae_pct` NULL rate > 5% on new closes | halt — instrumentation is broken, and the pilot's only deliverable is void |
-| K4 | fill rate < 3/day for 5 consecutive days | halt — supply insufficient; n=200 unreachable in a sane window |
+| K1 | auto-suspend fires | let it. Do **not** re-revive. Record `n` reached |
+| K2 | net ≤ −$400 at n<200 | halt + rollback; below the −$500 gate by design |
+| K3 | `pre_leg1_mae_pct` NULL rate > 5% on new eligible closes | halt — instrumentation broken, the only deliverable is void |
+| K4 | fill rate < 3/day for 5 consecutive days | halt — n=200 unreachable in a sane window |
+| K5 | simultaneous open pilot positions > 60 | halt + rollback — exposure bound breached |
 
-**Explicitly NOT a kill criterion:** negative P&L within the gates. A
-break-even-minus result is the *prior*, not a surprise. Killing the pilot for
+**Explicitly NOT a kill criterion:** negative P&L within the gates.
+Break-even-minus is the *prior*, not a surprise. Killing the pilot for
 confirming the prior would destroy the measurement it exists to collect.
+
+### 7.5 Mandatory rollback — the pilot disables itself
+
+**At n=200, or on ANY kill criterion, the DB row returns to `enabled = 0`.**
+
+This is not optional and not deferred to analysis. A "bounded pilot" that
+reaches its gate but leaves the row enabled while someone reads the numbers is
+not bounded — it is an unbounded revival with a report attached.
+
+Default sequence: **collect → disable → analyze → separately authorize anything
+further.** No automatic continuation. No geometry change merely because the
+sample completed. `live_eligible` and `tg_alert_eligible` stay `0` throughout and
+across the rollback.
+
+Rollback is an audited write (`applied_by='operator'`, reason referencing this
+plan), not a silent flip.
+
+### 7.6 Decision rules — pre-registered mapping
+
+Computed on the eligible cohort only. Let **D** = share of *profitable* eligible
+trades whose `pre_leg1_mae_pct` ≤ the candidate stop (the true damage rate), and
+**S** = P&L saved on trades that closed `closed_sl`.
+
+| Outcome | Condition | Verdict |
+|---|---|---|
+| **REVISE** | net stop-width change is positive with D ≤ 15%, **and** the sign survives candidate stops of −10/−12/−15% | propose a `sl_pct` change as its own audited PR with its own approval |
+| **KEEP** | net change is positive but D > 15%, or the sign flips across candidate stops | leave geometry unchanged; record the measurement; signal stays disabled |
+| **RE-SUSPEND** | net change is negative, or the cohort's own P&L is worse than the −$1,133 / 330-trade historical rate on a size-normalised basis | signal stays disabled; write the result up as a retirement argument |
+
+All three verdicts end with the signal **disabled** (§7.5). REVISE authorizes a
+*proposal*, never an application — the same proposal-only discipline the
+deterministic learner runs under.
 
 **What the pilot can and cannot conclude:**
 
-- ✅ *Can*: whether a tighter stop is net-beneficial, by measuring the winner
-  damage that is currently unmeasurable.
+- ✅ *Can*: whether a tighter **initial** stop is net-beneficial, using a window
+  that matches the stop's actual eligibility.
 - ✅ *Can*: whether the 2026-04/05 peak distribution is stable three months on.
-- ❌ *Cannot*: whether the signal is profitable at $300 — sizing differs, and
-  USD results do not transfer across a 2× size change (§5).
+- ❌ *Cannot*: whether the signal is profitable at $300 — USD results do not
+  transfer across a 2× size change (§5).
+- ❌ *Cannot*: anything about the *post-arm* breakeven floor or the trailing
+  stop. `pre_leg1_mae_pct` is silent past arm time by construction; those are a
+  separate question needing a separate measurement.
 - ❌ *Cannot*: anything about live execution. Paper only.
-
----
 
 ## 8. Sequencing
 
+Ordering is load-bearing: steps 1–3 must complete **before** step 4, or the
+cohort accumulates rows that can never satisfy §7.1.
+
 1. **This plan reviewed and approved** ← current state
-2. §5 registry contradiction filed as its own item (does **not** block the pilot)
-3. Single `revive_signal_with_baseline` call, recorded in the approvals log
-4. Verify within 24h: trades opening, `signal_type='losers_contrarian'`,
-   `amount_usd=150`, `mae_pct` non-NULL on first close, `tg_alert_eligible` still 0
-5. Read at n=100 (descriptive), decide at n=200
-6. Only then consider a geometry change — as its own audited proposal
+2. **#516 merged** (`pre_leg1_mae_pct` + the discriminating test pair)
+3. **#516 deployed and verified in prod** — confirm a freshly-opened trade gets a
+   non-NULL `pre_leg1_mae_pct`. Merge is not deploy; a plan gated on a column
+   that exists only on master would collect 200 unusable rows.
+4. Record `PILOT_T0`, then the single `revive_signal_with_baseline` call —
+   `restore_tg_alert_eligible=False`, logged in the approvals table
+5. Verify within 24h: trades opening with `signal_type='losers_contrarian'`,
+   `amount_usd = 150`, `pre_leg1_mae_pct` non-NULL on first close,
+   `tg_alert_eligible` still `0`, open positions ≤ 60
+6. Read at n=100 (descriptive only), decide at n=200 per §7.6
+7. **Rollback to `enabled=0` at n=200 or any kill criterion (§7.5)** — before
+   analysis, not after
+8. Only then consider a geometry change — as its own audited proposal, with its
+   own approval
+
+Filed separately, **not** blocking the pilot: the registry self-description and
+coverage drift (§5).
 
 ---
 
@@ -331,8 +525,25 @@ signal · no registry edit.
 |---|---|---|---|
 | Read-only prod DB / config queries | read-only | covered by standing test-bed calibration (2026-07-19) | 2026-08-08 |
 | Author this plan | doc | operator: "prepare, do not execute" | 2026-08-08 |
-| **Revive `losers_contrarian` (paper)** | **runtime state change** | **NOT YET REQUESTED** | — |
-| Registry / sizing correction | code + config | NOT YET REQUESTED — separate item | — |
+| Revise this plan per review ruling | doc | operator: `CHANGES_REQUIRED_BEFORE_MERGE` (7-item list) | 2026-08-08 |
+| Ship `pre_leg1_mae_pct` (PR #516) | code + migration | operator item 3: "establish a temporally valid measurement… prove with tests" | 2026-08-08 |
+| Merge #516 | merge | **NOT YET REQUESTED** — per-PR only | — |
+| Deploy #516 to testbed | deploy | **NOT YET REQUESTED** | — |
+| **Revive `losers_contrarian` (paper)** | **runtime state change** | **NOT YET REQUESTED** — operator: `LOSERS_CONTRARIAN_REVIVAL_NOT_AUTHORIZED` | — |
+| Registry self-description / coverage correction | code + config | NOT YET REQUESTED — separate item | — |
 
-No action in the third or fourth row has been taken. This document is the
-approval ask for the third.
+No action in the last four rows has been taken. #516 is authored and pushed but
+**not merged**; the revival is **not authorized** and nothing in prod has
+changed.
+
+### Review-ruling conformance
+
+| # | Required correction | Where satisfied |
+|---|---|---|
+| 1 | Keep the managed/unmanaged falsification | §3, unchanged |
+| 2 | Retract the whole-life `mae_pct` claim | §4 retraction block |
+| 3 | Temporally valid measurement + discriminating tests | PR #516; `tests/test_pre_leg1_adverse_excursion.py`, mutation-tested |
+| 4 | n=200 gate uses the valid measurement | §7.1 condition 4, §7.3 |
+| 5 | Cohort timestamp / max opens / max notional / rollback / KEEP-REVISE-RE-SUSPEND | §7.1, §7.2, §7.5, §7.6 |
+| 6 | Reclassify §5 per #455 | §5 reclassification block |
+| 7 | No production revival | §9 anti-scope; approvals log above |
