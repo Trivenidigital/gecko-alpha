@@ -148,24 +148,79 @@ class TestEvaluatorWiring:
     def test_the_evaluator_writes_the_columns(self):
         assert "SET trough_price = ?, mae_pct = ?" in self._src()
 
-    def test_the_columns_are_appended_last_in_the_select(self):
+    def test_the_columns_keep_their_positional_indices(self):
         """*** POSITIONAL READS BREAK SILENTLY. ***
 
-        Every read is `row[N]`. Inserting the new columns mid-list shifts every
-        index after it — the query still runs and the evaluator silently reads
-        the wrong field. They must stay at the END of the SELECT.
+        Every read is `row[N]`. Inserting a column mid-list shifts every index
+        after it — the query still runs and the evaluator silently reads the
+        wrong field.
+
+        The invariant is INDEX STABILITY, not "mae_pct is the final column".
+        An earlier version of this test asserted the latter, which made it fail
+        the moment a later column was correctly appended AFTER mae_pct
+        (`pre_leg1_trough_price`) — a change that honoured the real contract.
+        Pin the indices directly so the test tracks the property that matters
+        and still fails on a genuine mid-list insertion.
         """
         src = self._src()
         sel_start = src.index("SELECT id, token_id, entry_price")
         sel_end = src.index("FROM paper_trades", sel_start)
-        select_body = src[sel_start:sel_end]
-        assert "trough_price, mae_pct" in select_body
-        tail = select_body.rsplit("mae_pct", 1)[1]
-        assert tail.strip() in ("", ","), (
-            "trough_price/mae_pct must be the LAST columns in the SELECT; "
-            f"found {tail.strip()!r} after them"
+        body = src[sel_start:sel_end].replace("SELECT", "", 1)
+        cols = [c.strip() for c in body.split(",") if c.strip()]
+
+        assert cols[32] == "trough_price", (
+            f"trough_price moved to {cols.index('trough_price')}"
         )
+        assert cols[33] == "mae_pct", f"mae_pct moved to {cols.index('mae_pct')}"
         assert "row[32]" in src, "trough_price must be read at its appended index"
+        # NO row[33] assertion, deliberately. `mae_pct` is SELECTed to keep the
+        # positional contract contiguous, but it is never read positionally --
+        # the evaluator recomputes it from trough_price. An earlier revision
+        # wrote `assert "row[33]" in src or "mae_pct" in src`, whose second
+        # disjunct is satisfied by the SELECT text itself and can therefore
+        # never fail. A guard that cannot fail is worse than no guard: it
+        # reports coverage that does not exist.
+
+    # Indices 0..33 are the frozen positional contract. Most are read somewhere
+    # as `row[N]`; index 33 (`mae_pct`) deliberately is NOT -- it is SELECTed to
+    # keep the contract contiguous and recomputed from trough_price instead.
+    # The invariant is that NO index in this range may shift, whether or not a
+    # given one is currently consumed: a shift silently repoints every read
+    # after it, and a column that is unread today may be read tomorrow.
+    FROZEN_PREFIX = [
+        "id", "token_id", "entry_price", "opened_at",
+        "tp_price", "sl_price", "tp_pct", "sl_pct",
+        "checkpoint_1h_price", "checkpoint_6h_price",
+        "checkpoint_24h_price", "checkpoint_48h_price",
+        "peak_price", "peak_pct", "signal_data", "symbol", "name", "chain",
+        "amount_usd", "quantity", "signal_type",
+        "created_at", "leg_1_filled_at", "leg_2_filled_at",
+        "remaining_qty", "floor_armed", "realized_pnl_usd",
+        "checkpoint_6h_pct", "checkpoint_24h_pct",
+        "moonshot_armed_at", "conviction_locked_at",
+        "checkpoint_1h_pct",
+        "trough_price", "mae_pct",
+    ]
+
+    def test_new_columns_are_appended_not_inserted(self):
+        """The general rule this file exists to protect.
+
+        Anything added must land at index >= 34, after every column the
+        positional reads already depend on. Pinning the exact prefix catches a
+        mid-list insertion, a rename, and a reorder — the string-tail check this
+        replaced caught only the first, and only by accident.
+        """
+        src = self._src()
+        sel_start = src.index("SELECT id, token_id, entry_price")
+        sel_end = src.index("FROM paper_trades", sel_start)
+        body = src[sel_start:sel_end].replace("SELECT", "", 1)
+        cols = [c.strip() for c in body.split(",") if c.strip()]
+
+        assert len(cols) >= len(self.FROZEN_PREFIX)
+        assert cols[: len(self.FROZEN_PREFIX)] == self.FROZEN_PREFIX, (
+            "the first 34 SELECT columns are frozen — every one is read as "
+            "row[N]. Append new columns at the END instead."
+        )
 
     def test_the_seeding_branch_is_present(self):
         """Guard on the guard: `if trough_price is None` is what makes

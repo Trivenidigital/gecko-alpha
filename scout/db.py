@@ -246,6 +246,36 @@ class Database:
         # MAE analysis rather than treated as zero.
         await self._migrate_trade_adverse_excursion_v1()
 
+        # Pre-leg-1 adverse excursion. schema_version 20260808.
+        # Bare-additive: paper_trades gains `pre_leg1_trough_price` +
+        # `pre_leg1_mae_pct` -- the low-water mark restricted to the window in
+        # which the INITIAL stop-loss is actually eligible to fire.
+        #
+        # Why `mae_pct` alone is not enough. `mae_pct` above is a whole-life
+        # low-water mark: the evaluator updates it on every valid tick until
+        # close, unconditionally. But the initial SL is gated
+        # `if not floor_armed and ... current_price <= sl_price` -- once leg 1
+        # arms the floor, the SL is structurally out of the picture and the
+        # downside protection becomes a breakeven floor at entry instead.
+        #
+        # So a trade that runs entry -> +10% (leg 1 arms) -> -15% -> closes
+        # profitable records mae_pct = -15%, and a naive counterfactual reads
+        # that as "a -12% stop would have killed this winner". It would not
+        # have: the -12% stop was no longer eligible when the dip happened.
+        # Measured on the only cohort that has the column (2026-08), 7 of 47
+        # floor-armed closes dipped past -12% and ALL SEVEN were winners, while
+        # 0 of the 19 not-yet-armed trades that dipped past -12% won. The bias
+        # is not marginal and it runs in the direction that makes tightening
+        # look worse than it is.
+        #
+        # This column freezes at arm time, so it answers the question the
+        # whole-life column cannot: how far did this position dip while the
+        # initial stop could still have fired?
+        #
+        # Forward-only, same NULL discipline as mae_pct: NULL means never
+        # measured, 0.0 means never dipped below entry while the SL was live.
+        await self._migrate_pre_leg1_adverse_excursion_v1()
+
         # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
         # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
         # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -5740,6 +5770,107 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "bl_trade_adverse_excursion_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration=migration_name,
+                )
+            raise
+
+    async def _migrate_pre_leg1_adverse_excursion_v1(self) -> None:
+        """Add ``pre_leg1_trough_price`` + ``pre_leg1_mae_pct`` to paper_trades.
+
+        The low-water mark restricted to the window in which the INITIAL
+        stop-loss is eligible to fire -- i.e. before leg 1 arms the floor.
+        ``mae_pct`` is a whole-life mark and therefore cannot answer stop-width
+        questions on its own: it keeps accumulating after the SL has stopped
+        being the active downside rule, so post-arm dips get misread as
+        stop-outs a tighter stop would have caused.
+
+        Both nullable with NO DEFAULT, same discipline as ``mae_pct``: NULL
+        means "never measured" and MUST NOT be read as 0. Once leg 1 arms, the
+        value freezes -- a frozen value is a measurement, not an absence.
+
+        Anti-scope: NO backfill. The pre-arm price path of a closed trade is
+        unrecoverable for exactly the same reason ``mae_pct`` was not
+        backfilled. Any stop-width analysis must filter
+        ``pre_leg1_mae_pct IS NOT NULL``.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "bl_pre_leg1_adverse_excursion_v1"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            expected_cols = {
+                "pre_leg1_trough_price": "REAL",
+                "pre_leg1_mae_pct": "REAL",
+            }
+            cur_pragma = await conn.execute("PRAGMA table_info(paper_trades)")
+            existing_cols = {row[1] for row in await cur_pragma.fetchall()}
+            for col, coltype in expected_cols.items():
+                if col in existing_cols:
+                    _log.info(
+                        "schema_migration_column_action",
+                        migration=migration_name,
+                        col=col,
+                        action="skip_exists",
+                    )
+                    continue
+                await conn.execute(
+                    f"ALTER TABLE paper_trades ADD COLUMN {col} {coltype}"
+                )
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col=col,
+                    action="added",
+                )
+            # Verify presence -- fail loud on drift rather than at first UPDATE.
+            cur_pragma = await conn.execute("PRAGMA table_info(paper_trades)")
+            post_cols = {row[1] for row in await cur_pragma.fetchall()}
+            missing = sorted(set(expected_cols) - post_cols)
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: " + ", ".join(missing)
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260808, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "bl_pre_leg1_adverse_excursion_v1_migration_complete",
+                table="paper_trades",
+            )
+        except BaseException as e:
+            _log.exception(
+                "bl_pre_leg1_adverse_excursion_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

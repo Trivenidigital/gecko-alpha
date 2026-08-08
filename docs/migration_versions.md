@@ -71,6 +71,7 @@ number to appear in the table below.
 | 20260801 | solana_executions_v1 | #487-followup |
 | 20260802 | bl_venue_neutral_execution_v1 | #500 |
 | 20260803 | bl_trade_adverse_excursion_v1 | #505 |
+| 20260808 | bl_pre_leg1_adverse_excursion_v1 | #516 |
 
 ## Notes / gaps
 
