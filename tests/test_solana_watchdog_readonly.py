@@ -8,9 +8,15 @@ concurrently writing — 720 times a day. The watchdog log carried 74
 
 `solana_lane.main()` calls `initialize()` OUTSIDE the try/finally that owns
 `db.close()`, so each failure skipped cleanup entirely and leaked the aiosqlite
-connection with its worker thread. That thread is not a daemon, so the
-interpreter could not exit: 35 leaked invocations (70 processes counting shell
-wrappers), ~1.5 GB RSS on a 3.8 GB box, oldest resident 5.45 days.
+connection with its worker thread. That is a lifecycle defect on its own terms.
+
+Separately, 35 watchdog invocations (70 processes counting shell wrappers) were
+found resident, ~1.5 GB RSS on a 3.8 GB box, oldest 5.45 days. That is
+CONSISTENT with the leak but not explained by it — see
+`test_a_failed_init_does_not_keep_the_process_alive`, which demonstrates by
+mutation that a leaked connection alone still lets the process exit on aiosqlite
+0.22.1. The residency mechanism is unproven; the specimens were terminated
+during containment.
 
 Two independent fixes, tested separately:
   1. `Database.initialize()` owns its connection — any failure after connect
@@ -62,8 +68,8 @@ class TestInitializeOwnsItsConnection:
         # The ORIGINAL error must survive — a cleanup failure must never mask it.
         assert exc.value is boom
         assert db._conn is None, (
-            "initialize() must not leave a live connection behind; the aiosqlite "
-            "worker thread is non-daemon and keeps the process resident"
+            "initialize() opened this connection, so it must not lose it on the "
+            "way out — a caller that cannot reach db.close() has no other handle"
         )
 
     async def test_a_successful_initialize_still_leaves_the_connection_open(
@@ -217,3 +223,85 @@ class TestWatchdogSemanticsUnchanged:
         assert "NEVER rebuild" in fn, (
             "the operator instruction for a stuck execution must not be lost"
         )
+
+
+class TestReadOnlyPathActuallyRuns:
+    """*** THE TESTS THAT WOULD HAVE CAUGHT THE MISSING IMPORT. ***
+
+    Every other test in this file inspects `_run_watchdog_readonly` as SOURCE
+    TEXT or exercises a hand-rolled `mode=ro` connection alongside it. None of
+    them ever called it. `solana_lane.py` imports `sqlite3` but not `aiosqlite`,
+    so the first real cron invocation would have raised NameError — a green
+    suite over code that cannot run.
+
+    These execute the real function end to end.
+    """
+
+    async def test_no_stuck_executions_returns_exit_ok(
+        self, tmp_path, settings_factory
+    ):
+        from scout.live.solana_lane import EXIT_OK, _run_watchdog_readonly
+
+        db_path = tmp_path / "scout.db"
+        db = Database(str(db_path))
+        await db.initialize()
+        await db.close()
+
+        settings = settings_factory(SOLANA_EXECUTION_WATCHDOG_ENABLED=True)
+        rc = await _run_watchdog_readonly(db_path, settings)
+        assert rc == EXIT_OK
+
+    async def test_it_prints_the_operator_facing_line(
+        self, tmp_path, settings_factory, capsys
+    ):
+        """The string cron operators and the log grep depend on."""
+        from scout.live.solana_lane import _run_watchdog_readonly
+
+        db_path = tmp_path / "scout.db"
+        db = Database(str(db_path))
+        await db.initialize()
+        await db.close()
+
+        settings = settings_factory(SOLANA_EXECUTION_WATCHDOG_ENABLED=True)
+        await _run_watchdog_readonly(db_path, settings)
+        assert "solana lane: no stuck executions." in capsys.readouterr().out
+
+    async def test_disabled_flag_short_circuits(self, tmp_path, settings_factory):
+        from scout.live.solana_lane import EXIT_OK, _run_watchdog_readonly
+
+        db_path = tmp_path / "scout.db"
+        db = Database(str(db_path))
+        await db.initialize()
+        await db.close()
+
+        settings = settings_factory(SOLANA_EXECUTION_WATCHDOG_ENABLED=False)
+        rc = await _run_watchdog_readonly(db_path, settings)
+        assert rc == EXIT_OK
+
+    async def test_it_does_not_write_to_the_database(
+        self, tmp_path, settings_factory
+    ):
+        """Structural claim, verified behaviourally.
+
+        `mode=ro` is asserted elsewhere by reading the source. This proves the
+        real invocation leaves the file byte-identical — no journal, no WAL
+        growth, no migration.
+        """
+        import hashlib
+
+        db_path = tmp_path / "scout.db"
+        db = Database(str(db_path))
+        await db.initialize()
+        await db.close()
+
+        before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        settings = settings_factory(SOLANA_EXECUTION_WATCHDOG_ENABLED=True)
+        await _run(db_path, settings)
+        after = hashlib.sha256(db_path.read_bytes()).hexdigest()
+        assert before == after, "the watchdog must not modify the database"
+
+
+async def _run(db_path, settings):
+    from scout.live.solana_lane import _run_watchdog_readonly
+
+    return await _run_watchdog_readonly(db_path, settings)

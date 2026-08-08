@@ -216,6 +216,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import aiohttp
+import aiosqlite
 import structlog
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -7694,9 +7695,15 @@ async def main(argv: list[str] | None = None) -> int:
     # That collided. The watchdog log carried 74 `database is locked` failures
     # raised out of `initialize()`, and because `initialize()` is called OUTSIDE
     # the try/finally that owns `db.close()`, each failure leaked its aiosqlite
-    # connection and worker thread. The non-daemon worker kept the interpreter
-    # alive: 35 leaked invocations (70 processes with their shell wrappers),
-    # ~1.5 GB RSS on a 3.8 GB box, oldest resident 5.45 days.
+    # connection and worker thread with no reference left able to close them.
+    #
+    # Separately, 35 watchdog invocations (70 processes counting shell wrappers)
+    # were found resident, ~1.5 GB RSS on a 3.8 GB box, oldest 5.45 days. That
+    # is consistent with this leak but NOT explained by it: aiosqlite 0.22.1
+    # reaps a leaked worker via `Connection.__del__` once the connection becomes
+    # unreachable, so persistence requires some further retention mechanism that
+    # was never captured -- the processes were killed during containment. The
+    # collision below is measured; the residency mechanism is not.
     #
     # `initialize()` is now exception-safe too, so the leak is closed at both
     # ends. This branch removes the collision itself: a read-only consumer has no

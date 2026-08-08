@@ -94,13 +94,23 @@ class Database:
         # worker thread still running. A short-lived caller then had no way to
         # close it: `solana_lane.main()` calls `initialize()` OUTSIDE the
         # try/finally that owns `db.close()`, so the exception skipped straight
-        # past it. The worker thread is not a daemon, so the interpreter could
-        # not exit and the process stayed resident forever.
+        # past it. That is a resource-ownership defect on its own terms: this
+        # method opened the connection, so this method must not lose it.
         #
-        # 2026-08-08: 35 such leaked watchdog invocations (70 processes with
-        # their shell wrappers) held ~1.5 GB RSS on a 3.8 GB box, the oldest
-        # resident 5.45 days. The log carried 74 `database is locked` failures
-        # from exactly this path.
+        # 2026-08-08: the Solana watchdog log carried 74 `database is locked`
+        # failures raised out of this path, and 35 of its invocations (70
+        # processes counting shell wrappers) were found resident, ~1.5 GB RSS on
+        # a 3.8 GB box, the oldest 5.45 days old.
+        #
+        # Those resident processes are CONSISTENT with this leak but not
+        # explained by it alone. On the pinned aiosqlite 0.22.1,
+        # `Connection.__del__` calls `stop()`, so a leaked connection that
+        # becomes unreachable has its worker thread reaped by GC and the process
+        # exits -- confirmed by mutation: a subprocess that leaks this way still
+        # terminates. Persistence therefore needs some additional mechanism
+        # keeping the connection REACHABLE (a retained traceback frame holding
+        # main()'s locals is the obvious candidate), and that link is unproven:
+        # the specimens were terminated during containment before capture.
         #
         # The original exception is re-raised; a failure to close is logged and
         # swallowed so it can never mask the real cause.
