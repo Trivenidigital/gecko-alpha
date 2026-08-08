@@ -180,13 +180,30 @@ async def _cohort_state(conn: aiosqlite.Connection, t0: str) -> dict:
 
 
 async def _entry_rate_days(conn: aiosqlite.Connection, t0: str, days: int) -> list[int]:
-    """Entries per day for the last *days* whole days — K4's observable."""
+    """Entries per day for the last *days* whole days — K4's observable.
+
+    The cutoff is bound as a PARAMETER via `sql_utc_cutoff()`, never composed
+    inline from SQLite's now-function with a relative modifier.
+
+    Why: `opened_at` stores Python `.isoformat()` output, which separates date
+    and time with a capital T. SQLite's own now-expression yields a
+    space-separated string instead. Comparing the two is a STRING comparison in
+    which that T (0x54) sorts after a space (0x20), so same-day rows land on the
+    wrong side of the boundary and the K4 entry rate silently mis-windows.
+    `sql_utc_cutoff()` emits an ISO string in the stored shape, so both sides
+    share one format.
+
+    Caught by `tests/test_datetime_predicate_lint.py` (INF-04), not by me. The
+    banned shape is deliberately PARAPHRASED above rather than quoted — that
+    lint greps source text, so spelling the pattern out in prose re-trips it.
+    """
+    from scout.timeutil import sql_utc_cutoff
+
     cur = await conn.execute(
         "SELECT substr(opened_at, 1, 10) d, COUNT(*) FROM paper_trades "
-        "WHERE signal_type = ? AND opened_at >= ? "
-        "AND opened_at >= datetime('now', ?) "
+        "WHERE signal_type = ? AND opened_at >= ? AND opened_at >= ? "
         "GROUP BY d ORDER BY d",
-        (PILOT_SIGNAL, t0, f"-{days} days"),
+        (PILOT_SIGNAL, t0, sql_utc_cutoff(days=days)),
     )
     return [int(r[1]) for r in await cur.fetchall()]
 
