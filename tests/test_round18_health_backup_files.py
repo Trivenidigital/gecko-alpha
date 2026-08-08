@@ -161,3 +161,67 @@ def test_health_silently_deleted_backup_is_detectable(
         "if file_count=0 while heartbeats are fresh, someone deleted "
         "the backup since the last script run — operator must know"
     )
+
+
+def test_health_ignores_partial_artifacts_when_counting_and_dating(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """*** THE /health HALF OF THE 2026-08-08 INCIDENT. ***
+
+    /health sorts newest-first and reports the top file's age as
+    `latest_backup_age_sec`. A failed run's sidecar is always newer than the
+    backup it failed to become, so counting them made backup health look FRESH
+    while the newest completed backup was a week stale — the precise condition
+    under which the operator would stop worrying.
+    """
+    _make_bak(tmp_path / "scout.db.bak.20260801T030001Z", age_seconds=7 * 86400)
+    for suffix in (".partial", ".partial-journal", ".partial-wal", ".partial-shm"):
+        _make_bak(
+            tmp_path / f"scout.db.bak.20260808T030002Z{suffix}",
+            age_seconds=60,
+            size_bytes=1024,
+        )
+
+    monkeypatch.setenv("GECKO_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("GECKO_BACKUP_HEARTBEAT_FILE", str(tmp_path / "missing"))
+    monkeypatch.setenv(
+        "GECKO_BACKUP_CREATE_HEARTBEAT_FILE", str(tmp_path / "missing2")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        data = client.get("/health").json()
+
+    assert data["backup_file_count"] == 1, (
+        "in-progress artifacts must not be counted as backups; "
+        f"got {data['backup_file_count']}"
+    )
+    assert data["latest_backup_age_sec"] > 6 * 86400, (
+        "age must reflect the newest COMPLETED backup (7d), not a 60s-old "
+        f"sidecar; got {data['latest_backup_age_sec']}s"
+    )
+    assert data["latest_backup_fresh"] is False, (
+        "a week-stale backup must not report fresh because a sidecar is new"
+    )
+
+
+def test_health_still_counts_manual_and_legacy_backup_names(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """The exclusion is `.partial*` only — the operator's manual-tag and legacy
+    hyphen forms remain valid backups."""
+    _make_bak(tmp_path / "scout.db.bak.manual-preupgrade", age_seconds=3600)
+    _make_bak(tmp_path / "scout.db.bak-legacy-format", age_seconds=7200)
+    _make_bak(tmp_path / "scout.db.bak.20260808T030002Z", age_seconds=1800)
+
+    monkeypatch.setenv("GECKO_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("GECKO_BACKUP_HEARTBEAT_FILE", str(tmp_path / "missing"))
+    monkeypatch.setenv(
+        "GECKO_BACKUP_CREATE_HEARTBEAT_FILE", str(tmp_path / "missing2")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        data = client.get("/health").json()
+
+    assert data["backup_file_count"] == 3, data

@@ -65,8 +65,35 @@ fi
 # (e.g., find permission-denied → empty mapfile → silent green-when-broken).
 TMP_LIST="$(mktemp)"
 trap 'rm -f "$TMP_LIST" "$TMP_LIST.err"' EXIT
+# Retention set = COMPLETED backups. Both separator families stay supported —
+# `scout.db.bak.<anything>` and `scout.db.bak-<anything>` — because the operator
+# contract explicitly includes hand-made backups via
+# `cp scout.db scout.db.bak.<tag>` with arbitrary tags (and even embedded
+# spaces), and /health treats `scout.db.bak-legacy-format` as valid.
+#
+# What is excluded is the RESERVED IN-PROGRESS NAMESPACE: anything containing
+# `.partial`. `gecko-backup-create.sh` owns `$DEST.partial` plus the SQLite
+# sidecars it can leave (`-journal`, `-wal`, `-shm`); none of those is ever a
+# completed backup, and cleaning them is create's job, not rotation's.
+#
+# Excluding a reserved suffix rather than whitelisting a timestamp shape is the
+# load-bearing choice: a timestamp-only matcher would have silently dropped
+# every manual backup out of rotation, redefining a supported workflow while
+# appearing to be a tightening.
+#
+# Why this matters. Rotation sorts by mtime descending and keeps the first
+# $KEEP. When in-progress artifacts were in the set, ones NEWER than the real
+# backups took the retention slots and the completed backups fell into the
+# delete list.
+#
+# 2026-08-08, prod: five 1 KB `*.partial-journal` files (one per failed run)
+# sat newer than all three completed backups. Rotation had not yet destroyed
+# them only because create kept failing and aborted the unit before rotate ran.
+# Simulated against the live directory, the next successful create would have
+# pruned all three real backups and retained three 1 KB journals.
 if ! find "$GECKO_BACKUP_DIR" -maxdepth 1 -type f \
         \( -name 'scout.db.bak.*' -o -name 'scout.db.bak-*' \) \
+        ! -name '*.partial*' \
         -printf '%T@ %p\n' 2>"$TMP_LIST.err" \
     | sort -rn \
     | cut -d' ' -f2- > "$TMP_LIST"; then

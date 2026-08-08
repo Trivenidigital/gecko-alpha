@@ -93,8 +93,16 @@ shopt -s nullglob
 for pattern in 'scout.db.bak.*' 'scout.db.bak-*'; do
     for f in "$BACKUP_DIR"/$pattern; do
         [[ -f "$f" ]] || continue
-        # Skip .partial sentinels left by gecko-backup-create.sh
-        [[ "$f" == *.partial ]] && continue
+        # Skip the RESERVED IN-PROGRESS NAMESPACE owned by
+        # gecko-backup-create.sh: `$DEST.partial` plus every SQLite sidecar it
+        # can leave beside it (`-journal`, `-wal`, `-shm`).
+        #
+        # `*.partial` alone was too narrow. This loop selects NEWEST by mtime,
+        # and a sidecar is always newer than the completed backup it failed to
+        # become — so a `.partial-journal` could be chosen and shipped off-host
+        # as though it were a backup. The five that accumulated on prod
+        # (2026-08-08) were exactly this shape.
+        [[ "$f" == *.partial* ]] && continue
         mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
         if (( mtime > NEWEST_MTIME )); then
             NEWEST="$f"

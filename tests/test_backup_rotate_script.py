@@ -34,6 +34,17 @@ SCRIPT = REPO_ROOT / "scripts" / "gecko-backup-rotate.sh"
 WATCHDOG_SCRIPT = REPO_ROOT / "scripts" / "gecko-backup-watchdog.sh"
 
 
+def _ts(i: int) -> str:
+    """A producer-shaped COMPLETED-backup filename for index *i*.
+
+    Convenience only. Rotation does NOT require this shape: arbitrary operator
+    tags (`cp scout.db scout.db.bak.<tag>`, spaces included) are a supported
+    workflow and remain in the retention set. What is excluded is the reserved
+    in-progress namespace, `*.partial*`.
+    """
+    return f"scout.db.bak.2026010{i % 10}T0000{i % 6}{i % 10}Z"
+
+
 def _make_backup(dir: Path, name: str, mtime: float, size: int = 100) -> Path:
     p = dir / name
     p.write_bytes(b"x" * size)
@@ -62,7 +73,7 @@ def test_keeps_top_n_by_mtime(tmp_path):
     now = time.time()
     for i, age_hours in enumerate([10, 20, 30, 40, 50]):
         _make_backup(
-            tmp_path, f"scout.db.bak.tag{i}.{int(now)}", now - age_hours * 3600
+            tmp_path, _ts(i), now - age_hours * 3600
         )
     hb = tmp_path / "hb"
     res = _run(
@@ -77,18 +88,20 @@ def test_keeps_top_n_by_mtime(tmp_path):
     surviving = sorted(
         p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
     )
-    assert any("tag0" in n for n in surviving)
-    assert any("tag1" in n for n in surviving)
-    assert any("tag2" in n for n in surviving)
-    assert not any("tag3" in n for n in surviving)
-    assert not any("tag4" in n for n in surviving)
+    # Identity assertions, not substring probes: the files are now real
+    # timestamped names, so `_ts(i)` is the exact expected filename.
+    assert _ts(0) in surviving
+    assert _ts(1) in surviving
+    assert _ts(2) in surviving
+    assert _ts(3) not in surviving
+    assert _ts(4) not in surviving
     assert len(surviving) == 3
 
 
 def test_idempotent_rerun_on_trimmed_dir(tmp_path):
     now = time.time()
     for i in range(3):
-        _make_backup(tmp_path, f"scout.db.bak.tag{i}.x", now - i * 3600)
+        _make_backup(tmp_path, _ts(i), now - i * 3600)
     hb = tmp_path / "hb"
     env = {
         "GECKO_BACKUP_DIR": str(tmp_path),
@@ -121,7 +134,7 @@ def test_empty_dir_is_noop(tmp_path):
 def test_keep_zero_deletes_everything(tmp_path):
     now = time.time()
     for i in range(3):
-        _make_backup(tmp_path, f"scout.db.bak.tag{i}", now - i * 3600)
+        _make_backup(tmp_path, _ts(i), now - i * 3600)
     hb = tmp_path / "hb"
     res = _run(
         {
@@ -141,8 +154,11 @@ def test_unified_sort_across_both_name_patterns(tmp_path):
     a SINGLE mtime sort. 8 alternating files, KEEP=3 → exactly 3 survive."""
     now = time.time()
     for i, hours_ago in enumerate([1, 2, 3, 4, 5, 6, 7, 8]):
+        # Both LEGITIMATE completed forms — dot-separated (current producer)
+        # and hyphen-separated (historical). Both must remain in the retention
+        # set after the matcher was tightened; that is the point of this test.
         if i % 2 == 0:
-            name = f"scout.db.bak.tag{i}.{int(now)}"
+            name = f"scout.db.bak.2026020{i}T000000Z"
         else:
             name = f"scout.db.bak-2026010{i}T000000Z"
         _make_backup(tmp_path, name, now - hours_ago * 3600)
@@ -190,7 +206,7 @@ def test_nonexistent_dir_aborts(tmp_path):
 
 def test_negative_keep_aborts(tmp_path):
     hb = tmp_path / "hb"
-    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    _make_backup(tmp_path, _ts(0), time.time())
     res = _run(
         {
             "GECKO_BACKUP_DIR": str(tmp_path),
@@ -208,7 +224,7 @@ def test_unwritable_heartbeat_path_aborts(tmp_path):
     blocker_file = tmp_path / "blocker_file"
     blocker_file.write_text("not a directory")
     hb = blocker_file / "hb"
-    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    _make_backup(tmp_path, _ts(0), time.time())
     res = _run(
         {
             "GECKO_BACKUP_DIR": str(tmp_path),
@@ -224,7 +240,7 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
     """R3 MUST-FIX: flock guard against concurrent invocations."""
     hb = tmp_path / "hb"
     lock = tmp_path / "lock"
-    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    _make_backup(tmp_path, _ts(0), time.time())
     quoted_lock = shlex.quote(str(lock))
     holder = subprocess.Popen(
         ["bash", "-c", f"exec 9>{quoted_lock}; flock 9; sleep 5"],
@@ -252,6 +268,16 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
 
 
 def test_filename_with_space_preserved(tmp_path):
+    """*** OPERATOR CONTRACT: manual `cp scout.db scout.db.bak.<tag>`. ***
+
+    Arbitrary tags — including embedded spaces — are real backups and MUST stay
+    in the retention set, rotating by mtime like any other.
+
+    An earlier revision of this branch narrowed the matcher to
+    `scout.db.bak[.-]YYYYMMDDTHHMMSSZ`, which would have dropped every manual
+    backup out of rotation entirely while looking like a tightening. This test
+    is the guard against that recurring.
+    """
     now = time.time()
     _make_backup(tmp_path, "scout.db.bak.tag.normal", now - 1)
     _make_backup(tmp_path, "scout.db.bak. extra-tag", now - 2)
@@ -274,9 +300,38 @@ def test_filename_with_space_preserved(tmp_path):
     assert "scout.db.bak.older" not in surviving
 
 
+def test_manual_tag_backups_rotate_alongside_producer_names(tmp_path):
+    """Both families in ONE mtime sort — arbitrary tags are not second-class.
+
+    `scout.db.bak-legacy-format` is treated as a valid backup by the /health
+    contract, so rotation must agree.
+    """
+    now = time.time()
+    _make_backup(tmp_path, "scout.db.bak.manual-preupgrade", now - 1 * 3600)
+    _make_backup(tmp_path, _ts(0), now - 2 * 3600)
+    _make_backup(tmp_path, "scout.db.bak-legacy-format", now - 3 * 3600)
+    _make_backup(tmp_path, "scout.db.bak.ancient-manual", now - 99 * 3600)
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    surviving = {p.name for p in tmp_path.iterdir()}
+    assert "scout.db.bak.manual-preupgrade" in surviving
+    assert _ts(0) in surviving
+    assert "scout.db.bak-legacy-format" in surviving
+    assert "scout.db.bak.ancient-manual" not in surviving
+    assert "found=4" in res.stdout, res.stdout
+
+
 def test_heartbeat_written_on_success(tmp_path):
     hb = tmp_path / "hb"
-    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    _make_backup(tmp_path, _ts(0), time.time())
     before = time.time()
     res = _run(
         {
@@ -310,7 +365,7 @@ def test_heartbeat_NOT_written_on_failure(tmp_path):
 def test_heartbeat_atomic_write_via_rename(tmp_path):
     """R6 MUST-FIX regression-lock: heartbeat must be written via .tmp + mv-f rename."""
     hb = tmp_path / "hb"
-    _make_backup(tmp_path, "scout.db.bak.x", time.time())
+    _make_backup(tmp_path, _ts(0), time.time())
     res = _run(
         {
             "GECKO_BACKUP_DIR": str(tmp_path),
@@ -556,3 +611,85 @@ def test_watchdog_path_with_apostrophe_does_not_break(tmp_path):
     )
     assert res.returncode == 1
     assert marker.exists()
+
+
+# ----------------------------------------------------------------------
+# In-progress / orphaned artifacts must never enter the retention set
+# ----------------------------------------------------------------------
+
+
+def test_newer_partial_artifacts_do_not_evict_completed_backups(tmp_path):
+    """*** THE 2026-08-08 PROD INCIDENT, LOCKED DOWN. ***
+
+    Rotation sorts by mtime descending and keeps the first KEEP. When the match
+    set was a broad glob, in-progress artifacts NEWER than every real backup
+    took all the retention slots and the completed backups fell into the delete
+    list.
+
+    Observed on prod: five 1 KB `*.partial-journal` files, one per failed run,
+    all newer than the three completed backups. Rotation had not yet destroyed
+    them only because create kept failing and aborted the unit before rotate
+    ran — i.e. a second bug was the only thing preventing data loss.
+    """
+    now = time.time()
+    # Three real backups, oldest → newest.
+    for i, age in enumerate([30, 20, 10]):
+        _make_backup(tmp_path, _ts(i), now - age * 3600)
+    # Five orphaned artifacts, ALL newer than every real backup.
+    for i in range(5):
+        _make_backup(
+            tmp_path,
+            f"scout.db.bak.2026030{i}T000000Z.partial-journal",
+            now - i * 60,
+            size=1024,
+        )
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    surviving = {p.name for p in tmp_path.iterdir()}
+    for i in range(3):
+        assert _ts(i) in surviving, (
+            f"completed backup {_ts(i)} was evicted by newer partial artifacts "
+            f"— this is the prod incident. stdout: {res.stdout}"
+        )
+    assert "found=3" in res.stdout, (
+        f"partials must not be counted toward KEEP; got: {res.stdout}"
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix", [".partial", ".partial-journal", ".partial-wal", ".partial-shm"]
+)
+def test_each_partial_suffix_is_excluded(tmp_path, suffix):
+    """Every SQLite sidecar shape, not just `.partial`.
+
+    `.partial` alone was already skipped by intent; the `-journal`/`-wal`/`-shm`
+    companions were not, and those are what actually accumulated on prod.
+    """
+    now = time.time()
+    _make_backup(tmp_path, _ts(0), now - 3600)
+    _make_backup(tmp_path, f"scout.db.bak.20260301T000000Z{suffix}", now)
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "1",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    surviving = {p.name for p in tmp_path.iterdir()}
+    assert _ts(0) in surviving, f"{suffix} evicted the only real backup"
+    assert f"scout.db.bak.20260301T000000Z{suffix}" in surviving, (
+        f"{suffix} must be ignored, not deleted — rotation owns completed "
+        "backups only; cleaning partials is the create script's job"
+    )
+    assert "found=1" in res.stdout

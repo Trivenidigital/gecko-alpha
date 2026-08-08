@@ -11,6 +11,7 @@ Skipped on Windows: bash + flock semantics are Linux-specific.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -211,7 +212,11 @@ def test_create_exits_5_on_integrity_failure(tmp_path):
         "#!/usr/bin/env bash\n"
         'if [[ "$2" == .backup* ]]; then\n'
         '  # extract dest from `.backup \'path\'`\n'
-        '  dest=$(echo "$2" | sed "s/^.backup '"'"'\\(.*\\)'"'"'$/\\1/")\n'
+        # Raw triple-quoted: `\(` and `\1` must reach sed literally. In a plain
+        # string `"\1"` is chr(1), which silently made `dest` garbage — no
+        # .partial was ever written and `assert partials == []` passed for the
+        # wrong reason.
+        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
         '  echo "stub-backup-data" > "$dest"\n'
         "  exit 0\n"
         'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then\n'
@@ -236,3 +241,147 @@ def test_create_exits_5_on_integrity_failure(tmp_path):
     # The .partial file must have been cleaned up.
     partials = list(backup_dir.glob("*.partial"))
     assert partials == []
+
+
+# ---------------------------------------------------------------------
+# Sidecar cleanup — the artifacts that actually accumulated on prod
+# ---------------------------------------------------------------------
+
+
+def _sidecar_stub(path: Path, *, mode: str, witness: Path | None = None) -> Path:
+    """A stub sqlite3 that writes the .partial AND its SQLite sidecars.
+
+    `sqlite3 .backup` opens the destination as a database, so an interrupted or
+    failed run can leave `-journal` / `-wal` / `-shm` companions beside it.
+    Every prior test stubbed only the main file, which is exactly why five
+    orphaned `*.partial-journal` files survived on prod undetected.
+
+    mode="backup_fail"    -> create all four, then fail the .backup   (exit 4)
+    mode="integrity_fail" -> create all four, report corruption       (exit 5)
+
+    *witness*, when given, receives one line per artifact the stub actually
+    created, written OUTSIDE the backup directory so cleanup cannot erase it.
+    Without it, `leftovers == []` passes just as happily when the stub created
+    nothing at all — which is precisely the vacuous-negative shape this file
+    exists to eliminate. The witness turns "nothing left behind" into "these
+    four existed, and then they were removed".
+    """
+    body = [
+        "#!/usr/bin/env bash",
+        'if [[ "$2" == .backup* ]]; then',
+        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''',
+        '  echo "stub-backup-data" > "$dest"',
+        '  echo "j" > "$dest-journal"',
+        '  echo "w" > "$dest-wal"',
+        '  echo "s" > "$dest-shm"',
+    ]
+    if witness is not None:
+        body += [
+            f'  for a in "$dest" "$dest-journal" "$dest-wal" "$dest-shm"; do',
+            f'    [[ -f "$a" ]] && echo "$a" >> {shlex.quote(str(witness))}',
+            "  done",
+        ]
+    if mode == "backup_fail":
+        body += ['  echo "stub: disk full" >&2', "  exit 1"]
+    else:
+        body += ["  exit 0"]
+    body += [
+        'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then',
+        '  echo "***corruption detected by stub***"'
+        if mode == "integrity_fail"
+        else '  echo "ok"',
+        "  exit 0",
+        "fi",
+        "exit 99",
+    ]
+    path.write_text("\n".join(body) + "\n")
+    path.chmod(0o755)
+    return path
+
+
+@pytest.mark.parametrize(
+    "mode,expected_rc", [("backup_fail", 4), ("integrity_fail", 5)]
+)
+def test_failure_removes_partial_AND_every_sidecar(tmp_path, mode, expected_rc):
+    """*** THE PROD LEAK. ***
+
+    Both failure paths removed only `$DEST_TMP`. The `-journal`, `-wal` and
+    `-shm` companions were left behind permanently — nothing else ever cleaned
+    them, and while the rotation matcher was a broad glob they counted toward
+    KEEP and could evict a completed backup.
+
+    The pre-existing regression asserted only `glob("*.partial") == []`, which
+    passes with every sidecar still on disk. That is why five of them
+    accumulated on prod across five consecutive failed runs before anyone
+    noticed.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+    # Witness lives OUTSIDE backup_dir so cleanup cannot erase the evidence.
+    witness = tmp_path / "created-artifacts.txt"
+    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode=mode, witness=witness)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_SQLITE_BIN": str(stub),
+        }
+    )
+    assert proc.returncode == expected_rc, proc.stderr
+
+    # POSITIVE WITNESS FIRST. Without this, `leftovers == []` passes just as
+    # happily when the stub created nothing — the vacuous negative this file
+    # exists to eliminate. Assert existence AND count, not `if witness:`.
+    assert witness.exists(), (
+        "stub never ran or never created artifacts — the cleanup assertion "
+        "below would pass for the wrong reason"
+    )
+    created = [ln for ln in witness.read_text().splitlines() if ln.strip()]
+    assert len(created) == 4, f"expected all 4 artifacts created, got {created}"
+    assert sorted(Path(c).name.split(".partial")[1] for c in created) == [
+        "",
+        "-journal",
+        "-shm",
+        "-wal",
+    ], created
+
+    # ...and only now is "nothing left behind" meaningful.
+    leftovers = sorted(p.name for p in backup_dir.iterdir())
+    assert leftovers == [], (
+        f"failure path left artifacts behind: {leftovers}. Every one of these "
+        "persists forever — no later run revisits a .partial-* name."
+    )
+
+
+def test_success_leaves_no_sidecars_beside_the_promoted_backup(tmp_path):
+    """`mv` promotes only the main file; anything beside it would linger."""
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+    witness = tmp_path / "created-artifacts.txt"
+    stub = _sidecar_stub(tmp_path / "sqlite3-stub", mode="ok", witness=witness)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_SQLITE_BIN": str(stub),
+        }
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    assert witness.exists(), "stub never created the sidecars it was asked to"
+    assert len([ln for ln in witness.read_text().splitlines() if ln.strip()]) == 4
+
+    names = sorted(p.name for p in backup_dir.iterdir())
+    assert len(names) == 1, f"expected exactly the promoted backup, got {names}"
+    assert names[0].startswith("scout.db.bak."), names
+    assert ".partial" not in names[0], names
