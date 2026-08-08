@@ -140,7 +140,10 @@ class TestInitializeOwnsItsConnection:
             [sys.executable, "-c", script],
             capture_output=True,
             text=True,
-            timeout=60,  # a leaked worker thread hangs here instead
+            # Liveness bound only. This test is intentionally NON-DISCRIMINATING
+            # on aiosqlite 0.22.1: the docstring above explains why a leaked
+            # worker does NOT hang here — GC reaps it via `Connection.__del__`.
+            timeout=60,
         )
         assert "RAISED_AS_EXPECTED" in proc.stdout, proc.stderr
         assert proc.returncode == 0, (
