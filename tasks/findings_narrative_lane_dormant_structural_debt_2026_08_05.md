@@ -1,23 +1,113 @@
 # Narrative-prediction lane — dormant structural debt and mandatory revival gate
 
 **Date:** 2026-08-05
-**Status:** ANALYSIS COMPLETE. Nothing modified — no parameter changed, quarantine
-not lifted, learner not run.
-**Class:** dormant structural debt. Zero behavioural impact while quarantined;
-**blocking** if the lane is ever revived.
+**Status:** **SUPERSEDED — HISTORICAL RECORD.** See the update block immediately
+below. Nothing in this document was modified in production; it is retained as
+forensic provenance, not as current runtime truth.
+**Class:** dormant structural debt at time of writing. Zero behavioural impact
+while quarantined.
+
+---
+
+## *** SUPERSEDED / POST-INVESTIGATION UPDATE — 2026-08-07 ***
+
+**Everything below this block describes the system as of 2026-08-05 and must not
+be read as current requirements.** A later investigation falsified the central
+hypothesis and shipped code that removes most of the structural debt this
+document was written to flag.
+
+### The root-cause hypothesis is FALSIFIED
+
+This document argues (§2, "HIGH confidence, NOT proven") that the learner failed
+because `NARRATIVE_LEARN_MODEL = claude-sonnet-4-6` is a retired model ID, and
+reasons that because `NARRATIVE_SCORING_MODEL` is current and an API key is
+present, the fault is *path-specific, not credentials*.
+
+**Both halves are wrong.** A read-only probe on 2026-08-07 using the production
+key and `NARRATIVE_SCORING_MODEL` (`claude-haiku-4-5` — the model this document
+calls "current") returned:
+
+```
+BadRequestError | 400 | BILLING_BLOCKED | req_011CdooRRpdEKNVoRZx8cSZm
+"Your credit balance is too low to access the Anthropic API."
+```
+
+It **is** credentials — an exhausted account balance — and it is **not**
+path-specific: the scoring path fails identically. The presence of an API key
+was never evidence that billing was healthy. (This is the recorded
+"billing ≠ retired model" trap, reproduced here in full.)
+
+### What has since shipped
+
+| Change | PR | Effect on this document |
+|---|---|---|
+| Deterministic, provider-free daily learner | **#510** | The required daily learning path no longer calls any provider. §2's failure mode cannot recur on that path. |
+| Typed outcomes, secret-safe failure telemetry | #510 | Addresses G2 for the learner path. |
+| Cadence anchor, shared bounds registry, scoped verdict | **#511** | Corrects the bounds/verdict handling §3 discusses. |
+| Paper-only revival contract guard | **#513** | Revival can no longer silently re-enable Telegram alerting. |
+| `score_token` diagnostics | **#514** | A scorer failure now reports provider health, status, request id and a bounded traceback — the §2.1 "traceback is discarded" defect, for the scoring path. |
+| Dashboard lock/unlock route | #512-era | See below. |
+
+### Specific claims that are no longer true
+
+- **"Fixing the learner alone restores adaptation" — FALSE.** The daily path now
+  runs `run_deterministic_daily_learn`, which is **proposal-only**: it writes a
+  `learn_logs` provenance row and calls no `Strategy.set`. There is no automatic
+  apply path, so no learner fix restores adaptation by itself. Applying a
+  proposal is a separate, owner-gated decision that is not implemented.
+- **Weekly learner failure as an unresolved required-path issue — NO LONGER
+  APPLIES.** Weekly Anthropic commentary is now optional and **disabled by
+  default** (`NARRATIVE_WEEKLY_COMMENTARY_ENABLED=False`). Its absence is
+  reported as `OPTIONAL_COMMENTARY_DISABLED` and is explicitly not a learner
+  failure.
+- **"No unlock route / one-way-door hazard" — FIXED.** `PUT
+  /api/narrative/strategy/{key}/lock` now sets or clears the lock **without
+  touching the value**, with a required `reason` and an audit row. Editing a
+  value no longer implies locking it. The constraint in §6 about not using the
+  dashboard PUT to set parameters is therefore obsolete.
+- **`LEARNER_SCHEDULING: ACTIVE` / `REVIVAL STATUS: BLOCKED_PENDING_LEARNER_FIX`
+  — SUPERSEDED.** The current blocker is not the learner. It is (a) the provider
+  billing state above, and (b) an *independent* strategy judgement: the lane is
+  dispatch-quarantined on its own negative evidence (16% win rate, −$1,542 over
+  six weeks, PR #437). **Restoring provider access would restore scoring, not the
+  lane** — those are separate decisions, and no Anthropic top-up is warranted for
+  this lane alone.
+
+### Gates G1–G4 — historical
+
+`G1`–`G4` below are **historical requirements**, not a current checklist. G4 was
+already withdrawn by the in-document CORRECTION. G1 (learner proven functional)
+is moot for the daily path, which no longer uses a provider. G2 is partially
+delivered via #510/#514 for the learner and scorer paths; process-wide traceback
+rendering remains open debt. G3 (explicit parameter re-baselining) survives as a
+sensible precondition **if** the lane is ever revived — but revival is gated on
+the strategy evidence, not on these gates.
+
+### What remains valid
+
+The measurements, the mutation-path inventory (§4), the narrowed claim (§5), and
+the in-document CORRECTION about the sample gate being measured on the wrong
+table are all retained as provenance. The forensic method — and the fact that
+this document already caught and corrected one of its own errors — is why it is
+superseded rather than deleted.
 
 ---
 
 ## Status block
 
 ```
-NARRATIVE_PREDICTION_CURRENT_STATE: QUARANTINED
-LEARNER_SCHEDULING: ACTIVE
+*** HISTORICAL — state as of 2026-08-05. See SUPERSEDED block above. ***
+NARRATIVE_PREDICTION_CURRENT_STATE: QUARANTINED        (still true 2026-08-07)
+LEARNER_SCHEDULING: ACTIVE                             (superseded: daily path is
+                                                        now deterministic/provider-free, #510)
 QUALIFYING_SAMPLE: 932 / 100  (MET — 9.3x; see CORRECTION below)
 LAST PARAMETER CHANGE: 2026-06-02
 RESTRICTIVE_BOUND PARAMETERS: 2 / 14
-CURRENT BEHAVIORAL IMPACT: NONE WHILE QUARANTINED
-REVIVAL STATUS: BLOCKED_PENDING_LEARNER_FIX
+CURRENT BEHAVIORAL IMPACT: NONE WHILE QUARANTINED      (still true)
+REVIVAL STATUS: BLOCKED_PENDING_LEARNER_FIX            (SUPERSEDED: blocked by
+                                                        provider billing AND by
+                                                        independent negative
+                                                        strategy evidence, PR #437)
 ```
 
 ---
@@ -131,7 +221,12 @@ The caller then logs `narrative.daily_learn_complete` regardless, so the failure
 is invisible to anyone reading the completion event. That masking is why this
 went unnoticed.
 
-### Root-cause hypothesis (HIGH confidence, NOT proven)
+### ~~Root-cause hypothesis (HIGH confidence, NOT proven)~~ — **FALSIFIED 2026-08-07**
+
+> Proven cause is `400 BILLING_BLOCKED` (exhausted credit balance), request
+> `req_011CdooRRpdEKNVoRZx8cSZm`, reproduced on `NARRATIVE_SCORING_MODEL`
+> — the model this section calls "current". It is credentials, and it is not
+> path-specific. The paragraph below is retained as provenance only.
 
 `NARRATIVE_LEARN_MODEL = claude-sonnet-4-6` — a **retired model ID**. Step 4 of
 the daily learn calls Claude with `DAILY_REFLECTION_TEMPLATE`; a retired model
@@ -221,9 +316,16 @@ Accurate statement:
 > adaptation additionally requires ≥100 qualifying outcomes, which the dispatch
 > quarantine currently prevents accumulating.
 
-**CORRECTED:** one condition, not two. **The learner is broken.** The sample is
-*not* unavailable — 932 qualifying predictions exceed the 100 required. Fixing the
-learner alone restores adaptation.
+**CORRECTED (2026-08-05):** one condition, not two. **The learner is broken.** The
+sample is *not* unavailable — 932 qualifying predictions exceed the 100 required.
+~~Fixing the learner alone restores adaptation.~~
+
+> **SUPERSEDED 2026-08-07 — the struck sentence is false.** The daily path now
+> runs `run_deterministic_daily_learn` (#510), which is **proposal-only**: it
+> writes a `learn_logs` provenance row and calls no `Strategy.set`. There is no
+> automatic apply path, so *no* learner fix restores adaptation by itself.
+> Applying a proposal is a separate, owner-gated decision that is deliberately
+> not implemented. The 932-sample finding above remains correct.
 
 ## 6. Mandatory revival gate
 
