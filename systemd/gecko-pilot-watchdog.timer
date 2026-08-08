@@ -1,0 +1,17 @@
+[Unit]
+Description=Gecko-Alpha — pilot threshold watchdog schedule
+
+[Timer]
+# Hourly. The observables are data-bound counts that move on the order of
+# hours-to-days (historical losers rate ~12.7 entries/day), so a tighter
+# cadence buys nothing and adds DB reads against a live 6.8 GB database.
+#
+# A systemd timer rather than another crontab line, per the repo's cron
+# guidance for new high-cadence triggers — and because the Solana leak showed
+# how an unsupervised cron entry accumulates invisibly.
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
