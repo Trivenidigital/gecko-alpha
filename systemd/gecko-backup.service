@@ -21,9 +21,28 @@ ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-rotate.sh
 # day for weeks before discovery).
 ExecStart=/usr/local/bin/gecko-backup-create.sh
 ExecStart=/usr/local/bin/gecko-backup-rotate.sh
-# Backup of a 5GB scout.db via sqlite3 .backup takes ~2-3 minutes on
-# the Hetzner cx21 disk; integrity_check adds another ~30s. 600s
-# gives 4× headroom for slower disks / larger DBs.
-TimeoutStartSec=600
+# Sizing, corrected 2026-08-08 against measurement rather than estimate.
+#
+# The previous value was derived from an estimate of a few minutes for a 5 GB
+# database plus a short integrity check, treated as generous headroom. That
+# assumption is empirically false at the current size: on 2026-08-08 with
+# scout.db at 6.82 GB, the
+# `.backup` phase alone was still running when systemd terminated the unit at
+# exactly 600s, having written 6.82 GB (99.98% of source).
+#
+# Note what that observation does NOT establish: it measures the `.backup`
+# phase only, up to termination. It says nothing about how long the subsequent
+# full `PRAGMA integrity_check` takes on a ~6.8 GB database, and "99.98% of
+# bytes written" is not proof the copy was seconds from done — the source is
+# being written concurrently by the live pipeline.
+#
+# 1800s is therefore chosen for headroom over an unmeasured phase, not as a
+# tight fit to a known duration. It still bounds a hung job at 30 minutes
+# instead of removing the bound.
+#
+# A too-small value here is not merely a failed backup: systemd sends SIGTERM,
+# and before the signal trap in gecko-backup-create.sh that left a full-size
+# orphan `.partial` (6.8 GB on 2026-08-08) which no later run ever cleaned.
+TimeoutStartSec=1800
 StandardOutput=journal
 StandardError=journal

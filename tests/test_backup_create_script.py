@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -385,3 +386,216 @@ def test_success_leaves_no_sidecars_beside_the_promoted_backup(tmp_path):
     assert len(names) == 1, f"expected exactly the promoted backup, got {names}"
     assert names[0].startswith("scout.db.bak."), names
     assert ".partial" not in names[0], names
+
+
+# ---------------------------------------------------------------------
+# Signal termination — the systemd TimeoutStartSec path
+# ---------------------------------------------------------------------
+
+
+def test_sigterm_removes_partial_and_every_sidecar(tmp_path):
+    """*** THE 2026-08-08 TIMEOUT ORPHAN, LOCKED DOWN. ***
+
+    systemd sends SIGTERM when TimeoutStartSec expires. Before the trap, the
+    shell died with the partial and all sidecars on disk: a 6.8 GB orphan that
+    no later run ever revisits.
+
+    Signals the PROCESS GROUP, not just the direct child — that is the shape
+    systemd uses when terminating a unit's control group, and a trap that only
+    survives a direct `kill <pid>` would not prove the real case.
+
+    Not a `grep for trap` test: it runs the real script against a stub that
+    creates all four artifacts and then blocks, so the artifacts genuinely exist
+    at signal time.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+    witness = tmp_path / "created-artifacts.txt"
+
+    # Stub: create all four artifacts, record them, then block forever.
+    stub = tmp_path / "sqlite3-stub"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$2" == .backup* ]]; then\n'
+        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
+        '  echo d > "$dest"\n'
+        '  echo j > "$dest-journal"\n'
+        '  echo w > "$dest-wal"\n'
+        '  echo s > "$dest-shm"\n'
+        '  for a in "$dest" "$dest-journal" "$dest-wal" "$dest-shm"; do\n'
+        f'    [[ -f "$a" ]] && echo "$a" >> {shlex.quote(str(witness))}\n'
+        "  done\n"
+        "  sleep 300\n"  # block, as a real .backup on a large DB would
+        "fi\n"
+        "exit 99\n"
+    )
+    stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_SQLITE_BIN": str(stub),
+        }
+    )
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # own process group, like a unit's cgroup
+    )
+    try:
+        # Wait until the artifacts genuinely exist, so the signal lands during
+        # the backup rather than before it started.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if witness.exists() and len(witness.read_text().split()) >= 4:
+                break
+            time.sleep(0.2)
+        assert witness.exists(), "stub never created artifacts — nothing to clean"
+        created = [ln for ln in witness.read_text().splitlines() if ln.strip()]
+        assert len(created) == 4, created
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        _, stderr = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=10)
+
+    assert proc.returncode != 0, "a signalled backup must not report success"
+    leftovers = sorted(p.name for p in backup_dir.iterdir())
+    assert leftovers == [], (
+        f"SIGTERM left artifacts behind: {leftovers} — this is exactly the "
+        "6.8 GB orphan from 2026-08-08"
+    )
+    assert not (tmp_path / "hb").exists(), (
+        "heartbeat must NOT advance on a signalled run — a moved heartbeat "
+        "would tell the watchdog a backup succeeded"
+    )
+    assert "SIGTERM" in stderr or "removing partial" in stderr, stderr
+
+
+def test_sigint_and_sighup_also_clean_up(tmp_path):
+    """INT/HUP take the same path — an operator Ctrl-C or a closed session
+    must not orphan a multi-GB file either."""
+    for sig in (signal.SIGINT, signal.SIGHUP):
+        db = tmp_path / f"scout-{sig}.db"
+        backup_dir = tmp_path / f"backups-{sig}"
+        backup_dir.mkdir()
+        _make_seed_db(db)
+        witness = tmp_path / f"w-{sig}.txt"
+
+        stub = tmp_path / f"stub-{sig}"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$2" == .backup* ]]; then\n'
+            r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
+            '  echo d > "$dest"; echo j > "$dest-journal"\n'
+            '  echo w > "$dest-wal"; echo s > "$dest-shm"\n'
+            f'  echo "$dest" >> {shlex.quote(str(witness))}\n'
+            "  sleep 300\n"
+            "fi\n"
+            "exit 99\n"
+        )
+        stub.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "GECKO_DB_PATH": str(db),
+                "GECKO_BACKUP_DIR": str(backup_dir),
+                "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / f"hb-{sig}"),
+                "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / f"lock-{sig}"),
+                "GECKO_BACKUP_SQLITE_BIN": str(stub),
+            }
+        )
+        proc = subprocess.Popen(
+            ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and not witness.exists():
+                time.sleep(0.2)
+            assert witness.exists(), f"{sig}: stub never ran"
+            os.killpg(os.getpgid(proc.pid), sig)
+            proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=10)
+
+        assert sorted(p.name for p in backup_dir.iterdir()) == [], (
+            f"{sig.name} left artifacts behind"
+        )
+
+
+# ---------------------------------------------------------------------
+# Unit-file contract — the timeout that produced the orphan
+# ---------------------------------------------------------------------
+
+
+def test_unit_timeout_is_pinned_at_30_minutes():
+    """*** THE VALUE THAT CAUSED THE INCIDENT. ***
+
+    `TimeoutStartSec=600` expired mid-`.backup` on a 6.82 GB database on
+    2026-08-08, and systemd's SIGTERM orphaned a 6.8 GB `.partial`.
+
+    Pinned rather than merely raised: this number is easy to lower "back to
+    something reasonable" by someone who has not seen the failure, and the cost
+    of getting it wrong is a multi-GB orphan plus a missed backup, not a slow
+    job. The trap now cleans up on TERM, so a future expiry is survivable — but
+    the backup still would not exist.
+    """
+    unit = (REPO_ROOT / "systemd" / "gecko-backup.service").read_text("utf-8")
+    values = [
+        ln.split("=", 1)[1].strip()
+        for ln in unit.splitlines()
+        if ln.strip().startswith("TimeoutStartSec=")
+    ]
+    assert values == ["1800"], f"expected exactly one TimeoutStartSec=1800, got {values}"
+    # The stale RATIONALE must be gone, not every mention of the old number:
+    # the replacement comment cites 600s when explaining the incident, which is
+    # exactly the context a future reader needs.
+    assert "4× headroom" not in unit and "4x headroom" not in unit, (
+        "the superseded sizing rationale must not survive alongside the new value"
+    )
+    assert "~2-3 minutes" not in unit, "stale duration estimate still present"
+
+
+def test_create_script_traps_termination_signals():
+    """Static companion to the behavioural SIGTERM test.
+
+    The behavioural test proves cleanup happens; this proves the trap is
+    installed AFTER `_cleanup_partial` and `DEST_TMP` exist. A trap registered
+    before them would reference an unset variable and silently clean nothing —
+    a failure the behavioural test could not distinguish from success if the
+    stub happened to create no artifacts.
+    """
+    src = (REPO_ROOT / "scripts" / "gecko-backup-create.sh").read_text("utf-8")
+    i_tmp = src.index("DEST_TMP=")
+    i_fn = src.index("_cleanup_partial() {")
+    for sig in ("TERM", "INT", "HUP"):
+        marker = f"trap '_on_signal {sig}' {sig}"
+        assert marker in src, f"missing trap for SIG{sig}"
+        assert src.index(marker) > i_fn > i_tmp, (
+            f"SIG{sig} trap must be installed after DEST_TMP and "
+            "_cleanup_partial are defined"
+        )
+    # No `trap ... KILL` REGISTRATION. Asserted against trap lines only, not
+    # prose: the script legitimately explains that SIGKILL is uncatchable and
+    # out of scope, so grepping the file for "KILL" would fail on its own
+    # correct disclaimer.
+    trap_lines = [ln for ln in src.splitlines() if ln.strip().startswith("trap ")]
+    assert trap_lines, "no traps registered at all"
+    assert not any("KILL" in ln for ln in trap_lines), (
+        f"SIGKILL is uncatchable and must not be registered: {trap_lines}"
+    )
