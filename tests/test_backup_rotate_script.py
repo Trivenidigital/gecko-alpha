@@ -267,23 +267,21 @@ def test_flock_concurrent_invocation_exits_3(tmp_path):
 # ----------------------------------------------------------------------
 
 
-def test_non_timestamped_names_are_outside_the_retention_set(tmp_path):
-    """Ad-hoc names are now IGNORED rather than rotated.
+def test_filename_with_space_preserved(tmp_path):
+    """*** OPERATOR CONTRACT: manual `cp scout.db scout.db.bak.<tag>`. ***
 
-    This replaces `test_filename_with_space_preserved`, which asserted that
-    `scout.db.bak. extra-tag` survived rotation *as a retained backup*. Under
-    the tightened matcher such files are not backups at all: they are never
-    counted toward KEEP and never deleted. Both old and new behaviour leave the
-    file on disk, so the old assertion would still pass while testing something
-    that no longer happens — hence the rewrite.
+    Arbitrary tags — including embedded spaces — are real backups and MUST stay
+    in the retention set, rotating by mtime like any other.
+
+    An earlier revision of this branch narrowed the matcher to
+    `scout.db.bak[.-]YYYYMMDDTHHMMSSZ`, which would have dropped every manual
+    backup out of rotation entirely while looking like a tightening. This test
+    is the guard against that recurring.
     """
     now = time.time()
     _make_backup(tmp_path, "scout.db.bak.tag.normal", now - 1)
     _make_backup(tmp_path, "scout.db.bak. extra-tag", now - 2)
     _make_backup(tmp_path, "scout.db.bak.older", now - 100)
-    # Three REAL backups, oldest of which must be pruned at KEEP=2.
-    for i, age in enumerate([10, 20, 30]):
-        _make_backup(tmp_path, _ts(i), now - age * 3600)
     hb = tmp_path / "hb"
     res = _run(
         {
@@ -294,17 +292,41 @@ def test_non_timestamped_names_are_outside_the_retention_set(tmp_path):
         }
     )
     assert res.returncode == 0, res.stderr
-    surviving = {p.name for p in tmp_path.iterdir()}
-    # Untouched — outside the set entirely, regardless of age.
+    surviving = sorted(
+        p.name for p in tmp_path.iterdir() if p.name not in {"hb", "lock"}
+    )
     assert "scout.db.bak.tag.normal" in surviving
     assert "scout.db.bak. extra-tag" in surviving
-    assert "scout.db.bak.older" in surviving
-    # Real rotation still happened among the timestamped files.
-    assert _ts(0) in surviving and _ts(1) in surviving
-    assert _ts(2) not in surviving
-    assert "found=3" in res.stdout, (
-        f"only the 3 timestamped backups may be counted; got: {res.stdout}"
+    assert "scout.db.bak.older" not in surviving
+
+
+def test_manual_tag_backups_rotate_alongside_producer_names(tmp_path):
+    """Both families in ONE mtime sort — arbitrary tags are not second-class.
+
+    `scout.db.bak-legacy-format` is treated as a valid backup by the /health
+    contract, so rotation must agree.
+    """
+    now = time.time()
+    _make_backup(tmp_path, "scout.db.bak.manual-preupgrade", now - 1 * 3600)
+    _make_backup(tmp_path, _ts(0), now - 2 * 3600)
+    _make_backup(tmp_path, "scout.db.bak-legacy-format", now - 3 * 3600)
+    _make_backup(tmp_path, "scout.db.bak.ancient-manual", now - 99 * 3600)
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
     )
+    assert res.returncode == 0, res.stderr
+    surviving = {p.name for p in tmp_path.iterdir()}
+    assert "scout.db.bak.manual-preupgrade" in surviving
+    assert _ts(0) in surviving
+    assert "scout.db.bak-legacy-format" in surviving
+    assert "scout.db.bak.ancient-manual" not in surviving
+    assert "found=4" in res.stdout, res.stdout
 
 
 def test_heartbeat_written_on_success(tmp_path):
