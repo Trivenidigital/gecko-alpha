@@ -97,13 +97,34 @@ For scale: lifetime system loss is ≈ **−$11,396**. The best variant recovers
 
 ## Caveats that must be closed before implementation
 
-1. **The checkpoint is not reliably written.** 256 of 2,122 closed trades (12%)
-   have no 6h reading — *including trades held an average of 26.1 hours*, which
-   is far past 6h. The write is `if cp_6h is None and elapsed >= 6h` inside the
-   evaluator loop, after the stale-price/no-price guards, so a tick that skips on
-   price unavailability never records it. Any cut rule must treat "no reading" as
-   an explicit third state, not as "not negative". Those 256 trades are
-   themselves net **−$781**.
+1. ~~**The checkpoint is not reliably written.** 256 of 2,122 closed trades
+   (12%) have no 6h reading.~~ **RETRACTED 2026-08-07 —
+   `NO_6H_CHECKPOINT_WRITE_DEFECT`.**
+
+   That 12% divided by **all** closed trades, counting rows for which `NULL` is
+   the *correct* value: a trade closing before the 6h landmark never had a 6h
+   observation to record. On the eligible population:
+
+   ```
+   survived to >=6h                    1,940
+   measured                            1,904  (98.1%)
+   no valid at-or-after-6h observation     36  ( 1.9%)
+   ```
+
+   The 36 are **entirely** stale/no-price exits — `expired_stale_price` 22,
+   `expired_stale_no_price` 14. What is provable is narrower than "no price
+   existed anywhere": *the evaluator never obtained an acceptable fresh
+   observation at or after the landmark before those trades closed.* Writing a
+   checkpoint from a stale or absent price would violate the column's provenance
+   contract — replacing missing data with false data in exactly the population
+   where it is least trustworthy. `NULL` is the correct value for all 36.
+
+   **The caveat that survives:** the residual 1.9% is **not random**
+   missingness. Any cut rule must still treat "no reading" as an explicit third
+   state, not as "not negative", and any analysis on this column should state:
+   *analysis covers trades with a valid fresh observation at/after 6h; the
+   excluded 1.9% consists entirely of stale/no-price trajectories and may
+   represent a systematically worse population.*
 2. **"6h" is really "first evaluator tick at or after 6h."** Causally valid (no
    lookahead) but the drift is bounded by evaluator cadence, which I could not
    establish from config. Unmeasured.
@@ -120,9 +141,11 @@ thin, in-sample, and it discards a third of its targets as false positives.
 
 Instead, in order:
 
-1. **Fix the checkpoint write** (caveat 1). A 12% miss rate on the column any
-   such rule depends on is a defect independent of whether the rule ships, and it
-   silently biases every analysis built on it.
+1. ~~**Fix the checkpoint write** (caveat 1).~~ **Withdrawn 2026-08-07** — there
+   is no writer defect to fix (see caveat 1). Coverage on the eligible
+   population is 98.1%, and the residual 1.9% is correct `NULL`. What remains is
+   an *analysis* obligation, not an implementation one: exclude the stale/no-price
+   population explicitly and state that it is non-random, rather than imputing it.
 2. **Let the `gainers_early` run produce out-of-sample data.** It is already
    running, free, and now serves a sharper purpose than stop width: it will show
    whether the 6h relationship holds forward. It is no longer the critical path,
