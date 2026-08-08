@@ -488,7 +488,7 @@ yields ~98 profitable trades — enough to estimate `D(X)`, the damage-incidence
 rate of §7.6, to about ±10pp at 95%. `n_eff = 100` gives roughly ±15pp.
 
 **Minimum for a verdict: `n_eff ≥ 120`** (~59 winners, ~±13pp). Below that,
-§7.6 returns **no verdict** — record the incidence table as descriptive and stop.
+§7.6 returns **`NO_VERDICT`** — record the incidence table as descriptive and stop.
 Pre-registering this floor matters because the entry cap makes `n_eff` an upper
 bound rather than something reachable by waiting longer: **if `n_eff` is short,
 more calendar time cannot fix it**, unlike a closes-based gate.
@@ -561,30 +561,90 @@ candidate threshold would have been crossed while the initial stop was eligible,
 separately for trades that ended profitable and unprofitable. It does not answer
 *how much* P&L a tighter stop would have produced.
 
+> ### ⚠️ CORRECTION 2026-08-08 — `C(X)` was a pseudo-discriminator
+>
+> A previous revision made REVISE depend on `C(X)`, the share of `closed_sl`
+> trades crossing each candidate threshold, and required the rule to hold at all
+> three of −10/−12/−15%. **`C(X)` cannot discriminate anything, and the
+> three-threshold requirement collapses.**
+>
+> `closed_sl` fires only when `not floor_armed and current_price <= sl_price`,
+> and `sl_pct` is **25**. `pre_leg1_mae_pct` tracks the low-water mark over
+> exactly that same pre-floor window, and #516 updates it *before* the SL branch
+> on the same tick — so at the moment a trade closes at stop, its recorded
+> trough already includes the stop-crossing price. Therefore, for every properly
+> instrumented `closed_sl` row:
+>
+> ```
+> pre_leg1_mae_pct ≤ −25%   ⟹   C(−10) = C(−12) = C(−15) = 100%
+> ```
+>
+> And `D` is nested by construction — crossing −15% implies crossing −12% and
+> −10% — so `D(−10) ≥ D(−12) ≥ D(−15)`. If `D(−10) ≤ 15%` the looser caps pass
+> automatically, and with `C = 100%` both `C − D ≥ 20 pp` and `C ≥ 2 × D` pass
+> automatically too.
+>
+> The elaborate rule was therefore **already** just `D(−10) ≤ 15%`, dressed up as
+> four conditions across three thresholds. Stating it plainly is strictly more
+> honest and removes a gate that could never fail.
+
 Computed on the eligible cohort (§7.1) only. For each candidate stop
 `X ∈ {−10%, −12%, −15%}`:
 
 - **D(X)** = share of *profitable* eligible trades with `pre_leg1_mae_pct ≤ X`
   — the damage-incidence rate: winners a stop at X would have cut short.
+  **This is the only discriminating quantity the pilot produces.**
 - **C(X)** = share of *`closed_sl`* eligible trades with `pre_leg1_mae_pct ≤ X`
-  — the capture-incidence rate: losers a stop at X would have caught earlier.
+  — **repurposed as a measurement sanity check, not a decision input.**
 
-| Outcome | Condition | Verdict |
-|---|---|---|
-| **REVISE** | `D(X) ≤ 15%` **and** `C(X) − D(X) ≥ 20 pp` **and** `C(X) ≥ 2 × D(X)`, at **all three** of −10/−12/−15% | **authorize a separate, bounded stop-width experiment** — with a pre-registered fill model — as its own proposal and approval. **Not** "the geometry is proven better." |
-| **KEEP** | `D(X) > 15%` at any candidate, or the `C(X)` vs `D(X)` ordering flips across candidates | leave geometry unchanged; record the incidence table; signal stays disabled |
-| **RE-SUSPEND** | `R_pilot ≤ −2.00%` (definition below) | signal stays disabled; write the result up as a retirement argument |
+### C(X) as a sanity check
 
-**Every number above is fixed now, before activation.** "Materially exceeds" and
-"size-normalised" were undefined in the previous revision, which left the
-criterion selectable after seeing the data — the precise failure pre-registration
-exists to prevent.
+`C(X)` is expected to be **100% at all three thresholds**. It is a check on the
+pilot's own assumptions, and it is valuable precisely because its expected value
+is known in advance:
 
-- **`C(X) − D(X) ≥ 20 pp` and `C(X) ≥ 2 × D(X)` together.** The absolute gap
-  alone passes on large, similar rates (70% vs 50%); the ratio alone passes on
-  tiny ones (2% vs 1%). Both must hold.
-- **All three thresholds.** A result at one only is a threshold artifact.
-- **`D(X) ≤ 15%`** caps acceptable winner damage regardless of capture.
+| Observed | Meaning |
+|---|---|
+| `C(X) = 100%` at all three | instrumentation, cohort and geometry all behaving as modelled |
+| `C(X)` materially below 100% | **at least one modelling assumption is false** — the SL geometry changed mid-pilot, the eligible cohort admitted rows it should not have (§7.1), or `pre_leg1_mae_pct` is not tracking the window it claims to |
+
+**If `C(X) < 95%` at any threshold, the pilot returns `NO_VERDICT`.** Report the
+incidence table descriptively and investigate the assumption breach; do not read
+`D(X)` as meaningful, because whatever broke `C` plausibly broke `D` too.
+
+### Verdict, with explicit precedence
+
+Evaluated in this order. Precedence is required because a cohort can satisfy
+RE-SUSPEND *and* REVISE simultaneously — poor realized return with low winner
+damage is an entirely reachable combination, and without an ordering the verdict
+would depend on which row of a table someone read first.
+
+```
+if C(-10) < 95% or C(-12) < 95% or C(-15) < 95%:
+    NO_VERDICT      # assumption breach — see the sanity-check table
+elif n_eff < 120:
+    NO_VERDICT      # under-powered (§7.3)
+elif R_pilot <= -2.00%:
+    RE-SUSPEND      # the signal's own economics fail, independent of stop width
+elif D(-10) <= 15%:
+    REVISE          # authorize a separate stop-width experiment
+else:
+    KEEP
+```
+
+| Outcome | Meaning |
+|---|---|
+| **NO_VERDICT** | sanity check failed or under-powered; record descriptively, change nothing |
+| **RE-SUSPEND** | `R_pilot ≤ −2.00%`; signal stays disabled, write up as a retirement argument |
+| **REVISE** | `D(−10) ≤ 15%`; **authorize a separate, bounded stop-width experiment** with a pre-registered fill model, as its own proposal and approval. **Not** "the geometry is proven better." |
+| **KEEP** | `D(−10) > 15%`; leave geometry unchanged, record the incidence table, signal stays disabled |
+
+**RE-SUSPEND outranks REVISE deliberately.** If the signal's own realized return
+is materially negative, tuning its stop is the wrong conversation — the question
+becomes whether to run it at all.
+
+`D(−12)` and `D(−15)` are still **reported**, because the shape of the nesting is
+informative for designing the follow-on experiment. They are not gates.
 
 **Size-normalisation, stated as a formula.** Compare mean *percentage* return per
 trade, never USD — the pilot runs at $150 and the historical cohort at $300, so
@@ -707,5 +767,8 @@ changed.
 | R3-3 | Remove remaining "net-beneficial" claim | §7.6 verdict wording; "can/cannot" list |
 | R3-4 | Quantify "materially exceeds" | §7.6 — `C−D ≥ 20pp` **and** `C ≥ 2×D`, all three thresholds |
 | R3-5 | Define size-normalisation formula | §7.6 — `R_pilot = mean(pnl_pct)`, absolute gate ≤ −2.00% |
+| R4-1 | Cap guarantee scoped to one admission writer | §7.2 concurrency block; K6 |
+| R4-2 | `C(X)` is structurally 100% — not a discriminator | §7.6 correction; repurposed as a sanity check with a `NO_VERDICT` floor |
+| R4-3 | Define verdict precedence | §7.6 — explicit ordered branch; RE-SUSPEND outranks REVISE |
 | 6 | Reclassify §5 per #455 | §5 reclassification block |
 | 7 | No production revival | §9 anti-scope; approvals log above |
