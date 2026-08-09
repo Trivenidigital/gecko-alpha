@@ -27,7 +27,9 @@ SAFETY POSTURE.
     migration machinery is precisely the failure class removed in PR #520:
     the Solana cron watchdog ran ~40 migrations against a live 6.8 GB database
     every two minutes and produced 74 `database is locked` failures.
-  - Mutates nothing. It does not flip `enabled`, geometry, or sizing. At
+  - Does not mutate the production DB or signal state. It does not flip
+    `enabled`, geometry, or sizing. It DOES write dedup marker files under
+    `--state-dir` after a successful send — that is its only write. At
     admission close it PAGES that the §7.5 rollback is due; it does not perform
     it. Removing the memory dependency is a smaller change than introducing an
     autonomous mutating supervisor into a frozen experiment.
@@ -44,7 +46,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -65,6 +67,20 @@ def _configure_logging() -> None:
     configuring structlog at import time is a process-wide mutation that would
     silently empty other tests' captured logs."""
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=sys.stderr))
+
+
+def _parse_iso(raw: str | None) -> datetime | None:
+    """Parse a stored isoformat timestamp; None when unparseable/absent."""
+    if not raw:
+        return None
+    txt = raw.strip()
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _is_enabled(value: str) -> bool:
@@ -179,36 +195,53 @@ async def _cohort_state(conn: aiosqlite.Connection, t0: str) -> dict:
     }
 
 
-async def _entry_rate_days(conn: aiosqlite.Connection, t0: str, days: int) -> list[int]:
-    """Entries per day for the last *days* whole days — K4's observable.
+async def _entry_rate_days(
+    conn: aiosqlite.Connection, t0: str, days: int
+) -> list[int] | None:
+    """Entries per COMPLETE UTC calendar day for the last *days* days.
 
-    The cutoff is bound as a PARAMETER via `sql_utc_cutoff()`, never composed
-    inline from SQLite's now-function with a relative modifier.
+    *** ZERO DAYS MUST APPEAR AS ZEROS. ***
 
-    Why: `opened_at` stores Python `.isoformat()` output, which separates date
-    and time with a capital T. SQLite's own now-expression yields a
-    space-separated string instead. Comparing the two is a STRING comparison in
-    which that T (0x54) sorts after a space (0x20), so same-day rows land on the
-    wrong side of the boundary and the K4 entry rate silently mis-windows.
-    `sql_utc_cutoff()` emits an ISO string in the stored shape, so both sides
-    share one format.
+    A GROUP BY returns only dates that HAVE rows, so a true sequence of
+    2, 1, 0, 2, 1 comes back as four buckets. K4 requires `days` values all
+    below the threshold, so the missing zero made the criterion LESS likely to
+    fire on the very day it should have fired hardest — backwards. The buckets
+    are therefore pre-seeded to 0 and filled from the query.
 
-    Caught by `tests/test_datetime_predicate_lint.py` (INF-04), not by me. The
-    banned shape is deliberately PARAPHRASED above rather than quoted — that
-    lint greps source text, so spelling the pattern out in prose re-trips it.
+    Temporal definition, pinned rather than left implicit: the window is the
+    last *days* COMPLETE UTC calendar days, excluding today. Today is partial,
+    and counting it would let a normal morning look like a collapsed day. The
+    frozen rule reads "< 3/day for 5 consecutive days"; complete days are the
+    only reading under which each value is comparable to the others.
+
+    Returns None when the pilot is younger than the window — the five-day
+    window does not exist yet, so K4 is inapplicable rather than satisfied.
+    That is an APPLICABILITY condition (the data does not span the window), not
+    a minimum-sample grace period of the kind removed from K3.
     """
-    from scout.timeutil import sql_utc_cutoff
+    t0_dt = _parse_iso(t0)
+    if t0_dt is None:
+        return None
+    today = datetime.now(timezone.utc).date()
+    window = [today - timedelta(days=n) for n in range(days, 0, -1)]
+    if t0_dt.date() > window[0]:
+        return None
 
+    lo, hi = window[0].isoformat(), (window[-1] + timedelta(days=1)).isoformat()
     cur = await conn.execute(
         "SELECT substr(opened_at, 1, 10) d, COUNT(*) FROM paper_trades "
-        "WHERE signal_type = ? AND opened_at >= ? AND opened_at >= ? "
-        "GROUP BY d ORDER BY d",
-        (PILOT_SIGNAL, t0, sql_utc_cutoff(days=days)),
+        "WHERE signal_type = ? AND opened_at >= ? "
+        "AND substr(opened_at, 1, 10) >= ? AND substr(opened_at, 1, 10) < ? "
+        "GROUP BY d",
+        (PILOT_SIGNAL, t0, lo, hi),
     )
-    return [int(r[1]) for r in await cur.fetchall()]
+    counts = {r[0]: int(r[1]) for r in await cur.fetchall()}
+    return [counts.get(d.isoformat(), 0) for d in window]
 
 
-async def _gainers_instrumentation_count(conn: aiosqlite.Connection) -> int:
+async def _gainers_instrumentation_count(
+    conn: aiosqlite.Connection,
+) -> tuple[int, str | None]:
     """Closed gainers rows with FULLY-OBSERVED whole-life MAE.
 
     Anchored on the MAE migration's own `cutover_ts`, not a hand-written date.
@@ -222,13 +255,18 @@ async def _gainers_instrumentation_count(conn: aiosqlite.Connection) -> int:
     )
     row = await cur.fetchone()
     if row is None or not row[0]:
-        return 0
+        return 0, None
+    cutover = row[0]
     cur = await conn.execute(
         "SELECT COUNT(*) FROM paper_trades WHERE signal_type = ? "
         "AND status LIKE 'closed%' AND mae_pct IS NOT NULL AND opened_at >= ?",
-        (GAINERS_SIGNAL, row[0]),
+        (GAINERS_SIGNAL, cutover),
     )
-    return int((await cur.fetchone())[0] or 0)
+    # The cutover is ALSO the gainers run's dedup anchor. Keying its alert to
+    # the losers PILOT_T0 would let a future losers revival re-page an already
+    # completed gainers gate, while a genuinely new gainers instrumentation run
+    # could never re-arm its own trigger.
+    return int((await cur.fetchone())[0] or 0), cutover
 
 
 # ----------------------------------------------------------------------
@@ -241,7 +279,7 @@ def evaluate_triggers(
     t0: str | None,
     enabled: int,
     cohort: dict,
-    entry_rate: list[int],
+    entry_rate: list[int] | None,
     writers: int | None,
     gainers_n: int,
     max_entries: int,
@@ -285,7 +323,15 @@ def evaluate_triggers(
             }
         )
 
-    if cohort["closed"] >= 20:
+    # NO minimum-sample floor. An earlier revision only evaluated K3 once 20
+    # trades had closed — an unauthorized weakening of a FROZEN kill criterion.
+    # The registered rule is "NULL rate > 5% on new eligible closes → halt",
+    # full stop. A first post-T0 close carrying NULL IS an instrumentation
+    # failure worth surfacing; under the floor it could stay silent for another
+    # 19 closes, which is exactly the window in which the pilot's only
+    # deliverable quietly stops being produced. Amending K3 is an operator
+    # decision about the pilot, not something this observer may redefine.
+    if cohort["closed"] > 0:
         null_pct = 100.0 * (cohort["closed"] - cohort["n_eff"]) / cohort["closed"]
         if null_pct > k3_null_pct:
             fired.append(
@@ -297,10 +343,12 @@ def evaluate_triggers(
                 }
             )
 
+    # `entry_rate is None` = window does not exist yet (pilot younger than it).
     if (
         not admissions_closed
-        and len(entry_rate) >= k4_days
-        and all(d < k4_min_per_day for d in entry_rate[-k4_days:])
+        and entry_rate is not None
+        and len(entry_rate) == k4_days
+        and all(d < k4_min_per_day for d in entry_rate)
     ):
         fired.append(
             {
@@ -426,18 +474,45 @@ def _compose(fired: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _send(text: str) -> None:
+async def _send_via_alerter(text: str) -> None:
+    """Real plain-text Telegram send. Lazy heavy imports (aiohttp + alerter).
+
+    `raise_on_failure=True` is LOAD-BEARING (§12b). The default alerter SWALLOWS
+    non-200 and network errors — it logs a warning and returns. Without the flag
+    the `_alert_delivered` log below would fire even when Telegram rejected the
+    page, and worse, `main()` would then write dedup state marking an
+    UNDELIVERED alert as delivered — permanently suppressing that trigger for
+    the life of the pilot. A watchdog that silently loses its own page is worse
+    than no watchdog.
+
+    `parse_mode=None`: trigger names carry underscores (`K5_concurrency_tripwire`)
+    which MarkdownV1 renders as italics, mangling the body while Telegram still
+    returns HTTP 200.
+    """
+    import aiohttp
+
     from scout.alerter import send_telegram_message
     from scout.config import Settings
 
     settings = Settings()
+    async with aiohttp.ClientSession() as session:
+        await send_telegram_message(
+            text,
+            session,
+            settings,
+            parse_mode=None,
+            raise_on_failure=True,
+            source="pilot_threshold_watchdog",
+        )
+
+
+# Indirection point so tests can exercise the dispatch seam without network.
+_SEND = _send_via_alerter
+
+
+async def _send(text: str) -> None:
     _log.info("pilot_watchdog_alert_dispatched", chars=len(text))
-    await send_telegram_message(
-        settings.TELEGRAM_BOT_TOKEN,
-        settings.TELEGRAM_CHAT_ID,
-        text,
-        parse_mode=None,
-    )
+    await _SEND(text)
     _log.info("pilot_watchdog_alert_delivered")
 
 
@@ -449,8 +524,8 @@ async def _evaluate(db_path: str, args) -> dict:
             if t0
             else {"entries": 0, "open": 0, "closed": 0, "n_eff": 0, "net_usd": 0.0}
         )
-        rate = await _entry_rate_days(conn, t0, args.k4_days) if t0 else []
-        gainers_n = await _gainers_instrumentation_count(conn)
+        rate = await _entry_rate_days(conn, t0, args.k4_days) if t0 else None
+        gainers_n, gainers_anchor = await _gainers_instrumentation_count(conn)
 
     procs = _read_process_table()
     writers = count_admission_writers(procs, self_pid=0) if procs else None
@@ -477,6 +552,7 @@ async def _evaluate(db_path: str, args) -> dict:
         "cohort": cohort,
         "writers": writers,
         "gainers_n": gainers_n,
+        "gainers_anchor": gainers_anchor,
         "fired": fired,
     }
 
@@ -514,8 +590,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     fired = result["fired"]
-    anchor = result["pilot_t0"] or "no-pilot"
-    to_send = [f for f in fired if not _already_fired(args.state_dir, _state_key(f["trigger"], anchor))]
+    pilot_anchor = result["pilot_t0"] or "no-pilot"
+    gainers_anchor = result["gainers_anchor"] or "no-gainers-run"
+
+    def _anchor_for(trigger: str) -> str:
+        """Each trigger dedups against ITS OWN run, not a shared timestamp."""
+        return gainers_anchor if trigger.startswith("gainers_") else pilot_anchor
+
+    to_send = [
+        f
+        for f in fired
+        if not _already_fired(args.state_dir, _state_key(f["trigger"], _anchor_for(f["trigger"])))
+    ]
 
     result["suppressed"] = len(fired) - len(to_send)
     if to_send and not args.dry_run:
@@ -528,7 +614,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         now = datetime.now(timezone.utc)
         for f in to_send:
-            _mark_fired(args.state_dir, _state_key(f["trigger"], anchor), now)
+            _mark_fired(
+                args.state_dir, _state_key(f["trigger"], _anchor_for(f["trigger"])), now
+            )
 
     result["ok"] = True
     result["dispatched"] = len(to_send) if not args.dry_run else 0

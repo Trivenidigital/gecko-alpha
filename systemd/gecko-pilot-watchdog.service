@@ -13,8 +13,19 @@ Environment=GECKO_PILOT_WATCHDOG_ENABLED=false
 # cron watchdog ran ~40 migrations against a live 6.8 GB database every two
 # minutes and produced 74 `database is locked` failures.
 #
-# Deploy-without-activate: ships disabled. Activation is a single .env / unit
-# override flip, so the code can land and be verified before it can page.
+# Deploy-without-activate: ships DISABLED.
+#
+# Activation mechanism, stated exactly because the obvious guess is wrong: the
+# enable flag is a CLI ARGUMENT sourced from the Environment= line in THIS UNIT.
+# Editing the project's .env does NOT reach it — systemd never reads that file
+# here. Activation is therefore one of:
+#     systemctl edit gecko-pilot-watchdog.service     # drop-in override
+#         [Service]
+#         Environment=GECKO_PILOT_WATCHDOG_ENABLED=true
+#   or an explicit EnvironmentFile= wired in at deploy time.
+# Followed by `systemctl daemon-reload`. Verify with
+# `systemctl show gecko-pilot-watchdog.service -p Environment`, not by reading
+# this file — the effective value is what pages.
 ExecStart=/root/.local/bin/uv run python scripts/pilot_threshold_watchdog.py \
     --db /root/gecko-alpha/scout.db \
     --enabled ${GECKO_PILOT_WATCHDOG_ENABLED} \

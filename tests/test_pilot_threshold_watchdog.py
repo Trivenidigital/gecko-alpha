@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -200,10 +201,31 @@ class TestKillConditions:
                     "net_usd": -10.0}
         )
 
-    def test_K3_needs_a_sample_before_judging(self):
-        """1 of 2 NULL is 50% but proves nothing; don't page on n=2."""
-        assert "K3_instrumentation_broken" not in _eval(
+    def test_K3_fires_on_the_FIRST_null_close(self):
+        """*** NO MINIMUM-SAMPLE FLOOR. ***
+
+        An earlier revision of this watchdog only evaluated K3 once 20 trades
+        had closed. That silently weakened a FROZEN kill criterion: the
+        registered rule is "NULL rate > 5% on new eligible closes → halt", with
+        no sample floor. A single post-T0 close carrying NULL IS an
+        instrumentation failure, and under the floor it could stay silent for
+        another 19 closes — exactly the window in which the pilot's only
+        deliverable stops being produced.
+
+        This test previously asserted the floor. It was wrong, and a green
+        suite around it made an unauthorized amendment look sanctioned.
+        """
+        assert "K3_instrumentation_broken" in _eval(
+            cohort={"entries": 1, "open": 0, "closed": 1, "n_eff": 0, "net_usd": 0.0}
+        )
+        assert "K3_instrumentation_broken" in _eval(
             cohort={"entries": 2, "open": 0, "closed": 2, "n_eff": 1, "net_usd": 0.0}
+        )
+
+    def test_K3_silent_when_every_close_is_instrumented(self):
+        """Discriminating control: 0% NULL must NOT fire."""
+        assert "K3_instrumentation_broken" not in _eval(
+            cohort={"entries": 30, "open": 0, "closed": 30, "n_eff": 30, "net_usd": 0.0}
         )
 
     def test_K4_needs_all_days_below_threshold(self):
@@ -328,3 +350,296 @@ class TestDedup:
         assert not wd._already_fired(str(tmp_path), k)
         wd._mark_fired(str(tmp_path), k, datetime.now(timezone.utc))
         assert wd._already_fired(str(tmp_path), k)
+
+
+# ======================================================================
+# Re-review proofs — each covers a defect the previous green suite missed
+# ======================================================================
+
+
+def _seed_db(
+    path,
+    *,
+    entries,
+    open_n,
+    closed_n,
+    eligible,
+    t0="2026-08-08T17:17:39+00:00",
+    gainers=0,
+):
+    """Minimal schema the watchdog reads.
+
+    Deliberately NOT built via `Database.initialize()` — the observer must work
+    against the real column shape without the migration machinery it is
+    forbidden to touch.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE paper_trades (id INTEGER PRIMARY KEY, token_id TEXT, "
+        "signal_type TEXT, status TEXT, opened_at TEXT, pnl_usd REAL, "
+        "pre_leg1_mae_pct REAL, mae_pct REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE signal_params (signal_type TEXT PRIMARY KEY, "
+        "enabled INTEGER, drawdown_baseline_at TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE paper_migrations (name TEXT PRIMARY KEY, cutover_ts TEXT)"
+    )
+    conn.execute("INSERT INTO signal_params VALUES ('losers_contrarian', 1, ?)", (t0,))
+    conn.execute(
+        "INSERT INTO paper_migrations VALUES ('bl_trade_adverse_excursion_v1', ?)",
+        ("2026-08-03T22:05:50+00:00",),
+    )
+    opened = "2026-08-08T18:00:00+00:00"
+    for i in range(entries):
+        closed = i < closed_n
+        conn.execute(
+            "INSERT INTO paper_trades (token_id, signal_type, status, opened_at, "
+            "pnl_usd, pre_leg1_mae_pct, mae_pct) VALUES (?,?,?,?,?,?,?)",
+            (
+                "tok%d" % i,
+                "losers_contrarian",
+                "closed_sl" if closed else "open",
+                opened,
+                0.0,
+                -1.0 if (closed and i < eligible) else None,
+                None,
+            ),
+        )
+    for i in range(gainers):
+        conn.execute(
+            "INSERT INTO paper_trades (token_id, signal_type, status, opened_at, "
+            "pnl_usd, pre_leg1_mae_pct, mae_pct) VALUES (?,?,?,?,?,?,?)",
+            (
+                "g%d" % i,
+                "gainers_early",
+                "closed_sl",
+                "2026-08-05T00:00:00+00:00",
+                0.0,
+                None,
+                -5.0,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestDeliveryPath:
+    """*** THE ALERT PATH WAS NEVER EXECUTED BY ANY TEST. ***
+
+    The first revision called
+    ``send_telegram_message(bot_token, chat_id, text, parse_mode=None)``.
+    The real contract is ``(text, session, settings, *, parse_mode,
+    raise_on_failure, source)``. The first fired trigger would have raised
+    TypeError before reaching the network — and the live production dry-run
+    could not catch it, because ``fired=[]`` meant ``_send()`` never ran.
+    """
+
+    def test_it_matches_the_CURRENT_alerter_signature(self):
+        import inspect
+
+        from scout.alerter import send_telegram_message
+
+        params = list(inspect.signature(send_telegram_message).parameters)
+        assert params[:3] == ["text", "session", "settings"], (
+            "alerter contract changed: %s" % params
+        )
+        for kw in ("parse_mode", "raise_on_failure", "source"):
+            assert kw in params, "missing %s" % kw
+
+    def test_raise_on_failure_is_set(self):
+        """Load-bearing: the default alerter SWALLOWS non-200/network errors.
+
+        Without the flag a rejected page is logged as delivered AND its dedup
+        marker is written — permanently suppressing that trigger for the life of
+        the pilot.
+        """
+        import ast
+
+        src = (REPO_ROOT / "scripts" / "pilot_threshold_watchdog.py").read_text("utf-8")
+        tree = ast.parse(src)
+
+        # Asserted on the CALL NODE, not the source text. The docstring right
+        # above the call explains why this flag is load-bearing, so a substring
+        # grep matches the PROSE and passes even when the argument is deleted —
+        # verified by mutation: removing the keyword left a text-based guard
+        # green. Sixth self-referential-grep trip in this workstream.
+        call = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "send_telegram_message"
+            ):
+                call = node
+                break
+        assert call is not None, "no send_telegram_message call found"
+
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "raise_on_failure" in kw and kw["raise_on_failure"].value is True, (
+            "raise_on_failure=True missing — a rejected page would be logged as "
+            "delivered AND its dedup marker written, suppressing the trigger "
+            "for the life of the pilot"
+        )
+        assert "parse_mode" in kw and kw["parse_mode"].value is None, (
+            "parse_mode must be None; trigger names carry underscores"
+        )
+        assert "source" in kw, "source label missing"
+        # Positional contract: (text, session, settings)
+        assert len(call.args) == 3, (
+            "expected 3 positional args (text, session, settings), got %d"
+            % len(call.args)
+        )
+
+    def test_send_failure_leaves_NO_dedup_state(self, tmp_path, monkeypatch):
+        """*** THE SILENT-SUPPRESSION BUG. ***
+
+        If a failed send still wrote dedup state, the trigger would never page
+        again for this pilot — the watchdog would go dark on exactly the
+        condition it exists to report.
+        """
+        db = tmp_path / "s.db"
+        _seed_db(db, entries=201, open_n=1, closed_n=200, eligible=200)
+
+        async def _boom(_text):
+            raise RuntimeError("telegram rejected")
+
+        monkeypatch.setattr(wd, "_SEND", _boom)
+        state = tmp_path / "state"
+        rc = wd.main(["--db", str(db), "--enabled", "true", "--state-dir", str(state)])
+        assert rc == 1, "a dispatch failure must exit non-zero"
+        assert not list(state.glob("fired_*")), (
+            "dedup state written despite a FAILED send — the trigger would be "
+            "permanently suppressed"
+        )
+
+    def test_successful_send_writes_dedup_and_suppresses_the_repeat(
+        self, tmp_path, monkeypatch
+    ):
+        db = tmp_path / "s.db"
+        _seed_db(db, entries=201, open_n=1, closed_n=200, eligible=200)
+        sent = []
+
+        async def _ok(text):
+            sent.append(text)
+
+        monkeypatch.setattr(wd, "_SEND", _ok)
+        state = tmp_path / "state"
+        args = ["--db", str(db), "--enabled", "true", "--state-dir", str(state)]
+
+        assert wd.main(args) == 5
+        assert len(sent) == 1
+        assert list(state.glob("fired_*")), "successful send must record dedup state"
+
+        assert wd.main(args) == 5  # still detected...
+        assert len(sent) == 1, "...but must NOT page twice for the same pilot"
+
+
+class TestK4RealDatabase:
+    """*** ZERO DAYS MUST SURVIVE THE SQL. ***
+
+    A GROUP BY returns only dates that HAVE rows. Feeding ``[1,2,0,1,2]`` to the
+    pure evaluator proves nothing about whether the reader can PRODUCE that 0 —
+    and it could not: the missing bucket made K4 LESS likely to fire on the day
+    it should fire hardest.
+    """
+
+    async def test_a_day_with_no_entries_reads_as_zero(self, tmp_path):
+        import aiosqlite
+
+        db = tmp_path / "k4.db"
+        today = datetime.now(timezone.utc).date()
+        t0 = (today - timedelta(days=10)).isoformat() + "T00:00:00+00:00"
+        _seed_db(db, entries=0, open_n=0, closed_n=0, eligible=0, t0=t0)
+
+        conn = sqlite3.connect(db)
+        for n, count in ((5, 2), (4, 1), (3, 0), (2, 2), (1, 1)):
+            d = today - timedelta(days=n)
+            for i in range(count):
+                conn.execute(
+                    "INSERT INTO paper_trades (token_id, signal_type, status, "
+                    "opened_at, pnl_usd, pre_leg1_mae_pct, mae_pct) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        "t%d-%d" % (n, i),
+                        "losers_contrarian",
+                        "open",
+                        "%sT12:00:00+00:00" % d.isoformat(),
+                        0.0,
+                        None,
+                        None,
+                    ),
+                )
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect("file:%s?mode=ro" % db, uri=True) as c:
+            rate = await wd._entry_rate_days(c, t0, 5)
+
+        assert rate == [2, 1, 0, 2, 1], (
+            "expected the empty day to read as 0, got %s" % rate
+        )
+
+    async def test_a_pilot_younger_than_the_window_is_inapplicable(self, tmp_path):
+        """None (window does not exist) — NOT an empty list, which would
+        silently satisfy ``all()`` and fire K4 on a brand-new pilot."""
+        import aiosqlite
+
+        db = tmp_path / "young.db"
+        t0 = datetime.now(timezone.utc).isoformat()
+        _seed_db(db, entries=0, open_n=0, closed_n=0, eligible=0, t0=t0)
+        async with aiosqlite.connect("file:%s?mode=ro" % db, uri=True) as c:
+            assert await wd._entry_rate_days(c, t0, 5) is None
+
+    def test_none_or_short_rate_never_fires_K4(self):
+        assert "K4_entry_rate_collapsed" not in _eval(entry_rate=None)
+        assert "K4_entry_rate_collapsed" not in _eval(entry_rate=[1, 2])
+
+
+class TestGainersDedupAnchor:
+    """Gainers dedups against ITS OWN run, not the losers revival timestamp."""
+
+    def test_gainers_key_differs_by_run(self):
+        a = wd._state_key("gainers_instrumentation_gate", "2026-08-03T22:05:50+00:00")
+        b = wd._state_key("gainers_instrumentation_gate", "2026-08-08T17:17:39+00:00")
+        assert a != b
+
+    def test_a_new_losers_pilot_does_not_repage_a_done_gainers_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """*** THE CROSS-RUN LEAK. ***
+
+        Keying every trigger to the losers PILOT_T0 meant a future losers
+        revival re-armed — and therefore re-paged — an already-completed
+        gainers gate, while a genuinely new gainers run could never re-arm.
+        """
+        db = tmp_path / "g.db"
+        _seed_db(db, entries=0, open_n=0, closed_n=0, eligible=0, gainers=100)
+        sent = []
+
+        async def _ok(text):
+            sent.append(text)
+
+        monkeypatch.setattr(wd, "_SEND", _ok)
+        state = tmp_path / "state"
+        args = ["--db", str(db), "--enabled", "true", "--state-dir", str(state)]
+
+        wd.main(args)
+        assert any("gainers_instrumentation_gate" in t for t in sent)
+        before = len(sent)
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE signal_params SET drawdown_baseline_at = ? "
+            "WHERE signal_type = 'losers_contrarian'",
+            ("2026-12-25T00:00:00+00:00",),
+        )
+        conn.commit()
+        conn.close()
+
+        wd.main(args)
+        assert len(sent) == before, (
+            "a new losers pilot re-paged a completed gainers gate — the gainers "
+            "trigger must dedup against the MAE cutover, not the losers anchor"
+        )
