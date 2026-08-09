@@ -9,8 +9,9 @@ Both are tested directly.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -366,6 +367,8 @@ def _seed_db(
     eligible,
     t0="2026-08-08T17:17:39+00:00",
     gainers=0,
+    enabled=1,
+    pnl_each=0.0,
 ):
     """Minimal schema the watchdog reads.
 
@@ -386,7 +389,9 @@ def _seed_db(
     conn.execute(
         "CREATE TABLE paper_migrations (name TEXT PRIMARY KEY, cutover_ts TEXT)"
     )
-    conn.execute("INSERT INTO signal_params VALUES ('losers_contrarian', 1, ?)", (t0,))
+    conn.execute(
+        "INSERT INTO signal_params VALUES ('losers_contrarian', ?, ?)", (enabled, t0)
+    )
     conn.execute(
         "INSERT INTO paper_migrations VALUES ('bl_trade_adverse_excursion_v1', ?)",
         ("2026-08-03T22:05:50+00:00",),
@@ -402,7 +407,7 @@ def _seed_db(
                 "losers_contrarian",
                 "closed_sl" if closed else "open",
                 opened,
-                0.0,
+                pnl_each if closed else 0.0,
                 -1.0 if (closed and i < eligible) else None,
                 None,
             ),
@@ -643,3 +648,183 @@ class TestGainersDedupAnchor:
             "a new losers pilot re-paged a completed gainers gate — the gainers "
             "trigger must dedup against the MAE cutover, not the losers anchor"
         )
+
+
+# ======================================================================
+# Review round 3 — output embargo, K4 partial-day boundary, real seam
+# ======================================================================
+
+
+class TestOutputEmbargo:
+    """*** THE EMBARGO APPLIES TO STDOUT, NOT JUST TO PAGES. ***
+
+    An earlier revision withheld ``n_eff`` from the alert text and then printed
+    the whole evaluation dict — ``n_eff`` AND running ``net_usd`` — every run.
+    An hourly systemd unit would have persisted a mid-cohort P&L series into the
+    journal: durable, greppable, and arriving unprompted. That defeats the
+    pre-registration more thoroughly than one early Telegram page.
+
+    The production dry-run output visibly carried ``n_eff: 0`` and it was read
+    past, which is precisely how an embargo erodes.
+    """
+
+    def _run_json(self, db, state, monkeypatch, capsys):
+        async def _ok(_text):
+            pass
+
+        monkeypatch.setattr(wd, "_SEND", _ok)
+        wd.main(["--db", str(db), "--enabled", "true", "--state-dir", str(state)])
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    def test_mid_pilot_output_hides_n_eff_and_net_usd(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "mid.db"
+        # Mid-cohort: some closed, some open, admissions still running.
+        _seed_db(db, entries=40, open_n=10, closed_n=30, eligible=28)
+        out = self._run_json(db, tmp_path / "st", monkeypatch, capsys)
+
+        cohort = out["cohort"]
+        assert "n_eff" not in cohort, (
+            "n_eff reached stdout mid-cohort — an hourly unit would persist it"
+        )
+        assert "net_usd" not in cohort, "running P&L reached stdout mid-cohort"
+        # Operational state stays visible: that is what the watchdog is FOR.
+        for k in ("entries", "open", "closed"):
+            assert k in cohort, f"operational field {k} must remain public"
+        assert "gainers_n" in out, "gainers count is an operational gate, keep it"
+
+    def test_tail_resolution_may_expose_n_eff(self, tmp_path, monkeypatch, capsys):
+        db = tmp_path / "tail.db"
+        _seed_db(db, entries=200, open_n=0, closed_n=200, eligible=150, enabled=0)
+        out = self._run_json(db, tmp_path / "st", monkeypatch, capsys)
+
+        assert any(f["trigger"] == "pilot_tail_resolved" for f in out["fired"])
+        assert out["cohort"]["n_eff"] == 150, (
+            "at the terminal gate n_eff is the reportable result"
+        )
+
+    def test_K2_may_expose_its_own_threshold_evidence(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """net_usd is K2's evidence — meaningless to page a kill condition
+        while hiding the number that triggered it."""
+        db = tmp_path / "k2.db"
+        _seed_db(db, entries=50, open_n=10, closed_n=40, eligible=40, pnl_each=-20.0)
+        out = self._run_json(db, tmp_path / "st", monkeypatch, capsys)
+
+        assert any(f["trigger"] == "K2_net_loss" for f in out["fired"])
+        assert "net_usd" in out["cohort"]
+
+    def test_projection_is_applied_to_dry_run_too(self, tmp_path, capsys):
+        """A dry-run is exactly when someone inspects output."""
+        db = tmp_path / "dry.db"
+        _seed_db(db, entries=40, open_n=10, closed_n=30, eligible=28)
+        wd.main(["--db", str(db), "--dry-run", "--state-dir", str(tmp_path / "st")])
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert "n_eff" not in out["cohort"]
+        assert "net_usd" not in out["cohort"]
+
+
+class TestK4PartialActivationDay:
+    """*** FOUR FULL DAYS IS NOT FIVE. ***
+
+    PILOT_T0 is 17:17:39Z, so the pilot existed for 6h42m of its first calendar
+    day. Comparing dates alone accepted that partial day as a complete bucket,
+    letting K4 fire on four full days plus one partial one — a rate comparison
+    between incomparable windows.
+    """
+
+    def test_first_full_day_is_the_day_after_a_non_midnight_T0(self):
+        t0 = datetime(2026, 8, 8, 17, 17, 39, tzinfo=timezone.utc)
+        assert wd.first_full_pilot_day(t0) == date(2026, 8, 9)
+
+    def test_a_midnight_T0_is_already_full(self):
+        t0 = datetime(2026, 8, 8, 0, 0, 0, tzinfo=timezone.utc)
+        assert wd.first_full_pilot_day(t0) == date(2026, 8, 8)
+
+    async def test_window_including_the_partial_day_is_inapplicable(self, tmp_path):
+        """now = Aug 13 → window Aug 8..12 includes the partial activation day."""
+        import aiosqlite
+
+        db = tmp_path / "pd.db"
+        t0 = "2026-08-08T17:17:39+00:00"
+        _seed_db(db, entries=0, open_n=0, closed_n=0, eligible=0, t0=t0)
+        async with aiosqlite.connect("file:%s?mode=ro" % db, uri=True) as c:
+            rate = await wd._entry_rate_days(
+                c, t0, 5, now=datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+            )
+        assert rate is None, (
+            "Aug 8 was only ~6h42m of pilot exposure; counting it as a complete "
+            "day means K4 could fire on four full days while claiming five"
+        )
+
+    async def test_first_five_FULL_days_are_applicable(self, tmp_path):
+        """now = Aug 14 → window Aug 9..13, all fully pilot-active."""
+        import aiosqlite
+
+        db = tmp_path / "pd2.db"
+        t0 = "2026-08-08T17:17:39+00:00"
+        _seed_db(db, entries=0, open_n=0, closed_n=0, eligible=0, t0=t0)
+        async with aiosqlite.connect("file:%s?mode=ro" % db, uri=True) as c:
+            rate = await wd._entry_rate_days(
+                c, t0, 5, now=datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+            )
+        assert rate == [0, 0, 0, 0, 0], f"expected five zero-filled buckets, got {rate}"
+
+
+class TestRealAlerterSeam:
+    """*** THE SEAM ITSELF, EXECUTED. ***
+
+    Every earlier guard inspected the call rather than running it. The AST test
+    proves three positional args EXIST — it cannot prove their ORDER, so
+    `send_telegram_message(settings, session, text, ...)` satisfied it while
+    being exactly the original defect. This calls the real wrapper.
+    """
+
+    async def test_wrapper_passes_the_correct_positional_contract(self, monkeypatch):
+        import aiohttp
+
+        import scout.alerter as alerter
+        from scout.config import Settings
+
+        captured = {}
+
+        async def _fake(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        monkeypatch.setattr(alerter, "send_telegram_message", _fake)
+        monkeypatch.setattr(
+            Settings, "__init__", lambda self, **kw: None, raising=False
+        )
+
+        await wd._send_via_alerter("probe")
+
+        args, kwargs = captured["args"], captured["kwargs"]
+        assert args[0] == "probe", f"text must be positional arg 0, got {args[0]!r}"
+        assert isinstance(args[1], aiohttp.ClientSession), (
+            f"session must be positional arg 1, got {type(args[1])}"
+        )
+        assert isinstance(args[2], Settings), (
+            f"settings must be positional arg 2, got {type(args[2])}"
+        )
+        assert kwargs["parse_mode"] is None
+        assert kwargs["raise_on_failure"] is True
+        assert kwargs["source"] == "pilot_threshold_watchdog"
+
+    async def test_wrapper_propagates_a_delivery_failure(self, monkeypatch):
+        """`raise_on_failure=True` is pointless if the wrapper swallows."""
+        import scout.alerter as alerter
+        from scout.config import Settings
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError("telegram rejected")
+
+        monkeypatch.setattr(alerter, "send_telegram_message", _boom)
+        monkeypatch.setattr(
+            Settings, "__init__", lambda self, **kw: None, raising=False
+        )
+
+        with pytest.raises(RuntimeError, match="telegram rejected"):
+            await wd._send_via_alerter("probe")

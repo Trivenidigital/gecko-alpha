@@ -195,8 +195,28 @@ async def _cohort_state(conn: aiosqlite.Connection, t0: str) -> dict:
     }
 
 
+def first_full_pilot_day(t0: datetime):
+    """First UTC calendar day the pilot was active for its WHOLE duration.
+
+    PILOT_T0 is 2026-08-08T17:17:39Z — the pilot existed for 6h42m of Aug 8.
+    Comparing dates alone accepted Aug 8 as a "complete" bucket, so K4 could
+    fire on four full days plus one partial one while claiming five. A partial
+    day judged against a whole-day threshold is a rate comparison between
+    incomparable windows.
+
+    Midnight T0 is exact, so that date itself is already full.
+    """
+    d = t0.date()
+    midnight = t0.hour == 0 and t0.minute == 0 and t0.second == 0 and t0.microsecond == 0
+    return d if midnight else d + timedelta(days=1)
+
+
 async def _entry_rate_days(
-    conn: aiosqlite.Connection, t0: str, days: int
+    conn: aiosqlite.Connection,
+    t0: str,
+    days: int,
+    *,
+    now: datetime | None = None,
 ) -> list[int] | None:
     """Entries per COMPLETE UTC calendar day for the last *days* days.
 
@@ -222,9 +242,11 @@ async def _entry_rate_days(
     t0_dt = _parse_iso(t0)
     if t0_dt is None:
         return None
-    today = datetime.now(timezone.utc).date()
+    # `now` is injectable so tests pin the boundary instead of racing the real
+    # clock — this workstream has already produced one real-clock CI flake.
+    today = (now or datetime.now(timezone.utc)).date()
     window = [today - timedelta(days=n) for n in range(days, 0, -1)]
-    if t0_dt.date() > window[0]:
+    if window[0] < first_full_pilot_day(t0_dt):
         return None
 
     lo, hi = window[0].isoformat(), (window[-1] + timedelta(days=1)).isoformat()
@@ -436,6 +458,36 @@ def evaluate_triggers(
 # ----------------------------------------------------------------------
 
 
+def public_projection(result: dict) -> dict:
+    """Strip embargoed fields from anything that reaches stdout / the journal.
+
+    *** THE EMBARGO APPLIES TO OUTPUT, NOT JUST TO PAGES. ***
+
+    An earlier revision withheld `n_eff` from the alert text and then printed
+    the whole evaluation dict — `n_eff` AND running `net_usd` — on every run. An
+    hourly systemd unit would have persisted a mid-cohort P&L series into the
+    journal, which defeats the pre-registration more thoroughly than one early
+    Telegram page: it is durable, greppable, and arrives unprompted.
+
+    Always public (operational state):
+        entries, open, closed, writers, gainers_n
+    Withheld until its own terminal trigger fires:
+        n_eff   -> only with `pilot_tail_resolved`
+        net_usd -> only if K2 actually fires (it is that trigger's evidence)
+    """
+    fired = {f["trigger"] for f in result.get("fired", [])}
+    cohort = dict(result.get("cohort") or {})
+
+    if "pilot_tail_resolved" not in fired:
+        cohort.pop("n_eff", None)
+    if "K2_net_loss" not in fired:
+        cohort.pop("net_usd", None)
+
+    out = dict(result)
+    out["cohort"] = cohort
+    return out
+
+
 def _state_key(trigger: str, anchor: str) -> str:
     """Dedup key = trigger + pilot/run anchor. Re-arming on a NEW pilot is
     automatic because the anchor changes; a re-fire within one pilot is
@@ -610,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             _log.exception("pilot_watchdog_dispatch_failed")
             result["dispatch_error"] = str(exc)
-            print(json.dumps({"ok": False, **result}, default=str))
+            print(json.dumps({"ok": False, **public_projection(result)}, default=str))
             return 1
         now = datetime.now(timezone.utc)
         for f in to_send:
@@ -620,7 +672,9 @@ def main(argv: list[str] | None = None) -> int:
 
     result["ok"] = True
     result["dispatched"] = len(to_send) if not args.dry_run else 0
-    print(json.dumps(result, default=str))
+    # Projection applies to dry-run too: a dry-run is exactly when someone
+    # inspects output, which is exactly when the embargo matters most.
+    print(json.dumps(public_projection(result), default=str))
     return 5 if fired else 0
 
 
