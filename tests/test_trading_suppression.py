@@ -361,8 +361,10 @@ async def test_fallback_counter_alerts_at_threshold(
 
 
 # ---------------------------------------------------------------------------
-# D1 — parole reservation: a retest slot must never be lost on an admission
-# that never commits, and must never be returned when commit state is unknown.
+# D1 — parole reservation: refund on VERIFIED non-commit; never refund an
+# ambiguous outcome. Cancellation, ambiguous exceptions and process death
+# deliberately LEAK a slot — that under-admits, which is the required failure
+# direction. Over-admission must stay structurally impossible.
 # ---------------------------------------------------------------------------
 
 
