@@ -439,10 +439,12 @@ async def test_reservation_keeps_slot_on_verified_commit(tmp_path, settings_fact
 async def test_reservation_never_refunds_on_exception(tmp_path, settings_factory):
     """THE over-admission guard.
 
-    `paper.execute_buy` commits and THEN awaits `stamp_entry_snapshot`;
-    `open_trade` then awaits `_emit_decision` / `_spawn_tg_alert`. An exception
-    can surface with the paper_trades row already durable, so refunding on a
-    raise would hand back a slot for a trade that exists.
+    After `paper.execute_buy` returns a durable trade id, `open_trade` still
+    awaits `_emit_decision` and then `_spawn_tg_alert`, neither individually
+    guarded. An exception can surface with the paper_trades row already
+    committed, so refunding on a raise would hand back a slot for a trade that
+    exists. (`stamp_entry_snapshot` is NOT such a source — `execute_buy` wraps
+    it fail-soft after the commit.)
     """
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -475,7 +477,7 @@ async def test_reservation_token_is_settled_after_exception(tmp_path, settings_f
             raise RuntimeError("boom")
     assert holder["res"].settled is True
     # Even an explicit refund attempt after the fact must be a no-op.
-    await holder["res"].settle_refund()
+    await holder["res"]._settle_refund()
     assert await _remaining(db, "c") == 2
     await db.close()
 
@@ -499,9 +501,9 @@ async def test_double_refund_is_impossible(tmp_path, settings_factory):
     async with suppression.parole_reservation(
         db, "c", settings=settings_factory()
     ) as res:
-        await res.settle_refund()
+        await res._settle_refund()
         assert await _remaining(db, "c") == 3
-        await res.settle_refund()  # no-op
+        await res._settle_refund()  # no-op
         assert await _remaining(db, "c") == 3
         assert res.settled is True
     # Context-manager exit must not refund a second time either.
@@ -652,3 +654,141 @@ def test_every_dispatcher_uses_the_reservation_contract():
     assert raw_gate not in src, "a dispatcher bypasses parole_reservation"
     assert src.count("async with parole_reservation(") == 8
     assert src.count("res.confirm()") == 8
+
+
+def test_no_dispatcher_calls_the_refund_primitive_directly():
+    """Over-admission must be STRUCTURAL, not caller discipline.
+
+    A dispatcher that refunded manually and then committed would over-admit.
+    Refund is internal to the context-manager contract; pin that no caller
+    reaches around it.
+    """
+    src = (
+        Path(__file__).resolve().parents[1] / "scout" / "trading" / "signals.py"
+    ).read_text(encoding="utf-8")
+    assert "settle_refund" not in src
+    assert "refund_parole_slot" not in src
+
+
+async def _resuppress(db, key: str, remaining: int = 5):
+    """Emulate combo_refresh installing a NEW suppression generation."""
+    now = datetime.now(timezone.utc)
+    await db._conn.execute(
+        "UPDATE combo_performance SET suppressed = 1, suppressed_at = ?, "
+        "parole_at = ?, parole_trades_remaining = ? "
+        "WHERE combo_key = ? AND window = '30d'",
+        (
+            now.isoformat(),
+            (now + timedelta(days=14)).isoformat(),
+            remaining,
+            key,
+        ),
+    )
+    await db._conn.commit()
+
+
+async def test_resuppression_between_preliminary_read_and_lock_denies_admission(
+    tmp_path, settings_factory
+):
+    """TOCTOU regression.
+
+    `_open_gate` validates suppressed/parole_at on a LOCK-FREE fast path. If
+    combo_refresh re-suppresses with a fresh future parole_at + full budget
+    before the caller obtains `_txn_lock`, the locked block must re-validate
+    the whole admission state — not just see `remaining > 0` and admit inside
+    the NEW lock period.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)  # window currently OPEN
+    s = settings_factory()
+
+    # Hold the lock so the gate blocks after its lock-free read.
+    await db._txn_lock.acquire()
+    task = asyncio.create_task(suppression.should_open(db, "c", settings=s))
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if db._txn_lock._waiters:
+            break
+
+    await _resuppress(db, "c", remaining=5)  # new generation lands
+    db._txn_lock.release()
+
+    allow, reason = await task
+    assert allow is False
+    assert reason == "suppressed"
+    # The replacement generation's budget is untouched.
+    assert await _remaining(db, "c") == 5
+    await db.close()
+
+
+async def test_clearance_between_preliminary_read_and_lock_allows_without_spending(
+    tmp_path, settings_factory
+):
+    """The mirror of the re-suppression race.
+
+    If combo_refresh CLEARS suppression while the caller queues for the lock,
+    the locked block must notice and allow on the ordinary `ok` path — not
+    spend a parole slot, and not deny because `parole_at` went NULL.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    s = settings_factory()
+
+    await db._txn_lock.acquire()
+    task = asyncio.create_task(suppression.should_open(db, "c", settings=s))
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if db._txn_lock._waiters:
+            break
+
+    await db._conn.execute(
+        "UPDATE combo_performance SET suppressed = 0, suppressed_at = NULL, "
+        "parole_at = NULL, parole_trades_remaining = NULL "
+        "WHERE combo_key = 'c' AND window = '30d'"
+    )
+    await db._conn.commit()
+    db._txn_lock.release()
+
+    allow, reason = await task
+    assert allow is True
+    assert reason == "ok"
+    assert await _remaining(db, "c") is None  # no slot spent
+    await db.close()
+
+
+async def test_stale_refund_does_not_credit_replacement_generation(
+    tmp_path, settings_factory
+):
+    """A slot taken from generation N must never be returned to generation N+1."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    async with suppression.parole_reservation(
+        db, "c", settings=settings_factory()
+    ) as res:
+        assert res.slot_taken is True
+        assert await _remaining(db, "c") == 2
+        await _resuppress(db, "c", remaining=5)
+        # exit without confirm -> refund attempted against a dead generation
+    assert await _remaining(db, "c") == 5  # NOT 6
+    await db.close()
+
+
+async def test_stale_refund_after_suppression_cleared_is_noop(
+    tmp_path, settings_factory
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    async with suppression.parole_reservation(db, "c", settings=settings_factory()):
+        await db._conn.execute(
+            "UPDATE combo_performance SET suppressed = 0, suppressed_at = NULL, "
+            "parole_at = NULL, parole_trades_remaining = NULL "
+            "WHERE combo_key = 'c' AND window = '30d'"
+        )
+        await db._conn.commit()
+    # Must not resurrect a counter on a combo that is no longer suppressed.
+    assert await _remaining(db, "c") is None
+    await db.close()
