@@ -148,7 +148,9 @@ async def test_parole_auto_clear_on_wr_recovery(tmp_path, settings_factory):
     # Add recent winning trades for recovery. `opened_at` must fall inside the
     # current parole generation (>= parole_at) — the retest cohort is anchored
     # on the generation, so trades predating it are not retest evidence.
-    for _ in range(15):
+    # Exactly FEEDBACK_PAROLE_RETEST_TRADES admissions: a 5-slot parole cannot
+    # produce more, and a larger cohort now trips the bypass-contamination check.
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
         await _insert_trade(
             db,
             "recovered",
@@ -183,7 +185,7 @@ async def test_re_suppression_resets_timestamps(tmp_path, settings_factory):
     await db._conn.commit()
     # Recent trades still poor. `opened_at` inside the current parole
     # generation so they count as resolved retest outcomes.
-    for _ in range(20):
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
         await _insert_trade(
             db,
             "re_supp",
@@ -1098,8 +1100,15 @@ async def test_parole_exhausted_resuppression_fires_reversal_alert(
         db, "gainers_early", remaining=0, parole_at=original_parole
     )
     # Real, in-window retest trades that fail (0% WR) — NOT a zero-trade combo.
-    for _ in range(20):
-        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
+        await _insert_trade(
+            db,
+            "gainers_early",
+            -5,
+            -3.0,
+            now - timedelta(days=2),
+            opened_at=now - timedelta(days=5),
+        )
 
     summary = await combo_refresh.refresh_all(db, s)
 
