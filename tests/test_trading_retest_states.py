@@ -19,6 +19,8 @@ from __future__ import annotations
 import itertools
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from scout.db import Database
 from scout.trading import combo_refresh
 
@@ -108,6 +110,18 @@ async def _row(db, combo: str):
     return await cur.fetchone()
 
 
+async def _refresh(db, combo: str, s):
+    """Refresh + run the post-lock alert pass, as refresh_all does.
+
+    Delivery is deliberately NOT inside refresh_combo: that holds `_txn_lock`
+    and sits mid-transaction, so a Telegram await would pin the trading lock
+    and the marker commit would split the refresh transaction.
+    """
+    ok = await combo_refresh.refresh_combo(db, combo, s)
+    await combo_refresh._process_retest_terminal_incomplete(db, s)
+    return ok
+
+
 async def _setup(tmp_path, settings_factory, monkeypatch, combo, remaining):
     db = Database(tmp_path / "t.db")
     await db.initialize()
@@ -128,7 +142,7 @@ async def test_enough_evidence_but_slots_remain_holds(
     )
     for _ in range(5):
         await _close(db, "inconsistent", parole_at)  # winners: would CLEAR
-    await combo_refresh.refresh_combo(db, "inconsistent", s)
+    await _refresh(db, "inconsistent", s)
     row = await _row(db, "inconsistent")
     assert row["suppressed"] == 1, "must not clear on inconsistent accounting"
     assert row["parole_trades_remaining"] == 2, "must not re-arm"
@@ -145,7 +159,7 @@ async def test_more_committed_trades_than_slots_spent_is_contaminated(
     # spent = 5 - 0 = 5, but 7 trades committed in the generation.
     for _ in range(7):
         await _close(db, "bypassed", parole_at)
-    await combo_refresh.refresh_combo(db, "bypassed", s)
+    await _refresh(db, "bypassed", s)
     row = await _row(db, "bypassed")
     assert row["suppressed"] == 1, "contaminated cohort must not decide"
     await db.close()
@@ -160,7 +174,7 @@ async def test_four_valid_plus_closed_manual_is_terminal_incomplete(
     for _ in range(4):
         await _close(db, "manualgap", parole_at)
     await _close(db, "manualgap", parole_at, pnl=0.0, status="closed_manual")
-    await combo_refresh.refresh_combo(db, "manualgap", s)
+    await _refresh(db, "manualgap", s)
     row = await _row(db, "manualgap")
     assert row["suppressed"] == 1
     assert stub.calls == 1, "terminal-incomplete must page"
@@ -177,7 +191,7 @@ async def test_four_valid_plus_invalid_provenance_is_terminal_incomplete(
     for _ in range(4):
         await _close(db, "provgap", parole_at)
     await _close(db, "provgap", parole_at, pnl=0.0, provenance="entry_fallback")
-    await combo_refresh.refresh_combo(db, "provgap", s)
+    await _refresh(db, "provgap", s)
     row = await _row(db, "provgap")
     assert row["suppressed"] == 1
     assert stub.calls == 1
@@ -195,7 +209,7 @@ async def test_three_valid_plus_two_open_is_waiting_not_terminal(
         await _close(db, "waiting", parole_at)
     for _ in range(2):
         await _still_open(db, "waiting", parole_at)
-    await combo_refresh.refresh_combo(db, "waiting", s)
+    await _refresh(db, "waiting", s)
     row = await _row(db, "waiting")
     assert row["suppressed"] == 1
     assert stub.calls == 0, "waiting must not page — it can still resolve"
@@ -212,7 +226,7 @@ async def test_three_valid_plus_leaked_slots_is_terminal_incomplete(
     )
     for _ in range(3):
         await _close(db, "leaked", parole_at)
-    await combo_refresh.refresh_combo(db, "leaked", s)
+    await _refresh(db, "leaked", s)
     row = await _row(db, "leaked")
     assert row["suppressed"] == 1
     assert row["parole_trades_remaining"] == 0, "must NOT silently re-arm slots"
@@ -228,9 +242,9 @@ async def test_terminal_incomplete_pages_only_once(
     )
     for _ in range(3):
         await _close(db, "once", parole_at)
-    await combo_refresh.refresh_combo(db, "once", s)
-    await combo_refresh.refresh_combo(db, "once", s)
-    await combo_refresh.refresh_combo(db, "once", s)
+    await _refresh(db, "once", s)
+    await _refresh(db, "once", s)
+    await _refresh(db, "once", s)
     assert stub.calls == 1, "nightly refresh must not re-page a stuck generation"
     await db.close()
 
@@ -251,7 +265,7 @@ async def test_alert_marker_not_set_when_send_fails(
     await _seed(db, "outage", parole_at, 0)
     for _ in range(3):
         await _close(db, "outage", parole_at)
-    await combo_refresh.refresh_combo(db, "outage", s)
+    await _refresh(db, "outage", s)
     row = await _row(db, "outage")
     assert row["retest_incomplete_alerted_at"] is None, "marker set despite failure"
     assert row["suppressed"] == 1
@@ -266,7 +280,7 @@ async def test_exactly_five_valid_and_slots_exhausted_decides(
     )
     for _ in range(5):
         await _close(db, "decide", parole_at)  # winners
-    await combo_refresh.refresh_combo(db, "decide", s)
+    await _refresh(db, "decide", s)
     row = await _row(db, "decide")
     assert row["suppressed"] == 0, "complete retest with WR>=30 must clear"
     assert stub.calls == 0
@@ -352,4 +366,99 @@ async def test_upgrade_adds_retest_marker_column_to_existing_table(tmp_path):
     assert row[0] == 40, "pre-existing data lost"
     assert row[1] == 1, "pre-existing suppression state lost"
     assert row[2] is None, "new column must default to NULL (never alerted)"
+    await db.close()
+
+
+async def test_real_alerter_seam_passes_raise_on_failure(monkeypatch):
+    """Contract test on the REAL seam, not the monkeypatched wrapper.
+
+    The alerter defaults `raise_on_failure=False` and merely logs on a non-200
+    or network error. If this call does not opt in, `_process_...` would log
+    `..._delivered` and set the dedup marker for a page Telegram rejected —
+    permanently suppressing every retry.
+    """
+    import scout.alerter as alerter_mod
+
+    captured: dict = {}
+
+    async def fake_send(message, session, settings, **kw):
+        captured.update(kw)
+        raise RuntimeError("telegram 400")
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+
+    with pytest.raises(RuntimeError):
+        await combo_refresh._send_retest_incomplete_alert("body", object())
+
+    assert captured.get("raise_on_failure") is True, "failure cannot propagate"
+    assert captured.get("parse_mode") is None, "combo keys contain underscores"
+    assert captured.get("source") == "combo_refresh_retest_terminal_incomplete"
+
+
+async def test_marker_not_written_when_real_alerter_fails(
+    tmp_path, settings_factory, monkeypatch
+):
+    """End-to-end through the real seam: a rejected page must stay un-marked."""
+    import scout.alerter as alerter_mod
+
+    async def fake_send(message, session, settings, **kw):
+        raise RuntimeError("telegram 500")
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    parole_at = datetime.now(timezone.utc) - timedelta(days=2)
+    await _seed(db, "realfail", parole_at, 0)
+    for _ in range(3):
+        await _close(db, "realfail", parole_at)
+
+    await combo_refresh.refresh_combo(db, "realfail", s)
+    await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+    row = await _row(db, "realfail")
+    assert row["retest_incomplete_alerted_at"] is None
+    assert row["suppressed"] == 1
+    await db.close()
+
+
+async def test_marker_write_is_generation_bound(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A slow send followed by a re-arm must not stamp the NEW generation.
+
+    Same principle as the D1 reservation: a write that lands after the
+    generation moved would mark a fresh parole as already-alerted, silencing
+    the page it is entitled to.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    parole_at = datetime.now(timezone.utc) - timedelta(days=2)
+    await _seed(db, "genshift", parole_at, 0)
+    for _ in range(3):
+        await _close(db, "genshift", parole_at)
+
+    async def slow_send(message, settings):
+        # combo_refresh re-arms a NEW parole generation mid-flight.
+        await db._conn.execute(
+            "UPDATE combo_performance SET suppressed_at = ?, parole_at = ?, "
+            "parole_trades_remaining = 5 "
+            "WHERE combo_key = 'genshift' AND window = '30d'",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+            ),
+        )
+        await db._conn.commit()
+
+    monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", slow_send)
+    alerted = await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+    row = await _row(db, "genshift")
+    assert (
+        row["retest_incomplete_alerted_at"] is None
+    ), "stale marker stamped the replacement generation"
+    assert alerted == [], "must not report an alert against a dead generation"
     await db.close()

@@ -39,6 +39,13 @@ async def _send_retest_incomplete_alert(message: str, settings) -> None:
     (``losers_contrarian``, ``cg_trending_rank+first_signal``), which Telegram
     MarkdownV1 would silently consume as italics markers — HTTP 200 with a
     mangled body (CLAUDE.md §12b).
+
+    ``raise_on_failure=True`` is LOAD-BEARING, not decoration. The alerter
+    defaults to ``False`` and merely LOGS on a non-200 or a network error, so
+    without it the caller would emit ``..._delivered`` and set the dedup marker
+    for a page Telegram actually rejected — and the marker would then suppress
+    every future attempt. "Set the marker only after a confirmed send" is only
+    a true statement if failure propagates.
     """
     import aiohttp  # deferred — module-level import aborts on Windows
 
@@ -53,65 +60,105 @@ async def _send_retest_incomplete_alert(message: str, settings) -> None:
             settings,
             parse_mode=None,
             source="combo_refresh_retest_terminal_incomplete",
+            raise_on_failure=True,
         )
 
 
-async def _alert_retest_terminal_incomplete(
-    db: Database, combo_key: str, acct: dict, target: int, settings
-) -> None:
-    """Page ONCE when a parole generation can no longer complete.
+async def _process_retest_terminal_incomplete(db: Database, settings) -> list[str]:
+    """Page ONCE per generation for parole retests that can never complete.
 
-    §12b: an automated hold on operator-visible state must surface at the write
-    site. Dedup via ``retest_incomplete_alerted_at``, set only after a
-    CONFIRMED send, so a transient Telegram outage re-attempts next run rather
-    than silently dropping the page. The marker is cleared when the combo
-    leaves the state (a fresh parole re-arms it), so a later stuck generation
-    pages again.
+    Runs AFTER the locked per-combo refreshes, mirroring
+    ``_process_permanent_suppression``. Delivery must not happen inside
+    ``_refresh_combo_locked``: that holds ``db._txn_lock`` and sits in the
+    middle of the refresh's multi-statement read->write sequence, so a Telegram
+    await would pin the trading lock for the client timeout and the marker's
+    commit would split the refresh transaction — making the 7d write durable
+    before the 30d write landed.
+
+    Marker writes are GENERATION-BOUND on ``(suppressed_at, parole_at)``. A
+    slow send followed by a re-arm must not stamp the NEW generation as already
+    alerted; if the generation moved while we were sending, the update matches
+    zero rows and the next run pages the new generation. Same principle as the
+    D1 parole reservation.
+
+    Returns the combos newly alerted this run.
     """
     conn = db._conn
-    cur = await conn.execute(
-        "SELECT retest_incomplete_alerted_at FROM combo_performance "
-        "WHERE combo_key = ? AND window = '30d'",
-        (combo_key,),
-    )
-    row = await cur.fetchone()
-    if row is not None and row[0] is not None:
-        return  # already paged for this generation
+    target = settings.FEEDBACK_PAROLE_RETEST_TRADES
 
-    message = (
-        f"[gecko-alpha] parole retest STUCK: {combo_key}\n"
-        f"valid resolved {acct['valid_closed']}/{target} — "
-        f"invalid closes {acct['invalid_closed']}, still open {acct['open_now']}, "
-        f"slots spent {acct['spent']}.\n"
-        "No slots left and nothing still open, so this retest can never "
-        "complete. Suppression is HELD and will not auto-clear. "
-        "Re-arming a retest requires operator authorization."
+    cur = await conn.execute(
+        "SELECT combo_key, suppressed_at, parole_at, parole_trades_remaining "
+        "FROM combo_performance "
+        "WHERE window = '30d' AND suppressed = 1 "
+        "  AND retest_incomplete_alerted_at IS NULL "
+        "  AND parole_at IS NOT NULL "
+        "  AND COALESCE(parole_trades_remaining, 1) <= 0"
     )
-    log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
-    try:
-        await _send_retest_incomplete_alert(message, settings)
-    except Exception as exc:
-        log.warning(
-            "retest_incomplete_alert_failed",
-            combo_key=combo_key,
-            err=str(exc),
-            detail="marker NOT set — will re-attempt on the next refresh",
+    candidates = await cur.fetchall()
+
+    alerted: list[str] = []
+    for combo_key, suppressed_at, parole_at, remaining in candidates:
+        acct = await _retest_accounting(db, combo_key, parole_at, remaining, target)
+        if _classify_retest(acct, remaining, target) != "terminal_incomplete":
+            continue
+
+        message = (
+            f"gecko-alpha: parole retest STUCK for {combo_key}\n"
+            f"valid resolved {acct['valid_closed']}/{target} - "
+            f"invalid closes {acct['invalid_closed']}, "
+            f"still open {acct['open_now']}, slots spent {acct['spent']}.\n"
+            "No slots left and nothing still open, so this retest can never "
+            "complete. Suppression is HELD and will not auto-clear. "
+            "Re-arming a retest requires operator authorization."
         )
-        return
-    log.info("retest_incomplete_alert_delivered", combo_key=combo_key)
-    try:
-        await conn.execute(
-            "UPDATE combo_performance SET retest_incomplete_alerted_at = ? "
-            "WHERE combo_key = ? AND window = '30d'",
-            (datetime.now(timezone.utc).isoformat(), combo_key),
-        )
-        await conn.commit()
-    except aiosqlite.Error as exc:
-        log.exception(
-            "retest_incomplete_marker_update_failed",
-            combo_key=combo_key,
-            err=str(exc),
-        )
+        log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
+        try:
+            await _send_retest_incomplete_alert(message, settings)
+        except Exception as exc:
+            log.warning(
+                "retest_incomplete_alert_failed",
+                combo_key=combo_key,
+                err=str(exc),
+                detail="marker NOT set - will re-attempt on the next refresh",
+            )
+            continue
+        log.info("retest_incomplete_alert_delivered", combo_key=combo_key)
+
+        try:
+            before = conn.total_changes
+            await conn.execute(
+                "UPDATE combo_performance SET retest_incomplete_alerted_at = ? "
+                "WHERE combo_key = ? AND window = '30d' "
+                "  AND suppressed_at IS ? AND parole_at IS ?",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    combo_key,
+                    suppressed_at,
+                    parole_at,
+                ),
+            )
+            changed = conn.total_changes - before
+            await conn.commit()
+            if changed == 0:
+                # The generation moved while we were sending. The marker is
+                # deliberately NOT stamped onto the replacement generation —
+                # that would silence the page the new generation is entitled
+                # to. This run's page described a state that no longer exists.
+                log.info(
+                    "retest_incomplete_marker_stale_generation",
+                    combo_key=combo_key,
+                    detail="parole generation changed during delivery; marker "
+                    "not written, new generation will page on its own merits",
+                )
+                continue
+            alerted.append(combo_key)
+        except aiosqlite.Error as exc:
+            log.exception(
+                "retest_incomplete_marker_update_failed",
+                combo_key=combo_key,
+                err=str(exc),
+            )
+    return alerted
 
 
 def _classify_retest(acct: dict, remaining, target: int) -> str:
@@ -377,9 +424,16 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                             detail="parole generation can no longer complete; "
                             "suppression held, operator action required",
                         )
-                        await _alert_retest_terminal_incomplete(
-                            db, combo_key, acct, retest, settings
-                        )
+                        # Delivery deliberately NOT done here. This function
+                        # runs with `db._txn_lock` held and inside the refresh's
+                        # multi-statement read→write sequence, so an aiohttp
+                        # await would hold the trading lock for the client
+                        # timeout, and the marker's own commit would split this
+                        # refresh transaction (making the 7d write durable
+                        # before the 30d write lands). Paging happens in
+                        # `_process_retest_terminal_incomplete` after the locked
+                        # per-combo refreshes, mirroring
+                        # `_process_permanent_suppression`.
                     elif retest_state == "contaminated":
                         log.error(
                             "parole_retest_cohort_contaminated",
@@ -568,6 +622,10 @@ async def refresh_all(db: Database, settings) -> dict:
 
     permanent = await _process_permanent_suppression(db, settings, window_cutoff)
 
+    # Also outside the per-combo lock, for the same reason: Telegram delivery
+    # must not run inside the refresh transaction.
+    retest_stuck = await _process_retest_terminal_incomplete(db, settings)
+
     log.info(
         "combo_refresh_summary",
         refreshed=refreshed,
@@ -575,6 +633,7 @@ async def refresh_all(db: Database, settings) -> dict:
         chronic=len(chronic),
         permanent_suppression=len(permanent),
         suppression_reversals=len(reversals),
+        retest_terminal_incomplete=len(retest_stuck),
     )
     return {
         "refreshed": refreshed,

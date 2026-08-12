@@ -55,6 +55,7 @@ not yet a runtime field.
 | Chain-pattern completion | `chain_alert` | Chain signal pattern completes | trading | None | info | N |
 | Cohort digest | `cohort_digest` | Weekly `would_be_live` cohort digest | trading | None | info | N |
 | Permanent combo suppression | `combo_refresh_permanent_suppression` | Combo permanently suppressed after parole exhaustion — **state reversal** | trading | None | warning | Y |
+| Parole retest terminal-incomplete (§12b) | `combo_refresh_retest_terminal_incomplete` | Parole generation can never complete — slots exhausted, nothing open, fewer than `FEEDBACK_PAROLE_RETEST_TRADES` valid resolved outcomes. Suppression HELD, no auto re-arm | trading | None | warning | Y |
 | Conviction-watchlist watchdog | `conviction_watchlist_watchdog` | Conviction watchlist staleness | trading | None | warning | Y |
 | Counter-signal risk | `counter_risk` | Counter-signal risk flag on a candidate | trading | None | warning | N |
 | Daily summary | `daily_summary` | Daily pipeline summary | trading | None | info | N |
@@ -119,7 +120,7 @@ Known instances: `scripts/acceleration-heartbeat-watchdog.sh`,
    | Severity | Channel | Kinds |
    |----------|---------|-------|
    | `critical` | health | `kill_switch` |
-   | `warning` (health/ops) | health | all `*_watchdog`, `auto_suspend`, `combo_refresh_permanent_suppression`, `ingest_watchdog`, `sqlite_*`, `price_refresh_streak`, `trade_expiry_anomaly`, `counter_risk`, `suppression` |
+   | `warning` (health/ops) | health | all `*_watchdog`, `auto_suspend`, `combo_refresh_permanent_suppression`, `combo_refresh_retest_terminal_incomplete`, `ingest_watchdog`, `sqlite_*`, `price_refresh_streak`, `trade_expiry_anomaly`, `counter_risk`, `suppression` |
    | `info` (trader-facing) | trading | `tg_alert_dispatch`, `trade_surface_alerts`, `candidate_alert`, `chain_alert`, `secondwave`, `velocity_alert`, `narrative_agent`, `live_decision`, digests/announcements |
 
 3. **Three trader-facing alerts still use MarkdownV1** (`candidate_alert`,

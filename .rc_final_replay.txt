@@ -1,0 +1,12 @@
+s                             
+------------------------------
+===== FINAL: merged-tree predi
+cate + two-axis gate =====    
+combo                           wl_n    wl_w    wl_wr    new_n   new_w   new_wr   supp   rem     r_vali  r_open  r_coh   first_refresh_action    
+------------------------------  ------  ------  -------  ------  ------  -------  -----  ------  ------  ------  ------  ------------------------
+gainers_early                   117     88      75.2     271     147     54.2     0                                      stay clear              
+
+volume_spike                    15      4       26.7     25      5       20.0     0                                      NEWLY SUPPRESS          
+
+losers_contrarian               0       0                3       1       33.3     1      0       3       0       3       HOLD terminal_incomplete
+                                                                                                                          (PAGE)                 
