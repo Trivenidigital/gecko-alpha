@@ -19,7 +19,7 @@ from scout.outcome_ledger import (
 from scout.spikes.models import VolumeSpike
 from scout.trading.combo_key import build_combo_key
 from scout.trading.decision_events import emit_trade_decision
-from scout.trading.suppression import should_open
+from scout.trading.suppression import parole_reservation
 
 logger = structlog.get_logger()
 
@@ -152,44 +152,46 @@ async def trade_volume_spikes(
             continue
         try:
             combo_key = build_combo_key(signal_type="volume_spike", signals=None)
-            allow, reason = await should_open(db, combo_key, settings=settings)
-            if not allow:
-                skipped_suppressed += 1
-                logger.info(
-                    "signal_suppressed",
-                    combo_key=combo_key,
-                    reason=reason,
-                    coin_id=spike.coin_id,
-                    signal_type="volume_spike",
-                )
-                await _record_suppressed_ledger_emission(
-                    db,
-                    settings,
-                    signal_type="volume_spike",
+            async with parole_reservation(db, combo_key, settings=settings) as res:
+                if not res.allow:
+                    skipped_suppressed += 1
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=res.reason,
+                        coin_id=spike.coin_id,
+                        signal_type="volume_spike",
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="volume_spike",
+                        token_id=spike.coin_id,
+                        combo_key=combo_key,
+                        suppression_reason=res.reason,
+                        price=spike.price,
+                        signal_data={
+                            "spike_ratio": spike.spike_ratio,
+                            "mcap": spike.market_cap,
+                        },
+                    )
+                    continue
+                trade_id = await engine.open_trade(
                     token_id=spike.coin_id,
-                    combo_key=combo_key,
-                    suppression_reason=reason,
-                    price=spike.price,
+                    symbol=spike.symbol,  # BL-076 Bug 2 fix
+                    name=spike.name,  # BL-076 Bug 2 fix
+                    chain="coingecko",
+                    signal_type="volume_spike",
                     signal_data={
                         "spike_ratio": spike.spike_ratio,
                         "mcap": spike.market_cap,
                     },
+                    entry_price=spike.price,
+                    signal_combo=combo_key,
                 )
-                continue
-            await engine.open_trade(
-                token_id=spike.coin_id,
-                symbol=spike.symbol,  # BL-076 Bug 2 fix
-                name=spike.name,  # BL-076 Bug 2 fix
-                chain="coingecko",
-                signal_type="volume_spike",
-                signal_data={
-                    "spike_ratio": spike.spike_ratio,
-                    "mcap": spike.market_cap,
-                },
-                entry_price=spike.price,
-                signal_combo=combo_key,
-            )
-            opened += 1
+                if trade_id is not None:
+                    res.confirm()
+                opened += 1
         except Exception:
             errors += 1
             logger.exception(
@@ -317,51 +319,53 @@ async def trade_gainers(
                     continue
             try:
                 combo_key = build_combo_key(signal_type="gainers_early", signals=None)
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=g["coin_id"],
-                        signal_type="gainers_early",
-                    )
-                    await _emit_dispatch_decision(
-                        db,
-                        row=g,
-                        signal_type="gainers_early",
-                        decision="blocked",
-                        reason="suppressed",
-                        signal_combo=combo_key,
-                        suppression_reason=reason,
-                    )
-                    await _record_suppressed_ledger_emission(
-                        db,
-                        settings,
-                        signal_type="gainers_early",
+                async with parole_reservation(db, combo_key, settings=settings) as res:
+                    if not res.allow:
+                        logger.info(
+                            "signal_suppressed",
+                            combo_key=combo_key,
+                            reason=res.reason,
+                            coin_id=g["coin_id"],
+                            signal_type="gainers_early",
+                        )
+                        await _emit_dispatch_decision(
+                            db,
+                            row=g,
+                            signal_type="gainers_early",
+                            decision="blocked",
+                            reason="suppressed",
+                            signal_combo=combo_key,
+                            suppression_reason=res.reason,
+                        )
+                        await _record_suppressed_ledger_emission(
+                            db,
+                            settings,
+                            signal_type="gainers_early",
+                            token_id=g["coin_id"],
+                            combo_key=combo_key,
+                            suppression_reason=res.reason,
+                            price=g["price_at_snapshot"],
+                            signal_data={
+                                "price_change_24h": g["price_change_24h"],
+                                "mcap": g["market_cap"],
+                            },
+                        )
+                        continue
+                    trade_id = await engine.open_trade(
                         token_id=g["coin_id"],
-                        combo_key=combo_key,
-                        suppression_reason=reason,
-                        price=g["price_at_snapshot"],
+                        symbol=g["symbol"],
+                        name=g["name"],
+                        chain="coingecko",
+                        signal_type="gainers_early",
                         signal_data={
                             "price_change_24h": g["price_change_24h"],
                             "mcap": g["market_cap"],
                         },
+                        entry_price=g["price_at_snapshot"],
+                        signal_combo=combo_key,
                     )
-                    continue
-                await engine.open_trade(
-                    token_id=g["coin_id"],
-                    symbol=g["symbol"],
-                    name=g["name"],
-                    chain="coingecko",
-                    signal_type="gainers_early",
-                    signal_data={
-                        "price_change_24h": g["price_change_24h"],
-                        "mcap": g["market_cap"],
-                    },
-                    entry_price=g["price_at_snapshot"],
-                    signal_combo=combo_key,
-                )
+                    if trade_id is not None:
+                        res.confirm()
             except Exception:
                 logger.exception("trading_gainers_error", coin_id=g["coin_id"])
         logger.info(
@@ -465,52 +469,54 @@ async def trade_slow_burn(
             continue
         try:
             combo_key = build_combo_key(signal_type="slow_burn", signals=None)
-            allow, reason = await should_open(db, combo_key, settings=settings)
-            if not allow:
-                logger.info(
-                    "signal_suppressed",
-                    combo_key=combo_key,
-                    reason=reason,
-                    coin_id=r["coin_id"],
-                    signal_type="slow_burn",
-                )
-                await _emit_dispatch_decision(
-                    db,
-                    row=r,
-                    signal_type="slow_burn",
-                    decision="blocked",
-                    reason="suppressed",
-                    signal_combo=combo_key,
-                    suppression_reason=reason,
-                )
-                await _record_suppressed_ledger_emission(
-                    db,
-                    settings,
-                    signal_type="slow_burn",
+            async with parole_reservation(db, combo_key, settings=settings) as res:
+                if not res.allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=res.reason,
+                        coin_id=r["coin_id"],
+                        signal_type="slow_burn",
+                    )
+                    await _emit_dispatch_decision(
+                        db,
+                        row=r,
+                        signal_type="slow_burn",
+                        decision="blocked",
+                        reason="suppressed",
+                        signal_combo=combo_key,
+                        suppression_reason=res.reason,
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="slow_burn",
+                        token_id=r["coin_id"],
+                        combo_key=combo_key,
+                        suppression_reason=res.reason,
+                        price=entry_price,
+                        signal_data={
+                            "price_change_7d": r["price_change_7d"],
+                            "mcap": r["market_cap"],
+                        },
+                    )
+                    continue
+                trade_id = await engine.open_trade(
                     token_id=r["coin_id"],
-                    combo_key=combo_key,
-                    suppression_reason=reason,
-                    price=entry_price,
+                    symbol=r["symbol"],
+                    name=r["name"],
+                    chain="coingecko",
+                    signal_type="slow_burn",
                     signal_data={
                         "price_change_7d": r["price_change_7d"],
                         "mcap": r["market_cap"],
                     },
+                    entry_price=entry_price,
+                    signal_combo=combo_key,
                 )
-                continue
-            await engine.open_trade(
-                token_id=r["coin_id"],
-                symbol=r["symbol"],
-                name=r["name"],
-                chain="coingecko",
-                signal_type="slow_burn",
-                signal_data={
-                    "price_change_7d": r["price_change_7d"],
-                    "mcap": r["market_cap"],
-                },
-                entry_price=entry_price,
-                signal_combo=combo_key,
-            )
-            opened += 1
+                if trade_id is not None:
+                    res.confirm()
+                opened += 1
         except Exception:
             logger.exception("trade_slow_burn_error", coin_id=r["coin_id"])
     logger.info("trade_slow_burn_filtered", new=len(new_rows), opened=opened)
@@ -695,81 +701,89 @@ async def trade_losers(
                 combo_key = build_combo_key(
                     signal_type="losers_contrarian", signals=None
                 )
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=l["coin_id"],
-                        signal_type="losers_contrarian",
-                    )
-                    await _emit_dispatch_decision(
-                        db,
-                        row=l,
-                        signal_type="losers_contrarian",
-                        decision="blocked",
-                        reason="suppressed",
-                        signal_combo=combo_key,
-                        suppression_reason=reason,
-                    )
-                    await _record_suppressed_ledger_emission(
-                        db,
-                        settings,
-                        signal_type="losers_contrarian",
+                async with parole_reservation(db, combo_key, settings=settings) as res:
+                    if not res.allow:
+                        logger.info(
+                            "signal_suppressed",
+                            combo_key=combo_key,
+                            reason=res.reason,
+                            coin_id=l["coin_id"],
+                            signal_type="losers_contrarian",
+                        )
+                        await _emit_dispatch_decision(
+                            db,
+                            row=l,
+                            signal_type="losers_contrarian",
+                            decision="blocked",
+                            reason="suppressed",
+                            signal_combo=combo_key,
+                            suppression_reason=res.reason,
+                        )
+                        await _record_suppressed_ledger_emission(
+                            db,
+                            settings,
+                            signal_type="losers_contrarian",
+                            token_id=l["coin_id"],
+                            combo_key=combo_key,
+                            suppression_reason=res.reason,
+                            price=l["price_at_snapshot"],
+                            signal_data={
+                                "price_change_24h": l["price_change_24h"],
+                                "mcap": l["market_cap"],
+                            },
+                        )
+                        continue
+                    loser_price = l["price_at_snapshot"]
+                    if not loser_price:
+                        pc = await db._conn.execute(
+                            "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                            (l["coin_id"],),
+                        )
+                        price_row = await pc.fetchone()
+                        loser_price = price_row[0] if price_row else None
+
+                    # Bounded-pilot admission cap. Re-counted per candidate
+                    # rather than computed once for the batch: `open_trade` can
+                    # decline for its own reasons (exposure, dedup,
+                    # unpriceable), so a pre-computed remaining-capacity number
+                    # would drift from the real entry count within a single
+                    # pass.
+                    #
+                    # A cap enforced only by an operator noticing "entry 200
+                    # landed" and then disabling the row is a monitored cutoff,
+                    # not a cap: this loop iterates the whole fresh-losers
+                    # batch, so further entries can be admitted before the
+                    # disable write lands.
+                    #
+                    # This `continue` leaves the reservation unconfirmed, so
+                    # the parole slot is refunded — a cap-blocked candidate
+                    # never committed a trade.
+                    if not await _pilot_admission_allowed(db, settings):
+                        await _emit_dispatch_decision(
+                            db,
+                            row=l,
+                            signal_type="losers_contrarian",
+                            decision="blocked",
+                            reason="pilot_entry_cap_reached",
+                            signal_combo=combo_key,
+                        )
+                        continue
+
+                    trade_id = await engine.open_trade(
                         token_id=l["coin_id"],
-                        combo_key=combo_key,
-                        suppression_reason=reason,
-                        price=l["price_at_snapshot"],
+                        symbol=l["symbol"],
+                        name=l["name"],
+                        chain="coingecko",
+                        signal_type="losers_contrarian",
                         signal_data={
                             "price_change_24h": l["price_change_24h"],
                             "mcap": l["market_cap"],
                         },
-                    )
-                    continue
-                loser_price = l["price_at_snapshot"]
-                if not loser_price:
-                    pc = await db._conn.execute(
-                        "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                        (l["coin_id"],),
-                    )
-                    price_row = await pc.fetchone()
-                    loser_price = price_row[0] if price_row else None
-
-                # Bounded-pilot admission cap. Re-counted per candidate rather
-                # than computed once for the batch: `open_trade` can decline for
-                # its own reasons (exposure, dedup, unpriceable), so a
-                # pre-computed remaining-capacity number would drift from the
-                # real entry count within a single pass.
-                #
-                # A cap enforced only by an operator noticing "entry 200 landed"
-                # and then disabling the row is a monitored cutoff, not a cap:
-                # this loop iterates the whole fresh-losers batch, so further
-                # entries can be admitted before the disable write lands.
-                if not await _pilot_admission_allowed(db, settings):
-                    await _emit_dispatch_decision(
-                        db,
-                        row=l,
-                        signal_type="losers_contrarian",
-                        decision="blocked",
-                        reason="pilot_entry_cap_reached",
+                        entry_price=loser_price,
                         signal_combo=combo_key,
                     )
-                    continue
-
-                await engine.open_trade(
-                    token_id=l["coin_id"],
-                    symbol=l["symbol"],
-                    name=l["name"],
-                    chain="coingecko",
-                    signal_type="losers_contrarian",
-                    signal_data={
-                        "price_change_24h": l["price_change_24h"],
-                        "mcap": l["market_cap"],
-                    },
-                    entry_price=loser_price,
-                    signal_combo=combo_key,
-                )
+                    if trade_id is not None:
+                        res.confirm()
             except Exception:
                 logger.exception("trading_losers_error", coin_id=l["coin_id"])
         logger.info(
@@ -835,49 +849,51 @@ async def trade_first_signals(
         try:
             sigs = signals_fired
             combo_key = build_combo_key(signal_type="first_signal", signals=sigs)
-            allow, reason = await should_open(db, combo_key, settings=settings)
-            if not allow:
-                logger.info(
-                    "signal_suppressed",
-                    combo_key=combo_key,
-                    reason=reason,
-                    coin_id=token.contract_address,
-                    signal_type="first_signal",
+            async with parole_reservation(db, combo_key, settings=settings) as res:
+                if not res.allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=res.reason,
+                        coin_id=token.contract_address,
+                        signal_type="first_signal",
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="first_signal",
+                        token_id=token.contract_address,
+                        combo_key=combo_key,
+                        suppression_reason=res.reason,
+                        price=None,
+                        signal_data={
+                            "quant_score": quant_score,
+                            "signals": signals_fired,
+                        },
+                    )
+                    continue
+                pc = await db._conn.execute(
+                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                    (token.contract_address,),
                 )
-                await _record_suppressed_ledger_emission(
-                    db,
-                    settings,
-                    signal_type="first_signal",
+                pr = await pc.fetchone()
+                price = pr[0] if pr else None
+
+                trade_id = await engine.open_trade(
                     token_id=token.contract_address,
-                    combo_key=combo_key,
-                    suppression_reason=reason,
-                    price=None,
+                    symbol=token.ticker,
+                    name=token.token_name,
+                    chain=token.chain,
+                    signal_type="first_signal",
                     signal_data={
                         "quant_score": quant_score,
                         "signals": signals_fired,
                     },
+                    entry_price=price,
+                    signal_combo=combo_key,
                 )
-                continue
-            pc = await db._conn.execute(
-                "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                (token.contract_address,),
-            )
-            pr = await pc.fetchone()
-            price = pr[0] if pr else None
-
-            await engine.open_trade(
-                token_id=token.contract_address,
-                symbol=token.ticker,
-                name=token.token_name,
-                chain=token.chain,
-                signal_type="first_signal",
-                signal_data={
-                    "quant_score": quant_score,
-                    "signals": signals_fired,
-                },
-                entry_price=price,
-                signal_combo=combo_key,
-            )
+                if trade_id is not None:
+                    res.confirm()
         except Exception:
             logger.exception("trading_first_signal_error", token=token.ticker)
     if skipped_large or skipped_junk:
@@ -1002,52 +1018,54 @@ async def trade_trending(
                 continue
             try:
                 combo_key = build_combo_key(signal_type="trending_catch", signals=None)
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=t["coin_id"],
-                        signal_type="trending_catch",
-                    )
-                    await _emit_dispatch_decision(
-                        db,
-                        row=t,
-                        signal_type="trending_catch",
-                        decision="blocked",
-                        reason="suppressed",
-                        signal_combo=combo_key,
-                        suppression_reason=reason,
-                    )
-                    await _record_suppressed_ledger_emission(
-                        db,
-                        settings,
-                        signal_type="trending_catch",
+                async with parole_reservation(db, combo_key, settings=settings) as res:
+                    if not res.allow:
+                        logger.info(
+                            "signal_suppressed",
+                            combo_key=combo_key,
+                            reason=res.reason,
+                            coin_id=t["coin_id"],
+                            signal_type="trending_catch",
+                        )
+                        await _emit_dispatch_decision(
+                            db,
+                            row=t,
+                            signal_type="trending_catch",
+                            decision="blocked",
+                            reason="suppressed",
+                            signal_combo=combo_key,
+                            suppression_reason=res.reason,
+                        )
+                        await _record_suppressed_ledger_emission(
+                            db,
+                            settings,
+                            signal_type="trending_catch",
+                            token_id=t["coin_id"],
+                            combo_key=combo_key,
+                            suppression_reason=res.reason,
+                            price=t["current_price"],
+                            signal_data={
+                                "source": "trending_snapshot",
+                                "mcap_rank": rank,
+                            },
+                        )
+                        continue
+                    trending_price = t["current_price"]
+                    trade_id = await engine.open_trade(
                         token_id=t["coin_id"],
-                        combo_key=combo_key,
-                        suppression_reason=reason,
-                        price=t["current_price"],
+                        symbol=t["symbol"],
+                        name=t["name"],
+                        chain="coingecko",
+                        signal_type="trending_catch",
                         signal_data={
                             "source": "trending_snapshot",
                             "mcap_rank": rank,
                         },
+                        entry_price=trending_price,
+                        signal_combo=combo_key,
                     )
-                    continue
-                trending_price = t["current_price"]
-                await engine.open_trade(
-                    token_id=t["coin_id"],
-                    symbol=t["symbol"],
-                    name=t["name"],
-                    chain="coingecko",
-                    signal_type="trending_catch",
-                    signal_data={
-                        "source": "trending_snapshot",
-                        "mcap_rank": rank,
-                    },
-                    entry_price=trending_price,
-                    signal_combo=combo_key,
-                )
+                    if trade_id is not None:
+                        res.confirm()
             except Exception:
                 logger.exception("trading_trending_error", coin_id=t["coin_id"])
         if (
@@ -1297,50 +1315,52 @@ async def trade_predictions(
             combo_key = build_combo_key(
                 signal_type="narrative_prediction", signals=None
             )
-            allow, reason = await should_open(db, combo_key, settings=settings)
-            if not allow:
-                logger.info(
-                    "signal_suppressed",
-                    combo_key=combo_key,
-                    reason=reason,
-                    coin_id=pred.coin_id,
-                    signal_type="narrative_prediction",
+            async with parole_reservation(db, combo_key, settings=settings) as res:
+                if not res.allow:
+                    logger.info(
+                        "signal_suppressed",
+                        combo_key=combo_key,
+                        reason=res.reason,
+                        coin_id=pred.coin_id,
+                        signal_type="narrative_prediction",
+                    )
+                    await _record_suppressed_ledger_emission(
+                        db,
+                        settings,
+                        signal_type="narrative_prediction",
+                        token_id=pred.coin_id,
+                        combo_key=combo_key,
+                        suppression_reason=res.reason,
+                        price=None,
+                        signal_data={
+                            "fit": pred.narrative_fit_score,
+                            "category": pred.category_name,
+                            "mcap": pred.market_cap_at_prediction,
+                        },
+                    )
+                    continue
+                pc = await db._conn.execute(
+                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                    (pred.coin_id,),
                 )
-                await _record_suppressed_ledger_emission(
-                    db,
-                    settings,
-                    signal_type="narrative_prediction",
+                pr = await pc.fetchone()
+                pred_price = pr[0] if pr else None
+                trade_id = await engine.open_trade(
                     token_id=pred.coin_id,
-                    combo_key=combo_key,
-                    suppression_reason=reason,
-                    price=None,
+                    symbol=pred.symbol,  # BL-076 Bug 2 fix
+                    name=pred.name,  # BL-076 Bug 2 fix
+                    chain="coingecko",
+                    signal_type="narrative_prediction",
                     signal_data={
                         "fit": pred.narrative_fit_score,
                         "category": pred.category_name,
                         "mcap": pred.market_cap_at_prediction,
                     },
+                    entry_price=pred_price,
+                    signal_combo=combo_key,
                 )
-                continue
-            pc = await db._conn.execute(
-                "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                (pred.coin_id,),
-            )
-            pr = await pc.fetchone()
-            pred_price = pr[0] if pr else None
-            await engine.open_trade(
-                token_id=pred.coin_id,
-                symbol=pred.symbol,  # BL-076 Bug 2 fix
-                name=pred.name,  # BL-076 Bug 2 fix
-                chain="coingecko",
-                signal_type="narrative_prediction",
-                signal_data={
-                    "fit": pred.narrative_fit_score,
-                    "category": pred.category_name,
-                    "mcap": pred.market_cap_at_prediction,
-                },
-                entry_price=pred_price,
-                signal_combo=combo_key,
-            )
+                if trade_id is not None:
+                    res.confirm()
         except Exception:
             logger.exception(
                 "trading_open_narrative_error",
@@ -1386,86 +1406,88 @@ async def trade_chain_completions(engine, db: Database, *, settings) -> None:
                 continue
             try:
                 combo_key = build_combo_key(signal_type="chain_completed", signals=None)
-                allow, reason = await should_open(db, combo_key, settings=settings)
-                if not allow:
-                    logger.info(
-                        "signal_suppressed",
-                        combo_key=combo_key,
-                        reason=reason,
-                        coin_id=c["token_id"],
-                        signal_type="chain_completed",
+                async with parole_reservation(db, combo_key, settings=settings) as res:
+                    if not res.allow:
+                        logger.info(
+                            "signal_suppressed",
+                            combo_key=combo_key,
+                            reason=res.reason,
+                            coin_id=c["token_id"],
+                            signal_type="chain_completed",
+                        )
+                        await _record_suppressed_ledger_emission(
+                            db,
+                            settings,
+                            signal_type="chain_completed",
+                            token_id=c["token_id"],
+                            combo_key=combo_key,
+                            suppression_reason=res.reason,
+                            price=None,
+                            signal_data={
+                                "pattern": c["pattern_name"],
+                                "boost": c["conviction_boost"],
+                            },
+                        )
+                        continue
+                    pc = await db._conn.execute(
+                        "SELECT current_price FROM price_cache WHERE coin_id = ?",
+                        (c["token_id"],),
                     )
-                    await _record_suppressed_ledger_emission(
-                        db,
-                        settings,
-                        signal_type="chain_completed",
+                    price_row = await pc.fetchone()
+                    chain_price = price_row[0] if price_row else None
+                    # BL-076: chain_matches has no symbol/name — resolve via
+                    # Database.lookup_symbol_name_by_coin_id (sequential lookup
+                    # gainers_snapshots → volume_history_cg → volume_spikes).
+                    # Returns ("", "") for orphan coins; log a warning so
+                    # operator sees the gap rate. open_trade still fires —
+                    # the trade is real, we just lack metadata.
+                    #
+                    # SF-2 fix (PR #67 silent-failure-hunter): wrap the lookup
+                    # in its own try/except so an unexpected exception
+                    # (e.g. aiosqlite.ProgrammingError) doesn't get caught by
+                    # the dispatcher's outer `except Exception` and silently
+                    # drop the trade. Lookup error → degrade metadata, NOT
+                    # block the trade.
+                    try:
+                        ct_symbol, ct_name = await db.lookup_symbol_name_by_coin_id(
+                            c["token_id"]
+                        )
+                    except Exception:
+                        logger.exception(
+                            "chain_metadata_lookup_failed",
+                            token_id=c["token_id"],
+                        )
+                        ct_symbol, ct_name = "", ""
+                    ct_orphan = not ct_symbol and not ct_name
+                    if ct_orphan:
+                        logger.warning(
+                            "chain_completed_no_metadata",
+                            coin_id=c["token_id"],
+                            hint="no row in gainers_snapshots/volume_history_cg/volume_spikes",
+                        )
+                    # MF-2 fix: pass expected_empty_metadata=True when we
+                    # KNOW we have no metadata (orphan path) so the engine
+                    # WARNING+INFO doesn't double-fire. The dispatcher already
+                    # logged chain_completed_no_metadata above; the engine
+                    # event would be wallpaper noise indistinguishable from
+                    # a 4th-dispatcher caller-drift bug (which is what F4 is
+                    # supposed to surface).
+                    trade_id = await engine.open_trade(
                         token_id=c["token_id"],
-                        combo_key=combo_key,
-                        suppression_reason=reason,
-                        price=None,
+                        symbol=ct_symbol,
+                        name=ct_name,
+                        chain="coingecko",
+                        signal_type="chain_completed",
                         signal_data={
                             "pattern": c["pattern_name"],
                             "boost": c["conviction_boost"],
                         },
+                        entry_price=chain_price,
+                        signal_combo=combo_key,
+                        expected_empty_metadata=ct_orphan,
                     )
-                    continue
-                pc = await db._conn.execute(
-                    "SELECT current_price FROM price_cache WHERE coin_id = ?",
-                    (c["token_id"],),
-                )
-                price_row = await pc.fetchone()
-                chain_price = price_row[0] if price_row else None
-                # BL-076: chain_matches has no symbol/name — resolve via
-                # Database.lookup_symbol_name_by_coin_id (sequential lookup
-                # gainers_snapshots → volume_history_cg → volume_spikes).
-                # Returns ("", "") for orphan coins; log a warning so
-                # operator sees the gap rate. open_trade still fires —
-                # the trade is real, we just lack metadata.
-                #
-                # SF-2 fix (PR #67 silent-failure-hunter): wrap the lookup
-                # in its own try/except so an unexpected exception
-                # (e.g. aiosqlite.ProgrammingError) doesn't get caught by
-                # the dispatcher's outer `except Exception` and silently
-                # drop the trade. Lookup error → degrade metadata, NOT
-                # block the trade.
-                try:
-                    ct_symbol, ct_name = await db.lookup_symbol_name_by_coin_id(
-                        c["token_id"]
-                    )
-                except Exception:
-                    logger.exception(
-                        "chain_metadata_lookup_failed",
-                        token_id=c["token_id"],
-                    )
-                    ct_symbol, ct_name = "", ""
-                ct_orphan = not ct_symbol and not ct_name
-                if ct_orphan:
-                    logger.warning(
-                        "chain_completed_no_metadata",
-                        coin_id=c["token_id"],
-                        hint="no row in gainers_snapshots/volume_history_cg/volume_spikes",
-                    )
-                # MF-2 fix: pass expected_empty_metadata=True when we
-                # KNOW we have no metadata (orphan path) so the engine
-                # WARNING+INFO doesn't double-fire. The dispatcher already
-                # logged chain_completed_no_metadata above; the engine
-                # event would be wallpaper noise indistinguishable from
-                # a 4th-dispatcher caller-drift bug (which is what F4 is
-                # supposed to surface).
-                await engine.open_trade(
-                    token_id=c["token_id"],
-                    symbol=ct_symbol,
-                    name=ct_name,
-                    chain="coingecko",
-                    signal_type="chain_completed",
-                    signal_data={
-                        "pattern": c["pattern_name"],
-                        "boost": c["conviction_boost"],
-                    },
-                    entry_price=chain_price,
-                    signal_combo=combo_key,
-                    expected_empty_metadata=ct_orphan,
-                )
+                    if trade_id is not None:
+                        res.confirm()
             except Exception:
                 logger.exception("trading_chain_error", token_id=c["token_id"])
         if new_chains:

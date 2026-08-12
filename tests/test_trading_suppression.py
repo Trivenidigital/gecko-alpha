@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from scout.db import Database
-from scout.trading import suppression
+from scout.spikes.models import VolumeSpike
+from scout.trading import signals, suppression
 
 
 async def _seed_combo(
@@ -356,3 +358,297 @@ async def test_fallback_counter_alerts_at_threshold(
     await suppression.should_open(db, "x", settings=s)
     assert len(sent) == 2
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# D1 — parole reservation: a retest slot must never be lost on an admission
+# that never commits, and must never be returned when commit state is unknown.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_parole(db, key: str, remaining: int) -> None:
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await _seed_combo(
+        db,
+        key,
+        trades=25,
+        wins=5,
+        suppressed=1,
+        suppressed_at=past,
+        parole_at=past,
+        parole_remaining=remaining,
+    )
+
+
+async def _remaining(db, key: str):
+    cur = await db._conn.execute(
+        "SELECT parole_trades_remaining FROM combo_performance "
+        "WHERE combo_key = ? AND window = '30d'",
+        (key,),
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+class _StubEngine:
+    """Engine double. `outcome` is open_trade's return, or an exception to raise."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = 0
+
+    async def open_trade(self, **kwargs):
+        self.calls += 1
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+async def test_reservation_refunds_slot_on_verified_no_commit(
+    tmp_path, settings_factory
+):
+    """open_trade -> None is a VERIFIED no-commit: the slot comes back."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    async with suppression.parole_reservation(
+        db, "c", settings=settings_factory()
+    ) as res:
+        assert res.allow is True
+        assert res.reason == suppression.PAROLE_RETEST_REASON
+        assert res.slot_taken is True
+        # Decrement happens at the GATE — pessimistic, never deferred.
+        assert await _remaining(db, "c") == 2
+    assert await _remaining(db, "c") == 3
+    await db.close()
+
+
+async def test_reservation_keeps_slot_on_verified_commit(tmp_path, settings_factory):
+    """confirm() marks a real commit — the slot stays spent."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    async with suppression.parole_reservation(
+        db, "c", settings=settings_factory()
+    ) as res:
+        res.confirm()
+    assert await _remaining(db, "c") == 2
+    await db.close()
+
+
+async def test_reservation_never_refunds_on_exception(tmp_path, settings_factory):
+    """THE over-admission guard.
+
+    `paper.execute_buy` commits and THEN awaits `stamp_entry_snapshot`;
+    `open_trade` then awaits `_emit_decision` / `_spawn_tg_alert`. An exception
+    can surface with the paper_trades row already durable, so refunding on a
+    raise would hand back a slot for a trade that exists.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    with pytest.raises(RuntimeError):
+        async with suppression.parole_reservation(db, "c", settings=settings_factory()):
+            assert await _remaining(db, "c") == 2
+            raise RuntimeError("post-commit failure, row may already be durable")
+    # Leaked, NOT refunded. Under-admits by one; never over-admits.
+    assert await _remaining(db, "c") == 2
+    await db.close()
+
+
+async def test_reservation_token_is_settled_after_exception(tmp_path, settings_factory):
+    """Pins the belt-and-braces `confirm()` on the ambiguous path.
+
+    Control flow alone (the `raise` preceding the refund) already prevents the
+    refund today. This pins the TOKEN state, so that relocating the refund into
+    a `finally:` — the natural refactor — still cannot return an ambiguous slot.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    holder = {}
+    with pytest.raises(RuntimeError):
+        async with suppression.parole_reservation(
+            db, "c", settings=settings_factory()
+        ) as res:
+            holder["res"] = res
+            raise RuntimeError("boom")
+    assert holder["res"].settled is True
+    # Even an explicit refund attempt after the fact must be a no-op.
+    await holder["res"].settle_refund()
+    assert await _remaining(db, "c") == 2
+    await db.close()
+
+
+async def test_reservation_leaks_slot_on_cancellation(tmp_path, settings_factory):
+    """CancelledError is a BaseException — still ambiguous, still no refund."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    with pytest.raises(asyncio.CancelledError):
+        async with suppression.parole_reservation(db, "c", settings=settings_factory()):
+            raise asyncio.CancelledError()
+    assert await _remaining(db, "c") == 2
+    await db.close()
+
+
+async def test_double_refund_is_impossible(tmp_path, settings_factory):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    async with suppression.parole_reservation(
+        db, "c", settings=settings_factory()
+    ) as res:
+        await res.settle_refund()
+        assert await _remaining(db, "c") == 3
+        await res.settle_refund()  # no-op
+        assert await _remaining(db, "c") == 3
+        assert res.settled is True
+    # Context-manager exit must not refund a second time either.
+    assert await _remaining(db, "c") == 3
+    await db.close()
+
+
+async def test_refund_is_clamped_at_grant_ceiling(tmp_path, settings_factory):
+    """A concurrent combo_refresh re-grant must not be pushed above the ceiling."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    ceiling = s.FEEDBACK_PAROLE_RETEST_TRADES
+    await _seed_parole(db, "c", ceiling)
+    async with suppression.parole_reservation(db, "c", settings=s):
+        assert await _remaining(db, "c") == ceiling - 1
+        # combo_refresh re-arms parole mid-flight.
+        await db._conn.execute(
+            "UPDATE combo_performance SET parole_trades_remaining = ? "
+            "WHERE combo_key = 'c' AND window = '30d'",
+            (ceiling,),
+        )
+        await db._conn.commit()
+    assert await _remaining(db, "c") == ceiling
+    await db.close()
+
+
+async def test_no_slot_taken_means_no_refund(tmp_path, settings_factory):
+    """Non-parole reasons never touch the counter in either direction."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_combo(db, "good", trades=30, wins=20, suppressed=0)
+    async with suppression.parole_reservation(
+        db, "good", settings=settings_factory()
+    ) as res:
+        assert res.allow is True
+        assert res.reason == "ok"
+        assert res.slot_taken is False
+    assert await _remaining(db, "good") is None
+    await db.close()
+
+
+async def test_exhausted_parole_takes_no_slot(tmp_path, settings_factory):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 0)
+    async with suppression.parole_reservation(
+        db, "c", settings=settings_factory()
+    ) as res:
+        assert res.allow is False
+        assert res.reason == "parole_exhausted"
+        assert res.slot_taken is False
+    assert await _remaining(db, "c") == 0
+    await db.close()
+
+
+async def test_slot_leaks_across_process_death_by_design(tmp_path, settings_factory):
+    """Pins the DELIBERATE non-durability of the token.
+
+    The reservation is process-local and transaction-local. If the process dies
+    between decrement and refund the slot is lost — under-admission, the
+    required failure direction. Do not "fix" this with cross-restart state.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "c", 3)
+    cm = suppression.parole_reservation(db, "c", settings=settings_factory())
+    await cm.__aenter__()  # decrement lands
+    assert await _remaining(db, "c") == 2
+    del cm  # process dies; __aexit__ never runs
+    assert await _remaining(db, "c") == 2
+    await db.close()
+
+
+async def test_dispatcher_refunds_when_open_trade_declines(tmp_path, settings_factory):
+    """End-to-end through a real dispatcher, not just the primitive."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "volume_spike", 3)
+    spike = VolumeSpike(
+        coin_id="realcoin",
+        symbol="REAL",
+        name="Real Coin",
+        current_volume=1_000_000.0,
+        avg_volume_7d=100_000.0,
+        spike_ratio=10.0,
+        market_cap=50_000_000.0,
+        price=1.0,
+        detected_at=datetime.now(timezone.utc),
+    )
+    engine = _StubEngine(None)  # verified no-commit
+    await signals.trade_volume_spikes(engine, db, [spike], settings_factory())
+    assert engine.calls == 1
+    assert await _remaining(db, "volume_spike") == 3
+    await db.close()
+
+
+async def test_dispatcher_leaks_when_open_trade_raises(tmp_path, settings_factory):
+    """The dispatcher's own `except Exception` must not launder a raise into a refund."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "volume_spike", 3)
+    spike = VolumeSpike(
+        coin_id="realcoin",
+        symbol="REAL",
+        name="Real Coin",
+        current_volume=1_000_000.0,
+        avg_volume_7d=100_000.0,
+        spike_ratio=10.0,
+        market_cap=50_000_000.0,
+        price=1.0,
+        detected_at=datetime.now(timezone.utc),
+    )
+    engine = _StubEngine(RuntimeError("post-commit boom"))
+    await signals.trade_volume_spikes(engine, db, [spike], settings_factory())
+    assert engine.calls == 1
+    assert await _remaining(db, "volume_spike") == 2
+    await db.close()
+
+
+async def test_dispatcher_keeps_slot_on_commit(tmp_path, settings_factory):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    await _seed_parole(db, "volume_spike", 3)
+    spike = VolumeSpike(
+        coin_id="realcoin",
+        symbol="REAL",
+        name="Real Coin",
+        current_volume=1_000_000.0,
+        avg_volume_7d=100_000.0,
+        spike_ratio=10.0,
+        market_cap=50_000_000.0,
+        price=1.0,
+        detected_at=datetime.now(timezone.utc),
+    )
+    engine = _StubEngine(4242)  # verified commit
+    await signals.trade_volume_spikes(engine, db, [spike], settings_factory())
+    assert await _remaining(db, "volume_spike") == 2
+    await db.close()
+
+
+def test_every_dispatcher_uses_the_reservation_contract():
+    """Caller-drift guard: a 9th dispatcher must not reintroduce the raw gate."""
+    src = (
+        Path(__file__).resolve().parents[1] / "scout" / "trading" / "signals.py"
+    ).read_text(encoding="utf-8")
+    raw_gate = "allow, reason = await " + "should_open"
+    assert raw_gate not in src, "a dispatcher bypasses parole_reservation"
+    assert src.count("async with parole_reservation(") == 8
+    assert src.count("res.confirm()") == 8
