@@ -10,7 +10,7 @@ import structlog
 
 from scout.db import Database
 from scout.timeutil import sql_utc_cutoff
-from scout.trading.paper import CLOSED_COUNTABLE_STATUSES
+from scout.trading.paper import VALID_TERMINAL_OUTCOME_SQL
 
 log = structlog.get_logger()
 
@@ -32,6 +32,31 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
         return await _refresh_combo_locked(db, combo_key, settings)
 
 
+async def _resolved_retest_outcomes(
+    db: Database, combo_key: str, parole_at: str | None
+) -> int:
+    """How many valid, CLOSED outcomes has the current parole generation produced?
+
+    The cohort is anchored on ``parole_at`` — the generation's own window
+    opening — so it counts exactly the trades admitted under the parole being
+    evaluated, and cannot borrow outcomes from a previous generation.
+
+    Returns 0 when no parole window is stamped: with no generation there is no
+    retest, and the caller must preserve rather than decide.
+    """
+    if parole_at is None:
+        return 0
+    cur = await db._conn.execute(
+        f"""SELECT COUNT(*) FROM paper_trades
+             WHERE signal_combo = ?
+               AND opened_at >= ?
+               AND {VALID_TERMINAL_OUTCOME_SQL}""",
+        (combo_key, parole_at),
+    )
+    row = await cur.fetchone()
+    return (row[0] or 0) if row else 0
+
+
 async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
     """Inner implementation — called with db._txn_lock already held."""
     try:
@@ -39,7 +64,6 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         now_iso = now.isoformat()
 
         stats = {}
-        status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
         for window, days in (("7d", 7), ("30d", 30)):
             cur = await db._conn.execute(
                 f"""SELECT
@@ -50,19 +74,15 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                      COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
                    FROM paper_trades
                    WHERE signal_combo = ?
-                     AND status IN ({status_placeholders})
-                     -- GA-01 / Phase 6 slice 2: exclude fabricated $0
-                     -- closes (unpriceable token_id force-closed at
-                     -- entry_price) from combo rollups — they dilute
-                     -- total/avg PnL toward zero. Keyed on
-                     -- exit_provenance (durable label); the GA-01
-                     -- exit_reason predicate stays as OR-fallback.
-                     AND COALESCE(exit_provenance, '') != 'entry_fallback'
-                     AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
+                     -- Canonical validity predicate, NOT an exit-status
+                     -- whitelist (see paper.VALID_TERMINAL_OUTCOME_SQL).
+                     -- Restores the locked spec's "only closed trades count
+                     -- (status != 'open')" population, while excluding
+                     -- sentinel rows and the fabricated-$0 class.
+                     AND {VALID_TERMINAL_OUTCOME_SQL}
                      AND closed_at >= ?""",
                 (
                     combo_key,
-                    *CLOSED_COUNTABLE_STATUSES,
                     (now - timedelta(days=days)).isoformat(),
                 ),
             )
@@ -109,7 +129,7 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         # 30d row: apply suppression rule.
         w30 = stats["30d"]
         cur = await db._conn.execute(
-            "SELECT suppressed, parole_trades_remaining, suppressed_at "
+            "SELECT suppressed, parole_trades_remaining, suppressed_at, parole_at "
             "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
             (combo_key,),
         )
@@ -142,34 +162,61 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
             else:
-                # Frozen-lock guard (fix/frozen-suppression-lock): a currently-
-                # suppressed combo with ZERO trades in the 30d window is being
-                # refreshed only to keep its state live/alertable (see the
-                # widened selection in refresh_all). Recomputing a re-suppression
-                # here would hand a permanently-locked combo a fresh parole
-                # window + retest allowance — auto-revival the operator never
-                # approved (constraint a). So zero-trade suppressed combos route
-                # to the preserve branch; only combos with REAL retest data
-                # (trades > 0) can clear or re-arm parole.
-                zero_trade = w30["trades"] == 0
-                exhausted = remaining is not None and remaining <= 0
-                if not zero_trade and exhausted and w30["wr"] >= wr_thresh:
-                    # Retest recovered on real data — clear suppression.
+                # PAROLE-COMPLETION GATE. Spec D5 is "14 days locked, then a
+                # 5-trade re-test" — so clear/re-suppress may only be decided
+                # once that re-test has actually RESOLVED: `retest` valid,
+                # closed outcomes admitted under the CURRENT parole generation.
+                #
+                # `parole_trades_remaining == 0` does NOT prove that, and
+                # gating on it was the defect. A slot is spent at the admission
+                # GATE, so the counter can reach zero while trades are still
+                # open; and the D1 reservation deliberately LEAKS a slot on
+                # ambiguous outcomes and process death. Exhaustion is therefore
+                # compatible with fewer than `retest` usable closes — which is
+                # how three closes came to clear a suppression earned on 103
+                # trades.
+                #
+                # Counting resolved outcomes instead also SUBSUMES the old
+                # frozen-lock guard: a locked combo with no retest data has
+                # 0 < retest resolved outcomes and routes to preserve, so it
+                # still cannot be handed an unapproved auto-revival.
+                #
+                # Deliberately NOT "require 20 closes to clear": that would
+                # silently convert D5's 5-trade parole into a 20-trade
+                # experiment and make legitimate recovery unreachable for
+                # low-volume lanes. Once the gate is satisfied, the decision
+                # keeps the original 30d-WR semantics unchanged.
+                parole_at_existing = existing["parole_at"]
+                retest_resolved = await _resolved_retest_outcomes(
+                    db, combo_key, parole_at_existing
+                )
+                retest_complete = retest_resolved >= retest
+                if retest_complete and w30["wr"] >= wr_thresh:
+                    # Re-test completed and recovered — clear suppression.
                     new_suppressed = 0
                     new_suppressed_at = None
                     new_parole_at = None
                     new_parole_remaining = None
-                elif not zero_trade and exhausted:
-                    # Retest failed on real data — re-suppress with fresh parole.
+                elif retest_complete:
+                    # Re-test completed and failed — re-suppress, fresh parole.
                     new_suppressed = 1
                     new_suppressed_at = now_iso
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
                 else:
-                    # Preserve existing suppression state verbatim. Covers both
-                    # mid-parole (remaining > 0 — parole timing must not reset
-                    # every nightly refresh) and the frozen-lock zero-trade case
-                    # (keep the lock exactly as-is; no revival).
+                    # Re-test incomplete — preserve state verbatim. Covers
+                    # mid-parole (slots left), partially-resolved retests
+                    # (admitted but still open / leaked), and the frozen-lock
+                    # no-data case.
+                    log.info(
+                        "parole_retest_incomplete",
+                        combo_key=combo_key,
+                        resolved=retest_resolved,
+                        required=retest,
+                        remaining=remaining,
+                        detail="holding suppression state; exhausted slots do "
+                        "not imply resolved outcomes",
+                    )
                     new_suppressed = 1
                     new_suppressed_at = existing["suppressed_at"]
                     cur2 = await db._conn.execute(

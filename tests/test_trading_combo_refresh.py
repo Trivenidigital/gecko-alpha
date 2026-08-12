@@ -145,12 +145,21 @@ async def test_parole_auto_clear_on_wr_recovery(tmp_path, settings_factory):
         ),
     )
     await db._conn.commit()
-    # Add recent winning trades for recovery
+    # Add recent winning trades for recovery. `opened_at` must fall inside the
+    # current parole generation (>= parole_at) — the retest cohort is anchored
+    # on the generation, so trades predating it are not retest evidence.
     for _ in range(15):
-        await _insert_trade(db, "recovered", 10, 5.0, now - timedelta(days=1))
+        await _insert_trade(
+            db,
+            "recovered",
+            10,
+            5.0,
+            now - timedelta(hours=1),
+            opened_at=now - timedelta(hours=12),
+        )
     await combo_refresh.refresh_combo(db, "recovered", s)
     row = await _get_combo_row(db, "recovered", "30d")
-    # With wr >= 30 and parole_trades_remaining=0: clear suppression.
+    # Retest COMPLETE (15 >= 5 resolved) and wr >= 30: clear suppression.
     assert row["suppressed"] == 0
     assert row["parole_at"] is None
     assert row["parole_trades_remaining"] is None
@@ -172,9 +181,17 @@ async def test_re_suppression_resets_timestamps(tmp_path, settings_factory):
         (old_suppressed_at, (now - timedelta(days=1)).isoformat(), now.isoformat()),
     )
     await db._conn.commit()
-    # Recent trades still poor
+    # Recent trades still poor. `opened_at` inside the current parole
+    # generation so they count as resolved retest outcomes.
     for _ in range(20):
-        await _insert_trade(db, "re_supp", -5, -3, now - timedelta(days=2))
+        await _insert_trade(
+            db,
+            "re_supp",
+            -5,
+            -3,
+            now - timedelta(hours=1),
+            opened_at=now - timedelta(hours=12),
+        )
     await combo_refresh.refresh_combo(db, "re_supp", s)
     row = await _get_combo_row(db, "re_supp", "30d")
     assert row["suppressed"] == 1

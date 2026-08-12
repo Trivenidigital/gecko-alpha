@@ -58,6 +58,59 @@ CLOSED_COUNTABLE_STATUSES: tuple[str, ...] = (
     # to discount them can key on exit_provenance='stale_snapshot'.
     "closed_stale_onset",
 )
+# NOTE: this hand-maintained whitelist is NO LONGER the outcome-feedback
+# population — see VALID_TERMINAL_OUTCOME_SQL below. It is retained for
+# consumers that genuinely want "the classic countable set"; do not add new
+# statuses here expecting the feedback loop to notice them.
+
+
+# Canonical population for outcome feedback (combo_performance rollups).
+#
+# The original locked spec — docs/superpowers/specs/
+# 2026-04-18-paper-trading-feedback-loop-design.md §"Only closed trades count
+# (status != 'open')" — defines the population by CLOSEDNESS, not by a
+# selected family of exit reasons. `CLOSED_COUNTABLE_STATUSES` drifted away
+# from that contract: `closed_time_death` shipped 2026-07-10 (#457), went live
+# via an .env flip with no commit, produced 106 real closes, and was invisible
+# to the feedback loop the whole time because nobody remembered to register it.
+# A whitelist makes "did someone remember?" a correctness dependency.
+#
+# So the predicate is defined by VALIDITY instead, and a new exit lane is
+# counted the day it starts closing trades:
+#
+#   * `status != 'open'`            — closed, per the spec
+#   * `closed_at`/`pnl_usd` NOT NULL — EXCLUDES SENTINEL ROWS. `kraken_pilot_
+#     anchor` and `solana_lane_anchor` satisfy `status != 'open'` but are not
+#     closes at all; they would enter COUNT(*) while contributing neither a
+#     win nor a loss, silently depressing win-rate toward suppression.
+#   * not `entry_fallback` / `expired_stale_no_price` — the established
+#     fabricated-$0 class (GA-01 / Phase 6 slice 2).
+#   * not `closed_manual` — an OPERATOR-INITIATED force close is an operator
+#     action, not evidence about the signal, and lands at ~0 pnl. This one is
+#     NOT drift: it was excluded deliberately in #29 — the same PR that
+#     implemented the locked spec — and is pinned by
+#     test_closed_manual_excluded_from_wr, whose docstring gives the rationale
+#     ("10 closed_tp wins + 10 closed_manual (0 pnl) -> WR=50% diluted").
+#     Contrast `closed_floor` (#48), `closed_peak_fade` (#50) and
+#     `closed_time_death` (#457), which carry no such test or rationale and
+#     are genuine drift.
+#
+# Caveat stated plainly: `closed_manual` is a PROVENANCE exclusion implemented
+# via a status name, because the schema has no `closed_by` column to key on. It
+# is the only name-based term here, and it is the marker of last resort — not a
+# reopening of the whitelist. A `closed_by`/provenance column would let this
+# become a true provenance predicate.
+#
+# Deliberately does NOT reference the status registry: the population must not
+# depend on `TradeStatus` membership, or the same drift returns by a new route.
+VALID_TERMINAL_OUTCOME_SQL: str = """
+        status != 'open'
+        AND status != 'closed_manual'
+        AND closed_at IS NOT NULL
+        AND pnl_usd IS NOT NULL
+        AND COALESCE(exit_provenance, '') != 'entry_fallback'
+        AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
+"""
 
 
 @dataclass
