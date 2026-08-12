@@ -124,21 +124,33 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
             continue
         log.info("retest_incomplete_alert_delivered", combo_key=combo_key)
 
+        # Delivery is done; the DB mutation is not. Reacquire `_txn_lock` for
+        # the short marker write: every commit on the shared connection must
+        # hold it, or concurrent writers interleave executes and leave
+        # half-open transactions. Only the NETWORK call belongs outside.
         try:
-            before = conn.total_changes
-            await conn.execute(
-                "UPDATE combo_performance SET retest_incomplete_alerted_at = ? "
-                "WHERE combo_key = ? AND window = '30d' "
-                "  AND suppressed_at IS ? AND parole_at IS ?",
-                (
-                    datetime.now(timezone.utc).isoformat(),
-                    combo_key,
-                    suppressed_at,
-                    parole_at,
-                ),
-            )
-            changed = conn.total_changes - before
-            await conn.commit()
+            async with db._txn_lock:
+                cur = await conn.execute(
+                    "UPDATE combo_performance "
+                    "SET retest_incomplete_alerted_at = ? "
+                    "WHERE combo_key = ? AND window = '30d' "
+                    "  AND suppressed_at IS ? AND parole_at IS ?",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        combo_key,
+                        suppressed_at,
+                        parole_at,
+                    ),
+                )
+                # THIS statement's affected-row count — never
+                # `Connection.total_changes`, which is connection-wide and
+                # cumulative. Because delivery ran unlocked, an unrelated
+                # coroutine can write on the shared connection around this
+                # point; a total_changes delta would then read as success even
+                # when this generation-bound UPDATE matched zero rows, exactly
+                # defeating the stale-generation check.
+                changed = cur.rowcount
+                await conn.commit()
             if changed == 0:
                 # The generation moved while we were sending. The marker is
                 # deliberately NOT stamped onto the replacement generation —

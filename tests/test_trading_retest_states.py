@@ -462,3 +462,122 @@ async def test_marker_write_is_generation_bound(
     ), "stale marker stamped the replacement generation"
     assert alerted == [], "must not report an alert against a dead generation"
     await db.close()
+
+
+async def test_unrelated_same_connection_write_cannot_fake_marker_success(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Kills the `Connection.total_changes` false-positive.
+
+    Delivery runs unlocked, so an unrelated coroutine can write on the shared
+    connection around the marker mutation. A connection-wide cumulative counter
+    would read that stranger's write as "my UPDATE succeeded" even when the
+    generation-bound UPDATE matched zero rows — silently defeating the
+    stale-generation check. Only THIS statement's affected-row count is valid.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    parole_at = datetime.now(timezone.utc) - timedelta(days=2)
+    await _seed(db, "victim", parole_at, 0)
+    # Slots remain -> NOT a terminal-incomplete candidate itself; it exists
+    # only to be the target of the interleaving stranger write.
+    await _seed(db, "unrelated", parole_at, 5)
+    for _ in range(3):
+        await _close(db, "victim", parole_at)
+
+    async def shift_generation(message, settings):
+        # Generation moves during delivery -> the marker UPDATE must match 0 rows.
+        await db._conn.execute(
+            "UPDATE combo_performance SET suppressed_at = ?, parole_at = ? "
+            "WHERE combo_key = 'victim' AND window = '30d'",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(),
+            ),
+        )
+        await db._conn.commit()
+
+    monkeypatch.setattr(
+        combo_refresh, "_send_retest_incomplete_alert", shift_generation
+    )
+
+    orig_execute = db._conn.execute
+
+    async def interleaving_execute(sql, parameters=None, *a, **kw):
+        if "retest_incomplete_alerted_at = ?" in sql:
+            # An unrelated SUCCESSFUL write lands on the same connection
+            # immediately before the marker UPDATE.
+            cur = await orig_execute(
+                "UPDATE combo_performance "
+                "SET refresh_failures = refresh_failures + 1 "
+                "WHERE combo_key = 'unrelated' AND window = '30d'"
+            )
+            assert cur.rowcount == 1, "fixture must actually write a row"
+        if parameters is None:
+            return await orig_execute(sql, *a, **kw)
+        return await orig_execute(sql, parameters, *a, **kw)
+
+    monkeypatch.setattr(db._conn, "execute", interleaving_execute)
+
+    alerted = await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+    monkeypatch.undo()
+    row = await _row(db, "victim")
+    assert row["retest_incomplete_alerted_at"] is None
+    assert (
+        alerted == []
+    ), "an unrelated same-connection write was read as marker success"
+    await db.close()
+
+
+async def test_network_runs_unlocked_but_marker_write_holds_the_lock(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Pins BOTH halves of the transaction-placement rule.
+
+    Telegram delivery must NOT hold `_txn_lock` — an aiohttp await would pin
+    the trading lock for the client timeout. The subsequent marker mutation
+    MUST hold it — every commit on the shared connection does, or concurrent
+    writers interleave executes and leave half-open transactions.
+
+    Lock acquisition is invisible to ordinary assertions, so observe it
+    directly at both sites rather than hoping a race surfaces it.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    parole_at = datetime.now(timezone.utc) - timedelta(days=2)
+    await _seed(db, "lockcheck", parole_at, 0)
+    for _ in range(3):
+        await _close(db, "lockcheck", parole_at)
+
+    seen: dict = {}
+
+    async def send(message, settings):
+        seen["locked_during_send"] = db._txn_lock.locked()
+
+    monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", send)
+
+    orig_execute = db._conn.execute
+
+    async def watch(sql, parameters=None, *a, **kw):
+        if "retest_incomplete_alerted_at = ?" in sql:
+            seen["locked_during_marker"] = db._txn_lock.locked()
+        if parameters is None:
+            return await orig_execute(sql, *a, **kw)
+        return await orig_execute(sql, parameters, *a, **kw)
+
+    monkeypatch.setattr(db._conn, "execute", watch)
+    await combo_refresh._process_retest_terminal_incomplete(db, s)
+    monkeypatch.undo()
+
+    assert seen.get("locked_during_send") is False, (
+        "Telegram delivery held _txn_lock — pins the trading lock for the "
+        "client timeout"
+    )
+    assert seen.get("locked_during_marker") is True, (
+        "marker mutation ran without _txn_lock — violates the shared-connection "
+        "commit invariant"
+    )
+    await db.close()
