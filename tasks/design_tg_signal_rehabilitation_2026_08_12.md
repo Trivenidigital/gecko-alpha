@@ -1,17 +1,16 @@
-**New primitives introduced:** (1) `tg_act_shadow` append-only decision table + writer (targeted `ON CONFLICT` idempotency, `_txn_lock`-guarded) + §12a lag-vs-eligible-input watchdog with generation cutover; (2) `tg_act_shadow_generations` gate-version activation registry (one row per gate_version, created only at enabled activation); (3) `evaluate_tg_actionability_shadow()` versioned counterfactual evaluator with code+config fingerprint binding, fed through a `CallerFeatureProvider` interface defined in Stage A; (4) `tg_caller_features()` read-only, as-of-decision-time feature extractor reconstructing from the INSERT-only canonical TG tables + forward-only price snapshots (NO new caller storage); (5) `scripts/qualify_tg_lifecycle_priceability.py` read-only historical-replay qualification harness with right-censoring; (6) widened `signal_data` pass-through fields in the TG dispatcher (field additions, not a new mechanism).
+**New primitives introduced:** (1) `tg_act_shadow` append-only decision table + writer (targeted `ON CONFLICT` idempotency, `_txn_lock`-guarded) + §12a lag-vs-eligible-input watchdog with generation cutover; (2) `tg_act_shadow_generations` gate-version activation registry (one row per gate_version, created only at enabled activation); (3) `resolution_snapshot_json` additive nullable column on `tg_social_signals`, populated in the SAME INSERT from the in-memory `ResolvedToken` (schema-versioned durable decision-input capture); (4) `evaluate_tg_actionability_shadow()` versioned counterfactual evaluator with code+config fingerprint binding, fed through a `CallerFeatureProvider` interface defined in Stage A; (5) `tg_caller_features()` read-only, as-of-decision-time feature extractor reconstructing from the INSERT-only canonical TG tables + forward-only price snapshots (NO new caller storage); (6) `scripts/qualify_tg_lifecycle_priceability.py` read-only historical-replay qualification harness with right-censoring; (7) widened `signal_data` pass-through fields in the TG dispatcher (field additions, not a new mechanism).
 
-# TG Signal Rehabilitation — Design Proposal v1.3 (2026-08-12)
+# TG Signal Rehabilitation — Design Proposal v1.4 (2026-08-12)
 
-v1.3 is a surgical truth-maintenance revision fixing the three v1.2 blockers:
-(i) Stage B reconstructs from the verified INSERT-only tables (`tg_social_messages`,
-`tg_social_signals`) + the verified forward-only snapshot writer — `source_calls` is
-removed from Stage B's input set because `_upsert_source_call()` mutates nearly every
-payload column (§B); (ii) generation rows are created at **enabled activation**, never
-at dark-deploy startup, with re-enable semantics defined (§A-generations); (iii)
-`gate_version` computation and generation creation are **activation-time operations**
-behind a Stage-A-defined `CallerFeatureProvider` interface, so PR A is self-consistent
-before PR B exists (§A-version). v1.2 resolved the prior 10-point review; v1.1 the five
-pre-approval requirements. The A/B/C/D architecture is unchanged and operator-accepted.
+v1.4 is a surgical revision fixing the two v1.3 blockers: (i) durable decision-input
+capture — the richer resolver facts are persisted at the existing TG signal INSERT
+boundary as `resolution_snapshot_json`, so catch-up and crash-restart reproduce the
+exact original shadow decision with zero refetch (§A-snapshot); (ii) the provider
+contract separates caller-history features (strictly excluding the current signal) from
+current-event context, and every forward-horizon coverage denominator carries its own
+maturity rule (§B-contract). v1.3 fixed canonical inputs / activation-time generations /
+provider decoupling; v1.2 the 10-point review; v1.1 the five pre-approval requirements.
+The A/B/C/D architecture is unchanged and operator-accepted.
 
 Operator directive: rehabilitate `tg_social` as an evidence-producing participant in ACT
 and learning **without** using paper-trade re-enablement as the discovery mechanism for
@@ -67,15 +66,48 @@ versioned** TG actionability decision and persist it, while the lane stays quara
 | duplicate/corroboration state | ledger cluster machinery | **absent** | within-channel: `duplicate_rank_in_cluster` recomputed as-of; cross-channel: channel-independent key (§B) |
 | resolution/priceability confidence | partial (`resolution_state`) | **absent** | `resolution_state` + identity shape (cg-id vs `dex:{chain}:{addr}`) |
 
+Every "forwarded" field above is ALSO persisted durably at the signal insert boundary —
+see the snapshot section below; `signal_data` widening serves the (blocked) trading
+path, but the **canonical recovery source is the persisted snapshot**, never
+`signal_data` (which, with TG quarantined, may never reach a trade record at all).
+
+### Durable resolution snapshot (v1.4 — decision inputs survive the process)
+
+The shadow's decision-time facts must be recoverable after the `ResolvedToken` is gone:
+v1.3's own semantics require it (same-generation catch-up after a disabled window;
+crash between the signal INSERT and the `tg_act_shadow` write), and the zero-refetch
+constraint forbids filling gaps from APIs. Therefore `tg_social_signals` gains an
+**additive nullable column `resolution_snapshot_json`**, populated **in the same
+INSERT** (`listener.py:585` site) from the already-resolved in-memory token — the table
+stays INSERT-only, the pinning tests stay valid, and no new table is introduced.
+
+Snapshot content (canonical JSON, sorted keys): `snapshot_schema_version` (starts at 1),
+`price_usd`, `volume_24h_usd`, `age_days`, `liquidity_usd` (when extractable — Stage A
+zero-new-API constraint unchanged), the safety trio
+(`safety_pass`/`safety_check_completed`/`safety_skipped_no_ca`), and an explicit
+per-field availability state — a field the resolver could not supply is recorded as
+`null` (distinguishable from absent-key, which means "schema version predates the
+field"). Recovery rule: **catch-up/restart reproduces the original decision exclusively
+from the persisted snapshot + as-of features; no external refetch may ever fill a
+missing historical decision input.** A post-cutover row whose snapshot is missing or
+unparseable is decided `shadow_block_snapshot_missing` — visible in the reason
+distribution, never silently skipped. (Generation cutover guarantees the evaluated
+population always post-dates the column: the migration ships in PR A, activation comes
+later, and the eligibility scan only sees `created_at ≥ activated_at`.) Migration:
+additive nullable `ALTER TABLE`, upgrade-tested from the OLD table shape; existing rows
+stay NULL — the correct pre-cutover state, and outside every generation by
+construction.
+
 ### Decision contract
 
-`evaluate_tg_actionability_shadow(signal, features) -> (actionable: bool, reason: str, gate_version: str)`
+`evaluate_tg_actionability_shadow(signal, snapshot, features) -> (actionable: bool, reason: str, gate_version: str)`
 — deterministic, thresholds from `Settings` (no hardcodes), reasons enumerated so we can
 later answer "how many rejections were weak-caller vs missing-liquidity vs unpriceable-identity":
 `shadow_pass`, `shadow_block_missing_mcap`, `shadow_block_liquidity_unknown`,
 `shadow_block_caller_insufficient_n`, `shadow_block_caller_quality`,
 `shadow_block_duplicate_call`, `shadow_block_safety_not_passed`,
-`shadow_block_identity_unpriceable_class`, `shadow_block_mcap_band`.
+`shadow_block_identity_unpriceable_class`, `shadow_block_mcap_band`,
+`shadow_block_snapshot_missing`.
 
 ### Version binding (v1.3: activation-time computation via a Stage-A interface)
 
@@ -99,7 +131,9 @@ split a cohort; that is accepted as the cheap side of the trade.
 
 **Stage-A/Stage-B decoupling (v1.3).** PR A defines a `CallerFeatureProvider` interface
 — `caller_feature_semantic_version`, `feature_schema()`, `module_source_hash`,
-`features(channel_handle, as_of)` — and the evaluator consumes only that interface.
+`features(channel_handle, decision_as_of, current_signal_id)` (signature per §B
+contract: caller-history strictly excludes the current signal; current-event context
+may include it) — and the evaluator consumes only that interface.
 **`gate_version` computation and generation creation are activation-time operations**,
 not import-time or deploy-time: they require a registered real provider. PR A ships no
 real provider; its tests inject a deterministic test-only fixture provider (clearly
@@ -245,10 +279,11 @@ on 2026-08-12:
   Supplies: `posted_at` (call time), `parsed_at` (ingest time), channel, raw
   extractions.
 - **`tg_social_signals`** — single INSERT site (`listener.py:585`), all columns
-  including `paper_trade_id` and `alert_sent_at` bound at insert; zero UPDATE
-  statements in `scout/`. Supplies: identity (`token_id`, `contract_address`, `chain`),
-  `mcap_at_sighting`, `resolution_state` (as recorded at insert), channel, `created_at`
-  (resolution/persist time).
+  including `paper_trade_id`, `alert_sent_at`, and (v1.4) `resolution_snapshot_json`
+  bound at insert; zero UPDATE statements in `scout/`. Supplies: identity (`token_id`,
+  `contract_address`, `chain`), `mcap_at_sighting`, `resolution_state` (as recorded at
+  insert), channel, `created_at` (resolution/persist time), and the durable decision
+  snapshot.
 - **`source_call_price_snapshots`** — single writer (`snapshot_writer.py:246`), which
   stamps `snapshot_at = now` of the cycle ("one forward-only snapshot cycle" is its
   documented contract): observation time IS ingest time, and no backfill path exists.
@@ -286,10 +321,39 @@ ledger's window-bound convention (`forward_24h_pct` closes at call time + 28h,
 
 "Exclude pending/partial as of today" is explicitly NOT the rule — that leaks future
 outcomes into historical decisions. **Determinism test (required):** recomputing
-`tg_caller_features(channel, T)` at any later wall-clock time must produce byte-identical
-`features_json` — guaranteed by the verified INSERT-only/forward-only inputs above;
-this also legitimizes backfill (a backfilled decision sees exactly what a live decision
-at `T` would have seen).
+`tg_caller_features(channel, T, signal_id)` at any later wall-clock time must produce
+byte-identical `features_json` — guaranteed by the verified INSERT-only/forward-only
+inputs above; this also legitimizes backfill (a backfilled decision sees exactly what a
+live decision at `T` would have seen).
+
+### Provider contract — self-exclusion + denominator maturity (v1.4)
+
+`features(channel_handle, decision_as_of, current_signal_id)` returns two explicitly
+separated feature groups:
+
+- **Caller-history features** (track record: forward returns, coverage rates, eligible
+  clusters, duplicate rate, recency split) — computed **strictly excluding
+  `current_signal_id`** and its message row. The signal being scored can neither
+  improve nor degrade its own caller's reputation; a naive `created_at ≤ as_of` query
+  would include it, since shadow evaluation runs after persistence.
+- **Current-event context** (duplicate state of THIS call, cross-channel corroboration
+  of THIS call's identity/time bucket) — may include the current signal, because these
+  describe the event itself rather than the caller's history.
+
+**Coverage-denominator maturity:** every coverage statistic tied to a forward horizon
+includes a call in **both numerator and denominator only if that horizon's measurement
+window was eligible to have completed by `as_of`** — i.e. `posted_at + window_end ≤
+as_of` for the horizon in question. A 10-minute-old priceable call therefore does not
+depress 30m coverage: it is simply not yet in that denominator, and it enters once its
+45-minute window closes. Without this rule, a channel receiving a burst of fresh calls
+would appear to have deteriorating coverage when the snapshot writer has had no
+opportunity to measure them.
+
+**Pinned fixtures (required in PR B):** (i) the current signal is excluded from
+caller-history features; (ii) the current signal IS visible to contemporaneous
+duplicate/corroboration context; (iii) a 10-minute-old call does not depress
+`forward_30m`-based coverage; (iv) the same call enters the 30m coverage denominator
+once its 45-minute window has closed.
 
 ### Cross-channel corroboration key (v1.3 — channel-independent, from canonical tables)
 
@@ -423,17 +487,21 @@ changes days later. Dark-merge order between the two PRs is free; **activation i
 
 ## Cost, sequencing, and approvals
 
-Build sequence (each its own PR, tests-first): (1) Stage A pass-through + shadow
-evaluator + `CallerFeatureProvider` interface + tables (`tg_act_shadow`,
-`tg_act_shadow_generations`) + watchdog (~300 LOC + tests incl. restart-replay
-idempotency, loud-failure, lock-discipline, activation-refused-without-provider,
-no-generation-while-disabled, and generation-cutover cases; evaluator tested against a
-deterministic fixture provider); (2) Stage B `tg_caller_features()` as the real provider
-(~220 LOC + tests incl. the determinism/no-leakage test with late-`parsed_at` fixtures,
-the cross-channel corroboration key test, and the two pinning tests: no-UPDATE guard on
-the TG tables and forward-only `snapshot_at` regression); (3) Stage C harness +
-stratified report (~200 LOC + fixture tests incl. the structural-invariant and
-pending_maturity assertions). API
+Build sequence (each its own PR, tests-first): (1) Stage A pass-through +
+`resolution_snapshot_json` migration (additive nullable, populated in the same INSERT,
+upgrade-tested from the OLD table shape) + shadow evaluator + `CallerFeatureProvider`
+interface + tables (`tg_act_shadow`, `tg_act_shadow_generations`) + watchdog (~340 LOC +
+tests incl. restart-replay idempotency, loud-failure, lock-discipline,
+activation-refused-without-provider, no-generation-while-disabled, generation-cutover,
+snapshot round-trip/recovery, and snapshot-missing-reason cases; evaluator tested
+against a deterministic fixture provider); (2) Stage B `tg_caller_features()` as the
+real provider (~250 LOC + tests incl. the determinism/no-leakage test with
+late-`parsed_at` fixtures, the cross-channel corroboration key test, the four v1.4
+contract fixtures — current-signal exclusion, contemporaneous-context inclusion, fresh
+call not depressing 30m coverage, matured call entering the denominator — and the two
+pinning tests: no-UPDATE guard on the TG tables and forward-only `snapshot_at`
+regression); (3) Stage C harness + stratified report (~200 LOC + fixture tests incl.
+the structural-invariant and pending_maturity assertions). API
 cost: zero new external calls in A/B; C's outcome calculation reads existing historical
 snapshots only (the disclosed exception: `gecko-solana-verify` identity RPC reads,
 reported separately). Approvals required: operator spec approval (this document), per-PR
