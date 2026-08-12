@@ -1,15 +1,17 @@
-**New primitives introduced:** (1) `tg_act_shadow` append-only decision table + writer (targeted `ON CONFLICT` idempotency, `_txn_lock`-guarded) + §12a lag-vs-eligible-input watchdog with generation cutover; (2) `tg_act_shadow_generations` gate-version activation registry (one row per gate_version); (3) `evaluate_tg_actionability_shadow()` versioned counterfactual evaluator with code+config fingerprint binding; (4) `tg_caller_features()` read-only, as-of-decision-time feature extractor reconstructing from immutable/timestamped ledger observations (NO new caller storage); (5) `scripts/qualify_tg_lifecycle_priceability.py` read-only historical-replay qualification harness with right-censoring; (6) widened `signal_data` pass-through fields in the TG dispatcher (field additions, not a new mechanism).
+**New primitives introduced:** (1) `tg_act_shadow` append-only decision table + writer (targeted `ON CONFLICT` idempotency, `_txn_lock`-guarded) + §12a lag-vs-eligible-input watchdog with generation cutover; (2) `tg_act_shadow_generations` gate-version activation registry (one row per gate_version, created only at enabled activation); (3) `evaluate_tg_actionability_shadow()` versioned counterfactual evaluator with code+config fingerprint binding, fed through a `CallerFeatureProvider` interface defined in Stage A; (4) `tg_caller_features()` read-only, as-of-decision-time feature extractor reconstructing from the INSERT-only canonical TG tables + forward-only price snapshots (NO new caller storage); (5) `scripts/qualify_tg_lifecycle_priceability.py` read-only historical-replay qualification harness with right-censoring; (6) widened `signal_data` pass-through fields in the TG dispatcher (field additions, not a new mechanism).
 
-# TG Signal Rehabilitation — Design Proposal v1.2 (2026-08-12)
+# TG Signal Rehabilitation — Design Proposal v1.3 (2026-08-12)
 
-v1.2 addresses the operator's 10-point review of v1.1 (6 blockers, 3 important, 1 minor):
-observed_at-bounded as-of reconstruction from immutable observations (§B), channel-
-independent corroboration key (§B), A+B joint activation (§Gates), watchdog generation
-cutover (§A-observability), targeted ON CONFLICT (§A-persistence), code-bound gate
-version (§A-version), pre-ratified PQ thresholds (§C), `pending_maturity` right-censoring
-(§C), `_txn_lock` ownership (§A-ownership), Solana-verify scope separation (§C).
-v1.1 incorporated the five pre-approval requirements. The A/B/C/D architecture is
-unchanged and operator-accepted.
+v1.3 is a surgical truth-maintenance revision fixing the three v1.2 blockers:
+(i) Stage B reconstructs from the verified INSERT-only tables (`tg_social_messages`,
+`tg_social_signals`) + the verified forward-only snapshot writer — `source_calls` is
+removed from Stage B's input set because `_upsert_source_call()` mutates nearly every
+payload column (§B); (ii) generation rows are created at **enabled activation**, never
+at dark-deploy startup, with re-enable semantics defined (§A-generations); (iii)
+`gate_version` computation and generation creation are **activation-time operations**
+behind a Stage-A-defined `CallerFeatureProvider` interface, so PR A is self-consistent
+before PR B exists (§A-version). v1.2 resolved the prior 10-point review; v1.1 the five
+pre-approval requirements. The A/B/C/D architecture is unchanged and operator-accepted.
 
 Operator directive: rehabilitate `tg_social` as an evidence-producing participant in ACT
 and learning **without** using paper-trade re-enablement as the discovery mechanism for
@@ -75,7 +77,7 @@ later answer "how many rejections were weak-caller vs missing-liquidity vs unpri
 `shadow_block_duplicate_call`, `shadow_block_safety_not_passed`,
 `shadow_block_identity_unpriceable_class`, `shadow_block_mcap_band`.
 
-### Version binding (v1.2: binds code, not just declared labels)
+### Version binding (v1.3: activation-time computation via a Stage-A interface)
 
 The effective version is `gate_version = "tg-shadow-v1+" + config_fingerprint[:16]`
 (16 visible hex chars; the **full** SHA-256 digest is persisted inside `features_json`).
@@ -94,6 +96,20 @@ semantics without renaming fields or touching thresholds still changes the finge
 Deliberately NOT the deployed repo SHA — unrelated commits must not split cohorts; only
 the decision-producing code is bound. A cosmetic-only edit to those two modules does
 split a cohort; that is accepted as the cheap side of the trade.
+
+**Stage-A/Stage-B decoupling (v1.3).** PR A defines a `CallerFeatureProvider` interface
+— `caller_feature_semantic_version`, `feature_schema()`, `module_source_hash`,
+`features(channel_handle, as_of)` — and the evaluator consumes only that interface.
+**`gate_version` computation and generation creation are activation-time operations**,
+not import-time or deploy-time: they require a registered real provider. PR A ships no
+real provider; its tests inject a deterministic test-only fixture provider (clearly
+marked, never registered in production wiring). If `TG_SHADOW_ENABLED=true` with no real
+provider registered, the writer refuses to arm: it logs structured
+`tg_shadow_activation_refused_no_feature_provider`, creates NO generation row, and
+processes nothing — a loud misconfiguration, not a silent half-activation. PR B ships
+`tg_caller_features()` as the real provider; only then is the two-module fingerprint
+computable and activation possible. This makes the joint-activation gate mechanical
+rather than procedural.
 
 ### Persistence + idempotency invariant (v1.2: targeted conflict handling)
 
@@ -134,7 +150,7 @@ BEFORE lock acquisition; nothing long-running (and zero network — see below) h
 under the lock. A feature flag does not make a malformed writer harmless; the lock
 discipline is a merge requirement, not an activation-time concern.
 
-### Generation registry + observability (v1.2: cutover boundary)
+### Generation registry + observability (v1.3: activation-time cutover, re-enable defined)
 
 New single-purpose registry:
 
@@ -145,26 +161,52 @@ tg_act_shadow_generations(
 )
 ```
 
-Written exactly once per gate_version: at writer startup, if the computed `gate_version`
-has no row, insert `(gate_version, now)` (same `ON CONFLICT DO NOTHING` + rowcount
-discipline). This is the **prospective-mode cutover**: the watchdog and the writer's
-eligibility scan consider only signals whose RESOLVED `created_at` ≥ the current
-gate_version's `activated_at`. First activation therefore starts from zero eligible rows,
-and a threshold change (new gate_version) starts a new generation prospectively — **no
-implicit obligation to backfill history, and no page storm at cutover.** Historical
-backfill, if ever wanted, is a separate **named operation** with a finite frozen
-signal-id cohort, run under an operator instruction, and the watchdog stays disarmed for
-that generation until the backfill reconciles. A LEFT JOIN never decides this policy.
+**Invariant: no `tg_act_shadow_generations` row is ever created while
+`TG_SHADOW_ENABLED=false`.** The generation row is created atomically on the **first
+enabled startup** after A+B are both deploy-verified and a real feature provider is
+registered (§Version binding): if the computed `gate_version` has no row, insert
+`(gate_version, now)` (same `ON CONFLICT DO NOTHING` + rowcount discipline).
+`activated_at` is therefore the **activation boundary, never installation/deployment
+time** — dark deployment writes nothing, and calls arriving between dark deploy and
+operator activation are NOT part of the generation. This is the prospective-mode
+cutover: the watchdog and the writer's eligibility scan consider only signals whose
+RESOLVED `created_at` ≥ the current gate_version's `activated_at`. First activation
+starts from zero eligible rows; a threshold change (new gate_version) starts a new
+generation prospectively — **no implicit obligation to backfill history, no page storm
+at cutover.**
 
-The §12a watchdog condition (activation-aware, generation-aware):
+**Re-enable semantics (explicit):** disabling and re-enabling the SAME `gate_version`
+**resumes the existing generation** — the registry row already exists and is not
+rewritten; signals that became RESOLVED during the disabled window satisfy
+`created_at ≥ activated_at` and are processed by the writer's startup catch-up scan.
+To avoid a false page during that catch-up, the writer logs a scan-completion event
+(`tg_shadow_scan_complete`, with scanned/written counts) and the watchdog alarms only
+for eligible rows that remain unshadowed **after** the most recent completed scan. A
+deliberate fresh start requires a new gate_version (threshold/semantic bump), not a
+disable/enable cycle. Historical backfill, if ever wanted, is a separate **named
+operation** with a finite frozen signal-id cohort, run under an operator instruction,
+and the watchdog stays disarmed for that generation until the backfill reconciles. A
+LEFT JOIN never decides this policy.
 
-> alarm iff `TG_SHADOW_ENABLED` is true AND ≥1 `tg_social_signals` row exists with
-> `resolution_state='RESOLVED'` AND `created_at ≥ activated_at(current gate_version)`
-> AND `created_at` older than the lag threshold (proposed 60 min) AND no `tg_act_shadow`
-> row for the current `gate_version`.
+The §12a watchdog fires on EITHER of two conditions (activation-aware, generation-aware,
+catch-up-aware — and a dead writer still pages):
 
-This distinguishes "no work arrived" (quiet Telegram day — no page) from "work arrived
-and the shadow writer failed" (page, with the eligible-but-unshadowed count in the body).
+> **(a) writer running but failing:** `TG_SHADOW_ENABLED` is true AND ≥1
+> `tg_social_signals` row exists with `resolution_state='RESOLVED'` AND
+> `created_at ≥ activated_at(current gate_version)` AND `created_at` older than the lag
+> threshold (proposed 60 min) AND no `tg_act_shadow` row for the current `gate_version`
+> AND a writer scan (`tg_shadow_scan_complete`) has completed since that row became
+> overdue — the row survived a real scan.
+>
+> **(b) writer dead:** `TG_SHADOW_ENABLED` is true AND ≥1 eligible overdue row exists
+> (as above) AND NO writer scan has completed within the scan-cadence budget (proposed
+> 30 min). Absence of scans is itself the failure — catch-up suppression never masks a
+> crashed writer.
+
+This distinguishes three states: "no work arrived" (quiet Telegram day — no page),
+"work arrived, writer scanning but rows still unshadowed" (page via a), and "work
+arrived, writer not scanning at all" (page via b). The page body carries the
+eligible-but-unshadowed count and the last scan-completion timestamp.
 
 ### Ownership and failure behavior
 
@@ -188,53 +230,79 @@ message count), duplicate rate/rank, both coverage denominators (`coverage_rate`
 unpriceable proportion, cross-channel corroboration, and a trailing-30d vs lifetime
 recency split.
 
-### Reconstruction source (v1.2 — immutable observations, not current aggregates)
+### Reconstruction source (v1.3 — verified INSERT-only inputs; `source_calls` excluded)
 
 `compute_source_quality_summary()` reads **current** derived fields, and the ledger is
-mutable by design: outcome fields refresh later, `resolved_state` updates,
-`duplicate_rank_in_cluster` is recomputed. Therefore Stage B **reuses the ledger's axes
-but NOT its current aggregate output**: every feature is reconstructed from
-immutable/timestamped observations — `source_calls` insert-time facts (`call_ts`,
-`observed_at`, identity, channel) and timestamped `source_call_price_snapshots` rows —
-restricted to what was provably recorded by `as_of`. Mutable derived columns
-(`resolved_state`, `duplicate_rank_in_cluster`, refreshed outcome fields) are never
-consumed as if they existed historically; where a derived value is needed (duplicate
-rank, cluster membership, forward returns) it is **re-derived as-of** from the immutable
-rows.
+mutable by design: `_upsert_source_call()` performs an upsert whose update set includes
+essentially every payload column (identity, channel, timestamps, linkage) — so
+**`source_calls` is NOT immutable at its writer boundary and is excluded from Stage B's
+input set entirely.** Stage B reuses the ledger's *axes* (the feature definitions) but
+reconstructs every feature from inputs whose immutability was verified against master
+on 2026-08-12:
 
-### As-of knowability (v1.2 — double time bound)
+- **`tg_social_messages`** — single INSERT site (`listener.py:498`), UNIQUE
+  `(channel_handle, msg_id)` duplicate-skip, zero UPDATE statements in `scout/`.
+  Supplies: `posted_at` (call time), `parsed_at` (ingest time), channel, raw
+  extractions.
+- **`tg_social_signals`** — single INSERT site (`listener.py:585`), all columns
+  including `paper_trade_id` and `alert_sent_at` bound at insert; zero UPDATE
+  statements in `scout/`. Supplies: identity (`token_id`, `contract_address`, `chain`),
+  `mcap_at_sighting`, `resolution_state` (as recorded at insert), channel, `created_at`
+  (resolution/persist time).
+- **`source_call_price_snapshots`** — single writer (`snapshot_writer.py:246`), which
+  stamps `snapshot_at = now` of the cycle ("one forward-only snapshot cycle" is its
+  documented contract): observation time IS ingest time, and no backfill path exists.
+  Supplies: price observations.
 
-A historical input row contributes to features at decision time `as_of` only if:
+Derived values (duplicate rank, cluster membership, forward returns) are **re-derived
+as-of** from these rows; no mutable derived column is ever consumed as if it existed
+historically. **Pinning obligations (required tests in PR B):** (i) a source-text +
+runtime guard asserting no UPDATE path targets the two TG tables (regression alarm if
+one is ever added); (ii) a forward-only regression test on the snapshot writer asserting
+every inserted `snapshot_at` ≥ the max existing `snapshot_at` (documents the invariant
+the knowability bound relies on). If either invariant is ever deliberately broken, Stage
+B's evidence claims must be re-reviewed before the next gate_version activates.
 
-> `call_ts ≤ as_of` **AND** `observed_at ≤ as_of`
+### As-of knowability (v1.3 — double time bound on verified columns)
+
+A historical input row contributes to features at decision time `as_of` only if it was
+both posted and **ingested** by `as_of`:
+
+> message facts: `posted_at ≤ as_of` **AND** `parsed_at ≤ as_of`
+> signal facts: `created_at ≤ as_of`
+> price observations: `snapshot_at ≤ as_of` (sufficient because the writer is verified
+> forward-only — `snapshot_at` is the recording time, not a claimed historical time;
+> the pinning test above keeps this sufficient)
 
 — a call posted before `T` but ingested after `T` was not knowable at `T` and is
 excluded. On top of knowability, **outcome maturity** applies per feature, using the
-ledger's own window bounds (`forward_24h_pct` closes at call_ts + 28h, `forward_6h_pct`
-at +7h, `forward_1h_pct` at +90m, `forward_30m_pct` at +45m):
+ledger's window-bound convention (`forward_24h_pct` closes at call time + 28h,
+`forward_6h_pct` at +7h, `forward_1h_pct` at +90m, `forward_30m_pct` at +45m):
 
 > a prior call contributes a forward-return field **only if**
-> `prior_call_ts + window_end ≤ as_of` AND the snapshot rows that price that window have
-> `snapshot_at ≤ as_of`. A window still open at `as_of` is excluded from that field's
-> numerator AND denominator — neither a win, a loss, nor a sample.
+> `prior_posted_at + window_end ≤ as_of` AND the snapshot rows that price that window
+> have `snapshot_at ≤ as_of`. A window still open at `as_of` is excluded from that
+> field's numerator AND denominator — neither a win, a loss, nor a sample.
 
 "Exclude pending/partial as of today" is explicitly NOT the rule — that leaks future
 outcomes into historical decisions. **Determinism test (required):** recomputing
 `tg_caller_features(channel, T)` at any later wall-clock time must produce byte-identical
-`features_json` — guaranteed precisely because inputs are immutable timestamped rows;
+`features_json` — guaranteed by the verified INSERT-only/forward-only inputs above;
 this also legitimizes backfill (a backfilled decision sees exactly what a live decision
 at `T` would have seen).
 
-### Cross-channel corroboration key (v1.2 — channel-independent)
+### Cross-channel corroboration key (v1.3 — channel-independent, from canonical tables)
 
 The existing `duplicate_cluster_key` embeds `source_id` (the channel) + day, so the same
 token called by two channels gets two different keys **by construction** — correct for
 within-channel duplicate rate, structurally unusable for corroboration. Corroboration is
-therefore derived (read-only, no new table) from the **channel-independent canonical
-`cluster_identity`** plus a frozen time-bucket rule (same UTC-day bucket as the ledger's
-cluster convention), counting **distinct `source_id`s** whose calls satisfy the §B
-knowability bound: `corroborating_channels(identity, bucket, as_of) = COUNT(DISTINCT
-source_id WHERE call_ts ≤ as_of AND observed_at ≤ as_of)`.
+therefore derived (read-only, no new table) from a **channel-independent canonical
+identity** computed from the INSERT-only signal rows — normalized
+`{chain}:{contract_address}` when a CA exists, else `token_id` (mirroring the ledger's
+cluster-identity convention) — plus a frozen UTC-day time bucket, counting **distinct
+`source_channel_handle`s** whose calls satisfy the §B knowability bound:
+`corroborating_channels(identity, bucket, as_of) = COUNT(DISTINCT source_channel_handle
+WHERE posted_at ≤ as_of AND parsed_at ≤ as_of)`.
 
 **Min-N gate:** a channel below `TG_CALLER_MIN_ELIGIBLE_CLUSTERS` (proposed 10, counted
 as-of decision time) yields `shadow_block_caller_insufficient_n`, mirroring the ledger's
@@ -342,7 +410,7 @@ Stages A–C touches any of the four controls.
 |---|---|---|
 | A→merge | spec approval + PR review | shadow writer merged, deploy-dark (`TG_SHADOW_ENABLED=false`) |
 | B→merge | PR review | feature extractor merged, still dark |
-| **A+B→activate** | **both** PRs merged AND deployed AND deploy-verified; operator flips `.env` | shadow live with the full intended caller-feature set from decision #1 — no throwaway gate_version, no mid-cohort semantic change |
+| **A+B→activate** | **both** PRs merged AND deployed AND deploy-verified; real feature provider registered; operator flips `.env` | first enabled startup computes `gate_version` and creates the generation row (the activation boundary); shadow live with the full intended caller-feature set from decision #1 — no throwaway gate_version, no mid-cohort semantic change |
 | Shadow health | eligible-but-unshadowed rows (current generation) older than 60 min, flag on | §12a watchdog page with count |
 | Feature freeze | ≥30 shadow decisions under one gate_version | freeze that gate_version's thresholds for measurement |
 | C→PQ-GATE verdict | all frozen-cohort members matured (≤ freeze+168h); report reviewed per-stratum | pass → Stage D proposal permitted; fail/unratable → upstream price-coverage work, lane stays closed |
@@ -356,12 +424,16 @@ changes days later. Dark-merge order between the two PRs is free; **activation i
 ## Cost, sequencing, and approvals
 
 Build sequence (each its own PR, tests-first): (1) Stage A pass-through + shadow
-evaluator + tables (`tg_act_shadow`, `tg_act_shadow_generations`) + watchdog (~280 LOC +
-tests incl. restart-replay idempotency, loud-failure, lock-discipline, generation-cutover
-cases); (2) Stage B as-of feature extractor consumed by the evaluator (~200 LOC + tests
-incl. the determinism/no-leakage test with late-`observed_at` fixtures and the
-cross-channel corroboration key test); (3) Stage C harness + stratified report (~200 LOC
-+ fixture tests incl. the structural-invariant and pending_maturity assertions). API
+evaluator + `CallerFeatureProvider` interface + tables (`tg_act_shadow`,
+`tg_act_shadow_generations`) + watchdog (~300 LOC + tests incl. restart-replay
+idempotency, loud-failure, lock-discipline, activation-refused-without-provider,
+no-generation-while-disabled, and generation-cutover cases; evaluator tested against a
+deterministic fixture provider); (2) Stage B `tg_caller_features()` as the real provider
+(~220 LOC + tests incl. the determinism/no-leakage test with late-`parsed_at` fixtures,
+the cross-channel corroboration key test, and the two pinning tests: no-UPDATE guard on
+the TG tables and forward-only `snapshot_at` regression); (3) Stage C harness +
+stratified report (~200 LOC + fixture tests incl. the structural-invariant and
+pending_maturity assertions). API
 cost: zero new external calls in A/B; C's outcome calculation reads existing historical
 snapshots only (the disclosed exception: `gecko-solana-verify` identity RPC reads,
 reported separately). Approvals required: operator spec approval (this document), per-PR
