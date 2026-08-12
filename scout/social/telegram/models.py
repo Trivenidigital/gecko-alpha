@@ -66,6 +66,14 @@ class ResolvedToken(BaseModel):
     mcap: float | None = None
     price_usd: float | None = None
     volume_24h_usd: float | None = None
+    # Populated ONLY where the resolution response already carried it — the
+    # DexScreener path, whose payload the resolver is already reading to pick
+    # the deepest pair. CG-resolved rows leave it None because no equivalent
+    # field exists in the CG by-contract or /coins/markets response. None
+    # therefore means "this source did not supply it", never "zero liquidity".
+    # Zero new network requests: this value was already in memory and being
+    # discarded.
+    liquidity_usd: float | None = None
     age_days: float | None = None
     safety_pass: bool = False
     safety_check_completed: bool = False  # FAIL-CLOSED discriminator (BL-063 lesson)
