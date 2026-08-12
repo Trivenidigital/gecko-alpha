@@ -145,12 +145,23 @@ async def test_parole_auto_clear_on_wr_recovery(tmp_path, settings_factory):
         ),
     )
     await db._conn.commit()
-    # Add recent winning trades for recovery
-    for _ in range(15):
-        await _insert_trade(db, "recovered", 10, 5.0, now - timedelta(days=1))
+    # Add recent winning trades for recovery. `opened_at` must fall inside the
+    # current parole generation (>= parole_at) — the retest cohort is anchored
+    # on the generation, so trades predating it are not retest evidence.
+    # Exactly FEEDBACK_PAROLE_RETEST_TRADES admissions: a 5-slot parole cannot
+    # produce more, and a larger cohort now trips the bypass-contamination check.
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
+        await _insert_trade(
+            db,
+            "recovered",
+            10,
+            5.0,
+            now - timedelta(hours=1),
+            opened_at=now - timedelta(hours=12),
+        )
     await combo_refresh.refresh_combo(db, "recovered", s)
     row = await _get_combo_row(db, "recovered", "30d")
-    # With wr >= 30 and parole_trades_remaining=0: clear suppression.
+    # Retest COMPLETE (15 >= 5 resolved) and wr >= 30: clear suppression.
     assert row["suppressed"] == 0
     assert row["parole_at"] is None
     assert row["parole_trades_remaining"] is None
@@ -172,9 +183,17 @@ async def test_re_suppression_resets_timestamps(tmp_path, settings_factory):
         (old_suppressed_at, (now - timedelta(days=1)).isoformat(), now.isoformat()),
     )
     await db._conn.commit()
-    # Recent trades still poor
-    for _ in range(20):
-        await _insert_trade(db, "re_supp", -5, -3, now - timedelta(days=2))
+    # Recent trades still poor. `opened_at` inside the current parole
+    # generation so they count as resolved retest outcomes.
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
+        await _insert_trade(
+            db,
+            "re_supp",
+            -5,
+            -3,
+            now - timedelta(hours=1),
+            opened_at=now - timedelta(hours=12),
+        )
     await combo_refresh.refresh_combo(db, "re_supp", s)
     row = await _get_combo_row(db, "re_supp", "30d")
     assert row["suppressed"] == 1
@@ -1081,8 +1100,15 @@ async def test_parole_exhausted_resuppression_fires_reversal_alert(
         db, "gainers_early", remaining=0, parole_at=original_parole
     )
     # Real, in-window retest trades that fail (0% WR) — NOT a zero-trade combo.
-    for _ in range(20):
-        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+    for _ in range(s.FEEDBACK_PAROLE_RETEST_TRADES):
+        await _insert_trade(
+            db,
+            "gainers_early",
+            -5,
+            -3.0,
+            now - timedelta(days=2),
+            opened_at=now - timedelta(days=5),
+        )
 
     summary = await combo_refresh.refresh_all(db, s)
 

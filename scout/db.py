@@ -2758,18 +2758,33 @@ class Database:
                     -- combo with no trade in the refresh window is alerted;
                     -- cleared (re-armed) when the combo leaves that state.
                     perm_suppression_alerted_at TEXT,
+                    -- D2 retest-terminal-incomplete alert. Set once when a
+                    -- parole generation can no longer complete (slots
+                    -- exhausted, nothing still open, fewer than the required
+                    -- valid resolved outcomes); cleared when the combo leaves
+                    -- that state. Distinct from perm_suppression_alerted_at:
+                    -- that one marks "suppressed with no trades at all", this
+                    -- one marks "retest started and can never finish".
+                    retest_incomplete_alerted_at TEXT,
                     PRIMARY KEY (combo_key, window)
                 )
             """)
             # Additive migration for existing DBs — CREATE TABLE IF NOT EXISTS
-            # above is a no-op when combo_performance already exists, so the new
-            # perm_suppression_alerted_at column must be ALTER-ed in explicitly.
+            # above is a no-op when combo_performance already exists, so new
+            # columns must be ALTER-ed in explicitly. Both are nullable with no
+            # default, so an upgrade leaves every existing row at NULL, which
+            # reads as "never alerted" — the correct pre-cutover state.
             cur_cp = await conn.execute("PRAGMA table_info(combo_performance)")
             cp_cols = {row[1] for row in await cur_cp.fetchall()}
             if "perm_suppression_alerted_at" not in cp_cols:
                 await conn.execute(
                     "ALTER TABLE combo_performance "
                     "ADD COLUMN perm_suppression_alerted_at TEXT"
+                )
+            if "retest_incomplete_alerted_at" not in cp_cols:
+                await conn.execute(
+                    "ALTER TABLE combo_performance "
+                    "ADD COLUMN retest_incomplete_alerted_at TEXT"
                 )
 
             expected_cols = {

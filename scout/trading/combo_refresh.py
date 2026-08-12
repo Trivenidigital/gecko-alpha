@@ -10,7 +10,7 @@ import structlog
 
 from scout.db import Database
 from scout.timeutil import sql_utc_cutoff
-from scout.trading.paper import CLOSED_COUNTABLE_STATUSES
+from scout.trading.paper import VALID_TERMINAL_OUTCOME_SQL
 
 log = structlog.get_logger()
 
@@ -32,6 +32,242 @@ async def refresh_combo(db: Database, combo_key: str, settings) -> bool:
         return await _refresh_combo_locked(db, combo_key, settings)
 
 
+async def _send_retest_incomplete_alert(message: str, settings) -> None:
+    """Deferred-import Telegram send. Monkeypatched in tests.
+
+    ``parse_mode=None``: the body carries combo keys containing underscores
+    (``losers_contrarian``, ``cg_trending_rank+first_signal``), which Telegram
+    MarkdownV1 would silently consume as italics markers — HTTP 200 with a
+    mangled body (CLAUDE.md §12b).
+
+    ``raise_on_failure=True`` is LOAD-BEARING, not decoration. The alerter
+    defaults to ``False`` and merely LOGS on a non-200 or a network error, so
+    without it the caller would emit ``..._delivered`` and set the dedup marker
+    for a page Telegram actually rejected — and the marker would then suppress
+    every future attempt. "Set the marker only after a confirmed send" is only
+    a true statement if failure propagates.
+    """
+    import aiohttp  # deferred — module-level import aborts on Windows
+
+    from scout import alerter  # deferred — pulls aiohttp at import time
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as session:
+        await alerter.send_telegram_message(
+            message,
+            session,
+            settings,
+            parse_mode=None,
+            source="combo_refresh_retest_terminal_incomplete",
+            raise_on_failure=True,
+        )
+
+
+async def _process_retest_terminal_incomplete(db: Database, settings) -> list[str]:
+    """Page ONCE per generation for parole retests that can never complete.
+
+    Runs AFTER the locked per-combo refreshes, mirroring
+    ``_process_permanent_suppression``. Delivery must not happen inside
+    ``_refresh_combo_locked``: that holds ``db._txn_lock`` and sits in the
+    middle of the refresh's multi-statement read->write sequence, so a Telegram
+    await would pin the trading lock for the client timeout and the marker's
+    commit would split the refresh transaction — making the 7d write durable
+    before the 30d write landed.
+
+    Marker writes are GENERATION-BOUND on ``(suppressed_at, parole_at)``. A
+    slow send followed by a re-arm must not stamp the NEW generation as already
+    alerted; if the generation moved while we were sending, the update matches
+    zero rows and the next run pages the new generation. Same principle as the
+    D1 parole reservation.
+
+    Returns the combos newly alerted this run.
+    """
+    conn = db._conn
+    target = settings.FEEDBACK_PAROLE_RETEST_TRADES
+
+    cur = await conn.execute(
+        "SELECT combo_key, suppressed_at, parole_at, parole_trades_remaining "
+        "FROM combo_performance "
+        "WHERE window = '30d' AND suppressed = 1 "
+        "  AND retest_incomplete_alerted_at IS NULL "
+        "  AND parole_at IS NOT NULL "
+        "  AND COALESCE(parole_trades_remaining, 1) <= 0"
+    )
+    candidates = await cur.fetchall()
+
+    alerted: list[str] = []
+    for combo_key, suppressed_at, parole_at, remaining in candidates:
+        acct = await _retest_accounting(db, combo_key, parole_at, remaining, target)
+        if _classify_retest(acct, remaining, target) != "terminal_incomplete":
+            continue
+
+        message = (
+            f"gecko-alpha: parole retest STUCK for {combo_key}\n"
+            f"valid resolved {acct['valid_closed']}/{target} - "
+            f"invalid closes {acct['invalid_closed']}, "
+            f"still open {acct['open_now']}, slots spent {acct['spent']}.\n"
+            "No slots left and nothing still open, so this retest can never "
+            "complete. Suppression is HELD and will not auto-clear. "
+            "Re-arming a retest requires operator authorization."
+        )
+        log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
+        try:
+            await _send_retest_incomplete_alert(message, settings)
+        except Exception as exc:
+            log.warning(
+                "retest_incomplete_alert_failed",
+                combo_key=combo_key,
+                err=str(exc),
+                detail="marker NOT set - will re-attempt on the next refresh",
+            )
+            continue
+        log.info("retest_incomplete_alert_delivered", combo_key=combo_key)
+
+        # Delivery is done; the DB mutation is not. Reacquire `_txn_lock` for
+        # the short marker write: every commit on the shared connection must
+        # hold it, or concurrent writers interleave executes and leave
+        # half-open transactions. Only the NETWORK call belongs outside.
+        try:
+            async with db._txn_lock:
+                cur = await conn.execute(
+                    "UPDATE combo_performance "
+                    "SET retest_incomplete_alerted_at = ? "
+                    "WHERE combo_key = ? AND window = '30d' "
+                    "  AND suppressed_at IS ? AND parole_at IS ?",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        combo_key,
+                        suppressed_at,
+                        parole_at,
+                    ),
+                )
+                # THIS statement's affected-row count — never
+                # `Connection.total_changes`, which is connection-wide and
+                # cumulative. Because delivery ran unlocked, an unrelated
+                # coroutine can write on the shared connection around this
+                # point; a total_changes delta would then read as success even
+                # when this generation-bound UPDATE matched zero rows, exactly
+                # defeating the stale-generation check.
+                changed = cur.rowcount
+                await conn.commit()
+            if changed == 0:
+                # The generation moved while we were sending. The marker is
+                # deliberately NOT stamped onto the replacement generation —
+                # that would silence the page the new generation is entitled
+                # to. This run's page described a state that no longer exists.
+                log.info(
+                    "retest_incomplete_marker_stale_generation",
+                    combo_key=combo_key,
+                    detail="parole generation changed during delivery; marker "
+                    "not written, new generation will page on its own merits",
+                )
+                continue
+            alerted.append(combo_key)
+        except aiosqlite.Error as exc:
+            log.exception(
+                "retest_incomplete_marker_update_failed",
+                combo_key=combo_key,
+                err=str(exc),
+            )
+    return alerted
+
+
+def _classify_retest(acct: dict, remaining, target: int) -> str:
+    """Which retest state is this parole generation in?
+
+    ``complete`` requires agreement on TWO axes — enough valid resolved
+    outcomes AND an exhausted slot budget. Calendar membership, slot
+    consumption and usable evidence are independent facts.
+
+    ``terminal_incomplete`` is the state that cannot resolve itself: no slots
+    left, nothing still open, and fewer valid outcomes than required (because
+    some closes were operator-manual / fabricated-provenance, or a slot was
+    deliberately leaked by an ambiguous D1 outcome). Distinguishing it from
+    ``waiting`` is the difference between "be patient" and "this is stuck".
+    """
+    slots_exhausted = remaining is not None and remaining <= 0
+    # Order matters. "Enough evidence but slots remain" is checked FIRST
+    # because it strictly implies contamination (cohort >= target > spent), so
+    # testing `contaminated` first would make this branch unreachable and
+    # report the less specific diagnosis.
+    if acct["valid_closed"] >= target and not slots_exhausted:
+        return "accounting_inconsistent"
+    if acct["contaminated"]:
+        return "contaminated"
+    if acct["valid_closed"] >= target:
+        return "complete"
+    if slots_exhausted and acct["open_now"] == 0:
+        return "terminal_incomplete"
+    return "waiting"
+
+
+async def _retest_accounting(
+    db: Database, combo_key: str, parole_at: str | None, remaining, target: int
+) -> dict:
+    """Account for the current parole generation along THREE separate axes.
+
+    Calendar membership, slot consumption and usable resolved evidence are
+    distinct facts; treating any one as proof of the others is what let three
+    closes clear a suppression earned on 103 trades.
+
+    SCOPE CAVEAT — ``opened_at >= parole_at`` is a TEMPORAL proxy for "admitted
+    under this parole", not an admission-membership stamp. It is sound only for
+    suppression-managed lanes, i.e. those whose opens pass through
+    ``parole_reservation``. It is NOT universally true: ``tg_social`` dispatches
+    via ``scout/social/telegram/dispatcher.py`` and never calls the suppression
+    gate (see engine.py's SIG-03 note), so such a lane could contribute a
+    post-``parole_at`` close without ever consuming a slot. The caller
+    falsifies that cheaply by comparing the cohort against slots actually
+    spent — see ``contaminated`` below. A durable per-trade generation stamp is
+    the real fix and is deliberately NOT attempted here.
+
+    Returns a dict with:
+      valid_closed   — closed outcomes passing the canonical validity predicate
+      invalid_closed — closed but EXCLUDED (closed_manual, fabricated $0, ...)
+      open_now       — admitted, still unresolved
+      cohort_total   — every current-generation trade, any state
+      spent          — slots consumed = target - remaining
+      contaminated   — cohort_total > spent, i.e. a trade committed without
+                       consuming a reservation → the cohort is not trustworthy
+    """
+    empty = dict(
+        valid_closed=0,
+        invalid_closed=0,
+        open_now=0,
+        cohort_total=0,
+        spent=0,
+        contaminated=False,
+    )
+    if parole_at is None:
+        return empty
+    cur = await db._conn.execute(
+        f"""SELECT
+              SUM(CASE WHEN {VALID_TERMINAL_OUTCOME_SQL} THEN 1 ELSE 0 END),
+              SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END),
+              COUNT(*)
+            FROM paper_trades
+            WHERE signal_combo = ? AND opened_at >= ?""",
+        (combo_key, parole_at),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return empty
+    valid_closed = row[0] or 0
+    open_now = row[1] or 0
+    cohort_total = row[2] or 0
+    invalid_closed = cohort_total - valid_closed - open_now
+    spent = target - remaining if remaining is not None else 0
+    return dict(
+        valid_closed=valid_closed,
+        invalid_closed=invalid_closed,
+        open_now=open_now,
+        cohort_total=cohort_total,
+        spent=spent,
+        contaminated=cohort_total > spent,
+    )
+
+
 async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
     """Inner implementation — called with db._txn_lock already held."""
     try:
@@ -39,7 +275,6 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         now_iso = now.isoformat()
 
         stats = {}
-        status_placeholders = ",".join("?" * len(CLOSED_COUNTABLE_STATUSES))
         for window, days in (("7d", 7), ("30d", 30)):
             cur = await db._conn.execute(
                 f"""SELECT
@@ -50,19 +285,15 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                      COALESCE(AVG(pnl_pct), 0) AS avg_pnl_pct
                    FROM paper_trades
                    WHERE signal_combo = ?
-                     AND status IN ({status_placeholders})
-                     -- GA-01 / Phase 6 slice 2: exclude fabricated $0
-                     -- closes (unpriceable token_id force-closed at
-                     -- entry_price) from combo rollups — they dilute
-                     -- total/avg PnL toward zero. Keyed on
-                     -- exit_provenance (durable label); the GA-01
-                     -- exit_reason predicate stays as OR-fallback.
-                     AND COALESCE(exit_provenance, '') != 'entry_fallback'
-                     AND COALESCE(exit_reason, '') != 'expired_stale_no_price'
+                     -- Canonical validity predicate, NOT an exit-status
+                     -- whitelist (see paper.VALID_TERMINAL_OUTCOME_SQL).
+                     -- Restores the locked spec's "only closed trades count
+                     -- (status != 'open')" population, while excluding
+                     -- sentinel rows and the fabricated-$0 class.
+                     AND {VALID_TERMINAL_OUTCOME_SQL}
                      AND closed_at >= ?""",
                 (
                     combo_key,
-                    *CLOSED_COUNTABLE_STATUSES,
                     (now - timedelta(days=days)).isoformat(),
                 ),
             )
@@ -109,7 +340,7 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         # 30d row: apply suppression rule.
         w30 = stats["30d"]
         cur = await db._conn.execute(
-            "SELECT suppressed, parole_trades_remaining, suppressed_at "
+            "SELECT suppressed, parole_trades_remaining, suppressed_at, parole_at "
             "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
             (combo_key,),
         )
@@ -142,34 +373,109 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
             else:
-                # Frozen-lock guard (fix/frozen-suppression-lock): a currently-
-                # suppressed combo with ZERO trades in the 30d window is being
-                # refreshed only to keep its state live/alertable (see the
-                # widened selection in refresh_all). Recomputing a re-suppression
-                # here would hand a permanently-locked combo a fresh parole
-                # window + retest allowance — auto-revival the operator never
-                # approved (constraint a). So zero-trade suppressed combos route
-                # to the preserve branch; only combos with REAL retest data
-                # (trades > 0) can clear or re-arm parole.
-                zero_trade = w30["trades"] == 0
-                exhausted = remaining is not None and remaining <= 0
-                if not zero_trade and exhausted and w30["wr"] >= wr_thresh:
-                    # Retest recovered on real data — clear suppression.
+                # PAROLE-COMPLETION GATE. Spec D5 is "14 days locked, then a
+                # 5-trade re-test" — so clear/re-suppress may only be decided
+                # once that re-test has actually RESOLVED: `retest` valid,
+                # closed outcomes admitted under the CURRENT parole generation.
+                #
+                # `parole_trades_remaining == 0` does NOT prove that, and
+                # gating on it was the defect. A slot is spent at the admission
+                # GATE, so the counter can reach zero while trades are still
+                # open; and the D1 reservation deliberately LEAKS a slot on
+                # ambiguous outcomes and process death. Exhaustion is therefore
+                # compatible with fewer than `retest` usable closes — which is
+                # how three closes came to clear a suppression earned on 103
+                # trades.
+                #
+                # Counting resolved outcomes instead also SUBSUMES the old
+                # frozen-lock guard: a locked combo with no retest data has
+                # 0 < retest resolved outcomes and routes to preserve, so it
+                # still cannot be handed an unapproved auto-revival.
+                #
+                # Deliberately NOT "require 20 closes to clear": that would
+                # silently convert D5's 5-trade parole into a 20-trade
+                # experiment and make legitimate recovery unreachable for
+                # low-volume lanes. Once the gate is satisfied, the decision
+                # keeps the original 30d-WR semantics unchanged.
+                parole_at_existing = existing["parole_at"]
+                acct = await _retest_accounting(
+                    db, combo_key, parole_at_existing, remaining, retest
+                )
+                retest_state = _classify_retest(acct, remaining, retest)
+
+                if retest_state == "complete" and w30["wr"] >= wr_thresh:
+                    # Re-test completed and recovered — clear suppression.
                     new_suppressed = 0
                     new_suppressed_at = None
                     new_parole_at = None
                     new_parole_remaining = None
-                elif not zero_trade and exhausted:
-                    # Retest failed on real data — re-suppress with fresh parole.
+                elif retest_state == "complete":
+                    # Re-test completed and failed — re-suppress, fresh parole.
                     new_suppressed = 1
                     new_suppressed_at = now_iso
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
                 else:
-                    # Preserve existing suppression state verbatim. Covers both
-                    # mid-parole (remaining > 0 — parole timing must not reset
-                    # every nightly refresh) and the frozen-lock zero-trade case
-                    # (keep the lock exactly as-is; no revival).
+                    # Every non-complete state PRESERVES. They differ only in
+                    # what the operator needs to know, and whether the state
+                    # can still resolve on its own.
+                    if retest_state == "terminal_incomplete":
+                        # Slots exhausted, nothing still open, not enough valid
+                        # outcomes: this generation can NEVER complete. Deliberately
+                        # NOT auto-re-armed — refilling slots would silently turn
+                        # D5's 5-trade retest into "trade until 5 usable
+                        # observations". Pages once; needs operator action.
+                        log.error(
+                            "parole_retest_terminal_incomplete",
+                            combo_key=combo_key,
+                            valid_closed=acct["valid_closed"],
+                            invalid_closed=acct["invalid_closed"],
+                            open_now=acct["open_now"],
+                            slots_spent=acct["spent"],
+                            required=retest,
+                            detail="parole generation can no longer complete; "
+                            "suppression held, operator action required",
+                        )
+                        # Delivery deliberately NOT done here. This function
+                        # runs with `db._txn_lock` held and inside the refresh's
+                        # multi-statement read→write sequence, so an aiohttp
+                        # await would hold the trading lock for the client
+                        # timeout, and the marker's own commit would split this
+                        # refresh transaction (making the 7d write durable
+                        # before the 30d write lands). Paging happens in
+                        # `_process_retest_terminal_incomplete` after the locked
+                        # per-combo refreshes, mirroring
+                        # `_process_permanent_suppression`.
+                    elif retest_state == "contaminated":
+                        log.error(
+                            "parole_retest_cohort_contaminated",
+                            combo_key=combo_key,
+                            cohort_total=acct["cohort_total"],
+                            slots_spent=acct["spent"],
+                            detail="committed trades exceed reservations spent "
+                            "— a bypass path (a dispatcher that never calls "
+                            "the suppression gate) contributed to this cohort; "
+                            "holding, no automatic decision",
+                        )
+                    elif retest_state == "accounting_inconsistent":
+                        log.error(
+                            "parole_retest_accounting_inconsistent",
+                            combo_key=combo_key,
+                            valid_closed=acct["valid_closed"],
+                            required=retest,
+                            remaining=remaining,
+                            detail="enough resolved outcomes but slots still "
+                            "remain — inconsistent with a clean parole; holding",
+                        )
+                    else:
+                        log.info(
+                            "parole_retest_waiting",
+                            combo_key=combo_key,
+                            valid_closed=acct["valid_closed"],
+                            open_now=acct["open_now"],
+                            remaining=remaining,
+                            required=retest,
+                        )
                     new_suppressed = 1
                     new_suppressed_at = existing["suppressed_at"]
                     cur2 = await db._conn.execute(
@@ -179,6 +485,19 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     )
                     new_parole_at = (await cur2.fetchone())[0]
                     new_parole_remaining = remaining
+
+        # Re-arm the terminal-incomplete page whenever the combo LEAVES that
+        # state — cleared suppression, or a fresh parole generation. Preserve
+        # branches keep it, so a stuck generation pages exactly once.
+        if existing is not None and (
+            new_suppressed == 0 or new_parole_at != existing["parole_at"]
+        ):
+            await db._conn.execute(
+                "UPDATE combo_performance "
+                "SET retest_incomplete_alerted_at = NULL "
+                "WHERE combo_key = ? AND window = '30d'",
+                (combo_key,),
+            )
 
         await db._conn.execute(
             "INSERT INTO combo_performance "
@@ -315,6 +634,10 @@ async def refresh_all(db: Database, settings) -> dict:
 
     permanent = await _process_permanent_suppression(db, settings, window_cutoff)
 
+    # Also outside the per-combo lock, for the same reason: Telegram delivery
+    # must not run inside the refresh transaction.
+    retest_stuck = await _process_retest_terminal_incomplete(db, settings)
+
     log.info(
         "combo_refresh_summary",
         refreshed=refreshed,
@@ -322,6 +645,7 @@ async def refresh_all(db: Database, settings) -> dict:
         chronic=len(chronic),
         permanent_suppression=len(permanent),
         suppression_reversals=len(reversals),
+        retest_terminal_incomplete=len(retest_stuck),
     )
     return {
         "refreshed": refreshed,
