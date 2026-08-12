@@ -1,15 +1,35 @@
 # D2b — What population is `combo_refresh` intended to measure?
 
-**Status: GOVERNANCE RULING REQUIRED. No code. No status-registry change.**
+**Status 2026-08-12: RULED. Implementation BLOCKED on explicit transition
+authorization. No code. No status-registry change.**
 
-This document presents evidence for a decision; it does not make one. Per
-operator direction 2026-08-11: *do not decide status inclusion from observed
-profitability.* The profitability table appears here only as impact analysis,
-after the design-history argument, and is not the basis of any recommendation.
+**Operator ruling (2026-08-12):** the authoritative population is **all
+legitimate closed trades carrying usable realized outcome data**, with
+exclusions based on **data validity/provenance** — not on which exit mechanism
+fired. The present `CLOSED_COUNTABLE_STATUSES` whitelist is implementation
+drift from the original locked contract, absent a later approved spec that
+deliberately superseded it. None was found.
+
+**Basis — the original locked spec, not the outcome table.**
+`docs/superpowers/specs/2026-04-18-paper-trading-feedback-loop-design.md`:
+
+> line 359 — *"Only closed trades count (`status != 'open'`). Single statement
+> per window:"*
+> line 370 — `AND status != 'open'`
+
+Decisions `D4` (*suppression rule `trades>=20 AND 30d_wr<30%`*) and `D5`
+(*parole: 14 days locked, then 5-trade re-test*) match the implementation
+exactly, which corroborates that this spec is the governing contract for this
+subsystem. PR #29 applied its D1–D21 decisions.
+
+§3 below (the "whole position vs residual slice" reconstruction) is retained as
+research only. It is **not** the governing rule and its own counterexample
+(countable `trailing_stop`/`moonshot_trail` can also fire post-leg-1) already
+showed it was unstable.
 
 ---
 
-## 1. The question
+## 1. The question (as originally posed)
 
 `combo_refresh` computes each combo's 30d trade/win/loss rollup and from it
 decides **suppression, parole re-arm, and clearance**. It counts only
@@ -114,37 +134,82 @@ checkpoints that would have prompted registration (`TradeStatus`,
 This is the same root cause as the D2a registry gap: an `.env` flip that
 bypassed the code-review surface where status registration would be noticed.
 
-## 5. Impact analysis — what changes under each candidate population
+## 5. Full terminal-status audit + transition matrix (post-ruling)
 
-Read-only replay, 30d window to 2026-08-11. Held constant: the documented rule
-(`trades >= FEEDBACK_SUPPRESSION_MIN_TRADES=20` **and**
-`wr < FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT=30.0`), the provenance filters, and
-each combo's persisted `suppressed` / `parole_trades_remaining`.
+Read-only, prod, 2026-08-12. **The three known omissions did not exhaust the
+drift.** Twelve distinct non-`open` statuses exist; two are not closes at all.
 
-### P0 — status quo (no change)
+### 5.1 Complete status universe
 
-| combo | n | wr | branch |
-|---|---|---|---|
-| `gainers_early` | 117 | 75.2% | stay clear |
-| `volume_spike` | 15 | 26.7% | stay clear (below min_trades) |
-| `losers_contrarian` | 0 | — | preserve (LOCKED — cannot ever clear) |
+| status | n ever | not a close | invalid prov | stale mark | in `TradeStatus` | in whitelist |
+|---|---|---|---|---|---|---|
+| `closed_expired` | 896 | 0 | 14 | 129 | ✅ | ✅ |
+| `closed_peak_fade` | 391 | 0 | 0 | 0 | ✅ | ❌ |
+| `closed_sl` | 355 | 0 | 0 | 0 | ✅ | ✅ |
+| `closed_trailing_stop` | 352 | 0 | 0 | 0 | ✅ | ✅ |
+| `closed_time_death` | 106 | 0 | 0 | 0 | ❌ | ❌ |
+| `closed_floor` | 71 | 0 | 0 | 0 | ✅ | ❌ |
+| `closed_moonshot_trail` | 42 | 0 | 0 | 0 | ✅ | ✅ |
+| `closed_tp` | 14 | 0 | 0 | 0 | ✅ | ✅ |
+| `closed_stale_onset` | 4 | 0 | 0 | 4 | ✅ | ✅ |
+| `closed_manual` | 1 | 0 | 0 | 0 | ✅ | ❌ |
+| `kraken_pilot_anchor` | 1 | **1** | 0 | 0 | ❌ | ❌ |
+| `solana_lane_anchor` | 1 | **1** | 0 | 0 | ❌ | ❌ |
 
-### P1 — add `closed_time_death` only (the "full-position" rule of §3)
+**`kraken_pilot_anchor` / `solana_lane_anchor` are sentinel rows** — NULL
+`closed_at`, NULL `exit_price`, NULL `pnl_usd` — that nonetheless satisfy
+`status != 'open'`. A literal reading of the spec sweeps them into the
+population, where they add to `COUNT(*)` while contributing neither a win nor a
+loss, depressing WR. This is exactly why the ruling's *"carrying usable
+realized outcome data"* qualifier is load-bearing and the literal SQL is not
+directly implementable.
 
-| combo | n | wr | branch | change |
+Invalid-provenance classes (already excluded today): 14 rows with
+`exit_provenance='entry_fallback'` / `exit_reason='expired_stale_no_price'`,
+all on `closed_expired`. `stale_snapshot` (133) is valid-but-discountable per
+#408.
+
+### 5.2 Replay — `CURRENT_WHITELIST` vs `ALL_VALID_TERMINAL_CLOSES`
+
+`ALL_VALID` = `status != 'open'` AND `closed_at IS NOT NULL` AND
+`pnl_usd IS NOT NULL` AND not `entry_fallback` AND not
+`expired_stale_no_price`. Rule held constant at D4/D5. Only the 30d window
+drives transitions.
+
+**30d**
+
+| combo | whitelist n / wr | all-valid n / wr | supp | transition |
 |---|---|---|---|---|
-| `gainers_early` | 212 | 41.5% | stay clear | stats move 33.7pt; branch same |
-| `volume_spike` | 24 | 16.7% | **NEWLY SUPPRESS** | ⚠ **active lane auto-suppressed** |
-| `losers_contrarian` | 2 | 0.0% | **RE-SUPPRESS + fresh parole 5** | lock released |
+| `gainers_early` | 117 / 75.2% | **271 / 54.2%** | 0 | stay clear — no transition |
+| `volume_spike` | 15 / 26.7% | **25 / 20.0%** | 0 | ⚠ **NEWLY SUPPRESS** |
+| `losers_contrarian` | 0 / — | **3 / 33.3%** | 1, rem=0 | ⚠ **CLEAR** |
 
-### P2 — all terminal outcomes (also `floor` + `peak_fade`)
+**7d** (reported; drives nothing): `gainers_early` 46/78.3% → 102/55.9%;
+`losers_contrarian` 0 → 3/33.3%.
 
-Adds 61 further closes (34 `peak_fade`, 27 `floor`). Not replayed per-combo
-here because it requires a prior ruling on whether a partial-slice PnL is
-comparable to a whole-trade PnL (§3) — if it is not, P2 is incoherent
-regardless of its numbers.
+### 5.3 The losers transition is defect-driven, and reveals a separate bug
 
-### Outcome character of the excluded statuses (30d)
+An earlier replay that held `floor`/`peak_fade` out of both arms showed
+`losers_contrarian` → RE-SUPPRESS + parole 5. **Under the correct population it
+becomes CLEAR**: the `closed_peak_fade` winner joins the two `closed_time_death`
+losers → 3 trades, 1 win, 33.3% ≥ 30% → the clear branch fires and lifts a
+suppression earned on **103 trades**.
+
+That is possible only because of an asymmetry in `combo_refresh`:
+
+```
+suppress:  if w30["trades"] >= min_trades (20) and w30["wr"] < wr_thresh
+clear:     if not zero_trade (n >= 1)        and w30["wr"] >= wr_thresh
+```
+
+**Suppression requires n≥20 (spec D3/D4). Clearance requires n≥1.** A single
+lucky retest trade can clear a suppression earned on a hundred. This is a
+latent defect independent of the population question — but the population
+correction is what makes it fire. The `losers_contrarian` CLEAR should
+therefore be read as a **defect-driven transition, not a legitimate one**, and
+likely wants its own ruling alongside `volume_spike`.
+
+### 5.4 Outcome character of the excluded statuses (30d)
 
 Presented **last and deliberately**, as impact data only:
 
@@ -162,20 +227,31 @@ current population has a selection axis. It does **not** by itself establish
 that the exclusions violate the metric's intended definition. That is the
 ruling being requested.
 
-## 6. What a ruling must settle
+## 6. Open decisions — what still requires explicit authorization
 
-1. Is the feedback population **all terminal outcomes**, or **whole-position
-   outcomes only**? §3 offers a reconstruction, not a specification.
-2. If whole-position only: `closed_time_death` is in, and the
-   `closed_trailing_stop` / `closed_moonshot_trail` post-leg-1 cases need
-   reconciling.
-3. **`volume_spike` auto-suppression is a required decision, not a side
-   effect.** Any population that includes `time_death` suppresses a currently
-   active lane on its first nightly refresh. Authorize or exclude it
-   explicitly.
-4. `closed_manual` — operator-initiated closes. Almost certainly out of any
-   automated feedback population, but it is currently excluded by the same
-   silence as the others.
+The population question is RULED (§ header). These remain:
+
+1. **`volume_spike` → NEWLY SUPPRESS.** Restoring the population definition and
+   letting a nightly job silently mutate an active lane's state are separate
+   decisions. Authorize or exclude explicitly before deployment.
+2. **`losers_contrarian` → CLEAR.** Per §5.3 this is driven by the
+   clear-branch min-trades asymmetry, not by a genuine recovery. Recommend
+   ruling on the asymmetry first; clearing a 103-trade suppression on n=3
+   should probably not be allowed to happen as a side effect of the population
+   fix.
+3. **The clear-branch asymmetry itself** — fix (add a min-trades guard to
+   clearance, mirroring D3/D4) or accept. Independent of D2, but it changes
+   what the corrected population does on first run.
+4. **Sentinel-row exclusion** (`kraken_pilot_anchor`, `solana_lane_anchor`) —
+   confirm they are excluded by a validity predicate (`closed_at`/`pnl_usd`
+   NOT NULL) rather than by an ever-growing status blacklist, so future anchor
+   rows cannot silently rejoin the population.
+5. **`closed_manual`** — operator-initiated closes. Likely out of an automated
+   feedback population, but currently excluded by the same silence as the rest.
+
+**Deployment constraint:** do not ship the corrected population and let the
+nightly refresh apply transitions automatically. Transitions are authorized
+individually, in advance.
 
 ## 7. Related
 
