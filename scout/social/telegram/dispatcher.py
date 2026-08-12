@@ -220,6 +220,16 @@ async def dispatch_to_engine(
             "channel_handle": channel_handle,
             "contract_address": token.contract_address,
             "mcap_at_sighting": token.mcap,
+            # Resolver facts that were previously dropped here. Field
+            # additions only — no gate reads them, and `mcap_at_sighting`
+            # remains the sole field ACT consumes. An unavailable value
+            # forwards as None; 0.0 would read as a measurement.
+            "price_usd": token.price_usd,
+            "volume_24h_usd": token.volume_24h_usd,
+            "age_days": token.age_days,
+            "safety_pass": token.safety_pass,
+            "safety_check_completed": token.safety_check_completed,
+            "safety_skipped_no_ca": token.safety_skipped_no_ca,
         },
         amount_usd=settings.PAPER_TG_SOCIAL_TRADE_AMOUNT_USD,
         entry_price=token.price_usd,
@@ -480,6 +490,16 @@ async def dispatch_cashtag_to_engine(
             "candidate_rank": 1,
             "candidates_total": len(candidates),
             "mcap_at_sighting": top.mcap,
+            # Same field additions as the CA path. On this path the safety
+            # trio records the cashtag reality (skipped_no_ca) rather than a
+            # verdict — that distinction is the whole point of the three
+            # booleans, and flattening it here would misreport it downstream.
+            "price_usd": top.price_usd,
+            "volume_24h_usd": top.volume_24h_usd,
+            "age_days": top.age_days,
+            "safety_pass": top.safety_pass,
+            "safety_check_completed": top.safety_check_completed,
+            "safety_skipped_no_ca": top.safety_skipped_no_ca,
         },
         amount_usd=settings.PAPER_TG_SOCIAL_CASHTAG_TRADE_AMOUNT_USD,
         entry_price=top.price_usd,

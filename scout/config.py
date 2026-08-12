@@ -1194,6 +1194,32 @@ class Settings(BaseSettings):
     TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
     TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS: int = 72
     TG_SOCIAL_CHANNEL_SILENCE_CHECK_INTERVAL_SEC: int = 3600
+    # TG shadow (Stage A, tasks/design_tg_signal_rehabilitation_2026_08_12.md).
+    # Counterfactual TG actionability evaluation written to `tg_act_shadow`
+    # while the lane stays quarantined — no trading mutation, zero new API
+    # calls. Default OFF; activation additionally requires a registered
+    # CallerFeatureProvider (Stage B), so flipping this alone arms nothing.
+    #
+    # Every value below EXCEPT `TG_SHADOW_ENABLED` participates in the
+    # `gate_version` fingerprint: a threshold change starts a new generation
+    # prospectively rather than silently re-labelling an existing cohort.
+    # `TG_SHADOW_ENABLED` is excluded because it is an activation control,
+    # not decision semantics — a disable/enable cycle must RESUME the same
+    # generation (design §Re-enable semantics), which it cannot do if the
+    # flag's own value moves the fingerprint.
+    TG_SHADOW_ENABLED: bool = False
+    TG_SHADOW_LAG_THRESHOLD_MIN: int = 60
+    TG_SHADOW_SCAN_CADENCE_MIN: int = 30
+    TG_SHADOW_MCAP_MIN_USD: float = 10_000.0
+    TG_SHADOW_MCAP_MAX_USD: float = 500_000_000.0
+    TG_SHADOW_REQUIRE_LIQUIDITY: bool = False
+    TG_SHADOW_MIN_CALLER_COVERAGE: float = 0.5
+    TG_CALLER_MIN_ELIGIBLE_CLUSTERS: int = 10
+    # Identity classes ('coingecko', 'dex:solana', 'dex:robinhood', ...) held
+    # to be structurally unpriceable. EMPTY until the Stage C PQ harness
+    # returns a per-stratum verdict — pre-populating it would encode a guess
+    # as policy.
+    TG_SHADOW_UNPRICEABLE_IDENTITY_CLASSES: list[str] = []
     # BL-062 signal-stacking: require >=N scoring signals for first_signal admission
     FIRST_SIGNAL_MIN_SIGNAL_COUNT: int = 2
     # BL-062 peak-fade early-kill: sustained-fade exit between trail and expiry
@@ -2853,6 +2879,39 @@ class Settings(BaseSettings):
                 f"TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC must be >= 0; got={v}"
             )
         return v
+
+    @field_validator("TG_SHADOW_LAG_THRESHOLD_MIN", "TG_SHADOW_SCAN_CADENCE_MIN")
+    @classmethod
+    def _validate_tg_shadow_minutes(cls, v: int, info) -> int:
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be > 0; got={v}")
+        return v
+
+    @field_validator("TG_SHADOW_MIN_CALLER_COVERAGE")
+    @classmethod
+    def _validate_tg_shadow_min_caller_coverage(cls, v: float) -> float:
+        if not 0.0 <= v <= 1.0:
+            raise ValueError(
+                f"TG_SHADOW_MIN_CALLER_COVERAGE is a rate in [0,1]; got={v}"
+            )
+        return v
+
+    @field_validator("TG_CALLER_MIN_ELIGIBLE_CLUSTERS")
+    @classmethod
+    def _validate_tg_caller_min_eligible_clusters(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"TG_CALLER_MIN_ELIGIBLE_CLUSTERS must be >= 0; got={v}")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_tg_shadow_mcap_band(self) -> "Settings":
+        if self.TG_SHADOW_MCAP_MIN_USD >= self.TG_SHADOW_MCAP_MAX_USD:
+            raise ValueError(
+                "TG_SHADOW_MCAP_MIN_USD "
+                f"({self.TG_SHADOW_MCAP_MIN_USD}) must be < "
+                f"TG_SHADOW_MCAP_MAX_USD ({self.TG_SHADOW_MCAP_MAX_USD})"
+            )
+        return self
 
     @field_validator("TG_SOCIAL_CHANNEL_SILENCE_ALERT_HOURS")
     @classmethod

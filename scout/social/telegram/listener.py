@@ -69,6 +69,7 @@ from scout.social.telegram.models import (
 )
 from scout.social.telegram.parser import parse_message
 from scout.social.telegram.resolver import resolve_and_enrich
+from scout.social.telegram.snapshot import build_resolution_snapshot
 from scout.trading.engine import TradingEngine
 
 log = structlog.get_logger()
@@ -269,6 +270,10 @@ async def _replay_post_resolution(
             resolution_state=result.state.value,
             channel_handle=channel_handle,
             paper_trade_id=None,
+            # No ResolvedToken exists on this path, so there are no decision
+            # inputs to capture. NULL, not an empty snapshot: the row is not
+            # RESOLVED and is never shadow-eligible.
+            resolution_snapshot_json=None,
         )
         return
 
@@ -371,7 +376,7 @@ async def _replay_post_resolution(
         # owns it.
         top = result.candidates_top3[0]
         try:
-            await _persist_signal_row(
+            signal_id = await _persist_signal_row(
                 db=db,
                 message_pk=message_pk,
                 token_id=top.token_id,
@@ -382,6 +387,14 @@ async def _replay_post_resolution(
                 resolution_state=result.state.value,
                 channel_handle=channel_handle,
                 paper_trade_id=paper_trade_id,
+                # Serialized BEFORE the writer takes `_txn_lock`.
+                resolution_snapshot_json=build_resolution_snapshot(top),
+            )
+            await _shadow_eval_after_persist(
+                db=db,
+                settings=settings,
+                signal_id=signal_id,
+                channel_handle=channel_handle,
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -426,7 +439,7 @@ async def _replay_post_resolution(
             )
         except Exception as e:
             log.warning("tg_social_alert_send_failed", error=str(e))
-        await _persist_signal_row(
+        signal_id = await _persist_signal_row(
             db=db,
             message_pk=message_pk,
             token_id=token.token_id,
@@ -437,6 +450,14 @@ async def _replay_post_resolution(
             resolution_state=result.state.value,
             channel_handle=channel_handle,
             paper_trade_id=paper_trade_id,
+            # Serialized BEFORE the writer takes `_txn_lock`.
+            resolution_snapshot_json=build_resolution_snapshot(token),
+        )
+        await _shadow_eval_after_persist(
+            db=db,
+            settings=settings,
+            signal_id=signal_id,
+            channel_handle=channel_handle,
         )
         log.info(
             "tg_social_alert_sent",
@@ -579,29 +600,100 @@ async def _persist_signal_row(
     resolution_state: str,
     channel_handle: str,
     paper_trade_id: int | None,
-) -> None:
+    resolution_snapshot_json: str | None,
+) -> int | None:
+    """INSERT one `tg_social_signals` row; returns its id.
+
+    `resolution_snapshot_json` is the durable capture of the resolver facts
+    that were true at this moment (see `snapshot.py`). It rides the SAME
+    INSERT as the row, so the table stays INSERT-only and a snapshot can
+    never disagree with the signal it describes. The CALLER serializes it —
+    nothing but the INSERT and the commit happens under the lock.
+
+    Holds `db._txn_lock` across INSERT + commit, same invariant as every
+    other writer on the shared `Database._conn`. Without it, this commit
+    seals whatever statements another coroutine had in flight on the same
+    connection. On failure the transaction is rolled back and the exception
+    propagates: a signal row that silently did not land would make the
+    message row's provenance unrecoverable.
+    """
+    conn = db._conn
+    if conn is None or db._txn_lock is None:
+        raise RuntimeError("Database not initialized.")
     now_iso = datetime.now(timezone.utc).isoformat()
-    await db._conn.execute(
-        """INSERT INTO tg_social_signals
-           (message_pk, token_id, symbol, contract_address, chain,
-            mcap_at_sighting, resolution_state, source_channel_handle,
-            alert_sent_at, paper_trade_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            message_pk,
-            token_id,
-            symbol,
-            contract_address,
-            chain,
-            mcap,
-            resolution_state,
-            channel_handle,
-            now_iso,
-            paper_trade_id,
-            now_iso,
-        ),
-    )
-    await db._conn.commit()
+
+    async with db._txn_lock:
+        try:
+            cur = await conn.execute(
+                """INSERT INTO tg_social_signals
+                   (message_pk, token_id, symbol, contract_address, chain,
+                    mcap_at_sighting, resolution_state, source_channel_handle,
+                    alert_sent_at, paper_trade_id, created_at,
+                    resolution_snapshot_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message_pk,
+                    token_id,
+                    symbol,
+                    contract_address,
+                    chain,
+                    mcap,
+                    resolution_state,
+                    channel_handle,
+                    now_iso,
+                    paper_trade_id,
+                    now_iso,
+                    resolution_snapshot_json,
+                ),
+            )
+            signal_id = cur.lastrowid
+            await conn.commit()
+            return signal_id
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception as rb_err:
+                # Don't mask the write failure via `raise` below, but a
+                # silent swallow here hides the double-failure. Same shape
+                # as `_persist_message_with_watermark`.
+                log.exception("tg_social_signal_rollback_failed", err=str(rb_err))
+            raise
+
+
+async def _shadow_eval_after_persist(
+    *,
+    db: Database,
+    settings: Settings,
+    signal_id: int | None,
+    channel_handle: str,
+) -> None:
+    """Best-effort live shadow evaluation, after alerting and persistence.
+
+    Inert unless `TG_SHADOW_ENABLED` is true AND a real `CallerFeatureProvider`
+    is registered — production wiring registers none in PR1, so this is a
+    no-op on every deployed path today.
+
+    A shadow failure is an evidence gap, not a pipeline fault: it must never
+    affect alert delivery, signal persistence, or the (quarantined) dispatch
+    path. The §12a watchdog converts a persistent gap into a page, so the
+    swallow here does not hide a stuck writer.
+    """
+    if signal_id is None or not settings.TG_SHADOW_ENABLED:
+        return
+    try:
+        from scout.social.telegram.shadow import maybe_evaluate_signal
+
+        await maybe_evaluate_signal(db=db, settings=settings, signal_id=signal_id)
+    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
+        log.exception(
+            "tg_shadow_eval_failed",
+            signal_id=signal_id,
+            channel_handle=channel_handle,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
 
 
 async def _append_dlq(
