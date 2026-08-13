@@ -53,6 +53,8 @@ async def _run(
     horizon_hours: int,
     max_identities_per_run: int,
     max_requests_per_day: int,
+    max_cg_identities_per_run: int,
+    max_price_cache_age_min: int,
 ) -> dict:
     """Enabled path: wire the real C0 GT client and run one snapshot cycle.
 
@@ -86,6 +88,8 @@ async def _run(
                 horizon_hours=horizon_hours,
                 max_identities_per_run=max_identities_per_run,
                 max_requests_per_day=max_requests_per_day,
+                max_cg_identities_per_run=max_cg_identities_per_run,
+                max_price_cache_age_min=max_price_cache_age_min,
             )
             # C4: persist this cycle's counters so the coverage watchdogs can
             # read output rows (writer freshness + provider-error rate).
@@ -167,6 +171,26 @@ def main() -> int:
             "SOURCE_CALL_SNAPSHOT_MAX_REQUESTS_PER_DAY."
         ),
     )
+    parser.add_argument(
+        "--max-cg-identities-per-run",
+        type=int,
+        default=32,
+        help=(
+            "Per-run ceiling for the CG coin_id lane. That lane spends no "
+            "provider requests, so this bounds WRITE RATE, not budget. Wired "
+            "from SOURCE_CALL_SNAPSHOT_MAX_CG_IDENTITIES_PER_RUN."
+        ),
+    )
+    parser.add_argument(
+        "--max-price-cache-age-min",
+        type=int,
+        default=90,
+        help=(
+            "price_cache rows older than this are not treated as "
+            "observations. Wired from "
+            "SOURCE_CALL_SNAPSHOT_MAX_PRICE_CACHE_AGE_MIN."
+        ),
+    )
     parser.add_argument("--heartbeat-file", default=None)
     args = parser.parse_args()
 
@@ -192,6 +216,8 @@ def main() -> int:
                 horizon_hours=args.horizon_hours,
                 max_identities_per_run=args.max_identities_per_run,
                 max_requests_per_day=args.max_requests_per_day,
+                max_cg_identities_per_run=args.max_cg_identities_per_run,
+                max_price_cache_age_min=args.max_price_cache_age_min,
             )
         )
     except Exception as exc:

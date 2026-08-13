@@ -251,6 +251,19 @@ class Settings(BaseSettings):
     SOURCE_CALL_SNAPSHOT_MAX_REQUESTS_PER_DAY: int = Field(
         default=2000, ge=1, le=100_000
     )
+    # Stage B CG coin_id lane. That lane prices from the LOCAL price_cache and
+    # spends no provider requests, so its per-run ceiling bounds WRITE RATE, not
+    # provider budget; the age bound decides how stale a cached price may be and
+    # still count as an observation. Declared here for the same reason as the
+    # knobs above — the .sh wrapper reads them from .env, and extra="forbid"
+    # turns an undeclared knob into a boot-time ValidationError for the WHOLE
+    # pipeline, not just this writer.
+    SOURCE_CALL_SNAPSHOT_MAX_CG_IDENTITIES_PER_RUN: int = Field(
+        default=32, ge=1, le=500
+    )
+    SOURCE_CALL_SNAPSHOT_MAX_PRICE_CACHE_AGE_MIN: int = Field(
+        default=90, ge=1, le=10_080
+    )
 
     # Held-position price-refresh lane (§12c-narrow remediation).
     # See tasks/plan_held_position_price_freshness.md and

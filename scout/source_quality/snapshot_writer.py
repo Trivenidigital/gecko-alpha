@@ -22,6 +22,32 @@ Design guarantees enforced here:
 The C0 price functions are taken as injected callables so this module never
 imports aiohttp and stays unit-testable without network; the cron script wires
 the real ``resolve_pool_address`` / ``fetch_pool_ohlcv``.
+
+Stage B Option 3 — CG coin_id lane
+----------------------------------
+A second identity kind is written here: genuine CoinGecko ``coin_id``
+identities, stored under ``identity_kind = 'coin_id'`` (see the naming
+reconciliation below). These are priced from the local ``price_cache`` surface
+the pipeline already maintains, so the lane adds **zero** provider requests and
+does not touch the contract lane's budget.
+
+It exists because the identities it covers are the MAJORITY of priceable TG
+calls, and the only other source for them — ``gainers_snapshots`` /
+``losers_snapshots`` — carries a 7-day retention DELETE. A trailing-30d decision
+surface cannot be reconstructed from a table that deletes its own history, which
+is why those were rejected as Stage B substrate.
+
+RETENTION / LIFECYCLE INVARIANT
+-------------------------------
+``source_call_price_snapshots`` is **append-only and unpruned**. No DELETE or
+prune path may target it, and a source-text pin in the tests enforces that.
+
+The constraint is not "keep everything forever" — it is that pruning is bounded
+by the *active feature/generation evidence lifecycle*: **no raw observation
+needed to reproduce an active generation's historical decision may be deleted
+before that lifecycle closes.** A retention policy may be added later only once
+it can demonstrate that the observations it removes cannot be required to
+reconstruct any still-active generation's decision surface.
 """
 
 from __future__ import annotations
@@ -52,6 +78,64 @@ _REQUESTS_PER_IDENTITY = 2
 # per run, so this is ~15x headroom over observed load, not a throttle.
 DEFAULT_MAX_IDENTITIES_PER_RUN = 25
 DEFAULT_MAX_REQUESTS_PER_DAY = 2000
+
+# THE NAMING RECONCILIATION. Two different strings name the same concept:
+#   * the SCHEMA CHECK on source_call_price_snapshots permits 'coin_id'
+#   * `ledger._priceable_identity` emits 'token_id'
+# Storing under one and reading under the other returns ZERO ROWS SILENTLY —
+# no constraint fires, no error, the series is simply always empty. So the two
+# are reconciled here, once, and pinned by a test that fails on a mismatch
+# rather than returning nothing.
+#
+# 'coin_id' is canonical for STORAGE because the schema CHECK already permits
+# exactly that and this PR alters no DDL. 'token_id' remains the ledger's
+# in-memory kind. Anything writing or reading a CG identity in this table must
+# go through these two names.
+LEDGER_CG_KIND = "token_id"
+STORAGE_CG_KIND = "coin_id"
+
+# Kind translation, ledger-side -> storage-side. Exported because the constants
+# ALONE are one-sided: a reader holding the ledger's 'token_id' and querying the
+# table with it still gets zero rows, silently. Anything reading this table for
+# an identity that came out of `_priceable_identity` should route through here.
+_LEDGER_TO_STORAGE_KIND = {
+    LEDGER_CG_KIND: STORAGE_CG_KIND,
+    "contract": "contract",
+}
+
+
+def storage_kind_for(ledger_kind: str) -> str:
+    """Storage ``identity_kind`` for a kind emitted by ``_priceable_identity``.
+
+    Raises on an unknown kind rather than passing it through: a silently
+    unmapped kind is exactly the zero-rows failure this indirection exists to
+    prevent, and a new ledger kind should fail loudly here the day it appears.
+    """
+    try:
+        return _LEDGER_TO_STORAGE_KIND[ledger_kind]
+    except KeyError:
+        raise ValueError(
+            f"no storage identity_kind mapped for ledger kind {ledger_kind!r}; "
+            f"known: {sorted(_LEDGER_TO_STORAGE_KIND)}"
+        ) from None
+
+
+# Per-run ceiling for the CG lane, mirroring the contract lane's. The CG lane
+# spends no provider requests, so this is a WRITE-RATE bound, not a budget one:
+# without it the row rate is bounded only by open-call coverage, which is 110
+# calls x 96 runs/day = ~10.5k rows/day worst case. 32 sits above the measured
+# steady state (14 distinct CG identities in the open window on 2026-08-13),
+# so it defers nothing today while capping the pathological case at
+# 32 x 96 = ~3.1k rows/day. Deferred identities are picked up next run — they
+# stay inside the forward horizon, so nothing is lost.
+DEFAULT_MAX_CG_IDENTITIES_PER_RUN = 32
+
+# price_cache rows older than this are not treated as observations. The cache is
+# a latest-value-per-coin surface refreshed by the pipeline, NOT a time series;
+# measured on prod 2026-08-13, 10 of the 13 covered call identities were under
+# an hour old (most ~1 minute) while one sat 3.3 days stale. Snapshotting the
+# stale one would record a days-old price as a fresh observation.
+DEFAULT_MAX_PRICE_CACHE_AGE_MIN = 90
 
 # (*, chain, contract_address) -> pool-like | None ; pool-like has .network + .pool_address
 PoolResolver = Callable[..., Awaitable[Any]]
@@ -87,6 +171,205 @@ async def _requests_used_today(conn: aiosqlite.Connection, *, now: datetime) -> 
     return int(row[0] or 0) * _REQUESTS_PER_IDENTITY
 
 
+async def _last_snapshot_at(
+    conn: aiosqlite.Connection, *, identity_kind: str, identity_key: str
+) -> str | None:
+    cur = await conn.execute(
+        "SELECT MAX(snapshot_at) FROM source_call_price_snapshots "
+        "WHERE identity_kind = ? AND identity_key = ?",
+        (identity_kind, identity_key),
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def _eligible_cg_identities(
+    conn: aiosqlite.Connection,
+    coin_ids: list[str],
+    *,
+    now: datetime,
+    max_cache_age_min: int,
+    stats: dict[str, int],
+) -> list[str]:
+    """Drop identities that CANNOT produce an observation, before the cap.
+
+    Rotation alone is not enough. A never-OBSERVABLE identity — no ``price_cache``
+    row, an unparseable timestamp, or a row perpetually beyond the freshness
+    bound — is also never-OBSERVED, so it sorts into the rank-0
+    bootstrap bucket and sits at the head of the rotation forever. With as few as
+    ``cap`` such identities the observable lane stalls COMPLETELY, and the only
+    symptom is a rising ``cg_no_cache_row`` that reads as innocent.
+
+    The accumulator makes this worse over time rather than better: a
+    ``price_cache`` row freezes once its token drops out of the ranked universe,
+    so perpetually-stale residents build up.
+
+    Filtering here means the cap bounds only work that can actually yield rows.
+
+    COUNTING AUTHORITY: this is the single counting site for the identities it
+    excludes — an excluded identity never reaches ``_write_cg_snapshots``, and an
+    admitted one is counted only there. So no identity is counted twice, and the
+    ``cg_no_cache_row`` ("no row / no price") vs ``cg_stale_cache`` ("row present
+    but too old") distinction is preserved at both sites.
+    """
+    if not coin_ids:
+        return []
+    placeholders = ",".join("?" for _ in coin_ids)
+    cur = await conn.execute(
+        "SELECT coin_id, current_price, updated_at FROM price_cache "
+        f"WHERE coin_id IN ({placeholders})",
+        tuple(coin_ids),
+    )
+    cached = {row["coin_id"]: row for row in await cur.fetchall()}
+
+    eligible: list[str] = []
+    for coin_id in coin_ids:
+        row = cached.get(coin_id)
+        if row is None or row["current_price"] is None:
+            stats["cg_no_cache_row"] += 1
+            continue
+        try:
+            observed_at = parse_utc(row["updated_at"])
+        except ValueError:
+            observed_at = None
+        if observed_at is None:
+            stats["cg_bad_timestamp"] += 1
+            continue
+        if (now - observed_at).total_seconds() / 60.0 > max_cache_age_min:
+            stats["cg_stale_cache"] += 1
+            continue
+        eligible.append(coin_id)
+    return eligible
+
+
+async def _rotate_cg_identities(
+    conn: aiosqlite.Connection, coin_ids: list[str]
+) -> list[str]:
+    """Order CG identities least-recently-observed first, never-observed FIRST.
+
+    Without this the per-run cap STARVES the tail rather than deferring it:
+    ``cg_seen`` comes out of a ``source_calls`` scan whose order is stable across
+    runs, so a plain prefix slice picks the SAME identities every cycle and the
+    ones past the cap never get a single observation. "Deferred, not dropped" is
+    only true if the selection rotates.
+
+    Never-observed identities sort first so a new identity bootstraps its series
+    immediately; after that the oldest ``MAX(snapshot_at)`` wins. The identity
+    key is the tiebreaker, so the order is deterministic.
+
+    The bootstrap-first rank is safe ONLY because callers hand this an already
+    filtered list (:func:`_eligible_cg_identities`): every identity here can
+    produce an observation this run, so the rank-0 bucket drains by construction
+    and no identity can hold a head slot permanently.
+    """
+    if not coin_ids:
+        return []
+    placeholders = ",".join("?" for _ in coin_ids)
+    cur = await conn.execute(
+        "SELECT identity_key, MAX(snapshot_at) AS last_at "
+        "FROM source_call_price_snapshots "
+        f"WHERE identity_kind = ? AND identity_key IN ({placeholders}) "
+        "GROUP BY identity_key",
+        (STORAGE_CG_KIND, *coin_ids),
+    )
+    last_by_key = {row["identity_key"]: row["last_at"] for row in await cur.fetchall()}
+
+    def _rank(coin_id: str) -> tuple[int, str, str]:
+        last = last_by_key.get(coin_id)
+        # (0, "", key) for never-observed -> ahead of every observed identity.
+        return (0, "", coin_id) if last is None else (1, last, coin_id)
+
+    return sorted(coin_ids, key=_rank)
+
+
+async def _write_cg_snapshots(
+    conn: aiosqlite.Connection,
+    coin_ids: list[str],
+    *,
+    now: datetime,
+    stats: dict[str, int],
+    max_cache_age_min: int,
+) -> None:
+    """Append CG coin_id observations from the local `price_cache` surface.
+
+    ZERO provider requests. `price_cache` is already maintained by the pipeline
+    and is keyed by coin_id, so the cheapest correct source is a local read — no
+    new CoinGecko call is added by this lane, and the provider budget that bounds
+    the contract lane is deliberately untouched.
+
+    `price_cache` is a latest-value cache, not a series, so the OBSERVATION TIME
+    is its own ``updated_at`` — not ``now``. Using ``now`` would stamp a stale
+    cached price as a fresh observation and silently corrupt the as-of reads the
+    whole Stage B substrate exists to serve.
+
+    Forward-only is enforced per identity: an observation is written only when it
+    is strictly newer than that identity's latest stored snapshot. That also
+    dedupes repeat runs inside one cache-refresh interval without needing a
+    unique constraint.
+    """
+    for coin_id in coin_ids:
+        cur = await conn.execute(
+            "SELECT current_price, updated_at FROM price_cache WHERE coin_id = ?",
+            (coin_id,),
+        )
+        row = await cur.fetchone()
+        if row is None or row["current_price"] is None:
+            stats["cg_no_cache_row"] += 1
+            continue
+        # A malformed `updated_at` is the plausible corruption mode here, and it
+        # is NOT the same fact as "no cache row" — conflating them would report
+        # a data-quality defect as absence. `parse_utc` returns None for some
+        # shapes and raises ValueError for others, so both are handled.
+        try:
+            observed_at = parse_utc(row["updated_at"])
+        except ValueError:
+            observed_at = None
+        if observed_at is None:
+            stats["cg_bad_timestamp"] += 1
+            _log.warning(
+                "scps_cg_bad_timestamp",
+                identity_key=coin_id,
+                updated_at=str(row["updated_at"])[:64],
+            )
+            continue
+        age_min = (now - observed_at).total_seconds() / 60.0
+        if age_min > max_cache_age_min:
+            stats["cg_stale_cache"] += 1
+            _log.info(
+                "scps_cg_cache_stale",
+                identity_key=coin_id,
+                age_min=round(age_min, 1),
+                max_cache_age_min=max_cache_age_min,
+            )
+            continue
+        observed_iso = observed_at.isoformat()
+        last = await _last_snapshot_at(
+            conn, identity_kind=STORAGE_CG_KIND, identity_key=coin_id
+        )
+        if last is not None and observed_iso <= last:
+            # Already captured this observation (or a newer one). Forward-only.
+            if observed_iso < last:
+                # STRICTLY older than what we already hold: the upstream cache
+                # moved BACKWARDS. Separated from the ordinary "nothing new"
+                # case because it is upstream misbehaviour, not a quiet tick.
+                _log.info(
+                    "scps_cg_cache_regressed",
+                    identity_key=coin_id,
+                    observed_at=observed_iso,
+                    last_snapshot_at=last,
+                )
+            stats["cg_not_newer"] += 1
+            continue
+        await conn.execute(
+            "INSERT INTO source_call_price_snapshots "
+            "(identity_key, identity_kind, chain, price, snapshot_at, source) "
+            "VALUES (?, ?, NULL, ?, ?, 'cg')",
+            (coin_id, STORAGE_CG_KIND, float(row["current_price"]), observed_iso),
+        )
+        stats["cg_snapshots_written"] += 1
+        stats["snapshots_written"] += 1
+
+
 async def write_price_snapshots(
     conn: aiosqlite.Connection,
     *,
@@ -96,6 +379,8 @@ async def write_price_snapshots(
     horizon_hours: int = DEFAULT_HORIZON_HOURS,
     max_identities_per_run: int = DEFAULT_MAX_IDENTITIES_PER_RUN,
     max_requests_per_day: int = DEFAULT_MAX_REQUESTS_PER_DAY,
+    max_cg_identities_per_run: int = DEFAULT_MAX_CG_IDENTITIES_PER_RUN,
+    max_price_cache_age_min: int = DEFAULT_MAX_PRICE_CACHE_AGE_MIN,
 ) -> dict[str, int]:
     """One forward-only snapshot cycle. Returns observability counters.
 
@@ -122,12 +407,21 @@ async def write_price_snapshots(
     # What a row genuinely needs to be priced here is a contract address, a
     # chain, and a still-open outcome window; `_priceable_identity` below is the
     # single authority on the first two.
+    #
+    # Stage B Option 3 widens this to CG coin_id identities too. The old
+    # predicate required a contract address, so a call carrying only a genuine
+    # CoinGecko id was invisible here — on prod 2026-08-13 that was 110 of 127
+    # open calls, i.e. the MAJORITY path. `_priceable_identity` still decides
+    # which kind a row is; this predicate only stops excluding the coin_id ones.
     cur = await conn.execute(
         "SELECT id, token_id, contract_address, chain, call_ts "
         "FROM source_calls "
-        "WHERE contract_address IS NOT NULL AND contract_address != '' "
-        "AND chain IS NOT NULL AND chain != '' "
-        "AND outcome_status IN ('pending','partial')"
+        "WHERE outcome_status IN ('pending','partial') "
+        "AND ("
+        "  (contract_address IS NOT NULL AND contract_address != '' "
+        "   AND chain IS NOT NULL AND chain != '') "
+        "  OR (token_id IS NOT NULL AND token_id != '')"
+        ")"
     )
     rows = await cur.fetchall()
 
@@ -136,14 +430,38 @@ async def write_price_snapshots(
     # for the provider call — the identity_key is lowercased for grouping only,
     # and Solana contract addresses are case-sensitive.
     seen: dict[str, tuple[str, str | None]] = {}
+    # CG identities are kept in a SEPARATE set: they are priced from an existing
+    # local surface, cost zero provider requests, and therefore must not consume
+    # the provider budget that bounds the contract lane.
+    cg_seen: list[str] = []
     for row in rows:
         call_ts = parse_utc(row["call_ts"])
         if call_ts is None or call_ts < cutoff:
             continue
         identity = _priceable_identity(row)
-        if identity is None or identity[0] != "contract":
+        if identity is None:
             continue
-        key = identity[1]
+        kind, key = identity
+        if kind == LEDGER_CG_KIND:
+            if key not in cg_seen:
+                cg_seen.append(key)
+            continue
+        if kind != "contract":
+            continue
+        # The widened SELECT admits token_id-bearing rows, and one of those can
+        # carry a contract with a NULL/empty chain — which `_priceable_identity`
+        # still calls a contract identity. Without this guard such a row enters
+        # the CONTRACT lane, calls resolve_pool(chain=None), and GT answers 404
+        # on /networks/None/...; at the observed 1-2 identities per run a single
+        # such row is enough to hold the provider_error_spike watchdog at its
+        # threshold. Restores byte-equivalent contract-lane selection while
+        # keeping the SQL widening.
+        #
+        # Measured on prod 2026-08-13: ZERO rows currently in this class, so
+        # this is a LATENT guard, not a live defect — it protects the lane the
+        # first time such a row appears.
+        if not row["chain"]:
+            continue
         if key not in seen:
             seen[key] = (row["contract_address"], row["chain"])
 
@@ -173,9 +491,62 @@ async def write_price_snapshots(
         "requests_used_today_before": used_today,
         "requests_remaining_today_before": remaining_today,
         "daily_cap_reached": int(affordable <= 0),
+        # CG lane counters. Reported separately from the contract lane so the
+        # two are never conflated in a coverage read.
+        "cg_identities_selected": len(cg_seen),
+        "cg_skipped_over_cap": 0,
+        "cg_snapshots_written": 0,
+        "cg_no_cache_row": 0,
+        "cg_stale_cache": 0,
+        "cg_bad_timestamp": 0,
+        "cg_not_newer": 0,
     }
+    # FILTER, then ROTATE, then slice — the order matters and each step fixes a
+    # distinct failure:
+    #   filter  drops identities that cannot produce a row this run, so they
+    #           cannot occupy the rotation's bootstrap head forever (H1)
+    #   rotate  stops the stable source_calls scan order from handing the same
+    #           prefix to every cycle, which starved the tail rather than
+    #           deferring it (G2)
+    #   slice   applies the cap to work that can actually yield rows
+    cg_eligible = await _eligible_cg_identities(
+        conn,
+        cg_seen,
+        now=now_dt,
+        max_cache_age_min=max_price_cache_age_min,
+        stats=stats,
+    )
+    cg_ordered = await _rotate_cg_identities(conn, cg_eligible)
+    stats["cg_skipped_over_cap"] = max(0, len(cg_ordered) - max_cg_identities_per_run)
+    if stats["cg_skipped_over_cap"]:
+        # Never silently truncate — deferred work must be separable from absent
+        # work, same contract as the contract lane's skipped_over_cap.
+        _log.info(
+            "scps_cg_run_cap_deferred",
+            processing=max_cg_identities_per_run,
+            deferred=stats["cg_skipped_over_cap"],
+        )
+
+    # The CG lane runs BEFORE the provider-budget gate and is not subject to it:
+    # it issues no provider requests at all, so a contract-lane budget breach
+    # must not also silence the majority path.
+    await _write_cg_snapshots(
+        conn,
+        cg_ordered[:max_cg_identities_per_run],
+        now=now_dt,
+        stats=stats,
+        max_cache_age_min=max_price_cache_age_min,
+    )
+    # Commit unconditionally, right here. The CG rows cost no provider requests,
+    # so they must survive a contract-lane budget stop; committing at this single
+    # point (rather than special-casing the early return) also bounds the
+    # contract loop's own transaction, so an INSERT error down there cannot
+    # strand these rows in a half-open transaction.
+    await conn.commit()
 
     if affordable <= 0:
+        # CG rows are already committed above, so the budget stop needs no
+        # special case of its own.
         stats["duration_ms"] = int((perf_counter() - started_perf) * 1000)
         _log.warning(
             "scps_daily_request_ceiling_reached",
@@ -279,7 +650,17 @@ async def record_snapshot_run(
     but nothing priceable", and to compute the provider-error rate over recent
     runs. Append-only; kept separate from ``write_price_snapshots`` so the pure
     pricing function stays side-effect-focused and the cron owns persistence.
+
+    ``snapshots_written`` persisted here is CONTRACT-ONLY. The consumers of this
+    table — notably the ``fresh_calls_no_snapshots`` coverage watchdog — read it
+    as "did the CONTRACT lane produce anything", and the CG lane can write on a
+    run where the contract lane produced nothing at all. Persisting the combined
+    total would make a dead contract lane look healthy, defeating the watchdog.
+    CG counters stay fully visible on the ``scps_writer_cycle`` log line.
     """
+    contract_snapshots = int(stats.get("snapshots_written", 0)) - int(
+        stats.get("cg_snapshots_written", 0)
+    )
     await conn.execute(
         "INSERT INTO source_call_price_snapshot_runs "
         "(ran_at, identities_seen, snapshots_written, provider_errors, "
@@ -287,7 +668,7 @@ async def record_snapshot_run(
         (
             ran_at,
             int(stats.get("identities_seen", 0)),
-            int(stats.get("snapshots_written", 0)),
+            max(0, contract_snapshots),
             int(stats.get("provider_errors", 0)),
             int(stats.get("pools_unresolved", 0)),
             int(stats.get("empty_ohlcv", 0)),
