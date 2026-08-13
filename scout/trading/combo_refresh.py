@@ -563,17 +563,41 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
 
 
 async def refresh_all(db: Database, settings) -> dict:
-    """Rebuild `combo_performance` for every combo that traded recently OR is
-    currently suppressed.
+    """Rebuild `combo_performance` for every combo whose rolling-window
+    economics can have moved since the last refresh.
 
-    The recent-trade window comes from ``FEEDBACK_REFRESH_WINDOW_DAYS``. A
-    currently-suppressed combo is refreshed even with NO trade in that window
-    (fix/frozen-suppression-lock): a suppressed combo blocks its own trades, so
-    it stops trading, so under a trade-only refresh set it would fall out of the
-    set, never be refreshed again, and latch at ``parole_exhausted`` forever
-    with no operator notification. Widening the selection keeps it live +
-    alertable; ``refresh_combo`` preserves its suppressed state verbatim for
-    zero-trade combos (no auto-revival — constraint a).
+    THE ENUMERATION INVARIANT: every persisted combo whose 7d/30d economic
+    state can change because outcomes entered or aged out of the rolling window
+    must be refreshed.
+
+    Membership used to be bound to ``opened_at`` while ``refresh_combo``
+    computes economics from ``VALID_TERMINAL_OUTCOME_SQL AND closed_at >=
+    cutoff`` — two different columns. A combo whose opens aged out while its
+    closes stayed inside the window was therefore never re-selected and its row
+    froze indefinitely. On 2026-08-13 ``volume_spike`` had ``MAX(opened_at)``
+    69 minutes before the cutoff, 21 valid closes INSIDE the window, and was
+    unsuppressed — so it was excluded entirely and its row stayed byte-stale;
+    seven unsuppressed 30d rows carried stale economics, some since May. The
+    three arms below close that gap:
+
+    1. recent opens (``opened_at >= cutoff``) — KEPT deliberately. It is the
+       only arm that sees a combo which has opened but not yet closed anything,
+       so it protects cold start and first-materialization.
+    2. recent VALID closes (``closed_at >= cutoff``) — binds membership to the
+       same column and the same canonical validity predicate the economics use.
+       Bound to the predicate, not merely to closedness: otherwise the
+       fabricated-$0 and operator-action rows that the economics deliberately
+       exclude would manufacture membership for a combo that has no row.
+    3. every existing 30d key — the only arm that can refresh a row DOWN as its
+       outcomes age out of the window. It also strictly SUBSUMES the former
+       ``suppressed = 1`` arm (fix/frozen-suppression-lock), which is why that
+       arm is gone rather than merely redundant: a suppressed combo blocks its
+       own trades, so under a trade-only refresh set it would fall out, never be
+       refreshed again, and latch at ``parole_exhausted`` forever with no
+       operator notification. ``refresh_combo`` still preserves its suppressed
+       state verbatim for zero-trade combos (no auto-revival — constraint a).
+
+    The window comes from ``FEEDBACK_REFRESH_WINDOW_DAYS``.
 
     Returns ``{"refreshed": N, "failed": M, "chronic_failures": [keys],
     "permanent_suppression": [keys], "suppression_reversals": [dicts]}`` where
@@ -591,13 +615,24 @@ async def refresh_all(db: Database, settings) -> dict:
     # (opened_at is not function-wrapped).
     window_cutoff = sql_utc_cutoff(days=window_days)
     cur = await db._conn.execute(
+        # Arm 1 — recent opens. Kept: the only arm that sees a combo which has
+        # opened but not yet closed anything (cold start / materialization).
         "SELECT DISTINCT signal_combo AS combo FROM paper_trades "
         "WHERE signal_combo IS NOT NULL "
         "  AND opened_at >= ? "
         "UNION "
-        "SELECT combo_key AS combo FROM combo_performance "
-        "WHERE window = '30d' AND suppressed = 1",
-        (window_cutoff,),
+        # Arm 2 — recent VALID closes. Same column AND same predicate the
+        # economics use, so membership can no longer disagree with them.
+        "SELECT DISTINCT signal_combo AS combo FROM paper_trades "
+        "WHERE signal_combo IS NOT NULL "
+        f"  AND {VALID_TERMINAL_OUTCOME_SQL} "
+        "  AND closed_at >= ? "
+        "UNION "
+        # Arm 3 — every existing 30d key. The only arm that can refresh a row
+        # DOWN as its outcomes age out. Strictly subsumes the former
+        # `AND suppressed = 1` arm, which is why that predicate is gone.
+        "SELECT combo_key AS combo FROM combo_performance WHERE window = '30d'",
+        (window_cutoff, window_cutoff),
     )
     rows = await cur.fetchall()
     combos = [r[0] for r in rows if r[0]]
