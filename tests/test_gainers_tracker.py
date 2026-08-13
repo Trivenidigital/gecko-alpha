@@ -356,3 +356,177 @@ async def test_stats_union_includes_new_surfaces(db):
     stats = await get_gainers_stats(db)
     assert stats["caught"] == 1
     assert stats["avg_lead_minutes"] == pytest.approx(90.0, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# feat/compare-started-observability — `compare_gainers_with_signals` ran for
+# minutes over per-coin subqueries while emitting NOTHING between entry and
+# completion, so "still running" and "never started" looked identical in the
+# logs. And `gainers_tracker.peaks_updated` was emitted from two callers at
+# different cadences under one event name, which cannot discriminate which path
+# ran — that ambiguity produced two wrong prod diagnoses during #512
+# verification.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_gainer_snapshot(db, coin_id: str, *, minutes_ago: int = 0):
+    await db._conn.execute(
+        """INSERT INTO gainers_snapshots
+           (coin_id, symbol, name, price_change_24h, market_cap, volume_24h,
+            snapshot_at)
+           VALUES (?, ?, ?, ?, ?, ?, datetime('now', ?))""",
+        (
+            coin_id,
+            coin_id[:3].upper(),
+            coin_id.title(),
+            40.0,
+            50_000_000,
+            1_000_000,
+            f"-{minutes_ago} minutes",
+        ),
+    )
+    await db._conn.commit()
+
+
+async def test_compare_started_is_emitted_once_before_the_per_coin_loop(db):
+    """The in-flight marker: one `compare_started` per invocation, carrying the
+    coin count the run is about to walk.
+
+    Without it, a compare that is still grinding through per-coin subqueries is
+    indistinguishable in the logs from one that never ran at all.
+    """
+    import structlog
+
+    for i in range(3):
+        await _seed_gainer_snapshot(db, f"started-coin-{i}", minutes_ago=i)
+
+    with structlog.testing.capture_logs() as log_events:
+        comparisons = await compare_gainers_with_signals(db)
+
+    assert len(comparisons) == 3
+    started = [e for e in log_events if e["event"] == "gainers_tracker.compare_started"]
+    assert len(started) == 1, "compare_started must fire exactly once per invocation"
+    assert started[0]["coins"] == 3, "coin count must match the set about to be walked"
+    # Scope facts so a reader can tell WHICH window this run covered.
+    assert started[0]["oldest_gainer_at"] is not None
+    assert started[0]["newest_gainer_at"] is not None
+    # Existence alone is not enough: a min/max swap in the source survives an
+    # existence-only check (reviewer probe). The fixture seeds at 0/1/2 minutes
+    # ago, so the ordering is strict and deterministic.
+    assert (
+        started[0]["oldest_gainer_at"] < started[0]["newest_gainer_at"]
+    ), "oldest/newest must not be swapped"
+
+
+async def test_compare_started_not_emitted_when_there_is_nothing_to_compare(db):
+    """Placement guard: the marker sits AFTER the empty-set early return.
+
+    Emitting `compare_started` on a run that immediately returns would make the
+    started/complete pair unbalanced for a no-op, which is exactly the ambiguity
+    this event exists to remove.
+    """
+    import structlog
+
+    with structlog.testing.capture_logs() as log_events:
+        comparisons = await compare_gainers_with_signals(db)
+
+    assert comparisons == []
+    events = [e["event"] for e in log_events]
+    assert "gainers_tracker.compare_started" not in events
+    assert "gainers_tracker.compare_no_data" in events
+
+
+async def _seed_peak_candidate(db, coin_id: str):
+    """A comparison row plus a fresh price_cache row that beats its peak."""
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_price, peak_price, is_gap)
+           VALUES (?, ?, ?, ?, datetime('now'), 1.0, 1.0, 1)""",
+        (coin_id, coin_id[:3].upper(), coin_id.title(), 30.0),
+    )
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES (?, ?, datetime('now'))",
+        (coin_id, 2.0),
+    )
+    await db._conn.commit()
+
+
+async def test_peaks_updated_carries_the_caller_label(db):
+    """The event name stays stable (existing greps keep working); the caller is
+    a new FIELD."""
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+
+    await _seed_peak_candidate(db, "peak-coin")
+
+    with structlog.testing.capture_logs() as log_events:
+        updated = await update_gainers_peaks(db, caller="pipeline_cycle")
+
+    assert updated == 1
+    emitted = [e for e in log_events if e["event"] == "gainers_tracker.peaks_updated"]
+    assert len(emitted) == 1
+    assert emitted[0]["caller"] == "pipeline_cycle"
+    assert emitted[0]["count"] == 1, "pre-existing count field must survive"
+
+
+async def test_peaks_updated_defaults_to_unattributed(db):
+    """An unlabelled call is reported as `unattributed` rather than silently
+    blank — same convention as `alerter.send_telegram_message(source=...)`."""
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+
+    await _seed_peak_candidate(db, "unlabelled-coin")
+
+    with structlog.testing.capture_logs() as log_events:
+        await update_gainers_peaks(db)
+
+    emitted = [e for e in log_events if e["event"] == "gainers_tracker.peaks_updated"]
+    assert len(emitted) == 1
+    assert emitted[0]["caller"] == "unattributed"
+
+
+def test_every_update_gainers_peaks_call_site_passes_a_distinct_caller():
+    """Static guard over the real call sites — the thing that actually breaks.
+
+    A runtime test can only cover the paths it boots; this catches a THIRD call
+    site added later without a label, which is precisely how the shared event
+    name became ambiguous in the first place. AST rather than grep so comments
+    and formatting cannot fool it.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "scout"
+    found: dict[str, str] = {}
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (
+                fn.attr
+                if isinstance(fn, ast.Attribute)
+                else fn.id if isinstance(fn, ast.Name) else None
+            )
+            if name != "update_gainers_peaks":
+                continue
+            caller = None
+            for kw in node.keywords:
+                if kw.arg == "caller" and isinstance(kw.value, ast.Constant):
+                    caller = kw.value.value
+            rel = path.relative_to(root.parent).as_posix()
+            assert (
+                caller is not None
+            ), f"{rel} calls update_gainers_peaks without caller="
+            found[rel] = caller
+
+    assert found == {
+        "scout/main.py": "pipeline_cycle",
+        "scout/narrative/agent.py": "narrative_agent_evaluate",
+    }, f"call-site caller labels changed: {found}"
+    assert len(set(found.values())) == len(found), "caller labels must be distinct"

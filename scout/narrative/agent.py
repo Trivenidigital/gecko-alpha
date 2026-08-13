@@ -732,7 +732,7 @@ async def narrative_agent_loop(
                 # Update peak prices for trending + gainers comparisons
                 try:
                     await update_trending_peaks(db)
-                    await update_gainers_peaks(db)
+                    await update_gainers_peaks(db, caller="narrative_agent_evaluate")
                 except Exception:
                     logger.exception("peak_tracker.update_error")
 

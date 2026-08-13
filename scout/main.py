@@ -2595,7 +2595,7 @@ async def main(argv: list[str] | None = None) -> int:
                         from scout.gainers.tracker import update_gainers_peaks
 
                         await update_trending_peaks(db)
-                        await update_gainers_peaks(db)
+                        await update_gainers_peaks(db, caller="pipeline_cycle")
                     except Exception:
                         logger.exception("peak_update_error")
 

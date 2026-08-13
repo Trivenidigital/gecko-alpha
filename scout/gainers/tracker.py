@@ -160,6 +160,25 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
         logger.info("gainers_tracker.compare_no_data")
         return []
 
+    # In-flight marker. The loop below runs several per-coin subqueries against
+    # predictions/candidates/chain_matches for every gainer, so a real run can
+    # take minutes; until this existed the function emitted nothing between
+    # entry and `comparisons_stored`, which made "still grinding" and "never
+    # ran" identical in the logs. Deliberately AFTER the empty-set return, so a
+    # no-op run does not open a started/complete pair it never closes.
+    # `min`/`max` are over the already-materialized rows — no extra query. Note
+    # both bounds are over per-coin FIRST-APPEARANCE times (the `MIN(snapshot_at)`
+    # this query groups by coin), NOT over every snapshot in the window: so
+    # `newest_gainer_at` is the most recent coin to first appear, not the most
+    # recent snapshot taken.
+    snapshot_times = [row[4] for row in gainer_rows if row[4] is not None]
+    logger.info(
+        "gainers_tracker.compare_started",
+        coins=len(gainer_rows),
+        oldest_gainer_at=min(snapshot_times) if snapshot_times else None,
+        newest_gainer_at=max(snapshot_times) if snapshot_times else None,
+    )
+
     comparisons: list[dict] = []
 
     for row in gainer_rows:
@@ -511,12 +530,19 @@ async def get_gainers_stats(db: "Database") -> dict:
     }
 
 
-async def update_gainers_peaks(db: "Database") -> int:
+async def update_gainers_peaks(db: "Database", *, caller: str = "unattributed") -> int:
     """Update peak prices for all gainers comparisons using current price_cache data.
 
     Uses a single JOIN query instead of N+1 per-row lookups.
     Only uses prices updated within the last hour to avoid stale peaks.
     Returns the number of rows updated.
+
+    ``caller`` labels the call site on the emitted ``peaks_updated`` event. Two
+    loops drive this function at different cadences — the per-cycle pipeline and
+    the narrative agent's EVALUATE interval — and one shared event name cannot
+    say which of them ran. That ambiguity produced two wrong production
+    diagnoses during #512 verification. Same convention (and same
+    ``"unattributed"`` default) as ``alerter.send_telegram_message(source=...)``.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -551,6 +577,6 @@ async def update_gainers_peaks(db: "Database") -> int:
 
     if updated:
         await conn.commit()
-        logger.info("gainers_tracker.peaks_updated", count=updated)
+        logger.info("gainers_tracker.peaks_updated", count=updated, caller=caller)
 
     return updated
