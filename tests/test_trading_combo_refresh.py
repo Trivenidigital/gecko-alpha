@@ -363,23 +363,48 @@ async def test_refresh_failures_resets_to_zero_on_success(tmp_path, settings_fac
     await db.close()
 
 
-async def test_chronic_failure_threshold_detected(tmp_path, settings_factory):
-    """refresh_all returns combos whose 30d window refresh_failures >= threshold."""
+async def test_chronic_failure_threshold_detected(
+    tmp_path, settings_factory, monkeypatch
+):
+    """refresh_all returns combos whose 30d window refresh_failures >= threshold.
+
+    The combo must actually FAIL its refresh on this run. Before
+    fix/refresh-enumeration-closed-window this fixture seeded a counter on a row
+    that was never enumerated at all, so nothing could reset it. Now every
+    existing 30d key IS enumerated, and a SUCCESSFUL refresh zeroes the counter
+    via the UPSERT — so a never-refreshed sentinel can no longer stand in for a
+    chronically failing combo. Forces a real failure through the established
+    `db._conn.execute` seam (see test_failure_counter_scoped_to_window) so the
+    genuine increment path runs.
+    """
+    import aiosqlite
+
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()
     now = datetime.now(timezone.utc)
-    # Seed a combo with refresh_failures=3 (== default threshold) in 30d window.
+    # One short of the threshold; THIS run's failure is what crosses it.
     await db._conn.execute(
         "INSERT INTO combo_performance "
         "(combo_key, window, trades, wins, losses, total_pnl_usd, "
         " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, last_refreshed) "
-        "VALUES ('stuck', '30d', 0, 0, 0, 0, 0, 0, 0, 3, ?)",
-        (now.isoformat(),),
+        "VALUES ('stuck', '30d', 0, 0, 0, 0, 0, 0, 0, ?, ?)",
+        (s.FEEDBACK_CHRONIC_FAILURE_THRESHOLD - 1, now.isoformat()),
     )
     await db._conn.commit()
 
+    original_execute = db._conn.execute
+
+    async def _fail_7d_upsert(sql, *args, **kwargs):
+        if "INSERT INTO combo_performance" in str(sql) and "'7d'" in str(sql):
+            raise aiosqlite.OperationalError("forced refresh failure")
+        return await original_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(db._conn, "execute", _fail_7d_upsert)
     summary = await combo_refresh.refresh_all(db, s)
+    monkeypatch.setattr(db._conn, "execute", original_execute)
+
+    assert summary["failed"] >= 1, "fixture invalid: the refresh did not fail"
     assert "stuck" in summary["chronic_failures"]
     await db.close()
 
@@ -895,11 +920,24 @@ async def test_normal_traded_combo_refresh_unchanged(
     await db.close()
 
 
-async def test_unsuppressed_zero_trade_combo_not_force_refreshed(
+async def test_unsuppressed_zero_trade_combo_is_now_refreshed(
     tmp_path, settings_factory, monkeypatch
 ):
-    """(vi) An UNSUPPRESSED combo with no recent trade is NOT force-refreshed —
-    only suppressed combos get the widening."""
+    """(vi) SUPERSEDED AND INVERTED by fix/refresh-enumeration-closed-window.
+
+    This test previously asserted the OPPOSITE — "an UNSUPPRESSED combo with no
+    recent trade is NOT force-refreshed; only suppressed combos get the
+    widening." That contract is exactly what froze seven unsuppressed 30d rows
+    with stale economics (some since May 2026): a row whose outcomes aged out of
+    the window could never be corrected downward, because nothing re-selected
+    it. The operator ruling of 2026-08-13 replaces it with the enumeration
+    invariant, under which this sentinel row MUST age to current-window
+    economics.
+
+    Kept in place rather than deleted so the inversion is explicit to a
+    reviewer; the general case is covered by
+    test_stale_unsuppressed_row_ages_down_to_current_window.
+    """
     db = Database(tmp_path / "t.db")
     await db.initialize()
     s = settings_factory()
@@ -918,16 +956,20 @@ async def test_unsuppressed_zero_trade_combo_not_force_refreshed(
     await db._conn.commit()
 
     summary = await combo_refresh.refresh_all(db, s)
-    # Untouched: sentinel trades=7 and last_refreshed both unchanged.
+    # The sentinel is now corrected to the truth: zero outcomes in the window.
     row = await _get_combo_row(db, "quiet", "30d")
-    assert row["trades"] == 7
+    assert row["trades"] == 0, "stale sentinel economics survived the refresh"
+    assert row["wins"] == 0
+    assert row["losses"] == 0
     new_refreshed = await _scalar(
         db,
         "SELECT last_refreshed FROM combo_performance "
         "WHERE combo_key='quiet' AND window='30d'",
     )
-    assert new_refreshed == old_refreshed
+    assert new_refreshed != old_refreshed, "row was not actually re-refreshed"
+    # Still not a permanent-suppression event — it is unsuppressed.
     assert "quiet" not in summary["permanent_suppression"]
+    assert row["suppressed"] == 0
     await db.close()
 
 
@@ -1457,4 +1499,260 @@ async def test_perm_marker_stamped_and_logged_when_telegram_accepts(
     assert events.count("permanent_suppression_alert_dispatched") == 1
     assert events.count("permanent_suppression_alert_delivered") == 1
     assert "permanent_suppression_alert_failed" not in events
+    await db.close()
+
+
+# ---------------------------------------------------------------------------
+# fix/refresh-enumeration-closed-window — refresh_all enumerated candidates by
+# `opened_at >= cutoff` while refresh_combo computes economics by
+# `VALID_TERMINAL_OUTCOME_SQL AND closed_at >= cutoff`. Membership and
+# economics were bound to DIFFERENT columns, so a combo whose opens aged out
+# of the window while its closes stayed inside was never re-selected and its
+# row froze. 2026-08-13: volume_spike had MAX(opened_at) 69 minutes before the
+# cutoff, 21 valid closes inside the window, unsuppressed -> excluded entirely;
+# seven unsuppressed 30d rows carried stale economics, some since May.
+#
+# The invariant now enumerated: every persisted combo whose 7d/30d economic
+# state can change because outcomes entered OR aged out of the rolling window
+# must be refreshed.
+# ---------------------------------------------------------------------------
+
+
+async def _insert_open_trade(db, combo_key: str, opened_at: datetime):
+    """An OPEN trade: no closed_at, no pnl. Never a valid terminal outcome."""
+    token_id = f"tok_{combo_key}_{next(_counter)}"
+    await db._conn.execute(
+        "INSERT INTO paper_trades "
+        "(token_id, symbol, name, chain, signal_type, signal_data, "
+        " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, sl_price, "
+        " status, opened_at, signal_combo) "
+        "VALUES (?, 'S', 'N', 'coingecko', 'volume_spike', '{}', "
+        " 1.0, 100.0, 100.0, 20.0, 10.0, 1.2, 0.9, 'open', ?, ?)",
+        (token_id, opened_at.isoformat(), combo_key),
+    )
+    await db._conn.commit()
+
+
+async def _insert_fallback_close(
+    db, combo_key: str, closed_at: datetime, opened_at: datetime
+):
+    """A close EXCLUDED by provenance (`entry_fallback`, the fabricated-$0 class).
+
+    Exercises the `exit_provenance` clause of VALID_TERMINAL_OUTCOME_SQL, which
+    a `closed_manual` row alone would leave untested.
+    """
+    await _insert_trade(
+        db, combo_key, 0.0, 0.0, closed_at, status="closed_expired", opened_at=opened_at
+    )
+    await db._conn.execute(
+        "UPDATE paper_trades SET exit_provenance = 'entry_fallback' "
+        "WHERE signal_combo = ? AND exit_provenance IS NULL",
+        (combo_key,),
+    )
+    await db._conn.commit()
+
+
+async def _seed_unsuppressed_combo_row(
+    db, combo_key, *, trades=25, wins=5, last_refreshed=None
+):
+    """A stale, UNSUPPRESSED 30d row — the seven-row census class.
+
+    Deliberately not `_seed_suppressed_combo`: a suppressed row is already
+    enumerated by the legacy arm, so it cannot discriminate the new one.
+    """
+    now = datetime.now(timezone.utc)
+    last_refreshed = last_refreshed or (now - timedelta(days=45)).isoformat()
+    losses = trades - wins
+    wr = (100.0 * wins / trades) if trades else 0.0
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES (?, '30d', ?, ?, ?, -100.0, -2.0, ?, 0, 0, ?)",
+        (combo_key, trades, wins, losses, wr, last_refreshed),
+    )
+    await db._conn.commit()
+    return last_refreshed
+
+
+def _stub_suppression_senders(monkeypatch):
+    """Both §12b senders stubbed — these tests are about ENUMERATION only."""
+    monkeypatch.setattr(
+        combo_refresh, "_send_permanent_suppression_alert", _StubSender()
+    )
+    monkeypatch.setattr(
+        combo_refresh, "_send_suppression_reversal_alert", _StubSender()
+    )
+
+
+async def test_old_open_recent_valid_close_combo_is_refreshed(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(a) THE volume_spike CLASS: opened before the cutoff, valid close inside
+    the window, unsuppressed, and NO pre-existing row.
+
+    No pre-existing row is load-bearing: with one, the existing-keys arm would
+    rescue this combo and the test could not discriminate the close arm.
+    """
+    from scout.timeutil import sql_utc_cutoff
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    _stub_suppression_senders(monkeypatch)
+
+    now = datetime.now(timezone.utc)
+    old_open = now - timedelta(days=45)  # BEFORE the 30d enumeration cutoff
+    for pnl in (10.0, 20.0):
+        await _insert_trade(
+            db, "volume_spike", pnl, 5.0, now - timedelta(days=1), opened_at=old_open
+        )
+    await _insert_trade(
+        db, "volume_spike", -5.0, -3.0, now - timedelta(days=1), opened_at=old_open
+    )
+
+    cur = await db._conn.execute(
+        "SELECT MAX(opened_at) FROM paper_trades WHERE signal_combo = 'volume_spike'"
+    )
+    assert (await cur.fetchone())[0] < sql_utc_cutoff(
+        days=s.FEEDBACK_REFRESH_WINDOW_DAYS
+    ), "fixture invalid: opens must sit OUTSIDE the enumeration window"
+
+    await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "volume_spike", "30d")
+    assert row is not None, "combo with in-window valid closes was never enumerated"
+    assert row["trades"] == 3
+    assert row["wins"] == 2
+    assert row["losses"] == 1
+    assert row["win_rate_pct"] == pytest.approx(200.0 / 3)
+    await db.close()
+
+
+async def test_stale_unsuppressed_row_ages_down_to_current_window(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(b) THE STALE-ROW CLASS: an existing unsuppressed 30d row with no recent
+    opens AND no recent closes must be refreshed DOWN to current-window
+    economics (ages to zero) with a fresh last_refreshed.
+
+    Membership must not require any paper_trades activity at all — that is the
+    whole point of the existing-keys arm.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    _stub_suppression_senders(monkeypatch)
+
+    old_refreshed = await _seed_unsuppressed_combo_row(
+        db, "stale_combo", trades=25, wins=5
+    )
+    # An ancient close: outside BOTH the enumeration window and 30d economics.
+    ancient = datetime.now(timezone.utc) - timedelta(days=200)
+    await _insert_trade(db, "stale_combo", 10.0, 5.0, ancient, opened_at=ancient)
+
+    await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "stale_combo", "30d")
+    assert row is not None, "existing 30d row disappeared"
+    assert row["trades"] == 0, "stale economics survived the refresh"
+    assert row["wins"] == 0
+    assert row["losses"] == 0
+    assert row["win_rate_pct"] == 0.0
+    assert row["suppressed"] == 0, "ageing to zero must not suppress"
+
+    cur = await db._conn.execute(
+        "SELECT last_refreshed FROM combo_performance "
+        "WHERE combo_key = 'stale_combo' AND window = '30d'"
+    )
+    new_refreshed = (await cur.fetchone())[0]
+    assert new_refreshed != old_refreshed, "row was not actually re-refreshed"
+    await db.close()
+
+
+async def test_recent_open_with_no_closes_still_enumerated(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(c) REGRESSION GUARD on the preserved opens arm: an open inside the
+    window with no closes yet is still selected, and materializes a row.
+
+    This is the cold-start / materialization protection the ruling keeps
+    deliberately — the close arm cannot see it (nothing has closed) and the
+    existing-keys arm cannot see it (no row yet).
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    _stub_suppression_senders(monkeypatch)
+
+    await _insert_open_trade(
+        db, "fresh_combo", datetime.now(timezone.utc) - timedelta(hours=2)
+    )
+
+    await combo_refresh.refresh_all(db, s)
+
+    row = await _get_combo_row(db, "fresh_combo", "30d")
+    assert row is not None, "recent-open combo lost its enumeration membership"
+    assert row["trades"] == 0, "an open trade is not a terminal outcome"
+    await db.close()
+
+
+async def test_invalid_closes_do_not_create_membership_but_existing_row_ages(
+    tmp_path, settings_factory, monkeypatch
+):
+    """(d) The close arm is bound to the CANONICAL validity predicate.
+
+    First half: invalid-only closes (closed_manual + entry_fallback) for a combo
+    with NO existing row and NO recent opens must NOT manufacture membership —
+    otherwise the enumeration would resurrect exactly the fabricated-$0 and
+    operator-action rows the economics predicate exists to exclude.
+
+    Second half: the SAME invalid-only close pattern for a combo that DOES have
+    a 30d row still participates, via the existing-keys arm, and ages correctly.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    _stub_suppression_senders(monkeypatch)
+
+    now = datetime.now(timezone.utc)
+    old_open = now - timedelta(days=45)
+    recent_close = now - timedelta(days=1)
+
+    # No row, no recent opens, only invalid closes -> must stay unknown.
+    await _insert_trade(
+        db,
+        "invalid_only",
+        0.0,
+        0.0,
+        recent_close,
+        status="closed_manual",
+        opened_at=old_open,
+    )
+    await _insert_fallback_close(db, "invalid_only", recent_close, old_open)
+
+    # Same close shape, but a pre-existing 30d row -> enumerated via arm 3.
+    await _seed_unsuppressed_combo_row(db, "invalid_with_row", trades=25, wins=5)
+    await _insert_trade(
+        db,
+        "invalid_with_row",
+        0.0,
+        0.0,
+        recent_close,
+        status="closed_manual",
+        opened_at=old_open,
+    )
+
+    await combo_refresh.refresh_all(db, s)
+
+    assert (
+        await _get_combo_row(db, "invalid_only", "30d")
+    ) is None, "invalid-only closes manufactured enumeration membership"
+    assert (
+        await _get_combo_row(db, "invalid_only", "7d")
+    ) is None, "invalid-only closes manufactured a 7d row"
+
+    row = await _get_combo_row(db, "invalid_with_row", "30d")
+    assert row is not None, "existing 30d row disappeared"
+    assert row["trades"] == 0, "an invalid close must not count as economics"
     await db.close()
