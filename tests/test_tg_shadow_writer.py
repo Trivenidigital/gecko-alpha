@@ -680,3 +680,34 @@ async def test_scan_refreshes_the_active_generation_marker(
     )
     (scan_updated_at,) = await cur.fetchone()
     assert scan_updated_at == updated_at
+
+
+async def test_generation_row_and_marker_are_armed_atomically(
+    db, settings_factory, fixture_caller_feature_provider
+):
+    """Belt to the watchdog's suspenders.
+
+    The registry row and the marker are written in ONE transaction, so the
+    state the watchdog now fails closed on — a registered generation that no
+    marker claims — is unreachable rather than merely alarmed.
+
+    Proved by making the marker write fail: dropping `tg_social_health` breaks
+    the second statement, and the assertion is that the FIRST one did not
+    survive it. Asserting both rows exist on the happy path would not
+    distinguish one transaction from two.
+    """
+    from scout.social.telegram.shadow import arm_generation
+
+    await db._conn.execute("DROP TABLE tg_social_health")
+    await db._conn.commit()
+
+    with pytest.raises(Exception):
+        await arm_generation(db, gate_version="tg-shadow-v1+atomic")
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM tg_act_shadow_generations WHERE gate_version = ?",
+        ("tg-shadow-v1+atomic",),
+    )
+    (rows,) = await cur.fetchone()
+    assert rows == 0, "generation row survived a failed marker publish"
+    assert not db._txn_lock.locked()

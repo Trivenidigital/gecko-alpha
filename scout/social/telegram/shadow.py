@@ -116,18 +116,27 @@ SHADOW_REASONS = (
     "shadow_block_duplicate_call",
 )
 
-# Settings that participate in the fingerprint. `TG_SHADOW_ENABLED` is
-# deliberately ABSENT: it is an activation control, and a disable/enable cycle
-# must RESUME the existing generation rather than start a new one, which it
-# could not do if the flag's own value moved the fingerprint.
+# Settings that participate in the fingerprint: DECISION AND EVIDENCE
+# SEMANTICS ONLY -- every value the evaluator actually reads, and nothing else.
+#
+# Two categories are deliberately ABSENT:
+#
+#   `TG_SHADOW_ENABLED` -- an activation control. A disable/enable cycle must
+#   RESUME the existing generation rather than start a new one, which it could
+#   not do if the flag's own value moved the fingerprint.
+#
+#   `TG_SHADOW_LAG_THRESHOLD_MIN` / `TG_SHADOW_SCAN_CADENCE_MIN` -- operational
+#   watchdog tuning. They change when the OPERATOR is paged, never what a
+#   decision is. Binding them would mean retuning an alert cadence starts a new
+#   evidence generation and resets the >=30-decision accumulation toward the
+#   feature freeze -- discarding real evidence to record a monitoring
+#   preference.
 _FINGERPRINTED_SETTING_NAMES = (
     "TG_CALLER_MIN_ELIGIBLE_CLUSTERS",
-    "TG_SHADOW_LAG_THRESHOLD_MIN",
     "TG_SHADOW_MCAP_MAX_USD",
     "TG_SHADOW_MCAP_MIN_USD",
     "TG_SHADOW_MIN_CALLER_COVERAGE",
     "TG_SHADOW_REQUIRE_LIQUIDITY",
-    "TG_SHADOW_SCAN_CADENCE_MIN",
     "TG_SHADOW_UNPRICEABLE_IDENTITY_CLASSES",
 )
 
@@ -340,10 +349,13 @@ def evaluate_tg_actionability_shadow(
     if not (settings.TG_SHADOW_MCAP_MIN_USD <= mcap <= settings.TG_SHADOW_MCAP_MAX_USD):
         return ShadowDecision(False, "shadow_block_mcap_band")
 
-    # 6. Liquidity is null for every v1 snapshot (ResolvedToken has no such
-    #    field and Stage A forbids new API calls), so this is off by default.
-    #    Turning it on without a liquidity-bearing snapshot schema would block
-    #    the entire cohort — which is the honest outcome, and why it is a flag.
+    # 6. Liquidity is real for DexScreener-resolved tokens (the resolver
+    #    forwards the value it already read to pick the deepest pair) and null
+    #    for CG-resolved and cashtag rows, whose responses carry no equivalent
+    #    field. So this check is OFF by default not because the data is
+    #    universally missing, but because turning it on is a cohort-shaping
+    #    decision: it would block every CG and cashtag row, making the gate
+    #    operationally "DexScreener-resolved rows only".
     if settings.TG_SHADOW_REQUIRE_LIQUIDITY and snapshot.get("liquidity_usd") is None:
         return ShadowDecision(False, "shadow_block_liquidity_unknown")
 
@@ -478,18 +490,53 @@ async def ensure_generation(db: Database, *, gate_version: str) -> bool:
     now_iso = datetime.now(timezone.utc).isoformat()
     async with db._txn_lock:
         try:
-            cur = await conn.execute(
-                "INSERT INTO tg_act_shadow_generations (gate_version, activated_at) "
-                "VALUES (?, ?) ON CONFLICT(gate_version) DO NOTHING",
-                (gate_version, now_iso),
-            )
-            created = cur.rowcount == 1
+            created = await _insert_generation_row(conn, gate_version, now_iso)
             await conn.commit()
         except Exception:
             try:
                 await conn.rollback()
             except Exception as rb_err:
                 log.exception("tg_shadow_generation_rollback_failed", err=str(rb_err))
+            raise
+    return created
+
+
+async def _insert_generation_row(conn, gate_version: str, now_iso: str) -> bool:
+    """Registry row insert. Caller MUST hold `db._txn_lock`. True if created."""
+    cur = await conn.execute(
+        "INSERT INTO tg_act_shadow_generations (gate_version, activated_at) "
+        "VALUES (?, ?) ON CONFLICT(gate_version) DO NOTHING",
+        (gate_version, now_iso),
+    )
+    return cur.rowcount == 1
+
+
+async def arm_generation(db: Database, *, gate_version: str) -> bool:
+    """Registry row AND active-generation marker, in ONE transaction.
+
+    Writing them separately leaves a crash window: the registry row commits,
+    the process dies, and the database now holds a legitimate generation that
+    no marker names. The watchdog treats that state as an inconsistency and
+    pages (fail-closed), but the better fix is for the state to be
+    unreachable — so activation publishes both or neither.
+    """
+    conn = _require_conn(db)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with db._txn_lock:
+        try:
+            created = await _insert_generation_row(conn, gate_version, now_iso)
+            await _upsert_health_row(
+                conn,
+                component=SHADOW_ACTIVE_GENERATION_COMPONENT,
+                detail=active_generation_detail(gate_version),
+                now_iso=now_iso,
+            )
+            await conn.commit()
+        except Exception:
+            try:
+                await conn.rollback()
+            except Exception as rb_err:
+                log.exception("tg_shadow_arm_rollback_failed", err=str(rb_err))
             raise
     return created
 
@@ -525,10 +572,9 @@ async def activate_shadow_generation(db: Database, settings: Settings) -> str | 
         )
         return None
     gate_version, fingerprint = current_gate_version(settings, provider)
-    created = await ensure_generation(db, gate_version=gate_version)
-    # Publish BEFORE returning: from this point the watchdog can resolve which
-    # generation is live, including when this is a resume of an older one.
-    await publish_active_generation(db, gate_version=gate_version)
+    # Registry row + marker atomically: a crash between them would leave a
+    # generation no marker names, which the watchdog must then page about.
+    created = await arm_generation(db, gate_version=gate_version)
     log.info(
         "tg_shadow_generation_active",
         gate_version=gate_version,
@@ -748,34 +794,6 @@ async def _upsert_health_row(conn, *, component: str, detail: str, now_iso: str)
              detail = excluded.detail""",
         (component, now_iso, now_iso, detail),
     )
-
-
-async def publish_active_generation(db: Database, *, gate_version: str) -> None:
-    """Record which generation the writer is operating under.
-
-    Called at arm time and refreshed on every completed scan, so the marker
-    stays true across a resume of an older gate_version — the case registry
-    chronology gets wrong.
-    """
-    conn = _require_conn(db)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    async with db._txn_lock:
-        try:
-            await _upsert_health_row(
-                conn,
-                component=SHADOW_ACTIVE_GENERATION_COMPONENT,
-                detail=active_generation_detail(gate_version),
-                now_iso=now_iso,
-            )
-            await conn.commit()
-        except Exception:
-            try:
-                await conn.rollback()
-            except Exception as rb_err:
-                log.exception(
-                    "tg_shadow_active_generation_rollback_failed", err=str(rb_err)
-                )
-            raise
 
 
 async def _record_scan_heartbeat(

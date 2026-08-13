@@ -138,10 +138,8 @@ def _active_generation(conn: sqlite3.Connection) -> dict[str, Any]:
     Outcomes:
       ok                    marker names a gate_version that exists in the registry
       no_generation         no marker and an empty registry — never armed
-      no_active_marker      registry has rows but no marker — armed by a build that
-                            predates the marker, or a partial activation. Ambiguous,
-                            so treated as not-yet-armed and logged rather than paged.
-      inconsistent          marker present but unusable — page, with the reason
+      inconsistent          marker unusable, OR the registry holds generations
+                            that no marker names — page, with the reason
     """
     marker = conn.execute(
         "SELECT detail FROM tg_social_health WHERE component = ?",
@@ -154,7 +152,17 @@ def _active_generation(conn: sqlite3.Connection) -> dict[str, Any]:
     if marker is None:
         if registry_row is None:
             return {"state": "no_generation"}
-        return {"state": "no_active_marker"}
+        # Registry rows exist but nothing claims them. Reachable if a crash
+        # lands between the generation insert and the marker publish (the
+        # activation path now writes both in one transaction, so this should
+        # be unreachable — but "should be unreachable" is not a monitoring
+        # strategy). Staying quiet here would leave a genuinely armed
+        # generation completely unwatched, which is the exact silent failure
+        # this watchdog exists to prevent, so it fails CLOSED.
+        return {
+            "state": "inconsistent",
+            "reason": "registry_nonempty_active_marker_missing",
+        }
 
     gate_version = parse_active_gate_version(marker["detail"])
     if gate_version is None:
@@ -195,15 +203,6 @@ def evaluate_tg_shadow_lag(
     resolved = _active_generation(conn)
     if resolved["state"] == "no_generation":
         return {"status": "no_generation", **idle}
-    if resolved["state"] == "no_active_marker":
-        _log.info(
-            "tg_shadow_active_generation_marker_absent",
-            note=(
-                "generation registry has rows but the writer has published no "
-                "active-generation marker; treating as not-yet-armed"
-            ),
-        )
-        return {"status": "no_active_marker", **idle}
     if resolved["state"] == "inconsistent":
         return {
             "status": "active_generation_inconsistent",
@@ -286,9 +285,10 @@ def _compose(state: dict[str, Any], config: _Config) -> str:
                 f"inconsistency: {state.get('inconsistency')}",
                 f"gate_version named by marker: {state.get('gate_version')}",
                 "",
-                "The writer published an active generation that has no row in "
-                "tg_act_shadow_generations. Shadow health cannot be evaluated "
-                "until the marker and the registry agree.",
+                "The active-generation marker and tg_act_shadow_generations "
+                "disagree, so shadow health cannot be evaluated. Either the "
+                "marker names a generation that was never registered, or "
+                "generations are registered that no marker claims.",
             ]
         )
     headline = (

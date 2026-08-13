@@ -281,17 +281,38 @@ def test_fingerprint_is_stable_across_calls(
         {"TG_SHADOW_MIN_CALLER_COVERAGE": 0.6},
         {"TG_CALLER_MIN_ELIGIBLE_CLUSTERS": 12},
         {"TG_SHADOW_UNPRICEABLE_IDENTITY_CLASSES": ["dex:robinhood"]},
-        {"TG_SHADOW_LAG_THRESHOLD_MIN": 90},
-        {"TG_SHADOW_SCAN_CADENCE_MIN": 15},
     ],
 )
-def test_any_shadow_threshold_change_moves_the_gate_version(
+def test_any_decision_threshold_change_moves_the_gate_version(
     override, settings_factory, fixture_caller_feature_provider
 ):
     provider = fixture_caller_feature_provider()
     base, _ = current_gate_version(settings_factory(), provider)
     changed, _ = current_gate_version(settings_factory(**override), provider)
     assert changed != base, override
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"TG_SHADOW_LAG_THRESHOLD_MIN": 90},
+        {"TG_SHADOW_SCAN_CADENCE_MIN": 15},
+    ],
+)
+def test_watchdog_tuning_does_not_move_the_gate_version(
+    override, settings_factory, fixture_caller_feature_provider
+):
+    """The fingerprint binds decision and evidence semantics ONLY.
+
+    These two settings change when the OPERATOR is paged, never what a decision
+    is. Binding them would mean retuning an alert cadence starts a new
+    generation and resets the >=30-decision accumulation toward the feature
+    freeze — discarding real evidence to record a monitoring preference.
+    """
+    provider = fixture_caller_feature_provider()
+    base, _ = current_gate_version(settings_factory(), provider)
+    changed, _ = current_gate_version(settings_factory(**override), provider)
+    assert changed == base, override
 
 
 def test_unrelated_setting_change_does_not_move_the_gate_version(

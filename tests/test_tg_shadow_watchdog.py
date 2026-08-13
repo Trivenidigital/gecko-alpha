@@ -574,10 +574,12 @@ def test_resumed_older_generation_still_reports_its_own_failures(tmp_path, now):
     assert state["overdue_count"] == 1
 
 
-def test_registry_rows_without_a_marker_are_not_yet_armed(tmp_path, now):
-    """Ambiguous rather than broken: a registry row with no marker means the
-    writer never announced itself. Paging on it would fire on any partially
-    activated deployment, so it is logged and left silent."""
+def test_registry_rows_without_a_marker_page(tmp_path, now):
+    """FAIL CLOSED. A registered generation that no marker claims is armed
+    state nobody is watching — reachable if a crash lands between the
+    generation insert and the marker publish. Staying quiet would leave that
+    generation unmonitored indefinitely, which is precisely the silent failure
+    this watchdog exists to prevent."""
     db = tmp_path / "s.db"
     _build_db(
         db,
@@ -587,8 +589,65 @@ def test_registry_rows_without_a_marker_are_not_yet_armed(tmp_path, now):
         active_marker=None,
     )
     state = _evaluate(db, now)
-    assert state["status"] == "no_active_marker"
+    assert state["status"] == "active_generation_inconsistent"
+    assert state["inconsistency"] == "registry_nonempty_active_marker_missing"
+
+    body = _compose(
+        state,
+        _Config(
+            enabled=True, lag_threshold_min=_LAG_MIN, scan_cadence_min=_CADENCE_MIN
+        ),
+    )
+    assert "registry_nonempty_active_marker_missing" in body
+
+
+def test_empty_registry_without_a_marker_stays_quiet(tmp_path, now):
+    """The discriminating half. Same missing marker, but nothing is registered
+    either — a dark deploy that was never armed. Silence is correct here, and
+    conflating it with the case above would either page on every unactivated
+    deployment or go blind on every orphaned generation."""
+    db = tmp_path / "s.db"
+    _build_db(
+        db,
+        now=now,
+        generation_age_h=None,
+        resolved_ages_min=(600,),
+        active_marker=None,
+    )
+    state = _evaluate(db, now)
+    assert state["status"] == "no_generation"
     assert state["overdue_count"] == 0
+
+
+def test_missing_marker_pages_through_main_with_exit_code_5(tmp_path, monkeypatch):
+    """End-to-end: the fail-closed path actually reaches the operator."""
+    real_now = datetime.now(timezone.utc)
+    db = tmp_path / "s.db"
+    _build_db(
+        db,
+        now=real_now,
+        generation_age_h=24.0,
+        resolved_ages_min=(600,),
+        last_scan_age_min=None,
+        active_marker=None,
+    )
+    sent: list[str] = []
+    monkeypatch.setattr("scripts.check_tg_shadow_lag._SEND", _recorder(sent))
+    code = main(
+        [
+            "--db",
+            str(db),
+            "--enabled",
+            "true",
+            "--lag-threshold-min",
+            str(_LAG_MIN),
+            "--scan-cadence-min",
+            str(_CADENCE_MIN),
+        ]
+    )
+    assert code == 5
+    assert len(sent) == 1
+    assert "registry_nonempty_active_marker_missing" in sent[0]
 
 
 def test_marker_naming_an_unknown_generation_pages(tmp_path, now):

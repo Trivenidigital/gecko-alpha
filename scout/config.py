@@ -1200,13 +1200,18 @@ class Settings(BaseSettings):
     # calls. Default OFF; activation additionally requires a registered
     # CallerFeatureProvider (Stage B), so flipping this alone arms nothing.
     #
-    # Every value below EXCEPT `TG_SHADOW_ENABLED` participates in the
-    # `gate_version` fingerprint: a threshold change starts a new generation
-    # prospectively rather than silently re-labelling an existing cohort.
-    # `TG_SHADOW_ENABLED` is excluded because it is an activation control,
-    # not decision semantics — a disable/enable cycle must RESUME the same
-    # generation (design §Re-enable semantics), which it cannot do if the
-    # flag's own value moves the fingerprint.
+    # The DECISION thresholds below participate in the `gate_version`
+    # fingerprint: changing one starts a new generation prospectively rather
+    # than silently re-labelling an existing cohort.
+    #
+    # Three are excluded. `TG_SHADOW_ENABLED` is an activation control — a
+    # disable/enable cycle must RESUME the same generation (design §Re-enable
+    # semantics), which it cannot do if the flag's own value moves the
+    # fingerprint. `TG_SHADOW_LAG_THRESHOLD_MIN` and
+    # `TG_SHADOW_SCAN_CADENCE_MIN` are operational watchdog tuning: they
+    # change when the operator is paged, never what a decision is, and binding
+    # them would discard accumulated evidence to record a monitoring
+    # preference.
     TG_SHADOW_ENABLED: bool = False
     TG_SHADOW_LAG_THRESHOLD_MIN: int = 60
     TG_SHADOW_SCAN_CADENCE_MIN: int = 30
