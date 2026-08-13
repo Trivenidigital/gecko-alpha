@@ -2783,6 +2783,17 @@ class Database:
                     -- that one marks "suppressed with no trades at all", this
                     -- one marks "retest started and can never finish".
                     retest_incomplete_alerted_at TEXT,
+                    -- fix/reversal-alert-durable-retry: the PENDING §12b
+                    -- suppression-reversal page, as JSON
+                    -- {transition, detected_at, message}. Written when the
+                    -- transition is DETECTED, before delivery is attempted, and
+                    -- cleared only after a confirmed send — so an outage leaves
+                    -- it set and every later refresh re-attempts. Inverted
+                    -- polarity from the two markers above: they record "already
+                    -- alerted", this one records "still owed". A reversal is
+                    -- diffed across a single refresh, so without it a rejected
+                    -- page is unrecoverable.
+                    reversal_alert_pending_json TEXT,
                     PRIMARY KEY (combo_key, window)
                 )
             """)
@@ -2802,6 +2813,11 @@ class Database:
                 await conn.execute(
                     "ALTER TABLE combo_performance "
                     "ADD COLUMN retest_incomplete_alerted_at TEXT"
+                )
+            if "reversal_alert_pending_json" not in cp_cols:
+                await conn.execute(
+                    "ALTER TABLE combo_performance "
+                    "ADD COLUMN reversal_alert_pending_json TEXT"
                 )
 
             expected_cols = {

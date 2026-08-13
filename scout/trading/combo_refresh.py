@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -603,8 +604,10 @@ async def refresh_all(db: Database, settings) -> dict:
     "permanent_suppression": [keys], "suppression_reversals": [dicts]}`` where
     ``permanent_suppression`` lists the combos newly alerted this run as entering
     permanent-suppression state, and ``suppression_reversals`` lists the combos
-    whose 30d suppression state reversed operator-favorable (active) state this
-    run and were §12b-alerted (see :func:`_process_suppression_reversals`).
+    §12b-alerted this run for a reversal of their 30d suppression state. Since
+    fix/reversal-alert-durable-retry that list is "DELIVERED this run", not
+    "transitioned this run": it can include pages first detected on an EARLIER
+    refresh whose delivery had failed (see :func:`_process_suppression_reversals`).
     """
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
     # INF-04: opened_at is stored as Python .isoformat() ('T'-separated,
@@ -665,7 +668,9 @@ async def refresh_all(db: Database, settings) -> dict:
             combo_key=key,
         )
 
-    reversals = await _process_suppression_reversals(settings, pre_state, post_state)
+    reversals = await _process_suppression_reversals(
+        db, settings, pre_state, post_state
+    )
 
     permanent = await _process_permanent_suppression(db, settings, window_cutoff)
 
@@ -745,11 +750,179 @@ def _classify_reversal(pre: dict | None, post: dict) -> str | None:
     return None
 
 
+def _build_reversal_message(combo: str, transition: str, post: dict, settings) -> str:
+    """The §12b reversal page body. Content is unchanged from #424 — extracted
+    only so the page can be rendered once, at DETECTION time, and persisted.
+
+    Rendering once matters: a retry days later must re-send the page describing
+    the transition that actually happened, not one re-derived from state that
+    has since moved on.
+    """
+    wr_thresh = settings.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT
+    parole_days = settings.FEEDBACK_PAROLE_DAYS
+    wr = post["win_rate_pct"] or 0.0
+    trades = post["trades"] or 0
+    revival = (
+        f"Revival: db.revive_signal_with_baseline('{combo}', reason=...) for "
+        f"a base combo, or clear combo_performance.suppressed for the base "
+        f"combo. See docs/runbook_gainers_early_revival.md"
+    )
+    if transition == "newly_suppressed":
+        return (
+            f"combo {combo} auto-suppressed (win-rate {wr:.1f}% < "
+            f"{wr_thresh:.0f}% over n={trades} trades, 30d) — the dispatcher "
+            f"now blocks its opens. {revival}"
+        )
+    # parole_exhausted_resuppressed
+    return (
+        f"combo {combo} failed its parole retest (win-rate {wr:.1f}% < "
+        f"{wr_thresh:.0f}% over n={trades} trades, 30d) — re-suppressed "
+        f"with a fresh {parole_days}d parole window. {revival}"
+    )
+
+
+async def _record_pending_reversals(
+    db: Database, settings, pre_state: dict, post_state: dict
+) -> str:
+    """Persist every reversal detected this refresh BEFORE any delivery.
+
+    Ordering is the whole point: the alert fact has to be durable before the
+    network call, or a crash (or a rejected page) between detection and delivery
+    loses it — and a reversal is diffed across a single refresh, so it is never
+    re-detected.
+
+    LATEST-WINS on a combo that already has an undelivered page. The page
+    describes the CURRENT suppression state, so an older undelivered one is
+    strictly less useful than the transition that superseded it (a
+    newly_suppressed followed by a parole_exhausted_resuppressed would otherwise
+    page twice, the first about a state that no longer holds). The superseded
+    fact is not lost — it is emitted as ``suppression_reversal_alert_superseded``
+    carrying the old transition, its detection time, its rendered body and its
+    raw bytes.
+
+    Returns the ISO timestamp stamped on everything recorded by THIS pass. The
+    delivery pass compares against it to tell a page it just recorded from one
+    carried over from an earlier refresh, which decides whether the body is
+    stamped with its detection time.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # Combos whose UPDATE landed. Only meaningful until the commit succeeds —
+    # its failure path uses this to name what the rollback throws away.
+    recorded: list[str] = []
+    # Every commit on the shared connection holds `_txn_lock`, or concurrent
+    # writers interleave executes and leave half-open transactions. Only the
+    # NETWORK call belongs outside it — and no network call happens here.
+    async with db._txn_lock:
+        for combo in sorted(post_state):
+            transition = _classify_reversal(pre_state.get(combo), post_state[combo])
+            if transition is None:
+                continue
+            # Per-combo containment, mirroring the retest-marker sibling. A DB
+            # error here used to propagate all the way out of `refresh_all`,
+            # skipping BOTH sibling §12b passes — a durability mechanism that
+            # silences two older alert paths is a net loss. One bad combo now
+            # costs only its own page, retried on the next refresh.
+            try:
+                payload = json.dumps(
+                    {
+                        "transition": transition,
+                        "detected_at": now_iso,
+                        "message": _build_reversal_message(
+                            combo, transition, post_state[combo], settings
+                        ),
+                    },
+                    sort_keys=True,
+                )
+                cur = await db._conn.execute(
+                    "SELECT reversal_alert_pending_json FROM combo_performance "
+                    "WHERE combo_key = ? AND window = '30d'",
+                    (combo,),
+                )
+                row = await cur.fetchone()
+                existing = row[0] if row else None
+                # `is not None`, not truthiness: an empty-string marker is
+                # present-but-corrupt, not absent, and silently skipping the
+                # supersede log for it would drop the only record that a page
+                # was overwritten.
+                if existing is not None:
+                    try:
+                        old = json.loads(existing)
+                    except (ValueError, TypeError):
+                        old = {}
+                    if not isinstance(old, dict):
+                        old = {}
+                    log.warning(
+                        "suppression_reversal_alert_superseded",
+                        combo_key=combo,
+                        superseded_transition=old.get("transition"),
+                        superseded_detected_at=old.get("detected_at"),
+                        superseded_message=old.get("message"),
+                        # The raw bytes, so an undecodable payload still leaves
+                        # evidence of what was overwritten.
+                        superseded_raw=existing,
+                        new_transition=transition,
+                        detail="an undelivered page was replaced by a newer "
+                        "transition; the superseded body is preserved here",
+                    )
+                cur = await db._conn.execute(
+                    "UPDATE combo_performance SET reversal_alert_pending_json = ? "
+                    "WHERE combo_key = ? AND window = '30d'",
+                    (payload, combo),
+                )
+                if cur.rowcount == 0:
+                    # No 30d row to hold the marker, so this page cannot be made
+                    # durable. Loud, because it is otherwise a silent lost alert.
+                    log.error(
+                        "suppression_reversal_pending_write_missed",
+                        combo_key=combo,
+                        transition=transition,
+                        detail="no 30d row — page cannot be persisted for retry",
+                    )
+                else:
+                    # Tracked so a failed COMMIT can name what it discards. These
+                    # combos succeeded individually and were therefore never
+                    # reported by the per-combo handler below.
+                    recorded.append(combo)
+            except aiosqlite.Error as exc:
+                log.exception(
+                    "suppression_reversal_pending_write_failed",
+                    combo_key=combo,
+                    transition=transition,
+                    err=str(exc),
+                    detail="page not recorded; refresh continues and the next "
+                    "run re-detects nothing — this page is lost",
+                )
+                continue
+        try:
+            await db._conn.commit()
+        except aiosqlite.Error as exc:
+            # Never hand the next writer a foreign open transaction. The rollback
+            # discards EVERY page this pass recorded — not just failures — and
+            # none of them were reported by the per-combo handler above, which
+            # only fires for combos whose own UPDATE raised. So they are NAMED
+            # here; otherwise a commit failure silently destroys §12b pages that
+            # will never be re-detected.
+            log.exception(
+                "suppression_reversal_pending_commit_failed",
+                err=str(exc),
+                lost_combos=recorded,
+                lost_count=len(recorded),
+                detail="rolling back; the connection must not be left half-open. "
+                "Every page listed in lost_combos is discarded and lost.",
+            )
+            try:
+                await db._conn.rollback()
+            except aiosqlite.Error:
+                log.exception("suppression_reversal_pending_rollback_failed")
+    return now_iso
+
+
 async def _process_suppression_reversals(
-    settings, pre_state: dict, post_state: dict
+    db: Database, settings, pre_state: dict, post_state: dict
 ) -> list[dict]:
     """Fire the §12b operator alert for every combo whose 30d suppression state
-    reversed operator-favorable (active) state during this refresh.
+    reversed operator-favorable (active) state, INCLUDING pages still owed from
+    an earlier refresh.
 
     Covers the two write sites the frozen-refresh permanent-suppression alert
     (#424) does NOT: the initial ``unsuppressed → suppressed`` latch and the
@@ -757,62 +930,88 @@ async def _process_suppression_reversals(
     2026-06-12 with no operator alert and sat dark 7.5 weeks — this closes that
     gap at the transition itself.
 
+    Two phases, in this order:
+
+    1. record every newly detected transition as PENDING (durable, pre-delivery)
+    2. attempt every pending page exactly once, clearing only what is confirmed
+
+    Doing all the recording first is what makes "exactly once per refresh" true
+    for a combo that both carries an old pending page and transitions again in
+    the same run: the second write supersedes the first, and the single delivery
+    pass then sees one row.
+
     Each alert is plain text (``parse_mode=None``, set in the sender) so the
     underscore-laden combo/signal names and ``revive_signal_with_baseline`` are
     not mangled by MarkdownV1. Dispatched/delivered/failed logs bracket the send
     so a successful delivery is not silent. A delivery failure never breaks
-    refresh; the combo is simply not counted as alerted. Note this path has NO
-    durable retry — see the failure branch below.
+    refresh; the page simply stays pending and the next refresh re-attempts.
 
-    Returns the list of ``{"combo_key", "transition"}`` alerted this run.
+    Returns the list of ``{"combo_key", "transition"}`` DELIVERED this run —
+    which may include pages first detected on an earlier run.
     """
-    wr_thresh = settings.FEEDBACK_SUPPRESSION_WR_THRESHOLD_PCT
-    parole_days = settings.FEEDBACK_PAROLE_DAYS
+    run_iso = await _record_pending_reversals(db, settings, pre_state, post_state)
+
+    cur = await db._conn.execute(
+        "SELECT combo_key, reversal_alert_pending_json FROM combo_performance "
+        "WHERE window = '30d' AND reversal_alert_pending_json IS NOT NULL "
+        "ORDER BY combo_key"
+    )
+    pending = await cur.fetchall()
+
     alerted: list[dict] = []
-    for combo, post in post_state.items():
-        transition = _classify_reversal(pre_state.get(combo), post)
-        if transition is None:
+    for combo, raw in pending:
+        try:
+            payload = json.loads(raw)
+            message = payload["message"]
+            transition = payload["transition"]
+        except (ValueError, TypeError, KeyError) as exc:
+            # Corrupt durable state. Deliberately left PENDING rather than
+            # cleared: an unreadable page is a real lost alert, and a row that
+            # complains on every refresh is a far better failure mode than one
+            # that quietly deletes itself.
+            log.error(
+                "suppression_reversal_pending_unreadable",
+                combo_key=combo,
+                err=str(exc),
+                err_type=type(exc).__name__,
+                detail="pending payload could not be decoded; left in place",
+            )
             continue
-        wr = post["win_rate_pct"] or 0.0
-        trades = post["trades"] or 0
-        revival = (
-            f"Revival: db.revive_signal_with_baseline('{combo}', reason=...) for "
-            f"a base combo, or clear combo_performance.suppressed for the base "
-            f"combo. See docs/runbook_gainers_early_revival.md"
-        )
-        if transition == "newly_suppressed":
-            message = (
-                f"combo {combo} auto-suppressed (win-rate {wr:.1f}% < "
-                f"{wr_thresh:.0f}% over n={trades} trades, 30d) — the dispatcher "
-                f"now blocks its opens. {revival}"
-            )
-        else:  # parole_exhausted_resuppressed
-            message = (
-                f"combo {combo} failed its parole retest (win-rate {wr:.1f}% < "
-                f"{wr_thresh:.0f}% over n={trades} trades, 30d) — re-suppressed "
-                f"with a fresh {parole_days}d parole window. {revival}"
-            )
+
+        # A page recorded on an EARLIER refresh outlives the state it describes:
+        # the suppression may have been cleared since — by a later refresh, or by
+        # the operator doing exactly what the page instructed. Without a
+        # timestamp the body is byte-indistinguishable from a fresh one, so a
+        # days-late page reads as current. Stamp only the retries: first-attempt
+        # bodies stay byte-identical to #424.
+        detected_at = payload.get("detected_at")
+        is_retry = detected_at != run_iso
+        if is_retry:
+            # A payload missing only this key would otherwise render the literal
+            # "[detected None]". Classification is unchanged — a missing key is
+            # still a retry, it just cannot say when.
+            stamp = detected_at if detected_at else "unknown"
+            message = f"{message} [detected {stamp}]"
+
         log.info(
             "suppression_reversal_alert_dispatched",
             combo_key=combo,
             transition=transition,
+            detected_at=detected_at,
+            retry=is_retry,
         )
         try:
             await _send_suppression_reversal_alert(settings, message)
         except Exception as exc:
-            # Alert failure must never break refresh. Unlike the permanent-
-            # suppression path (durable marker -> the next run re-attempts),
-            # the transition here is diffed across THIS refresh only: the next
-            # run sees the combo already suppressed with an unchanged parole_at,
-            # so `_classify_reversal` returns None and never re-pages. A failed
-            # send is therefore a permanently missed page, and this log is its
-            # only trace — which is precisely why the send must raise.
+            # Never breaks refresh, and no longer loses the page: the marker is
+            # untouched, so the next refresh re-attempts this same body.
             log.exception(
                 "suppression_reversal_alert_failed",
                 combo_key=combo,
                 transition=transition,
                 err=str(exc),
                 err_type=type(exc).__name__,
+                detail="page stays pending; the next refresh re-attempts",
             )
             continue
         log.info(
@@ -820,6 +1019,45 @@ async def _process_suppression_reversals(
             combo_key=combo,
             transition=transition,
         )
+
+        # Clear ONLY after a confirmed send, and only if the payload is still
+        # the one just delivered. Delivery ran unlocked, so a concurrent refresh
+        # could have superseded it mid-flight; a blind clear would drop that
+        # newer page. Matching on the exact payload makes the newer one survive.
+        try:
+            async with db._txn_lock:
+                cur = await db._conn.execute(
+                    "UPDATE combo_performance "
+                    "SET reversal_alert_pending_json = NULL "
+                    "WHERE combo_key = ? AND window = '30d' "
+                    "  AND reversal_alert_pending_json = ?",
+                    (combo, raw),
+                )
+                # THIS statement's affected-row count — never
+                # `Connection.total_changes`, which is connection-wide and
+                # cumulative, so an unrelated write would read as success.
+                changed = cur.rowcount
+                await db._conn.commit()
+            if changed == 0:
+                # Deliberately NEUTRAL. rowcount 0 means only that the payload
+                # this pass delivered is no longer the one on the row — it may
+                # have been superseded by a newer transition (still pending) OR
+                # already cleared by a concurrent pass (nothing pending). The
+                # old wording asserted the first, which is false half the time.
+                log.info(
+                    "suppression_reversal_pending_not_cleared",
+                    combo_key=combo,
+                    detail="payload no longer present on the row (superseded or "
+                    "already cleared); not cleared by this pass",
+                )
+        except aiosqlite.Error as exc:
+            # Delivered but not cleared: the next refresh re-sends. A duplicate
+            # page is the safe direction; silence is not.
+            log.exception(
+                "suppression_reversal_pending_clear_failed",
+                combo_key=combo,
+                err=str(exc),
+            )
         alerted.append({"combo_key": combo, "transition": transition})
 
     return alerted

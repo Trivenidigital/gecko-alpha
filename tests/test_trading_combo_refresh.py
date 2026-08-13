@@ -1756,3 +1756,780 @@ async def test_invalid_closes_do_not_create_membership_but_existing_row_ages(
     assert row is not None, "existing 30d row disappeared"
     assert row["trades"] == 0, "an invalid close must not count as economics"
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# fix/reversal-alert-durable-retry — the reversal page had no durable retry.
+# A transition is diffed across ONE refresh, so once the combo is suppressed
+# `_classify_reversal` returns None forever: a rejected page raised (#525),
+# logged `_failed`, and was then permanently lost. The permanent-suppression
+# path self-heals because its marker stays NULL until a confirmed send; the
+# reversal path had no marker at all.
+#
+# Now the pending alert is persisted BEFORE delivery is attempted and cleared
+# only after a confirmed send, so every later refresh re-attempts until it
+# lands. Same "stamp only after a confirmed send" contract as #523, same
+# statement-rowcount discipline, and the clear is payload-bound so a newer
+# transition cannot be silently dropped by a slow in-flight delivery.
+# ---------------------------------------------------------------------------
+
+
+async def _pending_marker(db, combo_key):
+    """Return `(row_exists, raw_json)` for the 30d pending-reversal marker.
+
+    Existence is returned separately so a caller can assert the row is THERE
+    before asserting on the column — a missing row would otherwise make an
+    `is None` assertion pass vacuously.
+    """
+    cur = await db._conn.execute(
+        "SELECT reversal_alert_pending_json FROM combo_performance "
+        "WHERE combo_key = ? AND window = '30d'",
+        (combo_key,),
+    )
+    row = await cur.fetchone()
+    return row is not None, (row[0] if row else None)
+
+
+async def _pending_payload(db, combo_key) -> dict:
+    import json
+
+    exists, raw = await _pending_marker(db, combo_key)
+    assert exists, "30d row missing — payload assertions would be vacuous"
+    assert raw is not None, "expected a pending reversal alert, found none"
+    return json.loads(raw)
+
+
+async def _count_pending_rows(db) -> int:
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM combo_performance "
+        "WHERE reversal_alert_pending_json IS NOT NULL"
+    )
+    return (await cur.fetchone())[0]
+
+
+async def test_failed_reversal_page_leaves_a_pending_marker(tmp_path, settings_factory):
+    """(a) Telegram rejects -> the alert fact is DURABLE, not just logged."""
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row is not None and row["suppressed"] == 1
+
+    payload = await _pending_payload(db, "gainers_early")
+    assert payload["transition"] == "newly_suppressed"
+    # The exact page is preserved, so the retry re-sends it verbatim rather
+    # than re-deriving content from state that has since moved.
+    assert "gainers_early" in payload["message"]
+    assert "revive_signal_with_baseline" in payload["message"]
+    datetime.fromisoformat(payload["detected_at"])
+
+    assert summary["suppression_reversals"] == [], "counted as alerted on a 500"
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_alert_dispatched") == 1
+    assert events.count("suppression_reversal_alert_failed") == 1
+    assert "suppression_reversal_alert_delivered" not in events
+    await db.close()
+
+
+async def test_next_refresh_reattempts_pending_reversal_and_clears_it(
+    tmp_path, settings_factory
+):
+    """(b) THE POINT OF THE CHANGE: the page survives the outage.
+
+    Refresh 1 fails. Refresh 2 finds NO new transition (the combo is already
+    suppressed) — the only reason it pages at all is the durable marker.
+    """
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        await combo_refresh.refresh_all(db, s)
+    assert (await _pending_payload(db, "gainers_early"))["transition"] == (
+        "newly_suppressed"
+    )
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=200, payload={"ok": True}, repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)
+
+    exists, raw = await _pending_marker(db, "gainers_early")
+    assert exists, "30d row missing — the marker assertion would be vacuous"
+    assert raw is None, "confirmed delivery did not clear the pending marker"
+
+    assert summary["suppression_reversals"] == [
+        {"combo_key": "gainers_early", "transition": "newly_suppressed"}
+    ]
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_alert_dispatched") == 1, "double-paged"
+    assert events.count("suppression_reversal_alert_delivered") == 1
+    assert "suppression_reversal_alert_failed" not in events
+    await db.close()
+
+
+async def test_successful_first_attempt_leaves_no_pending_marker(
+    tmp_path, settings_factory
+):
+    """(c) The happy path stamps and clears within the one refresh, so a clean
+    run never leaves durable residue behind."""
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=200, payload={"ok": True}, repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)
+
+    exists, raw = await _pending_marker(db, "gainers_early")
+    assert exists and raw is None, "clean delivery left a pending marker behind"
+    assert await _count_pending_rows(db) == 0
+
+    assert summary["suppression_reversals"] == [
+        {"combo_key": "gainers_early", "transition": "newly_suppressed"}
+    ]
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_alert_dispatched") == 1
+    assert events.count("suppression_reversal_alert_delivered") == 1
+    assert "suppression_reversal_alert_failed" not in events
+    await db.close()
+
+
+async def test_repeated_failures_reattempt_every_refresh_without_duplicating(
+    tmp_path, settings_factory
+):
+    """(d) Three failing refreshes -> three attempts, ONE pending row, and the
+    original detection timestamp preserved.
+
+    Also pins that the 30d UPSERT does not clobber the marker: `refresh_combo`
+    rewrites this row on every one of these runs, and the pending payload has to
+    survive all of them or the retry silently stops.
+    """
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    dispatched = failed = 0
+    first_detected_at = None
+    for _ in range(3):
+        with aioresponses() as m:
+            m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+            with structlog.testing.capture_logs() as log_events:
+                await combo_refresh.refresh_all(db, s)
+        events = [e["event"] for e in log_events]
+        dispatched += events.count("suppression_reversal_alert_dispatched")
+        failed += events.count("suppression_reversal_alert_failed")
+        payload = await _pending_payload(db, "gainers_early")
+        if first_detected_at is None:
+            first_detected_at = payload["detected_at"]
+
+    assert dispatched == 3, "a later refresh stopped re-attempting"
+    assert failed == 3
+    assert await _count_pending_rows(db) == 1, "duplicate pending state"
+    payload = await _pending_payload(db, "gainers_early")
+    assert payload["detected_at"] == first_detected_at, "retry rewrote the detection"
+    assert payload["transition"] == "newly_suppressed"
+    await db.close()
+
+
+async def test_new_transition_supersedes_pending_and_logs_the_superseded_fact(
+    tmp_path, settings_factory
+):
+    """Latest-wins: a NEW reversal while one is pending replaces the payload,
+    and the superseded one is preserved in a structured log rather than dropped.
+
+    Driven through `_process_suppression_reversals` with constructed snapshots:
+    the classifier is covered separately, and building a real
+    newly_suppressed-then-parole-exhausted sequence on top of an undelivered
+    page would obscure what is under test. The alerter seam stays REAL.
+    """
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_unsuppressed_combo_row(db, "flipper", trades=25, wins=5)
+
+    unsuppressed = {
+        "suppressed": 0,
+        "parole_at": None,
+        "win_rate_pct": 20.0,
+        "trades": 25,
+    }
+    latched = {
+        "suppressed": 1,
+        "parole_at": "2026-08-01T00:00:00+00:00",
+        "win_rate_pct": 20.0,
+        "trades": 25,
+    }
+    reparoled = {
+        "suppressed": 1,
+        "parole_at": "2026-08-20T00:00:00+00:00",
+        "win_rate_pct": 18.0,
+        "trades": 30,
+    }
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        await combo_refresh._process_suppression_reversals(
+            db, s, {"flipper": unsuppressed}, {"flipper": latched}
+        )
+    assert (await _pending_payload(db, "flipper"))["transition"] == "newly_suppressed"
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            await combo_refresh._process_suppression_reversals(
+                db, s, {"flipper": latched}, {"flipper": reparoled}
+            )
+
+    payload = await _pending_payload(db, "flipper")
+    assert (
+        payload["transition"] == "parole_exhausted_resuppressed"
+    ), "latest did not win"
+    assert await _count_pending_rows(db) == 1
+
+    superseded = [
+        e for e in log_events if e["event"] == "suppression_reversal_alert_superseded"
+    ]
+    assert len(superseded) == 1, "the superseded page vanished without a trace"
+    assert superseded[0]["superseded_transition"] == "newly_suppressed"
+    assert superseded[0]["new_transition"] == "parole_exhausted_resuppressed"
+    await db.close()
+
+
+async def test_clear_is_payload_bound_so_a_midflight_supersede_survives(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The clear matches on the EXACT payload delivered.
+
+    Delivery runs unlocked, so a concurrent refresh can supersede the pending
+    page while it is in flight. A blind `SET ... = NULL` would drop that newer
+    page — delivered one body, erased a different one. Mid-flight mutation is
+    the thing under test here, so the sender is the seam that gets replaced
+    (same idiom as the #523 generation-bound marker test); the real-alerter
+    contract is covered by the tests above.
+    """
+    import json
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_unsuppressed_combo_row(db, "racer", trades=25, wins=5)
+    old = json.dumps(
+        {
+            "transition": "newly_suppressed",
+            "detected_at": "2026-08-13T00:00:00+00:00",
+            "message": "old body",
+        },
+        sort_keys=True,
+    )
+    newer = json.dumps(
+        {
+            "transition": "parole_exhausted_resuppressed",
+            "detected_at": "2026-08-13T01:00:00+00:00",
+            "message": "newer body",
+        },
+        sort_keys=True,
+    )
+    await db._conn.execute(
+        "UPDATE combo_performance SET reversal_alert_pending_json = ? "
+        "WHERE combo_key = 'racer' AND window = '30d'",
+        (old,),
+    )
+    await db._conn.commit()
+
+    async def _supersede_midflight(settings, message):
+        # Carried-over payload, so R1 stamps the detection time onto the body.
+        assert message.startswith("old body"), "delivered the wrong body"
+        assert "[detected 2026-08-13T00:00:00+00:00]" in message
+        await db._conn.execute(
+            "UPDATE combo_performance SET reversal_alert_pending_json = ? "
+            "WHERE combo_key = 'racer' AND window = '30d'",
+            (newer,),
+        )
+        await db._conn.commit()
+
+    monkeypatch.setattr(
+        combo_refresh, "_send_suppression_reversal_alert", _supersede_midflight
+    )
+    with structlog.testing.capture_logs() as log_events:
+        await combo_refresh._process_suppression_reversals(db, s, {}, {})
+
+    _, raw = await _pending_marker(db, "racer")
+    assert raw == newer, "the newer pending page was clobbered by a blind clear"
+    events = [e["event"] for e in log_events]
+    # Neutral event name: rowcount 0 also occurs when the payload was already
+    # CLEARED mid-flight, in which case nothing is pending — the old
+    # "..._superseded_during_delivery" name asserted a state that is false half
+    # the time (reviewer probe C).
+    assert "suppression_reversal_pending_not_cleared" in events
+    await db.close()
+
+
+async def test_transition_without_a_30d_row_is_reported_not_swallowed(
+    tmp_path, settings_factory
+):
+    """A page that cannot be made durable must be LOUD.
+
+    `post_state` is built from 30d rows so this is defensive, but the failure it
+    guards is a silently unrecorded alert — the exact class this PR exists to
+    remove. Driven directly because refresh_all cannot produce the state.
+    """
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    ghost = {"suppressed": 1, "parole_at": None, "win_rate_pct": 12.0, "trades": 30}
+
+    with structlog.testing.capture_logs() as log_events:
+        alerted = await combo_refresh._process_suppression_reversals(
+            db, s, {}, {"ghost": ghost}
+        )
+
+    assert alerted == []
+    missed = [
+        e
+        for e in log_events
+        if e["event"] == "suppression_reversal_pending_write_missed"
+    ]
+    assert len(missed) == 1, "a page with nowhere to persist vanished silently"
+    assert missed[0]["combo_key"] == "ghost"
+    assert missed[0]["transition"] == "newly_suppressed"
+    await db.close()
+
+
+async def test_corrupt_pending_payload_is_reported_and_left_in_place(
+    tmp_path, settings_factory
+):
+    """An undecodable payload is a real lost page.
+
+    It is deliberately NOT cleared: a row that complains on every refresh is a
+    far better failure mode than one that quietly deletes itself. Pins both
+    halves — the error log AND the survival of the row.
+    """
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_unsuppressed_combo_row(db, "corrupt", trades=25, wins=5)
+    await db._conn.execute(
+        "UPDATE combo_performance SET reversal_alert_pending_json = '{not json' "
+        "WHERE combo_key = 'corrupt' AND window = '30d'"
+    )
+    await db._conn.commit()
+
+    with structlog.testing.capture_logs() as log_events:
+        alerted = await combo_refresh._process_suppression_reversals(db, s, {}, {})
+
+    assert alerted == []
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_pending_unreadable") == 1
+    assert "suppression_reversal_alert_dispatched" not in events
+    _, raw = await _pending_marker(db, "corrupt")
+    assert raw == "{not json", "corrupt payload was silently discarded"
+    await db.close()
+
+
+async def test_upgrade_adds_pending_reversal_column_to_existing_table(tmp_path):
+    """(e) Upgrade-with-data: build the OLD shape, then migrate.
+
+    A fresh `tmp_path` DB is created already-migrated and would never exercise
+    the ALTER. Existing rows must land at NULL — "no pending alert", the correct
+    pre-cutover state.
+    """
+    import aiosqlite
+
+    path = tmp_path / "old.db"
+    conn = await aiosqlite.connect(path)
+    await conn.execute("""CREATE TABLE combo_performance (
+               combo_key TEXT, window TEXT, trades INTEGER, wins INTEGER,
+               losses INTEGER, total_pnl_usd REAL, avg_pnl_pct REAL,
+               win_rate_pct REAL, suppressed INTEGER, suppressed_at TEXT,
+               parole_at TEXT, parole_trades_remaining INTEGER,
+               refresh_failures INTEGER, last_refreshed TEXT,
+               perm_suppression_alerted_at TEXT,
+               retest_incomplete_alerted_at TEXT,
+               PRIMARY KEY (combo_key, window))""")
+    await conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('legacy', '30d', 40, 8, 32, -9.0, -1.0, 20.0, 1, 0, 'x')"
+    )
+    await conn.commit()
+    await conn.close()
+
+    db = Database(path)
+    await db.initialize()
+    cur = await db._conn.execute("PRAGMA table_info(combo_performance)")
+    cols = {r[1] for r in await cur.fetchall()}
+    assert "reversal_alert_pending_json" in cols, "ALTER did not land"
+
+    cur = await db._conn.execute(
+        "SELECT trades, suppressed, reversal_alert_pending_json "
+        "FROM combo_performance WHERE combo_key = 'legacy'"
+    )
+    row = await cur.fetchone()
+    assert row[0] == 40, "pre-existing data lost"
+    assert row[1] == 1, "pre-existing suppression state lost"
+    assert row[2] is None, "new column must default to NULL (no pending alert)"
+    await db.close()
+
+
+# ---------------------------------------------------------------------------
+# LOOP-1 review fixes. The four tests below ORIGINATED AS PROBES written by the
+# independent adversarial reviewer of fix/reversal-alert-durable-retry (probes
+# A, D and E); they are promoted here as regression tests, adapted to house
+# style and INVERTED where the probe asserted the defect rather than the fix.
+# ---------------------------------------------------------------------------
+
+
+async def test_retried_page_is_stamped_with_its_detection_time(
+    tmp_path, settings_factory, monkeypatch
+):
+    """R1 (reviewer probe A): a page delivered on a LATER refresh must say when
+    it was detected.
+
+    A pending page outlives the state it describes — the suppression can be
+    cleared by a later refresh, or by the operator doing exactly what the page
+    told them to do. Delivered verbatim days later it asserts "the dispatcher
+    now blocks its opens" about a combo that is trading again, and with no
+    timestamp in the body it is byte-indistinguishable from a fresh page.
+
+    First-attempt bodies stay byte-identical to #424, so the stamp appears only
+    on a retry.
+    """
+    import scout.alerter as alerter_mod
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    bodies: list[str] = []
+    fail = {"on": True}
+
+    async def fake_send(message, session, settings, **kw):
+        bodies.append(message)
+        if fail["on"]:
+            raise RuntimeError("telegram 500")
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+
+    await combo_refresh.refresh_all(db, s)  # attempt 1 — rejected
+    payload = await _pending_payload(db, "gainers_early")
+    assert len(bodies) == 1
+    assert "[detected " not in bodies[0], "first attempt must not carry a stamp"
+
+    fail["on"] = False
+    await combo_refresh.refresh_all(db, s)  # attempt 2 — delivered
+
+    assert len(bodies) == 2
+    retried = bodies[1]
+    assert retried.endswith(f" [detected {payload['detected_at']}]"), retried
+    assert retried.startswith(payload["message"]), "original body not preserved"
+    await db.close()
+
+
+async def test_first_attempt_delivery_body_carries_no_stamp(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The happy path must not gain a stamp — pins the other half of R1."""
+    import scout.alerter as alerter_mod
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    bodies: list[str] = []
+
+    async def fake_send(message, session, settings, **kw):
+        bodies.append(message)
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+    await combo_refresh.refresh_all(db, s)
+
+    assert len(bodies) == 1
+    assert "[detected " not in bodies[0]
+    assert "auto-suppressed" in bodies[0]
+    await db.close()
+
+
+async def test_payload_without_a_detection_time_stamps_unknown_not_none(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A payload missing only `detected_at` must not render "[detected None]".
+
+    Caught by the mutation battery: removing the guard left every other test
+    green. `message` and `transition` are present so the page is deliverable,
+    and a missing key is still classified as a retry — it just cannot say when.
+    """
+    import json
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_unsuppressed_combo_row(db, "nodate", trades=25, wins=5)
+    await db._conn.execute(
+        "UPDATE combo_performance SET reversal_alert_pending_json = ? "
+        "WHERE combo_key = 'nodate' AND window = '30d'",
+        (json.dumps({"transition": "newly_suppressed", "message": "body"}),),
+    )
+    await db._conn.commit()
+
+    bodies: list[str] = []
+
+    async def _capture(settings, message):
+        bodies.append(message)
+
+    monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", _capture)
+    await combo_refresh._process_suppression_reversals(db, s, {}, {})
+
+    assert bodies == ["body [detected unknown]"], bodies
+    assert "None" not in bodies[0]
+    await db.close()
+
+
+async def test_db_error_in_record_phase_neither_aborts_refresh_nor_skips_siblings(
+    tmp_path, settings_factory, monkeypatch
+):
+    """R2 (reviewer probe D): a DB error while recording a pending page must not
+    take down the whole refresh.
+
+    Before this fix the error propagated out of `refresh_all`, so the two
+    sibling §12b passes — permanent-suppression and retest-terminal-incomplete —
+    never ran. A new durability mechanism that can silence two OLDER alert paths
+    is a net loss.
+    """
+    import aiosqlite
+    import structlog
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    real_execute = db._conn.execute
+    perm_ran: list[int] = []
+    retest_ran: list[int] = []
+
+    async def _flaky(sql, *a, **kw):
+        if "reversal_alert_pending_json = ?" in str(sql):
+            raise aiosqlite.OperationalError("database is locked")
+        return await real_execute(sql, *a, **kw)
+
+    async def _perm(*a, **kw):
+        perm_ran.append(1)
+        return []
+
+    async def _retest(*a, **kw):
+        retest_ran.append(1)
+        return []
+
+    monkeypatch.setattr(db._conn, "execute", _flaky)
+    monkeypatch.setattr(combo_refresh, "_process_permanent_suppression", _perm)
+    monkeypatch.setattr(combo_refresh, "_process_retest_terminal_incomplete", _retest)
+
+    with structlog.testing.capture_logs() as log_events:
+        summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+
+    monkeypatch.setattr(db._conn, "execute", real_execute)
+
+    assert perm_ran == [1], "permanent-suppression pass was skipped"
+    assert retest_ran == [1], "retest-incomplete pass was skipped"
+    assert summary["suppression_reversals"] == []
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_pending_write_failed") == 1
+    await db.close()
+
+
+async def test_record_phase_failure_leaves_no_half_open_transaction(
+    tmp_path, settings_factory
+):
+    """R2 (reviewer probe E): an `aiosqlite.Error` partway through the record
+    loop must not strand an open transaction on the SHARED connection.
+
+    The probe demonstrated `in_transaction` still True after the lock was
+    released — the precise hazard this function's own comment warns about, and
+    one that leaves the next writer inheriting a foreign transaction. Partial
+    progress is kept: combos that DID record stay recorded.
+
+    SCOPE: the guarantee covers `aiosqlite.Error` only, which is what the handler
+    catches. A non-aiosqlite exception still propagates and can leave the
+    transaction open — deliberately NOT widened, because no such exception is
+    reachable from `refresh_all` on this path and a bare `except` here would
+    swallow programming errors.
+    """
+    import aiosqlite
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    for combo in ("aaa", "zzz"):
+        await _seed_unsuppressed_combo_row(db, combo, trades=25, wins=5)
+
+    post = {
+        c: {"suppressed": 1, "parole_at": None, "win_rate_pct": 10.0, "trades": 30}
+        for c in ("aaa", "zzz")
+    }
+
+    real_execute = db._conn.execute
+    seen = {"n": 0}
+
+    async def _flaky(sql, *a, **kw):
+        if "SET reversal_alert_pending_json = ?" in str(sql):
+            seen["n"] += 1
+            if seen["n"] == 2:  # the second combo blows up
+                raise aiosqlite.OperationalError("database is locked")
+        return await real_execute(sql, *a, **kw)
+
+    db._conn.execute = _flaky
+    await combo_refresh._record_pending_reversals(db, s, {}, post)  # must NOT raise
+    db._conn.execute = real_execute
+
+    assert (
+        db._conn._conn.in_transaction is False
+    ), "half-open transaction stranded on the shared connection"
+    assert db._txn_lock.locked() is False
+
+    _, first = await _pending_marker(db, "aaa")
+    _, second = await _pending_marker(db, "zzz")
+    assert first is not None, "successful combo lost its committed page"
+    assert second is None, "the failed combo must not appear recorded"
+    await db.close()
+
+
+async def test_commit_failure_rolls_back_instead_of_leaving_a_half_open_txn(
+    tmp_path, settings_factory
+):
+    """The OTHER half of R2: the per-combo guard protects the writes, but the
+    final commit can fail on its own (disk I/O, lock timeout).
+
+    Caught by my own mutation battery — removing the rollback left every other
+    test green, i.e. this guard shipped unpinned. Without the rollback the
+    shared connection stays inside a transaction the next writer inherits.
+
+    F1: the rollback discards EVERY page this pass recorded, and those combos
+    were never reported by the per-combo handler (it only fires for combos whose
+    own UPDATE raised). So the commit-failure log must NAME them, or a commit
+    failure destroys §12b pages silently. TWO combos, because with one the
+    assertion cannot distinguish "names the lost pages" from "names something".
+    """
+    import aiosqlite
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    for combo in ("committer_one", "committer_two"):
+        await _seed_unsuppressed_combo_row(db, combo, trades=25, wins=5)
+    post = {
+        c: {"suppressed": 1, "parole_at": None, "win_rate_pct": 10.0, "trades": 30}
+        for c in ("committer_one", "committer_two")
+    }
+
+    real_commit = db._conn.commit
+
+    async def _boom_commit():
+        raise aiosqlite.OperationalError("disk I/O error")
+
+    db._conn.commit = _boom_commit
+    with structlog.testing.capture_logs() as log_events:
+        await combo_refresh._record_pending_reversals(db, s, {}, post)  # no raise
+    db._conn.commit = real_commit
+
+    failed = [
+        e
+        for e in log_events
+        if e["event"] == "suppression_reversal_pending_commit_failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["lost_combos"] == ["committer_one", "committer_two"], (
+        "the discarded pages must be NAMED — they were never reported "
+        "individually, so this log is their only trace"
+    )
+    assert failed[0]["lost_count"] == 2
+    assert (
+        db._conn._conn.in_transaction is False
+    ), "rollback did not run — connection left half-open"
+    for combo in ("committer_one", "committer_two"):
+        _, raw = await _pending_marker(db, combo)
+        assert raw is None, "a rolled-back write must not appear recorded"
+    await db.close()
+
+
+async def test_empty_string_marker_is_treated_as_present_but_corrupt(
+    tmp_path, settings_factory
+):
+    """MINOR from review: `if existing:` skipped the supersede log for an
+    empty-string marker, and a corrupt payload logged `superseded_message=None`,
+    dropping the bytes that were the only evidence of what was lost.
+    """
+    import structlog
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_unsuppressed_combo_row(db, "emptymark", trades=25, wins=5)
+    await db._conn.execute(
+        "UPDATE combo_performance SET reversal_alert_pending_json = '' "
+        "WHERE combo_key = 'emptymark' AND window = '30d'"
+    )
+    await db._conn.commit()
+
+    post = {
+        "emptymark": {
+            "suppressed": 1,
+            "parole_at": None,
+            "win_rate_pct": 10.0,
+            "trades": 30,
+        }
+    }
+    with structlog.testing.capture_logs() as log_events:
+        await combo_refresh._record_pending_reversals(db, s, {}, post)
+
+    superseded = [
+        e for e in log_events if e["event"] == "suppression_reversal_alert_superseded"
+    ]
+    assert len(superseded) == 1, "empty-string marker was treated as absent"
+    assert superseded[0]["superseded_raw"] == "", "raw bytes must be preserved"
+    assert superseded[0]["superseded_transition"] is None
+    await db.close()
