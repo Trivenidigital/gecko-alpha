@@ -1214,3 +1214,247 @@ def test_reversal_alert_sender_uses_plain_text_and_source():
     src = inspect.getsource(combo_refresh._send_suppression_reversal_alert)
     assert "parse_mode=None" in src
     assert "source=" in src
+
+
+# ---------------------------------------------------------------------------
+# fix/suppression-alert-delivery-failure — the two §12b suppression senders
+# inherited the pre-#523 pattern: they called the alerter WITHOUT
+# `raise_on_failure=True`. The alerter defaults to False and merely LOGS a
+# non-200, so a rejected page returned normally, the caller logged
+# `..._delivered` and stamped its alerted marker — silencing the operator
+# notification forever. These tests drive the REAL alerter (aioresponses fails
+# the actual Telegram POST); mocking the sender itself would mock away the very
+# seam that was broken.
+# ---------------------------------------------------------------------------
+
+
+def _tg_url(settings) -> str:
+    return f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+
+
+def _reset_tg_module_state() -> None:
+    """Clear the process-global pacing deadline + burst counter.
+
+    `TG_PACING_ENABLED` defaults True, so a 429 registered by an earlier test
+    for the same chat id would make these tests sleep before sending.
+    """
+    from scout.observability import tg_dispatch_counter, tg_pacing
+
+    tg_pacing.reset_for_tests()
+    tg_dispatch_counter.reset_for_tests()
+
+
+async def _seed_newly_suppressing_trades(db):
+    """5 wins + 15 losses = 25% WR (< 30% threshold) -> `newly_suppressed`."""
+    now = datetime.now(timezone.utc)
+    for _ in range(5):
+        await _insert_trade(db, "gainers_early", 10, 5.0, now - timedelta(days=2))
+    for _ in range(15):
+        await _insert_trade(db, "gainers_early", -5, -3.0, now - timedelta(days=2))
+
+
+async def _perm_marker(db, combo_key):
+    """Return `(row_exists, perm_suppression_alerted_at)` for the 30d row.
+
+    Returns the row's existence separately so a caller can assert the row is
+    THERE before asserting on the column — a missing row would otherwise make
+    an `is None` marker assertion pass vacuously.
+    """
+    cur = await db._conn.execute(
+        "SELECT perm_suppression_alerted_at FROM combo_performance "
+        "WHERE combo_key = ? AND window = '30d'",
+        (combo_key,),
+    )
+    row = await cur.fetchone()
+    return row is not None, (row[0] if row else None)
+
+
+async def test_reversal_sender_opts_into_raise_on_failure(settings_factory):
+    """(3a) A rejected page must propagate OUT of the reversal sender.
+
+    Contract-tests the real `scout.alerter` seam, not the monkeypatched wrapper
+    the other tests use: without `raise_on_failure=True` the alerter swallows a
+    non-200 and returns normally, so the caller's `except` never runs.
+    """
+    import scout.alerter as alerter_mod
+
+    captured: dict = {}
+
+    async def fake_send(message, session, settings, **kw):
+        captured.update(kw)
+        raise RuntimeError("telegram 400")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerter_mod, "send_telegram_message", fake_send)
+        with pytest.raises(RuntimeError):
+            await combo_refresh._send_suppression_reversal_alert(
+                settings_factory(), "body"
+            )
+
+    assert captured.get("raise_on_failure") is True, "failure cannot propagate"
+    assert captured.get("parse_mode") is None, "combo names contain underscores"
+    assert captured.get("source") == "combo_refresh_suppression_reversal"
+
+
+async def test_permanent_sender_opts_into_raise_on_failure(settings_factory):
+    """(3a) Same contract for the permanent-suppression sender."""
+    import scout.alerter as alerter_mod
+
+    captured: dict = {}
+
+    async def fake_send(message, session, settings, **kw):
+        captured.update(kw)
+        raise RuntimeError("telegram 400")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerter_mod, "send_telegram_message", fake_send)
+        with pytest.raises(RuntimeError):
+            await combo_refresh._send_permanent_suppression_alert(
+                settings_factory(), "body"
+            )
+
+    assert captured.get("raise_on_failure") is True, "failure cannot propagate"
+    assert captured.get("parse_mode") is None, "signal names contain underscores"
+    assert captured.get("source") == "combo_refresh_permanent_suppression"
+
+
+async def test_reversal_not_recorded_when_telegram_rejects_the_page(
+    tmp_path, settings_factory
+):
+    """(3b) Telegram 500 -> the combo is NOT recorded as alerted.
+
+    The whole alerter runs for real; only the HTTP layer fails. Before the fix
+    the 500 was swallowed, `..._delivered` was logged and the combo was appended
+    to the reversal list as if the operator had been told.
+    """
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+
+    # The transition really happened — so an empty list below means "not
+    # alerted", not "nothing to alert about".
+    row = await _get_combo_row(db, "gainers_early", "30d")
+    assert row is not None, "30d row missing — the marker assertion would be vacuous"
+    assert row["suppressed"] == 1
+
+    assert "suppression_reversals" in summary, "summary key vanished"
+    assert summary["suppression_reversals"] == [], "combo marked alerted on a 500"
+
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_alert_dispatched") == 1
+    assert events.count("suppression_reversal_alert_failed") == 1
+    assert (
+        "suppression_reversal_alert_delivered" not in events
+    ), "logged delivered for a page Telegram rejected"
+    await db.close()
+
+
+async def test_reversal_recorded_and_logged_when_telegram_accepts(
+    tmp_path, settings_factory
+):
+    """(3c + 3d) Telegram 200 -> recorded as alerted, with the §12b log pair."""
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=200, payload={"ok": True}, repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)
+
+    assert summary["suppression_reversals"] == [
+        {"combo_key": "gainers_early", "transition": "newly_suppressed"}
+    ]
+
+    events = [e["event"] for e in log_events]
+    assert events.count("suppression_reversal_alert_dispatched") == 1
+    assert events.count("suppression_reversal_alert_delivered") == 1
+    assert "suppression_reversal_alert_failed" not in events
+    await db.close()
+
+
+async def test_perm_marker_not_stamped_when_telegram_rejects_the_page(
+    tmp_path, settings_factory
+):
+    """(3b) Telegram 500 -> `perm_suppression_alerted_at` stays NULL.
+
+    This is the durable one: a stamped marker dedups the alert forever, so a
+    swallowed 500 meant the operator was never told a signal had entered
+    permanent suppression.
+    """
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_suppressed_combo(db, "gainers_early", remaining=0)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=500, body="rejected", repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)  # must NOT raise
+
+    exists, marker = await _perm_marker(db, "gainers_early")
+    assert exists, "30d row missing — the marker assertion would be vacuous"
+    assert marker is None, "dedup marker stamped for a page Telegram rejected"
+    assert summary["permanent_suppression"] == []
+
+    events = [e["event"] for e in log_events]
+    assert events.count("permanent_suppression_alert_dispatched") == 1
+    assert events.count("permanent_suppression_alert_failed") == 1
+    assert "permanent_suppression_alert_delivered" not in events
+
+    # Un-stamped means the NEXT run re-attempts — the point of not stamping.
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=200, payload={"ok": True}, repeat=True)
+        summary2 = await combo_refresh.refresh_all(db, s)
+    assert summary2["permanent_suppression"] == ["gainers_early"]
+    await db.close()
+
+
+async def test_perm_marker_stamped_and_logged_when_telegram_accepts(
+    tmp_path, settings_factory
+):
+    """(3c + 3d) Telegram 200 -> marker stamped, with the §12b log pair."""
+    import structlog
+    from aioresponses import aioresponses
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_suppressed_combo(db, "gainers_early", remaining=0)
+
+    with aioresponses() as m:
+        m.post(_tg_url(s), status=200, payload={"ok": True}, repeat=True)
+        with structlog.testing.capture_logs() as log_events:
+            summary = await combo_refresh.refresh_all(db, s)
+
+    exists, marker = await _perm_marker(db, "gainers_early")
+    assert exists, "30d row missing — the marker assertion would be vacuous"
+    assert marker is not None, "confirmed send did not stamp the dedup marker"
+    datetime.fromisoformat(marker)  # a real timestamp, not a truthy sentinel
+    assert summary["permanent_suppression"] == ["gainers_early"]
+
+    events = [e["event"] for e in log_events]
+    assert events.count("permanent_suppression_alert_dispatched") == 1
+    assert events.count("permanent_suppression_alert_delivered") == 1
+    assert "permanent_suppression_alert_failed" not in events
+    await db.close()

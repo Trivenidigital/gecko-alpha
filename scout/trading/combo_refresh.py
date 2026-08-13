@@ -726,8 +726,8 @@ async def _process_suppression_reversals(
     underscore-laden combo/signal names and ``revive_signal_with_baseline`` are
     not mangled by MarkdownV1. Dispatched/delivered/failed logs bracket the send
     so a successful delivery is not silent. A delivery failure never breaks
-    refresh; the combo is simply not counted as alerted (the state persists, so
-    a future run re-attempts).
+    refresh; the combo is simply not counted as alerted. Note this path has NO
+    durable retry — see the failure branch below.
 
     Returns the list of ``{"combo_key", "transition"}`` alerted this run.
     """
@@ -765,8 +765,13 @@ async def _process_suppression_reversals(
         try:
             await _send_suppression_reversal_alert(settings, message)
         except Exception as exc:
-            # Alert failure must never break refresh. The combo stays in its
-            # reversed state, so a future run re-detects and re-attempts.
+            # Alert failure must never break refresh. Unlike the permanent-
+            # suppression path (durable marker -> the next run re-attempts),
+            # the transition here is diffed across THIS refresh only: the next
+            # run sees the combo already suppressed with an unchanged parole_at,
+            # so `_classify_reversal` returns None and never re-pages. A failed
+            # send is therefore a permanently missed page, and this log is its
+            # only trace — which is precisely why the send must raise.
             log.exception(
                 "suppression_reversal_alert_failed",
                 combo_key=combo,
@@ -793,6 +798,14 @@ async def _send_suppression_reversal_alert(settings, message: str) -> None:
     aborts the interpreter on Windows dev boxes via OpenSSL Applink, and is
     pointless on any run with no reversal). Tests monkeypatch this function so
     the real aiohttp import never runs.
+
+    ``raise_on_failure=True`` is LOAD-BEARING, not decoration. The alerter
+    defaults to ``False`` and merely LOGS a non-200 or a network error, so
+    without it a rejected page returns normally: the caller then emits
+    ``suppression_reversal_alert_delivered`` and counts the combo as alerted.
+    The reversal is detected by diffing suppression state ACROSS one refresh, so
+    the transition never recurs — a swallowed rejection silences that alert
+    permanently, not just for this run.
     """
     import aiohttp  # deferred — module-level import aborts on Windows
 
@@ -807,6 +820,7 @@ async def _send_suppression_reversal_alert(settings, message: str) -> None:
             settings,
             parse_mode=None,
             source="combo_refresh_suppression_reversal",
+            raise_on_failure=True,
         )
 
 
@@ -918,6 +932,14 @@ async def _send_permanent_suppression_alert(settings, message: str) -> None:
     Applink), and importing it is pointless on any run with no
     permanent-suppression combo. Tests monkeypatch this function so the real
     aiohttp import never runs.
+
+    ``raise_on_failure=True`` is LOAD-BEARING, not decoration. The alerter
+    defaults to ``False`` and merely LOGS a non-200 or a network error, so
+    without it the caller would emit ``permanent_suppression_alert_delivered``
+    and stamp ``perm_suppression_alerted_at`` for a page Telegram rejected — and
+    that dedup marker then suppresses every future attempt until the combo
+    leaves the state. "Set the dedup marker only after a confirmed send" is only
+    a true statement if failure propagates.
     """
     import aiohttp  # deferred — module-level import aborts on Windows
 
@@ -932,4 +954,5 @@ async def _send_permanent_suppression_alert(settings, message: str) -> None:
             settings,
             parse_mode=None,
             source="combo_refresh_permanent_suppression",
+            raise_on_failure=True,
         )
