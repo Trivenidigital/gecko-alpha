@@ -47,6 +47,7 @@ not yet a runtime field.
 | Detection-receipt disk recovery | `detection_receipt_disk_recovery` | Free disk recovered above floor → receipt accrual resumed (distinct one-shot recovery page) | health | None | info | Y |
 | Alert-channel-death watchdog (script) | `alert_channel_watchdog` | No trading-chat alert delivered within the watchdog window | trading | None | warning | Y |
 | Pilot threshold watchdog (script) | `pilot_threshold_watchdog` | A pre-registered pilot gate was reached: instrumentation validated, K2–K6 kill condition, admission close (§7.5 rollback due), tail resolved, or the gainers instrumentation gate. Operational state only — never a verdict, `D(X)`, or P&L | trading | None | warning | Y |
+| TG shadow lag watchdog (script) | `tg_shadow_lag_watchdog` | TG shadow evidence stopped accumulating: eligible RESOLVED signals in the current generation are past the lag threshold and unshadowed, either after a completed scan (`writer_failing`) or with no scan inside the cadence budget (`writer_dead`). Silent while `TG_SHADOW_ENABLED=false` or no generation row exists | trading | None | warning | Y |
 | Signal auto-suspension | `auto_suspend` | Tier-1b combined gate (hard_loss / drawdown) suspends a signal — **reverses operator-enabled state** | trading | None | warning | Y |
 | Operator briefing | `briefing` | Periodic briefing synthesis | trading | None | info | N |
 | Calibration dry-run (calibrate module) | `calibrate` | Per-signal calibration proposals | trading | None | info | Y |

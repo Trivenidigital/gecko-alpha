@@ -116,6 +116,99 @@ def solana_retry_backoff(monkeypatch):
     return requested
 
 
+@pytest.fixture(autouse=True)
+def _reset_tg_shadow_provider_registry():
+    """Drop any registered `CallerFeatureProvider` between tests.
+
+    The registry is module-level. A provider left registered by one test
+    silently changes the next test's `gate_version` (its `module_source_hash`
+    is in the fingerprint), which turns a fingerprint assertion into a
+    test-order dependency.
+
+    Try/except for TDD-friendliness — works before the module exists.
+    """
+    try:
+        from scout.social.telegram.shadow import clear_registered_provider
+    except ImportError:
+        yield
+        return
+    clear_registered_provider()
+    yield
+    clear_registered_provider()
+
+
+class FixtureCallerFeatureProvider:
+    """TEST-ONLY deterministic `CallerFeatureProvider`.
+
+    NEVER registered by production wiring — Stage A ships no real provider,
+    and a fixture that leaked into production would arm a gate_version against
+    a made-up feature set.
+
+    Every returned value derives from `(channel_handle, decision_as_of,
+    current_signal_id)` and the events handed to the constructor, filtered by
+    `at <= decision_as_of`. That filter is what makes replay determinism real
+    rather than asserted: evidence added after a decision's `as_of` cannot
+    reach it, so re-running that decision later returns the same features.
+
+    `history_*` values exclude `current_signal_id` per the §B provider
+    contract — a signal may not improve its own caller's reputation. `event_*`
+    values describe THIS call and may see it.
+    """
+
+    caller_feature_semantic_version = "tg-caller-fixture-v1"
+
+    def __init__(
+        self,
+        events: list[dict] | None = None,
+        *,
+        module_source_hash: str = "0" * 64,
+        semantic_version: str | None = None,
+        schema: list[tuple[str, str]] | None = None,
+    ) -> None:
+        # `events`: dicts of {at: datetime, cluster: str, priceable: bool,
+        # signal_id: int | None}.
+        self._events = list(events or [])
+        self.module_source_hash = module_source_hash
+        if semantic_version is not None:
+            self.caller_feature_semantic_version = semantic_version
+        self._schema = schema or [
+            ("history_eligible_distinct_clusters", "int"),
+            ("history_priceable_coverage_rate", "float"),
+            ("event_duplicate_rank_in_cluster", "int"),
+        ]
+
+    def feature_schema(self) -> list[tuple[str, str]]:
+        return list(self._schema)
+
+    def features(self, channel_handle, decision_as_of, current_signal_id):
+        knowable = [e for e in self._events if e["at"] <= decision_as_of]
+        history = [e for e in knowable if e.get("signal_id") != current_signal_id]
+        clusters = {e["cluster"] for e in history}
+        priceable = [e for e in history if e.get("priceable", True)]
+        coverage = len(priceable) / len(history) if history else 0.0
+        current = [e for e in knowable if e.get("signal_id") == current_signal_id]
+        rank = 1
+        if current:
+            cluster = current[0]["cluster"]
+            rank = 1 + sum(
+                1
+                for e in history
+                if e["cluster"] == cluster and e["at"] <= current[0]["at"]
+            )
+        return {
+            "history_eligible_distinct_clusters": len(clusters),
+            "history_priceable_coverage_rate": coverage,
+            "event_duplicate_rank_in_cluster": rank,
+            "channel_handle": channel_handle,
+        }
+
+
+@pytest.fixture
+def fixture_caller_feature_provider():
+    """Factory for `FixtureCallerFeatureProvider`."""
+    return FixtureCallerFeatureProvider
+
+
 @pytest.fixture
 def settings_factory():
     def _make(**overrides):

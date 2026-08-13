@@ -165,7 +165,13 @@ async def _resolve_ca_via_dexscreener(
     pairs = data.get("pairs") or []
     if not pairs:
         return (_Outcome.NOT_FOUND, None)
-    best = max(pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")) or 0)
+    # `or {}` rather than a dict default: DexScreener sends `"liquidity": null`
+    # for some pairs, and `.get("liquidity", {})` returns that None and then
+    # raises AttributeError inside the key function, killing the whole
+    # resolution. The same expression now also feeds ResolvedToken below.
+    best = max(
+        pairs, key=lambda p: _safe_float((p.get("liquidity") or {}).get("usd")) or 0
+    )
     base = best.get("baseToken") or {}
     # Re-attribute chain from DexScreener's chainId. Defaults to parser's
     # original tag if the field is missing.
@@ -180,6 +186,11 @@ async def _resolve_ca_via_dexscreener(
             mcap=_safe_float(best.get("fdv")) or _safe_float(best.get("marketCap")),
             price_usd=_safe_float(best.get("priceUsd")),
             volume_24h_usd=_safe_float((best.get("volume") or {}).get("h24")),
+            # Already fetched — this is the very field the pair selection above
+            # sorts on. Forwarding it costs nothing and is what keeps the TG
+            # shadow's liquidity check from being structurally unanswerable for
+            # every DexScreener-resolved row.
+            liquidity_usd=_safe_float((best.get("liquidity") or {}).get("usd")),
             age_days=None,
         ),
     )

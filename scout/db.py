@@ -306,6 +306,23 @@ class Database:
             # measured, 0.0 means never dipped below entry while the SL was live.
             await self._migrate_pre_leg1_adverse_excursion_v1()
 
+            # TG actionability shadow (Stage A). schema_version 20260812.
+            # Additive: `tg_social_signals` gains `resolution_snapshot_json`
+            # plus two new tables (`tg_act_shadow`, `tg_act_shadow_generations`).
+            #
+            # Ordered after `_migrate_feedback_loop_schema`, which is what
+            # actually creates `tg_social_signals` (NOT `_create_tables`).
+            # The migration is nonetheless written to tolerate that table
+            # being absent — see its docstring.
+            #
+            # Deploy-dark by construction: the migration installs the tables,
+            # `TG_SHADOW_ENABLED=false` means no generation row is ever created,
+            # and the eligibility scan only ever sees rows whose created_at is
+            # at or after an activation that has not happened yet. Existing
+            # rows keep `resolution_snapshot_json = NULL`, which is the correct
+            # pre-cutover state, not a gap to backfill.
+            await self._migrate_tg_act_shadow_v1()
+
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
             # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -5942,6 +5959,177 @@ class Database:
                     "schema_migration_rollback_failed",
                     migration=migration_name,
                 )
+            raise
+
+    async def _migrate_tg_act_shadow_v1(self) -> None:
+        """TG shadow Stage A: durable decision inputs + counterfactual decisions.
+
+        Three additive changes, one transaction:
+
+        1. ``tg_social_signals.resolution_snapshot_json`` — nullable TEXT, the
+           canonical-JSON snapshot of the resolver facts that were true when
+           the signal was persisted. It is written in the SAME INSERT as the
+           row itself, so the table stays INSERT-only. This column is the ONLY
+           permitted recovery source for a historical decision input: catch-up
+           after a disabled window and crash-restart both reproduce the
+           original decision from it, and no external refetch may ever fill a
+           gap (that would decide a past call on today's facts).
+
+        2. ``tg_act_shadow`` — append-only, exactly one immutable decision per
+           ``(signal_id, gate_version)``, enforced by the UNIQUE index rather
+           than by writer discipline. Multiple rows per signal exist only
+           across distinct gate_versions; that is the mechanism for comparing
+           rule iterations, not an accident.
+
+        3. ``tg_act_shadow_generations`` — one row per gate_version, written
+           only on the first ENABLED startup with a real feature provider.
+           ``activated_at`` is therefore the activation boundary, never
+           install time: calls arriving between this dark deploy and operator
+           activation are outside every generation, so first activation starts
+           from zero eligible rows instead of a page storm.
+
+        Indexes are created inside this step (DDL-order lesson), not deferred.
+
+        Anti-scope: NO backfill of ``resolution_snapshot_json``. The resolver
+        facts of an already-persisted signal are unrecoverable, and generation
+        cutover guarantees the evaluated population post-dates the column.
+
+        Tolerates an absent ``tg_social_signals``: that table belongs to
+        :meth:`_migrate_feedback_loop_schema`, and a bootstrap in which that
+        step was skipped must not have its whole ``initialize()`` aborted by
+        this one. The column is added on the next startup instead (this
+        migration re-checks the PRAGMA every run rather than short-circuiting
+        on its ``paper_migrations`` marker).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "tg_act_shadow_v1"
+        schema_version = 20260812
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+
+            # 1. Additive nullable column, PRAGMA-guarded. No early return on
+            #    the paper_migrations marker: a partial state (column landed,
+            #    marker insert didn't) must still converge on re-run.
+            #
+            #    `tg_social_signals` is created by `_migrate_feedback_loop_schema`,
+            #    so on a bootstrap where that step was skipped or has not run
+            #    yet the table is simply absent. Skip rather than abort the
+            #    whole `initialize()`: because this migration re-checks the
+            #    PRAGMA on every run instead of short-circuiting on its
+            #    marker, the column lands on the next startup once the parent
+            #    table exists. Converging late beats failing the bootstrap.
+            cur_master = await conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='tg_social_signals'"
+            )
+            signals_table_exists = await cur_master.fetchone() is not None
+            cur_pragma = await conn.execute("PRAGMA table_info(tg_social_signals)")
+            signal_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if not signals_table_exists:
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col="resolution_snapshot_json",
+                    action="skip_no_table",
+                )
+            elif "resolution_snapshot_json" in signal_cols:
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col="resolution_snapshot_json",
+                    action="skip_exists",
+                )
+            else:
+                await conn.execute(
+                    "ALTER TABLE tg_social_signals "
+                    "ADD COLUMN resolution_snapshot_json TEXT"
+                )
+                _log.info(
+                    "schema_migration_column_action",
+                    migration=migration_name,
+                    col="resolution_snapshot_json",
+                    action="added",
+                )
+
+            # 2. Decision table. `actionable` is stored as INTEGER 0/1.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_act_shadow (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id      INTEGER NOT NULL,
+                    gate_version   TEXT NOT NULL,
+                    actionable     INTEGER NOT NULL,
+                    reason         TEXT NOT NULL,
+                    features_json  TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    UNIQUE(signal_id, gate_version),
+                    FOREIGN KEY (signal_id) REFERENCES tg_social_signals(id)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tg_act_shadow_gate_created "
+                "ON tg_act_shadow(gate_version, created_at)"
+            )
+
+            # 3. Activation registry.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS tg_act_shadow_generations (
+                    gate_version  TEXT PRIMARY KEY,
+                    activated_at  TEXT NOT NULL
+                )
+                """)
+
+            # Verify presence -- fail loud on drift rather than at first write.
+            # Only meaningful when the parent table exists; the skip_no_table
+            # branch above has nothing to verify.
+            cur_pragma = await conn.execute("PRAGMA table_info(tg_social_signals)")
+            post_cols = {row[1] for row in await cur_pragma.fetchall()}
+            if signals_table_exists and "resolution_snapshot_json" not in post_cols:
+                raise RuntimeError(
+                    f"{migration_name} schema missing column: "
+                    "tg_social_signals.resolution_snapshot_json"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "tg_act_shadow_v1_migration_complete",
+                table="tg_act_shadow",
+            )
+        except BaseException as e:
+            _log.exception(
+                "tg_act_shadow_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
     async def _migrate_entry_snapshot_liquidity_provenance_v1(self) -> None:

@@ -352,9 +352,9 @@ def _find_urllib_telegram_dispatches(tree: ast.AST) -> list[_UrllibTelegramDispa
 #        and is enforced by every CALL site (which the first AST arm checks).
 #        This is allowed by function name below instead of line number because
 #        instrumentation inside the helper can move the session.post line.
-#      scout/social/telegram/listener.py:123 — intentional plain-text
+#      scout/social/telegram/listener.py:124 — intentional plain-text
 #        Telegram dispatch (channel-listener auth flow). Payload at
-#        :120-121 builds {chat_id, text} with NO parse_mode field;
+#        :121-122 builds {chat_id, text} with NO parse_mode field;
 #        Telegram defaults to plain text. Per plan-review reviewer A:
 #        "SAFE by construction."
 # Follow-up PRs remove entries from this set; a NEW dispatch site that's
@@ -366,7 +366,7 @@ _ALLOWLIST_DISPATCH_SITES_WITHOUT_PARSE_MODE: set[tuple[str, int]] = {
     ("scout/main.py", 351),
     ("scout/main.py", 434),
     ("scout/main.py", 1537),
-    ("scout/social/telegram/listener.py", 123),
+    ("scout/social/telegram/listener.py", 124),
 }
 
 
