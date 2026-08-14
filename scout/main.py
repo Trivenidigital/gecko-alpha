@@ -2740,6 +2740,20 @@ async def main(argv: list[str] | None = None) -> int:
                     )
                 )
 
+            # TG actionability shadow (default OFF). Registers the Stage B
+            # caller-feature provider, arms the generation, and runs the
+            # catch-up scan. Spawned independently of TG_SOCIAL_ENABLED: a
+            # listener that is off or crashed still leaves already-RESOLVED
+            # signals for the scan to decide. The lane stays quarantined,
+            # `enabled=0`, `live_eligible=0`, `tg_alert_eligible=0` — nothing
+            # here touches any of those four controls.
+            if settings.TG_SHADOW_ENABLED:
+                from scout.social.telegram.shadow_runner import tg_shadow_loop
+
+                tasks.append(
+                    asyncio.create_task(tg_shadow_loop(db=db, settings=settings))
+                )
+
             # BL-055 live-subsystem loops (spec §10) — only spawned when a
             # LiveEngine was constructed above. Each loop is independently
             # cancellable; failures inside iterations are logged and swallowed.

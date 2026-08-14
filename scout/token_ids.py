@@ -12,6 +12,10 @@ heuristic lands here and flows to both the refresh lane and the gate.
 from __future__ import annotations
 
 
+# COUPLING: `scout/social/telegram/caller_features._is_cg_coin_id` is a
+# deliberate fingerprint-bound replica of this function — behavioral changes
+# here must be consciously mirrored there, and its drift test will fail until
+# they are (that failure also splits the TG shadow gate_version, by design).
 def is_cg_coin_id(token_id: str | None) -> bool:
     """Heuristic: skip obvious contract addresses; pass everything else.
 
