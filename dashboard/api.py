@@ -106,6 +106,83 @@ def _build_alert_outcome(row) -> dict:
     }
 
 
+# The signal_type the tg_social lane dispatches under. Must equal the value
+# `scout/social/telegram/dispatcher.py` writes to `paper_trades.signal_type`
+# and the entry `scout/config.py::SIGNAL_DISPATCH_QUARANTINE` blocks by;
+# `tests/test_dashboard_tg_signals.py` pins it against the config default.
+TG_SOCIAL_SIGNAL_TYPE = "tg_social"
+
+
+def _build_tg_lane_status(health: dict, shadow_state: dict) -> dict:
+    """Why the TG lane is or isn't acting, as facts rather than absences.
+
+    The deployed state is deliberately blocked on two independent controls,
+    and an operator surface that shows only their EFFECT (no trades, no shadow
+    rows) cannot distinguish "intentionally off" from "broken". So both are
+    reported as state:
+
+    ``trading.quarantined``
+        `tg_social` is in SIGNAL_DISPATCH_QUARANTINE, so paper-trade OPENS are
+        blocked at `TradingEngine.open_trade`. Detection, resolution, and
+        alerting are unaffected — which is exactly why an empty trade column
+        is the expected reading, not a fault.
+
+    ``shadow.state``
+        ``off`` (flag false — the deployed state), ``enabled_not_armed`` (flag
+        true but no generation: the evaluator refuses to arm without a
+        registered feature provider, and that refusal is invisible in row
+        counts), or ``collecting`` (a generation is armed and writing).
+
+    ``settings_loaded=False`` means the config could not be read at import;
+    the quarantine and shadow-flag fields are then ``None`` rather than a
+    guessed default, because guessing "not quarantined" here would render a
+    blocked lane as an open one.
+    """
+    settings = _DASHBOARD_SETTINGS
+    quarantined = None
+    shadow_enabled = None
+    listener_enabled = None
+    if settings is not None:
+        quarantined = TG_SOCIAL_SIGNAL_TYPE in (
+            settings.SIGNAL_DISPATCH_QUARANTINE or []
+        )
+        shadow_enabled = bool(settings.TG_SHADOW_ENABLED)
+        listener_enabled = bool(settings.TG_SOCIAL_ENABLED)
+
+    armed = bool(shadow_state.get("active_gate_version"))
+    if shadow_enabled is None:
+        shadow_lane_state = "unknown"
+    elif not shadow_enabled:
+        shadow_lane_state = "off"
+    elif not armed:
+        shadow_lane_state = "enabled_not_armed"
+    else:
+        shadow_lane_state = "collecting"
+
+    listener = health.get("listener") or {}
+    return {
+        "settings_loaded": settings is not None,
+        "listener": {
+            "enabled": listener_enabled,
+            "state": listener.get("state"),
+            "updated_at": listener.get("updated_at"),
+        },
+        "trading": {
+            "signal_type": TG_SOCIAL_SIGNAL_TYPE,
+            "quarantined": quarantined,
+        },
+        "shadow": {
+            "enabled": shadow_enabled,
+            "armed": armed,
+            "state": shadow_lane_state,
+            "active_gate_version": shadow_state.get("active_gate_version"),
+            "activated_at": shadow_state.get("active_generation_activated_at"),
+            "decisions_total": shadow_state.get("decisions_total", 0),
+            "table_present": shadow_state.get("shadow_table_present", False),
+        },
+    }
+
+
 def create_app(db_path: str | None = None) -> FastAPI:
     """Create the FastAPI application with the given DB path."""
     global _db_path
@@ -1929,9 +2006,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # are "inconsistent" — they use different windows by design.
         cashtag_stats = await db.get_tg_social_cashtag_stats_24h(_db_path)
 
+        # Lane status + funnel: the two blocks the Overview needs in order to
+        # state an INTENTIONAL block as intent ("trading disabled — quarantine
+        # active") instead of rendering a wall of empty trade columns. Both are
+        # additive keys; every pre-existing key above is unchanged.
+        funnel_24h = await db.get_tg_social_funnel_24h(_db_path)
+        shadow_state = await db.get_tg_social_shadow_state(_db_path)
+        lane_status = _build_tg_lane_status(health, shadow_state)
+
         return {
             "channels": channels,
             "health": health,
+            "lane_status": lane_status,
+            "funnel_24h": funnel_24h,
             "stats_24h": {
                 "messages": s[0] or 0,
                 "with_ca": s[1] or 0,
@@ -1947,6 +2034,25 @@ def create_app(db_path: str | None = None) -> FastAPI:
             # is the hard-coded fallback rather than operator-configured.
             "settings_loaded": _DASHBOARD_SETTINGS is not None,
         }
+
+    @app.get("/api/tg_social/signals")
+    async def get_tg_social_signals_endpoint(
+        limit: int = Query(80, ge=1, le=200),
+    ):
+        """Signal-centric TG surface: what was heard, resolved, and decided.
+
+        Distinct from ``/api/tg_social/alerts`` (message-centric, and the
+        source of channel/health/rollup data) and from
+        ``/api/tg_alerts/recent`` — which despite the similar name is the
+        OUTBOUND dispatch ledger for every signal lane, not the inbound TG
+        social feed. Conflating the two is what made the previous tab render
+        `detection_lane` rows as if they were Telegram callers.
+
+        Read-only visibility. It does not classify, rank, alert, or dispatch;
+        the shadow verdicts it returns were written by the evaluator, and
+        nothing here re-decides them.
+        """
+        return await db.get_tg_social_signals(_db_path, limit=limit)
 
     @app.get("/api/x_alerts")
     async def get_x_alerts(limit: int = Query(80, ge=1, le=500)):

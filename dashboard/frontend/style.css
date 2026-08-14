@@ -7,6 +7,13 @@
   --color-accent-green: #1D9E75;
   --color-accent-amber: #d29922;
   --color-accent-red: #f85149;
+  /* On-dark TEXT variant of the red accent. #f85149 as label text on the
+     15%-tint error badge measures 4.35:1 against its effective backdrop
+     (#382328) — under the 4.5:1 minimum, on the two highest-stakes labels
+     in the TG tab ("Link broken", "Safety ¹7"). This lighter value
+     measures 5.79:1 there. The base token is unchanged because it is used
+     for borders and fills, where the text minimum does not apply. */
+  --color-accent-red-fg: #ff7b72;
   --color-accent-blue: #58a6ff;
   --color-bar-bg: #21262d;
   --font: system-ui, -apple-system, sans-serif;
@@ -1539,4 +1546,488 @@ body {
 }
 @media (max-width: 600px) {
   .global-search { max-width: none; }
+}
+
+/* ---------------------------------------------------------------------------
+   TG signal intelligence tab.
+
+   Extends the existing .tg-* vocabulary rather than replacing it: .tg-table,
+   .tg-badge and its four tones are unchanged and still used by TGDLQPanel and
+   the dispatch ledger. Everything here is built from the :root design tokens,
+   so a future theme flips these along with the rest of the dashboard.
+   --------------------------------------------------------------------------- */
+
+/* Sub-tab row inside the TG tab. Visually subordinate to .tab-btn (the tab bar
+   above it) so the nesting is legible: pill, not underline. */
+.tg-subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tg-subtab-btn {
+  padding: 6px 14px;
+  background: var(--color-bar-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  color: var(--color-text-secondary);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tg-subtab-btn:hover {
+  color: var(--color-text-primary);
+}
+
+.tg-subtab-btn.active {
+  color: var(--color-text-primary);
+  border-color: var(--color-accent-blue);
+  background: rgba(88, 166, 255, 0.16);
+}
+
+.tg-subtab-btn:focus-visible,
+.tg-filter-btn:focus-visible,
+.tg-expand-btn:focus-visible,
+.tg-action-select:focus-visible,
+.tg-search:focus-visible {
+  outline: 2px solid var(--color-accent-blue);
+  outline-offset: 1px;
+}
+
+/* Status cards. auto-fit so six cards reflow to three, two, then one without a
+   breakpoint per count. */
+.tg-status-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.tg-status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  background: var(--color-bar-bg);
+}
+
+.tg-status-card.tone-ok { border-left-color: var(--color-accent-green); }
+.tg-status-card.tone-warn { border-left-color: var(--color-accent-amber); }
+.tg-status-card.tone-error { border-left-color: var(--color-accent-red); }
+.tg-status-card.tone-muted { border-left-color: var(--color-border); }
+.tg-status-card.tone-neutral { border-left-color: var(--color-accent-blue); }
+
+.tg-status-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+}
+
+.tg-status-value {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  line-height: 1.2;
+}
+
+.tg-status-detail {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+/* 24h funnel. Each stage carries its own count and a bar scaled to the widest
+   stage, so the shape of the drop is readable at a glance. */
+.tg-funnel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.tg-funnel-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tg-funnel-count {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.tg-funnel-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-secondary);
+}
+
+.tg-funnel-bar-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--color-border);
+  overflow: hidden;
+}
+
+.tg-funnel-bar {
+  height: 100%;
+  background: var(--color-accent-blue);
+  min-width: 2px;
+}
+
+/* Visible explanation under the funnel. The stage tooltips carry the same
+   copy, but a tooltip does not exist on a touch device — and the one stage
+   that needs explaining (the mid-funnel up-tick) is exactly the one a reader
+   would otherwise file as a bug. */
+.tg-funnel-note {
+  padding: 0 16px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+/* Panel-header annotations + inline warnings */
+.panel-header .tg-panel-note {
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  opacity: 0.85;
+}
+
+.panel-header .tg-header-btn {
+  float: right;
+}
+
+.tg-inline-warning {
+  margin: 0 16px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-accent-amber);
+  border-radius: 4px;
+  background: rgba(210, 153, 34, 0.12);
+  color: var(--color-text-primary);
+  font-size: 12px;
+}
+
+/* Filter chips + search */
+.tg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tg-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tg-filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-family: var(--font);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tg-filter-btn:hover {
+  color: var(--color-text-primary);
+}
+
+.tg-filter-btn.active {
+  color: var(--color-text-primary);
+  border-color: var(--color-accent-blue);
+  background: rgba(88, 166, 255, 0.14);
+}
+
+.tg-filter-count {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.75;
+}
+
+.tg-search {
+  flex: 1 1 220px;
+  max-width: 320px;
+  padding: 5px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font);
+  font-size: 12px;
+}
+
+/* Wide tables scroll inside their panel; the page itself never scrolls
+   sideways.
+
+   `min-width: 0` on the panels is what makes that true. `.tg-alerts` is a flex
+   column, and a flex item defaults to `min-width: auto` — meaning it refuses
+   to shrink below its content. Without this the panel grows to the signals
+   table's 940px min-width and the whole PAGE scrolls sideways on a phone,
+   with the overflow container never getting the chance to do its job.
+
+   `position: relative` on the scroll container is the second half. The
+   visually-hidden `.sr-only` labels inside these tables are absolutely
+   positioned; with no positioned ancestor their containing block is the
+   viewport, so `overflow-x: auto` does NOT clip them and they extend the
+   DOCUMENT's scroll width instead — the page scrolls sideways on a phone
+   because of a 1px span nobody can see. */
+.tg-alerts > .panel {
+  min-width: 0;
+}
+
+.tg-table-scroll {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.tg-signals-table {
+  min-width: 940px;
+}
+
+.tg-nowrap { white-space: nowrap; }
+.tg-col-narrow { width: 28px; }
+
+.tg-token-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tg-token-symbol {
+  font-weight: 600;
+}
+
+.tg-token-secondary {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.tg-subtext {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.tg-quality {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tg-actionability-cell {
+  max-width: 220px;
+}
+
+/* A row awaiting a human decision is tinted, not badged — the badge slots are
+   already carrying meaning and a seventh one would compete with them. */
+.tg-row-review td:first-child {
+  box-shadow: inset 2px 0 0 var(--color-accent-amber);
+}
+
+.tg-row-removed td {
+  opacity: 0.55;
+}
+
+.tg-inline-badge {
+  margin-left: 6px;
+}
+
+.tg-expand-btn {
+  background: transparent;
+  border: none;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 4px;
+}
+
+.tg-expand-btn:hover {
+  color: var(--color-text-primary);
+}
+
+/* Absent values look different from present ones. Never a bare blank: a blank
+   cell reads as zero. */
+.tg-absent {
+  color: var(--color-text-secondary);
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.tg-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.tg-dim {
+  color: var(--color-text-secondary);
+  opacity: 0.75;
+}
+
+.tg-link {
+  color: var(--color-accent-blue);
+  text-decoration: none;
+  margin-right: 8px;
+}
+
+.tg-link:hover { text-decoration: underline; }
+
+.tg-badge-error {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--color-accent-red-fg);
+}
+
+/* Compact per-row label control on the dispatch ledger. */
+.tg-label-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tg-action-select {
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bar-bg);
+  color: var(--color-text-primary);
+  font-family: var(--font);
+  font-size: 12px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+
+.tg-action-select:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+/* Inline drawer beneath an expanded signal row. */
+.tg-drawer-tr td {
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.tg-drawer-cell {
+  padding: 12px 16px;
+}
+
+.tg-drawer-message {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg-primary);
+}
+
+.tg-drawer-message-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  color: var(--color-text-primary);
+}
+
+.tg-drawer-message-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.tg-drawer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.tg-drawer-group {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--color-bg-secondary);
+}
+
+.tg-drawer-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+  margin-bottom: 6px;
+}
+
+.tg-drawer-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+
+.tg-drawer-label {
+  color: var(--color-text-secondary);
+  flex: 0 0 auto;
+}
+
+.tg-drawer-value {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.tg-drawer-note {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+@media (max-width: 700px) {
+  .tg-toolbar {
+    justify-content: flex-start;
+  }
+  .tg-search {
+    max-width: none;
+  }
+  .tg-drawer-row {
+    flex-direction: column;
+    gap: 0;
+  }
+  .tg-drawer-value {
+    text-align: left;
+  }
+
+  /* The drawer's cell spans a table whose min-width is 940px, so without
+     these two rules its content is laid out against 940px and a phone shows
+     roughly the first third of it — four of the six groups less than 10%
+     visible. `sticky`/`left: 0` pins the wrapper to the scroll origin so it
+     stays put while the ROW above it scrolls horizontally, and the width cap
+     re-flows the groups against the viewport instead of the table. 64px is
+     the two paddings between viewport and content: .dashboard 16px each side
+     plus .tg-drawer-cell 16px each side. */
+  .tg-drawer-inner {
+    position: sticky;
+    left: 0;
+    width: calc(100vw - 64px);
+    max-width: calc(100vw - 64px);
+  }
+
+  .tg-drawer-grid {
+    grid-template-columns: 1fr;
+  }
 }

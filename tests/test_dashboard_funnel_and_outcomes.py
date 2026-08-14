@@ -294,9 +294,19 @@ def test_pipeline_tab_wires_dispatch_funnel_panel():
 
 
 def test_tg_alerts_tab_renders_outcome_column():
-    jsx = _read_component("TGAlertsTab.jsx")
+    """DASH-06 outcome column, now owned by TGDispatchFeedbackPanel.
+
+    The TG tab redesign moved the dispatch ledger into its own sub-tab panel.
+    The contract is unchanged and slightly stronger: an alert with no paper
+    trade still carries an explicit tag rather than a blank, and the redesign
+    additionally splits the old single "unlinked" badge into the two facts it
+    was conflating — "no trade was expected" versus "the link is broken".
+    """
+    jsx = _read_component("TGDispatchFeedbackPanel.jsx")
     assert "OutcomeCell" in jsx
     assert "a.outcome" in jsx
-    assert "<th>Outcome</th>" in jsx
-    # unlinked rows carry an explicit tag, never blank
-    assert "unlinked" in jsx
+    assert 'scope="col">Outcome<' in jsx
+    # No-trade rows carry an explicit tag, never blank...
+    assert "No trade" in jsx
+    # ...and a dangling FK is no longer indistinguishable from one.
+    assert "Link broken" in jsx
