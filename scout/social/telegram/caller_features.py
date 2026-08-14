@@ -13,18 +13,23 @@ column is ever consumed as if it had existed historically.
 **The determinism invariant.** Recomputing `features()` for the same
 `(channel_handle, decision_as_of, current_signal_id)` at any later wall-clock
 time must return byte-identical values, however much the database has learned
-since. Two mechanisms make that true rather than hoped-for:
+since. Two mechanisms make that true rather than hoped-for — subject to one
+bounded exception, the marker-publish window documented under the price-bound
+residual below:
 
-* Every input row is admitted only under a double knowability bound — one
-  clause for when the fact HAPPENED, one for when we RECORDED it. A message
-  fact needs `posted_at <= as_of` AND `parsed_at <= as_of`; a signal fact
-  needs `created_at <= as_of`; a price observation needs `snapshot_at <=
-  as_of` AND `created_at <= as_of`. A call posted before the decision but
-  *ingested* after it was not knowable then and is excluded now — and the same
-  is true of a price stamped before the decision but recorded after it.
-  Prices earn the second clause for a concrete reason: the snapshot writer
-  stamps `snapshot_at` ONCE at cycle start and commits the whole cycle ONCE at
-  the end, so forward-only monotonicity does NOT imply committed-by-T.
+* Every input row is admitted only under a knowability bound — one clause for
+  when the fact HAPPENED, one for when we RECORDED it, and on prices a third
+  for when it became READABLE. A message fact needs `posted_at <= as_of` AND
+  `parsed_at <= as_of`; a signal fact needs `created_at <= as_of`; a price
+  observation needs `snapshot_at <= as_of` AND `created_at <= as_of` AND a
+  commit-visibility marker at or before `as_of`. A call posted before the
+  decision but *ingested* after it was not knowable then and is excluded now —
+  and the same is true of a price stamped before the decision but recorded, or
+  committed, after it. Prices earn the extra clauses for concrete reasons: the
+  snapshot writer stamps `snapshot_at` ONCE at cycle start and commits the
+  whole cycle ONCE at the end, so forward-only monotonicity does NOT imply
+  committed-by-T; and `created_at` is stamped at INSERT, not at COMMIT, so it
+  does not imply readable-by-T either.
 * Every horizon-bound statistic additionally requires its measurement window
   to have been eligible to close: a prior call contributes a forward return,
   or enters a coverage denominator, only once `posted_at + window_end <=
@@ -34,7 +39,7 @@ since. Two mechanisms make that true rather than hoped-for:
 Consequently a 10-minute-old call does not depress 30m coverage: it is not yet
 in that denominator at all, and it enters once its 45-minute window closes.
 
-**Residual on the price bound (known, deliberately not closed here).**
+**Residual on the price bound — the defect the third clause exists to close.**
 `source_call_price_snapshots.created_at` is stamped per row at INSERT, not at
 COMMIT. A row INSERTed before `as_of` but COMMITted after it therefore passes
 both clauses and is still admitted. The exposure is the per-row insert→commit
@@ -47,13 +52,31 @@ What the bound still buys: `snapshot_at` alone gave EVERY row in a cycle the
 same cycle-start stamp, so the exposure was full-cycle for all of them; adding
 `created_at` makes it decay across the cycle instead. Strictly better on every
 row, dramatically better on most, worst case unchanged.
-Full closure needs a commit-stamped visibility marker, which does not exist in
-the schema today. That is a deliberately DEFERRED SCHEMA decision, not an
-oversight, and not something this read-side module should manufacture. Such a
-marker is now being built in the substrate lane, and this module will adopt its
-exported visibility helper once both land (see the seam note on
-`_load_observations`). Until that adoption, the residual above is OPEN in this
-tree and this paragraph describes the shipped behaviour exactly.
+**RELOCATED — not closed — by the commit-visibility marker.** The paragraph
+above describes the defect and why a read-side module could not fix it alone; it
+is retained because the reasoning still explains WHY the third bound exists. The
+substrate now writes a durable post-commit marker per writer cycle, and this
+module admits a price row only once that marker is COMMITTED and stamped at or
+before `as_of`. That shrinks the exposure by orders of magnitude — from a whole
+writer cycle (minutes) to the marker's own insert→commit latency (one aiosqlite
+hop plus fsync, milliseconds; ~1e-5 of the decision timeline at 900s cycles) —
+but it does not eliminate it. The marker row has the SAME insert-before /
+commit-after shape as the data it publishes: `visible_at` is stamped in Python
+at the call site, before the publishing transaction commits. Any marker value
+must be computed before its own transaction commits, so this residual is a
+property of the approach under SQLite primitives, not a defect in this
+implementation.
+
+**What the window does and does not break.** It never leaks the future: inside
+it the live read sees FEWER rows, not more, so a decision made then is
+conservative and no unknowable price can reach it. What it breaks is
+REPRODUCIBILITY — replaying the same `as_of` after the marker commits can admit
+rows the live read did not see, which is the one place the determinism invariant
+above is qualified rather than absolute. The bound is applied through
+`VISIBLE_AS_OF_SQL`, the helper exported by the substrate module, so "knowable"
+has ONE implementation shared with the source-quality ledger rather than a copy
+here. Rows predating the marker era are governed by a documented epoch rule and
+are not stranded. See `_load_observations`.
 
 **Unresolved rows are funnel facts, not behaviour facts.** When resolution
 fails, the listener writes a `(unresolved)` placeholder into `token_id` and
@@ -107,6 +130,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import structlog
+
+from scout.source_quality.snapshot_writer import VISIBLE_AS_OF_SQL
 
 log = structlog.get_logger()
 
@@ -646,7 +671,7 @@ class TgCallerFeatureProvider:
         # the rows are hidden from behaviour metrics, never deleted.
         identified = [c for c in history if c.has_genuine_identity]
 
-        observations = self._load_observations(conn, identified, as_of)
+        observations = self._load_observations(conn, identified, as_of=as_of)
         clusters = self._build_clusters(identified)
         outcomes = {
             cluster.signal_id: compute_call_outcome(
@@ -703,12 +728,16 @@ class TgCallerFeatureProvider:
         return calls
 
     def _load_observations(
-        self, conn: sqlite3.Connection, calls: Sequence[_Call], as_of: datetime
+        self,
+        conn: sqlite3.Connection,
+        calls: Sequence[_Call],
+        *,
+        as_of: datetime,
     ) -> dict[tuple[str | None, str | None], list[_Observation]]:
-        """Price observations per snapshot identity, under a DOUBLE bound.
+        """Price observations per snapshot identity, under a TRIPLE bound.
 
         A row is admitted only when `snapshot_at <= as_of` AND
-        `created_at <= as_of`.
+        `created_at <= as_of` AND its batch is COMMIT-VISIBLE at `as_of`.
 
         An earlier version of this docstring claimed `snapshot_at` alone was
         sufficient "because the writer is verified forward-only". That claim
@@ -724,17 +753,58 @@ class TgCallerFeatureProvider:
         COMMIT-stamped, so this is a much tighter bound rather than a closed
         one.
 
-        SEAM (incoming, do NOT depend on it yet) — commit-visibility marker.
-        A marker mechanism is being built in the substrate lane to close that
-        residual. Post-merge contract: as-of reads of
-        `source_call_price_snapshots` go through an EXPORTED visibility helper
-        owned by the substrate module, so "knowable" has ONE implementation —
-        `snapshot_at <= as_of` AND `created_at <= as_of` AND the post-commit
-        marker timestamp `<= as_of`, with a documented epoch rule so rows
-        predating the marker era are not stranded. This module adopts that
-        helper only AFTER both PRs merge; until then the two clauses below are
-        the whole bound and the Residual stands as written.
+        SEAM ADOPTED — commit-visibility marker (was: "do NOT depend on it yet").
+        The residual described above is RELOCATED, not closed: from a full
+        writer cycle down to the marker's own insert→commit latency, which
+        cannot be driven to zero because any marker value is computed before
+        its publishing transaction commits (see the module docstring). This
+        read goes through `VISIBLE_AS_OF_SQL`, the visibility helper exported
+        by the substrate module, so "knowable" has ONE implementation shared
+        with the ledger: a row counts only once the post-commit marker for its
+        batch is committed and stamped at or before `as_of`, with a documented
+        epoch rule so rows predating the marker era are not stranded.
+
+        The bound is therefore TRIPLE, and each clause does distinct work:
+          snapshot_at <= as_of   what had been OBSERVED by then
+          created_at  <= as_of   what had been RECORDED by then. Retained, not
+                                 replaced: the marker branch implies it (a
+                                 marker is published after the insert), but the
+                                 EPOCH branch does not — a pre-epoch row can
+                                 carry a `created_at` later than an early
+                                 `as_of`, and without this clause it would be
+                                 admitted.
+          VISIBLE_AS_OF_SQL      what had been PUBLISHED by then — a committed
+                                 marker stamped at or before `as_of`. This is
+                                 the bound INSERT-stamping could never express,
+                                 and it is tight to the marker's own commit
+                                 latency rather than exact.
+
+        WHY THE FIRST TWO STAY IN PYTHON rather than moving into the SQL beside
+        the helper: `created_at` is written by SQLite `datetime('now')`
+        (space-separated) while `as_of` here is a Python `.isoformat()`
+        ('T'-separated), and SQLite compares them as TEXT where ' ' (0x20) sorts
+        before 'T' (0x54). A SQL-side `created_at <= :as_of` would therefore read
+        every same-day row as EARLIER than it is and admit rows it must exclude —
+        the same INF-04 mismatch that made the substrate's epoch bound leak in
+        review. Compared here as parsed datetimes, both shapes are handled
+        correctly, and `parse_utc` returning None also screens unparseable
+        stamps. The helper's own comparisons are producer-matched by
+        construction (marker vs as_of both isoformat; created_at vs epoch both
+        SQLite).
+
+        `as_of` is KEYWORD-ONLY on both sides of the boundary — the Python
+        signature and the SQL binding. B-1 was a positional argument that
+        silently bound `identity_kind`, leaving a fully-correct gate inert in
+        production while every test passed. A keyword-only parameter makes the
+        Python half of that class a TypeError at the call site rather than a
+        silent mis-bind, which is why the two extra call-site keywords are
+        worth their noise.
         """
+        # Bound for the helper's marker comparison. isoformat() deliberately:
+        # `visible_at` is written by the writer with the same producer, so the
+        # two sides of that TEXT comparison match by construction.
+        as_of_iso = as_of.isoformat()
+
         by_kind: dict[str, set[str]] = {}
         for call in calls:
             if call.snapshot_kind and call.snapshot_key:
@@ -745,21 +815,34 @@ class TgCallerFeatureProvider:
             ordered = sorted(keys)
             for start in range(0, len(ordered), _IN_CLAUSE_CHUNK):
                 chunk = ordered[start : start + _IN_CLAUSE_CHUNK]
-                placeholders = ",".join("?" * len(chunk))
+                # NAMED params throughout. `VISIBLE_AS_OF_SQL` binds `:as_of`,
+                # and sqlite3 forbids mixing qmark and named styles — but the
+                # deeper reason is B-1: that defect was a positional argument
+                # silently binding the wrong parameter, and it left the gate
+                # inert in production while every test passed. Named binding
+                # makes the same class impossible to reintroduce here.
+                key_names = [f"k{i}" for i in range(len(chunk))]
+                placeholders = ",".join(f":{n}" for n in key_names)
+                params: dict[str, object] = {"kind": kind, "as_of": as_of_iso}
+                params.update(dict(zip(key_names, chunk)))
                 cur = conn.execute(
-                    f"""SELECT id, identity_key, price, snapshot_at, created_at
-                          FROM source_call_price_snapshots
-                         WHERE identity_kind = ?
-                           AND identity_key IN ({placeholders})
-                           AND price IS NOT NULL""",
-                    (kind, *chunk),
+                    f"""SELECT s.id, s.identity_key, s.price, s.snapshot_at,
+                               s.created_at
+                          FROM source_call_price_snapshots s
+                         WHERE s.identity_kind = :kind
+                           AND s.identity_key IN ({placeholders})
+                           AND s.price IS NOT NULL
+                           AND {VISIBLE_AS_OF_SQL}""",
+                    params,
                 )
                 for row in cur.fetchall():
                     snapshot_at = parse_utc(row["snapshot_at"])
                     created_at = parse_utc(row["created_at"])
                     if snapshot_at is None or snapshot_at > as_of:
                         continue
-                    # DOUBLE BOUND on price facts, for the same reason message
+                    # Two of the three bounds; the third (commit visibility)
+                    # is applied in the SQL above via VISIBLE_AS_OF_SQL.
+                    # BOUND on price facts, for the same reason message
                     # facts have one. `snapshot_at` is stamped ONCE at cycle
                     # start and the whole cycle commits ONCE at the end, so a
                     # row can carry a timestamp before `as_of` and only become

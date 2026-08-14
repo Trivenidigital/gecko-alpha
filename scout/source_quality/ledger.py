@@ -214,7 +214,9 @@ def _status_from_missing(
 async def _fetch_snapshot_rows(
     conn: aiosqlite.Connection,
     identity_key: str,
+    *,
     identity_kind: str = "token_id",
+    as_of: str | None = None,
 ) -> list[dict[str, Any]]:
     """Price series for a priceable identity, ascending by snapshot_at.
 
@@ -222,6 +224,25 @@ async def _fetch_snapshot_rows(
       coin_id — behavior UNCHANGED.
     - ``contract``: the C2 forward-only ``source_call_price_snapshots`` keyed by
       ``(identity_kind, identity_key)`` (design #392 C3).
+
+    ``as_of`` applies the COMMIT-VISIBILITY gate to the snapshots table: a row
+    counts only once its batch's post-commit marker exists at or before
+    ``as_of``. Without it, a row inserted before ``as_of`` but committed after it
+    still satisfies the ordinary bounds — it was never actually knowable. Pass
+    ``None`` (the default) for a non-as-of read; the predicate is then skipped
+    and every committed row is returned, which is what a coverage reader wants.
+
+    This is a LIVE-LEDGER behaviour change, and deliberately a conservative one:
+    a late-visible row is simply picked up on the next outcome refresh, and the
+    maturity states already absorb that lag.
+
+    ``identity_kind`` and ``as_of`` are KEYWORD-ONLY. Both previously sat in
+    positional slots behind defaults, and that is exactly how the gate came to
+    be inert in production: a call passing ``"contract"`` as the third
+    positional bound ``identity_kind`` and left ``as_of`` at ``None``, so the
+    visibility predicate was skipped entirely while every test still passed.
+    Fixing the call site alone left the shape that permits it; the ``*`` makes
+    the mis-bind a TypeError at the call site instead.
     """
     rows: list[dict[str, Any]] = []
     if identity_kind == "token_id":
@@ -243,11 +264,18 @@ async def _fetch_snapshot_rows(
                     }
                 )
     else:
-        cur = await conn.execute(
-            "SELECT price, snapshot_at, source FROM source_call_price_snapshots "
-            "WHERE identity_kind = ? AND identity_key = ? AND price IS NOT NULL",
-            (identity_kind, identity_key),
+        from scout.source_quality.snapshot_writer import VISIBLE_AS_OF_SQL
+
+        sql = (
+            "SELECT price, snapshot_at, source FROM source_call_price_snapshots s "
+            "WHERE s.identity_kind = :kind AND s.identity_key = :key "
+            "  AND s.price IS NOT NULL"
         )
+        params: dict[str, Any] = {"kind": identity_kind, "key": identity_key}
+        if as_of is not None:
+            sql += f" AND {VISIBLE_AS_OF_SQL}"
+            params["as_of"] = as_of
+        cur = await conn.execute(sql, params)
         for row in await cur.fetchall():
             snapshot_at = parse_utc(row["snapshot_at"])
             if snapshot_at is None:
@@ -664,7 +692,19 @@ async def refresh_source_call_outcomes(
             updated += 1
         else:  # contract — price from C2 forward-only snapshots (design #392 C3)
             await _set_resolved_state(conn, row["id"], RESOLVED_STATE_CONTRACT)
-            price_rows = await _fetch_snapshot_rows(conn, key, "contract")
+            # KEYWORD ARGS DELIBERATELY. This call previously passed "contract"
+            # as the third POSITIONAL, which binds `identity_kind` and left
+            # `as_of` at its None default — so the commit-visibility gate never
+            # ran in production at all, and this lane priced calls from rows in
+            # a stamped-but-unpublished batch. The callee's parameters are now
+            # keyword-only, so the mis-bind is a TypeError rather than a
+            # convention this call site has to remember.
+            price_rows = await _fetch_snapshot_rows(
+                conn,
+                key,
+                identity_kind="contract",
+                as_of=now_dt.isoformat(),
+            )
             outcome = _compute_outcome(
                 call_ts=call_ts, now=now_dt, price_rows=price_rows
             )

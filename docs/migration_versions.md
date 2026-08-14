@@ -73,6 +73,7 @@ number to appear in the table below.
 | 20260803 | bl_trade_adverse_excursion_v1 | #505 |
 | 20260808 | bl_pre_leg1_adverse_excursion_v1 | #516 |
 | 20260812 | tg_act_shadow_v1 | TG shadow Stage A (PR1) |
+| 20260813 | source_call_snapshot_batches_v1 | B1-residual commit visibility |
 
 ## Notes / gaps
 
