@@ -10,6 +10,17 @@ import aiosqlite
 import structlog
 
 from scout.timeutil import sql_utc_cutoff
+from scout.token_ids import is_cg_coin_id
+
+# Must equal `scout.social.telegram.shadow.SHADOW_ACTIVE_GENERATION_COMPONENT`
+# and `.ACTIVE_GENERATION_DETAIL_PREFIX`. Kept as local literals rather than
+# imports — that module pulls `scout.db` and `scout.config` at import time, and
+# the read-only dashboard query layer stays off the migration machinery. Same
+# posture as `scripts/check_tg_shadow_lag.py`; the same class of pin test
+# (`tests/test_dashboard_tg_signals.py`) holds them together, because a drifted
+# component name reads as "nothing is armed" forever rather than failing.
+TG_SHADOW_ACTIVE_GENERATION_COMPONENT = "tg_shadow_active_generation"
+TG_SHADOW_ACTIVE_GENERATION_DETAIL_PREFIX = "gate_version="
 
 KNOWN_SIGNALS = [
     "vol_liq_ratio",
@@ -4749,6 +4760,451 @@ async def get_tg_social_per_channel_cashtag_today(db_path: str) -> dict[str, int
                 count=unknown_count,
             )
         return result
+
+
+# ---------------------------------------------------------------------------
+# TG signal intelligence surface (signal-centric)
+#
+# `get_tg_social_alerts` (in dashboard/api.py) is MESSAGE-centric: it lists
+# tg_social_messages LEFT JOINed to their signal, so its LIMIT counts messages
+# and a message that resolved to nothing occupies a slot. The signals surface
+# needs the other direction — one row per tg_social_signals row, carrying the
+# decision inputs (`resolution_snapshot_json`) and the counterfactual decision
+# (`tg_act_shadow`) that the message-centric query never selects. Neither is
+# derivable from the existing response, which is why this is its own query
+# rather than extra keys on that one.
+# ---------------------------------------------------------------------------
+
+# The token_id/symbol the listener writes when resolution failed. MUST equal
+# the literal in `scout/social/telegram/listener.py::_persist_signal_row`
+# call on the unresolved path; `tests/test_dashboard_tg_signals.py` pins the
+# two together. Kept local rather than imported because that module pulls
+# telethon at import time, which is not installable on every dashboard host.
+TG_UNRESOLVED_PLACEHOLDER = "(unresolved)"
+
+
+def _tg_identity_kind(token_id: str | None, contract_address: str | None) -> str:
+    """Which listener path produced this row, inferred from identity SHAPE.
+
+    There is no stored provenance column — the listener records the resolved
+    identity, not the route that resolved it. Each shape below maps to exactly
+    one branch of `scout/social/telegram/listener.py`, so the inference is
+    total over rows that module can write:
+
+    ``dex_pseudo_id``
+        Resolved-by-CA path where the resolver minted a DexScreener
+        ``dex:{chain}:{address}`` pseudo-id (no CoinGecko coin exists).
+    ``cg_coin_with_contract``
+        Resolved-by-CA path that matched a real CoinGecko coin.
+    ``cg_coin_cashtag_only``
+        Cashtag-candidate path, which persists ``contract_address=None`` —
+        the only path that pairs a real token_id with a missing CA.
+    ``unresolved``
+        Unresolved path (placeholder token_id, no decision inputs captured).
+
+    Anything else returns ``unknown`` rather than being forced into a class:
+    a shape this function has never seen is a fact about the writer worth
+    surfacing, not a row to mislabel.
+    """
+    tid = (token_id or "").strip()
+    ca = (contract_address or "").strip()
+    if not tid or tid == TG_UNRESOLVED_PLACEHOLDER:
+        return "unresolved"
+    if tid.startswith("dex:"):
+        return "dex_pseudo_id"
+    if is_cg_coin_id(tid):
+        return "cg_coin_with_contract" if ca else "cg_coin_cashtag_only"
+    return "unknown"
+
+
+def _tg_priceable(token_id: str | None, contract_address: str | None) -> bool:
+    """Whether this signal carries an identity that CAN be priced.
+
+    Same predicate as `scout/source_quality/ledger.py::_priceable_identity`
+    (a real CoinGecko coin id, or any contract address) expressed over the
+    tg_social_signals column names. Deliberately NOT "did we get a price" —
+    a priceable identity whose price lookup failed is a coverage problem,
+    and collapsing the two would hide it.
+    """
+    tid = (token_id or "").strip()
+    if tid and tid != TG_UNRESOLVED_PLACEHOLDER and is_cg_coin_id(tid):
+        return True
+    return bool((contract_address or "").strip())
+
+
+async def _tg_shadow_tables_present(conn) -> dict[str, bool]:
+    """Which Stage A shadow objects this DB actually has.
+
+    Probed once per request instead of catching OperationalError around a
+    second copy of the main query: a dashboard pointed at a pre-`tg_act_shadow`
+    snapshot (rollback, or a fresh bootstrap whose migration has not run) must
+    render "not captured", never a 500 and never a duplicated SELECT that can
+    drift from the primary one.
+    """
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+        "('tg_act_shadow', 'tg_act_shadow_generations')"
+    )
+    tables = {r[0] for r in await cur.fetchall()}
+    cur = await conn.execute("PRAGMA table_info(tg_social_signals)")
+    cols = {r[1] for r in await cur.fetchall()}
+    return {
+        "shadow": "tg_act_shadow" in tables,
+        "generations": "tg_act_shadow_generations" in tables,
+        "snapshot_column": "resolution_snapshot_json" in cols,
+    }
+
+
+def _tg_trade_link(paper_trade_id, trade_status) -> dict:
+    """Three DISTINCT relationship states, never collapsed into one badge.
+
+    ``none``     no paper trade — expected while the lane is quarantined.
+    ``linked``   FK set and the paper_trades row is present.
+    ``missing``  FK set but the row is absent. A relationship that SHOULD
+                 exist and does not is an integrity error, and rendering it
+                 the same as "no trade" is how such an error stays invisible.
+    """
+    if paper_trade_id is None:
+        return {"state": "none", "paper_trade_id": None}
+    if trade_status is None:
+        return {"state": "missing", "paper_trade_id": paper_trade_id}
+    return {"state": "linked", "paper_trade_id": paper_trade_id}
+
+
+async def get_tg_social_signals(db_path: str, limit: int = 80) -> dict:
+    """Recent tg_social_signals rows with decision inputs and shadow verdict.
+
+    One row per SIGNAL (see module comment above for why this is not the
+    message-centric endpoint). Every semantic field is derived from persisted
+    state; absent state is reported as absent:
+
+    * ``snapshot`` — parsed ``resolution_snapshot_json``, or ``None`` when the
+      row predates the Stage A column or the path captured nothing. Nothing is
+      refetched to fill a gap: that would describe a past call with today's
+      facts.
+    * ``shadow`` — the most recent ``tg_act_shadow`` decision for the signal
+      across gate_versions, or ``None`` when the shadow has never evaluated it.
+      The row carries its own ``gate_version`` so a decision is never read as
+      belonging to the current generation when it came from a retired one.
+    * ``counts`` — computed over the SAME returned window as ``signals``, so a
+      filter chip's number and the rows behind it can never disagree.
+    """
+    async with _ro_db(db_path) as conn:
+        present = await _tg_shadow_tables_present(conn)
+        snapshot_expr = (
+            "s.resolution_snapshot_json" if present["snapshot_column"] else "NULL"
+        )
+        if present["shadow"]:
+            shadow_select = (
+                "a.actionable AS sh_actionable, a.reason AS sh_reason, "
+                "a.gate_version AS sh_gate_version, "
+                "a.created_at AS sh_created_at, a.features_json AS sh_features_json"
+            )
+            # Latest decision across gate_versions. A signal legitimately
+            # carries one row per generation; showing the newest is what makes
+            # "what would today's rules say" answerable without hiding that an
+            # older generation decided differently (its gate_version is
+            # returned alongside).
+            shadow_join = (
+                "LEFT JOIN tg_act_shadow a ON a.id = ("
+                "  SELECT a2.id FROM tg_act_shadow a2 "
+                "   WHERE a2.signal_id = s.id "
+                "   ORDER BY a2.created_at DESC, a2.id DESC LIMIT 1)"
+            )
+        else:
+            shadow_select = (
+                "NULL AS sh_actionable, NULL AS sh_reason, "
+                "NULL AS sh_gate_version, NULL AS sh_created_at, "
+                "NULL AS sh_features_json"
+            )
+            shadow_join = ""
+
+        cur = await conn.execute(
+            f"""SELECT s.id, s.token_id, s.symbol, s.contract_address, s.chain,
+                       s.mcap_at_sighting, s.resolution_state,
+                       s.source_channel_handle, s.alert_sent_at,
+                       s.paper_trade_id, s.created_at,
+                       {snapshot_expr} AS snapshot_json,
+                       m.msg_id, m.posted_at, m.sender, m.text,
+                       m.cashtags, m.contracts, m.urls,
+                       {shadow_select},
+                       p.status AS pt_status, p.pnl_usd AS pt_pnl_usd,
+                       p.pnl_pct AS pt_pnl_pct, p.exit_reason AS pt_exit_reason,
+                       p.peak_pct AS pt_peak_pct
+                  FROM tg_social_signals s
+                  LEFT JOIN tg_social_messages m ON m.id = s.message_pk
+                  {shadow_join}
+                  LEFT JOIN paper_trades p ON p.id = s.paper_trade_id
+                 ORDER BY s.created_at DESC, s.id DESC
+                 LIMIT ?""",
+            (max(1, min(limit, 200)),),
+        )
+        rows = await cur.fetchall()
+
+    signals = []
+    counts = {
+        "total": 0,
+        "resolved": 0,
+        "unresolved": 0,
+        "priceable": 0,
+        "needs_review": 0,
+        "shadow_pass": 0,
+    }
+    for r in rows:
+        resolution_state = r["resolution_state"]
+        resolved = resolution_state == "RESOLVED"
+        priceable = _tg_priceable(r["token_id"], r["contract_address"])
+        snapshot = _parse_json_object(r["snapshot_json"])
+        shadow = None
+        if r["sh_reason"] is not None:
+            shadow = {
+                "actionable": bool(r["sh_actionable"]),
+                "reason": r["sh_reason"],
+                "gate_version": r["sh_gate_version"],
+                "created_at": r["sh_created_at"],
+                "features": (_parse_json_object(r["sh_features_json"]) or {}).get(
+                    "features"
+                ),
+            }
+        trade_link = _tg_trade_link(r["paper_trade_id"], r["pt_status"])
+        if trade_link["state"] == "linked":
+            trade_link.update(
+                {
+                    "status": r["pt_status"],
+                    "pnl_usd": r["pt_pnl_usd"],
+                    "pnl_pct": r["pt_pnl_pct"],
+                    "exit_reason": r["pt_exit_reason"],
+                    "peak_pct": r["pt_peak_pct"],
+                }
+            )
+        # "Needs review" is the operator's triage bucket: something that WAS
+        # resolved but cannot be acted on or measured — an unpriceable
+        # identity, a safety check that never completed, or a dangling trade
+        # link. Unresolved rows are excluded: they are a resolver outcome, not
+        # a row awaiting a human.
+        needs_review = bool(
+            resolved
+            and (
+                not priceable
+                or trade_link["state"] == "missing"
+                or (snapshot is not None and not snapshot.get("safety_check_completed"))
+            )
+        )
+        signals.append(
+            {
+                "signal_id": r["id"],
+                "created_at": r["created_at"],
+                "channel_handle": r["source_channel_handle"],
+                "sender": r["sender"],
+                "token_id": r["token_id"],
+                "symbol": r["symbol"],
+                "contract_address": r["contract_address"],
+                "chain": r["chain"],
+                "mcap_at_sighting": r["mcap_at_sighting"],
+                "resolution_state": resolution_state,
+                "identity_kind": _tg_identity_kind(
+                    r["token_id"], r["contract_address"]
+                ),
+                "priceable": priceable,
+                "needs_review": needs_review,
+                "alert_sent_at": r["alert_sent_at"],
+                "snapshot": snapshot,
+                "shadow": shadow,
+                "trade_link": trade_link,
+                "message": {
+                    "msg_id": r["msg_id"],
+                    "posted_at": r["posted_at"],
+                    "text": r["text"] or "",
+                    "cashtags": r["cashtags"],
+                    "contracts": r["contracts"],
+                    "urls": r["urls"],
+                },
+            }
+        )
+        counts["total"] += 1
+        counts["resolved"] += 1 if resolved else 0
+        counts["unresolved"] += 0 if resolved else 1
+        counts["priceable"] += 1 if priceable else 0
+        counts["needs_review"] += 1 if needs_review else 0
+        counts["shadow_pass"] += 1 if shadow and shadow["actionable"] else 0
+
+    return {
+        "signals": signals,
+        "counts": counts,
+        # What the DB could actually answer. A frontend that renders "no
+        # shadow decisions" must be able to tell "the evaluator ran and passed
+        # nothing" apart from "this database has no shadow table at all".
+        "capabilities": {
+            "shadow_table_present": present["shadow"],
+            "snapshot_column_present": present["snapshot_column"],
+        },
+    }
+
+
+def _parse_json_object(text) -> dict | None:
+    """Parse a persisted JSON object column, or None if it isn't one.
+
+    Mirrors `scout/social/telegram/snapshot.py::parse_resolution_snapshot`:
+    missing, blank, malformed, and non-object all collapse to None so the
+    caller renders honest absence instead of a partial object.
+    """
+    if not text or not str(text).strip():
+        return None
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def get_tg_social_shadow_state(db_path: str) -> dict:
+    """Which shadow generation (if any) is actually producing evidence.
+
+    Reads the writer's own published marker rather than inferring from
+    registry chronology. Re-enable semantics resume an EXISTING gate_version
+    without rewriting its registry row, so after v1 -> v2 -> (operator returns
+    to the v1 configuration) the newest ``activated_at`` is v2 while the writer
+    runs v1. Picking the latest registry row would name the wrong generation.
+
+    Returns ``active_gate_version=None`` when nothing is armed — which is the
+    deployed state while `TG_SHADOW_ENABLED` is false, and must read as an
+    intentional OFF rather than as a missing value.
+    """
+    async with _ro_db(db_path) as conn:
+        present = await _tg_shadow_tables_present(conn)
+        cur = await conn.execute(
+            "SELECT detail, updated_at FROM tg_social_health WHERE component = ?",
+            (TG_SHADOW_ACTIVE_GENERATION_COMPONENT,),
+        )
+        marker = await cur.fetchone()
+        active_gate_version = None
+        if marker is not None and marker["detail"]:
+            detail = str(marker["detail"])
+            if detail.startswith(TG_SHADOW_ACTIVE_GENERATION_DETAIL_PREFIX):
+                active_gate_version = detail[
+                    len(TG_SHADOW_ACTIVE_GENERATION_DETAIL_PREFIX) :
+                ].strip()
+
+        generations = []
+        if present["generations"]:
+            cur = await conn.execute(
+                "SELECT gate_version, activated_at FROM tg_act_shadow_generations "
+                "ORDER BY activated_at DESC"
+            )
+            generations = [
+                {"gate_version": g[0], "activated_at": g[1]}
+                for g in await cur.fetchall()
+            ]
+
+        decisions_total = 0
+        if present["shadow"]:
+            cur = await conn.execute("SELECT COUNT(*) FROM tg_act_shadow")
+            decisions_total = (await cur.fetchone())[0]
+
+    activated_at = next(
+        (
+            g["activated_at"]
+            for g in generations
+            if g["gate_version"] == active_gate_version
+        ),
+        None,
+    )
+    return {
+        "active_gate_version": active_gate_version,
+        "active_generation_activated_at": activated_at,
+        "active_generation_marker_at": (
+            marker["updated_at"] if marker is not None else None
+        ),
+        "generations": generations,
+        "decisions_total": decisions_total,
+        "shadow_table_present": present["shadow"],
+    }
+
+
+async def get_tg_social_funnel_24h(db_path: str) -> dict:
+    """Messages -> parsed -> signals -> resolved -> priceable -> shadow -> trade.
+
+    Every stage is a count over persisted rows in the last 24 hours, and each
+    is defined against the writer that produces it:
+
+    * ``messages`` / ``parsed`` — tg_social_messages; parsed means the parser
+      extracted at least one cashtag or contract, i.e. there was something for
+      the resolver to work with.
+    * ``signals`` / ``resolved`` — tg_social_signals rows the resolver wrote,
+      and the subset that reached RESOLVED.
+    * ``priceable`` — resolved rows whose identity can be priced, using the
+      same predicate as the source-quality ledger (see `_tg_priceable`).
+    * ``shadow_eligible`` — resolved rows at or after the ACTIVE generation's
+      activation boundary. Zero with ``shadow_armed=False`` means "no
+      generation is running", which is a different fact from "the generation
+      ran and found nothing eligible"; the flag keeps them distinguishable.
+    * ``shadow_pass`` / ``paper_traded`` — decisions and trade links actually
+      recorded in the window.
+    """
+    cutoff = sql_utc_cutoff(hours=24)
+    shadow_state = await get_tg_social_shadow_state(db_path)
+    active_gate_version = shadow_state["active_gate_version"]
+    activated_at = shadow_state["active_generation_activated_at"]
+
+    async with _ro_db(db_path) as conn:
+        cur = await conn.execute(
+            """SELECT COUNT(*) AS messages,
+                      SUM(CASE WHEN COALESCE(cashtags,'') NOT IN ('','[]')
+                                 OR COALESCE(contracts,'') NOT IN ('','[]')
+                               THEN 1 ELSE 0 END) AS parsed
+                 FROM tg_social_messages
+                WHERE posted_at >= ?""",
+            (cutoff,),
+        )
+        msg_row = await cur.fetchone()
+
+        cur = await conn.execute(
+            """SELECT token_id, contract_address, resolution_state,
+                      paper_trade_id, created_at
+                 FROM tg_social_signals
+                WHERE created_at >= ?""",
+            (cutoff,),
+        )
+        signal_rows = await cur.fetchall()
+
+        shadow_pass = 0
+        if shadow_state["shadow_table_present"] and active_gate_version:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM tg_act_shadow "
+                "WHERE gate_version = ? AND actionable = 1 AND created_at >= ?",
+                (active_gate_version, cutoff),
+            )
+            shadow_pass = (await cur.fetchone())[0]
+
+    resolved = [r for r in signal_rows if r["resolution_state"] == "RESOLVED"]
+    priceable = [
+        r for r in resolved if _tg_priceable(r["token_id"], r["contract_address"])
+    ]
+    # The activation boundary is a lexicographic compare between two values
+    # both produced by `datetime.now(timezone.utc).isoformat()`, matching
+    # `scout/social/telegram/shadow.py::maybe_evaluate_signal`.
+    shadow_eligible = (
+        len([r for r in resolved if str(r["created_at"]) >= activated_at])
+        if activated_at
+        else 0
+    )
+    return {
+        "window_hours": 24,
+        "stages": {
+            "messages": (msg_row["messages"] if msg_row else 0) or 0,
+            "parsed": (msg_row["parsed"] if msg_row else 0) or 0,
+            "signals": len(signal_rows),
+            "resolved": len(resolved),
+            "priceable": len(priceable),
+            "shadow_eligible": shadow_eligible,
+            "shadow_pass": shadow_pass,
+            "paper_traded": len(
+                [r for r in signal_rows if r["paper_trade_id"] is not None]
+            ),
+        },
+        "shadow_armed": bool(active_gate_version),
+        "active_gate_version": active_gate_version,
+    }
 
 
 async def get_source_calls_health(db_path: str) -> dict:
