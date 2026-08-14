@@ -285,8 +285,13 @@ def _compute_outcome(
     else:
         # Forward-only series (design #392 C3): no snapshot at/before the call
         # (e.g. C2 contract snapshots captured just after it). Anchor on the
-        # EARLIEST snapshot within [call_ts, call_ts + tolerance]. token_id rows
-        # always have an at-or-before snapshot, so this never fires for them.
+        # EARLIEST snapshot within [call_ts, call_ts + tolerance].
+        #
+        # It previously said token_id rows "always have an at-or-before snapshot,
+        # so this never fires for them". That is FALSE and was measured false in
+        # production: 5 of 16 CG-id rows reached this fallback. A CG identity is
+        # only in gainers/losers snapshots once it enters those surfaces, which
+        # can be after the call. Comment corrected; behaviour unchanged.
         anchor_deadline = call_ts + timedelta(seconds=at_call_tolerance_sec)
         just_after = [
             row
