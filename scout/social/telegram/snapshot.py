@@ -106,6 +106,19 @@ def parse_resolution_snapshot(text: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def hash_module_source(path: Path) -> str:
+    """SHA-256 of a module's source with line endings normalized to ``\\n``.
+
+    Shared by every module whose source is bound into the gate fingerprint. A
+    CRLF working copy and an LF production checkout are the SAME commit and
+    must hash identically, or a locally recomputed ``gate_version`` can never
+    match production's and replay verification becomes impossible. Separated
+    from `module_source_hash` so the invariance is directly testable —
+    ``__file__`` cannot be varied inside a test.
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 @lru_cache(maxsize=1)
 def module_source_hash() -> str:
     """SHA-256 of this module's source, for the gate fingerprint.
@@ -113,5 +126,9 @@ def module_source_hash() -> str:
     Read from the ``.py`` file rather than derived from the imported objects:
     the point is to notice edits that change extraction semantics without
     touching any declared version or threshold.
+
+    Line endings normalized to ``\\n`` first: a CRLF checkout and an LF checkout
+    of the SAME commit must produce the same gate_version, or a locally
+    recomputed fingerprint can never match production's.
     """
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return hash_module_source(Path(__file__))
