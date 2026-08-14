@@ -101,11 +101,29 @@ async def _insert_price_snapshot(
     chain="base",
     source="gt",
 ):
+    # B1 (fix/snapshot-commit-visibility): a snapshot is knowable to an as-of
+    # reader only once its batch's post-commit marker exists. Production rows
+    # therefore always carry a batch_id and a published marker, so this fixture
+    # must too — an unstamped row created after the epoch is the WRITER-BUG class
+    # the reader deliberately treats as invisible, and a fixture in that shape
+    # would be testing a state production never produces. The ONE honest
+    # reachable case of the old NULL-batch-after-epoch shape is the ROLLBACK
+    # window (old writer running against the new schema), and that case is
+    # covered deliberately by
+    # test_snapshot_commit_visibility.py::test_post_epoch_unstamped_rows_are_not_grandfathered.
+    #
+    # One shared batch, published far in the past, so any `as_of` these tests use
+    # is after it and the gate is satisfied without each test managing batches.
     await conn.execute(
         "INSERT INTO source_call_price_snapshots "
-        "(identity_key, identity_kind, chain, price, snapshot_at, source) "
-        "VALUES (?,?,?,?,?,?)",
+        "(identity_key, identity_kind, chain, price, snapshot_at, source, batch_id) "
+        "VALUES (?,?,?,?,?,?,1)",
         (identity_key, identity_kind, chain, price, snapshot_at, source),
+    )
+    await conn.execute(
+        "INSERT OR IGNORE INTO source_call_snapshot_batches "
+        "(batch_id, visible_at, rows_written) "
+        "VALUES (1, '2000-01-01T00:00:00+00:00', 0)"
     )
     await conn.commit()
 

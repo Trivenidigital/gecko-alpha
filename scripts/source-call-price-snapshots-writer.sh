@@ -64,6 +64,19 @@ done
 
 cd "$REPO_ROOT"
 
+# flock: two overlapping cycles allocate the SAME batch id (allocation reads
+# MAX(batch_id) before either publishes), and the loser's marker would then
+# either collide or publish its rows under the earlier cycle's visible_at —
+# backdated visibility, the exact future leakage the batch mechanism exists to
+# prevent. A slow cycle must be skipped, never run concurrently. House
+# precedent: gecko-backup-create.sh, cron-drift-watchdog.sh.
+LOCK_FILE="${SCPS_WRITER_LOCK_FILE:-/tmp/scps-writer.lock}"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "OK: skipping run — previous invocation still holds $LOCK_FILE"
+    exit 0
+fi
+
 py_args=(
   --db "${DB_PATH}"
   --enabled "${ENABLED}"

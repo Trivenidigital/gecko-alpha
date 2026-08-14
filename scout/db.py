@@ -208,6 +208,10 @@ class Database:
             await self._migrate_source_call_price_snapshots_v1()
             # C4 (#392): per-cycle snapshot-writer run stats (§12a watchdog substrate).
             await self._migrate_source_call_price_snapshot_runs_v1()
+            # B1-residual: durable POST-COMMIT visibility markers, so an as-of
+            # reader cannot see rows that were inserted before its `as_of` but
+            # committed after it.
+            await self._migrate_source_call_snapshot_batches_v1()
             # GA-19: durable per-source consecutive-miss counters so the
             # ingest-starvation watchdog survives gecko-pipeline restarts.
             await self._migrate_ingest_watchdog_state_v1()
@@ -6631,6 +6635,153 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "source_call_price_snapshots_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_source_call_snapshot_batches_v1(self) -> None:
+        """B1-residual: durable post-commit visibility markers for snapshots.
+
+        THE DEFECT. ``source_call_price_snapshots.created_at`` is stamped at
+        INSERT, but the writer commits a whole cycle at once. A row inserted
+        before an ``as_of`` and committed after it therefore satisfies both
+        knowability bounds while having been genuinely unknowable at ``as_of``
+        — and the first-inserted rows of a long cycle approach full-cycle
+        exposure. That is future leakage: a historical feature can read a price
+        the decision could not have seen.
+
+        THE SHAPE. Not an attempt to guess SQLite's commit instant. Rows may
+        exist first; an as-of reader treats them as knowable only once a
+        durable marker written in a SEPARATE transaction AFTER the data commit
+        exists with ``visible_at <= as_of``. Conservative LATE visibility is
+        acceptable; future leakage is not — that asymmetry is the whole design.
+
+        CRASH SAFETY leans the same way. A crash between the data commit and
+        the marker commit leaves rows with a ``batch_id`` and no batch row, so
+        they are INVISIBLE rather than early-visible. They stay invisible until
+        an operator repair stamps the missing marker; the recovery story is
+        documented in tasks/brief_snapshot_commit_visibility_migration.md.
+
+        EPOCH. ``batch_id IS NULL`` marks rows written before this mechanism
+        existed. They are grandfathered — but only up to ``epoch_cutover_ts``,
+        recorded here at migration time. A NULL-batch row created AFTER that
+        cutover is a writer bug, and the conservative reading of a bug is
+        INVISIBLE, not always-visible; otherwise a stamping regression would
+        silently restore the very leak this closes.
+
+        Additive: one nullable column plus one new table. No backfill, no
+        rewrite of existing rows.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "source_call_snapshot_batches_v1"
+        schema_version = 20260813
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("source_call_snapshot_batches_v1_migration_skip_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_call_snapshot_batches (
+                    batch_id INTEGER PRIMARY KEY,
+                    visible_at TEXT NOT NULL,
+                    rows_written INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scsb_visible_at "
+                "ON source_call_snapshot_batches(visible_at)"
+            )
+            # The epoch cutover itself is durable state, not a constant: the
+            # reader needs to distinguish "written before the mechanism" from
+            # "written after it and unstamped", and only the DB knows when this
+            # DB crossed over.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_call_snapshot_visibility_epoch (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    epoch_cutover_ts TEXT NOT NULL
+                )
+            """)
+            # SAME PRODUCER AS `created_at`, deliberately. `created_at` is the
+            # DDL default `datetime('now')` — space-separated, no offset — while
+            # `now_iso` here is Python `.isoformat()`, 'T'-separated. Comparing
+            # the two as TEXT is the INF-04 bug: ' ' (0x20) < 'T' (0x54), so a
+            # Python-stamped cutover is lexicographically LATER than every
+            # same-day SQLite timestamp and the grandfather branch admits rows
+            # it must exclude. Stamping the cutover with datetime('now') keeps
+            # both sides of that comparison in one format.
+            #
+            # NOT solved by wrapping the predicate in datetime(): that truncates
+            # sub-second precision, which would round marker comparisons the
+            # wrong way and admit rows early.
+            await conn.execute(
+                "INSERT OR IGNORE INTO source_call_snapshot_visibility_epoch "
+                "(id, epoch_cutover_ts) VALUES (1, datetime('now'))"
+            )
+
+            cur_cols = await conn.execute(
+                "PRAGMA table_info(source_call_price_snapshots)"
+            )
+            cols = {row[1] for row in await cur_cols.fetchall()}
+            if cols and "batch_id" not in cols:
+                await conn.execute(
+                    "ALTER TABLE source_call_price_snapshots ADD COLUMN batch_id INTEGER"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_scps_batch "
+                    "ON source_call_price_snapshots(batch_id)"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            # Log the STORED value, not `now_iso`: the row is stamped by
+            # SQLite `datetime('now')` and `now_iso` is Python-shaped, so
+            # logging the latter would report a timestamp in a format the
+            # column never holds — and this is the field an operator would
+            # grep when diagnosing a grandfathering question.
+            cur_epoch = await conn.execute(
+                "SELECT epoch_cutover_ts FROM "
+                "source_call_snapshot_visibility_epoch WHERE id = 1"
+            )
+            stored_epoch_row = await cur_epoch.fetchone()
+            _log.info(
+                "source_call_snapshot_batches_v1_migration_complete",
+                table="source_call_snapshot_batches",
+                epoch_cutover_ts=(stored_epoch_row[0] if stored_epoch_row else None),
+            )
+        except BaseException as e:
+            _log.exception(
+                "source_call_snapshot_batches_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

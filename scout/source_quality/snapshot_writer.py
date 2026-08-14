@@ -183,6 +183,117 @@ async def _last_snapshot_at(
     return row[0] if row else None
 
 
+# The as-of visibility predicate, in ONE place. Any reader that answers a
+# question about the PAST must apply it; readers that report coverage must NOT.
+#
+# WHY THE SPLIT MATTERS, stated here because this is where the next reader
+# author will look:
+#   * DECISION / AS-OF readers (the ledger's price series, the Stage B caller-
+#     feature provider) reconstruct what was knowable at an instant. Skipping
+#     the gate lets them read a price the decision could not have seen —
+#     future leakage, the defect this exists to close.
+#   * COVERAGE / OBSERVABILITY readers (the snapshot watchdogs) answer "does
+#     this identity have data at all". Applying the gate there would make
+#     coverage UNDER-REPORT during the marker-lag window and page an operator
+#     about a lane that is working correctly.
+#
+# CANONICAL TIMESTAMP-FORMAT RULE — read this before adding a bound.
+# Four timestamps meet in this predicate and they have THREE producers:
+#   snapshot_at   Python .isoformat()      ('2026-08-14T02:53:45.340209+00:00')
+#   created_at    SQLite datetime('now')   ('2026-08-14 02:53:45')
+#   visible_at    Python .isoformat()      (written by `_publish_batch`)
+#   as_of         caller-supplied
+# SQLite compares these as TEXT, and ' ' (0x20) sorts BEFORE 'T' (0x54). So a
+# space-separated value is lexicographically EARLIER than a 'T'-separated one for
+# the same instant — which silently inverts a bound (INF-04; see
+# scout/timeutil.py). THE RULE: every comparison pair must share ONE producer.
+#   b.visible_at <= :as_of        -> both Python isoformat; callers MUST pass
+#                                    `.isoformat()`, never a SQLite-shaped string
+#   s.created_at <= epoch_cutover -> both SQLite datetime('now'); the epoch row
+#                                    is stamped by SQLite for exactly this reason
+# Do NOT "fix" a future mismatch by wrapping a side in datetime(): that truncates
+# sub-second precision and rounds marker comparisons the admitting way.
+#
+# `:as_of` is bound twice. The epoch subquery COALESCEs to '' — FAIL CLOSED: a DB
+# missing the epoch row (migration not run, row deleted) admits NO null-batch row
+# rather than all of them.
+#
+# THE TWO BOUNDS LEAN THE SAME WAY, which is why they differ in strictness:
+#   visible_at <= as_of      INCLUSIVE — a marker committed exactly at as_of was
+#                            knowable then; admitting it leaks nothing.
+#   created_at <  epoch      EXCLUSIVE — `datetime('now')` has ONE-SECOND
+#                            resolution, so a row written in the same second as
+#                            the migration compares EQUAL to the cutover. Under
+#                            `<=` that row would be grandfathered, i.e. treated
+#                            as always-visible, which is the admitting direction.
+#                            `<` costs at most one second of genuinely-old rows
+#                            (they become invisible) and never admits a
+#                            post-epoch row. Conservative both times.
+VISIBLE_AS_OF_SQL = """
+        (
+            s.batch_id IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM source_call_snapshot_batches b
+                WHERE b.batch_id = s.batch_id AND b.visible_at <= :as_of
+            )
+            OR (
+                s.batch_id IS NULL
+                AND s.created_at < COALESCE(
+                    (SELECT epoch_cutover_ts
+                     FROM source_call_snapshot_visibility_epoch WHERE id = 1),
+                    ''
+                )
+            )
+        )
+"""
+
+
+async def _allocate_batch_id(conn: aiosqlite.Connection) -> int:
+    """Next batch id, WITHOUT publishing it.
+
+    Allocated from the snapshots table (the highest id ever stamped onto data)
+    rather than from the batches table, because a crashed cycle leaves a stamped
+    id with no batch row — reusing that id would retroactively publish the
+    crashed cycle's orphan rows under a later cycle's marker, which is precisely
+    the early-visibility this mechanism exists to prevent.
+    """
+    cur = await conn.execute(
+        "SELECT COALESCE(MAX(batch_id), 0) FROM source_call_price_snapshots"
+    )
+    highest_stamped = (await cur.fetchone())[0] or 0
+    cur = await conn.execute(
+        "SELECT COALESCE(MAX(batch_id), 0) FROM source_call_snapshot_batches"
+    )
+    highest_published = (await cur.fetchone())[0] or 0
+    return max(highest_stamped, highest_published) + 1
+
+
+async def _publish_batch(
+    conn: aiosqlite.Connection, *, batch_id: int, visible_at: str, rows_written: int
+) -> None:
+    """Write the visibility marker in its OWN transaction, AFTER the data commit.
+
+    The separation is the mechanism, not an implementation detail: until this
+    row is committed, every snapshot carrying ``batch_id`` is unknowable to an
+    as-of reader, however long ago it was inserted. Called only when the cycle
+    actually wrote rows — an empty cycle publishes nothing and leaves the id
+    free for the next one.
+    """
+    # PLAIN INSERT, not INSERT OR IGNORE. Two concurrent cycles can allocate
+    # the same id; OR IGNORE would silently DISCARD the second marker, leaving
+    # the later cycle's rows published under the earlier cycle's (earlier)
+    # visible_at — backdated visibility, i.e. exactly the future leakage this
+    # mechanism exists to prevent. A collision must be LOUD. The .sh wrapper
+    # also takes an flock so the collision is prevented rather than merely
+    # detected.
+    await conn.execute(
+        "INSERT INTO source_call_snapshot_batches "
+        "(batch_id, visible_at, rows_written) VALUES (?, ?, ?)",
+        (batch_id, visible_at, rows_written),
+    )
+    await conn.commit()
+
+
 async def _eligible_cg_identities(
     conn: aiosqlite.Connection,
     coin_ids: list[str],
@@ -289,6 +400,7 @@ async def _write_cg_snapshots(
     now: datetime,
     stats: dict[str, int],
     max_cache_age_min: int,
+    batch_id: int,
 ) -> None:
     """Append CG coin_id observations from the local `price_cache` surface.
 
@@ -362,9 +474,16 @@ async def _write_cg_snapshots(
             continue
         await conn.execute(
             "INSERT INTO source_call_price_snapshots "
-            "(identity_key, identity_kind, chain, price, snapshot_at, source) "
-            "VALUES (?, ?, NULL, ?, ?, 'cg')",
-            (coin_id, STORAGE_CG_KIND, float(row["current_price"]), observed_iso),
+            "(identity_key, identity_kind, chain, price, snapshot_at, source, "
+            " batch_id) "
+            "VALUES (?, ?, NULL, ?, ?, 'cg', ?)",
+            (
+                coin_id,
+                STORAGE_CG_KIND,
+                float(row["current_price"]),
+                observed_iso,
+                batch_id,
+            ),
         )
         stats["cg_snapshots_written"] += 1
         stats["snapshots_written"] += 1
@@ -467,6 +586,11 @@ async def write_price_snapshots(
 
     # Daily ceiling is checked BEFORE any provider call so a breach costs zero
     # requests. Budget visibility is emitted whether or not the run proceeds.
+    # Allocate the batch id BEFORE any row is written, but publish it only
+    # after every data commit — see `_publish_batch`. Nothing is visible to an
+    # as-of reader in between, which is the conservative direction.
+    batch_id = await _allocate_batch_id(conn)
+
     used_today = await _requests_used_today(conn, now=now_dt)
     remaining_today = max(0, max_requests_per_day - used_today)
     affordable = remaining_today // _REQUESTS_PER_IDENTITY
@@ -536,6 +660,7 @@ async def write_price_snapshots(
         now=now_dt,
         stats=stats,
         max_cache_age_min=max_price_cache_age_min,
+        batch_id=batch_id,
     )
     # Commit unconditionally, right here. The CG rows cost no provider requests,
     # so they must survive a contract-lane budget stop; committing at this single
@@ -545,8 +670,16 @@ async def write_price_snapshots(
     await conn.commit()
 
     if affordable <= 0:
-        # CG rows are already committed above, so the budget stop needs no
-        # special case of its own.
+        # CG rows are already committed above; publish their marker before
+        # returning or they stay invisible until a later cycle.
+        if stats["cg_snapshots_written"]:
+            await _publish_batch(
+                conn,
+                batch_id=batch_id,
+                visible_at=datetime.now(timezone.utc).isoformat(),
+                rows_written=stats["cg_snapshots_written"],
+            )
+        stats["batch_id"] = batch_id
         stats["duration_ms"] = int((perf_counter() - started_perf) * 1000)
         _log.warning(
             "scps_daily_request_ceiling_reached",
@@ -615,19 +748,32 @@ async def write_price_snapshots(
         latest = candles[-1]  # C0 returns ascending; last candle is most recent
         await conn.execute(
             "INSERT INTO source_call_price_snapshots "
-            "(identity_key, identity_kind, chain, price, snapshot_at, source) "
-            "VALUES (?, 'contract', ?, ?, ?, ?)",
+            "(identity_key, identity_kind, chain, price, snapshot_at, source, "
+            " batch_id) "
+            "VALUES (?, 'contract', ?, ?, ?, ?, ?)",
             (
                 identity_key,
                 chain,
                 float(latest.close),
                 snapshot_at,
                 getattr(latest, "source", "gt"),
+                batch_id,
             ),
         )
         stats["snapshots_written"] += 1
 
     await conn.commit()
+    # DATA IS NOW DURABLE. Only now does the batch become knowable: the marker
+    # goes in its own transaction, so a crash here leaves the rows INVISIBLE
+    # rather than early-visible.
+    if stats["snapshots_written"]:
+        await _publish_batch(
+            conn,
+            batch_id=batch_id,
+            visible_at=datetime.now(timezone.utc).isoformat(),
+            rows_written=stats["snapshots_written"],
+        )
+    stats["batch_id"] = batch_id
     stats["duration_ms"] = int((perf_counter() - started_perf) * 1000)
     stats["error_rate"] = (
         round(stats["provider_errors"] / stats["requests_attempted"], 4)
