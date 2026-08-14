@@ -584,17 +584,44 @@ def test_committed_dist_references_what_changed_bundle():
 
 
 def test_tg_alerts_tab_exposes_factual_operator_action_buttons():
-    text = (
+    """The dispatch-feedback controls and the no-advice rule.
+
+    The TG tab redesign split the monolithic TGAlertsTab into sub-tab panels:
+    the ledger fetch and the four operator actions now live in
+    TGDispatchFeedbackPanel, with the POST still driven from the shell. Both
+    halves are asserted so the split cannot drop either, and the banned-phrase
+    scan now covers EVERY TG component rather than just the shell — a wider net
+    than before the split.
+    """
+    shell = (
         ROOT / "dashboard" / "frontend" / "components" / "TGAlertsTab.jsx"
     ).read_text(encoding="utf-8")
-    assert "/api/tg_alerts/recent?limit=80" in text
-    assert "/operator-action" in text
+    panel = (
+        ROOT / "dashboard" / "frontend" / "components" / "TGDispatchFeedbackPanel.jsx"
+    ).read_text(encoding="utf-8")
+    assert "/api/tg_alerts/recent?limit=80" in shell
+    assert "/operator-action" in shell
     for label in ("Acted", "Useful", "Ignored", "Bad"):
-        assert label in text
+        assert label in panel
+
     banned = ("buy now", "trade now", "act now", "should buy", "should sell")
-    lowered = text.lower()
-    for phrase in banned:
-        assert phrase not in lowered
+    tg_components = (
+        "TGAlertsTab.jsx",
+        "TGOverviewPanel.jsx",
+        "TGSignalsPanel.jsx",
+        "TGSignalDrawer.jsx",
+        "TGChannelsPanel.jsx",
+        "TGDispatchFeedbackPanel.jsx",
+        "tgSignals.js",
+    )
+    for name in tg_components:
+        lowered = (
+            (ROOT / "dashboard" / "frontend" / "components" / name)
+            .read_text(encoding="utf-8")
+            .lower()
+        )
+        for phrase in banned:
+            assert phrase not in lowered, f"{name} contains advice language"
 
 
 def test_conviction_tab_is_wired_to_dashboard():
