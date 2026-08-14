@@ -23,6 +23,7 @@ were written.
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -751,8 +752,8 @@ async def test_features_read_is_a_single_point_in_time(db, provider, monkeypatch
     fired: list[bool] = []
     mid = T0 - timedelta(hours=1)
 
-    def _load_then_commit_a_new_row(self, conn, calls, as_of):
-        result = original(self, conn, calls, as_of)
+    def _load_then_commit_a_new_row(self, conn, calls, *, as_of):
+        result = original(self, conn, calls, as_of=as_of)
         if not fired:
             fired.append(True)
             # Another channel calling THIS call's contract, same UTC day, fully
@@ -2023,3 +2024,129 @@ def test_dex_pseudo_ids_are_not_treated_as_coin_ids():
         "coin_id",
         "bitcoin",
     )
+
+
+# ---------------------------------------------------------------------------
+# B1 commit-visibility adoption — exercised through the PROVIDER READ, not the
+# helper. The helper being correct proved nothing last round: the substrate's
+# gate was fully correct and completely inert in production because the call
+# site bound it positionally. These pin the WIRING.
+# ---------------------------------------------------------------------------
+
+
+async def _price_row(db, *, created_at, batch_id, price=1.0, snapshot_at=None):
+    await db._conn.execute(
+        "INSERT INTO source_call_price_snapshots "
+        "(identity_key, identity_kind, chain, price, snapshot_at, source, "
+        " created_at, batch_id) "
+        "VALUES ('bitcoin', 'coin_id', NULL, ?, ?, 'cg', ?, ?)",
+        (price, snapshot_at or "2026-07-01T00:00:00+00:00", created_at, batch_id),
+    )
+    await db._conn.commit()
+
+
+async def _observations_via_provider(db, provider, as_of):
+    """Drive the provider's own read path for the coin_id identity."""
+    from scout.social.telegram.caller_features import _Call
+
+    call = _Call(
+        signal_id=1,
+        message_pk=1,
+        channel_handle="c",
+        identity="bitcoin",
+        contract_lower=None,
+        snapshot_kind="coin_id",
+        snapshot_key="bitcoin",
+        posted_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        has_genuine_identity=True,
+    )
+    conn = sqlite3.connect(f"file:{db._db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return provider._load_observations(conn, [call], as_of=as_of)
+    finally:
+        conn.close()
+
+
+async def test_provider_excludes_unpublished_batch(db, provider):
+    """The adoption itself: a stamped-but-unpublished batch is unknowable."""
+    await _price_row(db, created_at="2026-07-01 00:00:00", batch_id=99)
+    found = await _observations_via_provider(
+        db, provider, datetime(2027, 1, 1, tzinfo=timezone.utc)
+    )
+    assert found == {}, "provider read a row whose batch was never published"
+
+
+async def test_provider_admits_row_once_its_marker_is_at_or_before_as_of(db, provider):
+    await _price_row(db, created_at="2026-07-01 00:00:00", batch_id=100)
+    await db._conn.execute(
+        "INSERT INTO source_call_snapshot_batches (batch_id, visible_at, rows_written) "
+        "VALUES (100, '2026-07-02T00:00:00+00:00', 1)"
+    )
+    await db._conn.commit()
+
+    before = await _observations_via_provider(
+        db, provider, datetime(2026, 7, 1, 12, tzinfo=timezone.utc)
+    )
+    assert before == {}, "admitted before its marker"
+
+    after = await _observations_via_provider(
+        db, provider, datetime(2026, 7, 3, tzinfo=timezone.utc)
+    )
+    assert len(after[("coin_id", "bitcoin")]) == 1
+
+
+async def test_provider_epoch_boundary_same_second_excluded(db, provider):
+    """Same-second-as-epoch EXCLUDED, one-second-earlier VISIBLE — through the
+    provider, so the strict `<` bound is pinned at the wiring level too."""
+    cur = await db._conn.execute(
+        "SELECT epoch_cutover_ts FROM source_call_snapshot_visibility_epoch WHERE id=1"
+    )
+    epoch = (await cur.fetchone())[0]
+    cur = await db._conn.execute("SELECT datetime(?, '-1 second')", (epoch,))
+    one_earlier = (await cur.fetchone())[0]
+    as_of = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    await _price_row(db, created_at=epoch, batch_id=None)
+    assert (
+        await _observations_via_provider(db, provider, as_of) == {}
+    ), "same-second row grandfathered through the provider"
+
+    await db._conn.execute("DELETE FROM source_call_price_snapshots")
+    await db._conn.commit()
+    await _price_row(db, created_at=one_earlier, batch_id=None)
+    found = await _observations_via_provider(db, provider, as_of)
+    assert len(found[("coin_id", "bitcoin")]) == 1, "pre-epoch row stranded"
+
+
+async def test_provider_fails_closed_when_epoch_row_missing(db, provider):
+    await db._conn.execute("DELETE FROM source_call_snapshot_visibility_epoch")
+    await _price_row(db, created_at="2020-01-01 00:00:00", batch_id=None)
+    assert (
+        await _observations_via_provider(
+            db, provider, datetime(2030, 1, 1, tzinfo=timezone.utc)
+        )
+        == {}
+    ), "missing epoch row failed OPEN through the provider"
+
+
+async def test_as_of_is_keyword_only_at_the_provider_boundary(db, provider):
+    """B-1's class, as an executable guard rather than a comment.
+
+    B-1 was a positional argument silently binding `identity_kind`: the gate was
+    correct and inert, and every test passed because positional and keyword calls
+    agree right up until the arguments are reordered. The `*` in the signature is
+    what makes that a TypeError instead of a silent mis-bind, so it needs a test
+    that fails when someone deletes it — the rest of the suite would not notice.
+    """
+    conn = sqlite3.connect(f"file:{db._db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    as_of = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    try:
+        with pytest.raises(TypeError, match="positional"):
+            provider._load_observations(conn, [], as_of)
+
+        # The keyword form is the one that works, on the same inputs.
+        assert provider._load_observations(conn, [], as_of=as_of) == {}
+    finally:
+        conn.close()

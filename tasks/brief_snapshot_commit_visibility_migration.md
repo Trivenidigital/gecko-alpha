@@ -158,8 +158,12 @@ activated for the CG lane yet and a watchdog with no traffic is untestable.
 
 ## Reader split — stated at the helper, not only here
 
-- **Decision / as-of readers** (`ledger._fetch_snapshot_rows` with `as_of`, and
-  the Stage B caller-feature provider once it adopts the helper) **must** gate.
+- **Decision / as-of readers** **must** gate. Both are adopted IN THIS PR:
+  `ledger._fetch_snapshot_rows` (with `as_of`) and the Stage B caller-feature
+  provider `caller_features._load_observations`. The provider's adoption is here
+  rather than in a later PR because `VISIBLE_AS_OF_SQL` exists only on this
+  branch — merging the marker without it would ship the infrastructure while its
+  primary consumer kept the exact residual the marker supersedes.
 - **Coverage / observability readers** (`source_quality/watchdogs.py`) **must
   not** — gating them makes coverage under-report during the marker-lag window
   and pages an operator about a lane that is working correctly.
