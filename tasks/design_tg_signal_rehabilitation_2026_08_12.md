@@ -298,16 +298,44 @@ every inserted `snapshot_at` ≥ the max existing `snapshot_at` (documents the i
 the knowability bound relies on). If either invariant is ever deliberately broken, Stage
 B's evidence claims must be re-reviewed before the next gate_version activates.
 
-### As-of knowability (v1.3 — double time bound on verified columns)
+### As-of knowability (v1.3 — double time bound on verified columns; price bullet
+superseded by the v1.5 amendment below)
 
 A historical input row contributes to features at decision time `as_of` only if it was
 both posted and **ingested** by `as_of`:
 
 > message facts: `posted_at ≤ as_of` **AND** `parsed_at ≤ as_of`
 > signal facts: `created_at ≤ as_of`
-> price observations: `snapshot_at ≤ as_of` (sufficient because the writer is verified
-> forward-only — `snapshot_at` is the recording time, not a claimed historical time;
-> the pinning test above keeps this sufficient)
+> price observations: ~~`snapshot_at ≤ as_of` (sufficient because the writer is
+> verified forward-only)~~ **SUPERSEDED — see the v1.5 amendment.** The original
+> claim is preserved here, struck through, per amendment discipline: it was stated
+> as sufficient and was **falsified during Stage B adversarial review (2026-08-13)**.
+
+#### v1.5 AMENDMENT — price-fact knowability (operator-authorized truth maintenance, 2026-08-14)
+
+**Why the original claim was false (B1):** the snapshot writer stamps `snapshot_at`
+once at cycle START but commits the whole cycle's rows once at cycle END. Forward-only
+monotonicity constrains *ordering*, not *visibility*: a row stamped before `as_of`
+can become visible after it, so a live evaluation and a later replay diverge —
+demonstrated by probe (8 features flipped, including two gate inputs).
+
+**Binding Stage B price-knowability statement (now in force):**
+
+> a price observation is knowable at `as_of` only if
+> `observation timestamp (snapshot_at) ≤ as_of` **AND**
+> `persisted/created visibility timestamp (created_at) ≤ as_of`,
+> and provider feature computation uses **one explicit point-in-time database read
+> transaction** per `features()` call (per-statement WAL snapshots were shown to
+> permit internally inconsistent `features_json` no replay reproduces — B2).
+
+**Known residual (accepted for deploy-dark; BLOCKING for activation — operator
+ruling 4, 2026-08-14):** `created_at` is INSERT-stamped, not COMMIT-stamped; a row
+inserted before `as_of` but committed after it still passes both clauses, and the
+first-inserted rows of a long writer cycle approach full-cycle exposure. Full closure
+is a separately-authorized **durable post-commit visibility/batch marker**: readers
+treat rows knowable only once a marker written after the commit exists with
+`marker timestamp ≤ as_of`. Conservative late visibility is acceptable; future
+leakage is not.
 
 — a call posted before `T` but ingested after `T` was not knowable at `T` and is
 excluded. On top of knowability, **outcome maturity** applies per feature, using the
