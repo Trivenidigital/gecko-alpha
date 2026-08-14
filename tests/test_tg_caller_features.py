@@ -158,6 +158,19 @@ async def _snapshot(
     facts would exclude every fixture row and the whole suite would measure
     nothing. Tests that need the commit-clock straddle pass a later value on
     purpose.
+
+    WARNING — THIS FIXTURE IS COUPLED TO `T0`'s DATE, silently. Rows here carry
+    no `batch_id`, so commit-visibility admits them through the EPOCH branch:
+    `created_at < epoch_cutover_ts`. `created_at` is written here as Python
+    isoformat ('T'-separated) while the epoch is stamped by SQLite at migration
+    time ('space'-separated, real wall clock), and TEXT comparison puts ' '
+    (0x20) before 'T' (0x54). These rows therefore pass only because T0's DATE
+    is strictly earlier than the run date — the date difference dominates the
+    separator. Move `T0` to the current date and every row flips to EXCLUDED
+    even at 00:00:00, because on an equal date the 'T' loses to the space. The
+    failure is silent and file-wide: assertions start measuring an empty
+    observation set rather than erroring. If T0 ever needs to be current, stamp
+    `created_at` in SQLite's shape instead of bumping the anchor.
     """
     await db._conn.execute(
         "INSERT INTO source_call_price_snapshots "

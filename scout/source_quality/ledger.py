@@ -214,6 +214,7 @@ def _status_from_missing(
 async def _fetch_snapshot_rows(
     conn: aiosqlite.Connection,
     identity_key: str,
+    *,
     identity_kind: str = "token_id",
     as_of: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -234,6 +235,14 @@ async def _fetch_snapshot_rows(
     This is a LIVE-LEDGER behaviour change, and deliberately a conservative one:
     a late-visible row is simply picked up on the next outcome refresh, and the
     maturity states already absorb that lag.
+
+    ``identity_kind`` and ``as_of`` are KEYWORD-ONLY. Both previously sat in
+    positional slots behind defaults, and that is exactly how the gate came to
+    be inert in production: a call passing ``"contract"`` as the third
+    positional bound ``identity_kind`` and left ``as_of`` at ``None``, so the
+    visibility predicate was skipped entirely while every test still passed.
+    Fixing the call site alone left the shape that permits it; the ``*`` makes
+    the mis-bind a TypeError at the call site instead.
     """
     rows: list[dict[str, Any]] = []
     if identity_kind == "token_id":
@@ -687,8 +696,9 @@ async def refresh_source_call_outcomes(
             # as the third POSITIONAL, which binds `identity_kind` and left
             # `as_of` at its None default — so the commit-visibility gate never
             # ran in production at all, and this lane priced calls from rows in
-            # a stamped-but-unpublished batch. Naming the arguments makes that
-            # class of silent mis-binding impossible here.
+            # a stamped-but-unpublished batch. The callee's parameters are now
+            # keyword-only, so the mis-bind is a TypeError rather than a
+            # convention this call site has to remember.
             price_rows = await _fetch_snapshot_rows(
                 conn,
                 key,

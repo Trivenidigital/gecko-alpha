@@ -214,9 +214,19 @@ async def _last_snapshot_at(
 # Do NOT "fix" a future mismatch by wrapping a side in datetime(): that truncates
 # sub-second precision and rounds marker comparisons the admitting way.
 #
-# `:as_of` is bound twice. The epoch subquery COALESCEs to '' — FAIL CLOSED: a DB
-# missing the epoch row (migration not run, row deleted) admits NO null-batch row
-# rather than all of them.
+# `:as_of` is bound ONCE, in the marker branch. The epoch branch compares two
+# STORED values and takes no parameter at all.
+#
+# The epoch subquery COALESCEs to ''. That makes the FAIL-CLOSED intent legible;
+# it does not create the behaviour. SQL three-valued logic already fails closed
+# here: a DB missing the epoch row (migration not run, row deleted) makes the
+# subquery NULL, `created_at < NULL` evaluates to NULL, and WHERE treats NULL as
+# false — so the null-batch row is excluded with or without the COALESCE. All
+# four epoch states (row missing, row present with NULL ts, empty-string ts,
+# real ts) were checked and behave identically both ways. It is kept because
+# comparing against a value no timestamp can precede states the intent IN the
+# expression, rather than leaving the next reader to re-derive it from
+# three-valued-logic rules.
 #
 # THE TWO BOUNDS LEAN THE SAME WAY, which is why they differ in strictness:
 #   visible_at <= as_of      INCLUSIVE — a marker committed exactly at as_of was

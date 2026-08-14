@@ -13,7 +13,9 @@ column is ever consumed as if it had existed historically.
 **The determinism invariant.** Recomputing `features()` for the same
 `(channel_handle, decision_as_of, current_signal_id)` at any later wall-clock
 time must return byte-identical values, however much the database has learned
-since. Two mechanisms make that true rather than hoped-for:
+since. Two mechanisms make that true rather than hoped-for — subject to one
+bounded exception, the marker-publish window documented under the price-bound
+residual below:
 
 * Every input row is admitted only under a knowability bound — one clause for
   when the fact HAPPENED, one for when we RECORDED it, and on prices a third
@@ -50,12 +52,27 @@ What the bound still buys: `snapshot_at` alone gave EVERY row in a cycle the
 same cycle-start stamp, so the exposure was full-cycle for all of them; adding
 `created_at` makes it decay across the cycle instead. Strictly better on every
 row, dramatically better on most, worst case unchanged.
-**CLOSED as of the commit-visibility marker.** The paragraph above describes the
-defect and why a read-side module could not fix it alone; it is retained because
-the reasoning still explains WHY the third bound exists. The substrate now writes
-a durable post-commit marker per writer cycle, and this module admits a price row
-only once that marker exists at or before `as_of` — so an INSERT-before /
-COMMIT-after row is no longer admitted. The bound is applied through
+**RELOCATED — not closed — by the commit-visibility marker.** The paragraph
+above describes the defect and why a read-side module could not fix it alone; it
+is retained because the reasoning still explains WHY the third bound exists. The
+substrate now writes a durable post-commit marker per writer cycle, and this
+module admits a price row only once that marker is COMMITTED and stamped at or
+before `as_of`. That shrinks the exposure by orders of magnitude — from a whole
+writer cycle (minutes) to the marker's own insert→commit latency (one aiosqlite
+hop plus fsync, milliseconds; ~1e-5 of the decision timeline at 900s cycles) —
+but it does not eliminate it. The marker row has the SAME insert-before /
+commit-after shape as the data it publishes: `visible_at` is stamped in Python
+at the call site, before the publishing transaction commits. Any marker value
+must be computed before its own transaction commits, so this residual is a
+property of the approach under SQLite primitives, not a defect in this
+implementation.
+
+**What the window does and does not break.** It never leaks the future: inside
+it the live read sees FEWER rows, not more, so a decision made then is
+conservative and no unknowable price can reach it. What it breaks is
+REPRODUCIBILITY — replaying the same `as_of` after the marker commits can admit
+rows the live read did not see, which is the one place the determinism invariant
+above is qualified rather than absolute. The bound is applied through
 `VISIBLE_AS_OF_SQL`, the helper exported by the substrate module, so "knowable"
 has ONE implementation shared with the source-quality ledger rather than a copy
 here. Rows predating the marker era are governed by a documented epoch rule and
@@ -737,12 +754,15 @@ class TgCallerFeatureProvider:
         one.
 
         SEAM ADOPTED — commit-visibility marker (was: "do NOT depend on it yet").
-        The residual described above is now CLOSED. This read goes through
-        `VISIBLE_AS_OF_SQL`, the visibility helper exported by the substrate
-        module, so "knowable" has ONE implementation shared with the ledger:
-        a row counts only once the post-commit marker for its batch exists at
-        or before `as_of`, with a documented epoch rule so rows predating the
-        marker era are not stranded.
+        The residual described above is RELOCATED, not closed: from a full
+        writer cycle down to the marker's own insert→commit latency, which
+        cannot be driven to zero because any marker value is computed before
+        its publishing transaction commits (see the module docstring). This
+        read goes through `VISIBLE_AS_OF_SQL`, the visibility helper exported
+        by the substrate module, so "knowable" has ONE implementation shared
+        with the ledger: a row counts only once the post-commit marker for its
+        batch is committed and stamped at or before `as_of`, with a documented
+        epoch rule so rows predating the marker era are not stranded.
 
         The bound is therefore TRIPLE, and each clause does distinct work:
           snapshot_at <= as_of   what had been OBSERVED by then
@@ -753,8 +773,11 @@ class TgCallerFeatureProvider:
                                  carry a `created_at` later than an early
                                  `as_of`, and without this clause it would be
                                  admitted.
-          VISIBLE_AS_OF_SQL      what had been COMMITTED by then — the bound
-                                 INSERT-stamping could never express.
+          VISIBLE_AS_OF_SQL      what had been PUBLISHED by then — a committed
+                                 marker stamped at or before `as_of`. This is
+                                 the bound INSERT-stamping could never express,
+                                 and it is tight to the marker's own commit
+                                 latency rather than exact.
 
         WHY THE FIRST TWO STAY IN PYTHON rather than moving into the SQL beside
         the helper: `created_at` is written by SQLite `datetime('now')`

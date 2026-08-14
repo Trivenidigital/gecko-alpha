@@ -639,3 +639,20 @@ async def test_allocated_batch_id_never_reuses_an_orphaned_id(db):
         db._conn, batch_id=9, visible_at=NOW.isoformat(), rows_written=0
     )
     assert await _allocate_batch_id(db._conn) == 10
+
+
+async def test_fetch_snapshot_rows_gate_params_are_keyword_only(db):
+    """The defect that made this gate inert in prod, as an executable guard.
+
+    A call passing `"contract"` as the third positional bound `identity_kind`
+    and left `as_of` at None, so the visibility predicate was skipped entirely
+    — and every test still passed, because positional and keyword calls agree
+    until the arguments are reordered. Fixing that one call site left the
+    SHAPE that permits it; the `*` is what removes the shape. Nothing else in
+    the suite fails if someone deletes it, so this does.
+    """
+    with pytest.raises(TypeError, match="positional"):
+        await _fetch_snapshot_rows(db._conn, KEY, "contract")
+
+    # The keyword form is the one that works, on the same inputs.
+    assert await _fetch_snapshot_rows(db._conn, KEY, identity_kind="contract") == []

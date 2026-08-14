@@ -199,7 +199,7 @@ async def test_c3_generalized_fetch_reads_contract_snapshots(db):
     await _insert_price_snapshot(
         db._conn, identity_key="base|0xabc", price=2.0, snapshot_at=_iso(T)
     )
-    rows = await _fetch_snapshot_rows(db._conn, "base|0xabc", "contract")
+    rows = await _fetch_snapshot_rows(db._conn, "base|0xabc", identity_kind="contract")
     assert len(rows) == 1
     assert rows[0]["price"] == 2.0
     assert rows[0]["source"] == "gt"
