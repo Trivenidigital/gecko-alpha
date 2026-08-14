@@ -215,8 +215,13 @@ def clear_registered_provider() -> None:
 
 @lru_cache(maxsize=1)
 def module_source_hash() -> str:
-    """SHA-256 of this module's source. See `snapshot.module_source_hash`."""
-    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    """SHA-256 of this module's source. See `snapshot.module_source_hash`.
+
+    Line endings normalized to `\\n` first: a CRLF checkout and an LF checkout
+    of the SAME commit must produce the same gate_version, or a locally
+    recomputed fingerprint can never match production's.
+    """
+    return snapshot_module.hash_module_source(Path(__file__))
 
 
 def compute_config_fingerprint(
