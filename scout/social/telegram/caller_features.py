@@ -49,7 +49,27 @@ same cycle-start stamp, so the exposure was full-cycle for all of them; adding
 row, dramatically better on most, worst case unchanged.
 Full closure needs a commit-stamped visibility marker, which does not exist in
 the schema today. That is a deliberately DEFERRED SCHEMA decision, not an
-oversight, and not something this read-side module should manufacture.
+oversight, and not something this read-side module should manufacture. Such a
+marker is now being built in the substrate lane, and this module will adopt its
+exported visibility helper once both land (see the seam note on
+`_load_observations`). Until that adoption, the residual above is OPEN in this
+tree and this paragraph describes the shipped behaviour exactly.
+
+**Unresolved rows are funnel facts, not behaviour facts.** When resolution
+fails, the listener writes a `(unresolved)` placeholder into `token_id` and
+`symbol`. Those rows all share one canonical identity, so left in they form a
+single enormous cluster per channel-day and `duplicate_rate` silently stops
+measuring "does this caller re-post the same token" and starts measuring "how
+often did OUR resolver fail" — a property of our pipeline attributed to the
+caller. They are therefore excluded from every cluster-shaped metric:
+duplicate rate and rank, distinct and eligible clusters (so every min-N input),
+cluster-representative selection, and cross-channel corroboration.
+
+They are NOT deleted. `history_raw_calls` remains the total funnel, and
+`history_unresolved_identity_calls` / `history_unresolved_identity_rate` report
+the excluded volume explicitly, so resolution quality stays legible as its own
+axis instead of contaminating the caller's track record. `duplicate_rate` is
+computed over `history_identified_calls`.
 
 **Self-exclusion.** Shadow evaluation runs after the signal is persisted, so a
 naive as-of query would include the signal being scored. `history_*` features
@@ -139,13 +159,36 @@ TRAILING_RECENCY_WINDOW = timedelta(days=30)
 # Chunk size for `identity_key IN (...)` lookups, under SQLite's variable cap.
 _IN_CLAUSE_CHUNK = 400
 
+# The placeholder `listener.py` writes into BOTH `token_id` and `symbol` when
+# resolution fails. Such a row records that a message arrived and could not be
+# resolved — it does not identify a token.
+#
+# Left un-excluded, every one of these collapses to the SAME canonical identity,
+# so a channel's failures form ONE giant cluster per UTC day: duplicate_rate
+# stops measuring "does this caller re-post the same token" and starts measuring
+# "how often did OUR resolver fail". Prod at ruling time: 866 sentinel rows, all
+# with NULL contract_address and NONE in `RESOLVED` state.
+#
+# Declared here rather than imported from `listener.py` for the same reason as
+# `FORWARD_WINDOWS` and the CG-id replica: the gate fingerprint binds this
+# module, and an upstream change to the placeholder must not silently
+# re-admit 866 rows into caller behaviour under an unchanged gate_version.
+# `test_sentinel_literal_still_matches_the_listener` is the drift alarm.
+UNRESOLVED_IDENTITY_SENTINEL = "(unresolved)"
+
 # Ordered `(field_name, type_name)` pairs. Part of the gate fingerprint, so
 # reordering or renaming a field starts a new generation — which is correct:
 # the evaluator reads these by name and the persisted `features_json` is the
 # evidence record.
 FEATURE_SCHEMA: tuple[tuple[str, str], ...] = (
     # --- caller history: volume and duplication -------------------------
+    # `history_raw_calls` is the TOTAL funnel and still counts unresolved
+    # rows; every cluster-shaped metric below is computed over IDENTIFIED
+    # calls only, so resolver failure cannot read as caller behaviour.
     ("history_raw_calls", "int"),
+    ("history_identified_calls", "int"),
+    ("history_unresolved_identity_calls", "int"),
+    ("history_unresolved_identity_rate", "float"),
     ("history_distinct_clusters", "int"),
     ("history_duplicate_rate", "float"),
     # --- caller history: coverage (30m-window denominators) --------------
@@ -382,6 +425,10 @@ class _Call:
     snapshot_kind: str | None
     snapshot_key: str | None
     posted_at: datetime
+    # False when the row carries no token identity at all — the resolver's
+    # `(unresolved)` placeholder. Such calls are funnel facts, not behaviour
+    # facts, and are excluded from every cluster-shaped metric.
+    has_genuine_identity: bool
 
     @property
     def cluster_key(self) -> tuple[str, str]:
@@ -594,8 +641,13 @@ class TgCallerFeatureProvider:
             and (current is None or c.message_pk != current.message_pk)
         ]
 
-        observations = self._load_observations(conn, history, as_of)
-        clusters = self._build_clusters(history)
+        # Clustering sees IDENTIFIED calls only. `history` stays whole so the
+        # funnel and the unresolved diagnostic still count what was excluded —
+        # the rows are hidden from behaviour metrics, never deleted.
+        identified = [c for c in history if c.has_genuine_identity]
+
+        observations = self._load_observations(conn, identified, as_of)
+        clusters = self._build_clusters(identified)
         outcomes = {
             cluster.signal_id: compute_call_outcome(
                 call_ts=cluster.posted_at,
@@ -609,7 +661,9 @@ class TgCallerFeatureProvider:
 
         result: dict[str, Any] = {}
         result.update(
-            self._history_features(history, clusters, outcomes, observations, as_of)
+            self._history_features(
+                history, identified, clusters, outcomes, observations, as_of
+            )
         )
         result.update(
             self._trailing_features(clusters, outcomes, as_of),
@@ -669,6 +723,17 @@ class TgCallerFeatureProvider:
         See the module docstring's Residual paragraph: INSERT-stamped is not
         COMMIT-stamped, so this is a much tighter bound rather than a closed
         one.
+
+        SEAM (incoming, do NOT depend on it yet) — commit-visibility marker.
+        A marker mechanism is being built in the substrate lane to close that
+        residual. Post-merge contract: as-of reads of
+        `source_call_price_snapshots` go through an EXPORTED visibility helper
+        owned by the substrate module, so "knowable" has ONE implementation —
+        `snapshot_at <= as_of` AND `created_at <= as_of` AND the post-commit
+        marker timestamp `<= as_of`, with a documented epoch rule so rows
+        predating the marker era are not stranded. This module adopts that
+        helper only AFTER both PRs merge; until then the two clauses below are
+        the whole bound and the Residual stands as written.
         """
         by_kind: dict[str, set[str]] = {}
         for call in calls:
@@ -743,12 +808,15 @@ class TgCallerFeatureProvider:
     def _history_features(
         self,
         history: Sequence[_Call],
+        identified: Sequence[_Call],
         clusters: dict[tuple[str, str], _Call],
         outcomes: dict[int, dict[str, float | None]],
         observations: dict[tuple[str | None, str | None], list[_Observation]],
         as_of: datetime,
     ) -> dict[str, Any]:
         raw_calls = len(history)
+        identified_calls = len(identified)
+        unresolved_calls = raw_calls - identified_calls
         distinct = len(clusters)
         priceable = {
             key: call
@@ -809,9 +877,18 @@ class TgCallerFeatureProvider:
 
         return {
             "history_raw_calls": raw_calls,
+            "history_identified_calls": identified_calls,
+            "history_unresolved_identity_calls": unresolved_calls,
+            "history_unresolved_identity_rate": (
+                0.0 if raw_calls == 0 else unresolved_calls / raw_calls
+            ),
             "history_distinct_clusters": distinct,
+            # Denominator is IDENTIFIED calls, not the raw funnel: with the raw
+            # count here, a channel whose resolver failures outnumber its real
+            # calls would show a duplicate_rate approaching 1.0 while never
+            # having repeated a single token.
             "history_duplicate_rate": (
-                0.0 if raw_calls == 0 else 1.0 - (distinct / raw_calls)
+                0.0 if identified_calls == 0 else 1.0 - (distinct / identified_calls)
             ),
             "history_eligible_distinct_clusters": len(eligible),
             "history_mature_clusters": len(mature),
@@ -893,7 +970,28 @@ class TgCallerFeatureProvider:
                 "event_corroborating_channels": 0,
                 "event_identity_kind": "unknown",
             }
-        siblings = [c for c in knowable if c.cluster_key == current.cluster_key]
+        if not current.has_genuine_identity:
+            # A call whose token could not be resolved has no cluster to rank
+            # within and nothing another channel could corroborate: there is no
+            # identity to agree about. Reported as the SAME shape as an absent
+            # signal except for the identity kind, which stays truthful.
+            #
+            # Unreachable in production today — the shadow only evaluates
+            # RESOLVED rows and no sentinel row is RESOLVED — but the provider
+            # answers whatever id it is handed, and silently ranking such a call
+            # against the sentinel pseudo-cluster is exactly the collapse this
+            # ruling removes from history.
+            return {
+                "event_duplicate_rank_in_cluster": 1,
+                "event_cluster_size": 0,
+                "event_corroborating_channels": 0,
+                "event_identity_kind": "unresolved_identity",
+            }
+        siblings = [
+            c
+            for c in knowable
+            if c.has_genuine_identity and c.cluster_key == current.cluster_key
+        ]
         rank = 1 + sum(
             1
             for c in siblings
@@ -948,6 +1046,15 @@ class TgCallerFeatureProvider:
             call = _knowable_call(row, as_of)
             if call is None:
                 continue
+            # No sentinel filter here, deliberately: it would be UNREACHABLE.
+            # This function only runs for a current call that HAS a genuine
+            # identity, and both query shapes exclude sentinels structurally —
+            # the contract branch cannot match rows whose contract_address is
+            # NULL, and the token_id branch matches a genuine identity that the
+            # `(unresolved)` placeholder never equals. A guard here would be
+            # dead code implying a protection it does not provide;
+            # `test_sentinels_cannot_match_the_corroboration_query` pins the
+            # query property that actually does the work.
             if call.identity == current.identity and call.cluster_key[1] == day:
                 channels.add(call.channel_handle)
         return len(channels)
@@ -984,7 +1091,27 @@ def _knowable_call(row: sqlite3.Row, as_of: datetime) -> _Call | None:
         snapshot_kind=None if snap is None else snap[0],
         snapshot_key=None if snap is None else snap[1],
         posted_at=posted_at,
+        has_genuine_identity=_has_genuine_identity(
+            contract_address=row["contract_address"], token_id=row["token_id"]
+        ),
     )
+
+
+def _has_genuine_identity(
+    *, contract_address: str | None, token_id: str | None
+) -> bool:
+    """Whether a row identifies a TOKEN, as opposed to recording a failure.
+
+    A contract address is always genuine. Without one, the `token_id` must not
+    be the resolver's `(unresolved)` placeholder — that value says "we could
+    not tell what this message was about", and treating it as an identity makes
+    every failure of ours cluster together into what then reads as one caller
+    re-posting the same token all day.
+    """
+    if (contract_address or "").strip():
+        return True
+    token = (token_id or "").strip()
+    return bool(token) and token != UNRESOLVED_IDENTITY_SENTINEL
 
 
 def _horizon_matured(call_ts: datetime, horizon: str, as_of: datetime) -> bool:

@@ -1765,6 +1765,237 @@ def test_feature_schema_types_match_the_values_produced(db, provider):
         )
 
 
+async def _sentinel_call(
+    db: Database, *, n: int, posted_at: datetime, channel: str = CHANNEL
+) -> int:
+    """A resolution FAILURE row, exactly as `listener.py` writes it: the
+    `(unresolved)` placeholder in both token_id and symbol, no contract."""
+    await _message(db, pk=n, posted_at=posted_at, channel=channel)
+    await db._conn.execute(
+        """INSERT INTO tg_social_signals
+           (id, message_pk, token_id, symbol, contract_address, chain,
+            mcap_at_sighting, resolution_state, source_channel_handle, created_at)
+           VALUES (?, ?, '(unresolved)', '(unresolved)', NULL, NULL, NULL,
+                   'UNRESOLVED_TRANSIENT', ?, ?)""",
+        (n, n, channel, posted_at.isoformat()),
+    )
+    await db._conn.commit()
+    return n
+
+
+async def test_adding_100_sentinels_moves_only_the_diagnostic(db, provider):
+    """OPERATOR DISCRIMINATOR (Ruling 1).
+
+    Adding 100 unresolved sentinel calls to a channel MUST change the
+    unresolved/coverage diagnostic and MUST NOT change duplicate_rate, the
+    distinct canonical-cluster count, or corroboration.
+
+    Without the exclusion every sentinel shares the single `(unresolved)`
+    canonical identity, so they collapse into ONE cluster per UTC day: the
+    cluster count moves by 1 and duplicate_rate rockets toward 1.0 while the
+    caller has not repeated a single token. In prod that is 866 rows.
+    """
+    # Real behaviour: two genuine calls of the SAME token today (a true
+    # duplicate) plus one other token, so duplicate_rate is non-trivial.
+    base = T0 - timedelta(hours=6)
+    for n, offset in ((1, timedelta(0)), (2, timedelta(minutes=5))):
+        await _call(
+            db,
+            n=n,
+            posted_at=base + offset,
+            token_id="dex:solana:abc",
+            contract="ABC",
+            chain="solana",
+        )
+    await _call(db, n=3, posted_at=base + timedelta(minutes=10), token_id="other-coin")
+    current = await _call(
+        db, n=4, posted_at=T0, token_id="dex:solana:cur", contract="CUR", chain="solana"
+    )
+    await _call(
+        db,
+        n=5,
+        posted_at=T0 - timedelta(hours=1),
+        token_id="dex:solana:cur",
+        contract="CUR",
+        chain="solana",
+        channel=OTHER_CHANNEL,
+    )
+
+    before = provider.features(CHANNEL, T0, current)
+
+    for i in range(100):
+        await _sentinel_call(db, n=1000 + i, posted_at=base + timedelta(minutes=20 + i))
+
+    after = provider.features(CHANNEL, T0, current)
+
+    # MUST NOT move — caller behaviour.
+    assert after["history_duplicate_rate"] == before["history_duplicate_rate"]
+    assert after["history_distinct_clusters"] == before["history_distinct_clusters"]
+    assert (
+        after["history_eligible_distinct_clusters"]
+        == before["history_eligible_distinct_clusters"]
+    )
+    assert (
+        after["event_corroborating_channels"] == before["event_corroborating_channels"]
+    )
+    assert after["event_duplicate_rank_in_cluster"] == (
+        before["event_duplicate_rank_in_cluster"]
+    )
+    # MUST move — resolution-quality diagnostic and the total funnel.
+    assert after["history_unresolved_identity_calls"] == 100
+    assert before["history_unresolved_identity_calls"] == 0
+    assert after["history_unresolved_identity_rate"] > (
+        before["history_unresolved_identity_rate"]
+    )
+    assert after["history_raw_calls"] == before["history_raw_calls"] + 100
+    assert after["history_identified_calls"] == before["history_identified_calls"]
+
+
+async def test_duplicate_rate_measures_tokens_not_resolver_failures(db, provider):
+    """The concrete arithmetic the ruling protects.
+
+    Three identified calls, two of them the same token: 2 clusters / 3 calls
+    -> duplicate_rate 1/3. Adding 9 sentinels must leave that exactly 1/3. On
+    the raw-funnel denominator it would read 1 - 2/12 = 0.833.
+    """
+    base = T0 - timedelta(hours=6)
+    for n, offset in ((1, timedelta(0)), (2, timedelta(minutes=5))):
+        await _call(
+            db,
+            n=n,
+            posted_at=base + offset,
+            token_id="dex:solana:abc",
+            contract="ABC",
+            chain="solana",
+        )
+    await _call(db, n=3, posted_at=base + timedelta(minutes=10), token_id="other-coin")
+    for i in range(9):
+        await _sentinel_call(db, n=200 + i, posted_at=base + timedelta(minutes=30 + i))
+    current = await _call(db, n=4, posted_at=T0, token_id="beta-coin")
+
+    features = provider.features(CHANNEL, T0, current)
+
+    assert features["history_identified_calls"] == 3
+    assert features["history_distinct_clusters"] == 2
+    assert features["history_duplicate_rate"] == pytest.approx(1 / 3)
+    assert features["history_unresolved_identity_rate"] == pytest.approx(9 / 12)
+
+
+async def test_sentinels_do_not_corroborate(db, provider):
+    """Two channels failing to resolve on the same day agree about NOTHING —
+    there is no identity for them to agree about."""
+    await _sentinel_call(
+        db, n=1, posted_at=T0 - timedelta(hours=1), channel=OTHER_CHANNEL
+    )
+    current = await _sentinel_call(db, n=2, posted_at=T0)
+
+    features = provider.features(CHANNEL, T0, current)
+
+    assert features["event_corroborating_channels"] == 0
+
+
+async def test_sentinels_cannot_match_the_corroboration_query(db, provider):
+    """Pins the structural property that keeps sentinels out of corroboration.
+
+    `_corroborating_channels` carries no sentinel filter because one would be
+    unreachable: the contract branch cannot match rows with a NULL
+    contract_address, and the token_id branch matches a genuine identity that
+    the `(unresolved)` placeholder never equals. That is a property of the
+    QUERY SHAPES, so it is what gets pinned — a guard in the loop would be dead
+    code implying a protection it does not provide.
+
+    A channel that only ever failed to resolve therefore corroborates nothing,
+    even while another channel is making a real call the same day.
+    """
+    # Sentinels from a second channel, same day as the current genuine call.
+    for i in range(5):
+        await _sentinel_call(
+            db,
+            n=300 + i,
+            posted_at=T0 - timedelta(hours=2) + timedelta(minutes=i),
+            channel=OTHER_CHANNEL,
+        )
+    current = await _call(
+        db, n=1, posted_at=T0, token_id="dex:solana:cur", contract="CUR", chain="solana"
+    )
+
+    features = provider.features(CHANNEL, T0, current)
+
+    assert features["event_corroborating_channels"] == 1, (
+        "only the scored channel should count — sentinels from another channel "
+        "are not corroboration of anything"
+    )
+
+    # And the same for a no-contract genuine identity (the token_id branch).
+    current2 = await _call(db, n=2, posted_at=T0, token_id="genuine-slug")
+    features2 = provider.features(CHANNEL, T0, current2)
+    assert features2["event_corroborating_channels"] == 1
+
+
+async def test_sentinel_current_signal_reports_no_event_context(db, provider):
+    """Documented answer for a sentinel CURRENT signal (Ruling 1 item 4).
+
+    Unreachable in production — the shadow evaluates only RESOLVED rows and no
+    sentinel row is RESOLVED — but the provider answers whatever id it is
+    given. It reports rank 1 / cluster 0 / corroboration 0, the same shape as
+    an absent signal, with a truthful identity kind of its own so the state is
+    distinguishable in `features_json` rather than silently looking like a
+    clean first call.
+    """
+    await _sentinel_call(db, n=1, posted_at=T0 - timedelta(hours=2))
+    current = await _sentinel_call(db, n=2, posted_at=T0)
+
+    features = provider.features(CHANNEL, T0, current)
+
+    assert features["event_duplicate_rank_in_cluster"] == 1
+    assert features["event_cluster_size"] == 0
+    assert features["event_corroborating_channels"] == 0
+    assert features["event_identity_kind"] == "unresolved_identity"
+
+
+async def test_sentinels_never_reach_cluster_representative_or_min_n(db, provider):
+    """A channel with ONLY sentinels has no track record at all — not a
+    one-cluster record that could creep toward the min-N gate."""
+    for i in range(20):
+        await _sentinel_call(
+            db, n=100 + i, posted_at=T0 - timedelta(hours=5) + timedelta(minutes=i)
+        )
+    current = await _call(db, n=1, posted_at=T0, token_id="beta-coin")
+
+    features = provider.features(CHANNEL, T0, current)
+
+    assert features["history_raw_calls"] == 20
+    assert features["history_identified_calls"] == 0
+    assert features["history_distinct_clusters"] == 0
+    assert features["history_eligible_distinct_clusters"] == 0
+    assert features["history_duplicate_rate"] == 0.0
+    assert features["history_unresolved_identity_rate"] == 1.0
+
+
+def test_sentinel_literal_still_matches_the_listener():
+    """DRIFT ALARM. The placeholder is declared in this module (fingerprint
+    binding) but WRITTEN by `listener.py`. If the listener's literal changes
+    and this one does not, the exclusion silently stops matching and every
+    unresolved row floods back into caller behaviour under an unchanged
+    gate_version — the failure mode this ruling exists to remove.
+    """
+    from scout.social.telegram.caller_features import UNRESOLVED_IDENTITY_SENTINEL
+
+    listener_src = (
+        Path(__file__).resolve().parents[1]
+        / "scout"
+        / "social"
+        / "telegram"
+        / "listener.py"
+    ).read_text(encoding="utf-8")
+
+    assert f'token_id="{UNRESOLVED_IDENTITY_SENTINEL}"' in listener_src, (
+        "listener.py no longer writes this placeholder into token_id — the "
+        "sentinel exclusion is now matching nothing"
+    )
+    assert f'symbol="{UNRESOLVED_IDENTITY_SENTINEL}"' in listener_src
+
+
 def test_canonical_identity_is_channel_independent_and_normalized():
     a = canonical_identity(
         chain="Solana", contract_address="ABC123", token_id="dex:solana:ABC123"
