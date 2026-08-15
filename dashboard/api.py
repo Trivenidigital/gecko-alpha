@@ -62,16 +62,37 @@ _db_path: str = "scout.db"
 
 # Cached ScoutDatabase instance — avoids re-creating + re-migrating on every request.
 _scout_db = None
+# Serializes the cold start. Only the first request after a dashboard restart
+# ever contends for it; every later caller takes the lock-free fast path below.
+_scout_db_lock = asyncio.Lock()
 
 
 async def _get_scout_db(db_path: str):
-    """Return a cached, initialized ScoutDatabase instance."""
-    global _scout_db
-    if _scout_db is None:
-        from scout.db import Database as ScoutDatabase
+    """Return a cached, initialized ScoutDatabase instance.
 
-        _scout_db = ScoutDatabase(db_path)
-        await _scout_db.initialize()
+    Publishing ``_scout_db`` only AFTER ``initialize()`` returns is the whole
+    point: assigning it first left a window (the full migration run — seconds
+    on a large DB) in which a concurrently-arriving request took the
+    "already cached" branch and got a Database whose ``_conn`` is still None.
+    Handlers query through ``sdb._conn`` directly, so that request died on
+    ``'NoneType' object has no attribute 'execute'`` and returned HTTP 500.
+
+    The lock is not redundant with the reordering: without it, two racing cold
+    starts would each construct AND initialize their own Database, and the
+    loser's connection would be leaked with no reference left to close it.
+    """
+    global _scout_db
+    if _scout_db is not None:
+        return _scout_db
+    async with _scout_db_lock:
+        # Re-check under the lock — a caller that queued behind the initializer
+        # must reuse its result rather than run a second migration pass.
+        if _scout_db is None:
+            from scout.db import Database as ScoutDatabase
+
+            scout_db = ScoutDatabase(db_path)
+            await scout_db.initialize()
+            _scout_db = scout_db
     return _scout_db
 
 
