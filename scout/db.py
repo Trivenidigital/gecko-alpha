@@ -327,6 +327,19 @@ class Database:
             # pre-cutover state, not a gap to backfill.
             await self._migrate_tg_act_shadow_v1()
 
+            # F3 control-plane event ledger. schema_version 20260814.
+            # Purely additive: one new append-only table plus its two indexes,
+            # no column added to any existing table and no backfill.
+            #
+            # Deploy-inert until a writer runs: the table ships EMPTY, and the
+            # §12a watchdog that reads it is itself gated on
+            # ALERT_CHANNEL_WATCHDOG_ENABLED, so installing the schema pages
+            # nobody. The first `refresh_all` after deploy writes the first
+            # heartbeat row; before that the ledger's own freshness check has
+            # nothing to be stale about, which is why the watchdog treats an
+            # empty table as a breach only once it is enabled.
+            await self._migrate_alert_events_v1()
+
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
             # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -6142,6 +6155,142 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "tg_act_shadow_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_alert_events_v1(self) -> None:
+        """F3: `alert_events` — append-only control-plane event ledger.
+
+        THE DEFECT. journald retention on prod collapses to minutes during the
+        03:00 backup window, so any control-plane fact that exists only as a
+        log line is unreconstructable after the fact. Worse, the four decisive
+        suppression transitions (initial latch, re-latch, clear, parole re-arm)
+        and the parole slot decrement emit no log event at all — they exist
+        only as mutated `combo_performance` rows, which record the CURRENT
+        state and nothing about how it got there. Suppression / retest / alert
+        acceptance evidence therefore cannot be reconstructed.
+
+        THE SHAPE. One append-only table, written by
+        `scout.trading.alert_events.record_alert_event`. Rows are never updated
+        and never pruned — deliberate: they are rare (a handful per refresh) and
+        tiny, and a retention policy on an audit ledger reintroduces exactly the
+        "the evidence aged out" failure this closes. `event_type` is a CHECK
+        constraint rather than writer discipline, so a typo'd event lands as a
+        loud IntegrityError instead of an unqueryable row.
+
+        NO BACKFILL. The transitions that already happened left no record to
+        recover from; the ledger starts at the deploy boundary and every row in
+        it is a real observation.
+
+        Indexes ship inside this step (DDL-order lesson), not deferred: the two
+        query axes are per-combo history and per-event-type freshness (the §12a
+        watchdog reads the newest `refresh_completed`).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "alert_events_v1"
+        schema_version = 20260814
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS alert_events (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at       TEXT NOT NULL,
+                    event_type       TEXT NOT NULL CHECK (event_type IN (
+                        'suppression_transition',
+                        'parole_slot_spent',
+                        'parole_slot_refunded',
+                        'reversal_pending_recorded',
+                        'alert_dispatched',
+                        'alert_delivered',
+                        'alert_failed',
+                        'marker_stamped',
+                        'marker_cleared',
+                        'marker_anomaly',
+                        'refresh_completed'
+                    )),
+                    combo_key        TEXT,
+                    signal_type      TEXT,
+                    alert_source     TEXT,
+                    transition       TEXT,
+                    detected_at      TEXT,
+                    delivery_result  TEXT,
+                    retry            INTEGER,
+                    payload_hash     TEXT,
+                    state_json       TEXT,
+                    detail           TEXT
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_events_combo_created "
+                "ON alert_events(combo_key, created_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_events_type_created "
+                "ON alert_events(event_type, created_at)"
+            )
+
+            # Verify presence -- fail loud on drift rather than at first write.
+            cur = await conn.execute("PRAGMA table_info(alert_events)")
+            post_cols = {row[1] for row in await cur.fetchall()}
+            required = {
+                "id",
+                "created_at",
+                "event_type",
+                "combo_key",
+                "signal_type",
+                "alert_source",
+                "transition",
+                "detected_at",
+                "delivery_result",
+                "retry",
+                "payload_hash",
+                "state_json",
+                "detail",
+            }
+            missing = required - post_cols
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: {sorted(missing)}"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("alert_events_v1_migration_complete", table="alert_events")
+        except BaseException as e:
+            _log.exception(
+                "alert_events_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
