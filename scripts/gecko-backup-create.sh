@@ -145,7 +145,27 @@ fi
 # Verify the new file is structurally sound before we promote it.
 # PRAGMA integrity_check returns "ok" on a single line for a clean DB;
 # anything else (multi-line error report) indicates corruption.
-INTEGRITY="$("$SQLITE_BIN" "$DEST_TMP" "PRAGMA integrity_check;" 2>&1 || true)"
+#
+# `immutable=1`, NOT a bare path, and not merely `mode=ro`. The backup inherits
+# the source's WAL-mode header, so ANY ordinary open — read-only included —
+# makes SQLite create `-shm` and `-wal` beside the file. Verified locally
+# against sqlite 3.50.4: a `mode=ro` open of a freshly-`.backup`-ed WAL-header
+# database produces both sidecars; the same open with `immutable=1` produces
+# none and still returns `ok` from integrity_check and quick_check.
+#
+# On 2026-08-15 that mechanism cost prod all three of its backups: an operator
+# quick_check over the two newest minted sidecars with fresh mtimes, and
+# mtime-descending rotation retained the sidecars and deleted every real
+# backup. Rotation now excludes those suffixes, but the durable fix is to not
+# create them: `immutable=1` is correct here because a just-written `.backup`
+# output is a complete, checkpointed database with nothing to replay.
+#
+# The URI is built with the path percent-escaped only where it must be. DEST is
+# assembled from GECKO_BACKUP_DIR plus a timestamp, so `?` and `#` are the only
+# realistic URI metacharacters; a literal `?` in an operator-set backup dir
+# would otherwise truncate the path silently.
+DEST_TMP_URI="file:$(printf '%s' "$DEST_TMP" | sed 's/?/%3f/g; s/#/%23/g')?mode=ro&immutable=1"
+INTEGRITY="$("$SQLITE_BIN" "$DEST_TMP_URI" "PRAGMA integrity_check;" 2>&1 || true)"
 if [[ "$INTEGRITY" != "ok" ]]; then
     echo "ERROR: integrity check failed for $DEST_TMP:" >&2
     printf '%s\n' "$INTEGRITY" >&2

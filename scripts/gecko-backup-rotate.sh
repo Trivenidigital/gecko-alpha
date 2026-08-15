@@ -91,9 +91,32 @@ trap 'rm -f "$TMP_LIST" "$TMP_LIST.err"' EXIT
 # them only because create kept failing and aborted the unit before rotate ran.
 # Simulated against the live directory, the next successful create would have
 # pruned all three real backups and retained three 1 KB journals.
+#
+# 2026-08-15, prod: THE SAME CLASS, A DIFFERENT NAMESPACE — and this one was
+# not a simulation, it happened. `deleted=5 retained=2`, where the two retained
+# entries were a 32K `-shm` and a 0-byte `-wal`. All three real backups gone.
+#
+# Mechanism: the backup files carry a WAL-mode header, so merely OPENING one
+# makes SQLite create `<backup>-shm` and `<backup>-wal` beside it — even on a
+# read-only open. An operator running `PRAGMA quick_check` over the two newest
+# backups via `sqlite3 "file:...?mode=ro"` therefore minted sidecars with fresh
+# mtimes, and mtime-descending retention handed them every slot. The integrity
+# check destroyed the thing it was verifying.
+#
+# The `.partial` exclusion above did not cover it: these sidecars sit beside
+# COMPLETED backups, so their names contain no `.partial` at all.
+#
+# Hence the suffix exclusions below. They anchor to the END of the name, so an
+# operator tag that merely CONTAINS one of the words
+# (`scout.db.bak.before-wal-migration`) is still a backup and still retained —
+# the ad-hoc-tag workflow is deliberately not narrowed. The readers were fixed
+# too (`immutable=1` stops the sidecars being created at all), but rotation
+# excludes them regardless: a retention policy must not depend on every future
+# reader remembering a URI parameter.
 if ! find "$GECKO_BACKUP_DIR" -maxdepth 1 -type f \
         \( -name 'scout.db.bak.*' -o -name 'scout.db.bak-*' \) \
         ! -name '*.partial*' \
+        ! -name '*-shm' ! -name '*-wal' ! -name '*-journal' \
         -printf '%T@ %p\n' 2>"$TMP_LIST.err" \
     | sort -rn \
     | cut -d' ' -f2- > "$TMP_LIST"; then

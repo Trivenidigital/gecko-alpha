@@ -212,12 +212,12 @@ def test_create_exits_5_on_integrity_failure(tmp_path):
     stub.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$2" == .backup* ]]; then\n'
-        '  # extract dest from `.backup \'path\'`\n'
+        "  # extract dest from `.backup 'path'`\n"
         # Raw triple-quoted: `\(` and `\1` must reach sed literally. In a plain
         # string `"\1"` is chr(1), which silently made `dest` garbage — no
         # .partial was ever written and `assert partials == []` passed for the
         # wrong reason.
-        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
+        r"""  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")""" + "\n"
         '  echo "stub-backup-data" > "$dest"\n'
         "  exit 0\n"
         'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then\n'
@@ -270,7 +270,7 @@ def _sidecar_stub(path: Path, *, mode: str, witness: Path | None = None) -> Path
     body = [
         "#!/usr/bin/env bash",
         'if [[ "$2" == .backup* ]]; then',
-        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''',
+        r"""  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")""",
         '  echo "stub-backup-data" > "$dest"',
         '  echo "j" > "$dest-journal"',
         '  echo "w" > "$dest-wal"',
@@ -288,9 +288,11 @@ def _sidecar_stub(path: Path, *, mode: str, witness: Path | None = None) -> Path
         body += ["  exit 0"]
     body += [
         'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then',
-        '  echo "***corruption detected by stub***"'
-        if mode == "integrity_fail"
-        else '  echo "ok"',
+        (
+            '  echo "***corruption detected by stub***"'
+            if mode == "integrity_fail"
+            else '  echo "ok"'
+        ),
         "  exit 0",
         "fi",
         "exit 99",
@@ -419,7 +421,7 @@ def test_sigterm_removes_partial_and_every_sidecar(tmp_path):
     stub.write_text(
         "#!/usr/bin/env bash\n"
         'if [[ "$2" == .backup* ]]; then\n'
-        r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
+        r"""  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")""" + "\n"
         '  echo d > "$dest"\n'
         '  echo j > "$dest-journal"\n'
         '  echo w > "$dest-wal"\n'
@@ -497,7 +499,7 @@ def test_sigint_and_sighup_also_clean_up(tmp_path):
         stub.write_text(
             "#!/usr/bin/env bash\n"
             'if [[ "$2" == .backup* ]]; then\n'
-            r'''  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")''' + "\n"
+            r"""  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")""" + "\n"
             '  echo d > "$dest"; echo j > "$dest-journal"\n'
             '  echo w > "$dest-wal"; echo s > "$dest-shm"\n'
             f'  echo "$dest" >> {shlex.quote(str(witness))}\n'
@@ -518,8 +520,12 @@ def test_sigint_and_sighup_also_clean_up(tmp_path):
             }
         )
         proc = subprocess.Popen(
-            ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, start_new_session=True,
+            ["bash", str(SCRIPT)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
         try:
             deadline = time.time() + 30
@@ -533,9 +539,9 @@ def test_sigint_and_sighup_also_clean_up(tmp_path):
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 proc.wait(timeout=10)
 
-        assert sorted(p.name for p in backup_dir.iterdir()) == [], (
-            f"{sig.name} left artifacts behind"
-        )
+        assert (
+            sorted(p.name for p in backup_dir.iterdir()) == []
+        ), f"{sig.name} left artifacts behind"
 
 
 # ---------------------------------------------------------------------
@@ -561,13 +567,15 @@ def test_unit_timeout_is_pinned_at_30_minutes():
         for ln in unit.splitlines()
         if ln.strip().startswith("TimeoutStartSec=")
     ]
-    assert values == ["1800"], f"expected exactly one TimeoutStartSec=1800, got {values}"
+    assert values == [
+        "1800"
+    ], f"expected exactly one TimeoutStartSec=1800, got {values}"
     # The stale RATIONALE must be gone, not every mention of the old number:
     # the replacement comment cites 600s when explaining the incident, which is
     # exactly the context a future reader needs.
-    assert "4× headroom" not in unit and "4x headroom" not in unit, (
-        "the superseded sizing rationale must not survive alongside the new value"
-    )
+    assert (
+        "4× headroom" not in unit and "4x headroom" not in unit
+    ), "the superseded sizing rationale must not survive alongside the new value"
     assert "~2-3 minutes" not in unit, "stale duration estimate still present"
 
 
@@ -596,6 +604,71 @@ def test_create_script_traps_termination_signals():
     # correct disclaimer.
     trap_lines = [ln for ln in src.splitlines() if ln.strip().startswith("trap ")]
     assert trap_lines, "no traps registered at all"
-    assert not any("KILL" in ln for ln in trap_lines), (
-        f"SIGKILL is uncatchable and must not be registered: {trap_lines}"
+    assert not any(
+        "KILL" in ln for ln in trap_lines
+    ), f"SIGKILL is uncatchable and must not be registered: {trap_lines}"
+
+
+def test_integrity_check_opens_the_backup_immutable(tmp_path):
+    """*** THE 2026-08-15 PROD INCIDENT, READER SIDE. ***
+
+    The backup inherits the source's WAL-mode header, so ANY ordinary open —
+    `mode=ro` included — makes SQLite create `-shm` and `-wal` beside it.
+    Verified against sqlite 3.50.4: a `mode=ro` open of a freshly-`.backup`-ed
+    WAL-header database produces both sidecars; the same open with
+    `immutable=1` produces none and still returns `ok`.
+
+    On prod that mechanism cost all three backups: sidecars with fresh mtimes
+    took every mtime-descending retention slot. Rotation now excludes those
+    suffixes, but not creating them is the durable half of the fix.
+
+    Asserted on the ARGUMENT the script hands sqlite3, captured by a stub, so
+    the test pins the contract rather than the absence of files on a platform
+    whose sqlite may behave differently.
+    """
+    db = tmp_path / "scout.db"
+    db.write_bytes(b"x" * 64)
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    argfile = tmp_path / "args"
+
+    stub = tmp_path / "sqlite3-stub"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\n" "$1" >> "$ARGFILE"\n'
+        'if [[ "$2" == .backup* ]]; then\n'
+        r"""  dest=$(echo "$2" | sed "s/^.backup '\(.*\)'$/\1/")""" + "\n"
+        '  echo "stub-backup-data" > "$dest"\n'
+        "  exit 0\n"
+        'elif [[ "$2" == "PRAGMA integrity_check;" ]]; then\n'
+        '  echo "ok"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 99\n"
+    )
+    stub.chmod(0o755)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_SQLITE_BIN": str(stub),
+            "ARGFILE": str(argfile),
+        }
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    args = argfile.read_text().splitlines()
+    # Second invocation is the integrity check; the first is `.backup`.
+    assert len(args) == 2, args
+    verify_arg = args[1]
+    assert verify_arg.startswith("file:"), (
+        f"the integrity check opened a bare path, which creates sidecars on a "
+        f"WAL-header backup: {verify_arg}"
+    )
+    assert "immutable=1" in verify_arg, (
+        f"`mode=ro` alone still creates -shm/-wal; immutable=1 is what "
+        f"prevents them: {verify_arg}"
     )
