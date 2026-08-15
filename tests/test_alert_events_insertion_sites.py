@@ -1886,3 +1886,65 @@ async def test_open_gate_tail_fails_open_when_a_reason_was_recorded(
         assert seen == ["parole_decrement: database is locked"]
     finally:
         await db.close()
+
+
+async def test_non_db_exception_in_pending_write_is_contained(
+    tmp_path, settings_factory, monkeypatch
+):
+    """debt#8. The per-combo handler caught `aiosqlite.Error` only, but the
+    guarded body also renders a message and json-encodes a payload. A
+    TypeError from that work would escape, propagate out through the
+    `async with db._txn_lock`, and leave the transaction opened by the first
+    per-combo UPDATE half-open on the shared connection.
+
+    Two combos, the FIRST one made to raise a non-DB error: the refresh must
+    survive, the second combo's page must still be recorded, and the
+    connection must be left clean for the next writer."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_build = combo_refresh._build_reversal_message
+        seen: list[str] = []
+
+        def _boom_on_first(combo, transition, post, settings_):
+            seen.append(combo)
+            if combo == "combo_a":
+                raise TypeError("unrenderable payload")
+            return real_build(combo, transition, post, settings_)
+
+        monkeypatch.setattr(combo_refresh, "_build_reversal_message", _boom_on_first)
+        # Must not raise out of refresh_all.
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        assert "combo_a" in seen and "combo_b" in seen
+
+        # The surviving combo's page was still recorded — checked in the
+        # LEDGER, not on the row: a recorded page that then delivers
+        # successfully has its marker cleared by the payload-bound clear, so an
+        # empty `reversal_alert_pending_json` is the success shape, not
+        # evidence of a lost page.
+        recorded = {
+            r["combo_key"]
+            for r in await _events(db, event_type="reversal_pending_recorded")
+        }
+        assert "combo_b" in recorded
+        assert "combo_a" not in recorded, "the raising combo recorded a page anyway"
+
+        # ...and the connection is clean, not carrying a half-open transaction
+        # into the next writer.
+        assert not db._conn.in_transaction, "a half-open transaction was left behind"
+        await db._conn.execute(
+            "UPDATE combo_performance SET refresh_failures = refresh_failures "
+            "WHERE window = '30d'"
+        )
+        await db._conn.commit()
+    finally:
+        await db.close()

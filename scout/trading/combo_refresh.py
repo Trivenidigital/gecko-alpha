@@ -1310,12 +1310,22 @@ async def _record_pending_reversals(
                     # must preserve the page bodies, not just their names.
                     recorded.append(combo)
                     recorded_payloads[combo] = payload
-            except aiosqlite.Error as exc:
+            except Exception as exc:
+                # `Exception`, not `aiosqlite.Error`. The body between the
+                # try and here does more than talk to SQLite — it renders a
+                # message and json-encodes a payload — so a TypeError or a
+                # ValueError from that work would have escaped this handler,
+                # propagated out through the `async with db._txn_lock`, and
+                # left the transaction opened by the first per-combo UPDATE
+                # half-open on the shared connection for the next writer to
+                # inherit. Containing the DB errors and not the others made
+                # the least likely failure the most damaging one.
                 log.exception(
                     "suppression_reversal_pending_write_failed",
                     combo_key=combo,
                     transition=transition,
                     err=str(exc),
+                    err_type=type(exc).__name__,
                     detail="page not recorded; refresh continues and the next "
                     "run re-detects nothing — this page is lost",
                 )
