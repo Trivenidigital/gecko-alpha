@@ -528,11 +528,11 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
     when the DB is degraded, so the ledger INSERT may well fail too — the writer
     swallows that and the fail-open decision is unaffected.
 
-    The counter and cooldown are maintained BEFORE and independently of the
-    send: ``_last_alerted_ts`` is stamped at the moment the alert is decided on,
-    not when it lands. That is pre-existing behaviour and deliberately untouched
-    here — a rejected page therefore waits out the cooldown like a delivered
-    one. The ledger now records which of the two actually happened.
+    The fail-open COUNTER is maintained unconditionally — it measures DB
+    degradation, which happened whether or not anyone was told. The COOLDOWN is
+    not: ``_last_alerted_ts`` advances only after a confirmed delivery, so a
+    rejected page does not consume the window and the next fail-open re-attempts
+    immediately.
     """
     global _last_alerted_ts
     log.error(
@@ -551,7 +551,6 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
     threshold = settings.FEEDBACK_FALLBACK_ALERT_THRESHOLD
     cooldown = settings.FEEDBACK_FALLBACK_ALERT_COOLDOWN_SEC
     if len(_fallback_timestamps) >= threshold and now_ts - _last_alerted_ts >= cooldown:
-        _last_alerted_ts = now_ts
         msg = (
             f"⚠ Suppression fail-open fired {len(_fallback_timestamps)}x "
             f"in last hour. DB may be degraded — combos are currently ungated."
@@ -608,6 +607,13 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
                 payload_hash=digest,
             )
             return
+        # Cooldown consumed only by a page that ACTUALLY LANDED. Stamping at
+        # decision time meant a rejected page burned the whole window: the
+        # operator was told nothing, and the next fail-open inside the cooldown
+        # was suppressed on the strength of a delivery that never happened.
+        # This path fires when the DB is already degraded, so silence there is
+        # the most expensive kind.
+        _last_alerted_ts = now_ts
         await record_alert_event(
             db,
             event_type="alert_delivered",

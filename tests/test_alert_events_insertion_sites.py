@@ -1252,19 +1252,22 @@ async def test_fallback_non_200_records_failed_not_delivered(
             == []
         ), "a rejected page was recorded as delivered"
 
-        # Threshold/cooldown behaviour unchanged: the counter still holds every
-        # fail-open in the window, the cooldown was stamped at decision time
-        # (pre-existing, deliberately untouched), and a further fail-open inside
-        # the cooldown attempts no second send.
+        # The COUNTER still records every fail-open — it measures DB
+        # degradation, which happened whether or not anyone was told.
         assert len(suppression._fallback_timestamps) == threshold
-        assert suppression._last_alerted_ts != float("-inf")
+        # The COOLDOWN is not consumed by a page that never landed (debt#20).
+        # Stamping it here would mean the operator was told nothing AND the
+        # next fail-open was suppressed on the strength of that non-delivery.
+        assert suppression._last_alerted_ts == float(
+            "-inf"
+        ), "a rejected page consumed the cooldown window"
         await suppression._record_fallback(db, "combo_a", "database is locked", s)
-        assert len(fake.kwargs) == 1, "cooldown did not suppress the second send"
+        assert len(fake.kwargs) == 2, "the retry after a failed page was suppressed"
         assert (
             len(
                 await _events(db, event_type="alert_failed", alert_source="suppression")
             )
-            == 1
+            == 2
         )
     finally:
         suppression._fallback_timestamps.clear()
@@ -1881,5 +1884,140 @@ async def test_open_gate_tail_fails_open_when_a_reason_was_recorded(
         )
         assert result == (True, "db_error_fallback_allow", None)
         assert seen == ["parole_decrement: database is locked"]
+    finally:
+        await db.close()
+
+
+async def test_non_db_exception_in_pending_write_is_contained(
+    tmp_path, settings_factory, monkeypatch
+):
+    """debt#8. The per-combo handler caught `aiosqlite.Error` only, but the
+    guarded body also renders a message and json-encodes a payload. A
+    TypeError from that work would escape, propagate out through the
+    `async with db._txn_lock`, and leave the transaction opened by the first
+    per-combo UPDATE half-open on the shared connection.
+
+    Two combos, the FIRST one made to raise a non-DB error: the refresh must
+    survive, the second combo's page must still be recorded, and the
+    connection must be left clean for the next writer."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_build = combo_refresh._build_reversal_message
+        seen: list[str] = []
+
+        def _boom_on_first(combo, transition, post, settings_):
+            seen.append(combo)
+            if combo == "combo_a":
+                raise TypeError("unrenderable payload")
+            return real_build(combo, transition, post, settings_)
+
+        monkeypatch.setattr(combo_refresh, "_build_reversal_message", _boom_on_first)
+        # Must not raise out of refresh_all.
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        assert "combo_a" in seen and "combo_b" in seen
+
+        # The surviving combo's page was still recorded — checked in the
+        # LEDGER, not on the row: a recorded page that then delivers
+        # successfully has its marker cleared by the payload-bound clear, so an
+        # empty `reversal_alert_pending_json` is the success shape, not
+        # evidence of a lost page.
+        recorded = {
+            r["combo_key"]
+            for r in await _events(db, event_type="reversal_pending_recorded")
+        }
+        assert "combo_b" in recorded
+        assert "combo_a" not in recorded, "the raising combo recorded a page anyway"
+
+        # ...and the connection is clean, not carrying a half-open transaction
+        # into the next writer.
+        assert not db._conn.in_transaction, "a half-open transaction was left behind"
+        await db._conn.execute(
+            "UPDATE combo_performance SET refresh_failures = refresh_failures "
+            "WHERE window = '30d'"
+        )
+        await db._conn.commit()
+    finally:
+        await db.close()
+
+
+async def test_stale_reversal_page_is_delivered_with_a_contradiction_note(
+    tmp_path, settings_factory, monkeypatch
+):
+    """debt#4. A page carried over from an earlier refresh describes a
+    transition that may since have been undone — often by the operator doing
+    exactly what the page told them to. Delivering "combo X auto-suppressed"
+    about a combo that is currently unsuppressed sends them to fix something
+    already fixed.
+
+    CORRECTED, NOT SKIPPED: the transition really happened and was never
+    reported, so dropping the page would silently discard a §12b notification
+    on the strength of a state read taken after the fact."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        monkeypatch.setattr(
+            combo_refresh, "_send_suppression_reversal_alert", _BoomSender()
+        )
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)  # detected, delivery failed
+        assert await _events(db, event_type="alert_delivered") == []
+
+        # The suppression is cleared before the retry — the page is now stale.
+        await db._conn.execute(
+            "UPDATE combo_performance SET suppressed = 0 "
+            "WHERE combo_key = 'combo_a' AND window = '30d'"
+        )
+        await db._conn.commit()
+
+        rev = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev)
+        # Only the DELIVERY half, with pre == post so nothing new is detected.
+        # A full `refresh_all` here would recompute the losing trades and
+        # immediately re-suppress the combo, so the row would agree with the
+        # page again and the case under test would evaporate.
+        state = await combo_refresh._snapshot_suppression_state(db._conn)
+        await combo_refresh._process_suppression_reversals(db, s, state, state)
+
+        assert rev.calls == 1, "the stale page was skipped instead of corrected"
+        body = rev.messages[0]
+        assert "NOTE: this page is stale" in body
+        assert "NOT suppressed as of delivery" in body
+        assert "newly_suppressed" in body
+        # The original transition text survives — the note is an addition, not
+        # a replacement.
+        assert "auto-suppressed" in body
+        # And the payload-bound clear still fires on the confirmed send.
+        assert len(await _events(db, event_type="marker_cleared")) == 1
+    finally:
+        await db.close()
+
+
+async def test_a_page_the_row_still_agrees_with_gets_no_note(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The common case must stay byte-clean — a note on every page would train
+    the operator to skip the last line, which is where the note lives."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, rev, _ = _stub_all_senders(monkeypatch)
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)
+
+        assert rev.calls == 1
+        assert "NOTE: this page is stale" not in rev.messages[0]
     finally:
         await db.close()

@@ -309,7 +309,9 @@ async def _stuck_retest_candidates(
     db = _RoDb(conn)
     buckets: dict[str, list[dict]] = {"terminal_incomplete": [], "parole_stalled": []}
     for combo_key, _suppressed_at, parole_at, remaining in rows:
-        acct = await _retest_accounting(db, combo_key, parole_at, remaining, target)
+        acct = await _retest_accounting(
+            db, combo_key, parole_at, remaining, target, now=at
+        )
         state = _classify_retest(acct, remaining, target)
         if state not in buckets:
             continue
@@ -355,6 +357,7 @@ async def replay(db_path: Path, at: datetime, settings) -> dict:
                     existing_30d["parole_at"],
                     existing_30d["parole_trades_remaining"],
                     target,
+                    now=at,
                 )
                 retest_state = _classify_retest(
                     acct, existing_30d["parole_trades_remaining"], target

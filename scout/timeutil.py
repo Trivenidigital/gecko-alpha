@@ -64,7 +64,7 @@ def sql_utc_cutoff(
     return (now - timedelta(days=days, hours=hours, minutes=minutes)).isoformat()
 
 
-def parole_window_open(parole_at: str | None) -> bool:
+def parole_window_open(parole_at: str | None, *, now: datetime | None = None) -> bool:
     """Has a parole window already opened? Fails CLOSED.
 
     An absent or unparsable ``parole_at`` reads as NOT open. That direction is
@@ -79,6 +79,12 @@ def parole_window_open(parole_at: str | None) -> bool:
     copies that silently drift apart would produce a system that admits trades
     against a window its own classifier considers shut (or the reverse), which
     is precisely the two-axis desync class the F2 work exists to surface.
+
+    ``now`` exists for the replay harness, which reconstructs what the
+    classifier WOULD have decided at a past instant. Production passes nothing
+    and reads the wall clock; the harness passes its ``at`` so a replay of the
+    same database at the same ``at`` is deterministic instead of drifting with
+    the clock of whoever runs it.
 
     It lives here rather than in either caller because ``suppression`` imports
     ``aiohttp`` at module scope, and ``combo_refresh`` deliberately defers every
@@ -95,4 +101,4 @@ def parole_window_open(parole_at: str | None) -> bool:
         return False
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt <= datetime.now(timezone.utc)
+    return dt <= (now if now is not None else datetime.now(timezone.utc))

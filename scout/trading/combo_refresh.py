@@ -407,9 +407,10 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
     #
     # Checked BEFORE `terminal_incomplete` for that reason, and after
     # `contaminated` / `complete` so a cohort that does have trades is always
-    # diagnosed on its evidence first. The two are mutually exclusive anyway:
-    # `open_now <= cohort_total`, so `cohort_total == 0` implies
-    # `open_now == 0`.
+    # diagnosed on its evidence first. The ordering is load-bearing and is
+    # pinned by `test_classifier_ordering_prefers_evidence_over_the_stall_
+    # diagnosis` and `test_terminal_incomplete_is_retained_when_the_cohort_is_
+    # non_empty` in tests/test_parole_stalled.py.
     if acct.get("window_open") and acct["cohort_total"] == 0:
         return "parole_stalled"
     if slots_exhausted and acct["open_now"] == 0:
@@ -418,7 +419,13 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
 
 
 async def _retest_accounting(
-    db: Database, combo_key: str, parole_at: str | None, remaining, target: int
+    db: Database,
+    combo_key: str,
+    parole_at: str | None,
+    remaining,
+    target: int,
+    *,
+    now: datetime | None = None,
 ) -> dict:
     """Account for the current parole generation along THREE separate axes.
 
@@ -481,7 +488,7 @@ async def _retest_accounting(
         cohort_total=cohort_total,
         spent=spent,
         contaminated=cohort_total > spent,
-        window_open=parole_window_open(parole_at),
+        window_open=parole_window_open(parole_at, now=now),
     )
 
 
@@ -1161,6 +1168,51 @@ def _build_reversal_message(combo: str, transition: str, post: dict, settings) -
     )
 
 
+async def _reversal_contradiction(
+    db: Database, combo_key: str, transition: str
+) -> str | None:
+    """A note for a pending page whose transition the CURRENT row contradicts.
+
+    Returns ``None`` when the row still agrees with the page (the common case)
+    or when the state cannot be read — an unreadable row is not evidence of a
+    contradiction, and inventing one would be worse than sending the page
+    unannotated.
+
+    Only the unambiguous direction is reported. Both reversal transitions
+    assert the combo ended up SUPPRESSED, so a row that is now unsuppressed
+    flatly contradicts the page. The converse (still suppressed) is not a
+    contradiction and says nothing worth appending.
+    """
+    if db._conn is None:
+        return None
+    try:
+        cur = await db._conn.execute(
+            "SELECT suppressed FROM combo_performance "
+            "WHERE combo_key = ? AND window = '30d'",
+            (combo_key,),
+        )
+        row = await cur.fetchone()
+    except aiosqlite.Error as exc:
+        log.warning(
+            "reversal_contradiction_read_failed", combo_key=combo_key, err=str(exc)
+        )
+        return None
+    if row is None:
+        return (
+            "NOTE: this page is stale — the 30d row for this combo no longer "
+            "exists, so the state it describes cannot be confirmed."
+        )
+    if row[0]:
+        return None
+    return (
+        f"NOTE: this page is stale — it reports {transition}, but the combo is "
+        "NOT suppressed as of delivery. The suppression was cleared after the "
+        "page was recorded (a later retest passed, or an operator acted). No "
+        "action is needed on the suppression itself; the page is delivered "
+        "because the transition did happen and was never reported."
+    )
+
+
 async def _record_pending_reversals(
     db: Database, settings, pre_state: dict, post_state: dict
 ) -> str:
@@ -1309,12 +1361,22 @@ async def _record_pending_reversals(
                     # must preserve the page bodies, not just their names.
                     recorded.append(combo)
                     recorded_payloads[combo] = payload
-            except aiosqlite.Error as exc:
+            except Exception as exc:
+                # `Exception`, not `aiosqlite.Error`. The body between the
+                # try and here does more than talk to SQLite — it renders a
+                # message and json-encodes a payload — so a TypeError or a
+                # ValueError from that work would have escaped this handler,
+                # propagated out through the `async with db._txn_lock`, and
+                # left the transaction opened by the first per-combo UPDATE
+                # half-open on the shared connection for the next writer to
+                # inherit. Containing the DB errors and not the others made
+                # the least likely failure the most damaging one.
                 log.exception(
                     "suppression_reversal_pending_write_failed",
                     combo_key=combo,
                     transition=transition,
                     err=str(exc),
+                    err_type=type(exc).__name__,
                     detail="page not recorded; refresh continues and the next "
                     "run re-detects nothing — this page is lost",
                 )
@@ -1462,6 +1524,21 @@ async def _process_suppression_reversals(
             # still a retry, it just cannot say when.
             stamp = detected_at if detected_at else "unknown"
             message = f"{message} [detected {stamp}]"
+
+        # STALE-STATE CORRECTION. A page carried over from an earlier refresh
+        # describes a transition that may since have been undone — by a later
+        # refresh, or by the operator doing exactly what the page told them to.
+        # Delivering "combo X auto-suppressed" about a combo that is currently
+        # unsuppressed sends the operator to fix something already fixed.
+        #
+        # Corrected, NOT skipped. The page is still owed: the transition really
+        # happened, the operator was never told, and dropping it here would
+        # silently discard a §12b notification on the strength of a state read
+        # taken after the fact. And the clear stays payload-bound, so the
+        # correction cannot interfere with supersede semantics.
+        contradiction = await _reversal_contradiction(db, combo, transition)
+        if contradiction is not None:
+            message = f"{message}\n{contradiction}"
 
         # `payload_digest(message)` — the body as STAMPED, after the retry
         # suffix is appended. Hashing the pre-stamp text would prove which page
@@ -1799,17 +1876,25 @@ async def _process_permanent_suppression(
         # NETWORK call above belongs outside it.
         try:
             async with db._txn_lock:
+                # Read at STAMP time, not hoisted from function entry. This
+                # column is a delivery-time audit record: it answers "when was
+                # the operator actually told?", and the send that precedes it
+                # is a network call of unbounded duration. Stamping the
+                # function's entry timestamp backdates every page by however
+                # long the pass took, and on a slow Telegram round-trip across
+                # several combos that error is not small.
+                stamped_at = datetime.now(timezone.utc).isoformat()
                 await conn.execute(
                     "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
                     "WHERE combo_key = ? AND window = '30d'",
-                    (now_iso, combo),
+                    (stamped_at, combo),
                 )
                 await record_alert_event(
                     db,
                     event_type="marker_stamped",
                     combo_key=combo,
                     transition="perm_suppression_alerted_at",
-                    detected_at=now_iso,
+                    detected_at=stamped_at,
                     payload_hash=digest,
                     managed_txn=True,
                 )

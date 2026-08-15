@@ -2329,7 +2329,15 @@ async def test_payload_without_a_detection_time_stamps_unknown_not_none(
     monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", _capture)
     await combo_refresh._process_suppression_reversals(db, s, {}, {})
 
-    assert bodies == ["body [detected unknown]"], bodies
+    # The stamp is what this test is about.
+    assert len(bodies) == 1, bodies
+    assert bodies[0].startswith("body [detected unknown]"), bodies
+    assert "[detected None]" not in bodies[0]
+    # This fixture is ALSO a stale page by construction — the row is
+    # unsuppressed while the pending payload reports `newly_suppressed` — so
+    # debt#4's contradiction note is appended too. Asserted rather than
+    # tolerated, so the two behaviours cannot silently swap places.
+    assert "NOTE: this page is stale" in bodies[0]
     assert "None" not in bodies[0]
     await db.close()
 
