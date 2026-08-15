@@ -557,6 +557,16 @@ async def update_trending_peaks(db: "Database") -> int:
 
     if updated:
         await conn.commit()
-        logger.info("trending_tracker.peaks_updated", count=updated)
+        logger.info("trending_tracker.peaks_updated", tracker="trending", count=updated)
+    else:
+        # See the gainers sibling: a no-op run emitted nothing, so "ran and
+        # updated none" and "never ran" were indistinguishable. debug keeps the
+        # log volume of the quiet case flat.
+        logger.debug(
+            "trending_tracker.peaks_noop",
+            tracker="trending",
+            count=0,
+            examined=len(rows),
+        )
 
     return updated
