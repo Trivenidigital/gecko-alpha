@@ -302,6 +302,140 @@ async def test_terminal_incomplete_set_is_global_not_scoped_to_refreshed(
     assert entry["required"] == settings_factory().FEEDBACK_PAROLE_RETEST_TRADES
 
 
+async def _seed_split_windows(tmp_path, *, persisted_7d):
+    """Three valid closes inside BOTH windows, so canonical 7d == canonical 30d.
+
+    The persisted 30d row is written EXACT against that canonical value, so the
+    30d comparison contributes nothing. `persisted_7d` is the
+    `(trades, wins, losses, win_rate_pct)` written for the 7d window — `None`
+    writes no 7d row at all. Anything the report then says about change is
+    attributable to the 7d window alone.
+    """
+    path = tmp_path / "split.db"
+    db = Database(path)
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    wr = round(200.0 / 3, 6)
+
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, refresh_failures, last_refreshed) "
+        "VALUES ('driftwood', '30d', 3, 2, 1, 15.0, ?, ?, 0, 0, ?)",
+        (round((5.0 + 5.0 - 3.0) / 3, 6), wr, now.isoformat()),
+    )
+    if persisted_7d is not None:
+        trades, wins, losses, wr_7d = persisted_7d
+        await db._conn.execute(
+            "INSERT INTO combo_performance "
+            "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+            " avg_pnl_pct, win_rate_pct, suppressed, refresh_failures, "
+            " last_refreshed) "
+            "VALUES ('driftwood', '7d', ?, ?, ?, 0.0, 0.0, ?, 0, 0, ?)",
+            (trades, wins, losses, wr_7d, now.isoformat()),
+        )
+
+    for i in range(3):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+            " sl_price, status, pnl_usd, pnl_pct, opened_at, closed_at, "
+            " signal_combo) "
+            "VALUES (?, 'S', 'N', 'coingecko', 'volume_spike', '{}', "
+            " 1.0, 100.0, 100.0, 20.0, 10.0, 1.2, 0.9, 'closed_tp', ?, ?, ?, ?, "
+            " 'driftwood')",
+            (
+                f"d_{i}",
+                10.0 if i < 2 else -5.0,
+                5.0 if i < 2 else -3.0,
+                (now - timedelta(days=3)).isoformat(),
+                (now - timedelta(days=2)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    await db.close()
+    return path
+
+
+async def test_stale_7d_row_is_reported_when_the_30d_row_is_exact(
+    tmp_path, settings_factory
+):
+    """The F1 defect, replayed.
+
+    Before the fix the comparison fetched only the `window = '30d'` row and
+    decided `would_change` from it alone, so this shape — persisted 30d exact,
+    persisted 7d stale — reported `would_change = False` and
+    `rows_that_would_change = 0`. The instrument under-attested by half: the
+    refresh WOULD rewrite the 7d row.
+    """
+    path = await _seed_split_windows(tmp_path, persisted_7d=(1, 0, 1, 0.0))
+    mod = _load_script()
+
+    report = await mod.replay(path, datetime.now(timezone.utc), settings_factory())
+    entry = next(c for c in report["combos"] if c["combo_key"] == "driftwood")
+
+    assert entry["30d_match"] is True
+    assert entry["would_change_30d"] is False
+    assert entry["change_reason_30d"] == "no_change"
+
+    assert entry["7d_match"] is False
+    assert entry["would_change_7d"] is True
+    assert entry["change_reason_7d"] == "economics_differ"
+
+    assert entry["would_change_any"] is True
+    assert entry["would_change"] is True, "the legacy aggregate must be ANY-window"
+    assert report["rows_that_would_change"] == 1
+    assert report["rows_that_would_change_7d"] == 1
+    assert report["rows_that_would_change_30d"] == 0
+
+    # Both persisted rows are reported, so a reader can see WHICH one is stale.
+    assert entry["existing_row_7d"]["trades"] == 1
+    assert entry["existing_row_30d"]["trades"] == 3
+    assert entry["recomputed_7d"]["trades"] == 3
+    assert entry["recomputed_30d"]["trades"] == 3
+
+
+async def test_both_windows_exact_reports_no_change(tmp_path, settings_factory):
+    """The other side of the discrimination: a genuinely current pair of rows
+    must not be inflated into a change by the new per-window comparison."""
+    exact = (3, 2, 1, round(200.0 / 3, 6))
+    path = await _seed_split_windows(tmp_path, persisted_7d=exact)
+    mod = _load_script()
+
+    report = await mod.replay(path, datetime.now(timezone.utc), settings_factory())
+    entry = next(c for c in report["combos"] if c["combo_key"] == "driftwood")
+
+    assert entry["7d_match"] is True
+    assert entry["30d_match"] is True
+    assert entry["would_change_any"] is False
+    assert entry["would_change"] is False
+    assert entry["change_reason"] == "no_change"
+    assert report["rows_that_would_change"] == 0
+    assert report["rows_that_would_change_7d"] == 0
+    assert report["rows_that_would_change_30d"] == 0
+
+
+async def test_missing_7d_row_is_an_explicit_change_not_a_silent_skip(
+    tmp_path, settings_factory
+):
+    """A window with no persisted row is a change for that window — the same
+    treatment the 30d window already gave a missing row, not a skip."""
+    path = await _seed_split_windows(tmp_path, persisted_7d=None)
+    mod = _load_script()
+
+    report = await mod.replay(path, datetime.now(timezone.utc), settings_factory())
+    entry = next(c for c in report["combos"] if c["combo_key"] == "driftwood")
+
+    assert entry["existing_row_7d"] is None
+    assert entry["7d_match"] is False
+    assert entry["would_change_7d"] is True
+    assert entry["change_reason_7d"] == "row_would_be_created"
+    assert entry["30d_match"] is True
+    assert entry["would_change_any"] is True
+    assert report["rows_that_would_change"] == 1
+
+
 async def test_output_is_deterministic_for_a_fixed_at(tmp_path, settings_factory):
     """Two runs at the same `--at` must be byte-identical, or the report cannot
     be diffed across a merge."""
