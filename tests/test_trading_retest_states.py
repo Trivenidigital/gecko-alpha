@@ -480,9 +480,12 @@ async def test_unrelated_same_connection_write_cannot_fake_marker_success(
     s = settings_factory()
     parole_at = datetime.now(timezone.utc) - timedelta(days=2)
     await _seed(db, "victim", parole_at, 0)
-    # Slots remain -> NOT a terminal-incomplete candidate itself; it exists
-    # only to be the target of the interleaving stranger write.
-    await _seed(db, "unrelated", parole_at, 5)
+    # Exists ONLY to be the target of the interleaving stranger write, so it
+    # must not be a candidate for this pass on any axis. Slots remaining keeps
+    # it out of `terminal_incomplete`; the FUTURE parole window keeps it out of
+    # `parole_stalled` (F2), which otherwise matches it exactly — suppressed,
+    # window open, full budget, zero cohort is the livelock shape.
+    await _seed(db, "unrelated", datetime.now(timezone.utc) + timedelta(days=7), 5)
     for _ in range(3):
         await _close(db, "victim", parole_at)
 
