@@ -10,7 +10,7 @@ import aiosqlite
 import structlog
 
 from scout.db import Database
-from scout.timeutil import sql_utc_cutoff
+from scout.timeutil import parole_window_open, sql_utc_cutoff
 from scout.trading.alert_events import (
     encode_state,
     generation_state,
@@ -113,8 +113,7 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
         "WHERE window = '30d' AND suppressed = 1 "
         "  AND retest_incomplete_alerted_at IS NULL "
         "  AND parole_at IS NOT NULL "
-        "  AND (COALESCE(parole_trades_remaining, 1) <= 0 "
-        "       OR (parole_at <= ? AND COALESCE(parole_trades_remaining, 0) > 0))",
+        "  AND (COALESCE(parole_trades_remaining, 1) <= 0 OR parole_at <= ?)",
         (stalled_grace_cutoff,),
     )
     candidates = await cur.fetchall()
@@ -134,10 +133,16 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
             ledger_transition = "parole_stalled"
             days_open = _days_since(parole_at)
             elapsed = f"{days_open:.1f} days" if days_open is not None else "unknown"
+            # A NULL budget renders as the word, not as "None". The stall
+            # diagnosis does not depend on the budget — an empty cohort under
+            # an open window is the whole finding — so an unknown budget is
+            # reported as unknown rather than suppressing an accurate page.
+            budget = "unknown" if remaining is None else remaining
             message = (
                 f"gecko-alpha: parole retest STALLED for {combo_key}\n"
                 f"parole window opened {parole_at} ({elapsed} elapsed), "
-                f"zero admissions, full slot budget ({remaining}/{target}).\n"
+                f"slot budget {budget}/{target} remaining, zero admissions "
+                f"since the window opened.\n"
                 "The window is open and nothing is being admitted, so this "
                 "retest cannot start — something DOWNSTREAM of the suppression "
                 "gate is blocking every open. Check signal_params.enabled and "
@@ -356,24 +361,6 @@ def _days_since(iso_ts: str | None) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
 
 
-def _parole_window_open(parole_at: str | None) -> bool:
-    """Has this parole window already opened? Fails CLOSED.
-
-    An absent or unparsable `parole_at` reads as NOT open, so a malformed
-    timestamp can never be the thing that promotes a combo into
-    `parole_stalled` and pages the operator about it.
-    """
-    if parole_at is None:
-        return False
-    try:
-        dt = datetime.fromisoformat(parole_at)
-    except (ValueError, TypeError):
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt <= datetime.now(timezone.utc)
-
-
 def _classify_retest(acct: dict, remaining, target: int) -> str:
     """Which retest state is this parole generation in?
 
@@ -398,23 +385,35 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
         return "contaminated"
     if acct["valid_closed"] >= target:
         return "complete"
+    # LIVELOCK. The parole window is open and NOTHING has ever been admitted —
+    # not one trade. `waiting` is the wrong answer because there is nothing to
+    # wait for: the retest cannot advance without an admission, and no
+    # admission is arriving. Something downstream of the suppression gate is
+    # refusing every open, so the combo sits suppressed and no page fires.
+    #
+    # PARTITIONED ON THE COHORT, NOT THE BUDGET. An earlier revision required
+    # `not slots_exhausted`, which split the wrong way: a combo can burn its
+    # whole budget and still admit nothing (slots reserved at the gate, then
+    # leaked — the pre-#522 no-refund bug did exactly this). Those rows fell
+    # through to `terminal_incomplete` and were paged as an evidence-quality
+    # problem — "valid resolved 0/5, so this retest can never complete" — which
+    # is confidently wrong about a retest that never started.
+    #
+    # Prod, 2026-08-13: chain_completed and cg_trending_rank+first_signal both
+    # had spent=5 with cohort_total=0 and got that page; only
+    # losers_contrarian (cohort_total=3) was genuinely terminal_incomplete. An
+    # empty cohort is the discriminating fact, and it is independent of how the
+    # budget was spent.
+    #
+    # Checked BEFORE `terminal_incomplete` for that reason, and after
+    # `contaminated` / `complete` so a cohort that does have trades is always
+    # diagnosed on its evidence first. The two are mutually exclusive anyway:
+    # `open_now <= cohort_total`, so `cohort_total == 0` implies
+    # `open_now == 0`.
+    if acct.get("window_open") and acct["cohort_total"] == 0:
+        return "parole_stalled"
     if slots_exhausted and acct["open_now"] == 0:
         return "terminal_incomplete"
-    # LIVELOCK. The parole window is open, the full slot budget is intact, and
-    # NOTHING has been admitted — not one trade, ever. `waiting` is the wrong
-    # answer because there is nothing to wait for: the retest cannot advance
-    # without an admission, and no admission is arriving. Something downstream
-    # of the suppression gate is refusing every open, so the combo sits
-    # suppressed forever and no page ever fires.
-    #
-    # Verified live: slow_burn (~6 weeks) and narrative_prediction (~4 weeks)
-    # are in this state today, with volume_spike joining 2026-08-29.
-    #
-    # Ordered after `contaminated` / `complete` so a cohort that DOES have
-    # trades is always diagnosed on its evidence first; mutually exclusive with
-    # `terminal_incomplete`, which requires an exhausted budget.
-    if acct.get("window_open") and acct["cohort_total"] == 0 and not slots_exhausted:
-        return "parole_stalled"
     return "waiting"
 
 
@@ -482,7 +481,7 @@ async def _retest_accounting(
         cohort_total=cohort_total,
         spent=spent,
         contaminated=cohort_total > spent,
-        window_open=_parole_window_open(parole_at),
+        window_open=parole_window_open(parole_at),
     )
 
 

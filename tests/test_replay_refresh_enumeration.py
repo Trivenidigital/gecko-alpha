@@ -294,11 +294,18 @@ async def test_terminal_incomplete_set_is_global_not_scoped_to_refreshed(
     mod = _load_script()
     report = await mod.replay(path, now, settings_factory())
 
-    keys = [c["combo_key"] for c in report["terminal_incomplete_candidates_GLOBAL"]]
+    # F2 reclassification: `stuck_gen` has NO trades at all, so it was never
+    # stuck on evidence quality — it is `parole_stalled`, a cohort that never
+    # existed. The globality claim this test exists for is unchanged and still
+    # asserted; only the bucket moved, and the harness reports both classes so
+    # the diagnostic cannot go blind on the newer one.
+    assert report["terminal_incomplete_candidates_GLOBAL"] == []
+    keys = [c["combo_key"] for c in report["parole_stalled_candidates_GLOBAL"]]
     assert keys == ["stuck_gen"]
-    entry = report["terminal_incomplete_candidates_GLOBAL"][0]
+    entry = report["parole_stalled_candidates_GLOBAL"][0]
     assert entry["valid_closed"] == 0
     assert entry["open_now"] == 0
+    assert entry["cohort_total"] == 0
     assert entry["required"] == settings_factory().FEEDBACK_PAROLE_RETEST_TRADES
 
 
@@ -452,3 +459,61 @@ async def test_output_is_deterministic_for_a_fixed_at(tmp_path, settings_factory
         await mod.replay(path, at, settings_factory()), indent=2, sort_keys=True
     )
     assert first == second
+
+
+async def test_terminal_incomplete_bucket_still_scans_globally(
+    tmp_path, settings_factory
+):
+    """The sibling of the reclassified case: a combo whose cohort DID exist but
+    produced too little usable evidence stays in the terminal-incomplete
+    bucket, and is still found globally rather than via the refreshed list.
+
+    Added alongside the F2 reclassification so that bucket keeps a fixture of
+    its own — otherwise the only test covering it was the one that moved."""
+    path = tmp_path / "ti_real.db"
+    db = Database(path)
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    parole_at = now - timedelta(days=6)
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, suppressed_at, parole_at, "
+        " parole_trades_remaining, refresh_failures, last_refreshed) "
+        "VALUES ('evidence_short', '30d', 40, 8, 32, -9.0, -1.0, 20.0, 1, ?, ?, "
+        " 0, 0, ?)",
+        (
+            (now - timedelta(days=20)).isoformat(),
+            parole_at.isoformat(),
+            now.isoformat(),
+        ),
+    )
+    # Two closed trades admitted under this parole: a real cohort, just short
+    # of the required evidence.
+    for i in range(2):
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+            " sl_price, status, pnl_usd, pnl_pct, opened_at, closed_at, "
+            " signal_combo) "
+            "VALUES (?, 'S', 'N', 'coingecko', 'volume_spike', '{}', 1.0, 100.0, "
+            " 100.0, 20.0, 10.0, 1.2, 0.9, 'closed_sl', -5.0, -5.0, ?, ?, "
+            " 'evidence_short')",
+            (
+                f"tok-ti-{i}",
+                (parole_at + timedelta(hours=1)).isoformat(),
+                (now - timedelta(hours=2)).isoformat(),
+            ),
+        )
+    await db._conn.commit()
+    await db.close()
+
+    mod = _load_script()
+    report = await mod.replay(path, now, settings_factory())
+
+    keys = [c["combo_key"] for c in report["terminal_incomplete_candidates_GLOBAL"]]
+    assert keys == ["evidence_short"]
+    assert report["parole_stalled_candidates_GLOBAL"] == []
+    entry = report["terminal_incomplete_candidates_GLOBAL"][0]
+    assert entry["cohort_total"] == 2

@@ -62,3 +62,37 @@ def sql_utc_cutoff(
             )
         return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     return (now - timedelta(days=days, hours=hours, minutes=minutes)).isoformat()
+
+
+def parole_window_open(parole_at: str | None) -> bool:
+    """Has a parole window already opened? Fails CLOSED.
+
+    An absent or unparsable ``parole_at`` reads as NOT open. That direction is
+    deliberate on both sides of the system: at the admission gate it denies
+    rather than admitting a trade against an unvalidated window, and at the
+    classifier it declines to promote a combo into an operator page on the
+    strength of a malformed timestamp.
+
+    SHARED ON PURPOSE. This predicate is consulted by two independent axes —
+    ``scout.trading.suppression`` deciding whether to spend a parole slot, and
+    ``scout.trading.combo_refresh`` deciding whether a combo is stalled. Two
+    copies that silently drift apart would produce a system that admits trades
+    against a window its own classifier considers shut (or the reverse), which
+    is precisely the two-axis desync class the F2 work exists to surface.
+
+    It lives here rather than in either caller because ``suppression`` imports
+    ``aiohttp`` at module scope, and ``combo_refresh`` deliberately defers every
+    aiohttp import (a module-level one aborts the interpreter on Windows dev
+    boxes). Importing one from the other to share a two-line datetime helper
+    would trade a duplication bug for an import-time one; this module has no
+    dependency beyond ``datetime``.
+    """
+    if parole_at is None:
+        return False
+    try:
+        dt = datetime.fromisoformat(parole_at)
+    except (ValueError, TypeError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt <= datetime.now(timezone.utc)

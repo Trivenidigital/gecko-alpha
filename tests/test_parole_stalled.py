@@ -127,9 +127,20 @@ def test_one_admission_is_enough_to_be_waiting_again():
     assert combo_refresh._classify_retest(acct, 4, 5) == "waiting"
 
 
-def test_exhausted_budget_is_terminal_incomplete_not_stalled():
-    """The two stuck classes are mutually exclusive by construction: stalled
-    requires an INTACT budget, terminal_incomplete an exhausted one."""
+def test_a_drained_budget_with_an_empty_cohort_is_still_stalled():
+    """PARTITIONED ON THE COHORT, NOT THE BUDGET.
+
+    A combo can burn its entire slot budget and still admit NOTHING — slots are
+    reserved at the gate and were leaked without a refund (the pre-#522 bug did
+    exactly this). An earlier revision of this classifier required an intact
+    budget, so these rows fell through to `terminal_incomplete` and were paged
+    as an evidence-quality problem: "valid resolved 0/5, so this retest can
+    never complete". That is confidently wrong about a retest that never
+    started, and it points the operator at the cohort instead of at the
+    dispatch path that is actually blocking.
+
+    PROD, 2026-08-13: this exact shape (spent=5, cohort_total=0) is what
+    chain_completed and cg_trending_rank+first_signal were mis-paged as."""
     acct = dict(
         valid_closed=0,
         invalid_closed=0,
@@ -139,7 +150,53 @@ def test_exhausted_budget_is_terminal_incomplete_not_stalled():
         contaminated=False,
         window_open=True,
     )
+    assert combo_refresh._classify_retest(acct, 0, 5) == "parole_stalled"
+
+
+def test_terminal_incomplete_is_retained_when_the_cohort_is_non_empty():
+    """The other side of the same partition, and the regression that matters:
+    reclassifying on the cohort must NOT swallow the class it replaced.
+
+    PROD, 2026-08-13: losers_contrarian had cohort_total=3 with the budget
+    drained — trades WERE admitted, they just did not produce enough usable
+    outcomes. Its terminal-incomplete page was accurate and must stay."""
+    acct = dict(
+        valid_closed=3,
+        invalid_closed=0,
+        open_now=0,
+        cohort_total=3,
+        spent=5,
+        contaminated=False,
+        window_open=True,
+    )
     assert combo_refresh._classify_retest(acct, 0, 5) == "terminal_incomplete"
+
+
+def test_the_two_prod_shapes_are_no_longer_indistinguishable():
+    """Before the fix both 2026-08-13 shapes returned `terminal_incomplete`, so
+    the classifier could not tell "nothing was ever admitted" from "three
+    trades produced too little". Pin that they now differ."""
+    drained_empty = dict(
+        valid_closed=0,
+        invalid_closed=0,
+        open_now=0,
+        cohort_total=0,
+        spent=5,
+        contaminated=False,
+        window_open=True,
+    )
+    drained_with_cohort = dict(
+        valid_closed=3,
+        invalid_closed=0,
+        open_now=0,
+        cohort_total=3,
+        spent=5,
+        contaminated=False,
+        window_open=True,
+    )
+    assert combo_refresh._classify_retest(
+        drained_empty, 0, 5
+    ) != combo_refresh._classify_retest(drained_with_cohort, 0, 5)
 
 
 def test_classifier_ordering_prefers_evidence_over_the_stall_diagnosis():
@@ -223,7 +280,10 @@ async def test_livelocked_combo_pages_exactly_once_per_generation(
         assert "STALLED" in body
         assert "slow_burn" in body
         assert "zero admissions" in body
-        assert "full slot budget (5/5)" in body
+        assert "slot budget 5/5 remaining" in body
+        # Must not ASSERT fullness — under a drained stall this renders
+        # 0/5, and "full slot budget (0/5)" would be a false statement.
+        assert "full slot budget" not in body
         assert "SIGNAL_DISPATCH_QUARANTINE" in body
         assert "signal_params.enabled" in body
         assert "*" not in body, "plain text only — underscores must not be mangled"
@@ -454,5 +514,179 @@ async def test_preserve_branch_records_when_the_generation_moves_concurrently(
             "as steady state"
         )
         assert rows[-1]["detail"] == "generation moved on a preserve branch"
+    finally:
+        await db.close()
+
+
+async def test_a_drained_empty_cohort_pages_as_stalled_not_as_stuck(
+    tmp_path, settings_factory, monkeypatch
+):
+    """End-to-end on the mis-paged prod shape: the combo that burned 5 slots
+    and admitted nothing must now get the STALLED body (look downstream of the
+    gate), not the STUCK body (look at the evidence)."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        sender = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", sender)
+        # spent = target - remaining = 5; cohort empty because nothing was
+        # ever admitted, exactly the pre-#522 no-refund shape.
+        await _seed_livelocked(db, "chain_completed", days_open=6.0, remaining=0)
+
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+        assert sender.calls == 1
+        body = sender.messages[0]
+        assert "STALLED" in body
+        assert "STUCK" not in body
+        assert "can never complete" not in body, (
+            "the evidence-quality claim was made about a retest that never " "started"
+        )
+        assert "slot budget 0/5 remaining" in body
+        assert "zero admissions" in body
+        dispatched = await _events(db, event_type="alert_dispatched")
+        assert len(dispatched) == 1
+        assert dispatched[0]["transition"] == "parole_stalled"
+    finally:
+        await db.close()
+
+
+async def test_the_pager_sql_no_longer_gates_the_stalled_arm_on_budget(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The SQL only narrows; the CLASSIFIER decides. A drained combo has to
+    reach the classifier at all, which the old `parole_trades_remaining > 0`
+    conjunct prevented."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        sender = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", sender)
+        # remaining=0 AND an open window: admitted by the exhausted arm, and it
+        # must classify as stalled rather than be filtered out or mis-paged.
+        await _seed_livelocked(
+            db, "cg_trending_rank+first_signal", days_open=9.0, remaining=0
+        )
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+        assert sender.calls == 1
+        assert "STALLED" in sender.messages[0]
+    finally:
+        await db.close()
+
+
+def test_both_axes_share_one_parole_window_predicate():
+    """DRY, and not for tidiness. The admission gate decides whether to SPEND a
+    slot against this predicate; the classifier decides whether the combo is
+    STALLED against it. Two copies drifting apart would let the system admit
+    trades against a window its own classifier considers shut — the two-axis
+    desync class this PR exists to surface."""
+    from scout import timeutil
+    from scout.trading import suppression
+
+    assert combo_refresh.parole_window_open is timeutil.parole_window_open
+    assert suppression.parole_window_open is timeutil.parole_window_open
+
+
+async def test_null_budget_row_reaches_the_classifier_and_renders_honestly(
+    tmp_path, settings_factory, monkeypatch
+):
+    """PINS THE ONLY BEHAVIOURAL DELTA of dropping the budget conjunct from the
+    stalled SQL arm.
+
+    Worked out exactly: a drained row (`remaining = 0`) was already admitted by
+    the exhausted arm, and an intact row satisfied the old conjunct, so for
+    every non-NULL budget the drop is a pure simplification — which is why no
+    other test moved when it was reverted. The single row the union newly
+    admits is `parole_trades_remaining IS NULL`: `COALESCE(remaining, 1) <= 0`
+    excludes it and `COALESCE(remaining, 0) > 0` excluded it too.
+
+    That is the N-2 corner the operator ticketed as out of scope, so this test
+    documents rather than endorses the new behaviour — it is here so the
+    consequence is visible and pinned instead of arriving unnoticed. The
+    diagnosis itself stands on its own feet: an open window with an empty
+    cohort is a stall whatever the budget says.
+
+    It also pins the rendering. `remaining` interpolates straight into the page
+    body, so a NULL would have read "slot budget None/5 remaining"."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        sender = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", sender)
+        now = datetime.now(timezone.utc)
+        await db._conn.execute(
+            "INSERT INTO combo_performance "
+            "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+            " avg_pnl_pct, win_rate_pct, suppressed, suppressed_at, parole_at, "
+            " parole_trades_remaining, refresh_failures, last_refreshed) "
+            "VALUES ('nullbudget', '30d', 25, 4, 21, -100.0, -2.0, 16.0, 1, ?, "
+            " ?, NULL, 0, ?)",
+            (
+                (now - timedelta(days=20)).isoformat(),
+                (now - timedelta(days=6)).isoformat(),
+                (now - timedelta(hours=1)).isoformat(),
+            ),
+        )
+        await db._conn.commit()
+
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+        assert sender.calls == 1
+        body = sender.messages[0]
+        assert "STALLED" in body
+        assert "slot budget unknown/5 remaining" in body
+        assert "None" not in body, "a NULL budget leaked into the page as 'None'"
+    finally:
+        await db.close()
+
+
+async def test_reclassification_does_not_re_page_already_alerted_combos(
+    tmp_path, settings_factory, monkeypatch
+):
+    """NO RE-PAGE STORM ON DEPLOY.
+
+    chain_completed and cg_trending_rank+first_signal were mis-paged as
+    terminal_incomplete on 2026-08-13 and therefore already carry
+    `retest_incomplete_alerted_at`. Reclassifying them to `parole_stalled`
+    changes the DIAGNOSIS, not the marker: the candidate query requires
+    `retest_incomplete_alerted_at IS NULL`, and the marker re-arms only when
+    the combo leaves suppression or its parole generation moves.
+
+    So on deploy they stay silent until something actually changes. Proven
+    here rather than argued: the marker is pre-set, the pass is run, and the
+    sender must not fire — then the marker is cleared (a generation change)
+    and it must fire with the corrected body."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        sender = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_retest_incomplete_alert", sender)
+        now = datetime.now(timezone.utc)
+        await _seed_livelocked(db, "chain_completed", days_open=9.0, remaining=0)
+        # The 08-13 page already went out.
+        await db._conn.execute(
+            "UPDATE combo_performance SET retest_incomplete_alerted_at = ? "
+            "WHERE combo_key = 'chain_completed' AND window = '30d'",
+            ((now - timedelta(days=2)).isoformat(),),
+        )
+        await db._conn.commit()
+
+        for _ in range(3):
+            await combo_refresh._process_retest_terminal_incomplete(db, s)
+        assert sender.calls == 0, "reclassification re-paged an already-alerted combo"
+
+        # A generation change re-arms it, and the page is now the corrected one.
+        await db._conn.execute(
+            "UPDATE combo_performance SET retest_incomplete_alerted_at = NULL "
+            "WHERE combo_key = 'chain_completed' AND window = '30d'"
+        )
+        await db._conn.commit()
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+        assert sender.calls == 1
+        assert "STALLED" in sender.messages[0]
     finally:
         await db.close()
