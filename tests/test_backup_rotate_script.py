@@ -72,9 +72,7 @@ def _run(env_overrides=None, cwd=None):
 def test_keeps_top_n_by_mtime(tmp_path):
     now = time.time()
     for i, age_hours in enumerate([10, 20, 30, 40, 50]):
-        _make_backup(
-            tmp_path, _ts(i), now - age_hours * 3600
-        )
+        _make_backup(tmp_path, _ts(i), now - age_hours * 3600)
     hb = tmp_path / "hb"
     res = _run(
         {
@@ -659,9 +657,9 @@ def test_newer_partial_artifacts_do_not_evict_completed_backups(tmp_path):
             f"completed backup {_ts(i)} was evicted by newer partial artifacts "
             f"— this is the prod incident. stdout: {res.stdout}"
         )
-    assert "found=3" in res.stdout, (
-        f"partials must not be counted toward KEEP; got: {res.stdout}"
-    )
+    assert (
+        "found=3" in res.stdout
+    ), f"partials must not be counted toward KEEP; got: {res.stdout}"
 
 
 @pytest.mark.parametrize(
@@ -693,3 +691,125 @@ def test_each_partial_suffix_is_excluded(tmp_path, suffix):
         "backups only; cleaning partials is the create script's job"
     )
     assert "found=1" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-15 prod incident — sidecars on COMPLETED backups.
+# ---------------------------------------------------------------------------
+
+
+def _sidecar_names(base: str) -> list[str]:
+    """The three sidecars SQLite can create beside an opened database."""
+    return [f"{base}-wal", f"{base}-shm", f"{base}-journal"]
+
+
+def test_sidecars_on_completed_backups_do_not_evict_them(tmp_path):
+    """*** THE 2026-08-15 PROD INCIDENT, LOCKED DOWN. ***
+
+    Same class as 2026-08-08, different namespace. The `.partial` fix excluded
+    the reserved IN-PROGRESS namespace — `gecko-backup-create.sh` owns
+    `$DEST.partial` and the sidecars beside it. But sidecars can also appear
+    beside a COMPLETED backup, and those carry no `.partial` at all.
+
+    Mechanism: the backups carry a WAL-mode header, so merely opening one to
+    run `PRAGMA quick_check` — even `mode=ro` — makes SQLite create
+    `<backup>-shm` and `<backup>-wal` next to it, with fresh mtimes. Rotation
+    sorts by mtime descending, so those 32K/0-byte files took the retention
+    slots and every real backup fell into the delete list: `deleted=5
+    retained=2`, all three completed backups gone.
+
+    The operator's own integrity check destroyed the thing it was verifying.
+    """
+    now = time.time()
+    # Three real backups, oldest -> newest.
+    for i, age in enumerate([30, 20, 10]):
+        _make_backup(tmp_path, _ts(i), now - age * 3600)
+    # Verifying the two newest leaves sidecars with the NEWEST mtimes.
+    for j, base in enumerate([_ts(1), _ts(2)]):
+        for k, name in enumerate(_sidecar_names(base)[:2]):
+            _make_backup(tmp_path, name, now - (j * 2 + k), size=32768)
+
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "3",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    surviving = {p.name for p in tmp_path.iterdir()}
+    for i in range(3):
+        assert _ts(i) in surviving, (
+            f"completed backup {_ts(i)} was evicted by sidecar files — this is "
+            f"the 2026-08-15 prod incident. stdout: {res.stdout}"
+        )
+    assert (
+        "found=3" in res.stdout
+    ), f"sidecars must not be counted toward KEEP; got: {res.stdout}"
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_each_sidecar_suffix_on_a_completed_backup_is_excluded(tmp_path, suffix):
+    """Each sidecar shape independently, on a COMPLETED backup name.
+
+    Distinct from `test_each_partial_suffix_is_excluded`: that one covers
+    `*.partial-wal` and friends, which the `.partial` matcher already caught.
+    These names contain no `.partial`, which is exactly why they slipped
+    through.
+    """
+    now = time.time()
+    _make_backup(tmp_path, _ts(0), now - 3600)
+    _make_backup(tmp_path, f"{_ts(0)}{suffix}", now, size=32768)
+
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": "1",
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    assert (
+        "found=1" in res.stdout
+    ), f"{suffix} on a completed backup was counted as a backup: {res.stdout}"
+    assert (tmp_path / _ts(0)).exists(), f"{suffix} evicted the real backup"
+
+
+def test_operator_ad_hoc_tags_still_survive_the_sidecar_exclusion(tmp_path):
+    """The exclusion must not narrow the supported workflow.
+
+    `cp scout.db scout.db.bak.<tag>` with arbitrary tags — spaces included — is
+    a documented operator workflow, and /health treats
+    `scout.db.bak-legacy-format` as valid. A tag that merely CONTAINS one of the
+    sidecar words must still be retained; only the trailing suffix is a
+    sidecar.
+    """
+    now = time.time()
+    keepers = [
+        "scout.db.bak.before-wal-migration",
+        "scout.db.bak.shm-investigation",
+        "scout.db.bak-legacy-format",
+        "scout.db.bak.my journal notes",
+    ]
+    for i, name in enumerate(keepers):
+        _make_backup(tmp_path, name, now - (i + 1) * 3600)
+
+    hb = tmp_path / "hb"
+    res = _run(
+        {
+            "GECKO_BACKUP_DIR": str(tmp_path),
+            "GECKO_BACKUP_KEEP": str(len(keepers)),
+            "GECKO_BACKUP_HEARTBEAT_FILE": str(hb),
+            "GECKO_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert res.returncode == 0, res.stderr
+    assert (
+        f"found={len(keepers)}" in res.stdout
+    ), f"an operator ad-hoc tag was excluded as a sidecar: {res.stdout}"
+    for name in keepers:
+        assert (tmp_path / name).exists(), f"{name} was deleted"
