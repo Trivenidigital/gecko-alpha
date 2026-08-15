@@ -55,7 +55,7 @@ not yet a runtime field.
 | CG-ingestion outage watchdog (script) | `cg_ingestion_watchdog` | `trending_snapshots` stale beyond SLO, or all CG snapshot writers dark beyond the outage window (primary-source quota exhaustion) | trading | None | warning | Y |
 | Chain-pattern completion | `chain_alert` | Chain signal pattern completes | trading | None | info | N |
 | Cohort digest | `cohort_digest` | Weekly `would_be_live` cohort digest | trading | None | info | N |
-| Permanent combo suppression | `combo_refresh_permanent_suppression` | Combo permanently suppressed after parole exhaustion — **state reversal** | trading | None | warning | Y |
+| Suppressed-and-idle combo | `combo_refresh_permanent_suppression` | Combo suppressed with no trades in the refresh window, so it accrues no retest evidence and nothing will start a retest — **state reversal**. Clears on a passing parole retest (D4), not permanent; the source label predates the rename and is unchanged for wire compatibility | trading | None | warning | Y |
 | Parole retest terminal-incomplete (§12b) | `combo_refresh_retest_terminal_incomplete` | Parole generation can never complete — slots exhausted, nothing open, fewer than `FEEDBACK_PAROLE_RETEST_TRADES` valid resolved outcomes. Suppression HELD, no auto re-arm | trading | None | warning | Y |
 | Conviction-watchlist watchdog | `conviction_watchlist_watchdog` | Conviction watchlist staleness | trading | None | warning | Y |
 | Counter-signal risk | `counter_risk` | Counter-signal risk flag on a candidate | trading | None | warning | N |

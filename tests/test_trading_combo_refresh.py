@@ -814,7 +814,14 @@ async def test_permanent_suppression_alert_fires_once_deduped(
     summary1 = await combo_refresh.refresh_all(db, s)
     assert stub.calls == 1
     assert "losers_contrarian" in summary1["permanent_suppression"]
-    assert "permanent-suppression state" in stub.messages[0]
+    # J1: the body no longer claims permanence. Assert what it must now SAY —
+    # the state, and both gates with their distinct remedies — rather than the
+    # old phrase, so this test tracks meaning instead of prose.
+    body = stub.messages[0]
+    assert "SUPPRESSED AND IDLE" in body
+    assert "not permanent" in body.lower()
+    assert "combo_performance.suppressed" in body
+    assert "signal_params.enabled" in body
     assert "revive_signal_with_baseline" in stub.messages[0]
     marker = await _scalar(
         db,
