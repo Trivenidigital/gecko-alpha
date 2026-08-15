@@ -2540,3 +2540,158 @@ async def test_empty_string_marker_is_treated_as_present_but_corrupt(
     assert superseded[0]["superseded_raw"] == "", "raw bytes must be preserved"
     assert superseded[0]["superseded_transition"] is None
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# FROZEN-CLOCK HAZARD — read this before adding freezegun (or any other clock
+# freeze) to a test that touches suppression-reversal pages.
+#
+# The retry stamp is decided by `is_retry = detected_at != run_iso` in
+# `_process_suppression_reversals`, where both sides come from
+# `datetime.now(timezone.utc).isoformat()` in `scout/trading/combo_refresh.py`.
+# That equality is the ONLY thing separating "recorded by this refresh" from
+# "carried over from an earlier one".
+#
+# Freeze the clock and every refresh in the test gets the SAME `run_iso`, so a
+# page carried across refreshes compares equal to the current run and is
+# classified as a first attempt. The `[detected ...]` suffix silently vanishes
+# — no error, no failed assertion anywhere except the one test that happens to
+# check the suffix. A days-late page then reads as current, which is the exact
+# operator-facing defect the stamp exists to prevent.
+#
+# So: these tests need a REAL, ADVANCING clock. If you need determinism, drive
+# `detected_at` in the seeded payload (as
+# `test_payload_without_a_detection_time_stamps_unknown_not_none` does) rather
+# than freezing the source of `run_iso`.
+#
+# The two tests below pin both halves: the real-clock behavior that must hold,
+# and a demonstration of what a freeze does to it.
+# ---------------------------------------------------------------------------
+
+
+class _ClockStub:
+    """Stands in for the module's `datetime`, overriding only `now`.
+
+    Everything else (`fromisoformat`, which combo_refresh also calls) falls
+    through to the real class — a stub that shadowed the whole name would fail
+    with AttributeError on an unrelated code path instead of testing the clock.
+    """
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
+
+
+class _RecordingClock(_ClockStub):
+    """Real clock that records every `now()` the module asks for."""
+
+    def __init__(self):
+        self.seen: list[datetime] = []
+
+    def now(self, tz=None):
+        value = datetime.now(tz)
+        self.seen.append(value)
+        return value
+
+
+class _FrozenClock(_ClockStub):
+    """What freezegun does to the module: every `now()` returns one instant."""
+
+    def __init__(self, fixed: datetime):
+        self.fixed = fixed
+
+    def now(self, tz=None):
+        return self.fixed
+
+
+async def test_carried_page_is_stamped_because_the_clock_advances(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Real-clock behavior, stated as the invariant it rests on.
+
+    Two refreshes must observe two DISTINCT `now()` values; that distinctness
+    is what makes a carried page classify as a retry and pick up its stamp.
+    """
+    import scout.alerter as alerter_mod
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    clock = _RecordingClock()
+    monkeypatch.setattr(combo_refresh, "datetime", clock)
+
+    bodies: list[str] = []
+    fail = {"on": True}
+
+    async def fake_send(message, session, settings, **kw):
+        bodies.append(message)
+        if fail["on"]:
+            raise RuntimeError("telegram 500")
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+
+    await combo_refresh.refresh_all(db, s)  # attempt 1 — rejected, stays pending
+    payload = await _pending_payload(db, "gainers_early")
+    fail["on"] = False
+    await combo_refresh.refresh_all(db, s)  # attempt 2 — delivered as a retry
+
+    assert len(bodies) == 2
+    assert bodies[1].endswith(f" [detected {payload['detected_at']}]"), bodies[1]
+    # The invariant underneath the assertion above. A clock that returned the
+    # same instant twice would satisfy neither.
+    stamps = {value.isoformat() for value in clock.seen}
+    assert len(stamps) > 1, (
+        "every now() returned the same instant — the retry stamp cannot work "
+        "against a frozen clock"
+    )
+    await db.close()
+
+
+async def test_frozen_clock_silently_un_stamps_a_carried_page(
+    tmp_path, settings_factory, monkeypatch
+):
+    """HAZARD DEMONSTRATION — asserts the BROKEN behavior on purpose.
+
+    This is not a defect being blessed; it is the failure mode being made
+    visible so it is discovered here rather than in prod. Under a frozen
+    clock the carried page's `detected_at` equals the current run's
+    `run_iso`, so `is_retry` is False and the page goes out looking fresh.
+
+    If a future change makes stamping robust to a frozen clock (e.g. by
+    keying the retry off a delivery-attempt counter rather than timestamp
+    equality), THIS TEST WILL FAIL — and the correct response is to delete it
+    along with the warning block above, not to re-freeze anything.
+    """
+    import scout.alerter as alerter_mod
+
+    _reset_tg_module_state()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    s = settings_factory()
+    await _seed_newly_suppressing_trades(db)
+
+    frozen = _FrozenClock(datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(combo_refresh, "datetime", frozen)
+
+    bodies: list[str] = []
+    fail = {"on": True}
+
+    async def fake_send(message, session, settings, **kw):
+        bodies.append(message)
+        if fail["on"]:
+            raise RuntimeError("telegram 500")
+
+    monkeypatch.setattr(alerter_mod, "send_telegram_message", fake_send)
+
+    await combo_refresh.refresh_all(db, s)
+    fail["on"] = False
+    await combo_refresh.refresh_all(db, s)
+
+    assert len(bodies) == 2, "the page must still be carried and re-attempted"
+    assert "[detected " not in bodies[1], (
+        "if this now carries a stamp, timestamp equality is no longer what "
+        "decides `is_retry` — delete this test and the warning block above"
+    )
+    await db.close()
