@@ -909,6 +909,11 @@ async def get_system_health(db_path: str, *, now: datetime | None = None) -> dic
         # disconnected writer shows up as a stale emitted_at here (plus the
         # hourly `ledger_label_pass` structured log on the labeling side).
         ("signal_outcome_ledger", "emitted_at"),
+        # F3: control-plane event ledger §12a freshness surface. The
+        # `refresh_completed` heartbeat guarantees >=1 row per refresh_all run,
+        # so a stale created_at here means the combo-refresh pass itself stopped
+        # — the same signal the alert-channel watchdog pages on.
+        ("alert_events", "created_at"),
     ]
     result = {}
     async with _ro_db(db_path) as conn:

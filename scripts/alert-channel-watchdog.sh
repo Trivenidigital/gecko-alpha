@@ -10,6 +10,10 @@
 #   2. paper_daily_summary     — daily-digest write-rate (DIGEST_SUMMARY_SLO_DAYS)
 #   3. narrative_alerts_inbound — X/narrative inbound freshness (NARRATIVE_INBOUND_SLO_HOURS)
 #   4. tg_social_health        — per-channel staleness scan (TG_CHANNEL_STALE_DAYS)
+#   5. alert_events            — control-plane ledger heartbeat freshness, keyed
+#                                on the newest 'refresh_completed' row
+#                                (ALERT_EVENTS_SLO_HOURS, default 27). §12a
+#                                pairing shipped with the F3 ledger itself.
 #
 # Context: the Telegram alert channel went silent 2026-06-25 -> 07-08 (14
 # days, zero 'sent' rows) AND the daily digest stopped writing after
@@ -68,6 +72,8 @@ SENT_SLO_HOURS="${ALERT_SENT_SLO_HOURS:-48}"
 DIGEST_SLO_DAYS="${DIGEST_SUMMARY_SLO_DAYS:-2}"
 NARRATIVE_INBOUND_SLO_HOURS="${NARRATIVE_INBOUND_SLO_HOURS:-72}"
 TG_CHANNEL_STALE_DAYS="${TG_CHANNEL_STALE_DAYS:-14}"
+# F3 control-plane ledger heartbeat SLO (hours). From the cron env, not .env.
+ALERT_EVENTS_SLO_HOURS="${ALERT_EVENTS_SLO_HOURS:-27}"
 # ALR-08 dispatch-activity qualifier for check 1 (default 0: any open with 0
 # sent pages; raise to tolerate the 24h-dedup tail). From the cron env, not .env.
 DISPATCH_ACTIVITY_THRESHOLD="${ALERT_DISPATCH_ACTIVITY_THRESHOLD:-0}"
@@ -96,5 +102,6 @@ exec "${PYTHON}" "${SCRIPT_DIR}/alert_channel_watchdog.py" \
     --sent-slo-hours "${SENT_SLO_HOURS}" --digest-slo-days "${DIGEST_SLO_DAYS}" \
     --narrative-inbound-slo-hours "${NARRATIVE_INBOUND_SLO_HOURS}" \
     --tg-channel-stale-days "${TG_CHANNEL_STALE_DAYS}" \
+    --alert-events-slo-hours "${ALERT_EVENTS_SLO_HOURS}" \
     --dispatch-activity-threshold "${DISPATCH_ACTIVITY_THRESHOLD}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"

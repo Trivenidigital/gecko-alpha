@@ -140,6 +140,34 @@ CREATE TABLE trade_decision_events (
 """
 
 
+# alert_events: db.py `_migrate_alert_events_v1` (F3). The watchdog only reads
+# created_at + event_type; the remaining nullable columns are carried for schema
+# fidelity, and the CHECK constraint is kept so a fixture cannot seed an
+# event_type the real table would reject.
+_CREATE_ALERT_EVENTS = """
+CREATE TABLE alert_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    event_type       TEXT NOT NULL CHECK (event_type IN (
+        'suppression_transition','parole_slot_spent','parole_slot_refunded',
+        'reversal_pending_recorded','alert_dispatched','alert_delivered',
+        'alert_failed','marker_stamped','marker_cleared','marker_anomaly',
+        'refresh_completed'
+    )),
+    combo_key        TEXT,
+    signal_type      TEXT,
+    alert_source     TEXT,
+    transition       TEXT,
+    detected_at      TEXT,
+    delivery_result  TEXT,
+    retry            INTEGER,
+    payload_hash     TEXT,
+    state_json       TEXT,
+    detail           TEXT
+)
+"""
+
+
 def _make_db(
     tmp_path,
     *,
@@ -153,6 +181,8 @@ def _make_db(
     create_dispatch=True,
     dispatch_opens=None,
     dispatch_blocked=0,
+    alert_event_rows=None,
+    create_alert_events=True,
 ):
     """Build a minimal SQLite DB and return its path.
 
@@ -177,6 +207,12 @@ def _make_db(
     dispatch_blocked: number of ``decision='blocked'`` rows to seed. These are
       skips (universe-filtered / deduped / quarantined) and must NOT count as
       dispatch activity — used to prove the all-blocked quiet case stays silent.
+    alert_event_rows: list of (created_at_iso, event_type) tuples for the F3
+      ledger. ``None`` (the default) seeds ONE fresh ``refresh_completed`` row so
+      the F3 check stays green for the pre-existing tests; ``[]`` creates an
+      empty table (no-heartbeat breach).
+    create_alert_events: when False the alert_events table is absent
+      (missing-table breach path).
     """
     dbp = tmp_path / "wd.db"
     conn = sqlite3.connect(dbp)
@@ -239,12 +275,28 @@ def _make_db(
                     " 'scout.trading.engine', '{}', ?)",
                     (f"bl-{i}", recent),
                 )
+        if create_alert_events:
+            conn.execute(_CREATE_ALERT_EVENTS)
+            rows = alert_event_rows
+            if rows is None:  # default: one fresh heartbeat (keeps F3 check green)
+                rows = [
+                    (
+                        (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                        "refresh_completed",
+                    )
+                ]
+            for created_at, event_type in rows:
+                conn.execute(
+                    "INSERT INTO alert_events (created_at, event_type) VALUES (?, ?)",
+                    (created_at, event_type),
+                )
         # Guarantee at least one table exists so the DB file is non-trivial.
         if (
             not create_alert
             and not create_digest
             and not create_narrative
             and not create_dispatch
+            and not create_alert_events
         ):
             conn.execute("CREATE TABLE _placeholder (x INTEGER)")
         conn.commit()
@@ -1040,3 +1092,118 @@ def test_importing_module_does_not_reconfigure_structlog():
         "logger_factory at import time — a global side effect that empties other "
         "tests' captured logs (move the configure into __main__)"
     )
+
+
+# --- F3: alert_events control-plane ledger heartbeat freshness -------------
+
+
+def test_alert_events_fresh_no_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(2), "refresh_completed")],  # < 27h SLO
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["alert_events_rate"]["status"] == "ok"
+    assert body["checks"]["alert_events_rate"]["slo_hours"] == 27
+
+
+def test_alert_events_stale_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(40), "refresh_completed")],  # > 27h SLO
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["alert_events_rate"]["status"] == "breach"
+    assert body["checks"]["alert_events_rate"]["reason"] == "stale"
+    msg = body["message"]
+    assert "alert_events" in msg
+    assert "27h" in msg  # SLO named
+    assert "*" not in msg  # plain text, no Markdown bold
+
+
+def test_alert_events_other_event_types_do_not_count_as_a_heartbeat(tmp_path):
+    """The check is keyed on `refresh_completed` specifically. A table full of
+    fresh conditional events while the refresh pass is dead must still breach —
+    otherwise the heartbeat is a symptom, not a heartbeat."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[
+            (_iso(1), "alert_delivered"),
+            (_iso(1), "suppression_transition"),
+            (_iso(40), "refresh_completed"),
+        ],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["status"] == "breach"
+    assert body["checks"]["alert_events_rate"]["reason"] == "stale"
+
+
+def test_alert_events_empty_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[],  # table created, no rows
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["alert_events_rate"]["reason"] == "no_refresh_completed_rows"
+    assert "NO 'refresh_completed' rows" in body["message"]
+
+
+def test_alert_events_missing_table_is_breach(tmp_path):
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        create_alert_events=False,  # table absent
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["alert_events_rate"]["reason"] == "table_absent"
+    msg = body["message"]
+    assert "alert_events" in msg
+    assert "missing/absent" in msg
+
+
+def test_alert_events_slo_hours_flag_is_honoured(tmp_path):
+    """The wrapper wires ALERT_EVENTS_SLO_HOURS through this flag; a run that
+    ignored it would page on the default while the operator believed otherwise."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(40), "refresh_completed")],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run", "--alert-events-slo-hours", "48")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["status"] == "ok"
+    assert body["checks"]["alert_events_rate"]["slo_hours"] == 48
+
+
+def test_alert_events_flag_is_wired_in_the_shell_wrapper():
+    """The check is inert unless the .sh passes the flag. Assert the wrapper
+    both reads the env var and forwards it — a check nobody invokes is the same
+    silent-failure class this ledger exists to close."""
+    sh = (REPO_ROOT / "scripts" / "alert-channel-watchdog.sh").read_text()
+    assert 'ALERT_EVENTS_SLO_HOURS="${ALERT_EVENTS_SLO_HOURS:-27}"' in sh
+    assert '--alert-events-slo-hours "${ALERT_EVENTS_SLO_HOURS}"' in sh
