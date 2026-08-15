@@ -1970,14 +1970,23 @@ async def _drain_pending_live_tasks(paper_trader, timeout_sec: float = 5.0) -> N
 # around their per-cycle work — so turning one off does not produce a "skipped"
 # line, it produces NOTHING. A disabled lane and a lane whose loop died are
 # then the same absence in journald, which is the ambiguity this closes.
+#
+# `detail` names what the flag ACTUALLY gates, verified against the call
+# sites — not what the flag's name suggests. Both peak updaters run
+# unconditionally (scout/main.py run loop and the narrative EVALUATE loop call
+# them outside either gate), so a disabled tracker keeps refreshing the peaks
+# of the rows it already has. Saying otherwise would hand the operator a wrong
+# mental model in the one line they get.
 _TRACKER_DISABLED_EVENTS: dict[str, tuple[str, str]] = {
     "GAINERS_TRACKER_ENABLED": (
         "gainers_tracker_disabled_by_flag",
-        "gainers snapshot, compare and peak-update lanes will not run",
+        "no gainers snapshots stored, no gainers compare, no gainers paper "
+        "trades; peak updates still run for existing rows",
     ),
     "TRENDING_SNAPSHOT_ENABLED": (
         "trending_tracker_disabled_by_flag",
-        "trending snapshot and compare lanes will not run",
+        "no trending snapshots fetched, no trending compare; peak updates "
+        "still run for existing rows",
     ),
 }
 
