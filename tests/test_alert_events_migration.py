@@ -494,3 +494,83 @@ async def test_rebuild_drops_only_rows_outside_the_current_vocabulary(tmp_path):
         assert kept == ["refresh_completed", "marker_stamped", "ledger_installed"]
     finally:
         await db.close()
+
+
+# The CURRENT deployed shape: the 12-member vocabulary as merged in #535, i.e.
+# everything except `parole_denied`. Every prod database is at exactly this
+# shape when the C3 migration runs, so this is the upgrade that actually
+# happens rather than a hypothetical one.
+_CURRENT_SCHEMA = _INTERMEDIATE_SCHEMA.replace(
+    "        'refresh_completed'\n",
+    "        'refresh_completed',\n        'ledger_installed'\n",
+)
+
+
+def _build_current_shape(db_path) -> None:
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_CURRENT_SCHEMA)
+    conn.execute(
+        "INSERT INTO alert_events (created_at, event_type, detail) "
+        "VALUES ('2026-08-14T00:00:00+00:00', 'ledger_installed', 'epoch')"
+    )
+    conn.execute(
+        "INSERT INTO alert_events (created_at, event_type, state_json) "
+        "VALUES ('2026-08-15T00:00:00+00:00', 'refresh_completed', "
+        "'{\"refreshed\": 5}')"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_from_the_current_shape_adds_parole_denied(tmp_path):
+    """C3 extends the vocabulary with `parole_denied`, which is exactly what
+    the drift-rebuild path was built for. Pinned at the CURRENT shape, not the
+    original one: this is the upgrade every deployed database performs.
+
+    The load-bearing fixture asserts are what stop this passing vacuously
+    against an already-current table."""
+    db_path = tmp_path / "current.db"
+    _build_current_shape(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    pre_ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+    ).fetchone()[0]
+    conn.close()
+    assert "ledger_installed" in pre_ddl, "fixture is not the CURRENT shape"
+    assert "parole_denied" not in pre_ddl, "fixture already has the new member"
+
+    db = Database(db_path)
+    await db.initialize()  # must not raise
+    try:
+        cur = await db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+        )
+        assert "parole_denied" in (await cur.fetchone())[0]
+
+        # Both pre-existing rows survived the rebuild, byte-for-byte.
+        cur = await db._conn.execute(
+            "SELECT event_type, created_at, state_json FROM alert_events ORDER BY id"
+        )
+        rows = [tuple(r) for r in await cur.fetchall()]
+        assert rows == [
+            ("ledger_installed", "2026-08-14T00:00:00+00:00", None),
+            ("refresh_completed", "2026-08-15T00:00:00+00:00", '{"refreshed": 5}'),
+        ]
+
+        # The epoch row was NOT re-seeded on top of the surviving one.
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM alert_events WHERE event_type='ledger_installed'"
+        )
+        (epochs,) = await cur.fetchone()
+        assert epochs == 1
+
+        # And the new member is actually usable.
+        await db._conn.execute(
+            "INSERT INTO alert_events (created_at, event_type) "
+            "VALUES ('2026-08-15T01:00:00+00:00', 'parole_denied')"
+        )
+        await db._conn.commit()
+    finally:
+        await db.close()

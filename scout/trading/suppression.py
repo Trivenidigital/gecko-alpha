@@ -162,6 +162,29 @@ async def _open_gate(
             # validated on the fast path no longer exists. Deny rather than
             # spend a slot from a generation whose lock period is still running.
             if not parole_window_open(parole_at_now):
+                # Recorded IN this transaction, before the COMMIT that closes
+                # it: the denial and the state it was decided against are one
+                # durable fact. A denial is the gate working correctly, not an
+                # anomaly — hence its own event type rather than
+                # `marker_anomaly`, which would misfile a normal decision as a
+                # fault.
+                await record_alert_event(
+                    db,
+                    event_type="parole_denied",
+                    combo_key=combo_key,
+                    transition="generation_changed_before_reservation",
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                    state_json=encode_state(
+                        suppressed=supp_now,
+                        suppressed_at=supp_at_now,
+                        parole_at=parole_at_now,
+                        parole_trades_remaining=remaining,
+                    ),
+                    detail="suppression was re-latched between the lock-free "
+                    "read and the locked reservation; the validated window no "
+                    "longer exists",
+                    managed_txn=True,
+                )
                 await db._conn.execute("COMMIT")
                 log.info(
                     "parole_generation_changed_before_reservation",
@@ -172,6 +195,23 @@ async def _open_gate(
                 return (False, "suppressed", None)
 
             if remaining is None or remaining <= 0:
+                # The parole budget is spent. This is the denial that explains
+                # a stalled retest after the fact, and until now it left no
+                # trace at all — not even a log line.
+                await record_alert_event(
+                    db,
+                    event_type="parole_denied",
+                    combo_key=combo_key,
+                    transition="parole_exhausted",
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                    state_json=encode_state(
+                        suppressed=supp_now,
+                        suppressed_at=supp_at_now,
+                        parole_at=parole_at_now,
+                        parole_trades_remaining=remaining,
+                    ),
+                    managed_txn=True,
+                )
                 await db._conn.execute("COMMIT")
                 return (False, "parole_exhausted", None)
             await db._conn.execute(
