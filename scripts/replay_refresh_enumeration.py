@@ -10,13 +10,35 @@ the only question that matters: *which rows change, and does any of them cross a
 suppression boundary?*
 
 WHAT IT REPORTS, per key in the proposed enumeration:
-  - the row as it stands today (trades / wins / losses / WR / suppressed /
-    last_refreshed)
+  - both rows as they stand today (trades / wins / losses / WR / suppressed /
+    last_refreshed), for the 7d window and the 30d window
   - the canonical 7d + 30d economics recomputed at `--at`
-  - whether the row would change at all
+  - whether EITHER persisted row would change, decided per window
   - which combos NEWLY enter membership relative to the deployed enumeration
   - predicted D4/D5 suppression transitions
   - the full GLOBAL terminal-incomplete candidate set
+
+PER-WINDOW COMPARISON. `_refresh_combo_locked` writes TWO rows per combo, one
+per window, from two independent aggregates. A comparison that fetches only the
+`window = '30d'` row therefore attests to half the write: a stale persisted 7d
+row sitting behind an exact 30d row reported "no change". Each window is now
+compared against its own canonical recomputation and reported separately as
+`7d_match` / `30d_match` and `would_change_7d` / `would_change_30d`, with
+`would_change_any` as the aggregate. A window with NO persisted row is a change
+for that window (`row_would_be_created`), never a silent skip — the treatment
+the 30d window already gave a missing row.
+
+  The legacy field names are kept so reports either side of this change stay
+  diffable, and both now carry ANY-window semantics: `would_change` equals
+  `would_change_any`, and `rows_that_would_change` counts combos where either
+  window moves (`rows_that_would_change_7d` / `_30d` break that count down).
+  `change_reason` reports the 30d reason when the 30d window changes — it is the
+  window that drives suppression — and otherwise the 7d reason; the unambiguous
+  per-window fields are `change_reason_7d` and `change_reason_30d`.
+
+  Enumeration itself stays keyed on `window = '30d'`, mirroring `refresh_all`.
+  A combo carrying a 7d row but no 30d row is outside both the production
+  enumeration and this replay of it.
 
 THRESHOLD PROVENANCE. `_classify_retest` and `_retest_accounting` are IMPORTED
 from `scout.trading.combo_refresh` and `VALID_TERMINAL_OUTCOME_SQL` from
@@ -178,12 +200,21 @@ async def _economics(
     }
 
 
-async def _existing_row(conn: aiosqlite.Connection, combo: str) -> dict | None:
+async def _existing_row(
+    conn: aiosqlite.Connection, combo: str, window: str
+) -> dict | None:
+    """The persisted row for `combo` in `window`, or None if there is none.
+
+    Same shape for both windows so the comparison has one code path. The
+    suppression and parole fields are meaningful only on the 30d row —
+    `_refresh_combo_locked` pins the 7d row's `suppressed` to 0 and never writes
+    its parole columns.
+    """
     cur = await conn.execute(
         "SELECT trades, wins, losses, win_rate_pct, suppressed, suppressed_at, "
         "       parole_at, parole_trades_remaining, last_refreshed "
-        "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
-        (combo,),
+        "FROM combo_performance WHERE combo_key = ? AND window = ?",
+        (combo, window),
     )
     row = await cur.fetchone()
     if row is None:
@@ -199,6 +230,28 @@ async def _existing_row(conn: aiosqlite.Connection, combo: str) -> dict | None:
         "parole_trades_remaining": row[7],
         "last_refreshed": row[8],
     }
+
+
+def _matches(existing: dict | None, recomputed: dict) -> bool:
+    """Does the persisted row already carry the canonical economics?
+
+    A missing row is NOT a match — the refresh would create it, which is a
+    change for that window.
+    """
+    if existing is None:
+        return False
+    return (
+        existing["trades"] == recomputed["trades"]
+        and existing["wins"] == recomputed["wins"]
+        and existing["losses"] == recomputed["losses"]
+        and abs(existing["win_rate_pct"] - recomputed["win_rate_pct"]) < 1e-6
+    )
+
+
+def _change_reason(existing: dict | None, matched: bool) -> str:
+    if existing is None:
+        return "row_would_be_created"
+    return "no_change" if matched else "economics_differ"
 
 
 def _predict_transition(
@@ -276,52 +329,73 @@ async def replay(db_path: Path, at: datetime, settings) -> dict:
 
         combos: list[dict] = []
         changed = 0
+        changed_7d = 0
+        changed_30d = 0
         for combo in sorted(proposed):
-            existing = await _existing_row(conn, combo)
+            existing_7d = await _existing_row(conn, combo, "7d")
+            existing_30d = await _existing_row(conn, combo, "30d")
             w7 = await _economics(conn, combo, at, 7)
             w30 = await _economics(conn, combo, at, 30)
 
             retest_state = None
-            if existing is not None and existing["suppressed"]:
+            if existing_30d is not None and existing_30d["suppressed"]:
                 acct = await _retest_accounting(
                     ro,
                     combo,
-                    existing["parole_at"],
-                    existing["parole_trades_remaining"],
+                    existing_30d["parole_at"],
+                    existing_30d["parole_trades_remaining"],
                     target,
                 )
                 retest_state = _classify_retest(
-                    acct, existing["parole_trades_remaining"], target
+                    acct, existing_30d["parole_trades_remaining"], target
                 )
 
-            if existing is None:
-                would_change = True
-                change_reason = "row_would_be_created"
+            # Each window against its OWN canonical recomputation. The refresh
+            # writes both rows; comparing only one attests to half the write.
+            match_7d = _matches(existing_7d, w7)
+            match_30d = _matches(existing_30d, w30)
+            would_change_7d = not match_7d
+            would_change_30d = not match_30d
+            would_change_any = would_change_7d or would_change_30d
+
+            reason_7d = _change_reason(existing_7d, match_7d)
+            reason_30d = _change_reason(existing_30d, match_30d)
+            if would_change_30d:
+                change_reason = reason_30d
+            elif would_change_7d:
+                change_reason = reason_7d
             else:
-                same = (
-                    existing["trades"] == w30["trades"]
-                    and existing["wins"] == w30["wins"]
-                    and existing["losses"] == w30["losses"]
-                    and abs(existing["win_rate_pct"] - w30["win_rate_pct"]) < 1e-6
-                )
-                would_change = not same
-                change_reason = "economics_differ" if would_change else "no_change"
-            if would_change:
+                change_reason = "no_change"
+
+            if would_change_any:
                 changed += 1
+            if would_change_7d:
+                changed_7d += 1
+            if would_change_30d:
+                changed_30d += 1
 
             combos.append(
                 {
                     "combo_key": combo,
                     "in_deployed_enumeration": combo in deployed,
                     "newly_enumerated": combo not in deployed,
-                    "existing_row_30d": existing,
+                    "existing_row_7d": existing_7d,
+                    "existing_row_30d": existing_30d,
                     "recomputed_7d": w7,
                     "recomputed_30d": w30,
-                    "would_change": would_change,
+                    "7d_match": match_7d,
+                    "30d_match": match_30d,
+                    "would_change_7d": would_change_7d,
+                    "would_change_30d": would_change_30d,
+                    "would_change_any": would_change_any,
+                    # Legacy field, now ANY-window (see module docstring).
+                    "would_change": would_change_any,
+                    "change_reason_7d": reason_7d,
+                    "change_reason_30d": reason_30d,
                     "change_reason": change_reason,
                     "retest_state": retest_state,
                     "predicted_transition_MIRRORED_LOGIC": _predict_transition(
-                        existing, w30, retest_state, settings
+                        existing_30d, w30, retest_state, settings
                     ),
                 }
             )
@@ -354,7 +428,10 @@ async def replay(db_path: Path, at: datetime, settings) -> dict:
             "newly_enumerated": sorted(proposed - deployed),
             "dropped_vs_deployed": sorted(deployed - proposed),
         },
+        # ANY-window count, with the per-window breakdown beside it.
         "rows_that_would_change": changed,
+        "rows_that_would_change_7d": changed_7d,
+        "rows_that_would_change_30d": changed_30d,
         "predicted_suppression_transitions": transitions,
         "terminal_incomplete_candidates_GLOBAL": terminal,
         "combos": combos,
