@@ -69,6 +69,7 @@ EVENT_TYPES = frozenset(
         "marker_anomaly",
         "refresh_completed",
         "ledger_installed",
+        "parole_denied",
     }
 )
 

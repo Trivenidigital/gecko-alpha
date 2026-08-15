@@ -56,7 +56,8 @@ CREATE TABLE alert_events (
         'marker_cleared',
         'marker_anomaly',
         'refresh_completed',
-        'ledger_installed'
+        'ledger_installed',
+        'parole_denied'
     )),
     combo_key        TEXT,
     signal_type      TEXT,

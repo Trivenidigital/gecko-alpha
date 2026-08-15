@@ -285,6 +285,23 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 combo_key=combo_key,
                 err=str(exc),
             )
+            # The page WENT OUT and the marker did not land, so the next
+            # refresh will page this generation again. Durable because the
+            # duplicate is otherwise unexplainable after the fact: the log line
+            # that says why has a minutes-long half-life on prod, and the row
+            # itself carries no trace of the failed write. Unmanaged — the
+            # `async with` above has released, and the failed txn is gone.
+            await record_alert_event(
+                db,
+                event_type="marker_anomaly",
+                combo_key=combo_key,
+                transition="retest_incomplete_marker_update_failed",
+                detected_at=detected_at,
+                delivery_result=f"error:{type(exc).__name__}",
+                payload_hash=digest,
+                detail="page delivered but the marker write failed; the next "
+                "refresh will page this generation again",
+            )
     return alerted
 
 
@@ -914,6 +931,51 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                 "WHERE combo_key = ? AND window = '30d'",
                 (combo_key,),
             )
+            # Read the post-increment count back inside the SAME transaction, so
+            # the ledger rows below and the counter they describe cannot
+            # disagree. `managed_txn=True` throughout: this whole function runs
+            # with `db._txn_lock` held by `refresh_combo`.
+            cur = await db._conn.execute(
+                "SELECT refresh_failures FROM combo_performance "
+                "WHERE combo_key = ? AND window = '30d'",
+                (combo_key,),
+            )
+            row = await cur.fetchone()
+            failures = row[0] if row else None
+            await record_alert_event(
+                db,
+                event_type="marker_anomaly",
+                combo_key=combo_key,
+                transition="refresh_failed",
+                detected_at=datetime.now(timezone.utc).isoformat(),
+                delivery_result=f"error:{type(e).__name__}",
+                state_json=encode_state(refresh_failures=failures),
+                detail=str(e),
+                managed_txn=True,
+            )
+            # ONCE PER CROSSING, gated on equality rather than `>=`. The
+            # chronic-failure log in `refresh_all` fires every run for as long
+            # as the combo stays above the threshold; a ledger row per run
+            # would be the steady-state noise this ledger exists to avoid. The
+            # moment the counter FIRST reaches the threshold is the event.
+            if failures is not None and failures == (
+                settings.FEEDBACK_CHRONIC_FAILURE_THRESHOLD
+            ):
+                await record_alert_event(
+                    db,
+                    event_type="marker_anomaly",
+                    combo_key=combo_key,
+                    transition="chronic_failure",
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                    delivery_result=f"error:{type(e).__name__}",
+                    state_json=encode_state(
+                        refresh_failures=failures,
+                        threshold=settings.FEEDBACK_CHRONIC_FAILURE_THRESHOLD,
+                    ),
+                    detail="refresh_failures reached the chronic threshold on "
+                    "this run",
+                    managed_txn=True,
+                )
             await db._conn.commit()
         except Exception as counter_err:
             # The chronic-failure surfacing in weekly_digest depends on this
@@ -1246,6 +1308,9 @@ async def _record_pending_reversals(
     # released, so the rows are self-committed and survive the rollback that
     # destroyed the pages they describe.
     lost_pages: list[tuple[str, str]] = []
+    # Same deferral, same reason: this handler runs INSIDE `db._txn_lock`, and
+    # `record_alert_event`'s unmanaged mode takes that same non-reentrant lock.
+    write_failures: list[tuple[str, str, str]] = []
     # Every commit on the shared connection holds `_txn_lock`, or concurrent
     # writers interleave executes and leave half-open transactions. Only the
     # NETWORK call belongs outside it — and no network call happens here.
@@ -1380,6 +1445,7 @@ async def _record_pending_reversals(
                     detail="page not recorded; refresh continues and the next "
                     "run re-detects nothing — this page is lost",
                 )
+                write_failures.append((combo, transition, type(exc).__name__))
                 continue
         try:
             await db._conn.commit()
@@ -1413,6 +1479,21 @@ async def _record_pending_reversals(
     # pages that are diffed across a single refresh and therefore NEVER
     # re-detected — no retry, no re-derivation, no second chance. Until now the
     # only trace was a journald line with a ~minutes half-life on prod.
+    for combo, transition, err_type in write_failures:
+        # A §12b page that was never recorded and will never be re-detected —
+        # the transition is diffed across a single refresh, so there is no
+        # second chance and no retry. Until now the only trace was a log line.
+        await record_alert_event(
+            db,
+            event_type="marker_anomaly",
+            combo_key=combo,
+            transition="suppression_reversal_pending_write_failed",
+            detected_at=now_iso,
+            delivery_result=f"error:{err_type}",
+            detail=f"pending page for transition {transition} was never "
+            "recorded; it will not be re-detected and is lost",
+        )
+
     for combo, payload in lost_pages:
         try:
             body = json.loads(payload)
@@ -1663,6 +1744,17 @@ async def _process_suppression_reversals(
                 combo_key=combo,
                 err=str(exc),
             )
+            await record_alert_event(
+                db,
+                event_type="marker_anomaly",
+                combo_key=combo,
+                transition="suppression_reversal_pending_clear_failed",
+                detected_at=detected_at,
+                delivery_result=f"error:{type(exc).__name__}",
+                payload_hash=digest,
+                detail="page delivered but the pending marker was not cleared; "
+                "the next refresh re-sends the same body",
+            )
         alerted.append({"combo_key": combo, "transition": transition})
 
     return alerted
@@ -1904,6 +1996,17 @@ async def _process_permanent_suppression(
                 "permanent_suppression_marker_update_failed",
                 combo_key=combo,
                 err=str(exc),
+            )
+            await record_alert_event(
+                db,
+                event_type="marker_anomaly",
+                combo_key=combo,
+                transition="permanent_suppression_marker_update_failed",
+                detected_at=now_iso,
+                delivery_result=f"error:{type(exc).__name__}",
+                payload_hash=digest,
+                detail="page delivered but the dedup marker write failed; the "
+                "next run will page this combo again",
             )
         alerted.append(combo)
 
