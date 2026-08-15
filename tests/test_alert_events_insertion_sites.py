@@ -1252,19 +1252,22 @@ async def test_fallback_non_200_records_failed_not_delivered(
             == []
         ), "a rejected page was recorded as delivered"
 
-        # Threshold/cooldown behaviour unchanged: the counter still holds every
-        # fail-open in the window, the cooldown was stamped at decision time
-        # (pre-existing, deliberately untouched), and a further fail-open inside
-        # the cooldown attempts no second send.
+        # The COUNTER still records every fail-open — it measures DB
+        # degradation, which happened whether or not anyone was told.
         assert len(suppression._fallback_timestamps) == threshold
-        assert suppression._last_alerted_ts != float("-inf")
+        # The COOLDOWN is not consumed by a page that never landed (debt#20).
+        # Stamping it here would mean the operator was told nothing AND the
+        # next fail-open was suppressed on the strength of that non-delivery.
+        assert suppression._last_alerted_ts == float(
+            "-inf"
+        ), "a rejected page consumed the cooldown window"
         await suppression._record_fallback(db, "combo_a", "database is locked", s)
-        assert len(fake.kwargs) == 1, "cooldown did not suppress the second send"
+        assert len(fake.kwargs) == 2, "the retry after a failed page was suppressed"
         assert (
             len(
                 await _events(db, event_type="alert_failed", alert_source="suppression")
             )
-            == 1
+            == 2
         )
     finally:
         suppression._fallback_timestamps.clear()
