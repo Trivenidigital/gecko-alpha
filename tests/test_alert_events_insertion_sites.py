@@ -1262,16 +1262,31 @@ async def _seed_hard_loss(db, signal_type="gainers_early", n=30):
 
 
 class _FakeAlerter:
-    """Stands in for `scout.alerter`, honouring the `raise_on_failure` contract:
-    a non-200 raises only when the caller asked it to. That is the exact
-    property under test — without the flag the real alerter returns normally on
-    a rejection and the caller stamps `delivered`."""
+    """Stands in for `scout.alerter.send_telegram_message`, honouring the
+    `raise_on_failure` contract: a non-200 raises only when the caller asked it
+    to. That is the exact property under test — without the flag the real
+    alerter returns normally on a rejection and the caller stamps `delivered`.
+
+    Every call is bound against the REAL function's signature first. A plain
+    `**kwargs` stand-in silently accepts a renamed or dropped parameter, so a
+    refactor that broke the production call would leave this test green while
+    the page died in prod — the same reason safety-critical mocks are built
+    with `spec=`."""
 
     def __init__(self, status=200):
+        import inspect
+
+        import scout.alerter as _real
+
+        # Captured at construction, BEFORE the monkeypatch swaps the attribute —
+        # reading it inside the call would bind against this fake's own
+        # signature and prove nothing.
+        self._real_signature = inspect.signature(_real.send_telegram_message)
         self.status = status
         self.kwargs: list[dict] = []
 
     async def send_telegram_message(self, text, session, settings, **kwargs):
+        self._real_signature.bind(text, session, settings, **kwargs)
         self.kwargs.append(kwargs)
         if self.status != 200 and kwargs.get("raise_on_failure"):
             raise RuntimeError(f"telegram send failed status={self.status}")
