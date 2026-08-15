@@ -393,10 +393,26 @@ async def _check_alert_events_rate(
         }
 
     last_seen, state_json = newest[0], newest[1]
+    age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
+
+    # AGE FIRST. The payload-quality reasons below all describe a pass that is
+    # RUNNING, so they must not pre-empt staleness — a 100h-old heartbeat that
+    # happens to say `refreshed: 0` is a stalled pass, not a failing one, and
+    # paging "the refresh pass IS running" about it would be false.
+    if age_hours > slo_hours:
+        return {
+            **base,
+            "status": "breach",
+            "reason": "stale",
+            "last_seen": last_seen,
+            "age_hours": round(age_hours, 2),
+        }
+
     try:
-        refreshed = (json.loads(state_json) or {}).get("refreshed")
+        payload = json.loads(state_json) or {}
     except (ValueError, TypeError):
-        refreshed = None
+        payload = None
+    refreshed = payload.get("refreshed") if isinstance(payload, dict) else None
     if not isinstance(refreshed, int):
         # Cannot PROVE the pass succeeded. Fail toward the page: an unreadable
         # heartbeat is a broken writer, not a healthy one.
@@ -405,28 +421,33 @@ async def _check_alert_events_rate(
             "status": "breach",
             "reason": "heartbeat_unreadable",
             "last_seen": last_seen,
-            "age_hours": round(
-                (now - _parse_ts(last_seen)).total_seconds() / 3600.0, 2
-            ),
+            "age_hours": round(age_hours, 2),
         }
 
-    age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
     if refreshed <= 0:
-        # Fresh but broken. Breach NOW rather than at SLO expiry — the pass is
-        # running and failing, which is a louder fact than a stalled one.
+        # Fresh but unproductive. Two very different causes, and the page has
+        # to say which: an EMPTY enumeration means there was nothing to refresh
+        # (a restored or freshly-seeded DB), while a non-empty enumeration that
+        # refreshed nothing means every per-combo refresh failed. Claiming the
+        # latter for the former sends the operator hunting a fault that does
+        # not exist.
+        enumerated = payload.get("combos_enumerated")
+        empty_universe = enumerated == 0
         return {
             **base,
             "status": "breach",
-            "reason": "refresh_all_failing",
+            "reason": (
+                "no_combos_enumerated" if empty_universe else "refresh_all_failing"
+            ),
             "last_seen": last_seen,
             "age_hours": round(age_hours, 2),
             "refreshed": refreshed,
+            "combos_enumerated": enumerated,
         }
-    breached = age_hours > slo_hours
     return {
         **base,
-        "status": "breach" if breached else "ok",
-        "reason": "stale" if breached else "fresh",
+        "status": "ok",
+        "reason": "fresh",
         "last_seen": last_seen,
         "age_hours": round(age_hours, 2),
         "refreshed": refreshed,
@@ -615,16 +636,25 @@ def _compose_message(checks: dict, include: list[str]) -> str:
             )
         elif e["reason"] == "refresh_all_failing":
             lines.append(
-                f"- alert_events: the refresh pass IS running (last heartbeat "
-                f"{e['last_seen']}, {e['age_hours']}h ago) but refreshed 0 "
-                "combos — every per-combo refresh is failing, so suppression "
-                "economics are frozen while the heartbeat looks healthy"
+                f"- alert_events: the refresh pass ran {e['age_hours']}h ago "
+                f"(within SLO) over {e['combos_enumerated']} combo(s) but "
+                "refreshed 0 — every per-combo refresh is failing, so "
+                "suppression economics are frozen while the heartbeat looks "
+                "healthy"
+            )
+        elif e["reason"] == "no_combos_enumerated":
+            lines.append(
+                f"- alert_events: the refresh pass ran {e['age_hours']}h ago "
+                "(within SLO) but enumerated 0 combos — there is nothing to "
+                "refresh, which on a live box means the trade history it reads "
+                "is empty (restored/reseeded DB?), not that refresh is broken"
             )
         elif e["reason"] == "heartbeat_unreadable":
             lines.append(
-                f"- alert_events: last heartbeat at {e['last_seen']} carries no "
-                "readable refreshed-count — the heartbeat writer is broken, so "
-                "refresh health cannot be confirmed either way"
+                f"- alert_events: the heartbeat at {e['last_seen']} is within "
+                "SLO but carries no readable refreshed-count — the heartbeat "
+                "writer is broken, so refresh health cannot be confirmed "
+                "either way"
             )
         else:
             lines.append(

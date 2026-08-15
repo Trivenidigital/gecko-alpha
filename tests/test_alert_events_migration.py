@@ -306,12 +306,191 @@ def test_event_types_constant_matches_the_migration_check_constraint():
     from scout.db import Database as _Database
     from scout.trading.alert_events import EVENT_TYPES
 
-    src = inspect.getsource(_Database._migrate_alert_events_v1)
-    body = src[src.index("event_type       TEXT NOT NULL CHECK") :]
-    body = body[: body.index("))")]
-    in_ddl = set(re.findall(r"'([a-z_]+)'", body))
+    from scout.db import _ALERT_EVENTS_DDL, _alert_event_check_vocabulary
+
+    in_ddl = _alert_event_check_vocabulary(_ALERT_EVENTS_DDL)
+    assert in_ddl, "the CHECK vocabulary could not be parsed out of the DDL"
     assert in_ddl == set(EVENT_TYPES), (
         "EVENT_TYPES and the migration CHECK constraint disagree: "
         f"only in DDL={sorted(in_ddl - set(EVENT_TYPES))}, "
         f"only in EVENT_TYPES={sorted(set(EVENT_TYPES) - in_ddl)}"
     )
+
+
+# --- upgrade safety against this migration's OWN prior vocabulary ----------
+
+# The INTERMEDIATE-F3 shape: the table as it stood at branch commit `1ef2ad8c`,
+# before `ledger_installed` joined the CHECK enum. This is not a hypothetical —
+# it is the exact shape any DB created by an earlier commit of this branch has,
+# and running the current migration against it used to raise IntegrityError out
+# of `initialize()`, i.e. the pipeline could not boot.
+_INTERMEDIATE_SCHEMA = """
+CREATE TABLE alert_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    event_type       TEXT NOT NULL CHECK (event_type IN (
+        'suppression_transition',
+        'parole_slot_spent',
+        'parole_slot_refunded',
+        'reversal_pending_recorded',
+        'alert_dispatched',
+        'alert_delivered',
+        'alert_failed',
+        'marker_stamped',
+        'marker_cleared',
+        'marker_anomaly',
+        'refresh_completed'
+    )),
+    combo_key        TEXT,
+    signal_type      TEXT,
+    alert_source     TEXT,
+    transition       TEXT,
+    detected_at      TEXT,
+    delivery_result  TEXT,
+    retry            INTEGER,
+    payload_hash     TEXT,
+    state_json       TEXT,
+    detail           TEXT
+);
+CREATE INDEX idx_alert_events_combo_created ON alert_events(combo_key, created_at);
+CREATE INDEX idx_alert_events_type_created ON alert_events(event_type, created_at);
+"""
+
+
+def _build_intermediate_shape(db_path) -> None:
+    """Old CHECK (no `ledger_installed`), no epoch row, one real heartbeat."""
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_INTERMEDIATE_SCHEMA)
+    conn.execute(
+        "INSERT INTO alert_events (created_at, event_type, state_json) "
+        "VALUES ('2026-08-14T00:00:00+00:00', 'refresh_completed', "
+        "'{\"refreshed\": 5}')"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_from_the_intermediate_f3_shape_boots_and_rebuilds(tmp_path):
+    """RECURRENCE GUARD. `CREATE TABLE IF NOT EXISTS` is a no-op against an
+    existing table, so the stale CHECK survived and the `ledger_installed` seed
+    violated it — the migration re-raised and `initialize()` could not boot.
+
+    The load-bearing asserts are the fixture ones: without them this test would
+    happily pass against an already-current table and prove nothing."""
+    db_path = tmp_path / "intermediate.db"
+    _build_intermediate_shape(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    pre_ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+    ).fetchone()[0]
+    conn.close()
+    assert "ledger_installed" not in pre_ddl, "fixture is not the OLD vocabulary"
+    assert "refresh_completed" in pre_ddl, "fixture is not the intermediate shape"
+
+    db = Database(db_path)
+    await db.initialize()  # must not raise
+    try:
+        cur = await db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+        )
+        post_ddl = (await cur.fetchone())[0]
+        assert "ledger_installed" in post_ddl, "the CHECK vocabulary did not evolve"
+
+        # The pre-existing row SURVIVED the rebuild — a rebuild that silently
+        # ate the ledger it exists to preserve would be worse than the brick.
+        cur = await db._conn.execute(
+            "SELECT created_at, state_json FROM alert_events "
+            "WHERE event_type = 'refresh_completed'"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "2026-08-14T00:00:00+00:00"
+        assert rows[0][1] == '{"refreshed": 5}'
+
+        # And the seed that used to violate the stale CHECK now lands.
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM alert_events WHERE event_type = 'ledger_installed'"
+        )
+        (epochs,) = await cur.fetchone()
+        assert epochs == 1
+
+        # Indexes are re-attached to the rebuilt table, not left behind on the
+        # dropped one.
+        cur = await db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='alert_events'"
+        )
+        names = {r[0] for r in await cur.fetchall()}
+        assert {
+            "idx_alert_events_combo_created",
+            "idx_alert_events_type_created",
+        } <= names
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_vocabulary_rebuild_is_idempotent(tmp_path):
+    """A second initialize() must not rebuild again. Asserted on the table DDL
+    itself rather than on a log line: `sqlite_master.sql` is the artefact a
+    rebuild would change, so byte-equality across a restart is the only claim
+    that actually rules a second rebuild out."""
+    db_path = tmp_path / "intermediate.db"
+    _build_intermediate_shape(db_path)
+
+    db = Database(db_path)
+    await db.initialize()
+    cur = await db._conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+    )
+    first_ddl = (await cur.fetchone())[0]
+    cur = await db._conn.execute("SELECT id FROM alert_events ORDER BY id")
+    first_ids = [r[0] for r in await cur.fetchall()]
+    await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    try:
+        cur = await db2._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='alert_events'"
+        )
+        assert (await cur.fetchone())[0] == first_ddl, "the table was rebuilt twice"
+        cur = await db2._conn.execute("SELECT id FROM alert_events ORDER BY id")
+        assert [r[0] for r in await cur.fetchall()] == first_ids
+
+        cur = await db2._conn.execute(
+            "SELECT COUNT(*) FROM alert_events WHERE event_type='ledger_installed'"
+        )
+        (epochs,) = await cur.fetchone()
+        assert epochs == 1, "the rebuild path re-seeded a second epoch row"
+    finally:
+        await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_drops_only_rows_outside_the_current_vocabulary(tmp_path):
+    """Today the vocabulary has only ever grown, so this count is zero
+    everywhere. The test exists so that if a member is ever REMOVED, the
+    behaviour is a counted, logged drop rather than a surprise."""
+    db_path = tmp_path / "intermediate.db"
+    _build_intermediate_shape(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO alert_events (created_at, event_type) "
+        "VALUES ('2026-08-14T00:00:00+00:00', 'marker_stamped')"
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute("SELECT event_type FROM alert_events ORDER BY id")
+        kept = [r[0] for r in await cur.fetchall()]
+        # Every pre-existing row is still in the current vocabulary, so nothing
+        # was dropped; the epoch row is appended.
+        assert kept == ["refresh_completed", "marker_stamped", "ledger_installed"]
+    finally:
+        await db.close()

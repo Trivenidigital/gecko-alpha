@@ -324,11 +324,18 @@ def _iso(hours_ago):
     return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
 
 
-def _hb(refreshed: int, failed: int = 0) -> str:
-    """A HEALTHY `refresh_completed` payload. Spelled out at every call site
-    rather than defaulted, because "the heartbeat exists" and "the refresh
-    worked" are the two claims this check deliberately separates."""
-    return json.dumps({"refreshed": refreshed, "failed": failed})
+def _hb(refreshed: int, failed: int = 0, combos: int | None = None) -> str:
+    """A `refresh_completed` payload. Spelled out at every call site rather than
+    defaulted, because "the heartbeat exists" and "the refresh worked" are the
+    two claims this check deliberately separates. `combos` defaults to mirroring
+    `refreshed` so an ordinary healthy payload is self-consistent."""
+    return json.dumps(
+        {
+            "refreshed": refreshed,
+            "failed": failed,
+            "combos_enumerated": refreshed if combos is None else combos,
+        }
+    )
 
 
 def _day(days_ago):
@@ -1230,7 +1237,11 @@ def test_fresh_heartbeat_that_refreshed_nothing_is_a_breach(tmp_path):
         alert_rows=[(_iso(1), "sent")],
         digest_rows=[_day(1)],
         alert_event_rows=[
-            (_iso(1), "refresh_completed", '{"refreshed": 0, "failed": 7}')
+            (
+                _iso(1),
+                "refresh_completed",
+                '{"refreshed": 0, "failed": 7, "combos_enumerated": 7}',
+            )
         ],
     )
     res = _run(dbp, "--enabled", "true", "--dry-run")
@@ -1316,3 +1327,78 @@ def test_alert_events_flag_is_wired_in_the_shell_wrapper():
     sh = (REPO_ROOT / "scripts" / "alert-channel-watchdog.sh").read_text()
     assert 'ALERT_EVENTS_SLO_HOURS="${ALERT_EVENTS_SLO_HOURS:-27}"' in sh
     assert '--alert-events-slo-hours "${ALERT_EVENTS_SLO_HOURS}"' in sh
+
+
+def test_stale_heartbeat_is_reported_as_stale_not_as_a_running_pass(tmp_path):
+    """AGE FIRST. A 100h-old heartbeat that happens to say `refreshed: 0` is a
+    STALLED pass, not a failing one — the payload-quality reasons all describe a
+    pass that is running, so paging "the refresh pass ran Nh ago (within SLO)"
+    about it would be a false statement in the page body."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(100), "refresh_completed", _hb(0, 7, combos=7))],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["reason"] == "stale"
+    msg = body["message"]
+    assert "within SLO" not in msg
+    assert "every per-combo refresh is failing" not in msg
+
+
+def test_stale_unreadable_heartbeat_is_also_reported_as_stale(tmp_path):
+    """Same precedence for the unreadable case — staleness dominates payload
+    quality, so the page names the stall rather than the parse."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(100), "refresh_completed", "{not json")],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["reason"] == "stale"
+
+
+def test_zero_refresh_with_empty_enumeration_is_not_called_a_failure(tmp_path):
+    """`refreshed == 0` has two very different causes. An EMPTY enumeration
+    means there was nothing to refresh (restored / reseeded DB); claiming
+    "every per-combo refresh is failing" there sends the operator hunting a
+    fault that does not exist."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(1), "refresh_completed", _hb(0, 0, combos=0))],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    check = body["checks"]["alert_events_rate"]
+    assert check["reason"] == "no_combos_enumerated"
+    assert check["combos_enumerated"] == 0
+    msg = body["message"]
+    assert "enumerated 0 combos" in msg
+    assert "every per-combo refresh is failing" not in msg
+
+
+def test_zero_refresh_with_a_non_empty_enumeration_is_a_real_failure(tmp_path):
+    """The other side of the same discrimination: combos WERE enumerated and
+    none refreshed, which is a genuine all-failing pass."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(1), "refresh_completed", _hb(0, 9, combos=9))],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    check = body["checks"]["alert_events_rate"]
+    assert check["reason"] == "refresh_all_failing"
+    assert check["combos_enumerated"] == 9
+    assert "every per-combo refresh is failing" in body["message"]

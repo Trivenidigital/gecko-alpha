@@ -34,6 +34,80 @@ if TYPE_CHECKING:
     from scout.news.schemas import CryptoPanicPost
     from scout.perp.schemas import PerpAnomaly
 
+# F3 `alert_events` DDL, hoisted to module scope for ONE reason: the migration
+# has to compare a live table's CHECK vocabulary against the current one, and a
+# second copy of that vocabulary written out for comparison is a copy that can
+# drift. The migration creates from this string, the drift check parses this
+# string, and the tripwire test in tests/test_alert_events_migration.py reads
+# this string. There is exactly one place the vocabulary lives.
+_ALERT_EVENTS_DDL = """
+CREATE TABLE alert_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    event_type       TEXT NOT NULL CHECK (event_type IN (
+        'suppression_transition',
+        'parole_slot_spent',
+        'parole_slot_refunded',
+        'reversal_pending_recorded',
+        'alert_dispatched',
+        'alert_delivered',
+        'alert_failed',
+        'marker_stamped',
+        'marker_cleared',
+        'marker_anomaly',
+        'refresh_completed',
+        'ledger_installed'
+    )),
+    combo_key        TEXT,
+    signal_type      TEXT,
+    alert_source     TEXT,
+    transition       TEXT,
+    detected_at      TEXT,
+    delivery_result  TEXT,
+    retry            INTEGER,
+    payload_hash     TEXT,
+    state_json       TEXT,
+    detail           TEXT
+)
+"""
+
+_ALERT_EVENTS_COLUMNS = (
+    "id, created_at, event_type, combo_key, signal_type, alert_source, "
+    "transition, detected_at, delivery_result, retry, payload_hash, "
+    "state_json, detail"
+)
+
+_ALERT_EVENTS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_alert_events_combo_created "
+    "ON alert_events(combo_key, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_events_type_created "
+    "ON alert_events(event_type, created_at)",
+)
+
+
+def _alert_event_check_vocabulary(ddl: str | None) -> set[str]:
+    """The `event_type` CHECK enum as a set, parsed out of a CREATE statement.
+
+    Scoped to the CHECK clause rather than the whole statement so an unrelated
+    string literal elsewhere in the DDL could never be mistaken for a member of
+    the vocabulary. Returns an empty set when there is no CHECK to read, which
+    the caller treats as drift — a table without the constraint is exactly as
+    wrong as one with the wrong constraint.
+    """
+    if not ddl:
+        return set()
+    import re
+
+    match = re.search(
+        r"event_type\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*event_type\s+IN\s*\((.*?)\)\s*\)",
+        ddl,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match is None:
+        return set()
+    return set(re.findall(r"'([^']+)'", match.group(1)))
+
+
 # Columns that map 1:1 from CandidateToken to the candidates table.
 _CANDIDATE_COLUMNS = [
     "contract_address",
@@ -6219,44 +6293,76 @@ class Database:
                 "description TEXT NOT NULL)"
             )
 
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS alert_events (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at       TEXT NOT NULL,
-                    event_type       TEXT NOT NULL CHECK (event_type IN (
-                        'suppression_transition',
-                        'parole_slot_spent',
-                        'parole_slot_refunded',
-                        'reversal_pending_recorded',
-                        'alert_dispatched',
-                        'alert_delivered',
-                        'alert_failed',
-                        'marker_stamped',
-                        'marker_cleared',
-                        'marker_anomaly',
-                        'refresh_completed',
-                        'ledger_installed'
-                    )),
-                    combo_key        TEXT,
-                    signal_type      TEXT,
-                    alert_source     TEXT,
-                    transition       TEXT,
-                    detected_at      TEXT,
-                    delivery_result  TEXT,
-                    retry            INTEGER,
-                    payload_hash     TEXT,
-                    state_json       TEXT,
-                    detail           TEXT
+            # UPGRADE SAFETY. `CREATE TABLE IF NOT EXISTS` is a no-op against a
+            # table that already exists with an OLDER CHECK vocabulary, and the
+            # `ledger_installed` seed below then violates that stale constraint
+            # — the migration re-raises and `initialize()` cannot boot. Verified
+            # by reproduction against an intermediate-F3-shape DB.
+            #
+            # So the vocabulary is not merely additive-by-hope: on drift the
+            # table is REBUILT. Keeping the CHECK is what makes a typo'd
+            # event_type fail loudly, and this rebuild is what keeps the CHECK
+            # evolvable — without it, the next event type added to this ledger
+            # bricks every database that predates it.
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='alert_events'"
+            )
+            row = await cur.fetchone()
+            live_ddl = row[0] if row else None
+            wanted = _alert_event_check_vocabulary(_ALERT_EVENTS_DDL)
+            if (
+                live_ddl is not None
+                and _alert_event_check_vocabulary(live_ddl) != wanted
+            ):
+                found = _alert_event_check_vocabulary(live_ddl)
+                # Rows whose event_type is no longer in the vocabulary cannot be
+                # carried across — the new CHECK would reject them. Counted and
+                # logged rather than silently dropped: today this is zero
+                # everywhere (the vocabulary has only ever grown), and if it is
+                # ever non-zero the operator needs to know what the rebuild ate.
+                cur = await conn.execute(
+                    "SELECT COUNT(*) FROM alert_events WHERE event_type NOT IN "
+                    "(" + ",".join("?" * len(wanted)) + ")",
+                    tuple(sorted(wanted)),
                 )
-                """)
+                (dropped,) = await cur.fetchone()
+                _log.warning(
+                    "alert_events_vocabulary_rebuild",
+                    migration=migration_name,
+                    added=sorted(wanted - found),
+                    removed=sorted(found - wanted),
+                    rows_dropped=dropped,
+                    detail="rebuilding alert_events to carry the current "
+                    "event_type CHECK vocabulary",
+                )
+                await conn.execute(
+                    _ALERT_EVENTS_DDL.replace(
+                        "CREATE TABLE alert_events", "CREATE TABLE alert_events_new"
+                    )
+                )
+                await conn.execute(
+                    f"INSERT INTO alert_events_new ({_ALERT_EVENTS_COLUMNS}) "
+                    f"SELECT {_ALERT_EVENTS_COLUMNS} FROM alert_events "
+                    "WHERE event_type IN (" + ",".join("?" * len(wanted)) + ")",
+                    tuple(sorted(wanted)),
+                )
+                # DROP before RENAME: the old table's indexes go with it, and
+                # the recreate below re-attaches them to the new table under the
+                # same names.
+                await conn.execute("DROP TABLE alert_events")
+                await conn.execute(
+                    "ALTER TABLE alert_events_new RENAME TO alert_events"
+                )
+
             await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_alert_events_combo_created "
-                "ON alert_events(combo_key, created_at)"
+                _ALERT_EVENTS_DDL.replace(
+                    "CREATE TABLE alert_events",
+                    "CREATE TABLE IF NOT EXISTS alert_events",
+                )
             )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_alert_events_type_created "
-                "ON alert_events(event_type, created_at)"
-            )
+            for index_sql in _ALERT_EVENTS_INDEXES:
+                await conn.execute(index_sql)
 
             # Verify presence -- fail loud on drift rather than at first write.
             cur = await conn.execute("PRAGMA table_info(alert_events)")
