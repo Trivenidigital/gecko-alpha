@@ -407,9 +407,10 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
     #
     # Checked BEFORE `terminal_incomplete` for that reason, and after
     # `contaminated` / `complete` so a cohort that does have trades is always
-    # diagnosed on its evidence first. The two are mutually exclusive anyway:
-    # `open_now <= cohort_total`, so `cohort_total == 0` implies
-    # `open_now == 0`.
+    # diagnosed on its evidence first. The ordering is load-bearing and is
+    # pinned by `test_classifier_ordering_prefers_evidence_over_the_stall_
+    # diagnosis` and `test_terminal_incomplete_is_retained_when_the_cohort_is_
+    # non_empty` in tests/test_parole_stalled.py.
     if acct.get("window_open") and acct["cohort_total"] == 0:
         return "parole_stalled"
     if slots_exhausted and acct["open_now"] == 0:
