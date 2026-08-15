@@ -42,6 +42,7 @@ import structlog
 
 from scout.config import Settings
 from scout.db import Database
+from scout.trading.alert_events import payload_digest, record_alert_event
 from scout.trading.params import (
     CALIBRATION_EXCLUDE_SIGNALS,
     DEFAULT_SIGNAL_TYPES,
@@ -173,6 +174,7 @@ async def _suspend(
 
 
 async def _send_suspend_alert(
+    db: Database,
     *,
     session,
     settings,
@@ -180,7 +182,42 @@ async def _send_suspend_alert(
     reason: str,
     body: str,
 ) -> None:
+    """§12b page for an automated reversal of operator-applied state.
+
+    ``raise_on_failure=True`` is LOAD-BEARING, not decoration (ruled #525 class).
+    The alerter defaults to ``False`` and merely LOGS a non-200 or a network
+    error, so without it this function emitted ``auto_suspend_alert_delivered``
+    — and now would append an ``alert_delivered`` ledger row — for a page
+    Telegram rejected. A durable ledger that records deliveries which never
+    happened is worse than no ledger: it converts an unknown into a false
+    certainty. With the flag, a rejected page raises into the handler below and
+    is recorded as ``alert_failed``.
+
+    CONTAINMENT is unchanged and deliberate: the raise is caught HERE, so a
+    failed page never aborts the suspension pass. The state change is already
+    committed by the caller before this runs and stays applied; only the
+    notification is lost, and it is lost LOUDLY (log + ledger row). The
+    scheduler at ``scout.main._run_feedback_schedulers`` is the second layer.
+    """
+    digest = payload_digest(body)
     if session is None:
+        # No session means no page was ever attempted — an operator-applied
+        # signal was just auto-suspended and nobody was told. That is exactly
+        # the §12b state the ledger exists to make visible, so it gets a row
+        # rather than an early return into silence. The state change itself is
+        # already durable in `signal_params_audit`; this records the
+        # NOTIFICATION gap, which nothing else does.
+        await record_alert_event(
+            db,
+            event_type="alert_failed",
+            signal_type=signal_type,
+            alert_source="auto_suspend",
+            transition=reason,
+            delivery_result="skipped_no_session",
+            retry=0,
+            payload_hash=digest,
+            detail="no aiohttp session supplied; suspension applied unpaged",
+        )
         return
     from scout import alerter  # local import (Windows OpenSSL)
 
@@ -190,17 +227,37 @@ async def _send_suspend_alert(
             signal_type=signal_type,
             reason=reason,
         )
+        await record_alert_event(
+            db,
+            event_type="alert_dispatched",
+            signal_type=signal_type,
+            alert_source="auto_suspend",
+            transition=reason,
+            retry=0,
+            payload_hash=digest,
+        )
         await alerter.send_telegram_message(
             body,
             session,
             settings,
             parse_mode=None,
             source="auto_suspend",
+            raise_on_failure=True,
         )
         log.info(
             "auto_suspend_alert_delivered",
             signal_type=signal_type,
             reason=reason,
+        )
+        await record_alert_event(
+            db,
+            event_type="alert_delivered",
+            signal_type=signal_type,
+            alert_source="auto_suspend",
+            transition=reason,
+            delivery_result="ok",
+            retry=0,
+            payload_hash=digest,
         )
     except Exception as exc:
         log.exception(
@@ -209,6 +266,17 @@ async def _send_suspend_alert(
             reason=reason,
             err=str(exc),
             err_type=type(exc).__name__,
+        )
+        await record_alert_event(
+            db,
+            event_type="alert_failed",
+            signal_type=signal_type,
+            alert_source="auto_suspend",
+            transition=reason,
+            delivery_result=f"error:{type(exc).__name__}",
+            retry=0,
+            payload_hash=digest,
+            detail="suspension is already applied; only the page was lost",
         )
 
 
@@ -311,6 +379,7 @@ async def maybe_suspend_signals(
                     log.exception("auto_suspend_rollback_failed", err=str(rb_err))
                 raise
             await _send_suspend_alert(
+                db,
                 session=session,
                 settings=settings,
                 signal_type=signal_type,
@@ -355,6 +424,7 @@ async def maybe_suspend_signals(
                 log.exception("auto_suspend_rollback_failed", err=str(rb_err))
             raise
         await _send_suspend_alert(
+            db,
             session=session,
             settings=settings,
             signal_type=signal_type,

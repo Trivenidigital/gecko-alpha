@@ -11,6 +11,12 @@ import structlog
 
 from scout.db import Database
 from scout.timeutil import sql_utc_cutoff
+from scout.trading.alert_events import (
+    encode_state,
+    generation_state,
+    payload_digest,
+    record_alert_event,
+)
 from scout.trading.paper import VALID_TERMINAL_OUTCOME_SQL
 
 log = structlog.get_logger()
@@ -112,7 +118,19 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
             "complete. Suppression is HELD and will not auto-clear. "
             "Re-arming a retest requires operator authorization."
         )
+        digest = payload_digest(message)
+        detected_at = datetime.now(timezone.utc).isoformat()
         log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
+        await record_alert_event(
+            db,
+            event_type="alert_dispatched",
+            combo_key=combo_key,
+            alert_source="combo_refresh_retest_terminal_incomplete",
+            transition="terminal_incomplete_held",
+            detected_at=detected_at,
+            retry=0,
+            payload_hash=digest,
+        )
         try:
             await _send_retest_incomplete_alert(message, settings)
         except Exception as exc:
@@ -122,8 +140,31 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 err=str(exc),
                 detail="marker NOT set - will re-attempt on the next refresh",
             )
+            await record_alert_event(
+                db,
+                event_type="alert_failed",
+                combo_key=combo_key,
+                alert_source="combo_refresh_retest_terminal_incomplete",
+                transition="terminal_incomplete_held",
+                detected_at=detected_at,
+                delivery_result=f"error:{type(exc).__name__}",
+                retry=0,
+                payload_hash=digest,
+                detail="marker NOT set - will re-attempt on the next refresh",
+            )
             continue
         log.info("retest_incomplete_alert_delivered", combo_key=combo_key)
+        await record_alert_event(
+            db,
+            event_type="alert_delivered",
+            combo_key=combo_key,
+            alert_source="combo_refresh_retest_terminal_incomplete",
+            transition="terminal_incomplete_held",
+            detected_at=detected_at,
+            delivery_result="ok",
+            retry=0,
+            payload_hash=digest,
+        )
 
         # Delivery is done; the DB mutation is not. Reacquire `_txn_lock` for
         # the short marker write: every commit on the shared connection must
@@ -151,6 +192,21 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 # when this generation-bound UPDATE matched zero rows, exactly
                 # defeating the stale-generation check.
                 changed = cur.rowcount
+                if changed:
+                    await record_alert_event(
+                        db,
+                        event_type="marker_stamped",
+                        combo_key=combo_key,
+                        transition="retest_incomplete_alerted_at",
+                        detected_at=detected_at,
+                        payload_hash=digest,
+                        state_json=encode_state(
+                            suppressed_at=suppressed_at,
+                            parole_at=parole_at,
+                            parole_trades_remaining=remaining,
+                        ),
+                        managed_txn=True,
+                    )
                 await conn.commit()
             if changed == 0:
                 # The generation moved while we were sending. The marker is
@@ -160,6 +216,22 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 log.info(
                     "retest_incomplete_marker_stale_generation",
                     combo_key=combo_key,
+                    detail="parole generation changed during delivery; marker "
+                    "not written, new generation will page on its own merits",
+                )
+                await record_alert_event(
+                    db,
+                    event_type="marker_anomaly",
+                    combo_key=combo_key,
+                    transition="retest_incomplete_alerted_at",
+                    detected_at=detected_at,
+                    delivery_result="stale_generation",
+                    payload_hash=digest,
+                    state_json=encode_state(
+                        suppressed_at=suppressed_at,
+                        parole_at=parole_at,
+                        parole_trades_remaining=remaining,
+                    ),
                     detail="parole generation changed during delivery; marker "
                     "not written, new generation will page on its own merits",
                 )
@@ -341,7 +413,8 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         # 30d row: apply suppression rule.
         w30 = stats["30d"]
         cur = await db._conn.execute(
-            "SELECT suppressed, parole_trades_remaining, suppressed_at, parole_at "
+            "SELECT suppressed, parole_trades_remaining, suppressed_at, parole_at, "
+            "       retest_incomplete_alerted_at "
             "FROM combo_performance WHERE combo_key = ? AND window = '30d'",
             (combo_key,),
         )
@@ -356,6 +429,12 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         new_suppressed_at = None
         new_parole_at = None
         new_parole_remaining = None
+        # F3: the label of whichever branch below fired. The label alone does
+        # NOT cause a row — emission is gated on an actual state delta below.
+        # Vocabulary is `_classify_reversal`'s, verbatim, so the two axes of
+        # this ledger name the same event the same way.
+        transition: str | None = None
+        transition_detail: str | None = None
 
         if existing is None:
             # First write — maybe suppress immediately if bad enough.
@@ -364,6 +443,8 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                 new_suppressed_at = now_iso
                 new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                 new_parole_remaining = retest
+                transition = "newly_suppressed"
+                transition_detail = "first_write"
         else:
             was_suppressed = bool(existing["suppressed"])
             remaining = existing["parole_trades_remaining"]
@@ -373,6 +454,7 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     new_suppressed_at = now_iso
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
+                    transition = "newly_suppressed"
             else:
                 # PAROLE-COMPLETION GATE. Spec D5 is "14 days locked, then a
                 # 5-trade re-test" — so clear/re-suppress may only be decided
@@ -410,16 +492,39 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     new_suppressed_at = None
                     new_parole_at = None
                     new_parole_remaining = None
+                    transition = "clear"
                 elif retest_state == "complete":
                     # Re-test completed and failed — re-suppress, fresh parole.
                     new_suppressed = 1
                     new_suppressed_at = now_iso
                     new_parole_at = (now + timedelta(days=parole_days)).isoformat()
                     new_parole_remaining = retest
+                    transition = "parole_exhausted_resuppressed"
                 else:
                     # Every non-complete state PRESERVES. They differ only in
                     # what the operator needs to know, and whether the state
                     # can still resolve on its own.
+                    #
+                    # These branches PRESERVE the generation verbatim, so the
+                    # delta gate below emits nothing for them on an ordinary
+                    # nightly hold — which is the point. A suppressed combo
+                    # sitting in `waiting` would otherwise mint one identical
+                    # row every refresh, forever, and steady-state rows are
+                    # exactly the "ordinary log lines" this ledger must not
+                    # become. Their durable evidence lives in the
+                    # `marker_stamped` / `alert_*` rows and the
+                    # `refresh_completed` aggregates instead.
+                    #
+                    # The label is still computed, because a preserve branch
+                    # CAN legitimately move the generation (the `parole_at`
+                    # re-read below picks up a concurrent change). If that
+                    # happens it is a real state change and the delta gate
+                    # records it under its classification.
+                    transition = (
+                        "terminal_incomplete_held"
+                        if retest_state == "terminal_incomplete"
+                        else retest_state
+                    )
                     if retest_state == "terminal_incomplete":
                         # Slots exhausted, nothing still open, not enough valid
                         # outcomes: this generation can NEVER complete. Deliberately
@@ -490,15 +595,24 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         # Re-arm the terminal-incomplete page whenever the combo LEAVES that
         # state — cleared suppression, or a fresh parole generation. Preserve
         # branches keep it, so a stuck generation pages exactly once.
-        if existing is not None and (
+        rearm_window_open = existing is not None and (
             new_suppressed == 0 or new_parole_at != existing["parole_at"]
-        ):
+        )
+        if rearm_window_open:
             await db._conn.execute(
                 "UPDATE combo_performance "
                 "SET retest_incomplete_alerted_at = NULL "
                 "WHERE combo_key = ? AND window = '30d'",
                 (combo_key,),
             )
+        # F3: only a re-arm that actually CLEARED a stamped marker is an event.
+        # The UPDATE above is unconditional inside its window and matches every
+        # unsuppressed combo on every refresh, so keying the ledger row on the
+        # UPDATE firing would write one row per healthy combo per run — noise
+        # that would bury the transitions this ledger exists to preserve.
+        page_rearmed = (
+            rearm_window_open and existing["retest_incomplete_alerted_at"] is not None
+        )
 
         await db._conn.execute(
             "INSERT INTO combo_performance "
@@ -529,6 +643,67 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                 now_iso,
             ),
         )
+
+        # F3: record the transition IN this transaction, immediately before the
+        # commit that makes it real. These four branches (initial latch,
+        # re-latch, clear, parole re-arm) previously emitted NO event at all —
+        # they existed only as mutated `combo_performance` columns, so once the
+        # row moved on there was nothing left to reconstruct the decision from.
+        # `managed_txn=True` binds each row to the state change it describes:
+        # both land or neither does.
+        ledger_state = encode_state(
+            **generation_state(existing, prefix="before"),
+            after_suppressed=new_suppressed,
+            after_suppressed_at=new_suppressed_at,
+            after_parole_at=new_parole_at,
+            after_parole_trades_remaining=new_parole_remaining,
+            trades_30d=w30["trades"],
+            win_rate_pct_30d=w30["wr"],
+        )
+        # THE DELTA GATE. A row is written only when the generation quadruple
+        # actually moved. Labelling a branch is not the same as changing state:
+        # the preserve branches (waiting / contaminated /
+        # accounting_inconsistent / terminal_incomplete_held) re-write the same
+        # values every night, and gating on the label alone minted one identical
+        # row per suppressed combo per refresh, forever — confirmed empirically
+        # at 3 identical rows over 3 refreshes. That is a log line wearing a
+        # ledger's clothes, and it buries the four transitions that matter.
+        #
+        # `existing is None` counts as a delta: a first write has no prior state
+        # to be equal to.
+        state_moved = existing is None or (
+            (
+                existing["suppressed"],
+                existing["suppressed_at"],
+                existing["parole_at"],
+                existing["parole_trades_remaining"],
+            )
+            != (new_suppressed, new_suppressed_at, new_parole_at, new_parole_remaining)
+        )
+        if transition is not None and state_moved:
+            await record_alert_event(
+                db,
+                event_type="suppression_transition",
+                combo_key=combo_key,
+                transition=transition,
+                detected_at=now_iso,
+                state_json=ledger_state,
+                detail=transition_detail,
+                managed_txn=True,
+            )
+        if page_rearmed:
+            # Separate row, not a field on the one above: the re-arm can fire
+            # alongside `clear` or `relatch`, and collapsing them would make the
+            # "did this generation get its page back?" question unanswerable.
+            await record_alert_event(
+                db,
+                event_type="suppression_transition",
+                combo_key=combo_key,
+                transition="page_rearm",
+                detected_at=now_iso,
+                state_json=ledger_state,
+                managed_txn=True,
+            )
         await db._conn.commit()
         return True
     except (aiosqlite.Error, ValueError) as e:
@@ -687,6 +862,26 @@ async def refresh_all(db: Database, settings) -> dict:
         suppression_reversals=len(reversals),
         retest_terminal_incomplete=len(retest_stuck),
     )
+    # F3 §12a heartbeat: exactly one row per `refresh_all` run, unconditionally.
+    # Every other event in this ledger is conditional, so without this row a
+    # table full of fresh conditional events would read "healthy" during exactly
+    # the stretch in which the refresh pass had stopped running. The watchdog
+    # keys its freshness check on this event type for that reason. Its own short
+    # transaction (`managed_txn=False`): the per-combo transactions are already
+    # committed and this summarises them rather than participating in one.
+    await record_alert_event(
+        db,
+        event_type="refresh_completed",
+        state_json=encode_state(
+            refreshed=refreshed,
+            failed=failed,
+            chronic=len(chronic),
+            permanent_suppression=len(permanent),
+            suppression_reversals=len(reversals),
+            retest_terminal_incomplete=len(retest_stuck),
+            combos_enumerated=len(combos),
+        ),
+    )
     return {
         "refreshed": refreshed,
         "failed": failed,
@@ -809,6 +1004,11 @@ async def _record_pending_reversals(
     # Combos whose UPDATE landed. Only meaningful until the commit succeeds —
     # its failure path uses this to name what the rollback throws away.
     recorded: list[str] = []
+    recorded_payloads: dict[str, str] = {}
+    # Filled only by the commit-failure path. Written AFTER the lock is
+    # released, so the rows are self-committed and survive the rollback that
+    # destroyed the pages they describe.
+    lost_pages: list[tuple[str, str]] = []
     # Every commit on the shared connection holds `_txn_lock`, or concurrent
     # writers interleave executes and leave half-open transactions. Only the
     # NETWORK call belongs outside it — and no network call happens here.
@@ -840,6 +1040,7 @@ async def _record_pending_reversals(
                 )
                 row = await cur.fetchone()
                 existing = row[0] if row else None
+                superseded_state: str | None = None
                 # `is not None`, not truthiness: an empty-string marker is
                 # present-but-corrupt, not absent, and silently skipping the
                 # supersede log for it would drop the only record that a page
@@ -851,6 +1052,23 @@ async def _record_pending_reversals(
                         old = {}
                     if not isinstance(old, dict):
                         old = {}
+                    # The superseded page is an operator notification that will
+                    # now NEVER be delivered, and it was journald-only — i.e.
+                    # gone within minutes of the 03:00 backup window. Carry its
+                    # full content, not a reference to it: the body is the
+                    # thing the ledger exists to preserve, and it cannot be
+                    # re-derived (the transition it describes is diffed across a
+                    # single refresh and never recurs). `superseded_raw` keeps
+                    # the exact bytes so an undecodable payload still leaves
+                    # evidence of what was overwritten.
+                    superseded_state = encode_state(
+                        superseded_transition=old.get("transition"),
+                        superseded_detected_at=old.get("detected_at"),
+                        superseded_message=old.get("message"),
+                        superseded_payload_hash=payload_digest(existing),
+                        superseded_raw=existing,
+                        new_transition=transition,
+                    )
                     log.warning(
                         "suppression_reversal_alert_superseded",
                         combo_key=combo,
@@ -869,6 +1087,26 @@ async def _record_pending_reversals(
                     "WHERE combo_key = ? AND window = '30d'",
                     (payload, combo),
                 )
+                # F3: recorded either way, in this same transaction. The
+                # rowcount-0 case is the one that most needs durable evidence —
+                # it is a page that will never be delivered and never
+                # re-detected, and until now it existed only as a log line.
+                await record_alert_event(
+                    db,
+                    event_type="reversal_pending_recorded",
+                    combo_key=combo,
+                    transition=transition,
+                    detected_at=now_iso,
+                    delivery_result="ok" if cur.rowcount else "no_30d_row",
+                    payload_hash=payload_digest(payload),
+                    state_json=superseded_state,
+                    detail=(
+                        "superseded an undelivered page"
+                        if existing is not None
+                        else None
+                    ),
+                    managed_txn=True,
+                )
                 if cur.rowcount == 0:
                     # No 30d row to hold the marker, so this page cannot be made
                     # durable. Loud, because it is otherwise a silent lost alert.
@@ -881,8 +1119,11 @@ async def _record_pending_reversals(
                 else:
                     # Tracked so a failed COMMIT can name what it discards. These
                     # combos succeeded individually and were therefore never
-                    # reported by the per-combo handler below.
+                    # reported by the per-combo handler below. The PAYLOAD is
+                    # kept alongside the key because the commit-failure path
+                    # must preserve the page bodies, not just their names.
                     recorded.append(combo)
+                    recorded_payloads[combo] = payload
             except aiosqlite.Error as exc:
                 log.exception(
                     "suppression_reversal_pending_write_failed",
@@ -914,6 +1155,41 @@ async def _record_pending_reversals(
                 await db._conn.rollback()
             except aiosqlite.Error:
                 log.exception("suppression_reversal_pending_rollback_failed")
+            # Hand the bodies to the post-lock writer. They CANNOT be recorded
+            # here: every `reversal_pending_recorded` row this pass wrote was
+            # `managed_txn=True`, so the rollback just destroyed them too, and
+            # another in-transaction write would share the same fate.
+            lost_pages = [(c, recorded_payloads[c]) for c in recorded]
+
+    # OUTSIDE the lock, self-committed, one row per lost page. This is the case
+    # the ledger most needs to survive: a commit failure silently destroys §12b
+    # pages that are diffed across a single refresh and therefore NEVER
+    # re-detected — no retry, no re-derivation, no second chance. Until now the
+    # only trace was a journald line with a ~minutes half-life on prod.
+    for combo, payload in lost_pages:
+        try:
+            body = json.loads(payload)
+        except (ValueError, TypeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        await record_alert_event(
+            db,
+            event_type="marker_anomaly",
+            combo_key=combo,
+            transition="pending_commit_lost",
+            detected_at=body.get("detected_at"),
+            delivery_result="pending_commit_lost",
+            payload_hash=payload_digest(payload),
+            state_json=encode_state(
+                lost_transition=body.get("transition"),
+                lost_detected_at=body.get("detected_at"),
+                lost_message=body.get("message"),
+                lost_raw=payload,
+            ),
+            detail="the pending-page commit failed and was rolled back; this "
+            "page was never delivered and will never be re-detected",
+        )
     return now_iso
 
 
@@ -976,6 +1252,15 @@ async def _process_suppression_reversals(
                 err_type=type(exc).__name__,
                 detail="pending payload could not be decoded; left in place",
             )
+            await record_alert_event(
+                db,
+                event_type="marker_anomaly",
+                combo_key=combo,
+                transition="reversal_alert_pending_json",
+                delivery_result="pending_unreadable",
+                payload_hash=payload_digest(raw) if isinstance(raw, str) else None,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
             continue
 
         # A page recorded on an EARLIER refresh outlives the state it describes:
@@ -993,12 +1278,26 @@ async def _process_suppression_reversals(
             stamp = detected_at if detected_at else "unknown"
             message = f"{message} [detected {stamp}]"
 
+        # `payload_digest(message)` — the body as STAMPED, after the retry
+        # suffix is appended. Hashing the pre-stamp text would prove which page
+        # was rendered, not which page was sent.
+        digest = payload_digest(message)
         log.info(
             "suppression_reversal_alert_dispatched",
             combo_key=combo,
             transition=transition,
             detected_at=detected_at,
             retry=is_retry,
+        )
+        await record_alert_event(
+            db,
+            event_type="alert_dispatched",
+            combo_key=combo,
+            alert_source="combo_refresh_suppression_reversal",
+            transition=transition,
+            detected_at=detected_at,
+            retry=is_retry,
+            payload_hash=digest,
         )
         try:
             await _send_suppression_reversal_alert(settings, message)
@@ -1013,11 +1312,34 @@ async def _process_suppression_reversals(
                 err_type=type(exc).__name__,
                 detail="page stays pending; the next refresh re-attempts",
             )
+            await record_alert_event(
+                db,
+                event_type="alert_failed",
+                combo_key=combo,
+                alert_source="combo_refresh_suppression_reversal",
+                transition=transition,
+                detected_at=detected_at,
+                delivery_result=f"error:{type(exc).__name__}",
+                retry=is_retry,
+                payload_hash=digest,
+                detail="page stays pending; the next refresh re-attempts",
+            )
             continue
         log.info(
             "suppression_reversal_alert_delivered",
             combo_key=combo,
             transition=transition,
+        )
+        await record_alert_event(
+            db,
+            event_type="alert_delivered",
+            combo_key=combo,
+            alert_source="combo_refresh_suppression_reversal",
+            transition=transition,
+            detected_at=detected_at,
+            delivery_result="ok",
+            retry=is_retry,
+            payload_hash=digest,
         )
 
         # Clear ONLY after a confirmed send, and only if the payload is still
@@ -1037,6 +1359,16 @@ async def _process_suppression_reversals(
                 # `Connection.total_changes`, which is connection-wide and
                 # cumulative, so an unrelated write would read as success.
                 changed = cur.rowcount
+                if changed:
+                    await record_alert_event(
+                        db,
+                        event_type="marker_cleared",
+                        combo_key=combo,
+                        transition="reversal_alert_pending_json",
+                        detected_at=detected_at,
+                        payload_hash=digest,
+                        managed_txn=True,
+                    )
                 await db._conn.commit()
             if changed == 0:
                 # Deliberately NEUTRAL. rowcount 0 means only that the payload
@@ -1047,6 +1379,17 @@ async def _process_suppression_reversals(
                 log.info(
                     "suppression_reversal_pending_not_cleared",
                     combo_key=combo,
+                    detail="payload no longer present on the row (superseded or "
+                    "already cleared); not cleared by this pass",
+                )
+                await record_alert_event(
+                    db,
+                    event_type="marker_anomaly",
+                    combo_key=combo,
+                    transition="reversal_alert_pending_json",
+                    detected_at=detected_at,
+                    delivery_result="pending_not_cleared",
+                    payload_hash=digest,
                     detail="payload no longer present on the row (superseded or "
                     "already cleared); not cleared by this pass",
                 )
@@ -1120,35 +1463,73 @@ async def _process_permanent_suppression(
     conn = db._conn
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    # Re-arm: clear the dedup marker for any combo that has LEFT the
-    # permanent-suppression state since it was last alerted, so a future
-    # re-entry alerts again.
-    await conn.execute(
-        "UPDATE combo_performance "
-        "SET perm_suppression_alerted_at = NULL "
-        "WHERE window = '30d' "
-        "  AND perm_suppression_alerted_at IS NOT NULL "
-        "  AND (suppressed = 0 OR EXISTS ("
-        "        SELECT 1 FROM paper_trades pt "
-        "        WHERE pt.signal_combo = combo_performance.combo_key "
-        "          AND pt.opened_at >= ?))",
-        (window_cutoff,),
-    )
+    # `_txn_lock` held for the whole read→write→commit sequence, matching both
+    # sibling marker sites. This block previously committed on the shared
+    # connection WITHOUT the lock, which is the interleaving hazard the lock
+    # exists to prevent — a concurrent writer's half-finished statements could
+    # ride out on this commit.
+    async with db._txn_lock:
+        # Named BEFORE the UPDATE clears them: the re-arm is a state change the
+        # operator cares about (a combo that left permanent-suppression gets its
+        # page back), and afterwards the evidence is gone. Same stamped-marker
+        # gating as the retest sibling — only rows that actually HELD a marker
+        # are re-arms; the UPDATE's WHERE already requires IS NOT NULL, so this
+        # SELECT is the exact set it will clear.
+        cur = await conn.execute(
+            "SELECT combo_key, perm_suppression_alerted_at FROM combo_performance "
+            "WHERE window = '30d' "
+            "  AND perm_suppression_alerted_at IS NOT NULL "
+            "  AND (suppressed = 0 OR EXISTS ("
+            "        SELECT 1 FROM paper_trades pt "
+            "        WHERE pt.signal_combo = combo_performance.combo_key "
+            "          AND pt.opened_at >= ?))",
+            (window_cutoff,),
+        )
+        rearmed = await cur.fetchall()
 
-    # Pending = suppressed, no recent trade, not yet alerted for this entry.
-    cur = await conn.execute(
-        "SELECT combo_key FROM combo_performance cp "
-        "WHERE cp.window = '30d' "
-        "  AND cp.suppressed = 1 "
-        "  AND cp.perm_suppression_alerted_at IS NULL "
-        "  AND NOT EXISTS ("
-        "        SELECT 1 FROM paper_trades pt "
-        "        WHERE pt.signal_combo = cp.combo_key "
-        "          AND pt.opened_at >= ?)",
-        (window_cutoff,),
-    )
-    pending = [r[0] for r in await cur.fetchall()]
-    await conn.commit()
+        # Re-arm: clear the dedup marker for any combo that has LEFT the
+        # permanent-suppression state since it was last alerted, so a future
+        # re-entry alerts again.
+        await conn.execute(
+            "UPDATE combo_performance "
+            "SET perm_suppression_alerted_at = NULL "
+            "WHERE window = '30d' "
+            "  AND perm_suppression_alerted_at IS NOT NULL "
+            "  AND (suppressed = 0 OR EXISTS ("
+            "        SELECT 1 FROM paper_trades pt "
+            "        WHERE pt.signal_combo = combo_performance.combo_key "
+            "          AND pt.opened_at >= ?))",
+            (window_cutoff,),
+        )
+        for rearm_combo, stamped_at in rearmed:
+            await record_alert_event(
+                db,
+                event_type="suppression_transition",
+                combo_key=rearm_combo,
+                transition="page_rearm",
+                detected_at=now_iso,
+                state_json=encode_state(
+                    marker="perm_suppression_alerted_at",
+                    cleared_stamp=stamped_at,
+                ),
+                detail="perm_suppression_alerted_at",
+                managed_txn=True,
+            )
+
+        # Pending = suppressed, no recent trade, not yet alerted for this entry.
+        cur = await conn.execute(
+            "SELECT combo_key FROM combo_performance cp "
+            "WHERE cp.window = '30d' "
+            "  AND cp.suppressed = 1 "
+            "  AND cp.perm_suppression_alerted_at IS NULL "
+            "  AND NOT EXISTS ("
+            "        SELECT 1 FROM paper_trades pt "
+            "        WHERE pt.signal_combo = cp.combo_key "
+            "          AND pt.opened_at >= ?)",
+            (window_cutoff,),
+        )
+        pending = [r[0] for r in await cur.fetchall()]
+        await conn.commit()
 
     window_days = settings.FEEDBACK_REFRESH_WINDOW_DAYS
     alerted: list[str] = []
@@ -1162,7 +1543,17 @@ async def _process_permanent_suppression(
         # successful delivery is NOT silent. parse_mode=None is set inside the
         # sender — the body carries signal names + revive_signal_with_baseline
         # whose underscores MarkdownV1 would mangle without an error.
+        digest = payload_digest(message)
         log.info("permanent_suppression_alert_dispatched", combo_key=combo)
+        await record_alert_event(
+            db,
+            event_type="alert_dispatched",
+            combo_key=combo,
+            alert_source="combo_refresh_permanent_suppression",
+            detected_at=now_iso,
+            retry=0,
+            payload_hash=digest,
+        )
         try:
             await _send_permanent_suppression_alert(settings, message)
         except Exception as exc:
@@ -1175,17 +1566,50 @@ async def _process_permanent_suppression(
                 err=str(exc),
                 err_type=type(exc).__name__,
             )
+            await record_alert_event(
+                db,
+                event_type="alert_failed",
+                combo_key=combo,
+                alert_source="combo_refresh_permanent_suppression",
+                detected_at=now_iso,
+                delivery_result=f"error:{type(exc).__name__}",
+                retry=0,
+                payload_hash=digest,
+                detail="dedup marker left NULL; the next run re-attempts",
+            )
             continue
         log.info("permanent_suppression_alert_delivered", combo_key=combo)
+        await record_alert_event(
+            db,
+            event_type="alert_delivered",
+            combo_key=combo,
+            alert_source="combo_refresh_permanent_suppression",
+            detected_at=now_iso,
+            delivery_result="ok",
+            retry=0,
+            payload_hash=digest,
+        )
 
-        # Set the dedup marker only after a confirmed send.
+        # Set the dedup marker only after a confirmed send. `_txn_lock` held for
+        # the write+commit, matching both sibling marker sites — only the
+        # NETWORK call above belongs outside it.
         try:
-            await conn.execute(
-                "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
-                "WHERE combo_key = ? AND window = '30d'",
-                (now_iso, combo),
-            )
-            await conn.commit()
+            async with db._txn_lock:
+                await conn.execute(
+                    "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
+                    "WHERE combo_key = ? AND window = '30d'",
+                    (now_iso, combo),
+                )
+                await record_alert_event(
+                    db,
+                    event_type="marker_stamped",
+                    combo_key=combo,
+                    transition="perm_suppression_alerted_at",
+                    detected_at=now_iso,
+                    payload_hash=digest,
+                    managed_txn=True,
+                )
+                await conn.commit()
         except aiosqlite.Error as exc:
             log.exception(
                 "permanent_suppression_marker_update_failed",

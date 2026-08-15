@@ -223,6 +223,7 @@ async def _make_db(tmp_path) -> str:
             ("agent_strategy", "updated_at"),
             ("conviction_watchlist_runs", "run_at"),
             ("signal_outcome_ledger", "emitted_at"),
+            ("alert_events", "created_at"),
         ]
         for table, col in table_cols:
             await conn.execute(f"CREATE TABLE {table} ({col} TEXT)")

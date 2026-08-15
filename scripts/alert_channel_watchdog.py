@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Alert-channel + digest + narrative + tg-channel freshness watchdog (CLAUDE.md §12a).
 
-Monitors FOUR pipeline surfaces in ONE script (operator amendment):
+Monitors FIVE pipeline surfaces in ONE script (operator amendment):
 
   1. ``tg_alert_log`` — the latest ``outcome='sent'`` row must be newer than
      ``ALERT_SENT_SLO_HOURS`` (default 48). The Telegram alert channel went
@@ -30,6 +30,14 @@ Monitors FOUR pipeline surfaces in ONE script (operator amendment):
      freshness gate: an absent/empty table is NOT a breach (tg_social is a
      default-off feature; paging while it is off would only train the operator
      to ignore the watchdog).
+  5. ``alert_events`` — the newest ``event_type='refresh_completed'`` row must
+     be within ``ALERT_EVENTS_SLO_HOURS`` (default 27; the heartbeat is written
+     once per ``refresh_all`` run on a daily gate, so 27h tolerates gate jitter
+     while still catching a missed day). This is the §12a pairing that ships
+     WITH the F3 control-plane ledger: a ledger nobody watches reproduces the
+     class it exists to close — the writer works at ship time, a later refactor
+     disconnects it, and the gap surfaces months later via an unrelated audit.
+     A missing OR empty table is a breach.
 
 On ANY breach the watchdog sends ONE plain-text Telegram message covering
 every breached check that is not inside its send cooldown (``parse_mode=None``
@@ -306,6 +314,146 @@ async def _check_narrative_inbound_rate(
     }
 
 
+async def _check_alert_events_rate(
+    conn: aiosqlite.Connection, slo_hours: int, now: datetime
+) -> dict:
+    """F3 control-plane ledger heartbeat. Four states, because "a row exists"
+    and "the pipeline is working" are different claims.
+
+    Keyed on ``refresh_completed`` and NOT on ``MAX(created_at)`` over the whole
+    table: every other event type is conditional (a suppression transition, a
+    parole refund, a page), so a table whose only rows are conditional events
+    reads "fresh" during exactly the stretch in which the refresh pass has
+    stopped running. A heartbeat has to be unconditional or it is a symptom.
+
+    But ``refresh_all`` writes its heartbeat even when EVERY per-combo refresh
+    FAILED (``refreshed=0, failed=N``) — verified empirically. A fresh row is
+    therefore not evidence of health, and treating it as such would leave the
+    watchdog reporting OK through exactly the outage it exists to catch. So a
+    HEALTHY heartbeat is one whose payload carries ``refreshed > 0``; a fresh
+    heartbeat with ``refreshed == 0`` breaches immediately, distinctly, and
+    does not wait out the SLO.
+
+    Before the first refresh ever runs there is no heartbeat at all, only the
+    ``ledger_installed`` epoch row the migration seeds. Ageing from that row is
+    what keeps the deploy boundary quiet WITHOUT waiving §12a: the first
+    nightly refresh gets one full SLO to arrive, and if it never does, the
+    epoch row goes stale and pages truthfully.
+
+    A missing table, or a table with neither a heartbeat nor an epoch row, is a
+    breach — silence is never ambiguous."""
+    table = "alert_events"
+    base = {"table": table, "slo_hours": slo_hours, "refreshed": None}
+    try:
+        cur = await conn.execute(
+            "SELECT created_at, state_json FROM alert_events "
+            "WHERE event_type = 'refresh_completed' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        newest = await cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {
+                **base,
+                "status": "breach",
+                "reason": "table_absent",
+                "last_seen": None,
+                "age_hours": None,
+            }
+        raise
+
+    if newest is None:
+        # No refresh has ever completed. Age from the install epoch instead.
+        cur = await conn.execute(
+            "SELECT MAX(created_at) FROM alert_events "
+            "WHERE event_type = 'ledger_installed'"
+        )
+        row = await cur.fetchone()
+        installed_at = row[0] if row else None
+        if installed_at is None:
+            return {
+                **base,
+                "status": "breach",
+                "reason": "no_refresh_completed_rows",
+                "last_seen": None,
+                "age_hours": None,
+            }
+        age_hours = (now - _parse_ts(installed_at)).total_seconds() / 3600.0
+        breached = age_hours > slo_hours
+        return {
+            **base,
+            "status": "breach" if breached else "ok",
+            "reason": (
+                "no_successful_refresh_since_install"
+                if breached
+                else "awaiting_first_refresh"
+            ),
+            "last_seen": installed_at,
+            "age_hours": round(age_hours, 2),
+        }
+
+    last_seen, state_json = newest[0], newest[1]
+    age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
+
+    # AGE FIRST. The payload-quality reasons below all describe a pass that is
+    # RUNNING, so they must not pre-empt staleness — a 100h-old heartbeat that
+    # happens to say `refreshed: 0` is a stalled pass, not a failing one, and
+    # paging "the refresh pass IS running" about it would be false.
+    if age_hours > slo_hours:
+        return {
+            **base,
+            "status": "breach",
+            "reason": "stale",
+            "last_seen": last_seen,
+            "age_hours": round(age_hours, 2),
+        }
+
+    try:
+        payload = json.loads(state_json) or {}
+    except (ValueError, TypeError):
+        payload = None
+    refreshed = payload.get("refreshed") if isinstance(payload, dict) else None
+    if not isinstance(refreshed, int):
+        # Cannot PROVE the pass succeeded. Fail toward the page: an unreadable
+        # heartbeat is a broken writer, not a healthy one.
+        return {
+            **base,
+            "status": "breach",
+            "reason": "heartbeat_unreadable",
+            "last_seen": last_seen,
+            "age_hours": round(age_hours, 2),
+        }
+
+    if refreshed <= 0:
+        # Fresh but unproductive. Two very different causes, and the page has
+        # to say which: an EMPTY enumeration means there was nothing to refresh
+        # (a restored or freshly-seeded DB), while a non-empty enumeration that
+        # refreshed nothing means every per-combo refresh failed. Claiming the
+        # latter for the former sends the operator hunting a fault that does
+        # not exist.
+        enumerated = payload.get("combos_enumerated")
+        empty_universe = enumerated == 0
+        return {
+            **base,
+            "status": "breach",
+            "reason": (
+                "no_combos_enumerated" if empty_universe else "refresh_all_failing"
+            ),
+            "last_seen": last_seen,
+            "age_hours": round(age_hours, 2),
+            "refreshed": refreshed,
+            "combos_enumerated": enumerated,
+        }
+    return {
+        **base,
+        "status": "ok",
+        "reason": "fresh",
+        "last_seen": last_seen,
+        "age_hours": round(age_hours, 2),
+        "refreshed": refreshed,
+    }
+
+
 async def _check_tg_channel_staleness(
     conn: aiosqlite.Connection, stale_days: int, now: datetime
 ) -> dict:
@@ -367,6 +515,7 @@ async def _evaluate(
     narrative_slo_hours: int,
     tg_channel_stale_days: int,
     dispatch_activity_threshold: int,
+    alert_events_slo_hours: int,
     now: datetime,
 ) -> dict:
     async with aiosqlite.connect(db_path) as conn:
@@ -377,11 +526,13 @@ async def _evaluate(
         digest = await _check_digest_write_rate(conn, digest_slo_days, now)
         narrative = await _check_narrative_inbound_rate(conn, narrative_slo_hours, now)
         tg_channel = await _check_tg_channel_staleness(conn, tg_channel_stale_days, now)
+        alert_events = await _check_alert_events_rate(conn, alert_events_slo_hours, now)
     return {
         "alert_sent_rate": alert,
         "digest_write_rate": digest,
         "narrative_inbound_rate": narrative,
         "tg_channel_staleness": tg_channel,
+        "alert_events_rate": alert_events,
     }
 
 
@@ -462,6 +613,56 @@ def _compose_message(checks: dict, include: list[str]) -> str:
             f"- tg_social_health: {len(t['stale_channels'])} channel(s) silent "
             f"> {t['stale_days']}d — {listing}"
         )
+
+    e = checks["alert_events_rate"]
+    if "alert_events_rate" in include and e["status"] == "breach":
+        if e["reason"] == "table_absent":
+            lines.append(
+                "- alert_events: table missing/absent — the control-plane event "
+                f"ledger does not exist (SLO {e['slo_hours']}h)"
+            )
+        elif e["reason"] == "no_refresh_completed_rows":
+            lines.append(
+                "- alert_events: NO 'refresh_completed' rows AND no "
+                "'ledger_installed' epoch row — the ledger is present but empty, "
+                f"so its own install marker is missing too (SLO {e['slo_hours']}h)"
+            )
+        elif e["reason"] == "no_successful_refresh_since_install":
+            lines.append(
+                f"- alert_events: ledger installed at {e['last_seen']} "
+                f"({e['age_hours']}h ago) and NO combo refresh has completed "
+                f"successfully since (SLO {e['slo_hours']}h) — the nightly "
+                "refresh has not run, or has failed every time"
+            )
+        elif e["reason"] == "refresh_all_failing":
+            lines.append(
+                f"- alert_events: the refresh pass ran {e['age_hours']}h ago "
+                f"(within SLO) over {e['combos_enumerated']} combo(s) but "
+                "refreshed 0 — every per-combo refresh is failing, so "
+                "suppression economics are frozen while the heartbeat looks "
+                "healthy"
+            )
+        elif e["reason"] == "no_combos_enumerated":
+            lines.append(
+                f"- alert_events: the refresh pass ran {e['age_hours']}h ago "
+                "(within SLO) but enumerated 0 combos — there is nothing to "
+                "refresh, which on a live box means the trade history it reads "
+                "is empty (restored/reseeded DB?), not that refresh is broken"
+            )
+        elif e["reason"] == "heartbeat_unreadable":
+            lines.append(
+                f"- alert_events: the heartbeat at {e['last_seen']} is within "
+                "SLO but carries no readable refreshed-count — the heartbeat "
+                "writer is broken, so refresh health cannot be confirmed "
+                "either way"
+            )
+        else:
+            lines.append(
+                f"- alert_events: last 'refresh_completed' at {e['last_seen']} "
+                f"({e['age_hours']}h ago) exceeds SLO {e['slo_hours']}h — the combo "
+                "refresh pass has stalled, so suppression/alert transitions are "
+                "no longer being recorded"
+            )
 
     lines.append("Check the pipeline/digest cron and the Telegram delivery path.")
     return "\n".join(lines)
@@ -565,6 +766,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--digest-slo-days", type=int, default=2)
     parser.add_argument("--narrative-inbound-slo-hours", type=int, default=72)
     parser.add_argument("--tg-channel-stale-days", type=int, default=14)
+    # F3: 27h, not 24h — the ledger heartbeat is written once per refresh_all
+    # run on a daily gate, so a 24h SLO would page on ordinary jitter in when
+    # the gate fires. 27h tolerates the drift while still catching a missed day.
+    parser.add_argument("--alert-events-slo-hours", type=int, default=27)
     # ALR-08: a stale/empty tg_alert_log breaches only when the pipeline opened
     # MORE than this many trades in the window (0 => any open with 0 sent pages;
     # raise it to tolerate the dedup tail). See the qualifier in
@@ -604,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
                 narrative_slo_hours=args.narrative_inbound_slo_hours,
                 tg_channel_stale_days=args.tg_channel_stale_days,
                 dispatch_activity_threshold=args.dispatch_activity_threshold,
+                alert_events_slo_hours=args.alert_events_slo_hours,
                 now=now,
             )
         )
@@ -647,6 +853,8 @@ def main(argv: list[str] | None = None) -> int:
             tg_channel_stale_count=len(
                 checks["tg_channel_staleness"]["stale_channels"]
             ),
+            alert_events_last_seen=checks["alert_events_rate"]["last_seen"],
+            alert_events_age_hours=checks["alert_events_rate"]["age_hours"],
         )
         out = {"ok": True, "breaches": 0, "checks": checks}
         if quiet_msg is not None:

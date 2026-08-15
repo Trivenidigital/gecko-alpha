@@ -34,6 +34,80 @@ if TYPE_CHECKING:
     from scout.news.schemas import CryptoPanicPost
     from scout.perp.schemas import PerpAnomaly
 
+# F3 `alert_events` DDL, hoisted to module scope for ONE reason: the migration
+# has to compare a live table's CHECK vocabulary against the current one, and a
+# second copy of that vocabulary written out for comparison is a copy that can
+# drift. The migration creates from this string, the drift check parses this
+# string, and the tripwire test in tests/test_alert_events_migration.py reads
+# this string. There is exactly one place the vocabulary lives.
+_ALERT_EVENTS_DDL = """
+CREATE TABLE alert_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT NOT NULL,
+    event_type       TEXT NOT NULL CHECK (event_type IN (
+        'suppression_transition',
+        'parole_slot_spent',
+        'parole_slot_refunded',
+        'reversal_pending_recorded',
+        'alert_dispatched',
+        'alert_delivered',
+        'alert_failed',
+        'marker_stamped',
+        'marker_cleared',
+        'marker_anomaly',
+        'refresh_completed',
+        'ledger_installed'
+    )),
+    combo_key        TEXT,
+    signal_type      TEXT,
+    alert_source     TEXT,
+    transition       TEXT,
+    detected_at      TEXT,
+    delivery_result  TEXT,
+    retry            INTEGER,
+    payload_hash     TEXT,
+    state_json       TEXT,
+    detail           TEXT
+)
+"""
+
+_ALERT_EVENTS_COLUMNS = (
+    "id, created_at, event_type, combo_key, signal_type, alert_source, "
+    "transition, detected_at, delivery_result, retry, payload_hash, "
+    "state_json, detail"
+)
+
+_ALERT_EVENTS_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_alert_events_combo_created "
+    "ON alert_events(combo_key, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_events_type_created "
+    "ON alert_events(event_type, created_at)",
+)
+
+
+def _alert_event_check_vocabulary(ddl: str | None) -> set[str]:
+    """The `event_type` CHECK enum as a set, parsed out of a CREATE statement.
+
+    Scoped to the CHECK clause rather than the whole statement so an unrelated
+    string literal elsewhere in the DDL could never be mistaken for a member of
+    the vocabulary. Returns an empty set when there is no CHECK to read, which
+    the caller treats as drift — a table without the constraint is exactly as
+    wrong as one with the wrong constraint.
+    """
+    if not ddl:
+        return set()
+    import re
+
+    match = re.search(
+        r"event_type\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*event_type\s+IN\s*\((.*?)\)\s*\)",
+        ddl,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match is None:
+        return set()
+    return set(re.findall(r"'([^']+)'", match.group(1)))
+
+
 # Columns that map 1:1 from CandidateToken to the candidates table.
 _CANDIDATE_COLUMNS = [
     "contract_address",
@@ -326,6 +400,24 @@ class Database:
             # rows keep `resolution_snapshot_json = NULL`, which is the correct
             # pre-cutover state, not a gap to backfill.
             await self._migrate_tg_act_shadow_v1()
+
+            # F3 control-plane event ledger. schema_version 20260814.
+            # Purely additive: one new append-only table plus its two indexes,
+            # no column added to any existing table and no backfill.
+            #
+            # NOT deploy-inert, and the earlier claim that it was is wrong:
+            # `cron/gecko-alpha.crontab` sets ALERT_CHANNEL_WATCHDOG_ENABLED=true
+            # INLINE on the hourly :50 line, so the watchdog is live the moment
+            # the managed cron block is installed. "Gated on the flag" is true of
+            # the script and false of the deployment.
+            #
+            # What actually prevents a spurious page at the deploy boundary is
+            # the `ledger_installed` epoch row this migration seeds: the
+            # watchdog ages from it while no `refresh_completed` heartbeat
+            # exists yet, so the first nightly refresh has one full SLO to
+            # arrive. §12a is preserved rather than waived — if that refresh
+            # never runs, the epoch row itself goes stale and pages truthfully.
+            await self._migrate_alert_events_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -6142,6 +6234,203 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "tg_act_shadow_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_alert_events_v1(self) -> None:
+        """F3: `alert_events` — append-only control-plane event ledger.
+
+        THE DEFECT. journald retention on prod collapses to minutes during the
+        03:00 backup window, so any control-plane fact that exists only as a
+        log line is unreconstructable after the fact. Worse, the four decisive
+        suppression transitions (initial latch, re-latch, clear, parole re-arm)
+        and the parole slot decrement emit no log event at all — they exist
+        only as mutated `combo_performance` rows, which record the CURRENT
+        state and nothing about how it got there. Suppression / retest / alert
+        acceptance evidence therefore cannot be reconstructed.
+
+        THE SHAPE. One append-only table, written by
+        `scout.trading.alert_events.record_alert_event`. Rows are never updated
+        and never pruned — deliberate: they are rare (a handful per refresh) and
+        tiny, and a retention policy on an audit ledger reintroduces exactly the
+        "the evidence aged out" failure this closes. `event_type` is a CHECK
+        constraint rather than writer discipline, so a typo'd event lands as a
+        loud IntegrityError instead of an unqueryable row.
+
+        NO BACKFILL. The transitions that already happened left no record to
+        recover from; the ledger starts at the deploy boundary and every row in
+        it is a real observation.
+
+        Indexes ship inside this step (DDL-order lesson), not deferred: the two
+        query axes are per-combo history and per-event-type freshness (the §12a
+        watchdog reads the newest `refresh_completed`).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "alert_events_v1"
+        schema_version = 20260814
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+
+            # UPGRADE SAFETY. `CREATE TABLE IF NOT EXISTS` is a no-op against a
+            # table that already exists with an OLDER CHECK vocabulary, and the
+            # `ledger_installed` seed below then violates that stale constraint
+            # — the migration re-raises and `initialize()` cannot boot. Verified
+            # by reproduction against an intermediate-F3-shape DB.
+            #
+            # So the vocabulary is not merely additive-by-hope: on drift the
+            # table is REBUILT. Keeping the CHECK is what makes a typo'd
+            # event_type fail loudly, and this rebuild is what keeps the CHECK
+            # evolvable — without it, the next event type added to this ledger
+            # bricks every database that predates it.
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='alert_events'"
+            )
+            row = await cur.fetchone()
+            live_ddl = row[0] if row else None
+            wanted = _alert_event_check_vocabulary(_ALERT_EVENTS_DDL)
+            if (
+                live_ddl is not None
+                and _alert_event_check_vocabulary(live_ddl) != wanted
+            ):
+                found = _alert_event_check_vocabulary(live_ddl)
+                # Rows whose event_type is no longer in the vocabulary cannot be
+                # carried across — the new CHECK would reject them. Counted and
+                # logged rather than silently dropped: today this is zero
+                # everywhere (the vocabulary has only ever grown), and if it is
+                # ever non-zero the operator needs to know what the rebuild ate.
+                cur = await conn.execute(
+                    "SELECT COUNT(*) FROM alert_events WHERE event_type NOT IN "
+                    "(" + ",".join("?" * len(wanted)) + ")",
+                    tuple(sorted(wanted)),
+                )
+                (dropped,) = await cur.fetchone()
+                _log.warning(
+                    "alert_events_vocabulary_rebuild",
+                    migration=migration_name,
+                    added=sorted(wanted - found),
+                    removed=sorted(found - wanted),
+                    rows_dropped=dropped,
+                    detail="rebuilding alert_events to carry the current "
+                    "event_type CHECK vocabulary",
+                )
+                await conn.execute(
+                    _ALERT_EVENTS_DDL.replace(
+                        "CREATE TABLE alert_events", "CREATE TABLE alert_events_new"
+                    )
+                )
+                await conn.execute(
+                    f"INSERT INTO alert_events_new ({_ALERT_EVENTS_COLUMNS}) "
+                    f"SELECT {_ALERT_EVENTS_COLUMNS} FROM alert_events "
+                    "WHERE event_type IN (" + ",".join("?" * len(wanted)) + ")",
+                    tuple(sorted(wanted)),
+                )
+                # DROP before RENAME: the old table's indexes go with it, and
+                # the recreate below re-attaches them to the new table under the
+                # same names.
+                await conn.execute("DROP TABLE alert_events")
+                await conn.execute(
+                    "ALTER TABLE alert_events_new RENAME TO alert_events"
+                )
+
+            await conn.execute(
+                _ALERT_EVENTS_DDL.replace(
+                    "CREATE TABLE alert_events",
+                    "CREATE TABLE IF NOT EXISTS alert_events",
+                )
+            )
+            for index_sql in _ALERT_EVENTS_INDEXES:
+                await conn.execute(index_sql)
+
+            # Verify presence -- fail loud on drift rather than at first write.
+            cur = await conn.execute("PRAGMA table_info(alert_events)")
+            post_cols = {row[1] for row in await cur.fetchall()}
+            required = {
+                "id",
+                "created_at",
+                "event_type",
+                "combo_key",
+                "signal_type",
+                "alert_source",
+                "transition",
+                "detected_at",
+                "delivery_result",
+                "retry",
+                "payload_hash",
+                "state_json",
+                "detail",
+            }
+            missing = required - post_cols
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: {sorted(missing)}"
+                )
+
+            # Seed exactly ONE `ledger_installed` row, in this same
+            # transaction. It is the ledger's own epoch marker and it exists to
+            # keep the §12a watchdog TRUTHFUL across the deploy boundary.
+            #
+            # The watchdog is enabled unconditionally by the cron line
+            # (`cron/gecko-alpha.crontab`: ALERT_CHANNEL_WATCHDOG_ENABLED=true,
+            # hourly at :50), and an empty ledger is a breach. Without this row,
+            # the first watchdog run after deploy would page "NO
+            # 'refresh_completed' rows" — technically true and operationally
+            # false, because the nightly refresh simply has not come around yet.
+            # A page the operator learns to dismiss is worse than no page.
+            #
+            # It is a TRUE statement, not a silencer: `created_at` is the
+            # migration time, so the watchdog ages from it and still pages
+            # `no_successful_refresh_since_install` once the SLO elapses with no
+            # successful refresh. The deploy grace period is exactly the SLO,
+            # and a writer that never runs is still caught.
+            #
+            # Guarded on absence rather than INSERT OR IGNORE: there is no
+            # unique key to conflict on, so a re-run would otherwise append a
+            # second epoch and move the fallback age forward on every startup.
+            await conn.execute(
+                "INSERT INTO alert_events (created_at, event_type, detail) "
+                "SELECT ?, 'ledger_installed', ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM alert_events WHERE event_type = 'ledger_installed')",
+                (now_iso, f"{migration_name} applied; ledger epoch"),
+            )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("alert_events_v1_migration_complete", table="alert_events")
+        except BaseException as e:
+            _log.exception(
+                "alert_events_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
