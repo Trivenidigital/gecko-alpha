@@ -331,13 +331,18 @@ class Database:
             # Purely additive: one new append-only table plus its two indexes,
             # no column added to any existing table and no backfill.
             #
-            # Deploy-inert until a writer runs: the table ships EMPTY, and the
-            # §12a watchdog that reads it is itself gated on
-            # ALERT_CHANNEL_WATCHDOG_ENABLED, so installing the schema pages
-            # nobody. The first `refresh_all` after deploy writes the first
-            # heartbeat row; before that the ledger's own freshness check has
-            # nothing to be stale about, which is why the watchdog treats an
-            # empty table as a breach only once it is enabled.
+            # NOT deploy-inert, and the earlier claim that it was is wrong:
+            # `cron/gecko-alpha.crontab` sets ALERT_CHANNEL_WATCHDOG_ENABLED=true
+            # INLINE on the hourly :50 line, so the watchdog is live the moment
+            # the managed cron block is installed. "Gated on the flag" is true of
+            # the script and false of the deployment.
+            #
+            # What actually prevents a spurious page at the deploy boundary is
+            # the `ledger_installed` epoch row this migration seeds: the
+            # watchdog ages from it while no `refresh_completed` heartbeat
+            # exists yet, so the first nightly refresh has one full SLO to
+            # arrive. §12a is preserved rather than waived — if that refresh
+            # never runs, the epoch row itself goes stale and pages truthfully.
             await self._migrate_alert_events_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
@@ -6229,7 +6234,8 @@ class Database:
                         'marker_stamped',
                         'marker_cleared',
                         'marker_anomaly',
-                        'refresh_completed'
+                        'refresh_completed',
+                        'ledger_installed'
                     )),
                     combo_key        TEXT,
                     signal_type      TEXT,
@@ -6275,6 +6281,34 @@ class Database:
                 raise RuntimeError(
                     f"{migration_name} schema missing columns: {sorted(missing)}"
                 )
+
+            # Seed exactly ONE `ledger_installed` row, in this same
+            # transaction. It is the ledger's own epoch marker and it exists to
+            # keep the §12a watchdog TRUTHFUL across the deploy boundary.
+            #
+            # The watchdog is enabled unconditionally by the cron line
+            # (`cron/gecko-alpha.crontab`: ALERT_CHANNEL_WATCHDOG_ENABLED=true,
+            # hourly at :50), and an empty ledger is a breach. Without this row,
+            # the first watchdog run after deploy would page "NO
+            # 'refresh_completed' rows" — technically true and operationally
+            # false, because the nightly refresh simply has not come around yet.
+            # A page the operator learns to dismiss is worse than no page.
+            #
+            # It is a TRUE statement, not a silencer: `created_at` is the
+            # migration time, so the watchdog ages from it and still pages
+            # `no_successful_refresh_since_install` once the SLO elapses with no
+            # successful refresh. The deploy grace period is exactly the SLO,
+            # and a writer that never runs is still caught.
+            #
+            # Guarded on absence rather than INSERT OR IGNORE: there is no
+            # unique key to conflict on, so a re-run would otherwise append a
+            # second epoch and move the fallback age forward on every startup.
+            await conn.execute(
+                "INSERT INTO alert_events (created_at, event_type, detail) "
+                "SELECT ?, 'ledger_installed', ? WHERE NOT EXISTS "
+                "(SELECT 1 FROM alert_events WHERE event_type = 'ledger_installed')",
+                (now_iso, f"{migration_name} applied; ledger epoch"),
+            )
 
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "

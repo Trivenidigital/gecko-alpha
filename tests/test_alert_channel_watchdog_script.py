@@ -152,7 +152,7 @@ CREATE TABLE alert_events (
         'suppression_transition','parole_slot_spent','parole_slot_refunded',
         'reversal_pending_recorded','alert_dispatched','alert_delivered',
         'alert_failed','marker_stamped','marker_cleared','marker_anomaly',
-        'refresh_completed'
+        'refresh_completed','ledger_installed'
     )),
     combo_key        TEXT,
     signal_type      TEXT,
@@ -207,10 +207,10 @@ def _make_db(
     dispatch_blocked: number of ``decision='blocked'`` rows to seed. These are
       skips (universe-filtered / deduped / quarantined) and must NOT count as
       dispatch activity — used to prove the all-blocked quiet case stays silent.
-    alert_event_rows: list of (created_at_iso, event_type) tuples for the F3
-      ledger. ``None`` (the default) seeds ONE fresh ``refresh_completed`` row so
-      the F3 check stays green for the pre-existing tests; ``[]`` creates an
-      empty table (no-heartbeat breach).
+    alert_event_rows: list of (created_at_iso, event_type[, state_json]) tuples
+      for the F3 ledger. ``None`` (the default) seeds ONE fresh HEALTHY
+      ``refresh_completed`` row (``refreshed > 0``) so the F3 check stays green
+      for the pre-existing tests; ``[]`` creates an empty table.
     create_alert_events: when False the alert_events table is absent
       (missing-table breach path).
     """
@@ -278,17 +278,24 @@ def _make_db(
         if create_alert_events:
             conn.execute(_CREATE_ALERT_EVENTS)
             rows = alert_event_rows
-            if rows is None:  # default: one fresh heartbeat (keeps F3 check green)
+            if rows is None:  # default: one fresh HEALTHY heartbeat
                 rows = [
                     (
                         (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
                         "refresh_completed",
+                        '{"refreshed": 3, "failed": 0}',
                     )
                 ]
-            for created_at, event_type in rows:
+            for row in rows:
+                created_at, event_type = row[0], row[1]
+                # A 2-tuple means "no payload" — which the check now treats as
+                # an unreadable heartbeat, so tests must opt in to a healthy
+                # one explicitly rather than getting it by accident.
+                state_json = row[2] if len(row) > 2 else None
                 conn.execute(
-                    "INSERT INTO alert_events (created_at, event_type) VALUES (?, ?)",
-                    (created_at, event_type),
+                    "INSERT INTO alert_events (created_at, event_type, state_json) "
+                    "VALUES (?, ?, ?)",
+                    (created_at, event_type, state_json),
                 )
         # Guarantee at least one table exists so the DB file is non-trivial.
         if (
@@ -315,6 +322,13 @@ def _run(dbp, *extra):
 
 def _iso(hours_ago):
     return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _hb(refreshed: int, failed: int = 0) -> str:
+    """A HEALTHY `refresh_completed` payload. Spelled out at every call site
+    rather than defaulted, because "the heartbeat exists" and "the refresh
+    worked" are the two claims this check deliberately separates."""
+    return json.dumps({"refreshed": refreshed, "failed": failed})
 
 
 def _day(days_ago):
@@ -1102,7 +1116,7 @@ def test_alert_events_fresh_no_breach(tmp_path):
         tmp_path,
         alert_rows=[(_iso(1), "sent")],
         digest_rows=[_day(1)],
-        alert_event_rows=[(_iso(2), "refresh_completed")],  # < 27h SLO
+        alert_event_rows=[(_iso(2), "refresh_completed", _hb(3))],  # < 27h SLO
     )
     res = _run(dbp, "--enabled", "true", "--dry-run")
     assert res.returncode == 0, res.stderr
@@ -1117,7 +1131,7 @@ def test_alert_events_stale_is_breach(tmp_path):
         tmp_path,
         alert_rows=[(_iso(1), "sent")],
         digest_rows=[_day(1)],
-        alert_event_rows=[(_iso(40), "refresh_completed")],  # > 27h SLO
+        alert_event_rows=[(_iso(40), "refresh_completed", _hb(3))],  # > 27h SLO
     )
     res = _run(dbp, "--enabled", "true", "--dry-run")
     assert res.returncode == 5, res.stderr
@@ -1142,7 +1156,7 @@ def test_alert_events_other_event_types_do_not_count_as_a_heartbeat(tmp_path):
         alert_event_rows=[
             (_iso(1), "alert_delivered"),
             (_iso(1), "suppression_transition"),
-            (_iso(40), "refresh_completed"),
+            (_iso(40), "refresh_completed", _hb(3)),
         ],
     )
     res = _run(dbp, "--enabled", "true", "--dry-run")
@@ -1164,7 +1178,102 @@ def test_alert_events_empty_is_breach(tmp_path):
     body = json.loads(res.stdout)
     assert body["breaches"] == 1
     assert body["checks"]["alert_events_rate"]["reason"] == "no_refresh_completed_rows"
-    assert "NO 'refresh_completed' rows" in body["message"]
+    assert "no 'ledger_installed' epoch row" in body["message"]
+
+
+def test_fresh_install_with_no_heartbeat_does_not_page(tmp_path):
+    """THE DEPLOY BOUNDARY. cron/gecko-alpha.crontab sets
+    ALERT_CHANNEL_WATCHDOG_ENABLED=true inline, so the watchdog runs at :50 the
+    hour the migration lands — before any nightly refresh has had a chance to
+    write a heartbeat. Paging there is technically true and operationally
+    false, and a page the operator learns to dismiss is worse than no page."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(1), "ledger_installed")],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    assert body["checks"]["alert_events_rate"]["status"] == "ok"
+    assert body["checks"]["alert_events_rate"]["reason"] == "awaiting_first_refresh"
+
+
+def test_install_epoch_older_than_slo_with_no_heartbeat_is_breach(tmp_path):
+    """The grace period is exactly one SLO, not indefinite. §12a is preserved:
+    a writer that never runs is still caught, it just is not caught at t=0."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(40), "ledger_installed")],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert (
+        body["checks"]["alert_events_rate"]["reason"]
+        == "no_successful_refresh_since_install"
+    )
+    assert "NO combo refresh has completed" in body["message"]
+
+
+def test_fresh_heartbeat_that_refreshed_nothing_is_a_breach(tmp_path):
+    """`refresh_all` writes its heartbeat even when EVERY per-combo refresh
+    failed. A fresh row is therefore not evidence of health — without this the
+    watchdog would report OK through exactly the outage it exists to catch."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[
+            (_iso(1), "refresh_completed", '{"refreshed": 0, "failed": 7}')
+        ],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    assert body["checks"]["alert_events_rate"]["reason"] == "refresh_all_failing"
+    assert body["checks"]["alert_events_rate"]["refreshed"] == 0
+    assert "refreshed 0" in body["message"]
+
+
+def test_unreadable_heartbeat_payload_is_a_breach(tmp_path):
+    """Cannot PROVE the pass succeeded -> page. An unreadable heartbeat is a
+    broken writer, not a healthy one."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[(_iso(1), "refresh_completed", "{not json")],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["reason"] == "heartbeat_unreadable"
+
+
+def test_heartbeat_wins_over_the_install_epoch_once_one_exists(tmp_path):
+    """Once a real heartbeat exists the epoch row stops mattering — otherwise a
+    long-installed ledger would page forever on its own install age."""
+    dbp = _make_db(
+        tmp_path,
+        alert_rows=[(_iso(1), "sent")],
+        digest_rows=[_day(1)],
+        alert_event_rows=[
+            (_iso(500), "ledger_installed"),
+            (_iso(2), "refresh_completed", _hb(4)),
+        ],
+    )
+    res = _run(dbp, "--enabled", "true", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["checks"]["alert_events_rate"]["status"] == "ok"
+    assert body["checks"]["alert_events_rate"]["refreshed"] == 4
 
 
 def test_alert_events_missing_table_is_breach(tmp_path):
@@ -1191,7 +1300,7 @@ def test_alert_events_slo_hours_flag_is_honoured(tmp_path):
         tmp_path,
         alert_rows=[(_iso(1), "sent")],
         digest_rows=[_day(1)],
-        alert_event_rows=[(_iso(40), "refresh_completed")],
+        alert_event_rows=[(_iso(40), "refresh_completed", _hb(3))],
     )
     res = _run(dbp, "--enabled", "true", "--dry-run", "--alert-events-slo-hours", "48")
     assert res.returncode == 0, res.stderr

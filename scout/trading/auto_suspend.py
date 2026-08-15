@@ -199,11 +199,28 @@ async def _send_suspend_alert(
     notification is lost, and it is lost LOUDLY (log + ledger row). The
     scheduler at ``scout.main._run_feedback_schedulers`` is the second layer.
     """
+    digest = payload_digest(body)
     if session is None:
+        # No session means no page was ever attempted — an operator-applied
+        # signal was just auto-suspended and nobody was told. That is exactly
+        # the §12b state the ledger exists to make visible, so it gets a row
+        # rather than an early return into silence. The state change itself is
+        # already durable in `signal_params_audit`; this records the
+        # NOTIFICATION gap, which nothing else does.
+        await record_alert_event(
+            db,
+            event_type="alert_failed",
+            signal_type=signal_type,
+            alert_source="auto_suspend",
+            transition=reason,
+            delivery_result="skipped_no_session",
+            retry=0,
+            payload_hash=digest,
+            detail="no aiohttp session supplied; suspension applied unpaged",
+        )
         return
     from scout import alerter  # local import (Windows OpenSSL)
 
-    digest = payload_digest(body)
     try:
         log.info(
             "auto_suspend_alert_dispatched",

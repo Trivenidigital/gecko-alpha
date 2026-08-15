@@ -317,55 +317,119 @@ async def _check_narrative_inbound_rate(
 async def _check_alert_events_rate(
     conn: aiosqlite.Connection, slo_hours: int, now: datetime
 ) -> dict:
-    """Newest ``alert_events`` ``refresh_completed`` row must be within the SLO (F3).
+    """F3 control-plane ledger heartbeat. Four states, because "a row exists"
+    and "the pipeline is working" are different claims.
 
     Keyed on ``refresh_completed`` and NOT on ``MAX(created_at)`` over the whole
     table: every other event type is conditional (a suppression transition, a
     parole refund, a page), so a table whose only rows are conditional events
     reads "fresh" during exactly the stretch in which the refresh pass has
-    stopped running. ``refresh_completed`` is written once per ``refresh_all``
-    run unconditionally, which is what makes it a heartbeat rather than a
-    symptom.
+    stopped running. A heartbeat has to be unconditional or it is a symptom.
 
-    A missing OR empty table is a breach, matching the other freshness checks:
-    the whole point of the ledger is that silence is never ambiguous."""
+    But ``refresh_all`` writes its heartbeat even when EVERY per-combo refresh
+    FAILED (``refreshed=0, failed=N``) — verified empirically. A fresh row is
+    therefore not evidence of health, and treating it as such would leave the
+    watchdog reporting OK through exactly the outage it exists to catch. So a
+    HEALTHY heartbeat is one whose payload carries ``refreshed > 0``; a fresh
+    heartbeat with ``refreshed == 0`` breaches immediately, distinctly, and
+    does not wait out the SLO.
+
+    Before the first refresh ever runs there is no heartbeat at all, only the
+    ``ledger_installed`` epoch row the migration seeds. Ageing from that row is
+    what keeps the deploy boundary quiet WITHOUT waiving §12a: the first
+    nightly refresh gets one full SLO to arrive, and if it never does, the
+    epoch row goes stale and pages truthfully.
+
+    A missing table, or a table with neither a heartbeat nor an epoch row, is a
+    breach — silence is never ambiguous."""
     table = "alert_events"
+    base = {"table": table, "slo_hours": slo_hours, "refreshed": None}
     try:
         cur = await conn.execute(
-            "SELECT MAX(created_at) FROM alert_events "
-            "WHERE event_type = 'refresh_completed'"
+            "SELECT created_at, state_json FROM alert_events "
+            "WHERE event_type = 'refresh_completed' "
+            "ORDER BY created_at DESC LIMIT 1"
         )
-        row = await cur.fetchone()
+        newest = await cur.fetchone()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
             return {
-                "table": table,
+                **base,
                 "status": "breach",
                 "reason": "table_absent",
                 "last_seen": None,
                 "age_hours": None,
-                "slo_hours": slo_hours,
             }
         raise
-    last_seen = row[0] if row else None
-    if last_seen is None:
+
+    if newest is None:
+        # No refresh has ever completed. Age from the install epoch instead.
+        cur = await conn.execute(
+            "SELECT MAX(created_at) FROM alert_events "
+            "WHERE event_type = 'ledger_installed'"
+        )
+        row = await cur.fetchone()
+        installed_at = row[0] if row else None
+        if installed_at is None:
+            return {
+                **base,
+                "status": "breach",
+                "reason": "no_refresh_completed_rows",
+                "last_seen": None,
+                "age_hours": None,
+            }
+        age_hours = (now - _parse_ts(installed_at)).total_seconds() / 3600.0
+        breached = age_hours > slo_hours
         return {
-            "table": table,
-            "status": "breach",
-            "reason": "no_refresh_completed_rows",
-            "last_seen": None,
-            "age_hours": None,
-            "slo_hours": slo_hours,
+            **base,
+            "status": "breach" if breached else "ok",
+            "reason": (
+                "no_successful_refresh_since_install"
+                if breached
+                else "awaiting_first_refresh"
+            ),
+            "last_seen": installed_at,
+            "age_hours": round(age_hours, 2),
         }
+
+    last_seen, state_json = newest[0], newest[1]
+    try:
+        refreshed = (json.loads(state_json) or {}).get("refreshed")
+    except (ValueError, TypeError):
+        refreshed = None
+    if not isinstance(refreshed, int):
+        # Cannot PROVE the pass succeeded. Fail toward the page: an unreadable
+        # heartbeat is a broken writer, not a healthy one.
+        return {
+            **base,
+            "status": "breach",
+            "reason": "heartbeat_unreadable",
+            "last_seen": last_seen,
+            "age_hours": round(
+                (now - _parse_ts(last_seen)).total_seconds() / 3600.0, 2
+            ),
+        }
+
     age_hours = (now - _parse_ts(last_seen)).total_seconds() / 3600.0
+    if refreshed <= 0:
+        # Fresh but broken. Breach NOW rather than at SLO expiry — the pass is
+        # running and failing, which is a louder fact than a stalled one.
+        return {
+            **base,
+            "status": "breach",
+            "reason": "refresh_all_failing",
+            "last_seen": last_seen,
+            "age_hours": round(age_hours, 2),
+            "refreshed": refreshed,
+        }
     breached = age_hours > slo_hours
     return {
-        "table": table,
+        **base,
         "status": "breach" if breached else "ok",
         "reason": "stale" if breached else "fresh",
         "last_seen": last_seen,
         "age_hours": round(age_hours, 2),
-        "slo_hours": slo_hours,
+        "refreshed": refreshed,
     }
 
 
@@ -538,8 +602,29 @@ def _compose_message(checks: dict, include: list[str]) -> str:
             )
         elif e["reason"] == "no_refresh_completed_rows":
             lines.append(
-                "- alert_events: NO 'refresh_completed' rows in table — the combo "
-                f"refresh pass has never recorded a heartbeat (SLO {e['slo_hours']}h)"
+                "- alert_events: NO 'refresh_completed' rows AND no "
+                "'ledger_installed' epoch row — the ledger is present but empty, "
+                f"so its own install marker is missing too (SLO {e['slo_hours']}h)"
+            )
+        elif e["reason"] == "no_successful_refresh_since_install":
+            lines.append(
+                f"- alert_events: ledger installed at {e['last_seen']} "
+                f"({e['age_hours']}h ago) and NO combo refresh has completed "
+                f"successfully since (SLO {e['slo_hours']}h) — the nightly "
+                "refresh has not run, or has failed every time"
+            )
+        elif e["reason"] == "refresh_all_failing":
+            lines.append(
+                f"- alert_events: the refresh pass IS running (last heartbeat "
+                f"{e['last_seen']}, {e['age_hours']}h ago) but refreshed 0 "
+                "combos — every per-combo refresh is failing, so suppression "
+                "economics are frozen while the heartbeat looks healthy"
+            )
+        elif e["reason"] == "heartbeat_unreadable":
+            lines.append(
+                f"- alert_events: last heartbeat at {e['last_seen']} carries no "
+                "readable refreshed-count — the heartbeat writer is broken, so "
+                "refresh health cannot be confirmed either way"
             )
         else:
             lines.append(

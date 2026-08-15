@@ -7,11 +7,21 @@ is unreconstructable after the fact. And the decisive suppression transitions
 emitted NO log line at all — they existed only as mutated `combo_performance`
 rows, which record the current state and say nothing about how it was reached.
 
-WHY IT NEVER RAISES. This ledger OBSERVES the control plane; it must never be
-able to break it. Every failure path here is swallowed and logged
+WHY IT ALMOST NEVER RAISES. This ledger OBSERVES the control plane; it must
+never be able to break it. Failure paths here are swallowed and logged
 (`alert_event_write_failed`). The exception-swallow is deliberate and is
 exercised by tests in BOTH transaction modes — an untested `except` block is
 untested code, and this one exists precisely for the case nobody rehearses.
+
+TWO documented exceptions to "never raises", both deliberate:
+
+1. `asyncio.CancelledError` is a `BaseException` and propagates by design. It
+   means the process is shutting down or the task was cancelled; swallowing it
+   would make the ledger a place where cancellation goes to die.
+2. In `managed_txn=True`, a failure that ABORTED the caller's open transaction
+   is re-raised — see :func:`record_alert_event`. Swallowing that one would be
+   the worst outcome in this module: the caller would carry on believing its
+   state change is pending when SQLite has already discarded it.
 
 TRANSACTION MODES. `managed_txn=True` means the CALLER owns the transaction and
 will commit it: the row is a plain INSERT with no commit and no rollback, so the
@@ -20,14 +30,21 @@ writer's own short transaction under `db._txn_lock` — used on the delivery axi
 where the state change already committed and the event is a separate fact.
 
 Callers that already hold `db._txn_lock` MUST pass `managed_txn=True`:
-`asyncio.Lock` is not reentrant, so the self-committed mode would deadlock. The
-bounded acquire below turns a mistake into a logged timeout rather than a wedged
-pipeline loop, but it is a backstop, not a licence.
+`asyncio.Lock` is not reentrant, so the self-committed mode would deadlock. That
+is enforced by review, not by a timeout — every unmanaged call site is verified
+lock-free. An earlier draft used `asyncio.wait_for(lock.acquire(), ...)` as a
+backstop; it was removed because a cancelled `acquire()` can leave the lock
+permanently held, which converts a recoverable mistake into a wedged pipeline.
+
+`delivery_result` is a general-purpose OUTCOME field, not only a delivery
+verdict. On `alert_*` rows it carries `'ok'` / `'error:<ExcType>'`; on
+`parole_slot_refunded` it carries `'ok'` / `'stale_generation'`; on
+`reversal_pending_recorded`, `'ok'` / `'no_30d_row'`; on `marker_anomaly`, the
+anomaly reason. One column, read in the context of its `event_type`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -51,13 +68,9 @@ EVENT_TYPES = frozenset(
         "marker_cleared",
         "marker_anomaly",
         "refresh_completed",
+        "ledger_installed",
     }
 )
-
-# Bounded acquire for the self-committed mode. A ledger write must never be able
-# to block the control path it observes; a timeout is logged like any other
-# write failure. Mirrors `Database.record_minara_emission`'s lock_timeout_sec.
-_LOCK_TIMEOUT_SEC = 30.0
 
 _INSERT_SQL = (
     "INSERT INTO alert_events "
@@ -122,12 +135,21 @@ async def record_alert_event(
     detail: str | None = None,
     managed_txn: bool = False,
 ) -> None:
-    """Append one row to `alert_events`. NEVER raises.
+    """Append one row to `alert_events`. See the module docstring for the two
+    documented cases in which this raises.
 
     `managed_txn=True` — the caller owns an open transaction and will commit it;
-    this is a bare INSERT. A failed INSERT is logged and the caller's transaction
-    is left alone (SQLite's default ABORT resolution rolls back the statement,
-    not the transaction), so a ledger failure cannot poison the state change.
+    this is a bare INSERT. A failed INSERT has TWO possible effects, and the
+    handler distinguishes them rather than assuming the benign one:
+
+    * **statement-level abort** (constraint violations — SQLite's default
+      ABORT conflict resolution): only the INSERT is undone, the caller's
+      transaction survives intact, and the failure is swallowed and logged.
+      This is the common case and the one a ledger must never escalate.
+    * **transaction-level abort** (the IO class: SQLITE_FULL, SQLITE_IOERR,
+      SQLITE_BUSY, SQLITE_NOMEM): SQLite discards the whole transaction. The
+      failure is re-raised, because the caller would otherwise continue as if
+      its state change were still pending.
 
     `managed_txn=False` — acquire `db._txn_lock`, INSERT, commit. On failure the
     writer rolls its own transaction back so the shared connection is never
@@ -151,17 +173,30 @@ async def record_alert_event(
     )
 
     if managed_txn:
+        # Sampled BEFORE the write so the handler can tell "the caller had a
+        # transaction and SQLite threw it away" from "there was never one".
+        was_in_txn = db._conn.in_transaction
         try:
             await db._conn.execute(_INSERT_SQL, params)
         except Exception as exc:
             _log_write_failure(exc, event_type, combo_key, managed_txn=True)
+            if was_in_txn and not db._conn.in_transaction:
+                # The failure ABORTED the caller's transaction rather than just
+                # the statement. SQLite does this for the IO class —
+                # SQLITE_FULL / IOERR / BUSY / NOMEM — and disk-full has real
+                # history on this box. Swallowing here would be the worst
+                # outcome in this module: `_open_gate` would return an
+                # admission whose `parole_trades_remaining` decrement had
+                # already been discarded, i.e. silent over-admission (D1
+                # class). Re-raise so the caller's own failure path runs.
+                raise
         return
 
     try:
         lock = db._txn_lock
         if lock is None:
             raise RuntimeError("Database._txn_lock is None — not initialized")
-        await asyncio.wait_for(lock.acquire(), timeout=_LOCK_TIMEOUT_SEC)
+        await lock.acquire()
         try:
             try:
                 await db._conn.execute(_INSERT_SQL, params)

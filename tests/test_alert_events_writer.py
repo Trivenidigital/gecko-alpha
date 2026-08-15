@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+import aiosqlite
+
 import pytest
 import structlog
 
@@ -20,13 +22,18 @@ from scout.trading import alert_events
 
 
 async def _count(db, **where) -> int:
-    if not where:
-        cur = await db._conn.execute("SELECT COUNT(*) FROM alert_events")
-    else:
-        clause = " AND ".join(f"{k} = ?" for k in where)
-        cur = await db._conn.execute(
-            f"SELECT COUNT(*) FROM alert_events WHERE {clause}", tuple(where.values())
-        )
+    """Rows written by the WRITER. The migration seeds one `ledger_installed`
+    epoch row, which is schema, not writer output — counting it would make
+    every "no row was written" assertion below read as 1 and quietly stop
+    discriminating."""
+    clause = "event_type != 'ledger_installed'"
+    params: tuple = ()
+    if where:
+        clause += " AND " + " AND ".join(f"{k} = ?" for k in where)
+        params = tuple(where.values())
+    cur = await db._conn.execute(
+        f"SELECT COUNT(*) FROM alert_events WHERE {clause}", params
+    )
     (n,) = await cur.fetchone()
     return n
 
@@ -122,7 +129,7 @@ async def test_all_columns_round_trip(tmp_path):
         cur = await db._conn.execute(
             "SELECT event_type, combo_key, signal_type, alert_source, transition, "
             "detected_at, delivery_result, retry, payload_hash, state_json, detail "
-            "FROM alert_events"
+            "FROM alert_events WHERE event_type != 'ledger_installed'"
         )
         rows = await cur.fetchall()
         assert len(rows) == 1
@@ -154,7 +161,9 @@ async def test_retry_is_normalised_to_0_1_or_null(tmp_path, value, expected):
         await alert_events.record_alert_event(
             db, event_type="alert_dispatched", retry=value
         )
-        cur = await db._conn.execute("SELECT retry FROM alert_events")
+        cur = await db._conn.execute(
+            "SELECT retry FROM alert_events WHERE event_type != 'ledger_installed'"
+        )
         rows = await cur.fetchall()
         assert len(rows) == 1
         assert rows[0][0] == expected
@@ -261,3 +270,85 @@ async def test_generation_state_records_absence_as_explicit_nulls(tmp_path):
         "before_parole_at": None,
         "before_parole_trades_remaining": None,
     }
+
+
+async def test_managed_failure_that_aborted_the_caller_txn_is_re_raised(tmp_path):
+    """THE DANGEROUS CASE. SQLite's IO class (SQLITE_FULL / IOERR / BUSY /
+    NOMEM) aborts the whole TRANSACTION, not just the statement — and disk-full
+    has real history on this box. Swallowing there would let `_open_gate`
+    return an admission whose `parole_trades_remaining` decrement SQLite had
+    already discarded: silent over-admission against a live lock period.
+
+    So the writer distinguishes the two abort scopes rather than assuming the
+    benign one, and re-raises only when the caller's transaction is actually
+    gone."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        async with db._txn_lock:
+            await db._conn.execute("BEGIN IMMEDIATE")
+            await db._conn.execute(
+                "INSERT INTO combo_performance "
+                "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+                " avg_pnl_pct, win_rate_pct, suppressed, last_refreshed) "
+                "VALUES ('combo_a', '30d', 1, 1, 0, 0, 0, 100.0, 0, '2026-08-14')"
+            )
+            assert db._conn.in_transaction
+
+            real_execute = db._conn.execute
+
+            async def _abort_the_txn(sql, *a, **k):
+                # Simulate the IO class: the transaction is discarded and the
+                # statement reports failure.
+                await real_execute("ROLLBACK")
+                raise aiosqlite.OperationalError("database or disk is full")
+
+            db._conn.execute = _abort_the_txn
+            try:
+                with pytest.raises(aiosqlite.OperationalError):
+                    await alert_events.record_alert_event(
+                        db,
+                        event_type="parole_slot_spent",
+                        combo_key="combo_a",
+                        managed_txn=True,
+                    )
+            finally:
+                db._conn.execute = real_execute
+            assert not db._conn.in_transaction
+    finally:
+        await db.close()
+
+
+async def test_managed_constraint_failure_still_swallowed_when_txn_survives(tmp_path):
+    """The common case must NOT escalate: a constraint violation undoes only the
+    statement, the caller's transaction is intact, and the ledger stays silent
+    about it beyond its log line."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        async with db._txn_lock:
+            await db._conn.execute("BEGIN IMMEDIATE")
+            await db._conn.execute(
+                "INSERT INTO combo_performance "
+                "(combo_key, window, trades, wins, losses, total_pnl_usd, "
+                " avg_pnl_pct, win_rate_pct, suppressed, last_refreshed) "
+                "VALUES ('combo_b', '30d', 1, 1, 0, 0, 0, 100.0, 0, '2026-08-14')"
+            )
+            # Must not raise.
+            await alert_events.record_alert_event(
+                db,
+                event_type="not_a_real_event_type",
+                combo_key="combo_b",
+                managed_txn=True,
+            )
+            assert db._conn.in_transaction, "the constraint failure killed the txn"
+            await db._conn.commit()
+
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM combo_performance WHERE combo_key='combo_b'"
+        )
+        (survived,) = await cur.fetchone()
+        assert survived == 1
+        assert await _count(db) == 0
+    finally:
+        await db.close()

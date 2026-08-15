@@ -125,10 +125,13 @@ async def test_upgrade_preserves_existing_rows(tmp_path):
         after = [tuple(r) for r in await cur.fetchall()]
         assert after == [tuple(r) for r in before]
 
-        # Append-only ledger starts EMPTY — no backfill, by design.
-        cur = await db._conn.execute("SELECT COUNT(*) FROM alert_events")
-        (count,) = await cur.fetchone()
-        assert count == 0
+        # No backfill of history — the ledger holds exactly ONE row, its own
+        # install epoch, and nothing reconstructed from the past.
+        cur = await db._conn.execute("SELECT event_type, created_at FROM alert_events")
+        rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "ledger_installed"
+        assert rows[0][1] is not None
     finally:
         await db.close()
 
@@ -155,9 +158,19 @@ async def test_upgrade_is_idempotent(tmp_path):
     await db2.initialize()
     try:
         assert "alert_events" in await _table_names(db2)
-        cur = await db2._conn.execute("SELECT COUNT(*) FROM alert_events")
-        (count,) = await cur.fetchone()
-        assert count == 1
+        # The manually-inserted heartbeat survives, and the epoch row is NOT
+        # duplicated — a second epoch would move the watchdog's fallback age
+        # forward on every startup and mask a dead writer indefinitely.
+        cur = await db2._conn.execute(
+            "SELECT COUNT(*) FROM alert_events WHERE event_type='ledger_installed'"
+        )
+        (epochs,) = await cur.fetchone()
+        assert epochs == 1, "re-running initialize() appended a second epoch row"
+        cur = await db2._conn.execute(
+            "SELECT COUNT(*) FROM alert_events WHERE event_type='refresh_completed'"
+        )
+        (beats,) = await cur.fetchone()
+        assert beats == 1
         cur = await db2._conn.execute("SELECT COUNT(*) FROM combo_performance")
         (combos,) = await cur.fetchone()
         assert combos == 2
@@ -215,6 +228,7 @@ async def test_event_type_check_constraint_is_enforced_by_the_db(tmp_path):
             "marker_cleared",
             "marker_anomaly",
             "refresh_completed",
+            "ledger_installed",
         ):
             await db._conn.execute(
                 "INSERT INTO alert_events (created_at, event_type) VALUES (?, ?)",
@@ -223,7 +237,8 @@ async def test_event_type_check_constraint_is_enforced_by_the_db(tmp_path):
         await db._conn.commit()
         cur = await db._conn.execute("SELECT COUNT(*) FROM alert_events")
         (count,) = await cur.fetchone()
-        assert count == 11
+        # 12 inserted here + the 1 epoch row the migration seeded.
+        assert count == 13
     finally:
         await db.close()
 
@@ -245,3 +260,58 @@ async def test_schema_version_stamped(tmp_path):
         assert row[0] == "alert_events_v1"
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_install_epoch_row_is_seeded_once_with_the_migration_time(tmp_path):
+    """The epoch row is what keeps the §12a watchdog quiet across the deploy
+    boundary WITHOUT waiving it, so it has to be a true statement: seeded once,
+    stamped with the migration time, never refreshed on later startups."""
+    db_path = tmp_path / "fresh.db"
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT created_at, detail FROM alert_events "
+            "WHERE event_type = 'ledger_installed'"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 1
+        first_stamp = rows[0][0]
+        assert "alert_events_v1" in rows[0][1]
+    finally:
+        await db.close()
+
+    db2 = Database(db_path)
+    await db2.initialize()
+    try:
+        cur = await db2._conn.execute(
+            "SELECT created_at FROM alert_events WHERE event_type = 'ledger_installed'"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 1, "a second startup appended another epoch row"
+        assert rows[0][0] == first_stamp, "the epoch stamp moved on restart"
+    finally:
+        await db2.close()
+
+
+def test_event_types_constant_matches_the_migration_check_constraint():
+    """Tripwire. `EVENT_TYPES` is referenced by no production code path, so
+    nothing else would notice it drifting from the DB CHECK — and a constant
+    that silently disagrees with the schema is worse than no constant, because
+    a reader will trust it."""
+    import inspect
+    import re
+
+    from scout.db import Database as _Database
+    from scout.trading.alert_events import EVENT_TYPES
+
+    src = inspect.getsource(_Database._migrate_alert_events_v1)
+    body = src[src.index("event_type       TEXT NOT NULL CHECK") :]
+    body = body[: body.index("))")]
+    in_ddl = set(re.findall(r"'([a-z_]+)'", body))
+    assert in_ddl == set(EVENT_TYPES), (
+        "EVENT_TYPES and the migration CHECK constraint disagree: "
+        f"only in DDL={sorted(in_ddl - set(EVENT_TYPES))}, "
+        f"only in EVENT_TYPES={sorted(set(EVENT_TYPES) - in_ddl)}"
+    )

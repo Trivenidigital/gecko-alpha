@@ -206,7 +206,11 @@ async def _open_gate(
                 event_type="parole_slot_spent",
                 combo_key=combo_key,
                 transition="parole_retest",
-                detected_at=parole_at_now,
+                # The spend time, not the parole boundary. `parole_at` is a
+                # property of the generation and already appears in
+                # `state_json`; duplicating it here made `detected_at` mean
+                # something different on this row than on every other one.
+                detected_at=datetime.now(timezone.utc).isoformat(),
                 state_json=encode_state(
                     suppressed=supp_now,
                     suppressed_at=supp_at_now,
@@ -262,6 +266,36 @@ async def _open_gate(
             )
             return (False, "error", None)
 
+    return await _open_gate_tail(db, combo_key, settings, deferred_fallback_err)
+
+
+async def _open_gate_tail(
+    db: Database, combo_key: str, settings, deferred_fallback_err: str | None
+) -> tuple[bool, str, tuple | None]:
+    """Everything :func:`_open_gate` does after releasing ``db._txn_lock``.
+
+    Extracted so the invariant guard below is reachable by a test. Reaching
+    here means the locked block fell through without returning, which today
+    happens on exactly one path: the locked-and-busy fail-open, which sets
+    ``deferred_fallback_err``.
+
+    The guard exists because the FALL-THROUGH is the dangerous direction. This
+    function's default answer is "admit the trade" (fail-open), so a future edit
+    that adds a non-returning path inside the lock would silently start
+    admitting trades against a combo whose suppression state was never
+    validated. Deny instead: an unexplained fall-through is a bug, and the safe
+    reading of a bug at an entry gate is "do not open".
+    """
+    if deferred_fallback_err is None:
+        log.error(
+            "suppression_open_gate_fell_through",
+            combo_key=combo_key,
+            err_id="SUPP_FALLTHROUGH",
+            detail="the locked block exited without returning and without "
+            "recording a fail-open reason; denying rather than admitting an "
+            "unvalidated trade",
+        )
+        return (False, "error", None)
     await _record_fallback(db, combo_key, deferred_fallback_err, settings)
     return (True, "db_error_fallback_allow", None)
 

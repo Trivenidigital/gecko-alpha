@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 import pytest
+import structlog
 
 from scout.db import Database
 from scout.trading import alert_events, combo_refresh, suppression
@@ -69,10 +70,13 @@ def _stub_all_senders(monkeypatch):
 
 
 async def _events(db, **where) -> list[dict]:
-    clause = ""
+    """Rows written by the WRITER. The migration seeds one `ledger_installed`
+    epoch row; it is schema, not writer output, and counting it would make the
+    "zero rows" assertions below read as 1 and stop discriminating."""
+    clause = " WHERE event_type != 'ledger_installed'"
     params: tuple = ()
     if where:
-        clause = " WHERE " + " AND ".join(f"{k} = ?" for k in where)
+        clause += " AND " + " AND ".join(f"{k} = ?" for k in where)
         params = tuple(where.values())
     cur = await db._conn.execute(
         "SELECT event_type, combo_key, signal_type, alert_source, transition, "
@@ -159,7 +163,8 @@ async def test_first_write_latch_is_recorded(tmp_path, settings_factory):
 
         rows = await _events(db, event_type="suppression_transition")
         assert len(rows) == 1
-        assert rows[0]["transition"] == "first_write_latch"
+        assert rows[0]["transition"] == "newly_suppressed"
+        assert rows[0]["detail"] == "first_write"
         assert rows[0]["combo_key"] == "combo_a"
         state = json.loads(rows[0]["state_json"])
         assert state["before_suppressed"] is None, "no prior row -> explicit null"
@@ -195,7 +200,7 @@ async def test_initial_latch_from_an_unsuppressed_row_is_recorded(
 
         rows = await _events(db, event_type="suppression_transition")
         assert len(rows) == 1
-        assert rows[0]["transition"] == "initial_latch"
+        assert rows[0]["transition"] == "newly_suppressed"
         state = json.loads(rows[0]["state_json"])
         assert state["before_suppressed"] == 0
         assert state["after_suppressed"] == 1
@@ -321,18 +326,18 @@ async def test_relatch_is_recorded(tmp_path, settings_factory):
 
         rows = await _events(db, event_type="suppression_transition")
         transitions = [r["transition"] for r in rows]
-        assert transitions.count("relatch") == 1
+        assert transitions.count("parole_exhausted_resuppressed") == 1
         assert transitions.count("page_rearm") == 1
         assert len(rows) == 2
     finally:
         await db.close()
 
 
-async def test_terminal_incomplete_hold_is_recorded_with_the_held_label(
-    tmp_path, settings_factory
-):
-    """The classifier names the STATE (`terminal_incomplete`); the ledger names
-    what the refresh DID about it (`terminal_incomplete_held`)."""
+async def test_terminal_incomplete_hold_writes_nothing(tmp_path, settings_factory):
+    """A nightly HOLD is not a transition. The branch re-writes the same
+    generation every refresh, so gating on the branch label instead of an
+    actual state delta minted one identical row per suppressed combo per run,
+    forever — a log line wearing a ledger's clothes."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     try:
@@ -350,10 +355,57 @@ async def test_terminal_incomplete_hold_is_recorded_with_the_held_label(
                 opened_at=now - timedelta(days=2),
             )
         assert await combo_refresh.refresh_combo(db, "combo_a", s)
+        assert await _events(db, event_type="suppression_transition") == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.parametrize(
+    "label,valid_closes,remaining",
+    [
+        ("waiting", 1, 3),
+        ("terminal_incomplete_held", 2, 0),
+        ("contaminated", 6, 5),
+    ],
+)
+async def test_steady_state_classifications_write_nothing_on_repeat(
+    tmp_path, settings_factory, label, valid_closes, remaining
+):
+    """Run the refresh TWICE against an unchanged combo and assert ZERO
+    suppression_transition rows in total. One row would be defensible; a row
+    per refresh forever is the failure mode, and only a repeat run can tell
+    them apart."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        st = settings_factory()
+        now = datetime.now(timezone.utc)
+        parole_at = (now - timedelta(days=3)).isoformat()
+        await _seed_30d_row(
+            db, "combo_a", parole_at=parole_at, parole_trades_remaining=remaining
+        )
+        for _ in range(valid_closes):
+            await _insert_trade(
+                db,
+                "combo_a",
+                -10,
+                now - timedelta(days=1),
+                opened_at=now - timedelta(days=2),
+            )
+        for _ in range(3):
+            assert await combo_refresh.refresh_combo(db, "combo_a", st)
 
         rows = await _events(db, event_type="suppression_transition")
-        assert len(rows) == 1
-        assert rows[0]["transition"] == "terminal_incomplete_held"
+        assert rows == [], f"{label} minted {len(rows)} steady-state row(s)"
+
+        # The combo really is still suppressed — i.e. the branch under test ran
+        # and chose to preserve, rather than the fixture quietly clearing it.
+        cur = await db._conn.execute(
+            "SELECT suppressed FROM combo_performance "
+            "WHERE combo_key='combo_a' AND window='30d'"
+        )
+        (suppressed,) = await cur.fetchone()
+        assert suppressed == 1, "fixture did not exercise a preserve branch"
     finally:
         await db.close()
 
@@ -1523,3 +1575,293 @@ async def test_scheduler_contains_a_raising_suspension_pass(tmp_path):
     boom.assert_awaited_once()
     errors = [e for e in logs if e["event"] == "auto_suspend_loop_error"]
     assert len(errors) == 1, "a failed suspension pass was not contained + logged"
+
+
+# --- superseded page preservation (round-1 item 5) -------------------------
+
+
+async def test_superseded_page_body_is_preserved_in_the_ledger(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A superseded page is an operator notification that will NEVER be
+    delivered, and it was journald-only — i.e. gone within minutes of the 03:00
+    backup window. It cannot be re-derived either: the transition it describes
+    is diffed across a single refresh and never recurs. So the ledger carries
+    the BODY, not a reference to it."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        old_payload = json.dumps(
+            {
+                "transition": "newly_suppressed",
+                "detected_at": "2026-08-01T00:00:00+00:00",
+                "message": "combo_a auto-suppressed (win-rate 4.0 pct ...)",
+            },
+            sort_keys=True,
+        )
+        await _seed_30d_row(
+            db,
+            "combo_a",
+            suppressed=0,
+            suppressed_at=None,
+            parole_at=None,
+            parole_trades_remaining=None,
+            trades=1,
+            wins=1,
+            losses=0,
+            win_rate_pct=100.0,
+            reversal_alert_pending_json=old_payload,
+        )
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)
+
+        rows = await _events(db, event_type="reversal_pending_recorded")
+        assert len(rows) == 1
+        assert rows[0]["detail"] == "superseded an undelivered page"
+        state = json.loads(rows[0]["state_json"])
+        assert state["superseded_transition"] == "newly_suppressed"
+        assert state["superseded_detected_at"] == "2026-08-01T00:00:00+00:00"
+        assert state["superseded_message"] == (
+            "combo_a auto-suppressed (win-rate 4.0 pct ...)"
+        )
+        assert state["superseded_payload_hash"] == alert_events.payload_digest(
+            old_payload
+        )
+        assert state["superseded_raw"] == old_payload
+    finally:
+        await db.close()
+
+
+# --- commit-failure survival (round-1 item 6) ------------------------------
+
+
+async def test_pending_commit_failure_records_one_lost_page_per_combo(
+    tmp_path, settings_factory, monkeypatch
+):
+    """THE CASE THE LEDGER MOST NEEDS TO SURVIVE. A commit failure rolls back
+    every pending page this pass recorded; those pages are diffed across a
+    single refresh, so they are never re-detected — no retry, no re-derivation,
+    no second chance. The rows must therefore be written AFTER the rollback and
+    self-committed, or they die with the thing they document."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_commit = db._conn.commit
+        real_rollback = db._conn.rollback
+        armed = {"on": False}
+
+        async def _fail_pending_commit():
+            if armed["on"]:
+                armed["on"] = False
+                await real_rollback()
+                raise aiosqlite.OperationalError("disk I/O error")
+            return await real_commit()
+
+        real_record = combo_refresh._record_pending_reversals
+
+        async def _armed_record(*a, **k):
+            armed["on"] = True
+            try:
+                return await real_record(*a, **k)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(db._conn, "commit", _fail_pending_commit)
+        monkeypatch.setattr(combo_refresh, "_record_pending_reversals", _armed_record)
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        lost = await _events(db, event_type="marker_anomaly")
+        lost = [r for r in lost if r["transition"] == "pending_commit_lost"]
+        assert len(lost) == 2, f"expected one row per lost page, got {len(lost)}"
+        assert {r["combo_key"] for r in lost} == {"combo_a", "combo_b"}
+        for row in lost:
+            assert row["delivery_result"] == "pending_commit_lost"
+            state = json.loads(row["state_json"])
+            assert state["lost_transition"] == "newly_suppressed"
+            # The body, not just its name — that is the whole point.
+            assert row["combo_key"] in state["lost_message"]
+            assert state["lost_raw"]
+            assert row["payload_hash"] == alert_events.payload_digest(state["lost_raw"])
+
+        # And the pages really were destroyed, so the ledger row is the only
+        # surviving record.
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM combo_performance "
+            "WHERE window='30d' AND reversal_alert_pending_json IS NOT NULL"
+        )
+        (still_pending,) = await cur.fetchone()
+        assert still_pending == 0, "fixture did not actually roll the pages back"
+    finally:
+        await db.close()
+
+
+# --- perm-marker re-arm symmetry (round-1 item 7) --------------------------
+
+
+async def test_perm_suppression_marker_rearm_is_recorded(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Symmetry with the retest marker: a combo LEAVING permanent-suppression
+    gets its page back, which is a state change the operator cares about, and
+    afterwards the evidence is gone."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        # Suppressed + already perm-alerted, but it traded inside the window ->
+        # it has LEFT the permanent-suppression state, so the marker re-arms.
+        await _seed_30d_row(
+            db,
+            "combo_a",
+            perm_suppression_alerted_at=(now - timedelta(days=2)).isoformat(),
+        )
+        await _insert_trade(db, "combo_a", -5, now - timedelta(days=1))
+        await combo_refresh._process_permanent_suppression(
+            db, s, (now - timedelta(days=30)).isoformat()
+        )
+
+        rows = await _events(db, event_type="suppression_transition")
+        rows = [r for r in rows if r["transition"] == "page_rearm"]
+        assert len(rows) == 1
+        assert rows[0]["combo_key"] == "combo_a"
+        assert rows[0]["detail"] == "perm_suppression_alerted_at"
+        state = json.loads(rows[0]["state_json"])
+        assert state["marker"] == "perm_suppression_alerted_at"
+        assert state["cleared_stamp"] is not None
+
+        cur = await db._conn.execute(
+            "SELECT perm_suppression_alerted_at FROM combo_performance "
+            "WHERE combo_key='combo_a' AND window='30d'"
+        )
+        (marker,) = await cur.fetchone()
+        assert marker is None, "fixture did not actually re-arm the marker"
+    finally:
+        await db.close()
+
+
+async def test_perm_suppression_rearm_with_no_stamped_marker_writes_no_row(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Same stamped-marker gating as the retest sibling — no marker, no re-arm,
+    no row, however many times the pass runs."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        await _seed_30d_row(db, "combo_a", perm_suppression_alerted_at=None)
+        await _insert_trade(db, "combo_a", -5, now - timedelta(days=1))
+        for _ in range(3):
+            await combo_refresh._process_permanent_suppression(
+                db, s, (now - timedelta(days=30)).isoformat()
+            )
+        rows = await _events(db, event_type="suppression_transition")
+        assert [r for r in rows if r["transition"] == "page_rearm"] == []
+    finally:
+        await db.close()
+
+
+# --- auto_suspend unpaged suspension (round-2 item E) ----------------------
+
+
+async def test_auto_suspend_without_a_session_records_the_unpaged_gap(
+    tmp_path, settings_factory, monkeypatch
+):
+    """`session is None` used to return before every ledger row, so an
+    operator-applied signal could be auto-suspended with nobody told and
+    nothing recording that nobody was told."""
+    from scout.trading import auto_suspend
+    from scout.trading.params import clear_cache_for_tests
+
+    clear_cache_for_tests()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        await _seed_hard_loss(db)
+        s = settings_factory(SIGNAL_PARAMS_ENABLED=True)
+        suspended = await auto_suspend.maybe_suspend_signals(db, s, session=None)
+        assert any(r["signal_type"] == "gainers_early" for r in suspended)
+
+        rows = await _events(db, event_type="alert_failed", alert_source="auto_suspend")
+        assert len(rows) == 1
+        assert rows[0]["delivery_result"] == "skipped_no_session"
+        assert rows[0]["signal_type"] == "gainers_early"
+        assert rows[0]["transition"] == "hard_loss"
+        assert (
+            await _events(
+                db, event_type="alert_dispatched", alert_source="auto_suspend"
+            )
+            == []
+        ), "nothing was dispatched, so nothing may claim it was"
+    finally:
+        clear_cache_for_tests()
+        await db.close()
+
+
+# --- fail-open tail guard (round-1 item 8) ---------------------------------
+
+
+async def test_open_gate_tail_denies_when_the_invariant_breaks(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Simulates the invariant break directly: the locked block exited without
+    returning AND without recording a fail-open reason. This function's default
+    answer is "admit", so a future non-returning path inside the lock would
+    silently start admitting trades against an unvalidated combo. Deny."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        called = []
+
+        async def _must_not_be_called(*a, **k):
+            called.append(a)
+
+        monkeypatch.setattr(suppression, "_record_fallback", _must_not_be_called)
+        with structlog.testing.capture_logs() as logs:
+            result = await suppression._open_gate_tail(db, "combo_a", s, None)
+
+        assert result == (False, "error", None), "an invariant break ADMITTED a trade"
+        assert called == [], "the fail-open alert fired without a fail-open reason"
+        events = [e for e in logs if e["event"] == "suppression_open_gate_fell_through"]
+        assert len(events) == 1
+        assert events[0]["err_id"] == "SUPP_FALLTHROUGH"
+    finally:
+        await db.close()
+
+
+async def test_open_gate_tail_fails_open_when_a_reason_was_recorded(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The legitimate path is unchanged — the guard must not turn real
+    lock-contention fail-opens into denials."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        seen = []
+
+        async def _capture(db_, combo_key, err, settings_):
+            seen.append(err)
+
+        monkeypatch.setattr(suppression, "_record_fallback", _capture)
+        result = await suppression._open_gate_tail(
+            db, "combo_a", s, "parole_decrement: database is locked"
+        )
+        assert result == (True, "db_error_fallback_allow", None)
+        assert seen == ["parole_decrement: database is locked"]
+    finally:
+        await db.close()
