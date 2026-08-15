@@ -952,16 +952,18 @@ async def refresh_all(db: Database, settings) -> dict:
        ``suppressed = 1`` arm (fix/frozen-suppression-lock), which is why that
        arm is gone rather than merely redundant: a suppressed combo blocks its
        own trades, so under a trade-only refresh set it would fall out, never be
-       refreshed again, and latch at ``parole_exhausted`` forever with no
-       operator notification. ``refresh_combo`` still preserves its suppressed
+       refreshed again, and latch at ``parole_exhausted`` indefinitely with no
+       operator notification (indefinitely, not irreversibly — a passing retest
+       still clears it; nothing was starting one). ``refresh_combo`` still preserves its suppressed
        state verbatim for zero-trade combos (no auto-revival — constraint a).
 
     The window comes from ``FEEDBACK_REFRESH_WINDOW_DAYS``.
 
     Returns ``{"refreshed": N, "failed": M, "chronic_failures": [keys],
     "permanent_suppression": [keys], "suppression_reversals": [dicts]}`` where
-    ``permanent_suppression`` lists the combos newly alerted this run as entering
-    permanent-suppression state, and ``suppression_reversals`` lists the combos
+    ``permanent_suppression`` lists the combos newly alerted this run as
+    entering the suppressed-and-idle state (the key name predates the rename
+    and is kept for wire compatibility), and ``suppression_reversals`` lists the combos
     §12b-alerted this run for a reversal of their 30d suppression state. Since
     fix/reversal-alert-durable-retry that list is "DELIVERED this run", not
     "transitioned this run": it can include pages first detected on an EARLIER
@@ -1626,14 +1628,18 @@ async def _send_suppression_reversal_alert(settings, message: str) -> None:
 async def _process_permanent_suppression(
     db: Database, settings, window_cutoff: str
 ) -> list[str]:
-    """Detect combos entering permanent-suppression state and fire the §12b
+    """Detect combos entering the suppressed-and-idle state and fire the §12b
     operator alert once per entry.
 
-    A combo is in *permanent-suppression* state when its 30d row is
-    ``suppressed = 1`` AND it has NO trade opened within the refresh window —
-    i.e. it survives in the refresh set only because of the widening in
-    ``refresh_all``. That is a permanent, operator-invisible state change, so
-    §12b requires an operator alert.
+    A combo is *suppressed and idle* when its 30d row is ``suppressed = 1`` AND
+    it has NO trade opened within the refresh window — i.e. it survives in the
+    refresh set only because of the widening in ``refresh_all``.
+
+    This used to be called *permanent* suppression, and that word was wrong in
+    the way that matters: the state DOES clear, on a passing parole retest
+    (D4). What makes it worth paging is that nothing will start that retest on
+    its own — the combo is not trading, so it accrues no evidence, so it stays
+    suppressed. Calling it permanent told the operator the wrong remedy.
 
     Dedup via ``perm_suppression_alerted_at``: fire once, re-arm only when the
     combo leaves the state (becomes unsuppressed OR trades again inside the
@@ -1653,7 +1659,7 @@ async def _process_permanent_suppression(
     # ride out on this commit.
     async with db._txn_lock:
         # Named BEFORE the UPDATE clears them: the re-arm is a state change the
-        # operator cares about (a combo that left permanent-suppression gets its
+        # operator cares about (a combo that left suppressed-and-idle gets its
         # page back), and afterwards the evidence is gone. Same stamped-marker
         # gating as the retest sibling — only rows that actually HELD a marker
         # are re-arms; the UPDATE's WHERE already requires IS NOT NULL, so this
@@ -1671,7 +1677,7 @@ async def _process_permanent_suppression(
         rearmed = await cur.fetchall()
 
         # Re-arm: clear the dedup marker for any combo that has LEFT the
-        # permanent-suppression state since it was last alerted, so a future
+        # suppressed-and-idle state since it was last alerted, so a future
         # re-entry alerts again.
         await conn.execute(
             "UPDATE combo_performance "
@@ -1718,9 +1724,24 @@ async def _process_permanent_suppression(
     alerted: list[str] = []
     for combo in pending:
         message = (
-            f"signal {combo} is in permanent-suppression state (no trades in "
-            f">{window_days}d, still suppressed); revival requires explicit "
-            f"operator action via revive_signal_with_baseline"
+            f"combo {combo} is SUPPRESSED AND IDLE: no trades in "
+            f">{window_days}d and still suppressed, so it is not accumulating "
+            f"the retest evidence that would clear it.\n"
+            "This is not permanent — it clears on a passing parole retest — "
+            "but nothing will start that retest on its own.\n"
+            "TWO INDEPENDENT gates can hold a signal down, and they clear "
+            "differently:\n"
+            "- combo suppression (combo_performance.suppressed): clears ONLY "
+            "when a parole retest completes and passes. Operator action does "
+            "not clear it directly.\n"
+            "- signal suspension (signal_params.enabled=0): clears ONLY via "
+            "db.revive_signal_with_baseline(signal_type=...).\n"
+            f"On a BASE combo (combo_key == a signal_type, i.e. {combo} has no "
+            "'+'), revive_signal_with_baseline ALSO re-opens this combo's "
+            "parole window and refills its retest allowance — it does not "
+            "clear the suppression, it lets the retest begin. On a "
+            "multi-signal combo it does nothing to the combo axis at all.\n"
+            "See docs/runbook_gainers_early_revival.md"
         )
         # §12b: dispatched/delivered/failed logs bracket the send so a
         # successful delivery is NOT silent. parse_mode=None is set inside the
