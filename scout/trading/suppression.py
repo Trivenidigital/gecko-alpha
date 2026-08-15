@@ -18,6 +18,7 @@ import structlog
 
 from scout import alerter
 from scout.db import Database
+from scout.trading.alert_events import encode_state, payload_digest, record_alert_event
 
 log = structlog.get_logger()
 
@@ -90,7 +91,7 @@ async def _open_gate(
     except aiosqlite.OperationalError as e:
         msg = str(e).lower()
         if "locked" in msg or "busy" in msg:
-            await _record_fallback(combo_key, str(e), settings)
+            await _record_fallback(db, combo_key, str(e), settings)
             return (True, "db_error_fallback_allow", None)
         log.exception(
             "suppression_db_operational_error",
@@ -120,7 +121,7 @@ async def _open_gate(
     try:
         parole_dt = datetime.fromisoformat(parole_at)
     except (ValueError, TypeError) as e:
-        await _record_fallback(combo_key, f"parole_at parse: {e}", settings)
+        await _record_fallback(db, combo_key, f"parole_at parse: {e}", settings)
         return (True, "db_error_fallback_allow", None)
     if parole_dt.tzinfo is None:
         parole_dt = parole_dt.replace(tzinfo=timezone.utc)
@@ -147,6 +148,9 @@ async def _open_gate(
             "before should_open(). A fresh ephemeral Lock here would silently "
             "break mutual exclusion across concurrent callers."
         )
+    # Set by the locked-and-busy branch below; every other path inside the lock
+    # returns, so reaching the tail of this function means it was set.
+    deferred_fallback_err: str | None = None
     async with db._txn_lock:
         try:
             await db._conn.execute("BEGIN IMMEDIATE")
@@ -193,6 +197,25 @@ async def _open_gate(
                 "WHERE combo_key = ? AND window = '30d'",
                 (remaining - 1, combo_key),
             )
+            # F3: the decrement is the admission decision. Recorded IN this
+            # transaction (`managed_txn=True`) so the ledger row and the slot
+            # spend are the same durable fact — a decrement with no event, or
+            # an event with no decrement, would both be lies about admission.
+            await record_alert_event(
+                db,
+                event_type="parole_slot_spent",
+                combo_key=combo_key,
+                transition="parole_retest",
+                detected_at=parole_at_now,
+                state_json=encode_state(
+                    suppressed=supp_now,
+                    suppressed_at=supp_at_now,
+                    parole_at=parole_at_now,
+                    parole_trades_remaining_before=remaining,
+                    parole_trades_remaining_after=remaining - 1,
+                ),
+                managed_txn=True,
+            )
             await db._conn.commit()
             return (
                 True,
@@ -211,14 +234,22 @@ async def _open_gate(
                 )
             msg = str(e).lower()
             if "locked" in msg or "busy" in msg:
-                await _record_fallback(combo_key, f"parole_decrement: {e}", settings)
-                return (True, "db_error_fallback_allow", None)
-            log.exception(
-                "suppression_db_operational_error",
-                err_id="SUPP_DB_OP",
-                combo_key=combo_key,
-            )
-            return (False, "error", None)
+                # DEFERRED past the lock release, not called here. This branch
+                # runs with `db._txn_lock` HELD, and `_record_fallback` now
+                # writes ledger rows through `record_alert_event`, which takes
+                # that same non-reentrant lock — calling it in place would
+                # self-deadlock until the writer's bounded acquire timed out.
+                # Deferring is also strictly better for the pre-existing
+                # aiohttp send it wraps: that no longer pins the trading lock
+                # for the Telegram client timeout.
+                deferred_fallback_err = f"parole_decrement: {e}"
+            else:
+                log.exception(
+                    "suppression_db_operational_error",
+                    err_id="SUPP_DB_OP",
+                    combo_key=combo_key,
+                )
+                return (False, "error", None)
         except aiosqlite.Error:
             try:
                 await db._conn.execute("ROLLBACK")
@@ -230,6 +261,9 @@ async def _open_gate(
                 combo_key=combo_key,
             )
             return (False, "error", None)
+
+    await _record_fallback(db, combo_key, deferred_fallback_err, settings)
+    return (True, "db_error_fallback_allow", None)
 
 
 class ParoleReservation:
@@ -391,8 +425,14 @@ async def _refund_parole_slot(
     async with db._txn_lock:
         try:
             await db._conn.execute("BEGIN IMMEDIATE")
-            before_changes = db._conn.total_changes
-            await db._conn.execute(
+            cur = await db._conn.execute(
+                "SELECT parole_trades_remaining FROM combo_performance "
+                "WHERE combo_key = ? AND window = '30d'",
+                (combo_key,),
+            )
+            pre_row = await cur.fetchone()
+            remaining_before = pre_row[0] if pre_row else None
+            cur = await db._conn.execute(
                 "UPDATE combo_performance "
                 "SET parole_trades_remaining = "
                 "    MIN(COALESCE(parole_trades_remaining, 0) + 1, ?) "
@@ -403,7 +443,37 @@ async def _refund_parole_slot(
                 "  AND suppressed IS ? AND suppressed_at IS ? AND parole_at IS ?",
                 (ceiling, combo_key, *generation),
             )
-            changed = db._conn.total_changes - before_changes
+            # THIS statement's affected-row count — never
+            # `Connection.total_changes`, which is connection-wide and
+            # cumulative. The refund runs on the shared connection, so an
+            # unrelated write landing between the two reads would make a
+            # generation-bound UPDATE that matched ZERO rows report success,
+            # defeating the stale-generation check exactly as it did at the two
+            # sibling marker sites (combo_refresh.py).
+            changed = cur.rowcount
+            clamped = (
+                changed != 0
+                and remaining_before is not None
+                and remaining_before + 1 > ceiling
+            )
+            # F3: recorded in the SAME transaction as the credit, so the ledger
+            # cannot claim a refund that rolled back.
+            await record_alert_event(
+                db,
+                event_type="parole_slot_refunded",
+                combo_key=combo_key,
+                delivery_result="ok" if changed else "stale_generation",
+                detail="clamped at ceiling" if clamped else None,
+                state_json=encode_state(
+                    suppressed=generation[0],
+                    suppressed_at=generation[1],
+                    parole_at=generation[2],
+                    parole_trades_remaining_before=remaining_before,
+                    ceiling=ceiling,
+                    rows_changed=changed,
+                ),
+                managed_txn=True,
+            )
             await db._conn.commit()
             if changed == 0:
                 log.info(
@@ -433,8 +503,15 @@ async def _refund_parole_slot(
             )
 
 
-async def _record_fallback(combo_key: str, err: str, settings) -> None:
-    """Log + maintain the fail-open counter; fire Telegram alert with cooldown."""
+async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> None:
+    """Log + maintain the fail-open counter; fire Telegram alert with cooldown.
+
+    ``db`` is threaded through solely so the §12b send can be bracketed with F3
+    ledger rows. Every call site reaches this from ``_open_gate``, which already
+    holds it. Ledger writes here are best-effort by construction: this path fires
+    when the DB is degraded, so the ledger INSERT may well fail too — the writer
+    swallows that and the fail-open decision is unaffected.
+    """
     global _last_alerted_ts
     log.error(
         "suppression_db_error",
@@ -457,6 +534,15 @@ async def _record_fallback(combo_key: str, err: str, settings) -> None:
             f"⚠ Suppression fail-open fired {len(_fallback_timestamps)}x "
             f"in last hour. DB may be degraded — combos are currently ungated."
         )
+        digest = payload_digest(msg)
+        await record_alert_event(
+            db,
+            event_type="alert_dispatched",
+            combo_key=combo_key,
+            alert_source="suppression",
+            retry=0,
+            payload_hash=digest,
+        )
         try:
             # One-shot aiohttp session — fallbacks are rare (DB-degraded),
             # so the overhead of opening+closing a connection pool once per
@@ -471,5 +557,24 @@ async def _record_fallback(combo_key: str, err: str, settings) -> None:
                 await alerter.send_telegram_message(
                     msg, session, settings, parse_mode=None, source="suppression"
                 )
-        except Exception:
+        except Exception as exc:
             log.exception("suppression_fallback_alert_dispatch_error")
+            await record_alert_event(
+                db,
+                event_type="alert_failed",
+                combo_key=combo_key,
+                alert_source="suppression",
+                delivery_result=f"error:{type(exc).__name__}",
+                retry=0,
+                payload_hash=digest,
+            )
+            return
+        await record_alert_event(
+            db,
+            event_type="alert_delivered",
+            combo_key=combo_key,
+            alert_source="suppression",
+            delivery_result="ok",
+            retry=0,
+            payload_hash=digest,
+        )
