@@ -1965,6 +1965,37 @@ async def _drain_pending_live_tasks(paper_trader, timeout_sec: float = 5.0) -> N
     logger.info("live_shutdown_drain_done")
 
 
+# Boot-time flag -> the event announcing that lane is off for this process.
+# Both trackers default ON, and both are gated by a plain `if settings.FLAG:`
+# around their per-cycle work — so turning one off does not produce a "skipped"
+# line, it produces NOTHING. A disabled lane and a lane whose loop died are
+# then the same absence in journald, which is the ambiguity this closes.
+_TRACKER_DISABLED_EVENTS: dict[str, tuple[str, str]] = {
+    "GAINERS_TRACKER_ENABLED": (
+        "gainers_tracker_disabled_by_flag",
+        "gainers snapshot, compare and peak-update lanes will not run",
+    ),
+    "TRENDING_SNAPSHOT_ENABLED": (
+        "trending_tracker_disabled_by_flag",
+        "trending snapshot and compare lanes will not run",
+    ),
+}
+
+
+def log_disabled_trackers(settings: Settings) -> None:
+    """Announce every tracker lane this boot has turned OFF.
+
+    Once per process, not once per cycle: the fact is a property of the
+    resolved config, and repeating it every cycle would trade one silence for
+    a different kind of noise. The ENABLED case is deliberately not logged —
+    it is already provable from the tracker's own per-cycle events, and
+    `pipeline_config_resolved` carries the resolved flags either way.
+    """
+    for flag, (event, detail) in _TRACKER_DISABLED_EVENTS.items():
+        if not getattr(settings, flag):
+            logger.info(event, flag=flag, detail=detail)
+
+
 async def main(argv: list[str] | None = None) -> int:
     """Main entry point with CLI arg parsing and graceful shutdown.
 
@@ -2069,6 +2100,11 @@ async def main(argv: list[str] | None = None) -> int:
     # normalization divisor at process start, so phantom-signal drift (a signal
     # in the divisor that can never fire in this runtime) is visible in logs.
     log_active_scoring_config(settings)
+
+    # Same shape, for the tracker lanes: a flag-disabled tracker emits nothing
+    # at all downstream, so name it once here rather than leave the operator to
+    # infer it from an absence.
+    log_disabled_trackers(settings)
 
     # Honour CoinGecko rolling-cap and burst-profile settings from config.
     from scout.ratelimit import configure_from_settings as _cg_ratelimit_configure
