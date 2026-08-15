@@ -1114,6 +1114,94 @@ async def test_fallback_alert_is_bracketed(tmp_path, settings_factory, monkeypat
         await db.close()
 
 
+async def test_fallback_non_200_records_failed_not_delivered(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Operator ruling 2026-08-15: the ledger must not ship with a row type
+    that can lie. Without `raise_on_failure=True` the alerter merely LOGS a
+    non-200 and returns, so `_record_fallback` stamped `alert_delivered` for a
+    page Telegram had rejected.
+
+    The fake raises ONLY when the caller passed the flag — that is what makes
+    this test discriminate. A fake that raises unconditionally (see the sibling
+    test below) proves the bracket works but says nothing about the flag.
+
+    Three claims, all asserted: the failure is recorded, nothing propagates out
+    of `_record_fallback`, and the pre-existing threshold/cooldown behaviour is
+    untouched."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        suppression._fallback_timestamps.clear()
+        suppression._last_alerted_ts = float("-inf")
+
+        fake = _FakeAlerter(status=400)
+        import scout.alerter as _alerter
+
+        monkeypatch.setattr(
+            _alerter, "send_telegram_message", fake.send_telegram_message
+        )
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            suppression.aiohttp, "ClientSession", lambda *a, **k: _FakeSession()
+        )
+
+        threshold = s.FEEDBACK_FALLBACK_ALERT_THRESHOLD
+        for _ in range(threshold):
+            # Must not raise — containment is the point.
+            await suppression._record_fallback(db, "combo_a", "database is locked", s)
+
+        assert len(fake.kwargs) == 1, "the send was not attempted exactly once"
+        assert fake.kwargs[0]["raise_on_failure"] is True
+        assert fake.kwargs[0]["parse_mode"] is None
+
+        failed = await _events(
+            db, event_type="alert_failed", alert_source="suppression"
+        )
+        assert len(failed) == 1
+        assert failed[0]["delivery_result"] == "error:RuntimeError"
+        assert failed[0]["combo_key"] == "combo_a"
+        assert (
+            len(
+                await _events(
+                    db, event_type="alert_dispatched", alert_source="suppression"
+                )
+            )
+            == 1
+        )
+        assert (
+            await _events(db, event_type="alert_delivered", alert_source="suppression")
+            == []
+        ), "a rejected page was recorded as delivered"
+
+        # Threshold/cooldown behaviour unchanged: the counter still holds every
+        # fail-open in the window, the cooldown was stamped at decision time
+        # (pre-existing, deliberately untouched), and a further fail-open inside
+        # the cooldown attempts no second send.
+        assert len(suppression._fallback_timestamps) == threshold
+        assert suppression._last_alerted_ts != float("-inf")
+        await suppression._record_fallback(db, "combo_a", "database is locked", s)
+        assert len(fake.kwargs) == 1, "cooldown did not suppress the second send"
+        assert (
+            len(
+                await _events(db, event_type="alert_failed", alert_source="suppression")
+            )
+            == 1
+        )
+    finally:
+        suppression._fallback_timestamps.clear()
+        suppression._last_alerted_ts = float("-inf")
+        await db.close()
+
+
 async def test_fallback_alert_failure_is_bracketed(
     tmp_path, settings_factory, monkeypatch
 ):

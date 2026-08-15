@@ -511,6 +511,12 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
     holds it. Ledger writes here are best-effort by construction: this path fires
     when the DB is degraded, so the ledger INSERT may well fail too — the writer
     swallows that and the fail-open decision is unaffected.
+
+    The counter and cooldown are maintained BEFORE and independently of the
+    send: ``_last_alerted_ts`` is stamped at the moment the alert is decided on,
+    not when it lands. That is pre-existing behaviour and deliberately untouched
+    here — a rejected page therefore waits out the cooldown like a delivered
+    one. The ledger now records which of the two actually happened.
     """
     global _last_alerted_ts
     log.error(
@@ -554,8 +560,25 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
                 # parse_mode=None — plain-text fail-open alert, no
                 # formatting; passing explicit keeps §12b discipline even
                 # when the message body looks safe today.
+                # ``raise_on_failure=True`` is LOAD-BEARING (ruled #525 class).
+                # The alerter defaults to False and merely LOGS a non-200 or a
+                # network error, so without it this call returned normally on a
+                # rejected page and the `alert_delivered` ledger row below
+                # stamped anyway. A durable ledger asserting deliveries that
+                # never happened is worse than no ledger — it converts an
+                # unknown into a false certainty.
+                #
+                # Containment is unchanged: the raise is caught below, recorded
+                # as `alert_failed`, and never propagates. A failed
+                # system-health page must not break the suppression path, which
+                # is already running degraded (this is the fail-open branch).
                 await alerter.send_telegram_message(
-                    msg, session, settings, parse_mode=None, source="suppression"
+                    msg,
+                    session,
+                    settings,
+                    parse_mode=None,
+                    source="suppression",
+                    raise_on_failure=True,
                 )
         except Exception as exc:
             log.exception("suppression_fallback_alert_dispatch_error")
