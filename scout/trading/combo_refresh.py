@@ -1800,17 +1800,25 @@ async def _process_permanent_suppression(
         # NETWORK call above belongs outside it.
         try:
             async with db._txn_lock:
+                # Read at STAMP time, not hoisted from function entry. This
+                # column is a delivery-time audit record: it answers "when was
+                # the operator actually told?", and the send that precedes it
+                # is a network call of unbounded duration. Stamping the
+                # function's entry timestamp backdates every page by however
+                # long the pass took, and on a slow Telegram round-trip across
+                # several combos that error is not small.
+                stamped_at = datetime.now(timezone.utc).isoformat()
                 await conn.execute(
                     "UPDATE combo_performance SET perm_suppression_alerted_at = ? "
                     "WHERE combo_key = ? AND window = '30d'",
-                    (now_iso, combo),
+                    (stamped_at, combo),
                 )
                 await record_alert_event(
                     db,
                     event_type="marker_stamped",
                     combo_key=combo,
                     transition="perm_suppression_alerted_at",
-                    detected_at=now_iso,
+                    detected_at=stamped_at,
                     payload_hash=digest,
                     managed_txn=True,
                 )

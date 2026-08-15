@@ -197,3 +197,49 @@ def test_no_permanence_overstatement_remains_in_combo_refresh():
     )
     hits = [phrase for phrase in banned if phrase in src]
     assert hits == [], f"permanence overstatement still present: {hits}"
+
+
+async def test_perm_marker_is_stamped_at_delivery_time_not_function_entry(
+    tmp_path, settings_factory, monkeypatch
+):
+    """debt#13/J2. `perm_suppression_alerted_at` answers "when was the operator
+    actually told?", so it has to be read when the marker is written, not
+    hoisted from function entry — the send in between is a network call of
+    unbounded duration, and hoisting backdates every page by however long the
+    pass took.
+
+    Driven by making the send take measurable wall-clock time and asserting the
+    stamp lands AFTER the send returned. No clock freezing: the property under
+    test is an ordering, and an ordering is what is asserted."""
+    import asyncio
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        sent_at: list[datetime] = []
+
+        async def _slow_sender(settings_, message):
+            await asyncio.sleep(0.05)
+            sent_at.append(datetime.now(timezone.utc))
+
+        monkeypatch.setattr(
+            combo_refresh, "_send_permanent_suppression_alert", _slow_sender
+        )
+        await _seed_suppressed_idle(db, "gainers_early")
+        window_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        await combo_refresh._process_permanent_suppression(db, s, window_cutoff)
+
+        assert len(sent_at) == 1
+        cur = await db._conn.execute(
+            "SELECT perm_suppression_alerted_at FROM combo_performance "
+            "WHERE combo_key='gainers_early' AND window='30d'"
+        )
+        (marker,) = await cur.fetchone()
+        assert marker is not None
+        assert datetime.fromisoformat(marker) >= sent_at[0], (
+            "the marker predates the send it is supposed to record — it was "
+            "hoisted from function entry"
+        )
+    finally:
+        await db.close()
