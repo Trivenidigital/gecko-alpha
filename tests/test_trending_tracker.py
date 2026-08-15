@@ -580,3 +580,83 @@ async def test_compare_signal_events_like_matching(db):
     assert comp.detected_by_chains is True
     assert comp.chains_lead_minutes > 0
     assert comp.is_gap is False
+
+
+# ---------------------------------------------------------------------------
+# Peak-update attribution. The two trackers' peak updaters are driven by the
+# same two loops; `tracker=` lets a journald filter select one of them without
+# pattern-matching the event name, and the noop event stops a run that updated
+# nothing from being byte-identical (an empty log) to a run that never happened.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_trending_peak_row(db, coin_id: str, *, peak: float, price: float):
+    await db._conn.execute(
+        """INSERT INTO trending_comparisons
+           (coin_id, symbol, name, appeared_on_trending_at, detected_price,
+            peak_price, is_gap)
+           VALUES (?, ?, ?, datetime('now'), 1.0, ?, 1)""",
+        (coin_id, coin_id[:3].upper(), coin_id.title(), peak),
+    )
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES (?, ?, datetime('now'))",
+        (coin_id, price),
+    )
+    await db._conn.commit()
+
+
+async def test_trending_peaks_updated_carries_the_tracker_label(db):
+    """The sibling event was entirely unlabelled — nothing in the payload said
+    which tracker produced it."""
+    import structlog
+
+    from scout.trending.tracker import update_trending_peaks
+
+    await _seed_trending_peak_row(db, "peak-trend", peak=1.0, price=2.0)
+
+    with structlog.testing.capture_logs() as log_events:
+        assert await update_trending_peaks(db) == 1
+
+    emitted = [e for e in log_events if e["event"] == "trending_tracker.peaks_updated"]
+    assert len(emitted) == 1
+    assert emitted[0]["tracker"] == "trending"
+    assert emitted[0]["count"] == 1, "pre-existing count field must survive"
+
+
+async def test_trending_peaks_noop_is_emitted_at_debug(db):
+    """Rows joined, none higher than their stored peak: still says so."""
+    import structlog
+
+    from scout.trending.tracker import update_trending_peaks
+
+    await _seed_trending_peak_row(db, "noop-trend", peak=9.0, price=2.0)
+
+    with structlog.testing.capture_logs() as log_events:
+        assert await update_trending_peaks(db) == 0
+
+    noop = [e for e in log_events if e["event"] == "trending_tracker.peaks_noop"]
+    assert len(noop) == 1
+    assert noop[0]["log_level"] == "debug", "must not add info-level volume"
+    assert noop[0]["tracker"] == "trending"
+    assert noop[0]["count"] == 0
+    assert noop[0]["examined"] == 1
+    assert not [
+        e for e in log_events if e["event"] == "trending_tracker.peaks_updated"
+    ], "the updated event must not fire on a no-op run"
+
+
+async def test_trending_and_gainers_peak_events_are_distinguishable(db):
+    """The point of the label: one filter key separates the two trackers even
+    though both loops call both updaters back to back."""
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+    from scout.trending.tracker import update_trending_peaks
+
+    with structlog.testing.capture_logs() as log_events:
+        await update_trending_peaks(db)
+        await update_gainers_peaks(db, caller="pipeline_cycle")
+
+    trackers = [e["tracker"] for e in log_events if "tracker" in e]
+    assert sorted(trackers) == ["gainers", "trending"], trackers

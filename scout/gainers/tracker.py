@@ -577,6 +577,26 @@ async def update_gainers_peaks(db: "Database", *, caller: str = "unattributed") 
 
     if updated:
         await conn.commit()
-        logger.info("gainers_tracker.peaks_updated", count=updated, caller=caller)
+        logger.info(
+            "gainers_tracker.peaks_updated",
+            tracker="gainers",
+            count=updated,
+            caller=caller,
+        )
+    else:
+        # A run that updated nothing used to emit NOTHING, so "the peak updater
+        # ran and no price beat its peak" and "the peak updater never ran" were
+        # the same absence in journald. debug, not info: this is the common case
+        # on a quiet cycle and promoting it would multiply the log volume of
+        # both loops. `examined` separates the two no-op shapes — zero rows
+        # joined price_cache (stale or empty cache) vs rows joined but none
+        # higher than their stored peak.
+        logger.debug(
+            "gainers_tracker.peaks_noop",
+            tracker="gainers",
+            count=0,
+            caller=caller,
+            examined=len(rows),
+        )
 
     return updated

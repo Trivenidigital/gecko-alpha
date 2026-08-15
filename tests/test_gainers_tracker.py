@@ -489,6 +489,79 @@ async def test_peaks_updated_defaults_to_unattributed(db):
     assert emitted[0]["caller"] == "unattributed"
 
 
+async def test_peaks_updated_carries_the_tracker_label(db):
+    """`tracker=` is what lets a journald filter select ONE tracker's peak
+    events without pattern-matching the event name."""
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+
+    await _seed_peak_candidate(db, "labelled-coin")
+
+    with structlog.testing.capture_logs() as log_events:
+        await update_gainers_peaks(db, caller="pipeline_cycle")
+
+    emitted = [e for e in log_events if e["event"] == "gainers_tracker.peaks_updated"]
+    assert len(emitted) == 1
+    assert emitted[0]["tracker"] == "gainers"
+
+
+async def test_peaks_noop_is_emitted_at_debug_when_nothing_updated(db):
+    """A run that updated nothing must still SAY so.
+
+    Emitting nothing made "ran, no price beat its peak" and "never ran"
+    the same absence in the logs — the ambiguity that costs a diagnosis.
+    debug rather than info because this is the common case on a quiet cycle.
+    """
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+
+    # A comparison row whose stored peak already beats the cached price, so the
+    # JOIN returns it but the update branch never fires.
+    await db._conn.execute("""INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_price, peak_price, is_gap)
+           VALUES ('noop-coin', 'NOO', 'Noop', 30.0, datetime('now'), 1.0, 9.0, 1)""")
+    await db._conn.execute(
+        "INSERT INTO price_cache (coin_id, current_price, updated_at) "
+        "VALUES ('noop-coin', 2.0, datetime('now'))"
+    )
+    await db._conn.commit()
+
+    with structlog.testing.capture_logs() as log_events:
+        updated = await update_gainers_peaks(db, caller="pipeline_cycle")
+
+    assert updated == 0
+    noop = [e for e in log_events if e["event"] == "gainers_tracker.peaks_noop"]
+    assert len(noop) == 1, "a no-op run must emit exactly one noop event"
+    assert noop[0]["log_level"] == "debug", "must not add info-level volume"
+    assert noop[0]["tracker"] == "gainers"
+    assert noop[0]["caller"] == "pipeline_cycle"
+    assert noop[0]["count"] == 0
+    # Separates "nothing joined price_cache" from "joined but none higher" —
+    # without it the two no-op shapes are still indistinguishable.
+    assert noop[0]["examined"] == 1
+    assert not [
+        e for e in log_events if e["event"] == "gainers_tracker.peaks_updated"
+    ], "the updated event must not fire on a no-op run"
+
+
+async def test_peaks_noop_reports_zero_examined_when_nothing_joined(db):
+    """The other no-op shape: no comparison row joins a fresh price."""
+    import structlog
+
+    from scout.gainers.tracker import update_gainers_peaks
+
+    with structlog.testing.capture_logs() as log_events:
+        assert await update_gainers_peaks(db) == 0
+
+    noop = [e for e in log_events if e["event"] == "gainers_tracker.peaks_noop"]
+    assert len(noop) == 1
+    assert noop[0]["examined"] == 0
+    assert noop[0]["caller"] == "unattributed"
+
+
 def test_every_update_gainers_peaks_call_site_passes_a_distinct_caller():
     """Static guard over the real call sites — the thing that actually breaks.
 
