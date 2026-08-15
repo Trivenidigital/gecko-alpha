@@ -18,6 +18,7 @@ import structlog
 
 from scout import alerter
 from scout.db import Database
+from scout.timeutil import parole_window_open
 from scout.trading.alert_events import encode_state, payload_digest, record_alert_event
 
 log = structlog.get_logger()
@@ -39,25 +40,6 @@ _last_alerted_ts: float = float("-inf")
 def get_fallback_count() -> int:
     """Return current fallback-counter size. Public accessor for weekly digest."""
     return len(_fallback_timestamps)
-
-
-def _parole_window_open(parole_at: str | None) -> bool:
-    """Is ``parole_at`` a parsable timestamp that has already passed?
-
-    Used INSIDE the locked transaction, where an absent/unparsable/future
-    value all mean the same thing: the parole window this caller validated on
-    the lock-free fast path is not the window that is current now. Fails
-    CLOSED — an unparsable value denies rather than admits.
-    """
-    if parole_at is None:
-        return False
-    try:
-        dt = datetime.fromisoformat(parole_at)
-    except (ValueError, TypeError):
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt <= datetime.now(timezone.utc)
 
 
 async def should_open(db: Database, combo_key: str, *, settings) -> tuple[bool, str]:
@@ -179,7 +161,7 @@ async def _open_gate(
             # Re-suppressed / re-paroled while we were queueing: the window we
             # validated on the fast path no longer exists. Deny rather than
             # spend a slot from a generation whose lock period is still running.
-            if not _parole_window_open(parole_at_now):
+            if not parole_window_open(parole_at_now):
                 await db._conn.execute("COMMIT")
                 log.info(
                     "parole_generation_changed_before_reservation",

@@ -149,7 +149,7 @@ async def _seed_30d_row(db, combo_key, **cols):
 # --- suppression_transition (combo_refresh._refresh_combo_locked) ----------
 
 
-async def test_first_write_latch_is_recorded(tmp_path, settings_factory):
+async def test_first_write_newly_suppressed_is_recorded(tmp_path, settings_factory):
     """A combo suppressed on its very first 30d write. Before F3 this branch
     left nothing behind but a mutated column."""
     db = Database(tmp_path / "t.db")
@@ -174,7 +174,7 @@ async def test_first_write_latch_is_recorded(tmp_path, settings_factory):
         await db.close()
 
 
-async def test_initial_latch_from_an_unsuppressed_row_is_recorded(
+async def test_newly_suppressed_from_an_unsuppressed_row_is_recorded(
     tmp_path, settings_factory
 ):
     db = Database(tmp_path / "t.db")
@@ -333,7 +333,9 @@ async def test_relatch_is_recorded(tmp_path, settings_factory):
         await db.close()
 
 
-async def test_terminal_incomplete_hold_writes_nothing(tmp_path, settings_factory):
+async def test_terminal_incomplete_hold_is_recorded_once_on_entry(
+    tmp_path, settings_factory
+):
     """A nightly HOLD is not a transition. The branch re-writes the same
     generation every refresh, so gating on the branch label instead of an
     actual state delta minted one identical row per suppressed combo per run,
@@ -355,7 +357,10 @@ async def test_terminal_incomplete_hold_writes_nothing(tmp_path, settings_factor
                 opened_at=now - timedelta(days=2),
             )
         assert await combo_refresh.refresh_combo(db, "combo_a", s)
-        assert await _events(db, event_type="suppression_transition") == []
+        rows = await _events(db, event_type="suppression_transition")
+        assert len(rows) == 1
+        assert rows[0]["transition"] == "terminal_incomplete_held"
+        assert rows[0]["detail"] == "classification none -> terminal_incomplete_held"
     finally:
         await db.close()
 
@@ -365,7 +370,14 @@ async def test_terminal_incomplete_hold_writes_nothing(tmp_path, settings_factor
     [
         ("waiting", 1, 3),
         ("terminal_incomplete_held", 2, 0),
-        ("contaminated", 6, 5),
+        # `contaminated` needs cohort_total > spent AND valid_closed < target,
+        # or `accounting_inconsistent` (checked first) wins. The earlier
+        # (6, 5) fixture here produced accounting_inconsistent and was
+        # mislabelled — it passed only because the assertion was `== []`, which
+        # cannot tell one classification from another.
+        ("contaminated", 2, 5),
+        ("accounting_inconsistent", 6, 5),
+        ("parole_stalled", 0, 5),
     ],
 )
 async def test_steady_state_classifications_write_nothing_on_repeat(
@@ -395,8 +407,14 @@ async def test_steady_state_classifications_write_nothing_on_repeat(
         for _ in range(3):
             assert await combo_refresh.refresh_combo(db, "combo_a", st)
 
+        # Exactly ONE row: the first-entry diagnosis. The two repeat refreshes
+        # add nothing — that is the whole property under test, and only a
+        # repeat run can distinguish "recorded on entry" from "recorded every
+        # night forever".
         rows = await _events(db, event_type="suppression_transition")
-        assert rows == [], f"{label} minted {len(rows)} steady-state row(s)"
+        assert len(rows) == 1, f"{label} minted {len(rows)} rows over 3 refreshes"
+        assert rows[0]["transition"] == label
+        assert rows[0]["detail"] == f"classification none -> {label}"
 
         # The combo really is still suppressed — i.e. the branch under test ran
         # and chose to preserve, rather than the fixture quietly clearing it.

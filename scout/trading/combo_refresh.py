@@ -10,7 +10,7 @@ import aiosqlite
 import structlog
 
 from scout.db import Database
-from scout.timeutil import sql_utc_cutoff
+from scout.timeutil import parole_window_open, sql_utc_cutoff
 from scout.trading.alert_events import (
     encode_state,
     generation_state,
@@ -93,31 +93,73 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
     conn = db._conn
     target = settings.FEEDBACK_PAROLE_RETEST_TRADES
 
+    # Two structurally-stuck classes share this pass, because they share the
+    # thing that makes them dangerous: the combo is suppressed, cannot advance
+    # on its own, and NOTHING pages the operator about it.
+    #
+    #   terminal_incomplete — budget spent, nothing open, not enough evidence.
+    #   parole_stalled      — budget INTACT and zero admissions ever. The
+    #                         window opened and no trade has arrived, so the
+    #                         retest cannot start, let alone finish.
+    #
+    # The 1-day grace on the stalled arm is load-bearing: a parole window that
+    # opened minutes ago has legitimately not been used yet, and paging on it
+    # would fire a false alarm on every fresh generation. A window open for a
+    # full day with the full budget untouched is not "waiting", it is blocked.
+    stalled_grace_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     cur = await conn.execute(
         "SELECT combo_key, suppressed_at, parole_at, parole_trades_remaining "
         "FROM combo_performance "
         "WHERE window = '30d' AND suppressed = 1 "
         "  AND retest_incomplete_alerted_at IS NULL "
         "  AND parole_at IS NOT NULL "
-        "  AND COALESCE(parole_trades_remaining, 1) <= 0"
+        "  AND (COALESCE(parole_trades_remaining, 1) <= 0 OR parole_at <= ?)",
+        (stalled_grace_cutoff,),
     )
     candidates = await cur.fetchall()
 
     alerted: list[str] = []
     for combo_key, suppressed_at, parole_at, remaining in candidates:
         acct = await _retest_accounting(db, combo_key, parole_at, remaining, target)
-        if _classify_retest(acct, remaining, target) != "terminal_incomplete":
+        state = _classify_retest(acct, remaining, target)
+        # The classifier decides; the SQL only narrows. A row admitted by the
+        # widened arm that classifies as anything else (a trade landed between
+        # the query and here) falls out here rather than being paged as stalled
+        # on the strength of the WHERE clause alone.
+        if state not in ("terminal_incomplete", "parole_stalled"):
             continue
 
-        message = (
-            f"gecko-alpha: parole retest STUCK for {combo_key}\n"
-            f"valid resolved {acct['valid_closed']}/{target} - "
-            f"invalid closes {acct['invalid_closed']}, "
-            f"still open {acct['open_now']}, slots spent {acct['spent']}.\n"
-            "No slots left and nothing still open, so this retest can never "
-            "complete. Suppression is HELD and will not auto-clear. "
-            "Re-arming a retest requires operator authorization."
-        )
+        if state == "parole_stalled":
+            ledger_transition = "parole_stalled"
+            days_open = _days_since(parole_at)
+            elapsed = f"{days_open:.1f} days" if days_open is not None else "unknown"
+            # A NULL budget renders as the word, not as "None". The stall
+            # diagnosis does not depend on the budget — an empty cohort under
+            # an open window is the whole finding — so an unknown budget is
+            # reported as unknown rather than suppressing an accurate page.
+            budget = "unknown" if remaining is None else remaining
+            message = (
+                f"gecko-alpha: parole retest STALLED for {combo_key}\n"
+                f"parole window opened {parole_at} ({elapsed} elapsed), "
+                f"slot budget {budget}/{target} remaining, zero admissions "
+                f"since the window opened.\n"
+                "The window is open and nothing is being admitted, so this "
+                "retest cannot start — something DOWNSTREAM of the suppression "
+                "gate is blocking every open. Check signal_params.enabled and "
+                "SIGNAL_DISPATCH_QUARANTINE for this signal.\n"
+                "Suppression is HELD and will not auto-clear."
+            )
+        else:
+            ledger_transition = "terminal_incomplete_held"
+            message = (
+                f"gecko-alpha: parole retest STUCK for {combo_key}\n"
+                f"valid resolved {acct['valid_closed']}/{target} - "
+                f"invalid closes {acct['invalid_closed']}, "
+                f"still open {acct['open_now']}, slots spent {acct['spent']}.\n"
+                "No slots left and nothing still open, so this retest can never "
+                "complete. Suppression is HELD and will not auto-clear. "
+                "Re-arming a retest requires operator authorization."
+            )
         digest = payload_digest(message)
         detected_at = datetime.now(timezone.utc).isoformat()
         log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
@@ -126,7 +168,7 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
             event_type="alert_dispatched",
             combo_key=combo_key,
             alert_source="combo_refresh_retest_terminal_incomplete",
-            transition="terminal_incomplete_held",
+            transition=ledger_transition,
             detected_at=detected_at,
             retry=0,
             payload_hash=digest,
@@ -145,7 +187,7 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 event_type="alert_failed",
                 combo_key=combo_key,
                 alert_source="combo_refresh_retest_terminal_incomplete",
-                transition="terminal_incomplete_held",
+                transition=ledger_transition,
                 detected_at=detected_at,
                 delivery_result=f"error:{type(exc).__name__}",
                 retry=0,
@@ -159,7 +201,7 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
             event_type="alert_delivered",
             combo_key=combo_key,
             alert_source="combo_refresh_retest_terminal_incomplete",
-            transition="terminal_incomplete_held",
+            transition=ledger_transition,
             detected_at=detected_at,
             delivery_result="ok",
             retry=0,
@@ -246,6 +288,79 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
     return alerted
 
 
+# The preserve-branch classifications, i.e. every `_classify_retest` outcome
+# that does NOT move the suppression state. `terminal_incomplete` is spelled
+# `_held` in the ledger: the classifier names the STATE, the ledger names what
+# the refresh DID about it.
+_RETEST_CLASSIFICATIONS = (
+    "waiting",
+    "contaminated",
+    "accounting_inconsistent",
+    "terminal_incomplete_held",
+    "parole_stalled",
+)
+
+
+async def _prior_classification(db: Database, combo_key: str) -> str | None:
+    """The last preserve-branch diagnosis recorded for `combo_key`, or None.
+
+    Read back out of `alert_events` rather than tracked in a new column: the
+    ledger already IS the durable record of what the previous refresh
+    concluded, and a second copy of that state would be one more thing that can
+    disagree with it.
+
+    Scoped to `_RETEST_CLASSIFICATIONS` so the state-moving transitions
+    (`newly_suppressed`, `clear`, `page_rearm`, ...) cannot be mistaken for a
+    diagnosis — otherwise a re-arm sitting on top of `contaminated` would read
+    as "the classification changed" on the next refresh and page-adjacent noise
+    would resume.
+
+    Ordered by `id`, not `created_at`: two rows written inside the same refresh
+    share a timestamp to the microsecond, and insertion order is the only total
+    order that is actually reliable here.
+    """
+    if db._conn is None:
+        return None
+    placeholders = ",".join("?" * len(_RETEST_CLASSIFICATIONS))
+    try:
+        cur = await db._conn.execute(
+            "SELECT transition FROM alert_events "
+            "WHERE combo_key = ? AND event_type = 'suppression_transition' "
+            f"  AND transition IN ({placeholders}) "
+            "ORDER BY id DESC LIMIT 1",
+            (combo_key, *_RETEST_CLASSIFICATIONS),
+        )
+        row = await cur.fetchone()
+    except aiosqlite.Error as exc:
+        # Never break the refresh over a ledger read. Unknown prior means the
+        # classification is treated as changed, which over-records by at most
+        # one row — the safe direction for an audit trail.
+        log.warning(
+            "prior_classification_read_failed",
+            combo_key=combo_key,
+            err=str(exc),
+        )
+        return None
+    return row[0] if row else None
+
+
+def _days_since(iso_ts: str | None) -> float | None:
+    """Whole-and-fractional days since `iso_ts`, or None if unparsable.
+
+    Returns None rather than 0.0 on a bad timestamp so a page can say
+    "unknown" instead of asserting the window opened this instant.
+    """
+    if iso_ts is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+
 def _classify_retest(acct: dict, remaining, target: int) -> str:
     """Which retest state is this parole generation in?
 
@@ -270,6 +385,33 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
         return "contaminated"
     if acct["valid_closed"] >= target:
         return "complete"
+    # LIVELOCK. The parole window is open and NOTHING has ever been admitted —
+    # not one trade. `waiting` is the wrong answer because there is nothing to
+    # wait for: the retest cannot advance without an admission, and no
+    # admission is arriving. Something downstream of the suppression gate is
+    # refusing every open, so the combo sits suppressed and no page fires.
+    #
+    # PARTITIONED ON THE COHORT, NOT THE BUDGET. An earlier revision required
+    # `not slots_exhausted`, which split the wrong way: a combo can burn its
+    # whole budget and still admit nothing (slots reserved at the gate, then
+    # leaked — the pre-#522 no-refund bug did exactly this). Those rows fell
+    # through to `terminal_incomplete` and were paged as an evidence-quality
+    # problem — "valid resolved 0/5, so this retest can never complete" — which
+    # is confidently wrong about a retest that never started.
+    #
+    # Prod, 2026-08-13: chain_completed and cg_trending_rank+first_signal both
+    # had spent=5 with cohort_total=0 and got that page; only
+    # losers_contrarian (cohort_total=3) was genuinely terminal_incomplete. An
+    # empty cohort is the discriminating fact, and it is independent of how the
+    # budget was spent.
+    #
+    # Checked BEFORE `terminal_incomplete` for that reason, and after
+    # `contaminated` / `complete` so a cohort that does have trades is always
+    # diagnosed on its evidence first. The two are mutually exclusive anyway:
+    # `open_now <= cohort_total`, so `cohort_total == 0` implies
+    # `open_now == 0`.
+    if acct.get("window_open") and acct["cohort_total"] == 0:
+        return "parole_stalled"
     if slots_exhausted and acct["open_now"] == 0:
         return "terminal_incomplete"
     return "waiting"
@@ -311,6 +453,7 @@ async def _retest_accounting(
         cohort_total=0,
         spent=0,
         contaminated=False,
+        window_open=False,
     )
     if parole_at is None:
         return empty
@@ -338,6 +481,7 @@ async def _retest_accounting(
         cohort_total=cohort_total,
         spent=spent,
         contaminated=cohort_total > spent,
+        window_open=parole_window_open(parole_at),
     )
 
 
@@ -435,6 +579,12 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
         # this ledger name the same event the same way.
         transition: str | None = None
         transition_detail: str | None = None
+        # The preserve-branch diagnosis, when one applies. Kept SEPARATE from
+        # `transition` because the two are gated on different things: a
+        # transition is worth recording when the STATE moved, a classification
+        # when the DIAGNOSIS moved. Conflating them is what made the preserve
+        # branches mint a row per refresh.
+        classification: str | None = None
 
         if existing is None:
             # First write — maybe suppress immediately if bad enough.
@@ -520,7 +670,7 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                     # re-read below picks up a concurrent change). If that
                     # happens it is a real state change and the delta gate
                     # records it under its classification.
-                    transition = (
+                    classification = (
                         "terminal_incomplete_held"
                         if retest_state == "terminal_incomplete"
                         else retest_state
@@ -691,6 +841,39 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                 detail=transition_detail,
                 managed_txn=True,
             )
+
+        # CLASSIFICATION CHANGES. A preserve branch moves no state, so the delta
+        # gate above never fires for it — and yet `contaminated` and
+        # `accounting_inconsistent` are diagnoses the operator needs a durable
+        # record of, and neither one pages. Recording them every refresh was the
+        # original defect; recording them on CHANGE keeps steady state silent
+        # while making entry into an anomaly (and exit from it) reconstructable.
+        #
+        # The prior diagnosis is read back out of the ledger itself, so this
+        # needs no schema change and no new column: the newest
+        # classification-class row for this combo IS the previous answer.
+        #
+        # Why the whole class and not only the two anomalies: if exits were not
+        # recorded, `contaminated -> waiting -> contaminated` would look like
+        # one unbroken `contaminated` and the re-entry would be swallowed.
+        # "Changed" is only computable if both directions are written.
+        if classification is not None:
+            prior = await _prior_classification(db, combo_key)
+            if classification != prior or state_moved:
+                await record_alert_event(
+                    db,
+                    event_type="suppression_transition",
+                    combo_key=combo_key,
+                    transition=classification,
+                    detected_at=now_iso,
+                    state_json=ledger_state,
+                    detail=(
+                        f"classification {prior or 'none'} -> {classification}"
+                        if classification != prior
+                        else "generation moved on a preserve branch"
+                    ),
+                    managed_txn=True,
+                )
         if page_rearmed:
             # Separate row, not a field on the one above: the re-arm can fire
             # alongside `clear` or `relatch`, and collapsing them would make the

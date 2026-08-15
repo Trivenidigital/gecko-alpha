@@ -40,9 +40,16 @@ CREATE TABLE IF NOT EXISTS alert_events (
     combo_key TEXT,
     signal_type TEXT,
     alert_source TEXT,                 -- docs/alert_registry.md source label for alert_* rows
-    transition TEXT,                   -- branch label / marker kind (use existing enums VERBATIM:
-                                       -- _classify_retest, _classify_reversal outputs, plus
-                                       -- initial_latch|first_write_latch|relatch|clear|terminal_incomplete_held|page_rearm)
+    transition TEXT,                   -- branch label / marker kind. AS SHIPPED the vocabulary is
+                                       -- _classify_reversal's, reused verbatim on both axes:
+                                       -- newly_suppressed|parole_exhausted_resuppressed|clear|page_rearm
+                                       -- plus the preserve-branch classifications
+                                       -- waiting|contaminated|accounting_inconsistent|
+                                       -- terminal_incomplete_held|parole_stalled, and the marker
+                                       -- kinds (column names) for marker_* rows.
+                                       -- (The initial_latch|first_write_latch|relatch spelling in
+                                       -- the original draft was renamed during review and never
+                                       -- shipped; first-write is newly_suppressed + detail="first_write".)
     detected_at TEXT,                  -- transition/detection ts (payload-bound where applicable)
     delivery_result TEXT,              -- alert_*: 'ok' | 'error:<ExcType>'; anomalies: reason
     retry INTEGER,                     -- alert rows: 0/1 (payload detected_at != run_iso)

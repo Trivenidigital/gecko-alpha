@@ -278,43 +278,53 @@ def _predict_transition(
     return f"preserve:{retest_state}"
 
 
-async def _terminal_incomplete_candidates(
-    conn: aiosqlite.Connection, settings
-) -> list[dict]:
-    """The GLOBAL terminal-incomplete set, via the exact predicate in
-    `_process_retest_terminal_incomplete`.
+async def _stuck_retest_candidates(
+    conn: aiosqlite.Connection, settings, at: datetime
+) -> dict[str, list[dict]]:
+    """The GLOBAL stuck-retest sets, via the exact predicate in
+    `_process_retest_terminal_incomplete`, split by class.
 
     Global, not scoped to the refreshed combos — the 2026-08-13 review under-
     counted the expected pages precisely because it reasoned from the refreshed
     list instead of this predicate.
+
+    TWO classes since F2, and the split is the point: `terminal_incomplete` is
+    a cohort that produced too little usable evidence, `parole_stalled` is a
+    cohort that never existed. Reporting them in one bucket would reproduce, in
+    the diagnostic, the exact conflation the pager was fixed for — the harness
+    has to mirror production or it is not a replay.
     """
     target = settings.FEEDBACK_PAROLE_RETEST_TRADES
+    grace_cutoff = (at - timedelta(days=1)).isoformat()
     cur = await conn.execute(
         "SELECT combo_key, suppressed_at, parole_at, parole_trades_remaining "
         "FROM combo_performance "
         "WHERE window = '30d' AND suppressed = 1 "
         "  AND retest_incomplete_alerted_at IS NULL "
         "  AND parole_at IS NOT NULL "
-        "  AND COALESCE(parole_trades_remaining, 1) <= 0"
+        "  AND (COALESCE(parole_trades_remaining, 1) <= 0 OR parole_at <= ?)",
+        (grace_cutoff,),
     )
     rows = await cur.fetchall()
     db = _RoDb(conn)
-    out: list[dict] = []
+    buckets: dict[str, list[dict]] = {"terminal_incomplete": [], "parole_stalled": []}
     for combo_key, _suppressed_at, parole_at, remaining in rows:
         acct = await _retest_accounting(db, combo_key, parole_at, remaining, target)
-        if _classify_retest(acct, remaining, target) != "terminal_incomplete":
+        state = _classify_retest(acct, remaining, target)
+        if state not in buckets:
             continue
-        out.append(
+        buckets[state].append(
             {
                 "combo_key": combo_key,
                 "valid_closed": acct["valid_closed"],
                 "invalid_closed": acct["invalid_closed"],
                 "open_now": acct["open_now"],
+                "cohort_total": acct["cohort_total"],
                 "slots_spent": acct["spent"],
                 "required": target,
             }
         )
-    return sorted(out, key=lambda d: d["combo_key"])
+    return {k: sorted(v, key=lambda d: d["combo_key"]) for k, v in buckets.items()}
 
 
 async def replay(db_path: Path, at: datetime, settings) -> dict:
@@ -406,7 +416,7 @@ async def replay(db_path: Path, at: datetime, settings) -> dict:
             if c["predicted_transition_MIRRORED_LOGIC"]
             in ("new_suppression", "clear_suppression", "resuppress_fresh_parole")
         )
-        terminal = await _terminal_incomplete_candidates(conn, settings)
+        stuck = await _stuck_retest_candidates(conn, settings, at)
 
     return {
         "at": at.isoformat(),
@@ -433,7 +443,8 @@ async def replay(db_path: Path, at: datetime, settings) -> dict:
         "rows_that_would_change_7d": changed_7d,
         "rows_that_would_change_30d": changed_30d,
         "predicted_suppression_transitions": transitions,
-        "terminal_incomplete_candidates_GLOBAL": terminal,
+        "terminal_incomplete_candidates_GLOBAL": stuck["terminal_incomplete"],
+        "parole_stalled_candidates_GLOBAL": stuck["parole_stalled"],
         "combos": combos,
     }
 
