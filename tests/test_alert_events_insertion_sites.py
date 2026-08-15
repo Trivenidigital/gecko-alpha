@@ -1948,3 +1948,76 @@ async def test_non_db_exception_in_pending_write_is_contained(
         await db._conn.commit()
     finally:
         await db.close()
+
+
+async def test_stale_reversal_page_is_delivered_with_a_contradiction_note(
+    tmp_path, settings_factory, monkeypatch
+):
+    """debt#4. A page carried over from an earlier refresh describes a
+    transition that may since have been undone — often by the operator doing
+    exactly what the page told them to. Delivering "combo X auto-suppressed"
+    about a combo that is currently unsuppressed sends them to fix something
+    already fixed.
+
+    CORRECTED, NOT SKIPPED: the transition really happened and was never
+    reported, so dropping the page would silently discard a §12b notification
+    on the strength of a state read taken after the fact."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        monkeypatch.setattr(
+            combo_refresh, "_send_suppression_reversal_alert", _BoomSender()
+        )
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)  # detected, delivery failed
+        assert await _events(db, event_type="alert_delivered") == []
+
+        # The suppression is cleared before the retry — the page is now stale.
+        await db._conn.execute(
+            "UPDATE combo_performance SET suppressed = 0 "
+            "WHERE combo_key = 'combo_a' AND window = '30d'"
+        )
+        await db._conn.commit()
+
+        rev = _StubSender()
+        monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev)
+        # Only the DELIVERY half, with pre == post so nothing new is detected.
+        # A full `refresh_all` here would recompute the losing trades and
+        # immediately re-suppress the combo, so the row would agree with the
+        # page again and the case under test would evaporate.
+        state = await combo_refresh._snapshot_suppression_state(db._conn)
+        await combo_refresh._process_suppression_reversals(db, s, state, state)
+
+        assert rev.calls == 1, "the stale page was skipped instead of corrected"
+        body = rev.messages[0]
+        assert "NOTE: this page is stale" in body
+        assert "NOT suppressed as of delivery" in body
+        assert "newly_suppressed" in body
+        # The original transition text survives — the note is an addition, not
+        # a replacement.
+        assert "auto-suppressed" in body
+        # And the payload-bound clear still fires on the confirmed send.
+        assert len(await _events(db, event_type="marker_cleared")) == 1
+    finally:
+        await db.close()
+
+
+async def test_a_page_the_row_still_agrees_with_gets_no_note(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The common case must stay byte-clean — a note on every page would train
+    the operator to skip the last line, which is where the note lives."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, rev, _ = _stub_all_senders(monkeypatch)
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)
+
+        assert rev.calls == 1
+        assert "NOTE: this page is stale" not in rev.messages[0]
+    finally:
+        await db.close()

@@ -1168,6 +1168,51 @@ def _build_reversal_message(combo: str, transition: str, post: dict, settings) -
     )
 
 
+async def _reversal_contradiction(
+    db: Database, combo_key: str, transition: str
+) -> str | None:
+    """A note for a pending page whose transition the CURRENT row contradicts.
+
+    Returns ``None`` when the row still agrees with the page (the common case)
+    or when the state cannot be read — an unreadable row is not evidence of a
+    contradiction, and inventing one would be worse than sending the page
+    unannotated.
+
+    Only the unambiguous direction is reported. Both reversal transitions
+    assert the combo ended up SUPPRESSED, so a row that is now unsuppressed
+    flatly contradicts the page. The converse (still suppressed) is not a
+    contradiction and says nothing worth appending.
+    """
+    if db._conn is None:
+        return None
+    try:
+        cur = await db._conn.execute(
+            "SELECT suppressed FROM combo_performance "
+            "WHERE combo_key = ? AND window = '30d'",
+            (combo_key,),
+        )
+        row = await cur.fetchone()
+    except aiosqlite.Error as exc:
+        log.warning(
+            "reversal_contradiction_read_failed", combo_key=combo_key, err=str(exc)
+        )
+        return None
+    if row is None:
+        return (
+            "NOTE: this page is stale — the 30d row for this combo no longer "
+            "exists, so the state it describes cannot be confirmed."
+        )
+    if row[0]:
+        return None
+    return (
+        f"NOTE: this page is stale — it reports {transition}, but the combo is "
+        "NOT suppressed as of delivery. The suppression was cleared after the "
+        "page was recorded (a later retest passed, or an operator acted). No "
+        "action is needed on the suppression itself; the page is delivered "
+        "because the transition did happen and was never reported."
+    )
+
+
 async def _record_pending_reversals(
     db: Database, settings, pre_state: dict, post_state: dict
 ) -> str:
@@ -1479,6 +1524,21 @@ async def _process_suppression_reversals(
             # still a retry, it just cannot say when.
             stamp = detected_at if detected_at else "unknown"
             message = f"{message} [detected {stamp}]"
+
+        # STALE-STATE CORRECTION. A page carried over from an earlier refresh
+        # describes a transition that may since have been undone — by a later
+        # refresh, or by the operator doing exactly what the page told them to.
+        # Delivering "combo X auto-suppressed" about a combo that is currently
+        # unsuppressed sends the operator to fix something already fixed.
+        #
+        # Corrected, NOT skipped. The page is still owed: the transition really
+        # happened, the operator was never told, and dropping it here would
+        # silently discard a §12b notification on the strength of a state read
+        # taken after the fact. And the clear stays payload-bound, so the
+        # correction cannot interfere with supersede semantics.
+        contradiction = await _reversal_contradiction(db, combo, transition)
+        if contradiction is not None:
+            message = f"{message}\n{contradiction}"
 
         # `payload_digest(message)` — the body as STAMPED, after the retry
         # suffix is appended. Hashing the pre-stamp text would prove which page
