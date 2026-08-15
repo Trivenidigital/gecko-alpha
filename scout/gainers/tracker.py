@@ -142,6 +142,28 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
 
     Same pattern as trending compare_with_signals.
     Returns list of comparison dicts.
+
+    Reading `gainers_tracker.compare_started` in prod logs
+    -----------------------------------------------------
+    The marker below distinguishes "this run is still grinding" from "this run
+    never started". It does NOT, on its own, mean this function never ran —
+    and reading it that way has produced two wrong diagnoses already.
+
+    Its ABSENCE is evidence of "never ran" only after both of these are
+    confirmed, in this order:
+
+    1. The narrative agent's EVALUATE loop is alive. This function is called
+       only from that loop (`scout/narrative/agent.py`); if the loop is wedged
+       or the process is down, nothing here emits regardless of state.
+    2. `GAINERS_TRACKER_ENABLED` is on for the running process. The call site
+       is gated by it, and a disabled lane is silent by construction — see the
+       `gainers_tracker_disabled_by_flag` boot line in `scout/main.py`, which
+       exists precisely so this check is a grep rather than an inference.
+
+    With both confirmed, absence is still ambiguous in one benign direction:
+    the marker sits AFTER the empty-set early return, so a window with no
+    gainers logs `compare_no_data` and no `compare_started`. Check for that
+    event before concluding anything is broken.
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -171,6 +193,11 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
     # this query groups by coin), NOT over every snapshot in the window: so
     # `newest_gainer_at` is the most recent coin to first appear, not the most
     # recent snapshot taken.
+    #
+    # Before reading a MISSING `compare_started` as "this never ran", see the
+    # function docstring: two prerequisites (EVALUATE loop alive,
+    # GAINERS_TRACKER_ENABLED on) have to be confirmed first, and skipping them
+    # has already produced two wrong diagnoses.
     snapshot_times = [row[4] for row in gainer_rows if row[4] is not None]
     logger.info(
         "gainers_tracker.compare_started",
