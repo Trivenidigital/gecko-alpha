@@ -517,3 +517,96 @@ async def test_terminal_incomplete_bucket_still_scans_globally(
     assert report["parole_stalled_candidates_GLOBAL"] == []
     entry = report["terminal_incomplete_candidates_GLOBAL"][0]
     assert entry["cohort_total"] == 2
+
+
+async def test_stall_classification_is_deterministic_in_at(tmp_path, settings_factory):
+    """debt#24/N-5. `parole_window_open` read the wall clock, so a replay's
+    answer depended on WHEN it was run rather than on its `at` — the one thing
+    a replay must not do.
+
+    No clock freezing: both `at` values are fixed points in the past, one
+    before the parole window opens and one after. The wall clock is later than
+    both, so under the old wall-clock predicate BOTH runs would report the
+    window open and classify the combo as stalled. Threading `at` is what makes
+    the two answers differ, and makes either one reproducible tomorrow."""
+    path = tmp_path / "det.db"
+    db = Database(path)
+    await db.initialize()
+    parole_at = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    await db._conn.execute(
+        "INSERT INTO combo_performance "
+        "(combo_key, window, trades, wins, losses, total_pnl_usd, avg_pnl_pct, "
+        " win_rate_pct, suppressed, suppressed_at, parole_at, "
+        " parole_trades_remaining, refresh_failures, last_refreshed) "
+        "VALUES ('slow_burn', '30d', 40, 8, 32, -9.0, -1.0, 20.0, 1, ?, ?, 5, 0, ?)",
+        (
+            datetime(2025, 12, 27, tzinfo=timezone.utc).isoformat(),
+            parole_at.isoformat(),
+            parole_at.isoformat(),
+        ),
+    )
+    await db._conn.commit()
+    await db.close()
+
+    mod = _load_script()
+    s = settings_factory()
+
+    before = await mod.replay(path, datetime(2026, 1, 5, tzinfo=timezone.utc), s)
+    assert before["parole_stalled_candidates_GLOBAL"] == [], (
+        "a window that had not opened at `at` was reported as stalled — the "
+        "predicate is reading the wall clock, not `at`"
+    )
+
+    after = await mod.replay(path, datetime(2026, 1, 20, tzinfo=timezone.utc), s)
+    keys = [c["combo_key"] for c in after["parole_stalled_candidates_GLOBAL"]]
+    assert keys == ["slow_burn"]
+
+    # Same inputs, same answer — twice, so the result is a function of `at`.
+    again = await mod.replay(path, datetime(2026, 1, 20, tzinfo=timezone.utc), s)
+    assert again["parole_stalled_candidates_GLOBAL"] == (
+        after["parole_stalled_candidates_GLOBAL"]
+    )
+
+    # The per-combo `retest_state` is where the threading actually bites. The
+    # GLOBAL bucket above is narrowed by SQL first (`parole_at <= at - 1 day`),
+    # so a not-yet-open window is excluded before the predicate is consulted
+    # and that assertion alone would pass even with the wall clock. This call
+    # site has no such pre-filter.
+    combos = {c["combo_key"]: c for c in before["combos"]}
+    assert "slow_burn" in combos, "the replay did not evaluate the seeded combo"
+    assert combos["slow_burn"]["retest_state"] == "waiting", (
+        "the window had not opened at `at`, but the classifier called it "
+        "stalled — it is reading the wall clock, not `at`"
+    )
+    combos_after = {c["combo_key"]: c for c in after["combos"]}
+    assert combos_after["slow_burn"]["retest_state"] == "parole_stalled"
+
+
+def test_parole_window_open_honours_an_injected_now():
+    """The predicate itself, directly: production passes nothing and reads the
+    wall clock; a caller that supplies `now` gets an answer about THAT
+    instant."""
+    from scout.timeutil import parole_window_open
+
+    boundary = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    assert parole_window_open(boundary.isoformat()) is True  # wall clock is later
+    assert (
+        parole_window_open(
+            boundary.isoformat(), now=datetime(2026, 1, 9, tzinfo=timezone.utc)
+        )
+        is False
+    )
+    assert (
+        parole_window_open(
+            boundary.isoformat(), now=datetime(2026, 1, 11, tzinfo=timezone.utc)
+        )
+        is True
+    )
+    # Fails CLOSED regardless of `now`.
+    assert (
+        parole_window_open(None, now=datetime(2030, 1, 1, tzinfo=timezone.utc)) is False
+    )
+    assert (
+        parole_window_open("not-a-date", now=datetime(2030, 1, 1, tzinfo=timezone.utc))
+        is False
+    )

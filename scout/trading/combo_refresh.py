@@ -419,7 +419,13 @@ def _classify_retest(acct: dict, remaining, target: int) -> str:
 
 
 async def _retest_accounting(
-    db: Database, combo_key: str, parole_at: str | None, remaining, target: int
+    db: Database,
+    combo_key: str,
+    parole_at: str | None,
+    remaining,
+    target: int,
+    *,
+    now: datetime | None = None,
 ) -> dict:
     """Account for the current parole generation along THREE separate axes.
 
@@ -482,7 +488,7 @@ async def _retest_accounting(
         cohort_total=cohort_total,
         spent=spent,
         contaminated=cohort_total > spent,
-        window_open=parole_window_open(parole_at),
+        window_open=parole_window_open(parole_at, now=now),
     )
 
 
