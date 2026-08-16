@@ -178,11 +178,18 @@ async def _open_gate(
                 # This is a RACE, not a latched state: it fires only when
                 # `combo_refresh` re-latches inside the window between the
                 # lock-free read and the locked reservation, so each row is a
-                # distinct event worth counting. Prod measured ZERO of these in
-                # the same 17h in which `parole_exhausted` fired 20,094 times —
-                # there is no repetition here to collapse, and collapsing it
-                # would destroy the only signal that says how often the TOCTOU
-                # is actually being hit.
+                # distinct event worth counting. There is no repetition here to
+                # collapse, and collapsing it would destroy the only signal that
+                # says how often the TOCTOU is actually being hit.
+                #
+                # That is a COUNTED fact, not a reading of this code path:
+                # `SELECT transition, COUNT(*) FROM alert_events WHERE
+                # event_type='parole_denied' GROUP BY transition` on prod over
+                # 2026-08-15T10:48Z..2026-08-16T03:53Z returned exactly one row,
+                # `parole_exhausted|20094` — ZERO rows for this branch in ~17h.
+                # Recorded because assuming a branch is rare because it READS
+                # like an edge case, without counting it, is precisely what
+                # produced the 20,094-row fanout the branch below now fixes.
                 await record_alert_event(
                     db,
                     event_type="parole_denied",
