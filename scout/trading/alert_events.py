@@ -73,11 +73,30 @@ EVENT_TYPES = frozenset(
     }
 )
 
-_INSERT_SQL = (
-    "INSERT INTO alert_events "
+_COLUMNS = (
     "(created_at, event_type, combo_key, signal_type, alert_source, transition, "
     " detected_at, delivery_result, retry, payload_hash, state_json, detail) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+_INSERT_SQL = (
+    "INSERT INTO alert_events "
+    + _COLUMNS
+    + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+# ONE statement, not a SELECT-then-INSERT: the probe and the write have to be
+# the same statement or two dispatchers racing the same denial state both see
+# "absent" and both insert. Mirrors the `ledger_installed` epoch seed in
+# `scout/db.py`, which guards on absence for the same reason. Index-supported by
+# `idx_alert_events_dedup(event_type, payload_hash)` — this runs on the dispatch
+# hot path against a table that only grows, so a scan here would trade one
+# unbounded cost for a worse one.
+_INSERT_IF_ABSENT_SQL = (
+    "INSERT INTO alert_events "
+    + _COLUMNS
+    + "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+    "WHERE NOT EXISTS (SELECT 1 FROM alert_events "
+    "WHERE event_type = ? AND payload_hash = ?)"
 )
 
 
@@ -90,6 +109,60 @@ def payload_digest(text: str) -> str:
     that went out.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def denial_digest(
+    *,
+    combo_key: str | None,
+    denial_reason: str,
+    suppressed,
+    suppressed_at: str | None,
+    parole_at: str | None,
+) -> str:
+    """Dedup key for a `parole_denied` row: the denial STATE, not the attempt.
+
+    A latched combo (`suppressed=1`, parole window open, budget spent) takes the
+    same denial branch on EVERY dispatch attempt, so keying the ledger row on the
+    attempt appends a byte-identical row per attempt forever — 20,094 of them in
+    17h of prod. Keying it on this digest records the first occurrence of each
+    distinct denial state instead, so a MEANINGFUL change (a different reason, or
+    a new generation) still records while repetition collapses.
+
+    `suppressed_at` + `parole_at` ARE the generation identity: `combo_refresh`
+    moves both when it re-latches, so a replacement generation hashes differently
+    even for the same combo and reason.
+
+    NOT hashed over `state_json`: that is JSON text, and a key-order change would
+    silently split one state into two. The components are hashed as their exact
+    strings — no `Decimal.normalize()`-style ambient-context formatting, which
+    reads process state and can make the same value hash two ways.
+
+    `parole_trades_remaining` is deliberately absent. It is a detail WITHIN the
+    denial state (0 and NULL both mean "spent"), not part of its identity; the
+    first row's `state_json` still carries the value it was decided against.
+    """
+    parts = (combo_key, denial_reason, suppressed, suppressed_at, parole_at)
+    return hashlib.sha256(
+        _DIGEST_SEP.join(_digest_part(p) for p in parts).encode("utf-8")
+    ).hexdigest()
+
+
+# A separator that cannot occur in a combo_key, an ISO timestamp or a reason, so
+# no two distinct component tuples can join to the same string.
+_DIGEST_SEP = "\x1f"
+# Distinguishes a NULL component from an empty-string one.
+_DIGEST_NULL = "\x00"
+
+
+def _digest_part(value) -> str:
+    if value is None:
+        return _DIGEST_NULL
+    if isinstance(value, bool):
+        # `bool` IS an `int`: `str(True)` is "True" while SQLite hands the same
+        # column back as 1, so an unnormalised bool would hash the identical
+        # state two ways and defeat the dedup on the first restart.
+        return "1" if value else "0"
+    return str(value)
 
 
 def encode_state(**fields) -> str:
@@ -135,9 +208,17 @@ async def record_alert_event(
     state_json: str | None = None,
     detail: str | None = None,
     managed_txn: bool = False,
+    dedupe_on_payload_hash: bool = False,
 ) -> None:
     """Append one row to `alert_events`. See the module docstring for the two
     documented cases in which this raises.
+
+    `dedupe_on_payload_hash=True` makes the append conditional: the row lands
+    only if no row with this `event_type` and `payload_hash` exists yet. Used by
+    the `parole_denied` writer, whose branch re-fires on every dispatch attempt
+    for as long as a combo stays latched. It is NOT the default — every other
+    event type here records an occurrence, and collapsing occurrences would
+    destroy the evidence the ledger exists for.
 
     `managed_txn=True` — the caller owns an open transaction and will commit it;
     this is a bare INSERT. A failed INSERT has TWO possible effects, and the
@@ -156,6 +237,14 @@ async def record_alert_event(
     writer rolls its own transaction back so the shared connection is never
     handed to the next writer half-open.
     """
+    if dedupe_on_payload_hash and payload_hash is None:
+        # `payload_hash IS NULL` never satisfies `payload_hash = ?`, so a NULL
+        # key would make every NOT EXISTS probe miss and silently degrade back
+        # to a row per attempt. Raised rather than swallowed: it can only be a
+        # wiring bug at a constant call site, and the silent degradation is the
+        # exact failure this parameter exists to prevent.
+        raise ValueError("dedupe_on_payload_hash=True requires a payload_hash")
+
     params = (
         datetime.now(timezone.utc).isoformat(),
         event_type,
@@ -172,13 +261,18 @@ async def record_alert_event(
         state_json,
         detail,
     )
+    if dedupe_on_payload_hash:
+        sql = _INSERT_IF_ABSENT_SQL
+        params = params + (event_type, payload_hash)
+    else:
+        sql = _INSERT_SQL
 
     if managed_txn:
         # Sampled BEFORE the write so the handler can tell "the caller had a
         # transaction and SQLite threw it away" from "there was never one".
         was_in_txn = db._conn.in_transaction
         try:
-            await db._conn.execute(_INSERT_SQL, params)
+            await db._conn.execute(sql, params)
         except Exception as exc:
             _log_write_failure(exc, event_type, combo_key, managed_txn=True)
             if was_in_txn and not db._conn.in_transaction:
@@ -200,7 +294,7 @@ async def record_alert_event(
         await lock.acquire()
         try:
             try:
-                await db._conn.execute(_INSERT_SQL, params)
+                await db._conn.execute(sql, params)
                 await db._conn.commit()
             except BaseException:
                 try:

@@ -19,7 +19,12 @@ import structlog
 from scout import alerter
 from scout.db import Database
 from scout.timeutil import parole_window_open
-from scout.trading.alert_events import encode_state, payload_digest, record_alert_event
+from scout.trading.alert_events import (
+    denial_digest,
+    encode_state,
+    payload_digest,
+    record_alert_event,
+)
 
 log = structlog.get_logger()
 
@@ -168,6 +173,16 @@ async def _open_gate(
                 # anomaly — hence its own event type rather than
                 # `marker_anomaly`, which would misfile a normal decision as a
                 # fault.
+                #
+                # PER-OCCURRENCE, unlike the `parole_exhausted` branch below.
+                # This is a RACE, not a latched state: it fires only when
+                # `combo_refresh` re-latches inside the window between the
+                # lock-free read and the locked reservation, so each row is a
+                # distinct event worth counting. Prod measured ZERO of these in
+                # the same 17h in which `parole_exhausted` fired 20,094 times —
+                # there is no repetition here to collapse, and collapsing it
+                # would destroy the only signal that says how often the TOCTOU
+                # is actually being hit.
                 await record_alert_event(
                     db,
                     event_type="parole_denied",
@@ -196,14 +211,31 @@ async def _open_gate(
 
             if remaining is None or remaining <= 0:
                 # The parole budget is spent. This is the denial that explains
-                # a stalled retest after the fact, and until now it left no
-                # trace at all — not even a log line.
+                # a stalled retest after the fact, and before the ledger it left
+                # no trace at all — not even a log line.
+                #
+                # Written ONCE per distinct denial state, not once per attempt.
+                # This branch is not the rare event the original brief assumed:
+                # once a combo latches it is the steady state, so every dispatch
+                # attempt re-enters here and a per-attempt row appended 20,094
+                # byte-identical rows in 17h of prod across 3 combos. The digest
+                # keys the row on combo + reason + generation, so a re-latch or a
+                # different denial reason still records while the repetition
+                # collapses — the same shape as the `suppression_transition`
+                # delta gate and the `page_rearm` stamped-marker guard.
                 await record_alert_event(
                     db,
                     event_type="parole_denied",
                     combo_key=combo_key,
                     transition="parole_exhausted",
                     detected_at=datetime.now(timezone.utc).isoformat(),
+                    payload_hash=denial_digest(
+                        combo_key=combo_key,
+                        denial_reason="parole_exhausted",
+                        suppressed=supp_now,
+                        suppressed_at=supp_at_now,
+                        parole_at=parole_at_now,
+                    ),
                     state_json=encode_state(
                         suppressed=supp_now,
                         suppressed_at=supp_at_now,
@@ -211,6 +243,7 @@ async def _open_gate(
                         parole_trades_remaining=remaining,
                     ),
                     managed_txn=True,
+                    dedupe_on_payload_hash=True,
                 )
                 await db._conn.execute("COMMIT")
                 return (False, "parole_exhausted", None)
