@@ -42,7 +42,7 @@ import structlog
 
 from scout.config import Settings
 from scout.db import Database
-from scout.trading.alert_events import payload_digest, record_alert_event
+from scout.trading.alert_events import record_alert_event, record_alert_payload
 from scout.trading.params import (
     CALIBRATION_EXCLUDE_SIGNALS,
     DEFAULT_SIGNAL_TYPES,
@@ -199,7 +199,9 @@ async def _send_suspend_alert(
     notification is lost, and it is lost LOUDLY (log + ledger row). The
     scheduler at ``scout.main._run_feedback_schedulers`` is the second layer.
     """
-    digest = payload_digest(body)
+    # Lock-free: the caller committed the suspension before calling, so the
+    # unmanaged (self-committing) preimage write cannot capture foreign work.
+    digest = await record_alert_payload(db, body)
     if session is None:
         # No session means no page was ever attempted — an operator-applied
         # signal was just auto-suspended and nobody was told. That is exactly

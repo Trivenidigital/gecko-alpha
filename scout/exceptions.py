@@ -33,6 +33,32 @@ class SafetyCheckError(ScoutError):
     """Error checking token safety."""
 
 
+class AlertPayloadCorrupt(ScoutError):
+    """A stored `alert_payloads` body does not hash to its own primary key.
+
+    Raised rather than returned so a reconstruction attempt can never hand back
+    text it cannot vouch for. The caller asked what the operator was actually
+    told; a body that provably is not it is worse than no body at all.
+    """
+
+    def __init__(
+        self,
+        payload_hash: str,
+        actual_hash: str,
+        stored_bytes: int,
+        recorded_byte_length: int,
+    ) -> None:
+        self.payload_hash = payload_hash
+        self.actual_hash = actual_hash
+        self.stored_bytes = stored_bytes
+        self.recorded_byte_length = recorded_byte_length
+        super().__init__(
+            f"alert_payloads row {payload_hash} is corrupt: stored body hashes "
+            f"to {actual_hash} ({stored_bytes} bytes, byte_length column says "
+            f"{recorded_byte_length})"
+        )
+
+
 class PriceProviderError(ScoutError):
     """A price provider (DEX/CEX) failed to return usable price data.
 

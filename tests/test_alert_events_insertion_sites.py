@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -2019,5 +2020,526 @@ async def test_a_page_the_row_still_agrees_with_gets_no_note(
 
         assert rev.calls == 1
         assert "NOTE: this page is stale" not in rev.messages[0]
+    finally:
+        await db.close()
+
+
+# --- preimage wiring (alert_payloads) --------------------------------------
+#
+# Each site that hashes a MESSAGE must also store that message. The claim is
+# reconstruction: the body read back out of `alert_payloads` under the ledger's
+# own `payload_hash` has to be byte-identical to what the sender was handed.
+# `denial_digest` is the deliberate exception — it keys a denial STATE and there
+# is no body, so a preimage there would be a fabricated "message".
+
+
+async def _preimage(db, digest):
+    return await alert_events.load_alert_payload(db, digest)
+
+
+async def _payload_rows(db) -> int:
+    cur = await db._conn.execute("SELECT COUNT(*) FROM alert_payloads")
+    (n,) = await cur.fetchone()
+    return n
+
+
+async def test_retest_incomplete_body_is_reconstructable(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The motivating lane. Its body was recoverable from neither journald nor
+    the ledger; after this it is recoverable from the digest alone."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, _, retest = _stub_all_senders(monkeypatch)
+        await _seed_terminal_incomplete(db, s)
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+        assert retest.calls == 1
+        delivered = await _events(
+            db,
+            event_type="alert_delivered",
+            alert_source="combo_refresh_retest_terminal_incomplete",
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == retest.messages[0]
+        assert await _payload_rows(db) == 1
+    finally:
+        await db.close()
+
+
+async def test_retest_incomplete_triplet_shares_one_payload_row(
+    tmp_path, settings_factory, monkeypatch
+):
+    """dispatched + failed reference one digest and cost ONE body row. A count
+    of 2 here would mean the substrate duplicates per event, which is the shape
+    the content-addressed design exists to avoid."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        monkeypatch.setattr(
+            combo_refresh, "_send_retest_incomplete_alert", _BoomSender()
+        )
+        await _seed_terminal_incomplete(db, s)
+        await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+        rows = await _events(
+            db, alert_source="combo_refresh_retest_terminal_incomplete"
+        )
+        assert len(rows) == 2
+        assert len({r["payload_hash"] for r in rows}) == 1
+        assert await _payload_rows(db) == 1
+    finally:
+        await db.close()
+
+
+async def test_reversal_body_and_pending_payload_are_both_reconstructable(
+    tmp_path, settings_factory, monkeypatch
+):
+    """TWO distinct texts on this axis: the durable pending JSON envelope
+    (`reversal_pending_recorded`, written inside the caller's transaction) and
+    the delivered message. Both are stored, and they are not the same bytes."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, rev, _ = _stub_all_senders(monkeypatch)
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)
+
+        assert rev.calls == 1
+        delivered = await _events(
+            db,
+            event_type="alert_delivered",
+            alert_source="combo_refresh_suppression_reversal",
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == rev.messages[0]
+
+        pending = await _events(db, event_type="reversal_pending_recorded")
+        assert len(pending) == 1
+        envelope = await _preimage(db, pending[0]["payload_hash"])
+        assert json.loads(envelope)["message"] in rev.messages[0]
+        assert pending[0]["payload_hash"] != delivered[0]["payload_hash"]
+        assert await _payload_rows(db) == 2
+    finally:
+        await db.close()
+
+
+async def test_retry_page_stores_the_stamped_body_not_the_rendered_one(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The retry suffix is appended AFTER rendering. Storing the pre-stamp text
+    would preserve which page was rendered, not which page was sent — the exact
+    distinction the digest comment on that line makes."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, rev, _ = _stub_all_senders(monkeypatch)
+        monkeypatch.setattr(
+            combo_refresh, "_send_suppression_reversal_alert", _BoomSender()
+        )
+        await _drive_newly_suppressed(db, s)
+        await combo_refresh.refresh_all(db, s)
+
+        # Second pass: the page is still pending, so it re-sends WITH the stamp.
+        monkeypatch.setattr(combo_refresh, "_send_suppression_reversal_alert", rev)
+        await combo_refresh.refresh_all(db, s)
+
+        assert rev.calls == 1
+        assert "[detected " in rev.messages[0]
+        delivered = await _events(
+            db,
+            event_type="alert_delivered",
+            alert_source="combo_refresh_suppression_reversal",
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == rev.messages[0]
+    finally:
+        await db.close()
+
+
+async def test_permanent_suppression_body_is_reconstructable(
+    tmp_path, settings_factory, monkeypatch
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        perm, _, _ = _stub_all_senders(monkeypatch)
+        # Suppressed, no trades at all in the window -> permanent-suppression.
+        await _seed_30d_row(db, "combo_a")
+        await combo_refresh.refresh_all(db, s)
+
+        assert perm.calls == 1
+        delivered = await _events(
+            db,
+            event_type="alert_delivered",
+            alert_source="combo_refresh_permanent_suppression",
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == perm.messages[0]
+        # Counted per digest, not globally: `refresh_all` drives the sibling
+        # retest lane in the same pass, which legitimately stores its own body.
+        cur = await db._conn.execute(
+            "SELECT COUNT(*) FROM alert_payloads WHERE payload_hash = ?",
+            (delivered[0]["payload_hash"],),
+        )
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await db.close()
+
+
+async def test_fallback_alert_body_is_reconstructable(
+    tmp_path, settings_factory, monkeypatch
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        suppression._fallback_timestamps.clear()
+        suppression._last_alerted_ts = float("-inf")
+
+        sent: list[str] = []
+
+        async def _capture(text, session, settings_, **_kw):
+            sent.append(text)
+
+        import scout.alerter as _alerter
+
+        monkeypatch.setattr(_alerter, "send_telegram_message", _capture)
+
+        class _FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(
+            suppression.aiohttp, "ClientSession", lambda *a, **k: _FakeSession()
+        )
+
+        for _ in range(s.FEEDBACK_FALLBACK_ALERT_THRESHOLD):
+            await suppression._record_fallback(db, "combo_a", "database is locked", s)
+
+        assert len(sent) == 1
+        delivered = await _events(
+            db, event_type="alert_delivered", alert_source="suppression"
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == sent[0]
+        assert await _payload_rows(db) == 1
+    finally:
+        suppression._fallback_timestamps.clear()
+        suppression._last_alerted_ts = float("-inf")
+        await db.close()
+
+
+async def test_auto_suspend_body_is_reconstructable(
+    tmp_path, settings_factory, monkeypatch
+):
+    from scout.trading import auto_suspend
+    from scout.trading.params import clear_cache_for_tests
+
+    clear_cache_for_tests()
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        sent: list[str] = []
+
+        async def _capture(text, session, settings_, **_kw):
+            sent.append(text)
+
+        import scout.alerter as _alerter
+
+        monkeypatch.setattr(_alerter, "send_telegram_message", _capture)
+        await _seed_hard_loss(db)
+        s = settings_factory(SIGNAL_PARAMS_ENABLED=True)
+        await auto_suspend.maybe_suspend_signals(db, s, session=object())
+
+        assert len(sent) == 1
+        delivered = await _events(
+            db, event_type="alert_delivered", alert_source="auto_suspend"
+        )
+        assert len(delivered) == 1
+        assert await _preimage(db, delivered[0]["payload_hash"]) == sent[0]
+        # The underscore-laden signal name survives verbatim — the §12b
+        # rendering class is exactly what an operator later needs to re-read.
+        assert "gainers_early" in sent[0]
+    finally:
+        clear_cache_for_tests()
+        await db.close()
+
+
+async def test_parole_denied_writes_no_preimage(tmp_path, settings_factory):
+    """`denial_digest` is a DEDUP key over a denial STATE. Nobody was sent
+    anything, so there is no body — storing one would put a fabricated
+    "message" in the evidence substrate and make `payload_hash` mean two
+    different things depending on `event_type`."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        parole_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        await _seed_30d_row(
+            db, "combo_a", parole_at=parole_at, parole_trades_remaining=0
+        )
+        allow, reason = await suppression.should_open(db, "combo_a", settings=s)
+        assert (allow, reason) == (False, "parole_exhausted")
+
+        denied = await _events(db, event_type="parole_denied")
+        assert len(denied) == 1
+        assert denied[0]["payload_hash"] is not None
+        # The digest exists and resolves to NOTHING — deliberately.
+        assert await _preimage(db, denied[0]["payload_hash"]) is None
+        assert await _payload_rows(db) == 0
+    finally:
+        await db.close()
+
+
+async def test_unreadable_pending_payload_preserves_the_undecodable_bytes(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The case the preimage matters most for: the durable payload cannot be
+    decoded as JSON, so the ONLY way anyone learns what those bytes were is to
+    keep them."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        await _seed_30d_row(db, "combo_a")
+        corrupt = "{not json — em-dash and a \r\n newline"
+        await db._conn.execute(
+            "UPDATE combo_performance SET reversal_alert_pending_json = ? "
+            "WHERE combo_key = 'combo_a' AND window = '30d'",
+            (corrupt,),
+        )
+        await db._conn.commit()
+
+        await combo_refresh._process_suppression_reversals(db, s, {}, {})
+
+        rows = await _events(
+            db, event_type="marker_anomaly", delivery_result="pending_unreadable"
+        )
+        assert len(rows) == 1
+        assert await _preimage(db, rows[0]["payload_hash"]) == corrupt
+    finally:
+        await db.close()
+
+
+async def test_lost_page_bodies_are_rewritten_after_the_rollback(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The preimages recorded alongside the pending-page UPDATEs were
+    `managed_txn=True`, so the commit failure destroyed them along with the
+    `reversal_pending_recorded` rows. They must be RE-written, self-committed,
+    outside the lock — otherwise the surviving `marker_anomaly` row points at a
+    digest whose body the same rollback just deleted, and these pages are never
+    re-detected.
+
+    READ BACK THROUGH A SECOND CONNECTION. The first version of this test used
+    `load_alert_payload` on `db._conn` and could not detect the regression it
+    exists to prevent: an uncommitted INSERT is visible to its own writer, so
+    flipping this site to `managed_txn=True` left it green. A durability claim
+    verified through the connection that made the write is not a claim about
+    durability at all."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_commit = db._conn.commit
+        real_rollback = db._conn.rollback
+        armed = {"on": False}
+
+        async def _fail_pending_commit():
+            if armed["on"]:
+                armed["on"] = False
+                await real_rollback()
+                raise aiosqlite.OperationalError("disk I/O error")
+            return await real_commit()
+
+        real_record = combo_refresh._record_pending_reversals
+
+        async def _armed_record(*a, **k):
+            armed["on"] = True
+            try:
+                return await real_record(*a, **k)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(db._conn, "commit", _fail_pending_commit)
+        monkeypatch.setattr(combo_refresh, "_record_pending_reversals", _armed_record)
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        lost = [
+            r
+            for r in await _events(db, event_type="marker_anomaly")
+            if r["transition"] == "pending_commit_lost"
+        ]
+        assert len(lost) == 2
+        # No transaction may be left open on the shared connection: a preimage
+        # sitting in one is not durable, it is merely visible to us.
+        assert db._conn.in_transaction is False
+        probe = sqlite3.connect(str(db_path))
+        try:
+            for row in lost:
+                state = json.loads(row["state_json"])
+                found = probe.execute(
+                    "SELECT payload FROM alert_payloads WHERE payload_hash = ?",
+                    (row["payload_hash"],),
+                ).fetchone()
+                assert found is not None, "preimage not durable to another reader"
+                assert found[0].decode("utf-8") == state["lost_raw"]
+            (n,) = probe.execute("SELECT COUNT(*) FROM alert_payloads").fetchone()
+            assert n == 2
+        finally:
+            probe.close()
+    finally:
+        await db.close()
+
+
+async def test_lost_page_preimage_does_not_depend_on_the_sibling_ledger_write(
+    tmp_path, settings_factory, monkeypatch
+):
+    """THE assertion that actually discriminates managed from unmanaged here.
+
+    Reading the preimage back through a second connection is NOT enough on this
+    path, and the measurement says so: flipping this site to `managed_txn=True`
+    leaves that test green, because the `record_alert_event` call immediately
+    after is unmanaged and its COMMIT sweeps up the pending preimage INSERT. The
+    row ends up durable either way, so durability alone cannot tell the two
+    apart.
+
+    What separates them is WHO the preimage depends on. Unmanaged, it is
+    committed by its own writer and owes nothing to anyone. Managed, it survives
+    only as long as the sibling ledger write happens to succeed — and
+    `record_alert_event`'s failure path ROLLS BACK, taking the preimage with it.
+    So the sibling is forced to fail here, and the preimage must still be there.
+
+    These pages are diffed across a single refresh and never re-detected. A body
+    whose survival is contingent on an unrelated write is not evidence."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_commit = db._conn.commit
+        real_rollback = db._conn.rollback
+        armed = {"on": False}
+
+        async def _fail_pending_commit():
+            if armed["on"]:
+                armed["on"] = False
+                await real_rollback()
+                raise aiosqlite.OperationalError("disk I/O error")
+            return await real_commit()
+
+        real_record = combo_refresh._record_pending_reversals
+
+        async def _armed_record(*a, **k):
+            armed["on"] = True
+            try:
+                return await real_record(*a, **k)
+            finally:
+                armed["on"] = False
+
+        # The REAL writer, driven through its REAL failure path — the INSERT is
+        # made invalid only for the lost-page rows, so `record_alert_event`
+        # executes, raises, rolls back and swallows exactly as it would on a
+        # disk error. A hand-rolled stub would not perform the rollback that is
+        # the whole mechanism under test.
+        real_event = combo_refresh.record_alert_event
+
+        async def _fail_lost_page_events(db_, **kw):
+            if kw.get("transition") == "pending_commit_lost":
+                good = alert_events._INSERT_SQL
+                alert_events._INSERT_SQL = "INSERT INTO no_such_table VALUES (1)"
+                try:
+                    return await real_event(db_, **kw)
+                finally:
+                    alert_events._INSERT_SQL = good
+            return await real_event(db_, **kw)
+
+        monkeypatch.setattr(db._conn, "commit", _fail_pending_commit)
+        monkeypatch.setattr(combo_refresh, "_record_pending_reversals", _armed_record)
+        monkeypatch.setattr(combo_refresh, "record_alert_event", _fail_lost_page_events)
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        # The sibling ledger rows really did fail to land — otherwise this test
+        # proves nothing about surviving their failure.
+        lost = [
+            r
+            for r in await _events(db, event_type="marker_anomaly")
+            if r["transition"] == "pending_commit_lost"
+        ]
+        assert lost == [], "fixture did not actually fail the sibling writes"
+
+        assert db._conn.in_transaction is False
+        probe = sqlite3.connect(str(db_path))
+        try:
+            rows = probe.execute(
+                "SELECT payload FROM alert_payloads ORDER BY payload_hash"
+            ).fetchall()
+            assert len(rows) == 2, f"preimages did not survive, got {len(rows)}"
+            bodies = sorted(
+                json.loads(r[0].decode("utf-8"))["transition"] for r in rows
+            )
+            assert bodies == ["newly_suppressed", "newly_suppressed"]
+        finally:
+            probe.close()
+    finally:
+        await db.close()
+
+
+async def test_preimage_failure_does_not_stop_the_page(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Fail-soft at the wiring level, not just in the writer: with the
+    substrate gone the page still goes out, the ledger rows still land, and
+    nothing raises into the refresh."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _, _, retest = _stub_all_senders(monkeypatch)
+        await _seed_terminal_incomplete(db, s)
+        await db._conn.execute("DROP TABLE alert_payloads")
+        await db._conn.commit()
+
+        alerted = await combo_refresh._process_retest_terminal_incomplete(db, s)
+
+        assert alerted == ["combo_a"]
+        assert retest.calls == 1
+        delivered = await _events(
+            db,
+            event_type="alert_delivered",
+            alert_source="combo_refresh_retest_terminal_incomplete",
+        )
+        assert len(delivered) == 1
+        assert delivered[0]["payload_hash"] == alert_events.payload_digest(
+            retest.messages[0]
+        )
+        assert len(await _events(db, event_type="marker_stamped")) == 1
     finally:
         await db.close()
