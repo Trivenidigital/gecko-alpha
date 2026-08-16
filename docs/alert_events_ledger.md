@@ -100,15 +100,40 @@ content-addressed `alert_payloads` table (`schema_version 20260817`):
 | `byte_length` | `INTEGER` — their length, a second independent statement about the same bytes |
 | `first_seen_at` | `TEXT` — when the body was first stored, never moved by a later reference |
 
-Read it through `scout.trading.alert_events.load_alert_payload(db, digest)`,
-which verifies the stored body against its own key before returning it and
-raises `AlertPayloadCorrupt` rather than handing back text it cannot vouch for.
-A raw `SELECT` skips that check.
+**Read it through `scout.trading.alert_events.load_alert_payload(db, digest)`.**
+It verifies the stored body against its own key before returning it and raises
+`AlertPayloadCorrupt` rather than handing back text it cannot vouch for. A raw
+`SELECT` skips that check.
+
+### NEVER `CAST(payload AS TEXT)`
+
+The column is a BLOB on purpose, and casting it back to TEXT reintroduces
+exactly the hazard that choice was made to avoid. Two bodies this substrate
+stores faithfully break under the cast — measured, not theorised:
+
+| Body | Reality | Under `CAST(payload AS TEXT)` |
+|---|---|---|
+| contains a lone surrogate (`\ud800`) | 14 bytes, round-trips exactly | the `SELECT` **raises** `OperationalError: Could not decode to UTF-8` |
+| contains an embedded NUL (`abc\x00defghijk`) | 12 bytes, round-trips exactly | SQL `length()` reports **3** — silently truncated at the NUL, and any SQL-side `substr` / `LIKE` / comparison is truncated with it |
+
+The surrogate case is loud and merely inconvenient. The NUL case is the
+dangerous one: the row is still returned, no error is raised, and an analyst
+reading a length or matching a pattern gets a confident wrong answer about what
+the operator was told. Both are reachable — `json.loads` yields unpaired
+surrogates from `\udXXX` escapes in upstream API text, which is why the writer
+encodes with `surrogatepass`.
+
+If you must query in raw SQL, select the BLOB and decode it in the client with
+`errors="surrogatepass"`; use `length(p.payload)` (bytes) or `p.byte_length`,
+never `length(CAST(...))`.
 
 ```sql
--- what the operator was actually told, for one combo
+-- what the operator was actually told, for one combo.
+-- `p.payload` is a BLOB: decode it client-side with
+-- bytes.decode("utf-8", errors="surrogatepass"), or prefer load_alert_payload.
 SELECT e.created_at, e.event_type, e.transition,
-       CAST(p.payload AS TEXT) AS body
+       p.payload AS body_bytes,
+       p.byte_length
 FROM alert_events e
 LEFT JOIN alert_payloads p ON p.payload_hash = e.payload_hash
 WHERE e.combo_key = ?
