@@ -22,8 +22,8 @@ from scout.timeutil import parole_window_open
 from scout.trading.alert_events import (
     denial_digest,
     encode_state,
-    payload_digest,
     record_alert_event,
+    record_alert_payload,
 )
 
 log = structlog.get_logger()
@@ -230,6 +230,14 @@ async def _open_gate(
                 # different denial reason still records while the repetition
                 # collapses — the same shape as the `suppression_transition`
                 # delta gate and the `page_rearm` stamped-marker guard.
+                #
+                # NO PREIMAGE HERE, deliberately. `denial_digest` is a DEDUP key
+                # over the denial STATE — nobody was sent anything, so there is
+                # no body to preserve. Writing an `alert_payloads` row for it
+                # would put a fabricated "message" in the evidence substrate and
+                # make `payload_hash` mean two different things. The state that
+                # WAS decided against is preserved as `state_json` below, which
+                # is the honest representation of it.
                 await record_alert_event(
                     db,
                     event_type="parole_denied",
@@ -703,7 +711,11 @@ async def _record_fallback(db: Database, combo_key: str, err: str, settings) -> 
             f"⚠ Suppression fail-open fired {len(_fallback_timestamps)}x "
             f"in last hour. DB may be degraded — combos are currently ungated."
         )
-        digest = payload_digest(msg)
+        # Unmanaged: every path into `_record_fallback` has already RELEASED
+        # `db._txn_lock` (the locked-and-busy branch defers the call for exactly
+        # that reason), so the self-committing write cannot deadlock or capture
+        # a caller's open transaction.
+        digest = await record_alert_payload(db, msg)
         await record_alert_event(
             db,
             event_type="alert_dispatched",

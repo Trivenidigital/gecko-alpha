@@ -76,6 +76,7 @@ number to appear in the table below.
 | 20260813 | source_call_snapshot_batches_v1 | B1-residual commit visibility |
 | 20260814 | alert_events_v1 | F3 durable control-plane event ledger |
 | 20260816 | alert_events_dedup_index_v1 | index-only; `parole_denied` first-occurrence probe |
+| 20260817 | alert_payloads_v1 | content-addressed alert-body preimages; no backfill possible |
 
 ## Notes / gaps
 

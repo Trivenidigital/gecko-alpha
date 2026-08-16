@@ -78,6 +78,39 @@ _ALERT_EVENTS_COLUMNS = (
     "state_json, detail"
 )
 
+# The PREIMAGE substrate behind `alert_events.payload_hash`.
+#
+# WHAT THE DIGEST ALONE CANNOT DO. `payload_hash` proves that a body you already
+# hold is the body that went out. It cannot hand you that body. For the
+# suppression-axis pages the delivered text was recoverable from neither
+# journald (~59h retention on this box, and it never logged the body) nor the
+# ledger, so the ledger could prove integrity and not reconstruct what the
+# operator was told.
+#
+# CONTENT-ADDRESSED, not one body per event row. The dispatched/delivered/failed
+# triplet for one page shares one digest, and a retried page re-derives the same
+# digest from the same bytes, so keying on the digest pays for the body exactly
+# once no matter how many rows reference it. `alert_events` is unchanged and
+# keeps referencing the digest.
+#
+# BLOB, not TEXT, and the justification is the requirement: exact-byte fidelity.
+# `payload_digest` is defined over `body.encode("utf-8")`, so the stored value is
+# those same bytes and verification is a re-hash with no decode step in between.
+# A TEXT column would route the body through the driver's text handling on the
+# way out (`text_factory`, and truncation at an embedded NUL), which is exactly
+# the class of silent mutation a preimage cannot tolerate.
+#
+# No secondary index: `payload_hash` is the primary key and the only access path
+# is "resolve this digest".
+_ALERT_PAYLOADS_DDL = """
+CREATE TABLE IF NOT EXISTS alert_payloads (
+    payload_hash   TEXT PRIMARY KEY,
+    payload        BLOB NOT NULL,
+    byte_length    INTEGER NOT NULL,
+    first_seen_at  TEXT NOT NULL
+)
+"""
+
 # Serves the `parole_denied` first-occurrence probe
 # (`WHERE event_type = ? AND payload_hash = ?`), which runs inside the locked
 # reservation on every dispatch attempt against a table that is never pruned.
@@ -447,6 +480,13 @@ class Database:
             # above: it asserts on an index that step attaches, and on a fresh
             # install the table does not exist until then.
             await self._migrate_alert_events_dedup_index_v1()
+
+            # Content-addressed alert-body preimages, schema_version 20260817.
+            # Purely additive: one new table keyed by the digest `alert_events`
+            # already records. No column is added to `alert_events` and no
+            # backfill is possible — the bodies behind existing digests are
+            # gone, which is the gap this closes going forward.
+            await self._migrate_alert_payloads_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -6531,6 +6571,96 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "alert_events_dedup_index_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_alert_payloads_v1(self) -> None:
+        """`alert_payloads` — the exact bodies behind `alert_events.payload_hash`,
+        schema_version 20260817. See `_ALERT_PAYLOADS_DDL` for the shape and the
+        BLOB-over-TEXT justification.
+
+        THE GAP. The F3 ledger preserves `payload_hash = sha256(exact body)`.
+        That proves equality against a body you already hold and reconstructs
+        nothing on its own, and for the terminal-incomplete / `parole_stalled`
+        lane the delivered body survived nowhere else — journald never logged it
+        and drops what it did log inside ~59h. Integrity without reconstruction.
+
+        NO BACKFILL, and none is possible: the bodies behind digests already in
+        `alert_events` do not exist anywhere to recover from. Rows written before
+        this step keep a resolvable-to-nothing digest, which is the honest
+        pre-cutover state rather than a gap to fill with a re-rendered guess —
+        a re-render is a different string and would hash differently anyway.
+
+        Additive and independent of the `alert_events` vocabulary rebuild: this
+        is a separate table, so the rebuild in `_migrate_alert_events_v1` (which
+        DROPs and recreates `alert_events`) neither touches nor loses it.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "alert_payloads_v1"
+        schema_version = 20260817
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            await conn.execute(_ALERT_PAYLOADS_DDL)
+
+            # Verify presence — fail loud on drift rather than at first write.
+            # A missing column here means every preimage write would be
+            # swallowed by the writer's fail-soft handler, i.e. the substrate
+            # would be silently absent rather than loudly broken.
+            cur = await conn.execute("PRAGMA table_info(alert_payloads)")
+            info = await cur.fetchall()
+            post_cols = {row[1] for row in info}
+            required = {"payload_hash", "payload", "byte_length", "first_seen_at"}
+            missing = required - post_cols
+            if missing:
+                raise RuntimeError(
+                    f"{migration_name} schema missing columns: {sorted(missing)}"
+                )
+            # The primary key IS the dedup mechanism — `INSERT OR IGNORE` on a
+            # table without it would append a body per referencing event row and
+            # silently defeat the whole content-addressed design.
+            if not any(row[1] == "payload_hash" and row[5] for row in info):
+                raise RuntimeError(
+                    f"{migration_name}: alert_payloads.payload_hash is not the "
+                    "primary key — the content-addressed dedup would not hold"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("alert_payloads_v1_migration_complete", table="alert_payloads")
+        except BaseException as e:
+            _log.exception(
+                "alert_payloads_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

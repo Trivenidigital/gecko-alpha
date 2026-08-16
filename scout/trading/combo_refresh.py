@@ -16,6 +16,7 @@ from scout.trading.alert_events import (
     generation_state,
     payload_digest,
     record_alert_event,
+    record_alert_payload,
 )
 from scout.trading.paper import VALID_TERMINAL_OUTCOME_SQL
 
@@ -160,7 +161,11 @@ async def _process_retest_terminal_incomplete(db: Database, settings) -> list[st
                 "complete. Suppression is HELD and will not auto-clear. "
                 "Re-arming a retest requires operator authorization."
             )
-        digest = payload_digest(message)
+        # Preimage FIRST, before the row that references it: this lane is the
+        # motivating case — its body survived in neither journald nor the ledger,
+        # so a digest recorded ahead of its own body is the one ordering that can
+        # leave an unresolvable reference behind.
+        digest = await record_alert_payload(db, message)
         detected_at = datetime.now(timezone.utc).isoformat()
         log.info("retest_incomplete_alert_dispatched", combo_key=combo_key)
         await record_alert_event(
@@ -1389,6 +1394,13 @@ async def _record_pending_reversals(
                     "WHERE combo_key = ? AND window = '30d'",
                     (payload, combo),
                 )
+                # `managed_txn=True` — this runs inside `db._txn_lock` and the
+                # caller's open transaction, and the unmanaged path takes that
+                # same non-reentrant lock. The preimage therefore lives or dies
+                # with the pending-page write it describes, which is the correct
+                # coupling: a body recorded for a page the commit discarded
+                # would claim a page was owed that never was.
+                payload_hash = await record_alert_payload(db, payload, managed_txn=True)
                 # F3: recorded either way, in this same transaction. The
                 # rowcount-0 case is the one that most needs durable evidence —
                 # it is a page that will never be delivered and never
@@ -1400,7 +1412,7 @@ async def _record_pending_reversals(
                     transition=transition,
                     detected_at=now_iso,
                     delivery_result="ok" if cur.rowcount else "no_30d_row",
-                    payload_hash=payload_digest(payload),
+                    payload_hash=payload_hash,
                     state_json=superseded_state,
                     detail=(
                         "superseded an undelivered page"
@@ -1501,6 +1513,12 @@ async def _record_pending_reversals(
             body = {}
         if not isinstance(body, dict):
             body = {}
+        # RE-written here, unmanaged. The preimage recorded alongside the
+        # pending-page UPDATE was `managed_txn=True`, so the rollback that
+        # produced this list destroyed it too — exactly as it destroyed the
+        # `reversal_pending_recorded` rows. Self-committed, outside the lock,
+        # for the same reason those rows are.
+        lost_digest = await record_alert_payload(db, payload)
         await record_alert_event(
             db,
             event_type="marker_anomaly",
@@ -1508,7 +1526,7 @@ async def _record_pending_reversals(
             transition="pending_commit_lost",
             detected_at=body.get("detected_at"),
             delivery_result="pending_commit_lost",
-            payload_hash=payload_digest(payload),
+            payload_hash=lost_digest,
             state_json=encode_state(
                 lost_transition=body.get("transition"),
                 lost_detected_at=body.get("detected_at"),
@@ -1580,13 +1598,20 @@ async def _process_suppression_reversals(
                 err_type=type(exc).__name__,
                 detail="pending payload could not be decoded; left in place",
             )
+            # The preimage matters MOST here: the durable payload is
+            # undecodable, so the only way anyone ever learns what those bytes
+            # were is to keep them. `isinstance` guards a non-TEXT column value,
+            # which has no bytes to hash and no body to store.
+            unreadable_digest = (
+                await record_alert_payload(db, raw) if isinstance(raw, str) else None
+            )
             await record_alert_event(
                 db,
                 event_type="marker_anomaly",
                 combo_key=combo,
                 transition="reversal_alert_pending_json",
                 delivery_result="pending_unreadable",
-                payload_hash=payload_digest(raw) if isinstance(raw, str) else None,
+                payload_hash=unreadable_digest,
                 detail=f"{type(exc).__name__}: {exc}",
             )
             continue
@@ -1621,10 +1646,10 @@ async def _process_suppression_reversals(
         if contradiction is not None:
             message = f"{message}\n{contradiction}"
 
-        # `payload_digest(message)` — the body as STAMPED, after the retry
-        # suffix is appended. Hashing the pre-stamp text would prove which page
-        # was rendered, not which page was sent.
-        digest = payload_digest(message)
+        # The body as STAMPED, after the retry suffix and any staleness note are
+        # appended. Hashing — and storing — the pre-stamp text would preserve
+        # which page was rendered, not which page was sent.
+        digest = await record_alert_payload(db, message)
         log.info(
             "suppression_reversal_alert_dispatched",
             combo_key=combo,
@@ -1916,7 +1941,7 @@ async def _process_permanent_suppression(
         # successful delivery is NOT silent. parse_mode=None is set inside the
         # sender — the body carries signal names + revive_signal_with_baseline
         # whose underscores MarkdownV1 would mangle without an error.
-        digest = payload_digest(message)
+        digest = await record_alert_payload(db, message)
         log.info("permanent_suppression_alert_dispatched", combo_key=combo)
         await record_alert_event(
             db,

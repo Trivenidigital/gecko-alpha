@@ -36,6 +36,12 @@ lock-free. An earlier draft used `asyncio.wait_for(lock.acquire(), ...)` as a
 backstop; it was removed because a cancelled `acquire()` can leave the lock
 permanently held, which converts a recoverable mistake into a wedged pipeline.
 
+PREIMAGES. `payload_hash` proves that a body you already hold is the one that
+went out; it cannot hand you that body. `record_alert_payload` stores the exact
+bytes in the content-addressed `alert_payloads` table, keyed by that same digest,
+so the ledger can RECONSTRUCT a page and not merely verify one. `alert_events` is
+unchanged — it still carries only the digest.
+
 `delivery_result` is a general-purpose OUTCOME field, not only a delivery
 verdict. On `alert_*` rows it carries `'ok'` / `'error:<ExcType>'`; on
 `parole_slot_refunded` it carries `'ok'` / `'stale_generation'`; on
@@ -50,6 +56,8 @@ import json
 from datetime import datetime, timezone
 
 import structlog
+
+from scout.exceptions import AlertPayloadCorrupt
 
 log = structlog.get_logger()
 
@@ -109,6 +117,17 @@ def payload_digest(text: str) -> str:
     that went out.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# Content-addressed: the digest is the key, so the dispatched/delivered/failed
+# triplet that shares one body pays for exactly one row, and a retried page
+# re-derives the same key from the same bytes. `OR IGNORE` is the absence guard —
+# the only constraint it can suppress is that primary key, because every other
+# bound value is constructed inside `record_alert_payload` and cannot be NULL.
+_INSERT_PAYLOAD_SQL = (
+    "INSERT OR IGNORE INTO alert_payloads "
+    "(payload_hash, payload, byte_length, first_seen_at) VALUES (?, ?, ?, ?)"
+)
 
 
 def denial_digest(
@@ -191,6 +210,146 @@ def generation_state(row, *, prefix: str) -> dict:
         f"{prefix}_parole_at": row["parole_at"],
         f"{prefix}_parole_trades_remaining": row["parole_trades_remaining"],
     }
+
+
+async def record_alert_payload(db, body: str, *, managed_txn: bool = False) -> str:
+    """Persist the EXACT bytes behind a page and return their digest.
+
+    Returns `payload_digest(body)` — always, including when the persist failed.
+    The digest is the caller's `payload_hash=` argument, so an unwritable
+    preimage degrades the ledger back to what it was before this substrate
+    existed and never costs the operator a page.
+
+    WHY IT RETURNS THE DIGEST INSTEAD OF TAKING ONE. Hash and body cannot
+    diverge if the same call produces both: the bytes stored are the bytes
+    hashed, one expression, one place. A signature that accepted a
+    caller-computed hash alongside a body would make "the digest was taken over
+    some earlier revision of this text" representable, and that is precisely the
+    lie a preimage exists to rule out — the reversal lane already renders one
+    body and then appends a retry stamp to it before sending.
+
+    ONLY FOR TEXT THAT WAS ACTUALLY A MESSAGE. `denial_digest` is a DEDUP key
+    over a denial STATE, not a hash of anything anyone was ever sent; there is no
+    body to store, and inventing one would put a fabricated "message" in the
+    evidence substrate. Preimages are written where `payload_digest` is, and
+    nowhere else.
+
+    FAIL-SOFT, LOUDLY. This is evidence about the control plane and must never
+    be able to break it, so failures are logged (`alert_payload_write_failed`)
+    and swallowed — with the one exception `record_alert_event` documents and
+    for the same reason: in `managed_txn=True`, a failure that ABORTED the
+    caller's open transaction is re-raised, because the caller would otherwise
+    carry on believing a state change SQLite has already discarded is pending.
+
+    `managed_txn=True` is REQUIRED of any caller already holding `db._txn_lock`:
+    the unmanaged path takes that same non-reentrant lock and would deadlock.
+    """
+    # ONE definition of the digest (`payload_digest`), and the stored bytes are
+    # the same expression it hashes. Re-deriving the hash inline here would let
+    # the two drift on any future change to the encoding.
+    encoded = body.encode("utf-8")
+    digest = payload_digest(body)
+    params = (
+        digest,
+        encoded,
+        len(encoded),
+        datetime.now(timezone.utc).isoformat(),
+    )
+
+    if managed_txn:
+        # Sampled BEFORE the write, exactly as in `record_alert_event`: it is
+        # what distinguishes "SQLite threw the caller's transaction away" from
+        # "only this statement was undone".
+        was_in_txn = db._conn.in_transaction
+        try:
+            await db._conn.execute(_INSERT_PAYLOAD_SQL, params)
+        except Exception as exc:
+            _log_payload_write_failure(exc, digest, managed_txn=True)
+            if was_in_txn and not db._conn.in_transaction:
+                raise
+        return digest
+
+    try:
+        lock = db._txn_lock
+        if lock is None:
+            raise RuntimeError("Database._txn_lock is None — not initialized")
+        await lock.acquire()
+        try:
+            try:
+                await db._conn.execute(_INSERT_PAYLOAD_SQL, params)
+                await db._conn.commit()
+            except BaseException:
+                try:
+                    await db._conn.rollback()
+                except Exception as rb_err:
+                    # Never silent: a failed rollback can leave the shared
+                    # connection half-open for the next writer, which is a
+                    # bigger problem than the preimage this handler lost.
+                    log.exception("alert_payload_rollback_failed", err=str(rb_err))
+                raise
+        finally:
+            lock.release()
+    except Exception as exc:
+        _log_payload_write_failure(exc, digest, managed_txn=False)
+    return digest
+
+
+async def load_alert_payload(db, payload_hash: str) -> str | None:
+    """Reconstruct the body behind a `payload_hash`, or ``None`` if absent.
+
+    VERIFIES BEFORE IT RETURNS. A stored body whose sha256 is not its own key is
+    corruption, and handing it back would be worse than handing back nothing:
+    the caller asked what the operator was told and would receive text that
+    provably is not it. Raises :class:`AlertPayloadCorrupt` and logs, rather
+    than returning a body it cannot vouch for.
+
+    ``None`` means the digest has no preimage — the normal state for every row
+    written before `alert_payloads` existed, and not an error.
+    """
+    cur = await db._conn.execute(
+        "SELECT payload, byte_length FROM alert_payloads WHERE payload_hash = ?",
+        (payload_hash,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    stored, byte_length = row[0], row[1]
+    if isinstance(stored, str):
+        # SQLite is dynamically typed: a row written by anything other than
+        # `record_alert_payload` (an analyst's `sqlite3` session, a restore from
+        # a text dump) can hold TEXT in this column. Encode it back to the bytes
+        # the digest is defined over rather than raising a TypeError out of
+        # `hashlib` — the verification below still decides whether it is real.
+        stored = stored.encode("utf-8")
+    actual = hashlib.sha256(stored).hexdigest()
+    if actual != payload_hash or len(stored) != byte_length:
+        log.error(
+            "alert_payload_corrupt",
+            err_id="ALERT_PAYLOAD_CORRUPT",
+            payload_hash=payload_hash,
+            actual_hash=actual,
+            stored_bytes=len(stored),
+            recorded_byte_length=byte_length,
+        )
+        raise AlertPayloadCorrupt(payload_hash, actual, len(stored), byte_length)
+    return stored.decode("utf-8")
+
+
+def _log_payload_write_failure(exc, digest: str, *, managed_txn: bool) -> None:
+    """The one place a swallowed preimage failure surfaces.
+
+    `log`, not `logger` — this module binds the structlog logger under that name
+    at module scope, and a wrong name would raise NameError from inside the
+    handler whose whole job is to contain errors.
+    """
+    log.error(
+        "alert_payload_write_failed",
+        err_id="ALERT_PAYLOAD_WRITE",
+        payload_hash=digest,
+        managed_txn=managed_txn,
+        err=str(exc),
+        err_type=type(exc).__name__,
+    )
 
 
 async def record_alert_event(
