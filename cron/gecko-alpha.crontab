@@ -26,9 +26,10 @@
 # enabling the watch on a box with no destination pages every window for a
 # lane that was never meant to run. See docs/runbook_offhost_backup_b2.md.
 #
-# *** ORDERING: the shipper below must be SCHEDULED AND OBSERVED before that
-# flag is flipped. A watchdog over a job nothing runs is a false-alarm
-# generator, and a watchdog the operator learns to ignore is worse than none.
+# *** ORDERING: the shipper must be TRIGGERED AND OBSERVED before that flag is
+# flipped. It is not scheduled here — see the note below the next line. A
+# watchdog over a job nothing runs is a false-alarm generator, and a watchdog
+# the operator learns to ignore is worse than none.
 50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
 # The off-host backup shipper is deliberately NOT scheduled here. It runs as
 # systemd/gecko-backup-offhost.service, triggered by gecko-backup.service via

@@ -342,6 +342,20 @@ Note the `/usr/local/bin` install above is **not optional** — see the
 Deployment section. `git pull` alone changes nothing about what these units
 execute.
 
+**Also re-deploy the crontab in the same visit**, even though the shipper is not
+a cron job:
+
+```bash
+ssh srilu-vps 'cd /root/gecko-alpha && cron/deploy.sh'
+```
+
+`cron/gecko-alpha.crontab` gained comments in this change (explaining where the
+shipper actually lives and when to enable check 6), and
+`scripts/cron-drift-watchdog.sh` diffs the repo fragment against the live
+managed block **literally** — comments included. Skip this and the drift
+watchdog pages for a difference that is purely documentation. That is precisely
+the kind of self-inflicted false page this lane is supposed to be reducing.
+
 ### Step 1 — install rclone
 
 ```bash
