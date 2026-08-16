@@ -469,7 +469,12 @@ _verify_remote "$REMOTE_TMP" "staged upload"
 STAGE_RC=$?
 set -e
 if (( STAGE_RC != 0 )); then
-    echo "ERROR: post-upload verification FAILED for the staged object — rclone exited 0 but the stored object does not match the local backup. Removing the staging key; the real backup name was never written, so nothing corrupt is being presented as good." >&2
+    # "could not be verified", NOT "does not match". The specific reason is
+    # already on the line above, and one of the three reasons is that the
+    # remote reported no hash — in which case the object may well be fine and
+    # we simply cannot prove it. Summarising that as a mismatch would state as
+    # fact something this script does not know.
+    echo "ERROR: post-upload verification FAILED for the staged object — rclone exited 0 but the stored object could not be verified against the local backup (see the reason above). Removing the staging key; the real backup name was never written, so nothing unverified is being presented as good." >&2
     _delete_remote "$REMOTE_TMP"
     exit 5
 fi
