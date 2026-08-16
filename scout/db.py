@@ -78,11 +78,34 @@ _ALERT_EVENTS_COLUMNS = (
     "state_json, detail"
 )
 
+# Serves the `parole_denied` first-occurrence probe
+# (`WHERE event_type = ? AND payload_hash = ?`), which runs inside the locked
+# reservation on every dispatch attempt against a table that is never pruned.
+# This tuple is its ONLY definition, and TWO separate paths depend on that.
+#
+# The one that carries it on THIS deploy is the UNCONDITIONAL loop further down
+# (`for index_sql in _ALERT_EVENTS_INDEXES`), which re-executes every statement
+# here on every `initialize()`, outside the drift branch. Prod's `alert_events`
+# CHECK already contains `parole_denied`, so the vocabulary-drift rebuild does
+# NOT run on this deploy — that loop is the sole delivery mechanism, and
+# "simplifying" it away would silently drop the index on every non-rebuild boot.
+#
+# The second path matters later: when the vocabulary DOES next grow, the rebuild
+# DROPs `alert_events` and its indexes and re-attaches exactly what is listed
+# here. An index created anywhere else would vanish at that point.
+#
+# `_migrate_alert_events_dedup_index_v1` therefore verifies rather than creates.
+_ALERT_EVENTS_DEDUP_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_alert_events_dedup "
+    "ON alert_events(event_type, payload_hash)"
+)
+
 _ALERT_EVENTS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_alert_events_combo_created "
     "ON alert_events(combo_key, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_alert_events_type_created "
     "ON alert_events(event_type, created_at)",
+    _ALERT_EVENTS_DEDUP_INDEX,
 )
 
 
@@ -419,6 +442,11 @@ class Database:
             # arrive. §12a is preserved rather than waived — if that refresh
             # never runs, the epoch row itself goes stale and pages truthfully.
             await self._migrate_alert_events_v1()
+
+            # Index-only, schema_version 20260816. Must run AFTER the step
+            # above: it asserts on an index that step attaches, and on a fresh
+            # install the table does not exist until then.
+            await self._migrate_alert_events_dedup_index_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -6432,6 +6460,77 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "alert_events_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_alert_events_dedup_index_v1(self) -> None:
+        """`idx_alert_events_dedup(event_type, payload_hash)` — the index behind
+        the `parole_denied` first-occurrence probe.
+
+        THE DEFECT IT SERVES. `parole_denied` was written per DENIAL ATTEMPT.
+        A latched combo re-enters the `parole_exhausted` branch on every dispatch
+        attempt, so prod appended 20,094 byte-identical rows in 17h across three
+        combos. The writer now appends only the first occurrence of each distinct
+        denial state, which means an existence probe on the dispatch hot path
+        against a ledger that is never pruned — unindexed, that is a full scan of
+        a table whose whole problem is unbounded growth.
+
+        WHY THIS STEP DOES NOT CREATE IT. The DDL lives in exactly one place,
+        `_ALERT_EVENTS_DEDUP_INDEX` inside `_ALERT_EVENTS_INDEXES`, because that
+        tuple is what the vocabulary-drift rebuild re-attaches after it DROPs the
+        table — an index created only here would silently vanish the next time
+        the event vocabulary grows. A second `CREATE` here would make the tuple
+        membership look optional and hide that. This step records the version and
+        FAILS LOUD if the index is absent, so the single source is verified at
+        boot rather than discovered as a slow scan in prod.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "alert_events_dedup_index_v1"
+        schema_version = 20260816
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' "
+                "AND name='idx_alert_events_dedup'"
+            )
+            if await cur.fetchone() is None:
+                raise RuntimeError(
+                    f"{migration_name}: idx_alert_events_dedup absent after "
+                    "alert_events_v1 — the parole_denied dedup probe would "
+                    "full-scan a ledger that is never pruned"
+                )
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "alert_events_dedup_index_v1_migration_complete",
+                index="idx_alert_events_dedup",
+            )
+        except BaseException as e:
+            _log.exception(
+                "alert_events_dedup_index_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

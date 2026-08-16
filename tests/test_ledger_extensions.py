@@ -148,10 +148,21 @@ async def test_generation_change_denial_is_recorded(tmp_path, settings_factory):
 
 
 async def test_routine_suppressed_denial_writes_nothing(tmp_path, settings_factory):
-    """The high-volume denial deliberately stays out of the ledger: it fires
-    per candidate on every cycle for every suppressed combo, and it is already
-    durable in signal_outcome_ledger. Recording it here would drown the
-    low-frequency denials that actually explain a stalled retest."""
+    """The routine `suppressed` denial deliberately stays out of the ledger: it
+    fires per candidate on every cycle for every suppressed combo, and it is
+    already durable in signal_outcome_ledger.
+
+    Excluded for VOLUME — not because the denials that DO land here are rare.
+    That was the original premise and it was wrong: `parole_exhausted` is a
+    LATCHED steady-state denial, not an occasional one. Once a combo latches,
+    every dispatch attempt re-enters that branch indefinitely, which produced
+    20,094 byte-identical rows in 17h across 3 combos in prod. It is now
+    deduped on denial-state identity (combo + reason + generation) rather than
+    written per attempt — see tests/test_parole_denied_dedup.py.
+
+    So the contrast this test pins is volume-vs-volume, settled by counting:
+    the routine denial is excluded at the writer, and the latched denial is
+    collapsed at the key."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     try:
