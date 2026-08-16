@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gecko-backup-offhost — ship the newest local scout.db backup to an
+# gecko-backup-offhost — ship the newest COMPLETED local scout.db backup to an
 # operator-configured off-host destination.
 #
 # Round 20 motivation: R11/R13/R18/R19 produce, rotate, watchdog, and
@@ -7,14 +7,38 @@
 # filesystem as the live DB. A single filesystem failure (RAID die,
 # accidental `rm -rf /`, mistyped fdisk) takes both the DB and every
 # .bak with it. This script closes the gap by copying the newest .bak
-# elsewhere — another mount, another host, an object store mount — on
-# the same schedule.
+# elsewhere — another mount, another host, an object store — on the same
+# schedule.
 #
-# Required env (script no-ops if unset — opt-in by design):
-#   GECKO_OFFHOST_BACKUP_DEST  — rsync target spec. Anything rsync
-#                                accepts works: `user@host:/path/`,
-#                                `/mnt/external/backups/`, etc.
-#                                Empty/unset = disabled (exit 0).
+# B2 amendment (2026-08-16): "another mount on the same provider" is still
+# inside the provider's failure domain. The operator ruled Backblaze B2 the
+# off-host destination precisely to leave it. B2 is S3-compatible OBJECT
+# storage and rsync cannot speak to it at all — there is no shell on the far
+# side, no rsync daemon, no filesystem. So the transfer step is now PLUGGABLE:
+#
+#   GECKO_OFFHOST_BACKUP_TRANSPORT=rsync  (default, unchanged behaviour)
+#   GECKO_OFFHOST_BACKUP_TRANSPORT=s3     (rclone -> B2 / any S3-compatible)
+#
+# Everything ABOVE the transfer — the disabled-by-default gate, the flock
+# guard, the completed-backup selection, the heartbeat — is shared, because
+# those are the parts that are safety-critical and have already been paid for
+# in incidents. Forking a parallel script would have duplicated exactly the
+# selection logic that destroyed prod's backups twice.
+#
+# Required env (script no-ops if the destination is unset — opt-in by design):
+#   rsync transport:
+#     GECKO_OFFHOST_BACKUP_DEST  — rsync target spec. Anything rsync
+#                                  accepts works: `user@host:/path/`,
+#                                  `/mnt/external/backups/`, etc.
+#                                  Empty/unset = disabled (exit 0).
+#   s3 transport:
+#     GECKO_OFFHOST_S3_BUCKET           — bucket name. Empty/unset = disabled
+#                                         (exit 0). `GECKO_OFFHOST_BACKUP_DEST`
+#                                         is IGNORED under this transport.
+#     GECKO_OFFHOST_S3_ENDPOINT         — S3 endpoint URL, e.g.
+#                                         https://s3.us-west-004.backblazeb2.com
+#     GECKO_OFFHOST_S3_KEY_ID           — application key ID
+#     GECKO_OFFHOST_S3_APPLICATION_KEY  — application key (SECRET)
 #
 # Optional env:
 #   GECKO_DB_PATH                       — live scout.db (informational
@@ -30,28 +54,103 @@
 #                                         (testability seam)
 #   GECKO_OFFHOST_BACKUP_RSYNC_OPTS     — extra rsync flags (default
 #                                         "--archive --partial --inplace")
+#   GECKO_OFFHOST_S3_PREFIX             — key prefix inside the bucket
+#                                         (default: bucket root)
+#   GECKO_OFFHOST_S3_REGION             — S3 region, when the provider needs it
+#   GECKO_OFFHOST_S3_PROVIDER           — rclone s3 `provider` value
+#                                         (default "Other", correct for B2's
+#                                         S3-compatible API)
+#   GECKO_OFFHOST_S3_RCLONE_BIN         — override rclone binary (test seam)
+#
+# CREDENTIAL SCOPE: use a BUCKET-SCOPED application key, never an account-wide
+# master key. On Backblaze that is "Add a New Application Key" restricted to
+# this one bucket. The key this script holds can, by design, overwrite the
+# off-host copies; it must not be able to touch anything else in the account.
+#
+# CREDENTIAL HANDLING: the key is passed to rclone through
+# `RCLONE_CONFIG_<REMOTE>_*` environment variables exported inside a subshell,
+# never on the command line. Command lines are world-readable via `ps`/`/proc`,
+# environments are not. Any rclone output this script echoes is passed through
+# a literal-substitution redactor first, so a future rclone that decides to
+# echo its own configuration still cannot leak the key into the cron log.
 #
 # Exit codes:
-#   0 = success (file shipped + heartbeat written) OR disabled (env unset)
-#   2 = misconfiguration (no .bak found, can't create dirs)
+#   0 = success (file shipped + VERIFIED + heartbeat written), OR the object
+#       was already present and verified (idempotent re-run), OR disabled
+#   2 = misconfiguration (no .bak found, can't create dirs, missing required
+#       env for the selected transport, unknown transport)
 #   3 = lock contention (another invocation in flight)
-#   4 = rsync transfer failed
-#   6 = rsync binary missing
+#   4 = transfer failed (rsync/rclone returned non-zero)
+#   5 = POST-UPLOAD VERIFICATION FAILED (remote size and/or content hash does
+#       not match the local file, or the remote hash could not be read at all)
+#   6 = transport binary missing (rsync / rclone / md5sum)
+#
+# VERIFICATION IS NOT AN EXIT CODE. Under the s3 transport a zero exit from the
+# upload command is NOT accepted as proof the bytes landed. After every upload
+# the object's SIZE and CONTENT HASH are read back from the remote and compared
+# to the local file, and a mismatch — or an unreadable remote hash — is a hard
+# failure that does NOT write the heartbeat. This project has been burned
+# repeatedly by treating "the command returned 0" as evidence; an off-host
+# backup nobody has ever verified is indistinguishable from no backup at all,
+# right up until the restore.
+#
+# The rsync transport keeps its historical behaviour (rsync does its own
+# whole-file checksum on the wire); the read-back verification is specific to
+# the object-storage path, where the upload is an HTTP request that can succeed
+# while storing something else.
 #
 # Idempotency: rsync with --partial+--inplace makes re-runs cheap (only
-# changed pages transfer). Safe to schedule alongside the existing
-# rotate timer.
+# changed pages transfer). Under s3, a re-run first reads back the object and
+# skips the upload entirely when size+hash already match, so the daily cron
+# costs one metadata request once the day's backup is safe. Uploads land on a
+# `.partial-upload` key and are promoted server-side only after verification,
+# so an interrupted run can never leave a truncated object sitting under the
+# real backup name.
+#
+# ---------------------------------------------------------------------------
+# RESTORE PROCEDURE (s3/B2) — full detail in docs/runbook_offhost_backup_b2.md
+# ---------------------------------------------------------------------------
+#   1. List what is off-host:
+#        rclone lsl "$REMOTE:$BUCKET/$PREFIX/"
+#   2. Download the chosen object:
+#        rclone copyto "$REMOTE:$BUCKET/$PREFIX/scout.db.bak.<ts>" ./restore.db
+#   3. Verify it against the object store's own hash BEFORE trusting it:
+#        md5sum ./restore.db
+#        rclone lsjson --stat --hash "$REMOTE:$BUCKET/$PREFIX/scout.db.bak.<ts>"
+#   4. Integrity-check the downloaded file:
+#        sqlite3 "file:$PWD/restore.db?mode=ro&immutable=1" 'PRAGMA quick_check;'
+#
+#      *** `immutable=1` IS MANDATORY, NOT DECORATION. *** A backup carries the
+#      live DB's WAL-mode header, so ANY ordinary open — read-only included —
+#      makes SQLite mint `-wal` and `-shm` files beside it. On 2026-08-15 an
+#      operator ran exactly this integrity check with a plain `mode=ro` URI;
+#      the sidecars it created had fresh mtimes, mtime-descending rotation
+#      handed them the retention slots, and all three real backups were
+#      deleted. The integrity check destroyed the thing it was verifying.
+#      Every read of a backup file uses `file:...?mode=ro&immutable=1`.
+#   5. Only then promote: stop the pipeline, move the live scout.db aside,
+#      move restore.db into place.
 
 set -euo pipefail
 
-DEST="${GECKO_OFFHOST_BACKUP_DEST:-}"
-DEST="${DEST#"${DEST%%[![:space:]]*}"}"  # ltrim
-DEST="${DEST%"${DEST##*[![:space:]]}"}"  # rtrim
+_trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"  # ltrim
+    s="${s%"${s##*[![:space:]]}"}"  # rtrim
+    printf '%s' "$s"
+}
 
-if [[ -z "$DEST" ]]; then
-    echo "gecko-backup-offhost: GECKO_OFFHOST_BACKUP_DEST is empty — off-host backup disabled (set the env to enable)"
-    exit 0
-fi
+TRANSPORT="$(_trim "${GECKO_OFFHOST_BACKUP_TRANSPORT:-rsync}")"
+DEST="$(_trim "${GECKO_OFFHOST_BACKUP_DEST:-}")"
+
+S3_BUCKET="$(_trim "${GECKO_OFFHOST_S3_BUCKET:-}")"
+S3_ENDPOINT="$(_trim "${GECKO_OFFHOST_S3_ENDPOINT:-}")"
+S3_KEY_ID="$(_trim "${GECKO_OFFHOST_S3_KEY_ID:-}")"
+S3_APP_KEY="${GECKO_OFFHOST_S3_APPLICATION_KEY:-}"
+S3_PREFIX="$(_trim "${GECKO_OFFHOST_S3_PREFIX:-}")"
+S3_REGION="$(_trim "${GECKO_OFFHOST_S3_REGION:-}")"
+S3_PROVIDER="$(_trim "${GECKO_OFFHOST_S3_PROVIDER:-Other}")"
+RCLONE_BIN="${GECKO_OFFHOST_S3_RCLONE_BIN:-rclone}"
 
 BACKUP_DIR="${GECKO_BACKUP_DIR:-/root/gecko-alpha}"
 HEARTBEAT_FILE="${GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE:-/var/lib/gecko-alpha/backup-rotation/offhost-last-ok}"
@@ -59,13 +158,83 @@ LOCK_FILE="${GECKO_OFFHOST_BACKUP_LOCK_FILE:-/var/lock/gecko-backup-offhost.lock
 RSYNC_BIN="${GECKO_OFFHOST_BACKUP_BIN:-rsync}"
 RSYNC_OPTS="${GECKO_OFFHOST_BACKUP_RSYNC_OPTS:---archive --partial --inplace}"
 
+# rclone remote name. Defined ENTIRELY through RCLONE_CONFIG_GECKOOFFHOST_*
+# environment variables (see _rclone below), which take precedence over any
+# same-named remote in the operator's rclone.conf — so an unrelated ambient
+# config cannot silently redirect the backups somewhere else.
+S3_REMOTE="geckooffhost"
+
+# Redact credential material out of any text before it reaches stdout/stderr.
+# Pure bash parameter substitution: the secret is never an argument to another
+# process (which `ps` would expose), unlike the obvious `sed "s/$KEY/.../"`.
+_redact() {
+    local text="$1"
+    [[ -n "$S3_APP_KEY" ]] && text="${text//"$S3_APP_KEY"/[REDACTED]}"
+    [[ -n "$S3_KEY_ID" ]] && text="${text//"$S3_KEY_ID"/[REDACTED]}"
+    printf '%s' "$text"
+}
+
+# ---------------------------------------------------------------------------
+# Transport selection + disabled-by-default gate
+# ---------------------------------------------------------------------------
+case "$TRANSPORT" in
+    rsync)
+        if [[ -z "$DEST" ]]; then
+            echo "gecko-backup-offhost: GECKO_OFFHOST_BACKUP_DEST is empty — off-host backup disabled (set the env to enable)"
+            exit 0
+        fi
+        DEST_LABEL="$DEST"
+        ;;
+    s3)
+        if [[ -z "$S3_BUCKET" ]]; then
+            echo "gecko-backup-offhost: GECKO_OFFHOST_S3_BUCKET is empty — off-host backup disabled (set the env to enable)"
+            exit 0
+        fi
+        # Configured-but-incomplete is a MISCONFIGURATION, not a quiet skip:
+        # once the operator has named a bucket they expect backups to leave the
+        # box, and silently exiting 0 would satisfy the cron while shipping
+        # nothing. Names only — never the values.
+        MISSING=()
+        [[ -z "$S3_ENDPOINT" ]] && MISSING+=("GECKO_OFFHOST_S3_ENDPOINT")
+        [[ -z "$S3_KEY_ID" ]] && MISSING+=("GECKO_OFFHOST_S3_KEY_ID")
+        [[ -z "$S3_APP_KEY" ]] && MISSING+=("GECKO_OFFHOST_S3_APPLICATION_KEY")
+        if (( ${#MISSING[@]} > 0 )); then
+            echo "ERROR: GECKO_OFFHOST_S3_BUCKET is set but required env is missing: ${MISSING[*]}" >&2
+            exit 2
+        fi
+        S3_PREFIX="${S3_PREFIX#/}"
+        S3_PREFIX="${S3_PREFIX%/}"
+        if [[ -n "$S3_PREFIX" ]]; then
+            DEST_LABEL="s3://${S3_BUCKET}/${S3_PREFIX}/"
+        else
+            DEST_LABEL="s3://${S3_BUCKET}/"
+        fi
+        ;;
+    *)
+        echo "ERROR: unknown GECKO_OFFHOST_BACKUP_TRANSPORT='$TRANSPORT' (expected 'rsync' or 's3')" >&2
+        exit 2
+        ;;
+esac
+
 if [[ ! -d "$BACKUP_DIR" ]]; then
     echo "ERROR: GECKO_BACKUP_DIR=$BACKUP_DIR is not a directory" >&2
     exit 2
 fi
-if ! command -v "$RSYNC_BIN" >/dev/null 2>&1; then
-    echo "ERROR: rsync binary not found ($RSYNC_BIN). apt install rsync" >&2
-    exit 6
+
+if [[ "$TRANSPORT" == "rsync" ]]; then
+    if ! command -v "$RSYNC_BIN" >/dev/null 2>&1; then
+        echo "ERROR: rsync binary not found ($RSYNC_BIN). apt install rsync" >&2
+        exit 6
+    fi
+else
+    if ! command -v "$RCLONE_BIN" >/dev/null 2>&1; then
+        echo "ERROR: rclone binary not found ($RCLONE_BIN). Install it with 'apt install rclone' or 'curl https://rclone.org/install.sh | sudo bash' — the s3 transport cannot run without it (rsync cannot speak to object storage, which is why this transport exists)." >&2
+        exit 6
+    fi
+    if ! command -v md5sum >/dev/null 2>&1; then
+        echo "ERROR: md5sum not found — post-upload verification is impossible without it, and an unverified off-host copy is not a backup. apt install coreutils" >&2
+        exit 6
+    fi
 fi
 
 # Lock — prevent concurrent ships from racing on the heartbeat write
@@ -84,25 +253,46 @@ if ! mkdir -p "$(dirname "$HEARTBEAT_FILE")"; then
     exit 2
 fi
 
-# Find newest .bak — match both naming conventions the rotate script
-# accepts (scout.db.bak.* and scout.db.bak-*). `find -printf` so we sort
-# numerically by mtime without depending on stat-output formatting.
+# ---------------------------------------------------------------------------
+# Select the newest COMPLETED backup
+# ---------------------------------------------------------------------------
+# Shared by both transports on purpose. This is the single most incident-prone
+# piece of the whole backup stack and it must not be reimplemented per
+# destination.
 NEWEST=""
 NEWEST_MTIME=0
 shopt -s nullglob
 for pattern in 'scout.db.bak.*' 'scout.db.bak-*'; do
     for f in "$BACKUP_DIR"/$pattern; do
         [[ -f "$f" ]] || continue
-        # Skip the RESERVED IN-PROGRESS NAMESPACE owned by
-        # gecko-backup-create.sh: `$DEST.partial` plus every SQLite sidecar it
-        # can leave beside it (`-journal`, `-wal`, `-shm`).
+        # Two distinct exclusion families, from two distinct incidents. This
+        # loop selects NEWEST by mtime, and BOTH families are systematically
+        # newer than the completed backup they sit next to — so either one can
+        # win the selection and get shipped off-host as though it were a
+        # backup, quietly replacing the real off-site copy with a stub.
         #
-        # `*.partial` alone was too narrow. This loop selects NEWEST by mtime,
-        # and a sidecar is always newer than the completed backup it failed to
-        # become — so a `.partial-journal` could be chosen and shipped off-host
-        # as though it were a backup. The five that accumulated on prod
-        # (2026-08-08) were exactly this shape.
-        [[ "$f" == *.partial* ]] && continue
+        # 1. `*.partial*` — the RESERVED IN-PROGRESS NAMESPACE owned by
+        #    gecko-backup-create.sh: `$DEST.partial` plus every SQLite sidecar
+        #    it can leave beside it. Five such files accumulated on prod
+        #    (2026-08-08).
+        #
+        # 2. `*-wal` / `*-shm` / `*-journal` — sidecars minted beside a
+        #    COMPLETED backup. A backup carries the live DB's WAL-mode header,
+        #    so merely OPENING one creates them, read-only opens included. On
+        #    2026-08-15 an operator's `PRAGMA quick_check` over the two newest
+        #    backups minted sidecars with fresh mtimes and mtime-descending
+        #    rotation deleted all three real backups. Their names contain no
+        #    `.partial` at all, so family (1) did not cover them — which is
+        #    exactly how this script was left exposed after that fix landed in
+        #    gecko-backup-rotate.sh but not here.
+        #
+        # The sidecar patterns anchor to the END of the name, so an operator
+        # tag that merely CONTAINS one of the words
+        # (`scout.db.bak.before-wal-migration`) is still a backup and is still
+        # shipped — the ad-hoc-tag workflow is deliberately not narrowed.
+        case "$f" in
+            *.partial*|*-wal|*-shm|*-journal) continue ;;
+        esac
         mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
         if (( mtime > NEWEST_MTIME )); then
             NEWEST="$f"
@@ -118,18 +308,191 @@ if [[ -z "$NEWEST" ]]; then
 fi
 
 SIZE="$(stat -c '%s' "$NEWEST" 2>/dev/null || echo unknown)"
-echo "gecko-backup-offhost: source=$NEWEST size=$SIZE dest=$DEST"
+echo "gecko-backup-offhost: transport=$TRANSPORT source=$NEWEST size=$SIZE dest=$DEST_LABEL"
 
-# shellcheck disable=SC2086  # we intentionally word-split RSYNC_OPTS
-if ! "$RSYNC_BIN" $RSYNC_OPTS "$NEWEST" "$DEST" 2>&1; then
-    echo "ERROR: rsync transfer failed (src=$NEWEST dest=$DEST)" >&2
-    exit 4
+_write_heartbeat() {
+    # Atomic heartbeat write (matches gecko-backup-create.sh pattern).
+    # Reached ONLY after the copy is proven good — a heartbeat is the
+    # watchdog's evidence that an off-host copy exists, so writing one for an
+    # unverified upload would convert a real gap into a green dashboard.
+    local hb_tmp="${HEARTBEAT_FILE}.tmp.$$"
+    date +%s > "$hb_tmp"
+    mv -f "$hb_tmp" "$HEARTBEAT_FILE"
+    echo "gecko-backup-offhost: heartbeat updated at $HEARTBEAT_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Transport: rsync (unchanged)
+# ---------------------------------------------------------------------------
+if [[ "$TRANSPORT" == "rsync" ]]; then
+    # shellcheck disable=SC2086  # we intentionally word-split RSYNC_OPTS
+    if ! "$RSYNC_BIN" $RSYNC_OPTS "$NEWEST" "$DEST" 2>&1; then
+        echo "ERROR: rsync transfer failed (src=$NEWEST dest=$DEST)" >&2
+        exit 4
+    fi
+    echo "gecko-backup-offhost: transfer ok ($NEWEST → $DEST)"
+    # The local copy is NEVER removed. Off-host shipping is additive; local
+    # keep-N retention belongs to gecko-backup-rotate.sh and stays independent.
+    _write_heartbeat
+    exit 0
 fi
 
-echo "gecko-backup-offhost: transfer ok ($NEWEST → $DEST)"
+# ---------------------------------------------------------------------------
+# Transport: s3 (rclone → Backblaze B2 or any S3-compatible endpoint)
+# ---------------------------------------------------------------------------
 
-# Atomic heartbeat write (matches gecko-backup-create.sh pattern).
-HB_TMP="${HEARTBEAT_FILE}.tmp.$$"
-date +%s > "$HB_TMP"
-mv -f "$HB_TMP" "$HEARTBEAT_FILE"
-echo "gecko-backup-offhost: heartbeat updated at $HEARTBEAT_FILE"
+# Credentials live only in this subshell's environment — not in argv, not in
+# the parent's exported set.
+_rclone() {
+    (
+        export RCLONE_CONFIG_GECKOOFFHOST_TYPE="s3"
+        export RCLONE_CONFIG_GECKOOFFHOST_PROVIDER="$S3_PROVIDER"
+        export RCLONE_CONFIG_GECKOOFFHOST_ACCESS_KEY_ID="$S3_KEY_ID"
+        export RCLONE_CONFIG_GECKOOFFHOST_SECRET_ACCESS_KEY="$S3_APP_KEY"
+        export RCLONE_CONFIG_GECKOOFFHOST_ENDPOINT="$S3_ENDPOINT"
+        if [[ -n "$S3_REGION" ]]; then
+            export RCLONE_CONFIG_GECKOOFFHOST_REGION="$S3_REGION"
+        fi
+        exec "$RCLONE_BIN" "$@"
+    )
+}
+
+KEY_BASE="$(basename "$NEWEST")"
+if [[ -n "$S3_PREFIX" ]]; then
+    REMOTE_OBJ="${S3_REMOTE}:${S3_BUCKET}/${S3_PREFIX}/${KEY_BASE}"
+else
+    REMOTE_OBJ="${S3_REMOTE}:${S3_BUCKET}/${KEY_BASE}"
+fi
+# Uploads land here first. The suffix deliberately contains `.partial` so that
+# if one of these objects is ever pulled back down into a backup directory the
+# selection loop above skips it under the reserved-namespace rule.
+REMOTE_TMP="${REMOTE_OBJ}.partial-upload"
+
+LOCAL_SIZE="$(stat -c '%s' "$NEWEST")"
+# Hash from STDIN, not by filename. `md5sum FILE` escapes its output line with
+# a leading backslash whenever the path contains a backslash or a newline
+# (GNU coreutils' quoting rule), which would silently prepend `\` to the digest
+# and make every verification fail with a bogus mismatch. Feeding the file on
+# stdin removes the filename from the output entirely.
+LOCAL_MD5="$(md5sum < "$NEWEST" | awk '{print $1}')"
+if [[ -z "$LOCAL_MD5" ]]; then
+    echo "ERROR: could not compute local md5 for $NEWEST" >&2
+    exit 2
+fi
+
+# Read back size + content hash for a remote object.
+#   0 = present and matches local
+#   1 = absent
+#   2 = present but WRONG, or present with no readable hash
+# The third case is deliberately not folded into "absent": an object we cannot
+# prove is correct must never be reported as a verified backup, and it must
+# never be silently accepted either.
+_verify_remote() {
+    local obj="$1" label="$2"
+    local meta got_size got_md5
+    meta="$(_rclone lsjson --stat --hash --hash-type md5 "$obj" 2>/dev/null || true)"
+    if [[ -z "$meta" ]]; then
+        return 1
+    fi
+    got_size="$(printf '%s' "$meta" | sed -n 's/.*"Size"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' | head -n 1)"
+    got_md5="$(printf '%s' "$meta" | sed -n 's/.*"md5"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p' | head -n 1)"
+
+    if [[ -z "$got_size" ]]; then
+        echo "ERROR: $label — the remote object exists but its size could not be read back; refusing to call it verified" >&2
+        return 2
+    fi
+    if (( got_size != LOCAL_SIZE )); then
+        echo "ERROR: $label — SIZE MISMATCH: local=$LOCAL_SIZE remote=$got_size ($obj)" >&2
+        return 2
+    fi
+    if [[ -z "$got_md5" ]]; then
+        # Not a pass. A remote that cannot report a whole-object hash gives us
+        # no way to distinguish a good copy from a same-length corrupt one, and
+        # "the sizes matched" is the weakest possible restore guarantee.
+        echo "ERROR: $label — the remote reported NO md5 for the object, so its contents cannot be verified (size matched at $got_size bytes, which is not sufficient)" >&2
+        return 2
+    fi
+    if [[ "$got_md5" != "$LOCAL_MD5" ]]; then
+        echo "ERROR: $label — CONTENT HASH MISMATCH: local md5=$LOCAL_MD5 remote md5=$got_md5 (size matched at $got_size bytes — the upload returned success and stored different bytes)" >&2
+        return 2
+    fi
+    return 0
+}
+
+_delete_remote() {
+    local obj="$1" out=""
+    out="$(_rclone deletefile "$obj" 2>&1 || true)"
+    [[ -n "$out" ]] && printf 'gecko-backup-offhost: %s
+' "$(_redact "$out")"
+    return 0
+}
+
+# --- idempotence: is the day's object already up there and provably correct?
+set +e
+_verify_remote "$REMOTE_OBJ" "pre-upload check"
+PRE_RC=$?
+set -e
+if (( PRE_RC == 0 )); then
+    echo "gecko-backup-offhost: $KEY_BASE already present off-host and verified (size=$LOCAL_SIZE md5=$LOCAL_MD5) — skipping upload"
+    _write_heartbeat
+    exit 0
+fi
+if (( PRE_RC == 2 )); then
+    echo "gecko-backup-offhost: a remote object already exists at $REMOTE_OBJ but does NOT match the local backup — re-uploading over it" >&2
+fi
+
+# --- upload to the staging key
+echo "gecko-backup-offhost: uploading $KEY_BASE → $DEST_LABEL (staging key .partial-upload)"
+UPLOAD_OUT=""
+if ! UPLOAD_OUT="$(_rclone copyto "$NEWEST" "$REMOTE_TMP" 2>&1)"; then
+    echo "ERROR: rclone upload failed (src=$NEWEST dest=$DEST_LABEL)" >&2
+    printf '%s
+' "$(_redact "$UPLOAD_OUT")" >&2
+    _delete_remote "$REMOTE_TMP"
+    exit 4
+fi
+[[ -n "$UPLOAD_OUT" ]] && printf '%s
+' "$(_redact "$UPLOAD_OUT")"
+
+# --- verify the staged object BEFORE it is allowed to carry the backup's name
+set +e
+_verify_remote "$REMOTE_TMP" "staged upload"
+STAGE_RC=$?
+set -e
+if (( STAGE_RC != 0 )); then
+    echo "ERROR: post-upload verification FAILED for the staged object — rclone exited 0 but the stored object does not match the local backup. Removing the staging key; the real backup name was never written, so nothing corrupt is being presented as good." >&2
+    _delete_remote "$REMOTE_TMP"
+    exit 5
+fi
+echo "gecko-backup-offhost: staged object verified (size=$LOCAL_SIZE md5=$LOCAL_MD5)"
+
+# --- promote server-side
+MOVE_OUT=""
+if ! MOVE_OUT="$(_rclone moveto "$REMOTE_TMP" "$REMOTE_OBJ" 2>&1)"; then
+    echo "ERROR: rclone could not promote the staged object to $REMOTE_OBJ" >&2
+    printf '%s
+' "$(_redact "$MOVE_OUT")" >&2
+    _delete_remote "$REMOTE_TMP"
+    exit 4
+fi
+[[ -n "$MOVE_OUT" ]] && printf '%s
+' "$(_redact "$MOVE_OUT")"
+
+# --- verify the object AS PRESENTED. The promotion is a server-side copy, so
+# the bytes and the hash metadata it carries are the remote's word, not ours;
+# the authoritative check is the one against the name a restore would fetch.
+set +e
+_verify_remote "$REMOTE_OBJ" "promoted object"
+FINAL_RC=$?
+set -e
+if (( FINAL_RC != 0 )); then
+    echo "ERROR: the promoted object at $REMOTE_OBJ does not verify. Deleting it rather than leaving a bad copy under a good name, and NOT writing the heartbeat — the watchdog must see this as a missing off-host backup." >&2
+    _delete_remote "$REMOTE_OBJ"
+    exit 5
+fi
+
+echo "gecko-backup-offhost: transfer ok and VERIFIED ($NEWEST → $DEST_LABEL$KEY_BASE, size=$LOCAL_SIZE md5=$LOCAL_MD5)"
+# The local copy is NEVER removed on upload success. Off-host shipping is
+# additive; local keep-N retention belongs to gecko-backup-rotate.sh and stays
+# independent of whether this script ran at all.
+_write_heartbeat

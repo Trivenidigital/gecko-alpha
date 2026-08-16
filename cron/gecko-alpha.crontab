@@ -18,6 +18,13 @@
 # *** ACTIVATION PREREQUISITE: deploy PR #429 (daily-digest yesterday-fix) and
 # confirm >=1 fresh paper_daily_summary row exists BEFORE activating, else the
 # first digest pages are for a known-broken-being-fixed writer. ***
+#
+# The same line also carries check 6, the off-host backup shipper's heartbeat
+# freshness. It stays OFF until the B2 lane is actually configured: add
+# OFFHOST_BACKUP_WATCH_ENABLED=true to this line in the SAME change that
+# configures the bucket, never before — off-host shipping is opt-in, so
+# enabling the watch on a box with no destination pages every window for a
+# lane that was never meant to run. See docs/runbook_offhost_backup_b2.md.
 50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
 # Liquidity enrichment (b2 Phase 1a-ii). Writer is a NO-OP unless
 # LIQUIDITY_ENRICHMENT_ENABLED=true in .env (killswitch). See

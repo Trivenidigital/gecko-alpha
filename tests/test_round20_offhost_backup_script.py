@@ -312,3 +312,90 @@ def test_offhost_skips_every_partial_sidecar_not_just_dot_partial(tmp_path, suff
     assert not any(".partial" in n for n in shipped), (
         f"shipped an in-progress artifact off-host: {shipped}"
     )
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_offhost_skips_sidecars_beside_a_completed_backup(tmp_path, suffix):
+    """*** THE OFF-HOST HALF OF THE 2026-08-15 INCIDENT. ***
+
+    A backup carries the live DB's WAL-mode header, so merely OPENING one makes
+    SQLite mint `-wal` and `-shm` beside it — read-only opens included. An
+    operator running `PRAGMA quick_check` over the newest backups therefore
+    mints sidecars with FRESH mtimes, and this loop selects NEWEST by mtime.
+
+    On 2026-08-15 that cost prod all three local backups via mtime-descending
+    rotation. `gecko-backup-rotate.sh` was tightened; this script was not, and
+    its `.partial` exclusion does not cover these names — they sit beside a
+    COMPLETED backup and contain no `.partial` at all. The failure here is
+    worse than rotation's: shipping a 0-byte `-wal` off-host overwrites nothing
+    locally but silently replaces the one copy that exists outside the box.
+    """
+    if shutil.which("rsync") is None:
+        pytest.skip("rsync not installed")
+
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    real = _make_bak(
+        backup_dir / "scout.db.bak.20260815T030000Z",
+        age_seconds=7200,
+        payload=b"REAL-BACKUP-PAYLOAD",
+    )
+    # Minted by the integrity check — newer than the backup it describes.
+    _make_bak(
+        backup_dir / f"scout.db.bak.20260815T030000Z{suffix}",
+        age_seconds=60,
+        payload=b"",
+    )
+
+    proc = _run(
+        {
+            "GECKO_OFFHOST_BACKUP_DEST": str(dest) + "/",
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_OFFHOST_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    shipped = sorted(p.name for p in dest.iterdir())
+    assert shipped == [real.name], (
+        f"a SQLite sidecar won NEWEST selection and was shipped off-host: {shipped}"
+    )
+    assert (dest / real.name).read_bytes() == b"REAL-BACKUP-PAYLOAD"
+
+
+def test_offhost_still_ships_an_operator_tag_containing_a_sidecar_word(tmp_path):
+    """The sidecar exclusions anchor to the END of the name, so the supported
+    ad-hoc-tag workflow (`cp scout.db scout.db.bak.<tag>`) is not narrowed —
+    matching the same deliberate choice in gecko-backup-rotate.sh."""
+    if shutil.which("rsync") is None:
+        pytest.skip("rsync not installed")
+
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    tagged = _make_bak(
+        backup_dir / "scout.db.bak.before-wal-migration",
+        age_seconds=60,
+        payload=b"HAND-MADE",
+    )
+    _make_bak(
+        backup_dir / "scout.db.bak.20260815T030000Z",
+        age_seconds=7200,
+        payload=b"AUTO",
+    )
+
+    proc = _run(
+        {
+            "GECKO_OFFHOST_BACKUP_DEST": str(dest) + "/",
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_OFFHOST_BACKUP_LOCK_FILE": str(tmp_path / "lock"),
+        }
+    )
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    assert (dest / tagged.name).exists()
