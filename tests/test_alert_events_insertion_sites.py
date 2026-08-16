@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -2340,8 +2341,16 @@ async def test_lost_page_bodies_are_rewritten_after_the_rollback(
     `reversal_pending_recorded` rows. They must be RE-written, self-committed,
     outside the lock — otherwise the surviving `marker_anomaly` row points at a
     digest whose body the same rollback just deleted, and these pages are never
-    re-detected."""
-    db = Database(tmp_path / "t.db")
+    re-detected.
+
+    READ BACK THROUGH A SECOND CONNECTION. The first version of this test used
+    `load_alert_payload` on `db._conn` and could not detect the regression it
+    exists to prevent: an uncommitted INSERT is visible to its own writer, so
+    flipping this site to `managed_txn=True` left it green. A durability claim
+    verified through the connection that made the write is not a claim about
+    durability at all."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
     await db.initialize()
     try:
         s = settings_factory()
@@ -2382,10 +2391,123 @@ async def test_lost_page_bodies_are_rewritten_after_the_rollback(
             if r["transition"] == "pending_commit_lost"
         ]
         assert len(lost) == 2
-        for row in lost:
-            state = json.loads(row["state_json"])
-            assert await _preimage(db, row["payload_hash"]) == state["lost_raw"]
-        assert await _payload_rows(db) == 2
+        # No transaction may be left open on the shared connection: a preimage
+        # sitting in one is not durable, it is merely visible to us.
+        assert db._conn.in_transaction is False
+        probe = sqlite3.connect(str(db_path))
+        try:
+            for row in lost:
+                state = json.loads(row["state_json"])
+                found = probe.execute(
+                    "SELECT payload FROM alert_payloads WHERE payload_hash = ?",
+                    (row["payload_hash"],),
+                ).fetchone()
+                assert found is not None, "preimage not durable to another reader"
+                assert found[0].decode("utf-8") == state["lost_raw"]
+            (n,) = probe.execute("SELECT COUNT(*) FROM alert_payloads").fetchone()
+            assert n == 2
+        finally:
+            probe.close()
+    finally:
+        await db.close()
+
+
+async def test_lost_page_preimage_does_not_depend_on_the_sibling_ledger_write(
+    tmp_path, settings_factory, monkeypatch
+):
+    """THE assertion that actually discriminates managed from unmanaged here.
+
+    Reading the preimage back through a second connection is NOT enough on this
+    path, and the measurement says so: flipping this site to `managed_txn=True`
+    leaves that test green, because the `record_alert_event` call immediately
+    after is unmanaged and its COMMIT sweeps up the pending preimage INSERT. The
+    row ends up durable either way, so durability alone cannot tell the two
+    apart.
+
+    What separates them is WHO the preimage depends on. Unmanaged, it is
+    committed by its own writer and owes nothing to anyone. Managed, it survives
+    only as long as the sibling ledger write happens to succeed — and
+    `record_alert_event`'s failure path ROLLS BACK, taking the preimage with it.
+    So the sibling is forced to fail here, and the preimage must still be there.
+
+    These pages are diffed across a single refresh and never re-detected. A body
+    whose survival is contingent on an unrelated write is not evidence."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _stub_all_senders(monkeypatch)
+        now = datetime.now(timezone.utc)
+        for combo in ("combo_a", "combo_b"):
+            for _ in range(20):
+                await _insert_trade(db, combo, -5, now - timedelta(days=2))
+
+        real_commit = db._conn.commit
+        real_rollback = db._conn.rollback
+        armed = {"on": False}
+
+        async def _fail_pending_commit():
+            if armed["on"]:
+                armed["on"] = False
+                await real_rollback()
+                raise aiosqlite.OperationalError("disk I/O error")
+            return await real_commit()
+
+        real_record = combo_refresh._record_pending_reversals
+
+        async def _armed_record(*a, **k):
+            armed["on"] = True
+            try:
+                return await real_record(*a, **k)
+            finally:
+                armed["on"] = False
+
+        # The REAL writer, driven through its REAL failure path — the INSERT is
+        # made invalid only for the lost-page rows, so `record_alert_event`
+        # executes, raises, rolls back and swallows exactly as it would on a
+        # disk error. A hand-rolled stub would not perform the rollback that is
+        # the whole mechanism under test.
+        real_event = combo_refresh.record_alert_event
+
+        async def _fail_lost_page_events(db_, **kw):
+            if kw.get("transition") == "pending_commit_lost":
+                good = alert_events._INSERT_SQL
+                alert_events._INSERT_SQL = "INSERT INTO no_such_table VALUES (1)"
+                try:
+                    return await real_event(db_, **kw)
+                finally:
+                    alert_events._INSERT_SQL = good
+            return await real_event(db_, **kw)
+
+        monkeypatch.setattr(db._conn, "commit", _fail_pending_commit)
+        monkeypatch.setattr(combo_refresh, "_record_pending_reversals", _armed_record)
+        monkeypatch.setattr(combo_refresh, "record_alert_event", _fail_lost_page_events)
+        await combo_refresh.refresh_all(db, s)
+        monkeypatch.undo()
+
+        # The sibling ledger rows really did fail to land — otherwise this test
+        # proves nothing about surviving their failure.
+        lost = [
+            r
+            for r in await _events(db, event_type="marker_anomaly")
+            if r["transition"] == "pending_commit_lost"
+        ]
+        assert lost == [], "fixture did not actually fail the sibling writes"
+
+        assert db._conn.in_transaction is False
+        probe = sqlite3.connect(str(db_path))
+        try:
+            rows = probe.execute(
+                "SELECT payload FROM alert_payloads ORDER BY payload_hash"
+            ).fetchall()
+            assert len(rows) == 2, f"preimages did not survive, got {len(rows)}"
+            bodies = sorted(
+                json.loads(r[0].decode("utf-8"))["transition"] for r in rows
+            )
+            assert bodies == ["newly_suppressed", "newly_suppressed"]
+        finally:
+            probe.close()
     finally:
         await db.close()
 

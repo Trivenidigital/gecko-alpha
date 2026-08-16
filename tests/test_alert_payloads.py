@@ -85,6 +85,59 @@ async def test_body_round_trips_byte_for_byte(tmp_path, body):
         await db.close()
 
 
+async def test_lone_surrogate_body_neither_raises_nor_is_lost(tmp_path):
+    """A lone surrogate must not cost the page.
+
+    `str.encode("utf-8")` raises `UnicodeEncodeError` on an unpaired surrogate,
+    and `json.loads` yields exactly that from a `\\udXXX` escape in upstream API
+    text. The encode runs BEFORE the send at every wiring site — at
+    `auto_suspend` it runs before the §12b page goes out — so an exception there
+    would escape a function whose contract is fail-soft and destroy the
+    notification, not just the evidence.
+
+    Round-trips identically, which is the second half of the claim: an encoder
+    that accepts what the decoder cannot return would store evidence the
+    substrate is unable to hand back."""
+    body = "combo alert \ud800 with a lone surrogate"
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        digest = await alert_events.record_alert_payload(db, body)
+        assert digest == alert_events.payload_digest(body)
+        assert await alert_events.load_alert_payload(db, digest) == body
+
+        cur = await db._conn.execute(
+            "SELECT payload, byte_length FROM alert_payloads WHERE payload_hash = ?",
+            (digest,),
+        )
+        stored, byte_length = await cur.fetchone()
+        expected = body.encode("utf-8", errors="surrogatepass")
+        assert stored == expected
+        assert byte_length == len(expected)
+    finally:
+        await db.close()
+
+
+def test_surrogatepass_cannot_change_any_existing_hash():
+    """`surrogatepass` only alters inputs that PLAIN `utf-8` REJECTS, and a
+    rejected input has no hash today. So no digest already in `alert_events` can
+    be re-derived differently — asserted rather than argued, because a silent
+    digest change would orphan every preimage and break the dedup key."""
+    for text in (
+        "",
+        "plain ascii",
+        "em-dash — and an arrow →",
+        "emoji \U0001f680 astral",
+        "crlf\r\nlf\n",
+        "\x00 embedded nul",
+    ):
+        assert text.encode("utf-8") == text.encode("utf-8", errors="surrogatepass")
+        assert (
+            alert_events.payload_digest(text)
+            == hashlib.sha256(text.encode("utf-8")).hexdigest()
+        )
+
+
 async def test_stored_body_survives_a_reopen(tmp_path):
     """Durability through a SEPARATE connection — a body read back through the
     connection that wrote it proves nothing, because uncommitted writes are

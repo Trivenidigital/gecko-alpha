@@ -115,8 +115,23 @@ def payload_digest(text: str) -> str:
     `Decimal.normalize()`-style ambient formatting. The point of the digest is to
     prove which body went out, which is only true if it is taken over the body
     that went out.
+
+    `surrogatepass` because this is called on the alert path, BEFORE the send, at
+    every site. A plain `encode` raises `UnicodeEncodeError` on a lone surrogate
+    — reachable in principle, since `json.loads` yields unpaired surrogates from
+    `\\udXXX` escapes in upstream API text — and that exception would cost the
+    operator the page rather than the digest. NO EXISTING HASH CAN CHANGE: the
+    handler only alters inputs that currently raise, and an input that raises has
+    no hash today.
     """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_encode(text)).hexdigest()
+
+
+def _encode(text: str) -> bytes:
+    """The ONE definition of "the bytes of a body". The digest is taken over
+    these bytes and `alert_payloads` stores exactly these bytes, so they cannot
+    disagree about what a body is."""
+    return text.encode("utf-8", errors="surrogatepass")
 
 
 # Content-addressed: the digest is the key, so the dispatched/delivered/failed
@@ -243,11 +258,23 @@ async def record_alert_payload(db, body: str, *, managed_txn: bool = False) -> s
 
     `managed_txn=True` is REQUIRED of any caller already holding `db._txn_lock`:
     the unmanaged path takes that same non-reentrant lock and would deadlock.
+
+    A CORRUPTED PREIMAGE NEVER SELF-HEALS. `INSERT OR IGNORE` means re-sending
+    the identical page is a no-op against the existing row, so once a stored body
+    stops hashing to its own key `load_alert_payload` raises `AlertPayloadCorrupt`
+    for that digest forever. That is the correct direction — silently overwriting
+    would let a later write redefine what the operator was told — but nobody
+    should assume a resend repairs it.
     """
-    # ONE definition of the digest (`payload_digest`), and the stored bytes are
-    # the same expression it hashes. Re-deriving the hash inline here would let
-    # the two drift on any future change to the encoding.
-    encoded = body.encode("utf-8")
+    # ONE definition of the digest (`payload_digest`) over ONE definition of the
+    # bytes (`_encode`), which is also what gets stored. Re-deriving either
+    # inline would let them drift on any future change to the encoding.
+    #
+    # `_encode` is deliberately the FIRST thing that runs and is deliberately
+    # total: a `UnicodeEncodeError` here would escape a function whose contract
+    # is fail-soft, and at the `auto_suspend` site it would do so BEFORE the
+    # send — costing the page, which is the one outcome this design forbids.
+    encoded = _encode(body)
     digest = payload_digest(body)
     params = (
         digest,
@@ -320,7 +347,7 @@ async def load_alert_payload(db, payload_hash: str) -> str | None:
         # a text dump) can hold TEXT in this column. Encode it back to the bytes
         # the digest is defined over rather than raising a TypeError out of
         # `hashlib` — the verification below still decides whether it is real.
-        stored = stored.encode("utf-8")
+        stored = _encode(stored)
     actual = hashlib.sha256(stored).hexdigest()
     if actual != payload_hash or len(stored) != byte_length:
         log.error(
@@ -332,7 +359,10 @@ async def load_alert_payload(db, payload_hash: str) -> str | None:
             recorded_byte_length=byte_length,
         )
         raise AlertPayloadCorrupt(payload_hash, actual, len(stored), byte_length)
-    return stored.decode("utf-8")
+    # `surrogatepass` on the way out too, or a body the writer accepted becomes
+    # one the reader cannot return — an asymmetric codec would make the
+    # substrate store evidence it is unable to hand back.
+    return stored.decode("utf-8", errors="surrogatepass")
 
 
 def _log_payload_write_failure(exc, digest: str, *, managed_txn: bool) -> None:

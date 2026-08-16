@@ -70,12 +70,21 @@ MESSAGE.
 
 | Rows | What the digest is over | Preimage stored? |
 |---|---|---|
-| `alert_dispatched` / `alert_delivered` / `alert_failed`, `marker_stamped`, `marker_cleared`, `marker_anomaly`, `reversal_pending_recorded` | the EXACT text that was sent (or the exact durable payload that was written) — `payload_digest(text)` | yes |
+| `alert_dispatched` / `alert_delivered` / `alert_failed`, `marker_stamped`, `marker_cleared`, `reversal_pending_recorded` | the EXACT text that was sent (or the exact durable payload that was written) — `payload_digest(text)` | yes |
+| `marker_anomaly` | usually the same, but see below | **mostly** |
 | `parole_denied` | the denial STATE — `denial_digest(...)`, a dedup key | **no** |
+| everything else (`suppression_transition`, `parole_slot_spent`, `parole_slot_refunded`, `refresh_completed`, `ledger_installed`) | nothing — `payload_hash` is NULL | n/a |
 
 `parole_denied` rows have no body because nobody was sent anything. Their digest
 resolves to nothing in `alert_payloads`, and that is correct rather than a gap.
 The state that was decided against is preserved in `state_json` on the row.
+
+`marker_anomaly` is **not uniform**. Most of its rows carry a real message
+digest with a stored body (`pending_commit_lost`, `pending_not_cleared`, the
+marker-write failures). But the `pending_unreadable` writer stores
+`payload_hash = NULL` when the durable `reversal_alert_pending_json` value is
+not TEXT — there are no bytes to hash and no body to keep. Read this column per
+row, never per `event_type`.
 
 ---
 
@@ -107,16 +116,30 @@ WHERE e.combo_key = ?
 ORDER BY e.id;
 ```
 
-### `body IS NULL` has three distinct causes — do not conflate them
+### `body IS NULL` has at least four distinct causes — do not conflate them
 
-1. **Pre-cutover row.** The digest predates `alert_payloads`. **No backfill is
+Separate the two questions first: **is `e.payload_hash` itself NULL, or is it
+present but unresolvable?** They are different findings.
+
+1. **The row carries no `payload_hash` at all.** This is the common case, not an
+   edge case: most `event_type`s never pass one (see the table in section 2), and
+   `marker_anomaly` / `pending_unreadable` deliberately writes NULL when the
+   durable payload is not TEXT. Nothing is missing — there was never a digest.
+   Filter with `e.payload_hash IS NOT NULL` before drawing any conclusion about
+   coverage.
+2. **Pre-cutover row.** The digest predates `alert_payloads`. **No backfill is
    possible**: the bodies behind those digests exist nowhere to recover from,
    and a re-rendered body would be different text that hashes differently.
-2. **A `parole_denied` row.** By design — see section 2. There was no message.
-3. **A preimage write that failed.** The writer is fail-soft: it logs
+3. **A `parole_denied` row.** By design — see section 2. There was no message,
+   so the digest is a dedup key and resolves to nothing.
+4. **A preimage write that failed.** The writer is fail-soft: it logs
    `alert_payload_write_failed` (`err_id=ALERT_PAYLOAD_WRITE`) and returns the
    digest anyway, so the page still goes out and the ledger row still lands.
-   Search journald for that event before concluding (1).
+   Search journald for that event before concluding (2).
+
+"At least" is meant literally — treat this list as the causes known today, not
+as a closed set, and check the writer before asserting a cause you cannot see in
+the row.
 
 The `LEFT JOIN` is load-bearing. An inner join silently drops every row in all
-three categories, which is most of the historical table.
+four categories, which is most of the historical table.
