@@ -70,6 +70,11 @@ Fault injection (env):
   FAKE_RCLONE_MOVE_VANISH=1   moveto exits 0, consumes the source, and produces
                               no destination object
   FAKE_RCLONE_DELETE_FAIL=1   deletefile exits non-zero
+  FAKE_RCLONE_LSJSON_RC=<n>    lsjson exits <n> for an EXISTING object (a
+                              metadata read that fails while the object is
+                              present and byte-correct)
+  FAKE_RCLONE_LSJSON_RC_AFTER_MOVE=<n>
+                              same, but only for the PROMOTED key
   FAKE_RCLONE_LEAK_SECRET=1   copyto echoes its credentials on stderr and fails
 """
 import hashlib
@@ -172,6 +177,12 @@ def main(argv):
 
     if cmd == "lsjson":
         path = local_path(argv[-1])
+        forced = os.environ.get("FAKE_RCLONE_LSJSON_RC", "")
+        if not forced and not path.endswith(".partial-upload"):
+            forced = os.environ.get("FAKE_RCLONE_LSJSON_RC_AFTER_MOVE", "")
+        if forced and os.path.isfile(path):
+            sys.stderr.write("rclone: simulated metadata failure\n")
+            return int(forced)
         if not os.path.isfile(path):
             if os.environ.get("FAKE_RCLONE_STAT_NULL") == "1":
                 # Some backends answer --stat for a missing object with a JSON
@@ -1051,3 +1062,161 @@ def test_s3_a_promotion_that_produced_nothing_is_not_called_left_in_place(
     assert "NO object exists" in proc.stderr, proc.stderr
     assert "LEFT IN PLACE" not in proc.stderr, proc.stderr
     assert not (tmp_path / "hb").exists()
+
+
+# ---------------------------------------------------------------------
+# "Cannot see it" is not "it is not there" (review round 3)
+# ---------------------------------------------------------------------
+
+
+def test_s3_unreachable_metadata_after_promotion_does_not_claim_the_object_is_missing(
+    tmp_path, fake_rclone
+):
+    """*** The S2-3 conflation, polarity flipped. ***
+
+    The object is present and byte-correct; only the metadata read fails. A
+    blanket "non-zero exit means absent" reports that as "NO object exists ...
+    treat the off-host copy as missing", which is a false statement about a
+    good backup AND sends the operator away from an orphan that — per the
+    retention design — nothing will ever prune.
+
+    rclone exit 5 is a temporary error, not a not-found."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_LSJSON_RC_AFTER_MOVE"] = "5"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    obj = _remote_obj(fake_rclone, newest.name)
+    assert obj.exists(), "a present, byte-correct object was deleted"
+    assert obj.read_bytes() == newest.read_bytes()
+    assert "NO object exists" not in proc.stderr, proc.stderr
+    assert "cannot see it" in proc.stderr, proc.stderr
+    assert "LEFT IN PLACE" in proc.stderr, proc.stderr
+    assert not (tmp_path / "hb").exists()
+
+
+@pytest.mark.parametrize("rc", ["3", "4"])
+def test_s3_not_found_codes_still_mean_absent(tmp_path, fake_rclone, rc):
+    """The counter-direction. rclone documents 3 = directory not found and
+    4 = file not found; those must still read as absence, or the pre-upload
+    probe would call every first-ever run 'unverifiable' and the promoted-object
+    check could never report a genuinely missing object."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_LSJSON_RC_AFTER_MOVE"] = rc
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "NO object exists" in proc.stderr, proc.stderr
+    assert not (tmp_path / "hb").exists()
+
+
+def test_s3_unreachable_metadata_before_upload_does_not_abort_the_run(
+    tmp_path, fake_rclone
+):
+    """The pre-upload probe must not turn a transient metadata failure into a
+    skipped backup: unprovable means re-upload, never give up."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    obj = _remote_obj(fake_rclone, newest.name)
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    obj.write_bytes(newest.read_bytes())
+    # Fail the read for the final key only; the staged key still verifies, so
+    # the run must recover by re-uploading rather than aborting.
+    env["FAKE_RCLONE_LSJSON_RC_AFTER_MOVE"] = "5"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "could not be verified" in proc.stderr
+    assert obj.exists()
+
+
+# ---------------------------------------------------------------------
+# Non-secret configured-marker for cross-process readers
+# ---------------------------------------------------------------------
+
+
+def test_s3_writes_a_configured_marker_holding_no_credential(tmp_path, fake_rclone):
+    """The dashboard runs in a different process and must not be handed the
+    application key just to render `offhost_configured`. The shipper publishes
+    one non-secret bit instead."""
+    backup_dir, _ = _seed(tmp_path)
+    marker = tmp_path / "offhost-configured"
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["GECKO_OFFHOST_CONFIGURED_MARKER"] = str(marker)
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    assert marker.is_file()
+    body = marker.read_text()
+    assert "gecko-backups" in body, body
+    assert APP_KEY not in body, "the marker leaked the application key"
+    assert KEY_ID not in body, "the marker leaked the key id"
+
+
+def test_s3_marker_is_written_even_when_the_run_later_fails(tmp_path, fake_rclone):
+    """"Configured" and "working" are different claims. A configured lane whose
+    upload fails must still render as configured-and-stale, not as never
+    enabled — that is the whole distinction the field carries."""
+    backup_dir, _ = _seed(tmp_path)
+    marker = tmp_path / "offhost-configured"
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["GECKO_OFFHOST_CONFIGURED_MARKER"] = str(marker)
+    env["FAKE_RCLONE_UPLOAD_FAIL"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 4, f"stderr: {proc.stderr}"
+    assert marker.is_file(), "a configured-but-failing lane reads as unconfigured"
+    assert not (tmp_path / "hb").exists()
+
+
+def test_s3_marker_is_removed_when_the_lane_is_unconfigured(tmp_path, fake_rclone):
+    """Self-correcting: un-configuring the lane must not leave the dashboard
+    asserting a destination that no longer exists."""
+    backup_dir, _ = _seed(tmp_path)
+    marker = tmp_path / "offhost-configured"
+    marker.write_text("s3://stale-bucket/\n")
+
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir, bucket="")
+    env["GECKO_OFFHOST_CONFIGURED_MARKER"] = str(marker)
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    assert not marker.exists(), "stale marker survived an un-configured run"
+
+
+def test_rsync_transport_also_writes_the_marker(tmp_path, fake_rclone):
+    if shutil.which("rsync") is None:
+        pytest.skip("rsync not installed")
+    backup_dir, _ = _seed(tmp_path)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    marker = tmp_path / "offhost-configured"
+
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    del env["GECKO_OFFHOST_BACKUP_TRANSPORT"]
+    env["GECKO_OFFHOST_BACKUP_DEST"] = str(dest) + "/"
+    env["GECKO_OFFHOST_CONFIGURED_MARKER"] = str(marker)
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+    assert marker.is_file()
+
+
+# ---------------------------------------------------------------------
+# Operator-set values arrive with whitespace
+# ---------------------------------------------------------------------
+
+
+def test_s3_min_backup_bytes_is_trimmed(tmp_path, fake_rclone):
+    """Hand-written env files pick up trailing spaces. Untrimmed, `' 512 '`
+    fails the integer check and takes the whole lane down with a
+    misconfiguration error — every other operator-set variable is trimmed."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["GECKO_OFFHOST_MIN_BACKUP_BYTES"] = "  512  "
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert _remote_obj(fake_rclone, newest.name).exists()

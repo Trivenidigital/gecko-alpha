@@ -237,3 +237,139 @@ def test_health_offhost_whitespace_bucket_is_not_configured(
     data = r.json()
 
     assert data["offhost_configured"] is False
+
+
+# ---------------------------------------------------------------------
+# Cross-process: the dashboard reads a marker, never a credential
+# ---------------------------------------------------------------------
+
+
+def test_health_offhost_configured_from_marker_without_any_env(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """*** The process-boundary defect. ***
+
+    The shipper's configuration lives in a 0600 env file loaded only by the unit
+    that runs the shipper. gecko-dashboard.service has no EnvironmentFile and
+    nothing here loads a dotenv, so on a correctly configured box BOTH
+    destination variables are absent from this process and the field read False
+    while the lane shipped nightly.
+
+    Handing this process the env file would fix the display by putting the B2
+    application key into a network-facing service. The shipper publishes one
+    non-secret bit instead."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+
+    marker = tmp_path / "offhost-configured"
+    marker.write_text("s3://gecko-backups/hosts/srilu/\n")
+    monkeypatch.setenv("GECKO_OFFHOST_CONFIGURED_MARKER", str(marker))
+
+    hb = tmp_path / "offhost-last-ok"
+    hb.write_text(str(int(time.time())))
+    monkeypatch.setenv("GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(hb))
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is True
+    assert data["offhost_heartbeat_fresh"] is True
+
+
+def test_health_offhost_marker_present_but_stale_heartbeat(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """The dangerous half: a configured lane that has stopped shipping must read
+    configured-and-stale, not never-enabled."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+
+    marker = tmp_path / "offhost-configured"
+    marker.write_text("s3://gecko-backups/\n")
+    monkeypatch.setenv("GECKO_OFFHOST_CONFIGURED_MARKER", str(marker))
+
+    hb = tmp_path / "offhost-last-ok"
+    hb.write_text(str(int(time.time()) - 999999))
+    monkeypatch.setenv("GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(hb))
+    monkeypatch.setenv("GECKO_BACKUP_STALE_AFTER_SEC", "3600")
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is True
+    assert data["offhost_heartbeat_fresh"] is False
+
+
+def test_health_offhost_absent_marker_and_no_env_is_unconfigured(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """Counter-case: the marker must not make every box look configured."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_CONFIGURED_MARKER", str(tmp_path / "never-written")
+    )
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(tmp_path / "no-hb")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is False
+
+
+def test_health_offhost_marker_directory_is_not_a_marker(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """`is_file()`, not `exists()` — a directory at that path is not evidence
+    the operator configured anything."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+    marker_dir = tmp_path / "offhost-configured"
+    marker_dir.mkdir()
+    monkeypatch.setenv("GECKO_OFFHOST_CONFIGURED_MARKER", str(marker_dir))
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(tmp_path / "no-hb")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is False
+
+
+def test_health_offhost_marker_is_reread_per_request(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """No restart coupling. Reading configuration from the process environment
+    would need a dashboard restart to reflect a change; the marker is read from
+    disk on every request, so un-configuring the lane stops asserting a
+    destination that no longer exists."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+    marker = tmp_path / "offhost-configured"
+    marker.write_text("s3://gecko-backups/\n")
+    monkeypatch.setenv("GECKO_OFFHOST_CONFIGURED_MARKER", str(marker))
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(tmp_path / "no-hb")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        assert client.get("/health").json()["offhost_configured"] is True
+        marker.unlink()
+        assert client.get("/health").json()["offhost_configured"] is False

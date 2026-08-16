@@ -217,6 +217,19 @@ would mean an integrity check over the whole multi-GB file on every run;
 `gecko-backup-create.sh` already integrity-checks what *it* produces, and this
 floor is the cheap guard for the hand-made path.
 
+> **Operator warning — a stray stub takes the whole lane down.** If a file
+> matching `scout.db.bak.*` that fails the floor is the NEWEST thing in the
+> backup directory, the shipper exits 2 and ships nothing. It does **not** fall
+> back to the valid older backup, deliberately: a silent fallback would keep the
+> lane green while hiding that the newest backup is broken. But note the
+> asymmetry — a `-wal` sidecar is excluded **by name** and simply ignored,
+> whereas a hand-made stub is not excluded by name and therefore halts the run.
+> So an interrupted `cp scout.db scout.db.bak.tmp` stops off-host shipping until
+> someone removes the file. That is loud and intended; it should not be
+> discovered during an incident. If it happens, check
+> `journalctl -u gecko-backup-offhost.service` for "does not look like a SQLite
+> database", delete the stub, and re-run the unit.
+
 **The local copy is never deleted on upload success.** Off-host shipping is
 additive; local keep-N retention belongs to `gecko-backup-rotate.sh` and stays
 independent of whether this script ran at all.
@@ -240,6 +253,16 @@ cooldown. Env, read from the cron environment:
 48h rather than 27h because the shipper rides the daily backup schedule: one
 missed night on a disaster-recovery lane is not worth a page, two in a row is.
 
+**`offhost_configured` on `/health` comes from a marker, not the env.** The
+dashboard runs as a separate service with no access to
+`/etc/gecko-alpha/offhost.env`, and it must not be given access: that file holds
+the B2 application key, and a network-facing process has no business holding it
+to render a boolean. The shipper therefore writes a non-secret marker
+(`/var/lib/gecko-alpha/backup-rotation/offhost-configured`, containing only the
+destination label) on every configured run and removes it when the lane is
+un-configured. `/health` re-reads it per request, so it needs no dashboard
+restart to track reality.
+
 **What check 6 does and does not measure.** It measures **shipper liveness** —
 "the shipper ran and proved a copy landed" — not the freshness of the DATA in
 that copy. If `gecko-backup-create.sh` stalls and the newest local backup goes a
@@ -261,33 +284,63 @@ woken for.
 
 ## Enable sequence
 
-### Step 0 — SCHEDULE THE SHIPPER FIRST
+### Step 0 — INSTALL THE TRIGGER FIRST
 
-Nothing else in this sequence is safe until the job actually runs on a timer.
+Nothing else in this sequence is safe until the job actually runs on its own.
 The watchdog measures a heartbeat; if the only thing that ever writes that
 heartbeat is you, by hand, then it goes stale on schedule and check 6 pages
 every cooldown window forever over a lane nothing runs. A watchdog that cries
 wolf is worse than no watchdog, because it teaches the operator to skim past the
 one page that was real.
 
-The cron line ships in `cron/gecko-alpha.crontab` and is **inert until
-configured** — with no bucket set the script prints "off-host backup disabled"
-and exits 0. So install it first and let it no-op:
+**The shipper is event-triggered, not scheduled.** `gecko-backup.service` runs
+`OnSuccess=gecko-backup-offhost.service`, so the shipper runs when — and only
+when — a backup has just been created and rotated successfully.
+
+Do **not** "simplify" this into a timer 30 minutes after the backup. That was
+the first attempt and it is wrong: `gecko-backup.timer` sets `AccuracySec=1h` so
+the backup may start anywhere in 03:00–04:00, `Persistent=true` also fires
+missed runs at boot, and the backup legitimately runs for many minutes
+(`TimeoutStartSec=1800`, set because 600s expired mid-`.backup` on a 6.82 GB
+database). On any deferred day a fixed-time shipper re-verifies **yesterday's**
+backup and writes a fresh heartbeat — a lane that reads healthy while being
+permanently one day stale, and every individual run succeeds so nothing catches
+it.
+
+The units are **inert until configured** — with no bucket set the script prints
+"off-host backup disabled" and exits 0. Install them first and let them no-op:
 
 ```bash
-ssh srilu-vps 'cd /root/gecko-alpha && git pull && cron/deploy.sh'
-ssh srilu-vps 'crontab -l | grep gecko-backup-offhost'
+ssh srilu-vps 'cd /root/gecko-alpha && git pull'
+ssh srilu-vps '
+  install -m 0755 /root/gecko-alpha/scripts/gecko-backup-offhost.sh \
+                  /usr/local/bin/gecko-backup-offhost.sh
+  install -m 0644 /root/gecko-alpha/systemd/gecko-backup-offhost.service \
+                  /etc/systemd/system/gecko-backup-offhost.service
+  install -m 0644 /root/gecko-alpha/systemd/gecko-backup.service \
+                  /etc/systemd/system/gecko-backup.service
+  systemctl daemon-reload
+  systemctl show gecko-backup.service -p OnSuccess
+  systemctl show gecko-backup-offhost.service -p ExecStart
+'
 ```
 
-Let it fire at least once (03:30 UTC) and confirm the no-op:
+Expect `OnSuccess=gecko-backup-offhost.service` and an `ExecStart` naming
+`/usr/local/bin/gecko-backup-offhost.sh`. Then fire the chain by hand and
+confirm the no-op:
 
 ```bash
-ssh srilu-vps 'tail -5 /var/log/gecko-alpha-offhost-backup.log'
+ssh srilu-vps 'systemctl start gecko-backup.service'
+ssh srilu-vps 'journalctl -u gecko-backup-offhost.service -n 20 --no-pager'
 # expect: "off-host backup disabled (set the env to enable)"
 ```
 
-That proves the schedule, the path, the log target and the permissions before a
-single credential exists.
+That proves the trigger, the installed path, the journal target and the
+permissions before a single credential exists.
+
+Note the `/usr/local/bin` install above is **not optional** — see the
+Deployment section. `git pull` alone changes nothing about what these units
+execute.
 
 ### Step 1 — install rclone
 
@@ -319,6 +372,32 @@ GECKO_OFFHOST_S3_PREFIX=hosts/srilu
 EOF
 ssh srilu-vps 'ls -l /etc/gecko-alpha/offhost.env'   # expect -rw------- root root
 ```
+
+### Step 2b — verify rclone's exit codes on THIS box
+
+The shipper distinguishes "the object is absent" from "the metadata request
+failed", because the first is reported to you as *treat the off-host copy as
+missing* and the second must never be. That mapping uses rclone's documented
+codes — **3 = directory not found, 4 = file not found** — and documentation is
+not the running program:
+
+```bash
+ssh srilu-vps '
+  set -a; . /etc/gecko-alpha/offhost.env; set +a
+  export RCLONE_CONFIG_PROBE_TYPE=s3
+  export RCLONE_CONFIG_PROBE_PROVIDER=Other
+  export RCLONE_CONFIG_PROBE_ACCESS_KEY_ID="$GECKO_OFFHOST_S3_KEY_ID"
+  export RCLONE_CONFIG_PROBE_SECRET_ACCESS_KEY="$GECKO_OFFHOST_S3_APPLICATION_KEY"
+  export RCLONE_CONFIG_PROBE_ENDPOINT="$GECKO_OFFHOST_S3_ENDPOINT"
+  rclone lsjson --stat --hash "probe:$GECKO_OFFHOST_S3_BUCKET/definitely-not-here"
+  echo "not-found exit code: $?"
+'
+```
+
+Expect **3 or 4**. Any other code means a genuinely missing object would be
+reported as "unprovable" instead — the shipper would keep re-uploading and
+never claim something is missing, which is the safe direction, but you should
+know the mapping is off rather than discover it during a restore.
 
 ### Step 3 — first real run, by hand, sourcing that file
 

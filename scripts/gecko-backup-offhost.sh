@@ -171,6 +171,39 @@ RSYNC_OPTS="${GECKO_OFFHOST_BACKUP_RSYNC_OPTS:---archive --partial --inplace}"
 # config cannot silently redirect the backups somewhere else.
 S3_REMOTE="geckooffhost"
 
+# Non-secret marker recording that this lane IS configured, for readers in
+# OTHER PROCESSES.
+#
+# The dashboard renders `offhost_configured` to separate "the operator never
+# enabled this" from "enabled but stale". It cannot read the shipper's
+# configuration: the credentials live in a 0600 env file sourced only by the
+# unit that runs THIS script, and putting that file on the dashboard's unit
+# would hand a network-facing process the B2 application key to fix a display
+# field. So the shipper publishes the one bit the dashboard needs — configured
+# or not — and nothing else. The file holds the destination LABEL, never a
+# credential.
+#
+# Written on every configured run and REMOVED on the disabled path, so an
+# operator who un-configures the lane does not leave the dashboard asserting a
+# destination that no longer exists.
+CONFIGURED_MARKER="${GECKO_OFFHOST_CONFIGURED_MARKER:-/var/lib/gecko-alpha/backup-rotation/offhost-configured}"
+
+_clear_configured_marker() {
+    rm -f -- "$CONFIGURED_MARKER" 2>/dev/null || true
+}
+
+_write_configured_marker() {
+    local tmp="${CONFIGURED_MARKER}.tmp.$$"
+    if mkdir -p "$(dirname "$CONFIGURED_MARKER")" 2>/dev/null \
+        && printf '%s\n' "$1" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$CONFIGURED_MARKER" 2>/dev/null || rm -f "$tmp"
+    fi
+    # Best-effort by design: this marker drives a DISPLAY field. Failing the
+    # backup because a cosmetic breadcrumb could not be written would trade a
+    # wrong dashboard for a missing off-host copy.
+    return 0
+}
+
 # Redact credential material out of any text before it reaches stdout/stderr.
 # Pure bash parameter substitution: the secret is never an argument to another
 # process (which `ps` would expose), unlike the obvious `sed "s/$KEY/.../"`.
@@ -188,6 +221,7 @@ case "$TRANSPORT" in
     rsync)
         if [[ -z "$DEST" ]]; then
             echo "gecko-backup-offhost: GECKO_OFFHOST_BACKUP_DEST is empty — off-host backup disabled (set the env to enable)"
+            _clear_configured_marker
             exit 0
         fi
         DEST_LABEL="$DEST"
@@ -195,6 +229,7 @@ case "$TRANSPORT" in
     s3)
         if [[ -z "$S3_BUCKET" ]]; then
             echo "gecko-backup-offhost: GECKO_OFFHOST_S3_BUCKET is empty — off-host backup disabled (set the env to enable)"
+            _clear_configured_marker
             exit 0
         fi
         # Configured-but-incomplete is a MISCONFIGURATION, not a quiet skip:
@@ -222,6 +257,12 @@ case "$TRANSPORT" in
         exit 2
         ;;
 esac
+
+# Configured. Publish the bit the dashboard needs BEFORE anything that can
+# fail, so "the operator enabled this" is visible even on a run that then
+# aborts — that is exactly the state the field must not render as "never
+# enabled".
+_write_configured_marker "$DEST_LABEL"
 
 if [[ ! -d "$BACKUP_DIR" ]]; then
     echo "ERROR: GECKO_BACKUP_DIR=$BACKUP_DIR is not a directory" >&2
@@ -336,7 +377,10 @@ SIZE="$(stat -c '%s' "$NEWEST" 2>/dev/null || echo 0)"
 # mean an integrity check over the whole multi-GB file on every run;
 # gecko-backup-create.sh already integrity-checks what IT produces, and this
 # floor is the cheap guard for the hand-made path.
-MIN_BACKUP_BYTES="${GECKO_OFFHOST_MIN_BACKUP_BYTES:-512}"
+# Trimmed like every other operator-set variable. An env file written by hand
+# picks up trailing spaces easily, and `' 512 '` would otherwise fail the
+# integer check and take the whole lane down with a misconfiguration error.
+MIN_BACKUP_BYTES="$(_trim "${GECKO_OFFHOST_MIN_BACKUP_BYTES:-512}")"
 if ! [[ "$MIN_BACKUP_BYTES" =~ ^[0-9]+$ ]]; then
     echo "ERROR: GECKO_OFFHOST_MIN_BACKUP_BYTES=$MIN_BACKUP_BYTES must be a non-negative integer" >&2
     exit 2
@@ -438,20 +482,42 @@ fi
 _verify_remote() {
     local obj="$1" label="$2"
     local meta got_size got_md5
-    # Absence is decided by rclone's EXIT STATUS first, not by empty output.
-    # `lsjson --stat` on a missing object exits non-zero, but the JSON `null`
-    # body some backends return would otherwise be non-empty text with no
-    # readable Size — which the guards below would report as "present but
-    # unverifiable" and turn a perfectly ordinary first-ever upload into a
-    # verification failure.
     # `--hash` without `--hash-type`: the runbook's stated rclone floor (1.59,
     # the version that introduced `--stat`) does not cover `--hash-type` on
-    # lsjson, and an rclone that rejects the flag exits non-zero — which this
-    # function would report as "absent", discarding the real reason and
-    # triggering a full re-upload every run. Plain `--hash` returns every hash
-    # the backend knows; the md5 is picked out of the JSON below.
-    if ! meta="$(_rclone lsjson --stat --hash "$obj" 2>/dev/null)"; then
-        return 1
+    # lsjson, and an rclone that rejects the flag exits non-zero — which would
+    # be read below as "cannot see it", discarding the real reason.
+    #
+    # Absence is decided by rclone's EXIT STATUS, and ONLY by the codes that
+    # actually mean absence.
+    #
+    # A blanket "non-zero means absent" folds "the object is not there"
+    # together with "the metadata request failed" — a network blip, a 5xx, an
+    # expired key — and those demand opposite handling. The promoted-object
+    # call site reports absence as "NO object exists … treat the off-host copy
+    # as missing"; said about a temporary read failure that is a FALSE
+    # STATEMENT about a present, byte-correct backup, and it sends the operator
+    # away from an orphan object that nothing in the retention design will ever
+    # prune.
+    #
+    # rclone documents 3 = directory not found and 4 = file not found. Those
+    # two are absence. EVERY other non-zero code is UNPROVABLE (3), which keeps
+    # the object and says so. The mapping fails in the safe direction: if some
+    # rclone build reported not-found under a different code, a first-ever
+    # upload would read "present but unverifiable" and re-upload — noisy, but
+    # it never deletes, and it never claims something is missing that is not.
+    #
+    # VERIFY THE CODES AGAINST THE INSTALLED BINARY at enable time; the runbook
+    # carries that step. Documentation is not the running program.
+    local rc=0
+    meta="$(_rclone lsjson --stat --hash "$obj" 2>/dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        case "$rc" in
+            3|4) return 1 ;;
+            *)
+                echo "ERROR: $label — the metadata request for $obj FAILED (rclone exit $rc). That is not evidence the object is absent; it is evidence we cannot see it." >&2
+                return 3
+                ;;
+        esac
     fi
     meta="$(_trim "$meta")"
     if [[ -z "$meta" || "$meta" == "null" ]]; then

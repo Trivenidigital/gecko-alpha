@@ -30,21 +30,17 @@
 # flag is flipped. A watchdog over a job nothing runs is a false-alarm
 # generator, and a watchdog the operator learns to ignore is worse than none.
 50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
-# Off-host backup shipper. Runs 30 min after the 03:00 UTC local backup+rotate
-# timer, so it ships the backup that timer just produced.
+# The off-host backup shipper is deliberately NOT scheduled here. It runs as
+# systemd/gecko-backup-offhost.service, triggered by gecko-backup.service via
+# OnSuccess= — event-coupled to the backup it ships rather than clock-coupled
+# to a guess about how long that backup takes.
 #
-# INERT UNTIL CONFIGURED — this line is safe to deploy as-is. With no
-# destination set the script prints "off-host backup disabled" and exits 0, so
-# installing the schedule first (and watching it no-op for a day) is the
-# correct order: it proves the plumbing runs before any credential exists.
-#
-# Configuration is SOURCED, never inlined. /etc/gecko-alpha/offhost.env holds
-# GECKO_OFFHOST_BACKUP_TRANSPORT / _S3_BUCKET / _S3_ENDPOINT / _S3_KEY_ID /
-# _S3_APPLICATION_KEY / _S3_PREFIX and must be mode 0600 root:root. Putting the
-# application key on this line would publish it to every process that can read
-# /proc — `ps auxwwe` shows a cron job's environment — and would also commit a
-# live credential to this repo.
-30 3 * * * /bin/sh -c 'set -a; [ -r /etc/gecko-alpha/offhost.env ] && . /etc/gecko-alpha/offhost.env; set +a; exec /root/gecko-alpha/scripts/gecko-backup-offhost.sh' >> /var/log/gecko-alpha-offhost-backup.log 2>&1
+# A cron line 30 minutes after the backup timer was the first attempt and was
+# wrong: gecko-backup.timer has AccuracySec=1h and Persistent=true, and the
+# backup can legitimately run for many minutes, so on any deferred day the
+# shipper would re-verify YESTERDAY's backup and write a fresh heartbeat —
+# a lane that reads healthy while being permanently one day stale.
+# See docs/runbook_offhost_backup_b2.md.
 # Liquidity enrichment (b2 Phase 1a-ii). Writer is a NO-OP unless
 # LIQUIDITY_ENRICHMENT_ENABLED=true in .env (killswitch). See
 # tasks/runbook_enable_liquidity_enrichment_2026_06_23.md for the enable

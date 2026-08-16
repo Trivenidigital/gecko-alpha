@@ -1,18 +1,30 @@
-"""The off-host shipper must actually be SCHEDULED, and its credentials must not
-ride on the command line.
+"""The off-host shipper must actually be TRIGGERED, and its credentials must not
+ride on the command line or reach a network-facing process.
 
 Why this file exists: the shipper, its verification and its §12a watchdog check
-all shipped together and were individually well covered — and nothing anywhere
-ran the job. Repo-wide, ``gecko-backup-offhost`` appeared only in its own
-self-references and in the runbook. Follow the enable sequence exactly and the
-heartbeat gets written once, by hand, goes stale, and 48h later check 6 pages
-every cooldown window forever over a lane nothing runs. A watchdog that cries
-wolf is worse than no watchdog: it teaches the operator to skim past the page
-that was real.
+all shipped together and nothing ran the job. Repo-wide, ``gecko-backup-offhost``
+appeared only in its own self-references and in the runbook. Follow the enable
+sequence exactly and the heartbeat gets written once, by hand, goes stale, and
+48h later check 6 pages every cooldown window forever over a lane nothing runs.
+A watchdog that cries wolf is worse than no watchdog: it teaches the operator to
+skim past the page that was real.
 
 That class of gap is invisible to every behavioural test — the script works, the
-watchdog works, the wiring between them and the clock is simply absent — so it
-needs a contract test over the deployed cron file.
+watchdog works, the wiring between them and the trigger is simply absent — so it
+needs a contract test over the deployed units.
+
+The first attempt at that wiring was a cron entry 30 minutes after the backup
+timer, and it was WRONG in a way this file now pins against. ``gecko-backup.timer``
+carries ``AccuracySec=1h``, so the backup may start anywhere in 03:00-04:00;
+``Persistent=true`` also fires missed runs at boot; and the backup legitimately
+runs for many minutes (``TimeoutStartSec=1800``, set because 600s expired
+mid-``.backup`` on a 6.82 GB database). On any deferred day a fixed-time shipper
+re-verifies YESTERDAY's backup and writes a fresh heartbeat — a lane that reads
+healthy while being permanently one day stale, which no behavioural test can see
+because every individual run succeeds.
+
+So the guarantee asserted here is EVENT ordering, not a clock gap: the shipper is
+triggered by ``gecko-backup.service`` completing successfully.
 
 Pure-stdlib and platform-independent: it reads files, runs nothing.
 """
@@ -26,112 +38,187 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CRONTAB = REPO_ROOT / "cron" / "gecko-alpha.crontab"
 RUNBOOK = REPO_ROOT / "docs" / "runbook_offhost_backup_b2.md"
 SCRIPT = REPO_ROOT / "scripts" / "gecko-backup-offhost.sh"
+BACKUP_UNIT = REPO_ROOT / "systemd" / "gecko-backup.service"
+SHIPPER_UNIT = REPO_ROOT / "systemd" / "gecko-backup-offhost.service"
+DASHBOARD_UNIT = REPO_ROOT / "systemd" / "gecko-dashboard.service"
 
 ENV_FILE = "/etc/gecko-alpha/offhost.env"
 
 
-def _cron_lines():
-    """Active (non-comment, non-blank) crontab entries."""
+def _directives(path: Path) -> list[str]:
     return [
-        line
-        for line in CRONTAB.read_text(encoding="utf-8").splitlines()
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
 
-def _shipper_lines():
-    return [line for line in _cron_lines() if "gecko-backup-offhost.sh" in line]
+# ---------------------------------------------------------------------
+# The shipper is triggered at all
+# ---------------------------------------------------------------------
 
 
-def test_the_shipper_is_actually_scheduled():
+def test_the_shipper_unit_exists():
+    assert SHIPPER_UNIT.is_file(), "no systemd unit runs the off-host shipper"
+
+
+def test_the_backup_unit_triggers_the_shipper_on_success():
     """The whole point. Without this line the lane is code nobody runs."""
-    lines = _shipper_lines()
-    assert len(lines) == 1, (
-        "expected exactly one ACTIVE crontab entry invoking "
-        f"gecko-backup-offhost.sh, found {len(lines)}: {lines}"
+    directives = _directives(BACKUP_UNIT)
+    assert "OnSuccess=gecko-backup-offhost.service" in directives, (
+        "gecko-backup.service does not trigger the shipper; the off-host lane "
+        f"would never run. Directives: {directives}"
     )
 
 
-def test_the_schedule_is_a_real_daily_time():
-    """A five-field schedule, not a comment that looks like one."""
-    line = _shipper_lines()[0]
-    fields = line.split()
-    assert len(fields) >= 6, f"not a cron entry: {line}"
-    minute, hour = fields[0], fields[1]
-    assert re.fullmatch(r"\d+", minute), f"minute field is not fixed: {minute}"
-    assert re.fullmatch(r"\d+", hour), f"hour field is not fixed: {hour}"
-    assert fields[2:5] == ["*", "*", "*"], f"expected a daily schedule: {line}"
+def test_the_trigger_is_success_only_not_unconditional():
+    """A failed backup must ship nothing. Firing regardless would re-confirm
+    YESTERDAY's copy as though it were today's and write a fresh heartbeat over
+    a backup that was never made."""
+    body = BACKUP_UNIT.read_text(encoding="utf-8")
+    assert "OnFailure=gecko-backup-offhost.service" not in body
+    assert "OnSuccess=gecko-backup-offhost.service" in body
 
 
-def test_the_shipper_runs_after_the_local_backup():
-    """It ships what the 03:00 UTC backup+rotate timer just produced. Running
-    before it would ship yesterday's backup every day — a lane that looks
-    healthy while being permanently one day stale."""
-    fields = _shipper_lines()[0].split()
-    minutes_past_midnight = int(fields[1]) * 60 + int(fields[0])
-    assert 3 * 60 < minutes_past_midnight <= 6 * 60, (
-        "the shipper should run shortly AFTER the 03:00 UTC backup timer, "
-        f"got {fields[1]}:{fields[0]} UTC"
+def test_the_shipper_is_ordered_after_the_backup():
+    assert "After=gecko-backup.service" in _directives(SHIPPER_UNIT)
+
+
+def test_the_shipper_runs_the_installed_script():
+    directives = _directives(SHIPPER_UNIT)
+    assert any(
+        d.startswith("ExecStart=") and d.endswith("gecko-backup-offhost.sh")
+        for d in directives
+    ), directives
+    # /usr/local/bin, matching the rest of the backup stack — a repo path here
+    # would silently diverge from what the other units execute.
+    assert any(
+        "ExecStart=/usr/local/bin/gecko-backup-offhost.sh" == d for d in directives
+    ), directives
+
+
+def test_the_shipper_is_not_clock_coupled():
+    """No timer, and no cron entry. The ordering guarantee is event-based; a
+    second, time-based trigger would reintroduce exactly the staleness this
+    design removes (and double-run into the flock)."""
+    assert not (REPO_ROOT / "systemd" / "gecko-backup-offhost.timer").exists(), (
+        "a timer would reintroduce clock coupling alongside the OnSuccess trigger"
+    )
+    active_cron = [
+        line
+        for line in CRONTAB.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+        and not line.lstrip().startswith("#")
+        and "gecko-backup-offhost" in line
+    ]
+    assert active_cron == [], f"shipper is also scheduled by cron: {active_cron}"
+
+
+# ---------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------
+
+
+def test_the_shipper_unit_loads_the_credential_file_optionally():
+    directives = _directives(SHIPPER_UNIT)
+    assert f"EnvironmentFile=-{ENV_FILE}" in directives, (
+        "the shipper must load its configuration from the 0600 env file, and "
+        "the leading '-' must make a missing file a no-op so the unit is safe "
+        f"to install before the lane is configured. Directives: {directives}"
     )
 
 
-def test_the_cron_line_sources_the_credential_file():
-    line = _shipper_lines()[0]
-    assert ENV_FILE in line, (
-        f"the cron line must source {ENV_FILE}; without it the shipper runs "
-        f"with no configuration and no-ops forever: {line}"
-    )
+def test_no_credential_value_is_inlined_in_any_unit_or_the_crontab():
+    """*** The credential must never reach a command line or this repo. ***
 
-
-def test_no_credential_value_is_inlined_in_the_crontab():
-    """*** The credential must never reach a command line. ***
-
-    A cron entry's environment is readable via ``ps auxwwe`` and /proc by anyone
-    on the box, and this file is committed to the repo — an inlined key would be
-    a live credential in git history. The script goes out of its way to keep the
-    key out of argv; putting it in the schedule would hand it back.
+    A unit's environment is readable via ``systemctl show`` and /proc, and these
+    files are committed — an inlined key would be a live credential in git
+    history. The script goes out of its way to keep the key out of argv; putting
+    it in the trigger would hand it straight back.
     """
-    text = CRONTAB.read_text(encoding="utf-8")
-    for var in (
-        "GECKO_OFFHOST_S3_APPLICATION_KEY",
-        "GECKO_OFFHOST_S3_KEY_ID",
-        "GECKO_OFFHOST_S3_ENDPOINT",
-        "GECKO_OFFHOST_S3_BUCKET",
-    ):
-        assigned = re.search(rf"^\s*[^#\n]*\b{var}=(\S+)", text, re.M)
-        assert assigned is None, (
-            f"{var} is assigned a value in the crontab ({assigned.group(1)!r}); "
-            f"credentials belong in {ENV_FILE} at mode 0600, sourced by the line"
-        )
+    for path in (CRONTAB, SHIPPER_UNIT, BACKUP_UNIT, DASHBOARD_UNIT):
+        text = path.read_text(encoding="utf-8")
+        for var in (
+            "GECKO_OFFHOST_S3_APPLICATION_KEY",
+            "GECKO_OFFHOST_S3_KEY_ID",
+            "GECKO_OFFHOST_S3_ENDPOINT",
+            "GECKO_OFFHOST_S3_BUCKET",
+        ):
+            hit = re.search(rf"^\s*[^#\n]*\b{var}=(\S+)", text, re.M)
+            assert hit is None, (
+                f"{path.name} assigns {var} a value ({hit.group(1)!r}); "
+                f"credentials belong in {ENV_FILE} at mode 0600"
+            )
 
 
-def test_the_scheduled_line_is_inert_until_configured():
-    """Deploying the schedule before any credential exists must be safe, since
-    that ordering is what proves the plumbing before the watch is enabled. The
-    script's disabled path is the guarantee; assert it is still there."""
+def test_the_dashboard_unit_never_loads_the_credential_file():
+    """*** Load-bearing, and the reason the marker file exists. ***
+
+    The dashboard needs to know WHETHER the off-host lane is configured. The
+    obvious fix — adding the shipper's EnvironmentFile to this unit — would put
+    the B2 application key into a network-facing process's environment to
+    correct a display field, trading a wrong dashboard for a credential
+    exposure. The shipper publishes a non-secret marker instead.
+    """
+    body = DASHBOARD_UNIT.read_text(encoding="utf-8")
+    assert ENV_FILE not in body, (
+        "gecko-dashboard.service loads the off-host credential file; a "
+        "network-facing process must not hold the B2 application key"
+    )
+    assert "EnvironmentFile" not in body
+
+
+def test_the_shipper_publishes_a_non_secret_configured_marker():
+    """The cross-process signal the dashboard reads instead of the env."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert "GECKO_OFFHOST_CONFIGURED_MARKER" in body
+    assert "_write_configured_marker" in body
+    assert "_clear_configured_marker" in body
+    api = (REPO_ROOT / "dashboard" / "api.py").read_text(encoding="utf-8")
+    assert "GECKO_OFFHOST_CONFIGURED_MARKER" in api, (
+        "the dashboard does not read the marker, so offhost_configured still "
+        "depends on env vars that never reach its process"
+    )
+
+
+# ---------------------------------------------------------------------
+# Safe to deploy before the lane is configured
+# ---------------------------------------------------------------------
+
+
+def test_the_trigger_is_inert_until_configured():
+    """Installing the units before any credential exists must be safe, since
+    that ordering is what proves the plumbing before the watch is enabled."""
     body = SCRIPT.read_text(encoding="utf-8")
     assert "off-host backup disabled" in body
-    # Reached by an exit 0, not an error path.
-    disabled_block = body.split("off-host backup disabled", 1)[1][:200]
+    disabled_block = body.split("off-host backup disabled", 1)[1][:300]
     assert "exit 0" in disabled_block, disabled_block
 
 
-def test_runbook_puts_scheduling_before_enabling_the_watch():
-    """Ordering is the whole mitigation: schedule, observe it no-op, then turn
-    on the watchdog. Documented the other way round, an operator produces a
-    guaranteed false-page loop on day one."""
+def test_runbook_puts_the_trigger_before_enabling_the_watch():
+    """Ordering is the whole mitigation: install the trigger, observe it no-op,
+    then turn on the watchdog. Documented the other way round, an operator
+    produces a guaranteed false-page loop on day one."""
     text = RUNBOOK.read_text(encoding="utf-8")
     step0 = text.find("Step 0")
     watch_on = text.find("OFFHOST_BACKUP_WATCH_ENABLED=true")
     assert step0 != -1, "the runbook has no Step 0"
     assert watch_on != -1, "the runbook never says to enable the watch"
     assert step0 < watch_on, (
-        "the runbook enables the watchdog before it schedules the shipper"
+        "the runbook enables the watchdog before it installs the trigger"
+    )
+
+
+def test_runbook_documents_the_event_trigger_not_a_clock_gap():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "OnSuccess" in text, (
+        "the runbook must document how the shipper is triggered, or the "
+        "operator will install a timer and reintroduce the staleness"
     )
 
 
 def test_runbook_forbids_inlining_the_key_in_an_ssh_command():
-    """The earlier draft of this runbook told the operator to run
+    """The earlier draft told the operator to run
     ``ssh host 'GECKO_OFFHOST_S3_APPLICATION_KEY=<key> ... script.sh'``, which
     lands the secret in local shell history, local ssh argv, and the remote's
     argv and environ. Documentation that contradicts the code's own threat model
@@ -142,3 +229,12 @@ def test_runbook_forbids_inlining_the_key_in_an_ssh_command():
     ), "the runbook inlines the application key into an ssh command line"
     assert ENV_FILE in text, "the runbook must direct the key to the 0600 env file"
     assert "0600" in text or "umask 077" in text
+
+
+def test_runbook_requires_verifying_rclone_exit_codes_on_the_box():
+    """The absent-vs-unreachable mapping is taken from rclone's documentation.
+    Documentation is not the running program, and getting it wrong means the
+    shipper tells the operator a present backup is missing."""
+    text = RUNBOOK.read_text(encoding="utf-8")
+    assert "exit code" in text.lower()
+    assert "lsjson" in text
