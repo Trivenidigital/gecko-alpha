@@ -39,8 +39,23 @@ def _run(env_overrides=None):
     )
 
 
-def _make_bak(path: Path, age_seconds: int, payload: bytes = b"backup data") -> Path:
-    path.write_bytes(payload)
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _db_bytes(marker: bytes = b"backup data") -> bytes:
+    """A payload that clears the plausibility floor.
+
+    The shipper now refuses to send anything that is not at least 512 bytes and
+    does not start with the SQLite header, because a 0-byte stub newer than a
+    real backup would otherwise be selected, uploaded, and "verified" (0 == 0)
+    while standing as the only copy outside this box. Fixtures therefore have
+    to look like databases; the marker keeps each one identifiable so the
+    which-file-was-shipped assertions still mean the same thing."""
+    return (SQLITE_MAGIC + marker).ljust(512, b"\x00")
+
+
+def _make_bak(path: Path, age_seconds: int, payload: bytes | None = None) -> Path:
+    path.write_bytes(_db_bytes() if payload is None else payload)
     mtime = time.time() - age_seconds
     os.utime(path, (mtime, mtime))
     return path
@@ -146,7 +161,7 @@ def test_offhost_ships_newest_bak_and_writes_heartbeat(tmp_path):
     newest = _make_bak(
         backup_dir / "scout.db.bak.20260525T030000Z",
         age_seconds=3600,
-        payload=b"NEWEST",
+        payload=_db_bytes(b"NEWEST"),
     )
 
     before = int(time.time())
@@ -163,7 +178,7 @@ def test_offhost_ships_newest_bak_and_writes_heartbeat(tmp_path):
     # Newest .bak landed at destination
     shipped = dest / newest.name
     assert shipped.exists(), f"expected {shipped} after rsync"
-    assert shipped.read_bytes() == b"NEWEST"
+    assert shipped.read_bytes() == _db_bytes(b"NEWEST")
 
     # Heartbeat is unix-timestamp-ish
     assert heartbeat.exists()
@@ -187,13 +202,13 @@ def test_offhost_skips_partial_sentinel_files(tmp_path):
     real = _make_bak(
         backup_dir / "scout.db.bak.20260524T030000Z",
         age_seconds=7200,
-        payload=b"REAL",
+        payload=_db_bytes(b"REAL"),
     )
     # Even though .partial is newer (lower age), it must be skipped.
     _make_bak(
         backup_dir / "scout.db.bak.20260525T030000Z.partial",
         age_seconds=1800,
-        payload=b"PARTIAL",
+        payload=_db_bytes(b"PARTIAL"),
     )
 
     proc = _run(
@@ -286,13 +301,13 @@ def test_offhost_skips_every_partial_sidecar_not_just_dot_partial(tmp_path, suff
     real = _make_bak(
         backup_dir / "scout.db.bak.20260524T030000Z",
         age_seconds=7200,
-        payload=b"REAL-BACKUP-PAYLOAD",
+        payload=_db_bytes(b"REAL-BACKUP-PAYLOAD"),
     )
     # Newer than the real backup — must still lose.
     _make_bak(
         backup_dir / f"scout.db.bak.20260525T030000Z{suffix}",
         age_seconds=60,
-        payload=b"SIDECAR",
+        payload=_db_bytes(b"SIDECAR"),
     )
 
     proc = _run(
@@ -307,7 +322,7 @@ def test_offhost_skips_every_partial_sidecar_not_just_dot_partial(tmp_path, suff
     assert (dest / real.name).exists(), (
         f"the genuine backup was not shipped; {suffix} won NEWEST selection"
     )
-    assert (dest / real.name).read_bytes() == b"REAL-BACKUP-PAYLOAD"
+    assert (dest / real.name).read_bytes() == _db_bytes(b"REAL-BACKUP-PAYLOAD")
     shipped = sorted(p.name for p in dest.iterdir())
     assert not any(".partial" in n for n in shipped), (
         f"shipped an in-progress artifact off-host: {shipped}"
@@ -341,7 +356,7 @@ def test_offhost_skips_sidecars_beside_a_completed_backup(tmp_path, suffix):
     real = _make_bak(
         backup_dir / "scout.db.bak.20260815T030000Z",
         age_seconds=7200,
-        payload=b"REAL-BACKUP-PAYLOAD",
+        payload=_db_bytes(b"REAL-BACKUP-PAYLOAD"),
     )
     # Minted by the integrity check — newer than the backup it describes.
     _make_bak(
@@ -363,7 +378,7 @@ def test_offhost_skips_sidecars_beside_a_completed_backup(tmp_path, suffix):
     assert shipped == [real.name], (
         f"a SQLite sidecar won NEWEST selection and was shipped off-host: {shipped}"
     )
-    assert (dest / real.name).read_bytes() == b"REAL-BACKUP-PAYLOAD"
+    assert (dest / real.name).read_bytes() == _db_bytes(b"REAL-BACKUP-PAYLOAD")
 
 
 def test_offhost_still_ships_an_operator_tag_containing_a_sidecar_word(tmp_path):
@@ -381,12 +396,12 @@ def test_offhost_still_ships_an_operator_tag_containing_a_sidecar_word(tmp_path)
     tagged = _make_bak(
         backup_dir / "scout.db.bak.before-wal-migration",
         age_seconds=60,
-        payload=b"HAND-MADE",
+        payload=_db_bytes(b"HAND-MADE"),
     )
     _make_bak(
         backup_dir / "scout.db.bak.20260815T030000Z",
         age_seconds=7200,
-        payload=b"AUTO",
+        payload=_db_bytes(b"AUTO"),
     )
 
     proc = _run(

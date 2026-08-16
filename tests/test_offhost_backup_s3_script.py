@@ -62,6 +62,12 @@ Fault injection (env):
                               the promotion silently damages the object
   FAKE_RCLONE_NO_HASH=1       lsjson omits the Hashes block
   FAKE_RCLONE_STAT_NULL=1     lsjson answers a missing object with `null`, exit 0
+  FAKE_RCLONE_NO_HASH_AFTER_MOVE=1
+                              lsjson omits Hashes for the PROMOTED key only:
+                              the multipart server-side copy losing its
+                              Md5chksum metadata
+  FAKE_RCLONE_UPPER_HASH=1    lsjson reports the md5 in uppercase
+  FAKE_RCLONE_DELETE_FAIL=1   deletefile exits non-zero
   FAKE_RCLONE_LEAK_SECRET=1   copyto echoes its credentials on stderr and fails
 """
 import hashlib
@@ -150,6 +156,9 @@ def main(argv):
         return 0
 
     if cmd == "deletefile":
+        if os.environ.get("FAKE_RCLONE_DELETE_FAIL") == "1":
+            sys.stderr.write("rclone: simulated delete failure\n")
+            return 1
         path = local_path(argv[-1])
         if os.path.exists(path):
             os.remove(path)
@@ -175,8 +184,15 @@ def main(argv):
             "ModTime": "2026-08-16T00:00:00.000000000Z",
             "IsDir": False,
         }
-        if os.environ.get("FAKE_RCLONE_NO_HASH") != "1":
-            entry["Hashes"] = {"md5": hashlib.md5(data).hexdigest()}
+        promoted = not path.endswith(".partial-upload")
+        drop_hash = os.environ.get("FAKE_RCLONE_NO_HASH") == "1" or (
+            promoted and os.environ.get("FAKE_RCLONE_NO_HASH_AFTER_MOVE") == "1"
+        )
+        if not drop_hash:
+            digest = hashlib.md5(data).hexdigest()
+            if os.environ.get("FAKE_RCLONE_UPPER_HASH") == "1":
+                digest = digest.upper()
+            entry["Hashes"] = {"md5": digest}
         sys.stdout.write(json.dumps(entry) + "\n")
         return 0
 
@@ -193,7 +209,12 @@ if __name__ == "__main__":
 def fake_rclone(tmp_path):
     """Install the fake rclone and return (binary_path, s3_root, log_path)."""
     binary = tmp_path / "fake-rclone"
-    binary.write_text(FAKE_RCLONE)
+    # Explicit UTF-8: write_text() otherwise uses the platform default (cp1252
+    # on Windows), and python3 refuses to parse a non-UTF-8 source file without
+    # an encoding declaration. The fake's own source is kept ASCII-only for the
+    # same reason — belt and braces, since a locale-dependent test fixture
+    # fails in a way that looks like a script bug.
+    binary.write_text(FAKE_RCLONE, encoding="utf-8")
     binary.chmod(binary.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     s3_root = tmp_path / "s3"
     s3_root.mkdir()
@@ -230,14 +251,30 @@ def _run(env_overrides=None):
     )
 
 
-def _make_bak(path: Path, age_seconds: int, payload: bytes = b"backup data") -> Path:
-    path.write_bytes(payload)
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _db_bytes(marker: bytes = b"REAL-BACKUP-PAYLOAD") -> bytes:
+    """A payload that clears the plausibility floor.
+
+    Real SQLite magic, padded past the 512-byte minimum, with a caller-supplied
+    marker so tests can still assert WHICH file was shipped. Test fixtures have
+    to look like databases now, because the script refuses to ship anything
+    that doesn't — see the stub tests at the bottom of this file."""
+    body = SQLITE_MAGIC + marker
+    return body.ljust(512, b"\x00")
+
+
+def _make_bak(path: Path, age_seconds: int, payload: bytes | None = None) -> Path:
+    path.write_bytes(_db_bytes() if payload is None else payload)
     mtime = time.time() - age_seconds
     os.utime(path, (mtime, mtime))
     return path
 
 
-def _seed(tmp_path, payload=b"REAL-BACKUP-PAYLOAD-0123456789"):
+def _seed(tmp_path, payload=None):
+    if payload is None:
+        payload = _db_bytes()
     backup_dir = tmp_path / "src"
     backup_dir.mkdir()
     newest = _make_bak(
@@ -426,11 +463,13 @@ def test_s3_never_deletes_the_local_copy(tmp_path, fake_rclone):
     gecko-backup-rotate.sh and must stay independent of this script."""
     backup_dir, newest = _seed(tmp_path)
     older = _make_bak(
-        backup_dir / "scout.db.bak.20260815T030000Z", age_seconds=90000, payload=b"OLD"
+        backup_dir / "scout.db.bak.20260815T030000Z",
+        age_seconds=90000,
+        payload=_db_bytes(b"OLD"),
     )
     proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
     assert proc.returncode == 0, f"stderr: {proc.stderr}"
-    assert newest.exists() and newest.read_bytes() == b"REAL-BACKUP-PAYLOAD-0123456789"
+    assert newest.exists() and newest.read_bytes() == _db_bytes()
     assert older.exists(), "an older local backup was removed — retention is not ours"
 
 
@@ -449,6 +488,13 @@ def test_s3_size_mismatch_fails_loudly_and_writes_no_heartbeat(tmp_path, fake_rc
 
     assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
     assert "SIZE MISMATCH" in proc.stderr
+    # WHICH gate caught it, not merely that something did. Without these two,
+    # disabling the staged-verify gate entirely leaves every other assertion
+    # passing, because the FINAL verify then catches the same corruption and
+    # prints a near-identical message under a different label. The staged gate
+    # is the one that keeps a bad object from ever wearing the backup's name.
+    assert "staged upload" in proc.stderr, proc.stderr
+    assert "promoted object" not in proc.stderr, proc.stderr
     assert not (tmp_path / "hb").exists(), "heartbeat written for an unverified upload"
     assert not _remote_obj(
         fake_rclone, newest.name
@@ -651,12 +697,12 @@ def test_s3_never_ships_an_in_progress_file_or_a_sidecar(tmp_path, fake_rclone, 
     real = _make_bak(
         backup_dir / "scout.db.bak.20260815T030000Z",
         age_seconds=7200,
-        payload=b"REAL-BACKUP-PAYLOAD",
+        payload=_db_bytes(b"REAL-BACKUP-PAYLOAD"),
     )
     _make_bak(
         backup_dir / f"scout.db.bak.20260816T030000Z{suffix}",
         age_seconds=60,
-        payload=b"SIDECAR",
+        payload=_db_bytes(b"SIDECAR"),
     )
 
     proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
@@ -664,7 +710,7 @@ def test_s3_never_ships_an_in_progress_file_or_a_sidecar(tmp_path, fake_rclone, 
 
     shipped = sorted(p.name for p in _remote_dir(fake_rclone).iterdir())
     assert shipped == [real.name], f"wrong object shipped off-host: {shipped}"
-    assert _remote_obj(fake_rclone, real.name).read_bytes() == b"REAL-BACKUP-PAYLOAD"
+    assert _remote_obj(fake_rclone, real.name).read_bytes() == _db_bytes(b"REAL-BACKUP-PAYLOAD")
 
 
 def test_s3_ships_an_operator_tag_containing_a_sidecar_word(tmp_path, fake_rclone):
@@ -676,10 +722,12 @@ def test_s3_ships_an_operator_tag_containing_a_sidecar_word(tmp_path, fake_rclon
     tagged = _make_bak(
         backup_dir / "scout.db.bak.before-wal-migration",
         age_seconds=60,
-        payload=b"HAND-MADE",
+        payload=_db_bytes(b"HAND-MADE"),
     )
     _make_bak(
-        backup_dir / "scout.db.bak.20260815T030000Z", age_seconds=7200, payload=b"AUTO"
+        backup_dir / "scout.db.bak.20260815T030000Z",
+        age_seconds=7200,
+        payload=_db_bytes(b"AUTO"),
     )
 
     proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
@@ -785,3 +833,194 @@ def test_md5sum_available_for_verification():
     digest = hashlib.md5(b"x").hexdigest()
     out = subprocess.run(["md5sum"], input=b"x", capture_output=True).stdout.decode()
     assert out.split()[0] == digest
+
+
+# ---------------------------------------------------------------------
+# Unverifiable is not the same as wrong (review S2-3)
+# ---------------------------------------------------------------------
+
+
+def test_s3_unverifiable_promoted_object_is_KEPT_not_deleted(tmp_path, fake_rclone):
+    """The promotion drops the hash metadata. The object is not proven wrong —
+    it is unproven — and it must survive.
+
+    These exact bytes passed the staged verify seconds earlier; what failed is
+    the read-back. Deleting on that basis destroys a probably-good backup to
+    punish our own ignorance, and buys nothing: the heartbeat is withheld
+    either way, so the watchdog pages identically. It also matters at size — a
+    >5 GiB object is promoted by a multipart server-side copy that may
+    legitimately not carry Md5chksum forward, and the deleting version would
+    re-upload the entire backup every night forever."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_NO_HASH_AFTER_MOVE"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    obj = _remote_obj(fake_rclone, newest.name)
+    assert obj.exists(), "an unproven — not disproven — off-host copy was deleted"
+    assert obj.read_bytes() == newest.read_bytes()
+    assert "LEFT IN PLACE" in proc.stderr, proc.stderr
+    # Withheld regardless, so the operator is still paged.
+    assert not (tmp_path / "hb").exists()
+
+
+def test_s3_provably_wrong_promoted_object_is_still_deleted(tmp_path, fake_rclone):
+    """The other side of the same discrimination: a promotion that corrupts the
+    bytes IS provably wrong, and deleting it loses nothing. If this test and the
+    one above ever agree, the distinction has collapsed."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_CORRUPT_ON_MOVE"] = "garble"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert not _remote_obj(fake_rclone, newest.name).exists()
+    assert "PROVABLY WRONG" in proc.stderr, proc.stderr
+    assert not (tmp_path / "hb").exists()
+
+
+# ---------------------------------------------------------------------
+# Plausibility floor: is the selected file actually a database? (S2-5)
+# ---------------------------------------------------------------------
+
+
+def test_s3_refuses_to_ship_a_zero_byte_stub(tmp_path, fake_rclone):
+    """*** A stub uploads and VERIFIES perfectly. ***
+
+    0 == 0 and md5-of-nothing == md5-of-nothing, so every check downstream
+    passes and a GREEN heartbeat gets written over a lane whose only off-site
+    copy is an empty file. gecko-backup-create.sh cannot produce this, but an
+    interrupted ad-hoc `cp` — the workflow this script deliberately keeps
+    supporting — produces exactly it."""
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    real = _make_bak(
+        backup_dir / "scout.db.bak.20260815T030000Z",
+        age_seconds=7200,
+        payload=_db_bytes(b"REAL"),
+    )
+    _make_bak(backup_dir / "scout.db.bak.20260816T030000Z", age_seconds=60, payload=b"")
+
+    proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
+
+    assert proc.returncode == 2, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "does not look like a SQLite database" in proc.stderr
+    assert not (tmp_path / "hb").exists(), "green heartbeat over a stub"
+    shipped = (
+        sorted(p.name for p in _remote_dir(fake_rclone).iterdir())
+        if _remote_dir(fake_rclone).exists()
+        else []
+    )
+    assert shipped == [], f"a stub was shipped off-host: {shipped}"
+    # And it did NOT quietly fall back to the older good backup: a silent
+    # fallback would ship a stale copy while hiding that the newest is broken.
+    assert not _remote_obj(fake_rclone, real.name).exists()
+
+
+def test_s3_refuses_a_file_that_is_big_enough_but_is_not_a_database(
+    tmp_path, fake_rclone
+):
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    _make_bak(
+        backup_dir / "scout.db.bak.20260816T030000Z",
+        age_seconds=60,
+        payload=b"N" * 4096,
+    )
+    proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
+
+    assert proc.returncode == 2, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "not a SQLite header" in proc.stderr
+    assert not (tmp_path / "hb").exists()
+
+
+def test_s3_refuses_a_database_header_below_the_size_floor(tmp_path, fake_rclone):
+    """Header alone is not enough — a truncated copy keeps the magic bytes."""
+    backup_dir = tmp_path / "src"
+    backup_dir.mkdir()
+    _make_bak(
+        backup_dir / "scout.db.bak.20260816T030000Z",
+        age_seconds=60,
+        payload=SQLITE_MAGIC + b"\x00" * 64,
+    )
+    proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
+
+    assert proc.returncode == 2, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "floor=512B" in proc.stderr
+    assert not (tmp_path / "hb").exists()
+
+
+def test_s3_floor_is_configurable(tmp_path, fake_rclone):
+    backup_dir, _ = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["GECKO_OFFHOST_MIN_BACKUP_BYTES"] = "999999"
+    proc = _run(env)
+    assert proc.returncode == 2, f"stderr: {proc.stderr}"
+    assert "floor=999999B" in proc.stderr
+
+
+def test_s3_a_real_backup_still_ships(tmp_path, fake_rclone):
+    """Counter-case. A floor that rejects genuine backups is worse than none —
+    it converts a working lane into a silent one."""
+    backup_dir, newest = _seed(tmp_path)
+    proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
+    assert proc.returncode == 0, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert _remote_obj(fake_rclone, newest.name).exists()
+    assert (tmp_path / "hb").exists()
+
+
+# ---------------------------------------------------------------------
+# Cheap correctness (review S2-6)
+# ---------------------------------------------------------------------
+
+
+def test_s3_uppercase_remote_hash_still_verifies(tmp_path, fake_rclone):
+    """md5sum emits lowercase; the remote sends whatever it likes. Without a
+    case-fold an uppercase digest is a permanent exit 5 under a message that
+    falsely swears the remote stored different bytes."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_UPPER_HASH"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert _remote_obj(fake_rclone, newest.name).exists()
+    assert (tmp_path / "hb").exists()
+    assert "MISMATCH" not in proc.stderr
+
+
+def test_s3_does_not_pass_hash_type_to_lsjson(tmp_path, fake_rclone):
+    """`--hash-type` is not covered by the rclone floor the runbook states, and
+    an rclone that rejects it exits non-zero — which _verify_remote reads as
+    absent, discarding the real reason and re-uploading every run. Plain
+    `--hash` returns every hash the backend knows."""
+    backup_dir, _ = _seed(tmp_path)
+    proc = _run(_s3_env(tmp_path, fake_rclone, backup_dir=backup_dir))
+    assert proc.returncode == 0, f"stderr: {proc.stderr}"
+
+    lsjson_calls = [
+        ln
+        for ln in fake_rclone[2].read_text().splitlines()
+        if ln.startswith("ARGS: lsjson")
+    ]
+    assert lsjson_calls, "lsjson was never called"
+    for line in lsjson_calls:
+        assert "--hash" in line, line
+        assert "--hash-type" not in line, line
+
+
+def test_s3_failed_cleanup_is_reported_not_claimed(tmp_path, fake_rclone):
+    """"Removing the staging key" must not read as an accomplished fact when the
+    delete failed — an orphan accrues storage cost, and the operator can only
+    chase it if the log says so."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_CORRUPT"] = "truncate"
+    env["FAKE_RCLONE_DELETE_FAIL"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert "could not delete" in proc.stderr, proc.stderr
+    assert "orphan" in proc.stderr.lower(), proc.stderr
+    assert _remote_obj(fake_rclone, newest.name + ".partial-upload").exists()

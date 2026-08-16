@@ -61,6 +61,12 @@
 #                                         (default "Other", correct for B2's
 #                                         S3-compatible API)
 #   GECKO_OFFHOST_S3_RCLONE_BIN         — override rclone binary (test seam)
+#   GECKO_OFFHOST_MIN_BACKUP_BYTES      — plausibility floor for the selected
+#                                         backup (default 512, the smallest a
+#                                         valid SQLite database can be). Below
+#                                         this, or missing the SQLite header,
+#                                         the run aborts with exit 2 rather
+#                                         than shipping a stub off-host.
 #
 # CREDENTIAL SCOPE: use a BUCKET-SCOPED application key, never an account-wide
 # master key. On Backblaze that is "Add a New Application Key" restricted to
@@ -77,8 +83,9 @@
 # Exit codes:
 #   0 = success (file shipped + VERIFIED + heartbeat written), OR the object
 #       was already present and verified (idempotent re-run), OR disabled
-#   2 = misconfiguration (no .bak found, can't create dirs, missing required
-#       env for the selected transport, unknown transport)
+#   2 = misconfiguration (no .bak found, the newest backup fails the
+#       plausibility floor, can't create dirs, missing required env for the
+#       selected transport, unknown transport)
 #   3 = lock contention (another invocation in flight)
 #   4 = transfer failed (rsync/rclone returned non-zero)
 #   5 = POST-UPLOAD VERIFICATION FAILED (remote size and/or content hash does
@@ -307,7 +314,42 @@ if [[ -z "$NEWEST" ]]; then
     exit 2
 fi
 
-SIZE="$(stat -c '%s' "$NEWEST" 2>/dev/null || echo unknown)"
+SIZE="$(stat -c '%s' "$NEWEST" 2>/dev/null || echo 0)"
+
+# PLAUSIBILITY FLOOR — is the thing we selected actually a database?
+#
+# The sidecar exclusions above answer "is this file one of the artifact shapes
+# we know about". They cannot answer "is this file a backup". A 0-byte
+# `scout.db.bak.<tag>` newer than every real backup passes every exclusion, is
+# selected, uploads fine, and VERIFIES — 0 == 0, and the md5 of nothing matches
+# the md5 of nothing — then writes a green heartbeat. The lane would look
+# healthy while the only copy outside the failure domain was a stub.
+#
+# gecko-backup-create.sh cannot produce that shape, but an interrupted ad-hoc
+# `cp scout.db scout.db.bak.<tag>` can, and that hand-made workflow is one this
+# script deliberately keeps supporting. So the file has to look like a SQLite
+# database before it is allowed to become the off-site copy.
+#
+# KNOWN LIMIT, stated rather than implied: this catches empty and non-database
+# stubs. It does NOT catch a `cp` interrupted late, which is already larger
+# than the floor and still carries a valid header. Proving completeness would
+# mean an integrity check over the whole multi-GB file on every run;
+# gecko-backup-create.sh already integrity-checks what IT produces, and this
+# floor is the cheap guard for the hand-made path.
+MIN_BACKUP_BYTES="${GECKO_OFFHOST_MIN_BACKUP_BYTES:-512}"
+if ! [[ "$MIN_BACKUP_BYTES" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: GECKO_OFFHOST_MIN_BACKUP_BYTES=$MIN_BACKUP_BYTES must be a non-negative integer" >&2
+    exit 2
+fi
+# 15 bytes, not the full 16-byte `SQLite format 3\0` magic: bash command
+# substitution strips NUL bytes, so the terminator cannot survive into a
+# variable to be compared. The 15-character prefix is already unambiguous.
+HEADER="$(head -c 15 "$NEWEST" 2>/dev/null || true)"
+if (( SIZE < MIN_BACKUP_BYTES )) || [[ "$HEADER" != "SQLite format 3" ]]; then
+    echo "ERROR: $NEWEST is the newest backup but does not look like a SQLite database (size=${SIZE}B, floor=${MIN_BACKUP_BYTES}B, header=$([[ "$HEADER" == "SQLite format 3" ]] && echo ok || echo 'not a SQLite header')). Refusing to ship it off-host: an empty or truncated stub would upload and VERIFY cleanly and then stand as the only copy outside this box. Check the backup directory by hand — an interrupted 'cp' leaves exactly this shape." >&2
+    exit 2
+fi
+
 echo "gecko-backup-offhost: transport=$TRANSPORT source=$NEWEST size=$SIZE dest=$DEST_LABEL"
 
 _write_heartbeat() {
@@ -381,12 +423,18 @@ if [[ -z "$LOCAL_MD5" ]]; then
 fi
 
 # Read back size + content hash for a remote object.
-#   0 = present and matches local
-#   1 = absent
-#   2 = present but WRONG, or present with no readable hash
-# The third case is deliberately not folded into "absent": an object we cannot
-# prove is correct must never be reported as a verified backup, and it must
-# never be silently accepted either.
+#   0 = present and MATCHES local
+#   1 = absent, or its metadata could not be fetched at all
+#   2 = present and PROVABLY WRONG (size or hash differs from local)
+#   3 = present but UNPROVABLE (no readable size, or the remote reported no
+#       hash) — we know nothing about the bytes either way
+#
+# 2 and 3 are separate return codes and not one "failed" bucket, because they
+# license different ACTIONS, not just different messages. A provably-wrong
+# object is garbage and deleting it loses nothing. An unprovable object may be
+# a perfectly good backup that a backend simply would not checksum for us, and
+# deleting it destroys a copy to punish our own ignorance. Neither is ever
+# reported as verified.
 _verify_remote() {
     local obj="$1" label="$2"
     local meta got_size got_md5
@@ -396,7 +444,13 @@ _verify_remote() {
     # readable Size — which the guards below would report as "present but
     # unverifiable" and turn a perfectly ordinary first-ever upload into a
     # verification failure.
-    if ! meta="$(_rclone lsjson --stat --hash --hash-type md5 "$obj" 2>/dev/null)"; then
+    # `--hash` without `--hash-type`: the runbook's stated rclone floor (1.59,
+    # the version that introduced `--stat`) does not cover `--hash-type` on
+    # lsjson, and an rclone that rejects the flag exits non-zero — which this
+    # function would report as "absent", discarding the real reason and
+    # triggering a full re-upload every run. Plain `--hash` returns every hash
+    # the backend knows; the md5 is picked out of the JSON below.
+    if ! meta="$(_rclone lsjson --stat --hash "$obj" 2>/dev/null)"; then
         return 1
     fi
     meta="$(_trim "$meta")"
@@ -408,31 +462,47 @@ _verify_remote() {
 
     if [[ -z "$got_size" ]]; then
         echo "ERROR: $label — the remote object exists but its size could not be read back; refusing to call it verified" >&2
-        return 2
+        return 3
     fi
     if (( got_size != LOCAL_SIZE )); then
         echo "ERROR: $label — SIZE MISMATCH: local=$LOCAL_SIZE remote=$got_size ($obj)" >&2
         return 2
     fi
     if [[ -z "$got_md5" ]]; then
-        # Not a pass. A remote that cannot report a whole-object hash gives us
-        # no way to distinguish a good copy from a same-length corrupt one, and
-        # "the sizes matched" is the weakest possible restore guarantee.
+        # Not a pass, but not a mismatch either. A remote that cannot report a
+        # whole-object hash gives us no way to distinguish a good copy from a
+        # same-length corrupt one, and "the sizes matched" is the weakest
+        # possible restore guarantee. Return 3, so callers that would delete a
+        # provably-bad object leave this one alone.
         echo "ERROR: $label — the remote reported NO md5 for the object, so its contents cannot be verified (size matched at $got_size bytes, which is not sufficient)" >&2
-        return 2
+        return 3
     fi
-    if [[ "$got_md5" != "$LOCAL_MD5" ]]; then
+    # Case-fold before comparing. md5sum emits lowercase, but the hash comes
+    # back from whatever the backend chose to send; an uppercase digest would
+    # otherwise mismatch forever, under a message that falsely swears the
+    # remote "stored different bytes".
+    got_md5="${got_md5,,}"
+    if [[ "$got_md5" != "${LOCAL_MD5,,}" ]]; then
         echo "ERROR: $label — CONTENT HASH MISMATCH: local md5=$LOCAL_MD5 remote md5=$got_md5 (size matched at $got_size bytes — the upload returned success and stored different bytes)" >&2
         return 2
     fi
     return 0
 }
 
+# Best-effort delete. Reports whether it actually worked rather than letting
+# the caller's "Removing the staging key" read as an accomplished fact — a
+# delete that failed leaves an orphan object accruing storage cost, and the
+# operator can only chase it if the log says so.
 _delete_remote() {
-    local obj="$1" out=""
-    out="$(_rclone deletefile "$obj" 2>&1 || true)"
-    [[ -n "$out" ]] && printf 'gecko-backup-offhost: %s
-' "$(_redact "$out")"
+    local obj="$1" out="" rc=0
+    out="$(_rclone deletefile "$obj" 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        echo "WARNING: could not delete $obj (rclone exited $rc) — an orphan object may remain off-host and will need removing by hand" >&2
+        [[ -n "$out" ]] && printf '%s\n' "$(_redact "$out")" >&2
+        return 0
+    fi
+    [[ -n "$out" ]] && printf 'gecko-backup-offhost: %s\n' "$(_redact "$out")"
+    echo "gecko-backup-offhost: removed $obj"
     return 0
 }
 
@@ -448,6 +518,8 @@ if (( PRE_RC == 0 )); then
 fi
 if (( PRE_RC == 2 )); then
     echo "gecko-backup-offhost: a remote object already exists at $REMOTE_OBJ but does NOT match the local backup — re-uploading over it" >&2
+elif (( PRE_RC == 3 )); then
+    echo "gecko-backup-offhost: a remote object already exists at $REMOTE_OBJ but could not be verified (see the reason above) — re-uploading to replace it with a copy we can prove" >&2
 fi
 
 # --- upload to the staging key
@@ -499,9 +571,27 @@ set +e
 _verify_remote "$REMOTE_OBJ" "promoted object"
 FINAL_RC=$?
 set -e
-if (( FINAL_RC != 0 )); then
-    echo "ERROR: the promoted object at $REMOTE_OBJ does not verify. Deleting it rather than leaving a bad copy under a good name, and NOT writing the heartbeat — the watchdog must see this as a missing off-host backup." >&2
+if (( FINAL_RC == 2 )); then
+    # PROVABLY wrong: the bytes up there are not the backup. Deleting loses
+    # nothing and stops a known-bad object sitting under a name a restore
+    # would trust.
+    echo "ERROR: the promoted object at $REMOTE_OBJ is PROVABLY WRONG. Deleting it rather than leaving a bad copy under a good name, and NOT writing the heartbeat — the watchdog must see this as a missing off-host backup." >&2
     _delete_remote "$REMOTE_OBJ"
+    exit 5
+fi
+if (( FINAL_RC != 0 )); then
+    # UNPROVABLE, not wrong — and the object is KEPT.
+    #
+    # These same bytes passed the staged verify seconds ago; what failed here
+    # is the read-back, typically a promotion that did not carry the hash
+    # metadata forward or a metadata request that errored. Deleting on that
+    # basis destroys a copy that is probably fine in order to punish our own
+    # ignorance, and it buys nothing: the heartbeat is withheld either way, so
+    # the watchdog pages identically. On a >5 GiB object, where the promotion
+    # is a multipart server-side copy that may legitimately drop the
+    # Md5chksum metadata, the deleting version would also re-upload the whole
+    # backup every single night.
+    echo "ERROR: the promoted object at $REMOTE_OBJ could not be VERIFIED (see the reason above). It is being LEFT IN PLACE — it may well be a good copy that the remote would not checksum, and deleting an unproven object destroys a backup to punish our own ignorance. The heartbeat is NOT written, so the watchdog still reports this lane as broken; verify or remove the object by hand." >&2
     exit 5
 fi
 
