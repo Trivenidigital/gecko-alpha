@@ -146,3 +146,94 @@ def test_health_offhost_corrupt_heartbeat_treated_stale(
     assert data["offhost_configured"] is True
     assert data["offhost_heartbeat_age_sec"] is None
     assert data["offhost_heartbeat_fresh"] is False
+
+
+# ---------------------------------------------------------------------
+# The s3/B2 transport counts as "configured" too
+# ---------------------------------------------------------------------
+
+
+def test_health_offhost_configured_via_s3_bucket(monkeypatch, tmp_path, _scout_db_stub):
+    """*** Regression guard for the transport split. ***
+
+    `GECKO_OFFHOST_BACKUP_DEST` is the RSYNC destination. The s3/B2 transport is
+    configured by `GECKO_OFFHOST_S3_BUCKET` and leaves DEST unset, so keying
+    this field on DEST alone reports `offhost_configured: False` — "the operator
+    hasn't enabled this" — on a box where the lane is fully configured and
+    shipping nightly. That is exactly the reading this field exists to
+    distinguish from "enabled but stale", so the false negative would hide a
+    dead lane rather than surface it."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.setenv("GECKO_OFFHOST_S3_BUCKET", "gecko-backups")
+    hb = tmp_path / "offhost-last-ok"
+    hb.write_text(str(int(time.time())))
+    monkeypatch.setenv("GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(hb))
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is True
+    assert data["offhost_heartbeat_fresh"] is True
+
+
+def test_health_offhost_s3_configured_but_stale_is_not_reported_unconfigured(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """The dangerous half: an s3 lane that has stopped shipping must read as
+    configured-and-stale, not as never-enabled."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.setenv("GECKO_OFFHOST_S3_BUCKET", "gecko-backups")
+    hb = tmp_path / "offhost-last-ok"
+    hb.write_text(str(int(time.time()) - 999999))
+    monkeypatch.setenv("GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(hb))
+    monkeypatch.setenv("GECKO_BACKUP_STALE_AFTER_SEC", "3600")
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is True
+    assert data["offhost_heartbeat_fresh"] is False
+
+
+def test_health_offhost_unconfigured_when_neither_transport_is_set(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """Counter-case: broadening the check must not make every box look
+    configured."""
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.delenv("GECKO_OFFHOST_S3_BUCKET", raising=False)
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(tmp_path / "never-written")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is False
+
+
+def test_health_offhost_whitespace_bucket_is_not_configured(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    _set_local_backup_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GECKO_OFFHOST_BACKUP_DEST", raising=False)
+    monkeypatch.setenv("GECKO_OFFHOST_S3_BUCKET", "   ")
+    monkeypatch.setenv(
+        "GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE", str(tmp_path / "never-written")
+    )
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["offhost_configured"] is False

@@ -1763,6 +1763,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         #
         # Same definition as gecko-backup-rotate.sh and gecko-backup-offhost.sh
         # — "completed backup" must mean one thing across every reader.
+        #
+        # 2026-08-16: that claim had gone false. The `.partial` exclusion above
+        # covers the 2026-08-08 family; it does NOT cover the SQLite sidecars a
+        # reader mints beside a COMPLETED backup — those names contain no
+        # `.partial` at all. Rotation was fixed on 2026-08-15 and the off-host
+        # shipper in this change, leaving THIS reader as the last one still
+        # counting a 0-byte `-wal` as the newest backup and reporting its age
+        # and size as the backup's. A comment asserting a shared definition is
+        # worth nothing unless every reader is checked against it.
         backup_dir = Path(os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha"))
         try:
             files = sorted(
@@ -1770,7 +1779,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     p
                     for pattern in ("scout.db.bak.*", "scout.db.bak-*")
                     for p in backup_dir.glob(pattern)
-                    if p.is_file() and ".partial" not in p.name
+                    if p.is_file()
+                    and ".partial" not in p.name
+                    and not p.name.endswith(("-wal", "-shm", "-journal"))
                 ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
@@ -1792,7 +1803,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # "operator hasn't enabled this" (False) from "enabled but
         # stale" (True + fresh=False). Treating unconfigured as fresh
         # would mask a regression where the env was unset by accident.
-        if os.environ.get("GECKO_OFFHOST_BACKUP_DEST", "").strip():
+        #
+        # BOTH transports count. `GECKO_OFFHOST_BACKUP_DEST` is the rsync
+        # destination; the s3/B2 transport is configured by
+        # `GECKO_OFFHOST_S3_BUCKET` instead and leaves DEST unset. Keying this
+        # on DEST alone would report `offhost_configured: False` — "the
+        # operator hasn't enabled this" — on a box where the lane is fully
+        # configured and shipping nightly, which is precisely the reading this
+        # field exists to distinguish from "enabled but stale".
+        if (
+            os.environ.get("GECKO_OFFHOST_BACKUP_DEST", "").strip()
+            or os.environ.get("GECKO_OFFHOST_S3_BUCKET", "").strip()
+        ):
             backup_status["offhost_configured"] = True
             offhost_hb = Path(
                 os.environ.get(
