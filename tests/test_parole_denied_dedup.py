@@ -514,6 +514,15 @@ async def test_ledger_wiring_error_does_not_leak_the_gate_transaction(
         finally:
             supp_mod.denial_digest = real
 
+        # LIVE TRIPWIRE — do not delete as dead weight. It guards a REACHABLE
+        # future state, not a hypothetical one: hoisting the digest above
+        # `BEGIN IMMEDIATE` is a two-part edit (it also needs `suppressed_at`
+        # added to the lock-free SELECT, which does not currently fetch it), and
+        # "do less work while holding the lock" is exactly the optimisation a
+        # future author reaches for. Make that edit and this assertion fires
+        # with its own message; without it the test would silently go vacuous,
+        # because `in_transaction is False` at the end is trivially true when no
+        # transaction was ever opened.
         assert seen.get("in_txn_at_raise") is True, (
             "the injection fired before BEGIN IMMEDIATE — this test would be "
             "vacuous, since in_transaction would be False either way"

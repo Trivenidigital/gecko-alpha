@@ -342,9 +342,15 @@ async def _open_gate(
             #
             # WHAT THE LEAK COSTS, measured rather than reasoned:
             #   * The connection keeps the RESERVED write lock it took at
-            #     BEGIN IMMEDIATE, so every OTHER PROCESS on this database
-            #     (dashboard, cron, backup) gets "database is locked" for as
-            #     long as the leak lasts — unbounded if no dispatch follows.
+            #     BEGIN IMMEDIATE, so every other process's WRITES get
+            #     "database is locked" until the next transaction attempt on
+            #     this connection clears it (e.g. the refund path's BEGIN
+            #     IMMEDIATE below, or any committing writer).
+            #     Scoped deliberately: the DB runs in WAL, and measured against
+            #     a live leaked transaction a foreign READ still succeeds and
+            #     so does `wal_checkpoint(TRUNCATE)`. So the dashboard — a
+            #     reader — keeps working, and the 03:00 backup checkpoint is
+            #     NOT blocked. Writers are the casualty, and only writers.
             #   * The next `BEGIN IMMEDIATE` raises OperationalError "cannot
             #     start a transaction within a transaction", whose message
             #     contains neither "locked" nor "busy", so it falls to the
@@ -372,6 +378,13 @@ async def _open_gate(
                 # this can raise CancelledError. Under cancellation the rollback
                 # therefore is NOT guaranteed — no promise is made here beyond
                 # never masking the original failure.
+                #
+                # KNOWN NARROW CONSEQUENCE, stated so it is not rediscovered: if
+                # the ROLLBACK itself raises CancelledError while the ORIGINAL
+                # is not a cancellation, this swallows that cancellation and
+                # re-raises the original — so a cancelled task can keep running
+                # to its next await point. That is the deliberate trade: the
+                # alternative is letting cleanup replace the real failure.
                 log.warning(
                     "suppression_rollback_failed",
                     combo_key=combo_key,
