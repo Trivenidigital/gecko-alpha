@@ -39,22 +39,156 @@ forked parallel script would have duplicated exactly it.
    ssh srilu-vps 'apt install -y rclone && rclone version'
    ```
    Minimum version 1.59 — the verification step uses `rclone lsjson --stat`.
-2. **A Backblaze B2 bucket** for these backups and nothing else.
-3. **A BUCKET-SCOPED application key** — "Add a New Application Key" restricted
-   to that one bucket. Never the account master key. The key this script holds
-   can, by design, overwrite the off-host copies; it must not be able to touch
-   anything else in the account.
-4. **The S3 endpoint** for the bucket's region, e.g.
-   `https://s3.us-west-004.backblazeb2.com`.
-5. **The shipper on a schedule, deployed and observed no-op'ing first.** See
+2. **The B2 bucket and application key**, created to the frozen specification
+   below — not to a generic "make a bucket" instruction.
+3. **The S3 endpoint** for the bucket's region, copied from the bucket's own
+   page in the B2 console (e.g. `https://s3.us-west-004.backblazeb2.com`).
+   Copy it; do not infer it.
+4. **The shipper triggered, deployed and observed no-op'ing first.** See
    Step 0 of the enable sequence. This is a prerequisite for the *watchdog*, not
    for the upload: enabling check 6 over a job nothing runs produces a page
    every cooldown window forever.
-6. **An age-based lifecycle rule on the bucket.** Nothing prunes the remote
+5. **An age-based lifecycle rule on the bucket.** Nothing prunes the remote
    side; see "Off-host retention" below.
-7. **The multipart metadata probe, passed.** See "Pre-enable probe" below. It
-   is the one assumption in this design that cannot be settled without real
-   credentials.
+6. **Every item on the ACTIVATION GATE checklist below, ticked.** That includes
+   the multipart metadata probe and verifying the installed rclone's real
+   not-found exit codes — the two assumptions in this design that cannot be
+   settled without real credentials.
+
+## The frozen B2 specification
+
+These values are the operator's ruling, not suggestions. Create the bucket and
+key to match exactly; where a choice was deliberately made against the obvious
+option, the reason is recorded so it is not "tidied up" later.
+
+### Bucket
+
+| Setting | Value |
+|---|---|
+| Name | `gecko-alpha-srilu-prod-backups-a81626` |
+| Visibility | **Private** |
+| Default encryption | **Enabled** |
+| Object Lock | **OFF for v1** |
+
+**Object Lock is off deliberately, and this is not an oversight.** This lane
+must be able to *delete* objects: it removes the `.partial-upload` staging key
+after every run, and it deletes an object it has proven wrong rather than
+leaving a bad copy under a name a restore would trust. It also promotes by
+server-side move. Immutability would fight all three. Object Lock is
+reconsidered only after those semantics have been exercised against real B2 —
+turning it on before that would convert a bug in the promotion path into
+undeletable garbage that still costs storage.
+
+**Bucket names are globally unique across all of B2.** If that exact name is
+taken, append another 4-6 random hex characters and use the result everywhere
+below. That is a **naming-availability workaround only — it is not a policy
+change**, and nothing else about this specification moves with it.
+
+### Application key
+
+| Setting | Value |
+|---|---|
+| Name | `gecko-alpha-srilu-offhost` |
+| Scope | **This bucket only** — never account-wide |
+| Capabilities | **Read *and* Write** |
+| `listAllBucketNames` | **Enabled** |
+| Key-level file prefix | **None** initially |
+| Expiry | **None** for initial activation |
+
+**Create it manually. The S3-compatible API does not work with the account
+master key** — B2 requires an application key for S3-style access, so "just use
+the master key to get started" is not a shortcut that exists.
+
+**Why write, when this is a backup uploader.** Read alone cannot run this lane.
+The shipper lists and reads back object metadata to *verify* (read), uploads
+(write), promotes the staging key to the final name (write), and deletes both
+the staging key and any object it has proven wrong (delete, which B2 documents
+as generally requiring the write/delete capability). A read-only key would fail
+at the first upload; a key without delete would leave orphaned staging objects
+accruing storage forever.
+
+**Why `listAllBucketNames`.** B2's own S3-compatibility guidance requires it for
+bucket-restricted keys; without it the S3 API surface cannot resolve the bucket
+and the lane fails in a way that looks like a credential error rather than a
+capability one.
+
+**No file prefix on the KEY**, even though the shipper writes under
+`hosts/srilu`. The prefix is the shipper's business (`GECKO_OFFHOST_S3_PREFIX`);
+pinning it at the key as well would mean a future prefix change silently
+becomes a permission failure.
+
+**No expiry for initial activation**, then **rotate once the lane and the
+restore drill are both proven**. An expiring key during bring-up produces an
+outage that is indistinguishable from the bugs bring-up exists to find.
+
+### Shipper prefix
+
+`GECKO_OFFHOST_S3_PREFIX=hosts/srilu` — objects land at
+`gecko-alpha-srilu-prod-backups-a81626/hosts/srilu/scout.db.bak.<timestamp>`.
+
+### The secret is shown ONCE
+
+B2 displays the application key secret exactly once, at creation. There is no
+"show again".
+
+**Never paste it into a chat, a PR, a commit, a shell command line, or a cron
+entry.** Every one of those is durable and readable: shell history persists,
+`ps auxwwe` exposes a process environment to any user on the box, and a repo
+keeps it forever. Install it straight into the env file:
+
+```bash
+ssh srilu-vps 'install -d -m 0700 /etc/gecko-alpha'
+ssh srilu-vps 'umask 077; cat > /etc/gecko-alpha/offhost.env' <<'EOF'
+GECKO_OFFHOST_BACKUP_TRANSPORT=s3
+GECKO_OFFHOST_S3_BUCKET=gecko-alpha-srilu-prod-backups-a81626
+GECKO_OFFHOST_S3_ENDPOINT=
+GECKO_OFFHOST_S3_KEY_ID=
+GECKO_OFFHOST_S3_APPLICATION_KEY=
+GECKO_OFFHOST_S3_PREFIX=hosts/srilu
+EOF
+ssh srilu-vps 'chown root:root /etc/gecko-alpha/offhost.env
+               chmod 0600 /etc/gecko-alpha/offhost.env
+               ls -l /etc/gecko-alpha/offhost.env'
+```
+
+Expect `-rw------- 1 root root`. Fill `_ENDPOINT`, `_KEY_ID` and
+`_APPLICATION_KEY` by editing the file **on the box** (`vi`), not by re-running
+a command with the values inline.
+
+Those six keys are the complete set the shipper reads for an s3 lane. The
+heartbeat, marker, and backup-directory paths come from the systemd unit, not
+from this file.
+
+## ACTIVATION GATE
+
+**All six must pass before `OFFHOST_BACKUP_WATCH_ENABLED` goes on.** The
+watchdog asserts that a verified off-host copy exists; enabling it before that
+is true converts the first real page into noise.
+
+- [ ] **1. Multipart metadata probe.** Upload a **>5 GiB** object, `moveto` it,
+      then confirm the *promoted* key still reports a **non-empty md5**. If the
+      metadata is stripped, switch the shipper to `copyto` straight to the final
+      key. See "Pre-enable probe" below for the exact commands and the tradeoff.
+- [ ] **2. Verify the INSTALLED rclone's actual not-found exit codes.** The
+      shipper maps 3 and 4 to "absent" and every other code to "unprovable".
+      Those numbers come from rclone's documentation, and documentation is not
+      the running program. See Step 2b.
+- [ ] **3. Upload one real backup** — a genuine `scout.db.bak.<ts>`, not the
+      probe object.
+- [ ] **4. Verify the promoted object's size AND hash** against the local file.
+- [ ] **5. Download it again** to a scratch path.
+- [ ] **6. Restore-check the downloaded copy** with
+      `sqlite3 "file:$PWD/restore.db?mode=ro&immutable=1" 'PRAGMA quick_check;'`
+      — `immutable=1` is mandatory; see the restore section for what a plain
+      `mode=ro` open cost on 2026-08-15.
+
+Only with all six ticked: set `OFFHOST_BACKUP_WATCH_ENABLED=true` on the
+alert-channel-watchdog cron line and redeploy the crontab.
+
+**Deployment reminder that catches people every time:** `git pull` deploys
+**nothing** for these scripts. The units execute `/usr/local/bin/…`, so
+deployment requires `install` plus an on-box check that the effective path holds
+what you think it does. See the Deployment section.
 
 ## Deployment: the `/usr/local/bin` trap
 

@@ -238,3 +238,122 @@ def test_runbook_requires_verifying_rclone_exit_codes_on_the_box():
     text = RUNBOOK.read_text(encoding="utf-8")
     assert "exit code" in text.lower()
     assert "lsjson" in text
+
+
+# ---------------------------------------------------------------------
+# The operator's frozen B2 specification
+# ---------------------------------------------------------------------
+#
+# These are binding values, not examples. They are asserted here so a later
+# edit cannot quietly return the runbook to generic "create a bucket" wording,
+# and so the deliberate-looking-wrong choices (Object Lock OFF, write
+# capability on a backup uploader) keep their recorded reasons.
+
+
+def _runbook():
+    return RUNBOOK.read_text(encoding="utf-8")
+
+
+def test_runbook_pins_the_exact_bucket_name():
+    assert "gecko-alpha-srilu-prod-backups-a81626" in _runbook()
+
+
+def test_runbook_pins_the_exact_key_name_and_prefix():
+    text = _runbook()
+    assert "gecko-alpha-srilu-offhost" in text
+    assert "GECKO_OFFHOST_S3_PREFIX=hosts/srilu" in text
+
+
+def test_runbook_records_object_lock_off_with_its_reason():
+    """Object Lock OFF looks like an oversight to anyone hardening the bucket
+    later. The reason has to travel with the value: this lane deletes staging
+    keys and provably-wrong objects, and promotes by server-side move."""
+    text = _runbook()
+    assert "Object Lock" in text
+    assert "OFF for v1" in text
+    lock_section = text.split("Object Lock is off deliberately", 1)
+    assert len(lock_section) == 2, "no rationale recorded for Object Lock OFF"
+
+
+def test_runbook_says_the_master_key_does_not_work():
+    """Otherwise the first instinct during bring-up is to 'just use the master
+    key to get started', which is not a shortcut that exists for the S3 API."""
+    text = _runbook()
+    assert "master key" in text
+    assert "manually" in text.lower()
+
+
+def test_runbook_justifies_write_capability_and_list_all_bucket_names():
+    text = _runbook()
+    assert "listAllBucketNames" in text
+    assert "Read" in text and "Write" in text
+    # The justification, not just the setting.
+    assert "read-only key would fail" in text.lower() or "Read alone cannot" in text
+
+
+def test_runbook_states_bucket_names_are_globally_unique_and_that_this_is_not_policy():
+    """A name collision must not be read as license to change the spec."""
+    text = _runbook()
+    assert "globally unique" in text
+    assert "not a policy" in text.lower()
+
+
+def test_runbook_forbids_the_secret_in_chat_pr_argv_or_cron():
+    text = _runbook().lower()
+    for forbidden in ("chat", "pr", "cron"):
+        assert forbidden in text, forbidden
+    assert "shown once" in text or "displayed" in text
+    assert "0600" in _runbook()
+    assert "root:root" in _runbook()
+
+
+def test_runbook_lists_exactly_the_six_env_keys():
+    text = _runbook()
+    for key in (
+        "GECKO_OFFHOST_BACKUP_TRANSPORT=s3",
+        "GECKO_OFFHOST_S3_BUCKET=",
+        "GECKO_OFFHOST_S3_ENDPOINT=",
+        "GECKO_OFFHOST_S3_KEY_ID=",
+        "GECKO_OFFHOST_S3_APPLICATION_KEY=",
+        "GECKO_OFFHOST_S3_PREFIX=hosts/srilu",
+    ):
+        assert key in text, key
+
+
+def test_runbook_has_a_six_step_activation_gate():
+    """Every step is a thing that has to be TRUE before the watchdog is armed,
+    and the ordering is the mitigation: probe and verify before uploading, prove
+    the restore before trusting the lane."""
+    text = _runbook()
+    gate = text.split("## ACTIVATION GATE", 1)
+    assert len(gate) == 2, "no activation gate section"
+    body = gate[1].split("\n## ", 1)[0]
+    checkboxes = [ln for ln in body.splitlines() if ln.strip().startswith("- [ ]")]
+    assert len(checkboxes) == 6, f"expected 6 gate items, found {len(checkboxes)}"
+    # Assert content against the WHOLE gate body, not just the first line of
+    # each item — the load-bearing detail (which URI a quick_check must use)
+    # lives on continuation lines.
+    lowered = body.lower()
+    assert "5 gib" in lowered or "5gib" in lowered
+    assert "exit code" in lowered
+    assert "hash" in lowered
+    assert "quick_check" in lowered
+    assert "immutable=1" in lowered
+
+
+def test_activation_gate_precedes_enabling_the_watch_flag():
+    text = _runbook()
+    gate = text.find("## ACTIVATION GATE")
+    # The LAST mention of arming the watchdog must come after the gate.
+    arm = text.rfind("OFFHOST_BACKUP_WATCH_ENABLED")
+    assert gate != -1 and arm != -1
+    assert gate < arm, "the gate is documented after the flag it guards"
+
+
+def test_runbook_repeats_the_usr_local_bin_trap_in_the_gate():
+    """`git pull` deploying nothing is the single most repeated deployment
+    mistake in this repo; it belongs where the operator is actually working."""
+    text = _runbook()
+    gate_onward = text.split("## ACTIVATION GATE", 1)[1]
+    assert "/usr/local/bin" in gate_onward
+    assert "git pull" in gate_onward
