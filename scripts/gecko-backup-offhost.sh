@@ -390,8 +390,17 @@ fi
 _verify_remote() {
     local obj="$1" label="$2"
     local meta got_size got_md5
-    meta="$(_rclone lsjson --stat --hash --hash-type md5 "$obj" 2>/dev/null || true)"
-    if [[ -z "$meta" ]]; then
+    # Absence is decided by rclone's EXIT STATUS first, not by empty output.
+    # `lsjson --stat` on a missing object exits non-zero, but the JSON `null`
+    # body some backends return would otherwise be non-empty text with no
+    # readable Size — which the guards below would report as "present but
+    # unverifiable" and turn a perfectly ordinary first-ever upload into a
+    # verification failure.
+    if ! meta="$(_rclone lsjson --stat --hash --hash-type md5 "$obj" 2>/dev/null)"; then
+        return 1
+    fi
+    meta="$(_trim "$meta")"
+    if [[ -z "$meta" || "$meta" == "null" ]]; then
         return 1
     fi
     got_size="$(printf '%s' "$meta" | sed -n 's/.*"Size"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' | head -n 1)"

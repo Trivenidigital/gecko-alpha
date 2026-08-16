@@ -61,6 +61,7 @@ Fault injection (env):
   FAKE_RCLONE_CORRUPT_ON_MOVE=truncate|garble
                               the promotion silently damages the object
   FAKE_RCLONE_NO_HASH=1       lsjson omits the Hashes block
+  FAKE_RCLONE_STAT_NULL=1     lsjson answers a missing object with `null`, exit 0
   FAKE_RCLONE_LEAK_SECRET=1   copyto echoes its credentials on stderr and fails
 """
 import hashlib
@@ -157,6 +158,11 @@ def main(argv):
     if cmd == "lsjson":
         path = local_path(argv[-1])
         if not os.path.isfile(path):
+            if os.environ.get("FAKE_RCLONE_STAT_NULL") == "1":
+                # Some backends answer --stat for a missing object with a JSON
+                # `null` body and exit 0 rather than erroring.
+                sys.stdout.write("null\n")
+                return 0
             sys.stderr.write("rclone: directory not found\n")
             return 3
         with open(path, "rb") as fh:
@@ -546,6 +552,31 @@ def test_s3_rerun_skips_an_already_verified_object(tmp_path, fake_rclone):
     # Still a fresh heartbeat: the off-host copy IS current, and a watchdog that
     # goes stale on a correctly-skipped upload would page for a healthy lane.
     assert (tmp_path / "hb").exists()
+
+
+def test_s3_first_upload_survives_a_null_stat_for_the_missing_object(
+    tmp_path, fake_rclone
+):
+    """Absence must be decided by rclone's exit status, not by empty output.
+
+    Some backends answer `lsjson --stat` for a missing object with a JSON
+    `null` body and exit 0. Treating "non-empty text" as "object present" still
+    ends in a correct upload — the object is absent, so the staged verify after
+    the upload passes — but every first-ever upload would first log
+    "its size could not be read back" and "a remote object already exists ...
+    but does NOT match ... re-uploading over it". Both are false, and a backup
+    lane that cries corruption on its own happy path is a lane whose warnings
+    stop being read."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_STAT_NULL"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 0, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert _remote_obj(fake_rclone, newest.name).read_bytes() == newest.read_bytes()
+    assert (tmp_path / "hb").exists()
+    assert "does NOT match" not in proc.stderr, proc.stderr
+    assert "could not be read back" not in proc.stderr, proc.stderr
 
 
 def test_s3_rerun_refreshes_the_heartbeat(tmp_path, fake_rclone):
