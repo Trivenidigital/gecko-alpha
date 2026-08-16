@@ -67,6 +67,8 @@ Fault injection (env):
                               the multipart server-side copy losing its
                               Md5chksum metadata
   FAKE_RCLONE_UPPER_HASH=1    lsjson reports the md5 in uppercase
+  FAKE_RCLONE_MOVE_VANISH=1   moveto exits 0, consumes the source, and produces
+                              no destination object
   FAKE_RCLONE_DELETE_FAIL=1   deletefile exits non-zero
   FAKE_RCLONE_LEAK_SECRET=1   copyto echoes its credentials on stderr and fails
 """
@@ -148,6 +150,10 @@ def main(argv):
         if not os.path.exists(src):
             sys.stderr.write("rclone: source not found\n")
             return 3
+        if os.environ.get("FAKE_RCLONE_MOVE_VANISH") == "1":
+            # Reports success, consumes the source, produces no destination.
+            os.remove(src)
+            return 0
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.move(src, dst)
         mode = os.environ.get("FAKE_RCLONE_CORRUPT_ON_MOVE", "")
@@ -1024,3 +1030,24 @@ def test_s3_failed_cleanup_is_reported_not_claimed(tmp_path, fake_rclone):
     assert "could not delete" in proc.stderr, proc.stderr
     assert "orphan" in proc.stderr.lower(), proc.stderr
     assert _remote_obj(fake_rclone, newest.name + ".partial-upload").exists()
+
+
+def test_s3_a_promotion_that_produced_nothing_is_not_called_left_in_place(
+    tmp_path, fake_rclone
+):
+    """rclone reports a successful move and no object exists.
+
+    That is ABSENT, not "unprovable". Reporting it as "the object is being left
+    in place" would describe something that does not exist and send the operator
+    hunting for a copy to verify by hand. Same discrimination as the rest of
+    this file: say only what is known."""
+    backup_dir, newest = _seed(tmp_path)
+    env = _s3_env(tmp_path, fake_rclone, backup_dir=backup_dir)
+    env["FAKE_RCLONE_MOVE_VANISH"] = "1"
+    proc = _run(env)
+
+    assert proc.returncode == 5, f"stdout: {proc.stdout} stderr: {proc.stderr}"
+    assert not _remote_obj(fake_rclone, newest.name).exists()
+    assert "NO object exists" in proc.stderr, proc.stderr
+    assert "LEFT IN PLACE" not in proc.stderr, proc.stderr
+    assert not (tmp_path / "hb").exists()

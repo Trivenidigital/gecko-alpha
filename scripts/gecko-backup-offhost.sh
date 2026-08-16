@@ -579,6 +579,14 @@ if (( FINAL_RC == 2 )); then
     _delete_remote "$REMOTE_OBJ"
     exit 5
 fi
+if (( FINAL_RC == 1 )); then
+    # Not "unprovable" — ABSENT. rclone reported a successful move and the
+    # object is not there. Saying it is "being left in place" would describe an
+    # object that does not exist, and would send the operator looking for
+    # something to verify by hand.
+    echo "ERROR: rclone reported a successful promotion but NO object exists at $REMOTE_OBJ. Nothing was left off-host by this run and the heartbeat is NOT written; treat the off-host copy as missing." >&2
+    exit 5
+fi
 if (( FINAL_RC != 0 )); then
     # UNPROVABLE, not wrong — and the object is KEPT.
     #
