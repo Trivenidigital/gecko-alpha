@@ -81,11 +81,20 @@ _ALERT_EVENTS_COLUMNS = (
 # Serves the `parole_denied` first-occurrence probe
 # (`WHERE event_type = ? AND payload_hash = ?`), which runs inside the locked
 # reservation on every dispatch attempt against a table that is never pruned.
-# This tuple is its ONLY definition: the vocabulary-drift rebuild below DROPs
-# `alert_events`, taking its indexes with it, and re-attaches exactly what is
-# listed here. An index created anywhere else would silently disappear the next
-# time the event vocabulary grows. `_migrate_alert_events_dedup_index_v1`
-# therefore verifies rather than creates.
+# This tuple is its ONLY definition, and TWO separate paths depend on that.
+#
+# The one that carries it on THIS deploy is the UNCONDITIONAL loop further down
+# (`for index_sql in _ALERT_EVENTS_INDEXES`), which re-executes every statement
+# here on every `initialize()`, outside the drift branch. Prod's `alert_events`
+# CHECK already contains `parole_denied`, so the vocabulary-drift rebuild does
+# NOT run on this deploy — that loop is the sole delivery mechanism, and
+# "simplifying" it away would silently drop the index on every non-rebuild boot.
+#
+# The second path matters later: when the vocabulary DOES next grow, the rebuild
+# DROPs `alert_events` and its indexes and re-attaches exactly what is listed
+# here. An index created anywhere else would vanish at that point.
+#
+# `_migrate_alert_events_dedup_index_v1` therefore verifies rather than creates.
 _ALERT_EVENTS_DEDUP_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_alert_events_dedup "
     "ON alert_events(event_type, payload_hash)"

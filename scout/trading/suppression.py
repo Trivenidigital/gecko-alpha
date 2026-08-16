@@ -327,6 +327,61 @@ async def _open_gate(
                 combo_key=combo_key,
             )
             return (False, "error", None)
+        except BaseException:
+            # NON-aiosqlite escapes. Both handlers above already roll back; this
+            # one exists because everything else that can be raised inside the
+            # locked block — a wiring bug in the ledger writer, an assertion, a
+            # cancellation — would otherwise leave `BEGIN IMMEDIATE` OPEN.
+            #
+            # MUST BE THE LAST CLAUSE. Python matches handlers in source order,
+            # so putting this above the two aiosqlite handlers would swallow the
+            # busy/locked branch and convert its deliberate fail-OPEN (see
+            # `deferred_fallback_err`) into a raise — the dispatcher would count
+            # an error and SKIP the candidate, inverting the contract stated in
+            # `should_open`'s own docstring.
+            #
+            # WHAT THE LEAK COSTS, measured rather than reasoned:
+            #   * The connection keeps the RESERVED write lock it took at
+            #     BEGIN IMMEDIATE, so every OTHER PROCESS on this database
+            #     (dashboard, cron, backup) gets "database is locked" for as
+            #     long as the leak lasts — unbounded if no dispatch follows.
+            #   * The next `BEGIN IMMEDIATE` raises OperationalError "cannot
+            #     start a transaction within a transaction", whose message
+            #     contains neither "locked" nor "busy", so it falls to the
+            #     `else` above and returns (False, "error") — ONE admission
+            #     LOST, not spent. That handler's own ROLLBACK then clears the
+            #     leak, so the gate self-heals on the following call rather
+            #     than staying down.
+            #   * Slot accounting is structurally untouched: this raise happens
+            #     on the DENIAL branch, which never reaches the decrement, and
+            #     `_open_gate` is awaited outside `parole_reservation`'s try, so
+            #     no `confirm()` runs. Verified 0 -> 0 on the raising combo and
+            #     3 -> 3 on a healthy one.
+            # So the ledger and the slot counters both keep looking clean while
+            # a foreign process is locked out. That invisibility is the reason
+            # this catches BaseException rather than Exception.
+            try:
+                # Guarded rather than blind: the two handlers above may already
+                # have rolled back, and ROLLBACK with no active transaction is
+                # itself an error — which must never displace the real one.
+                if db._conn.in_transaction:
+                    await db._conn.execute("ROLLBACK")
+            except BaseException as rb_err:
+                # BaseException, not Exception: aiosqlite hands ROLLBACK to a
+                # worker thread and awaits a future, so during loop shutdown
+                # this can raise CancelledError. Under cancellation the rollback
+                # therefore is NOT guaranteed — no promise is made here beyond
+                # never masking the original failure.
+                log.warning(
+                    "suppression_rollback_failed",
+                    combo_key=combo_key,
+                    err=str(rb_err),
+                    err_id="SUPP_ROLLBACK",
+                )
+            # Bare `raise` — re-raises the ORIGINAL exception, never the
+            # rollback's. A cleanup failure that swallows the real error is
+            # worse than the leak this clause exists to close.
+            raise
 
     return await _open_gate_tail(db, combo_key, settings, deferred_fallback_err)
 

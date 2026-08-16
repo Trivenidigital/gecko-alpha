@@ -21,6 +21,8 @@ times.
 from __future__ import annotations
 
 import sqlite3
+
+import aiosqlite
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -367,7 +369,15 @@ async def test_dedup_state_survives_a_restart(tmp_path, settings_factory):
 
 async def test_dedup_probe_is_index_supported(tmp_path):
     """A per-dispatch FULL SCAN of a ledger that only grows would trade one
-    unbounded cost for a worse one."""
+    unbounded cost for a worse one.
+
+    The EXPLAIN target is a plain SELECT standing in as a PROXY for the probe
+    inside `_INSERT_IF_ABSENT_SQL`. This assertion cannot simply be repointed at
+    the real statement: that plan legitimately contains `SCAN CONSTANT ROW` —
+    the one-row VALUES source, not a table scan — so `assert "SCAN" not in plan`
+    would fail on a correct plan. The real statement's plan was verified
+    separately and reports the same
+    `SEARCH ... USING COVERING INDEX idx_alert_events_dedup` line."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     try:
@@ -445,7 +455,12 @@ async def test_upgrade_rebuild_keeps_the_index_and_the_existing_rows(tmp_path):
 
 async def test_dedupe_without_a_hash_is_a_wiring_error(tmp_path):
     """`payload_hash IS NULL` never satisfies `= ?`, so a NULL key would
-    silently degrade back to a row per attempt. Fail loudly instead."""
+    silently degrade back to a row per attempt. Fail loudly instead.
+
+    NOTE the mode: this is `managed_txn=False`, the writer's OWN transaction.
+    It pins the raise and nothing else. The DANGEROUS mode is `managed_txn=True`
+    — production — where the raise lands inside the caller's open transaction;
+    that is pinned by the two tests below, not by this one."""
     db = Database(tmp_path / "t.db")
     await db.initialize()
     try:
@@ -456,5 +471,202 @@ async def test_dedupe_without_a_hash_is_a_wiring_error(tmp_path):
                 combo_key="combo_a",
                 dedupe_on_payload_hash=True,
             )
+    finally:
+        await db.close()
+
+
+# --- the escape must not leak the gate's transaction ----------------------
+
+
+async def test_ledger_wiring_error_does_not_leak_the_gate_transaction(
+    tmp_path, settings_factory
+):
+    """The production mode: the raise happens INSIDE `_open_gate`'s
+    `BEGIN IMMEDIATE`, which only the locked block's own handler can close.
+
+    Injected by making `denial_digest` return None, which is guaranteed to fire
+    after the BEGIN — and the fixture ASSERTS that, because
+    `in_transaction is False` at the end would be trivially true if the
+    injection fired before the transaction ever opened.
+
+    Left unrolled-back, the leak costs a foreign-process lockout (the RESERVED
+    write lock is still held) plus one lost admission on the next gate call."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        await _seed_30d(db, "combo_a")
+        await _seed_30d(db, "combo_b", parole_trades_remaining=3)
+
+        seen = {}
+
+        def _null_digest(**kwargs):
+            seen["in_txn_at_raise"] = db._conn.in_transaction
+            return None
+
+        import scout.trading.suppression as supp_mod
+
+        real = supp_mod.denial_digest
+        supp_mod.denial_digest = _null_digest
+        try:
+            with pytest.raises(ValueError):
+                await suppression.should_open(db, "combo_a", settings=s)
+        finally:
+            supp_mod.denial_digest = real
+
+        assert seen.get("in_txn_at_raise") is True, (
+            "the injection fired before BEGIN IMMEDIATE — this test would be "
+            "vacuous, since in_transaction would be False either way"
+        )
+        assert db._conn.in_transaction is False, "the gate leaked its transaction"
+
+        # And the gate is immediately usable: no lost admission, no cascade.
+        assert await suppression.should_open(db, "combo_b", settings=s) == (
+            True,
+            suppression.PAROLE_RETEST_REASON,
+        )
+    finally:
+        await db.close()
+
+
+async def test_any_escaping_exception_leaves_the_gate_transaction_clean(
+    tmp_path, settings_factory
+):
+    """The CLASS, not the one instance. The value of the guard is that no
+    exception of any type can leave `BEGIN IMMEDIATE` open — a later edit that
+    introduces a different non-aiosqlite raise inside the locked block must not
+    reintroduce the leak."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        await _seed_30d(db, "combo_a")
+        seen = {}
+
+        async def _boom(*args, **kwargs):
+            seen["in_txn_at_raise"] = db._conn.in_transaction
+            raise RuntimeError("injected from inside the locked block")
+
+        import scout.trading.suppression as supp_mod
+
+        real = supp_mod.record_alert_event
+        supp_mod.record_alert_event = _boom
+        try:
+            with pytest.raises(RuntimeError, match="injected"):
+                await suppression.should_open(db, "combo_a", settings=s)
+        finally:
+            supp_mod.record_alert_event = real
+
+        assert seen.get("in_txn_at_raise") is True, "injection fired before BEGIN"
+        assert db._conn.in_transaction is False, "the gate leaked its transaction"
+    finally:
+        await db.close()
+
+
+async def test_busy_inside_the_locked_block_still_fails_open(
+    tmp_path, settings_factory, monkeypatch
+):
+    """CLAUSE ORDER. The new `except BaseException` must be the LAST handler in
+    the locked block. Python matches in source order, so hoisting it above
+    `except aiosqlite.OperationalError` swallows the busy/locked branch and
+    converts its deliberate fail-OPEN into a raise — the dispatcher would then
+    count an error and SKIP the candidate, inverting `should_open`'s documented
+    contract.
+
+    Pinned here by NAME as well as by behaviour: this invariant is otherwise
+    only caught incidentally by a test about deadlocks, which is fragile
+    coupling for an ordering rule."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        await _seed_30d(db, "combo_a", parole_trades_remaining=3)
+
+        sent = []
+
+        async def _capture(db_, combo_key, err, settings_):
+            sent.append(err)
+
+        monkeypatch.setattr(suppression, "_record_fallback", _capture)
+
+        real_execute = db._conn.execute
+
+        async def _busy_on_begin(sql, *a, **k):
+            if str(sql).strip().upper().startswith("BEGIN IMMEDIATE"):
+                raise aiosqlite.OperationalError("database is locked")
+            return await real_execute(sql, *a, **k)
+
+        monkeypatch.setattr(db._conn, "execute", _busy_on_begin)
+        allow, reason = await suppression.should_open(db, "combo_a", settings=s)
+        monkeypatch.undo()
+
+        assert (allow, reason) == (True, "db_error_fallback_allow"), (
+            "the busy branch no longer fails OPEN — the BaseException clause is "
+            "matching before the aiosqlite handlers"
+        )
+        assert len(sent) == 1
+    finally:
+        await db.close()
+
+
+async def test_dedup_probe_is_scoped_to_the_event_type(tmp_path, settings_factory):
+    """The `event_type = ?` half of the NOT EXISTS probe is load-bearing.
+
+    A row of a DIFFERENT event type that happens to carry the same
+    `payload_hash` must not suppress the denial. Without this the probe would
+    match on hash alone, and any event type sharing a digest would silently
+    swallow a `parole_denied` row — the exact evidence loss this PR exists to
+    prevent, re-entering through the back door."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        await _seed_30d(db, "combo_a")
+
+        cur = await db._conn.execute(
+            "SELECT suppressed, suppressed_at, parole_at FROM combo_performance "
+            "WHERE combo_key = 'combo_a' AND window = '30d'"
+        )
+        supp, supp_at, parole_at = await cur.fetchone()
+        collided = denial_digest(
+            combo_key="combo_a",
+            denial_reason="parole_exhausted",
+            suppressed=supp,
+            suppressed_at=supp_at,
+            parole_at=parole_at,
+        )
+        # A pre-existing row of another type carrying the IDENTICAL digest.
+        await db._conn.execute(
+            "INSERT INTO alert_events (created_at, event_type, combo_key, "
+            "payload_hash) VALUES ('2026-08-15T00:00:00+00:00', "
+            "'parole_slot_spent', 'combo_a', ?)",
+            (collided,),
+        )
+        await db._conn.commit()
+
+        assert await suppression.should_open(db, "combo_a", settings=s) == (
+            False,
+            "parole_exhausted",
+        )
+        assert (await _count(db, event_type="parole_denied")) == 1, (
+            "a same-digest row of a different event_type suppressed the denial "
+            "— the probe is matching on payload_hash alone"
+        )
+    finally:
+        await db.close()
+
+
+async def test_schema_version_20260816_is_stamped(tmp_path):
+    """20260816 is allocated to the dedup index (docs/migration_versions.md),
+    mirroring the 20260814 precedent in tests/test_alert_events_migration.py."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        cur = await db._conn.execute(
+            "SELECT description FROM schema_version WHERE version = 20260816"
+        )
+        row = await cur.fetchone()
+        assert row is not None, "schema_version row for 20260816 was not stamped"
+        assert row[0] == "alert_events_dedup_index_v1"
     finally:
         await db.close()
