@@ -81,17 +81,15 @@ async def load_recent_events(db: Database, max_hours: float) -> list[ChainEvent]
     ]
 
 
-async def prune_old_events(db: Database, retention_days: int) -> int:
-    """Delete events older than retention_days. Returns rows deleted."""
-    conn = db._conn
-    if conn is None:
-        raise RuntimeError("Database not initialized")
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cursor = await conn.execute(
-        "DELETE FROM signal_events WHERE created_at < ?", (cutoff,)
-    )
-    await conn.commit()
-    return cursor.rowcount or 0
+# `prune_old_events` used to live here. It was removed, not merely
+# un-called: `signal_events` retention is owned by exactly ONE implementation,
+# `Database.prune_signal_events`, driven from the hourly maintenance pass in
+# scout/main.py::_run_hourly_maintenance. Leaving a second, identical DELETE
+# reachable from the chains engine is the trap this repair exists to close —
+# the prune was gated on a non-empty load_active_patterns() result and would
+# have stopped silently the moment the pattern set emptied. Two owners for one
+# table's retention is how the boundary drifts back apart. Do not re-add a
+# prune here; extend the hourly pass instead.
 
 
 async def safe_emit(
