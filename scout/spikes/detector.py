@@ -18,7 +18,8 @@ logger = structlog.get_logger(__name__)
 async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
     """Store volume snapshot from CoinGecko /coins/markets response.
 
-    Returns the number of rows inserted. Also prunes history older than 7 days.
+    Returns the number of rows inserted. Does NOT prune — volume_history_cg
+    retention is owned solely by Database.prune_volume_history_cg (see below).
     """
     if db._conn is None:
         raise RuntimeError("Database not initialized.")
@@ -51,11 +52,24 @@ async def record_volume(db: "Database", raw_coins: list[dict]) -> int:
     if count:
         await db._conn.commit()
 
-    # Prune records older than 7 days
-    await db._conn.execute(
-        "DELETE FROM volume_history_cg WHERE datetime(recorded_at) < datetime('now', '-7 days')"
-    )
-    await db._conn.commit()
+    # volume_history_cg retention is NOT pruned here. It is owned by exactly one
+    # implementation — Database.prune_volume_history_cg, driven from the hourly
+    # maintenance pass with VOLUME_HISTORY_CG_RETENTION_DAYS.
+    #
+    # This prune hardcoded `-7 days`, which looked like it agreed with the
+    # config default. It did not agree with the actual requirement. The ledger
+    # labeler computes peak7d as MAX(price) over [emitted, emitted + 7d]
+    # (scout/outcome_ledger.py::_peak_price_in_window), so it needs the row
+    # recorded AT `emitted` — which is exactly 7.0 days old at the earliest
+    # moment the row can be finalized. Deleting at 7d leaves zero margin, and
+    # any labeling lateness silently truncates the window from the left,
+    # producing a wrong-but-plausible peak7d instead of a NULL. Measured on
+    # prod 2026-08-18 over n=273,296 completed rows: median lateness 0.153d,
+    # p99 2.857d, max 2.910d — i.e. essentially every labeled row was already
+    # losing data. Retention is now horizon + an explicit, measured lateness
+    # margin, validator-pinned in scout/config.py.
+    #
+    # Do not re-add a prune here. Two owners is how that floor drifts back to 7.
 
     logger.info("volume_history_recorded", count=count)
     return count

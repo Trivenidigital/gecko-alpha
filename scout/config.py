@@ -16,6 +16,19 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # this only fixes the DEFAULT.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# The ledger's longest forward-return horizon, in days. MIRRORS the
+# schema-bound constants in scout/outcome_ledger.py — the ``r7d`` entry of
+# ``_HORIZONS`` and ``_FINALIZE_AFTER``, which are deliberately NOT Settings
+# fields (each maps to a fixed ledger column, so changing one needs a schema
+# migration).
+#
+# It is duplicated here rather than imported because scout.outcome_ledger
+# imports scout.db, which imports this module — importing back would be
+# circular. The duplication is pinned by a test that asserts the two agree, so
+# a future change to _FINALIZE_AFTER cannot silently desynchronise the
+# retention floor derived from it below.
+LEDGER_R7D_HORIZON_DAYS = 7
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -624,12 +637,33 @@ class Settings(BaseSettings):
     # check_trade_decision_events uses 15min; evaluator's per-trade dedup is
     # bounded by PAPER_MAX_DURATION_HOURS=48h). 45d default clears them all.
     TRADE_DECISION_EVENTS_RETENTION_DAYS: int = Field(default=45, ge=7)
-    # INF-06: volume_history_cg's other prune lives in the spike detector
-    # (scout/spikes/detector.py) and runs ONLY when VOLUME_SPIKE_ENABLED is on.
-    # This decouples retention from the flag. 7d matches the detector cutoff
-    # AND the longest reader horizon (ledger r7d labeling + spike 7d average) —
-    # harmless duplication when the flag is on.
-    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=7, ge=7)
+    # volume_history_cg retention. ONE owner: Database.prune_volume_history_cg,
+    # driven from main._run_hourly_maintenance. The spike detector's duplicate
+    # hardcoded `-7 days` prune has been removed (scout/spikes/detector.py).
+    #
+    # The previous comment here claimed 7d "matches the longest reader horizon
+    # (ledger r7d labeling + spike 7d average) — harmless duplication". That was
+    # FALSE, because it omitted LABEL-PROCESSING LATENESS.
+    #
+    # The ledger labeler computes peak7d as MAX(price) over the CLOSED window
+    # [emitted, emitted + 7d] (scout/outcome_ledger.py::_peak_price_in_window).
+    # The row it needs at the LEFT edge is exactly 7.0 days old at the earliest
+    # instant the ledger row becomes finalizable (now >= emitted + 7d). A 7d
+    # prune therefore leaves ZERO margin: any lateness at all truncates the
+    # window from the left and yields a wrong-but-plausible peak7d rather than
+    # a NULL — a silently biased label, not a missing one.
+    #
+    # Measured on prod 2026-08-18, n=273,296 completed ledger rows, lateness
+    # past the r7d deadline (labeled_at - emitted_at - 7d):
+    #     p50 0.153d | p90 2.529d | p99 2.857d | max 2.910d
+    # i.e. essentially EVERY labeled row was already losing left-edge data, and
+    # p90 rows were computing "peak7d" over roughly 4.5 days.
+    #
+    # Retention is therefore horizon + an explicit permitted lateness margin,
+    # never a bare number. The margin is measured (max 2.910d), rounded up to a
+    # whole day. Do NOT lower either value without re-running that measurement.
+    LEDGER_LABEL_MAX_LATENESS_DAYS: int = Field(default=3, ge=1)
+    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=10, ge=8)
 
     # DASH-05 moved-already / too-late postmortem recorder. FORWARD-recording
     # only: gainers_snapshots has a 7-day retention so pre-run T-minus evidence
@@ -2324,6 +2358,34 @@ class Settings(BaseSettings):
                     f"backtest CLI default --days=30. Lower retention silently "
                     f"truncates backtest cohorts."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_volume_history_cg_covers_label_lateness(self) -> "Settings":
+        """volume_history_cg must outlive the r7d window PLUS labeling lateness.
+
+        The ledger labeler computes peak7d as MAX(price) over the closed window
+        [emitted, emitted + 7d] (outcome_ledger._peak_price_in_window), so the
+        left-edge row is exactly LEDGER_R7D_HORIZON_DAYS old at the earliest
+        finalizable instant. Retention equal to the horizon leaves zero margin,
+        and lateness then truncates the window from the left — yielding a
+        wrong-but-plausible peak7d instead of a NULL.
+
+        This is pinned as a validator rather than left to the field default
+        because the failure is SILENT: a retention of 7 produces labels, just
+        biased ones. Nothing downstream would raise.
+        """
+        required = LEDGER_R7D_HORIZON_DAYS + self.LEDGER_LABEL_MAX_LATENESS_DAYS
+        if self.VOLUME_HISTORY_CG_RETENTION_DAYS < required:
+            raise ValueError(
+                f"VOLUME_HISTORY_CG_RETENTION_DAYS="
+                f"{self.VOLUME_HISTORY_CG_RETENTION_DAYS} must be >= {required} "
+                f"(= {LEDGER_R7D_HORIZON_DAYS}d r7d/peak7d horizon + "
+                f"{self.LEDGER_LABEL_MAX_LATENESS_DAYS}d "
+                f"LEDGER_LABEL_MAX_LATENESS_DAYS). Below this the ledger's "
+                f"peak7d window is truncated from the left and labels are "
+                f"silently biased low rather than left NULL."
+            )
         return self
 
     @model_validator(mode="after")
