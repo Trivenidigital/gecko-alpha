@@ -10730,6 +10730,31 @@ class Database:
         await self._conn.commit()
         return cur.rowcount or 0
 
+    async def prune_signal_events(self, *, keep_days: int) -> int:
+        """Delete ``signal_events`` rows older than ``keep_days``. Returns rowcount.
+
+        Owned by the hourly maintenance pass, NOT by the chains engine. The
+        prune used to live in ``scout/chains/tracker.py::_prune_stale``, which
+        ``check_chains`` reaches only after its early return on an empty
+        ``load_active_patterns()`` result — so at zero active patterns the
+        largest table in the database (2.04 GB / 6.9M rows / ~550K rows a day)
+        stopped pruning silently. Retention housekeeping must not sit beneath a
+        "there is useful chain work to do" condition.
+
+        ``<`` not ``<=`` (the siblings above use ``<=``): this carries over the
+        exact boundary of the relocated implementation, so the relocation
+        changes WHEN the prune runs and never how much it keeps.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM signal_events WHERE created_at < ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
     async def prune_holder_snapshots(self, *, keep_days: int) -> int:
         """Delete ``holder_snapshots`` rows older than ``keep_days``. Returns rowcount."""
         if self._conn is None:

@@ -1710,17 +1710,33 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             "prune_conviction_watchlist_snapshots",
             "CONVICTION_WATCHLIST_SNAPSHOT_RETENTION_DAYS",
         ),
+        # signal_events is the LARGEST table in prod (2.04 GB / 6.9M rows /
+        # ~550K rows a day at 14d retention). Its prune used to live in the
+        # chains engine's _prune_stale, downstream of check_chains' early
+        # return on zero active patterns — so it would have stopped silently
+        # the moment the pattern set emptied, with nothing watching. Same
+        # decoupling rationale as INF-06 above; retention is unchanged.
+        ("prune_signal_events", "CHAIN_EVENT_RETENTION_DAYS"),
     ]:
         event_base = prune_name.removeprefix("prune_")
         try:
             keep_days = getattr(settings, retention_attr)
             rows = await getattr(db, prune_name)(keep_days=keep_days)
-            if rows:
-                logger.info(
-                    f"{event_base}_pruned",
-                    rows_deleted=rows,
-                    keep_days=keep_days,
-                )
+            # §12a prune-freshness: emit UNCONDITIONALLY, including
+            # rows_deleted=0. The previous `if rows:` made "the prune ran and
+            # had nothing to delete" and "the prune stopped running" produce
+            # byte-identical journals — the exact ambiguity that let the
+            # relocated signal_events prune be gated on active chain patterns
+            # for as long as it was without anything noticing. Absence of this
+            # event for >1h is now unambiguously "the hourly pass did not run".
+            # Same idiom as scout/conviction/prospective.py, which writes a run
+            # heartbeat even on an empty build so its watchdog can tell "ran,
+            # found 0" from "never ran".
+            logger.info(
+                f"{event_base}_pruned",
+                rows_deleted=rows,
+                keep_days=keep_days,
+            )
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
 
