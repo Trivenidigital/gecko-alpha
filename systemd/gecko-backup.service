@@ -1,5 +1,20 @@
 [Unit]
 Description=Gecko-Alpha — create scout.db online backup + rotate to keep top-N
+# Ship the result off-host, but ONLY when this unit succeeded. OnSuccess=
+# couples the shipper to the event it depends on (a backup exists and has been
+# rotated) instead of to the clock.
+#
+# A separate timer 30 minutes later was the obvious alternative and is wrong:
+# AccuracySec=1h below lets this unit start anywhere in 03:00-04:00,
+# Persistent=true also fires missed runs at boot, and TimeoutStartSec=1800
+# exists precisely because this job can run for many minutes. Any of those
+# pushes the backup past a fixed shipper time, and the shipper then re-verifies
+# YESTERDAY's file, writes a fresh heartbeat, and the lane reads healthy while
+# being permanently one day stale.
+#
+# On failure nothing is shipped — which is correct. A failed backup must not
+# cause the previous day's copy to be re-confirmed as though it were today's.
+OnSuccess=gecko-backup-offhost.service
 
 [Service]
 Type=oneshot

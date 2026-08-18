@@ -1402,3 +1402,198 @@ def test_zero_refresh_with_a_non_empty_enumeration_is_a_real_failure(tmp_path):
     assert check["reason"] == "refresh_all_failing"
     assert check["combos_enumerated"] == 9
     assert "every per-combo refresh is failing" in body["message"]
+
+
+# --- check 6: off-host backup shipper heartbeat ----------------------------
+#
+# The only check keyed on a FILE rather than a table: the shipper
+# (scripts/gecko-backup-offhost.sh) never touches the DB. It writes
+# `offhost-last-ok` only after the copy is proven good off-box, so freshness
+# here means "a VERIFIED off-site copy existed at that instant" — the single
+# fact worth monitoring for a lane whose whole purpose is surviving the loss of
+# the box the local backup watchdog lives on.
+
+
+def _fresh_db(tmp_path):
+    """All five DB-backed checks green, so any breach seen belongs to check 6."""
+    return _make_db(tmp_path, alert_rows=[(_iso(1), "sent")], digest_rows=[_day(1)])
+
+
+def _hb_file(tmp_path, hours_ago=None, *, text=None):
+    p = tmp_path / "offhost-last-ok"
+    if text is not None:
+        p.write_text(text)
+    else:
+        stamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        p.write_text(str(int(stamp.timestamp())))
+    return p
+
+
+def _offhost_run(dbp, hb_path, *extra, enabled="true"):
+    return _run(
+        dbp,
+        "--enabled",
+        "true",
+        "--dry-run",
+        "--offhost-heartbeat-file",
+        str(hb_path),
+        "--offhost-backup-watch-enabled",
+        enabled,
+        *extra,
+    )
+
+
+def test_offhost_watch_disabled_is_not_a_breach_even_with_no_heartbeat(tmp_path):
+    """Deploy-without-activate. Off-host shipping is opt-in and unconfigured by
+    default, so a default-on check would page on every box that has simply not
+    set a destination yet — the fastest way to teach an operator to ignore this
+    watchdog. Absence becomes meaningful only once the operator says it is."""
+    res = _offhost_run(
+        _fresh_db(tmp_path), tmp_path / "does-not-exist", enabled="false"
+    )
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "ok"
+    assert check["reason"] == "watch_disabled"
+
+
+def test_offhost_fresh_heartbeat_is_not_a_breach(tmp_path):
+    res = _offhost_run(_fresh_db(tmp_path), _hb_file(tmp_path, 3))
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 0
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "ok"
+    assert check["reason"] == "fresh"
+    assert check["age_hours"] == pytest.approx(3, abs=0.1)
+
+
+def test_offhost_stale_heartbeat_is_a_breach(tmp_path):
+    res = _offhost_run(_fresh_db(tmp_path), _hb_file(tmp_path, 100))
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 1
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "breach"
+    assert check["reason"] == "stale"
+    msg = body["message"]
+    assert "offhost_backup" in msg
+    assert "48h" in msg
+    # Plain text: the check name contains `_`, which MarkdownV1 would eat.
+    assert "*" not in msg
+
+
+def test_offhost_missing_heartbeat_is_a_breach_once_the_watch_is_on(tmp_path):
+    """ "The shipper has never run" and "the shipper broke" are both worth being
+    woken for. Silence stops being ambiguous once the watch is enabled."""
+    res = _offhost_run(_fresh_db(tmp_path), tmp_path / "never-written")
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "breach"
+    assert check["reason"] == "heartbeat_absent"
+    assert "never" in body["message"].lower()
+
+
+@pytest.mark.parametrize("junk", ["", "   ", "not-a-timestamp", "12.5.7"])
+def test_offhost_unreadable_heartbeat_is_a_breach(tmp_path, junk):
+    """A truncated or non-numeric heartbeat proves nothing. Fail toward the
+    page: an unreadable heartbeat is a broken shipper, not a healthy one."""
+    res = _offhost_run(_fresh_db(tmp_path), _hb_file(tmp_path, text=junk))
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "breach"
+    assert check["reason"] == "heartbeat_unreadable"
+
+
+def test_offhost_slo_hours_flag_is_honoured(tmp_path):
+    res = _offhost_run(
+        _fresh_db(tmp_path), _hb_file(tmp_path, 60), "--offhost-backup-slo-hours", "72"
+    )
+    assert res.returncode == 0, res.stderr
+    body = json.loads(res.stdout)
+    check = body["checks"]["offhost_backup_freshness"]
+    assert check["status"] == "ok"
+    assert check["slo_hours"] == 72
+
+
+def test_offhost_breach_composes_alongside_other_breaches(tmp_path):
+    """The composed page must name every breached surface, not just the first."""
+    dbp = _make_db(tmp_path, alert_rows=[(_iso(100), "sent")], digest_rows=[_day(1)])
+    res = _offhost_run(dbp, _hb_file(tmp_path, 100))
+    assert res.returncode == 5, res.stderr
+    body = json.loads(res.stdout)
+    assert body["breaches"] == 2
+    assert "tg_alert_log" in body["message"]
+    assert "offhost_backup" in body["message"]
+
+
+def test_offhost_flags_are_wired_in_the_shell_wrapper():
+    """A check nobody invokes is the same silent-failure class it exists to
+    close. Assert the wrapper reads each env var AND forwards each flag."""
+    sh = (REPO_ROOT / "scripts" / "alert-channel-watchdog.sh").read_text()
+    assert 'OFFHOST_BACKUP_SLO_HOURS="${OFFHOST_BACKUP_SLO_HOURS:-48}"' in sh
+    assert 'OFFHOST_BACKUP_WATCH_ENABLED="${OFFHOST_BACKUP_WATCH_ENABLED:-false}"' in sh
+    assert '--offhost-backup-slo-hours "${OFFHOST_BACKUP_SLO_HOURS}"' in sh
+    assert '--offhost-heartbeat-file "${OFFHOST_BACKUP_HEARTBEAT_FILE}"' in sh
+    assert '--offhost-backup-watch-enabled "${OFFHOST_BACKUP_WATCH_ENABLED}"' in sh
+
+
+def test_offhost_breach_rides_the_per_table_cooldown(tmp_path):
+    """It must dedup on its own state file, independently of the DB checks —
+    otherwise a standing off-host outage emits one page per cron tick."""
+    args = (
+        "--offhost-heartbeat-file",
+        str(tmp_path / "never-written"),
+        "--offhost-backup-watch-enabled",
+        "true",
+    )
+    sd = tmp_path / "state"
+    dbp = _fresh_db(tmp_path)
+
+    mod = _load_module()
+    sink = []
+    mod._log = _Recorder()
+    mod._SEND = _fake_send(sink)
+    assert _main(mod, dbp, sd, *args) == 5
+    assert len(sink) == 1
+    assert (sd / "last_alert_offhost_backup").exists()
+
+    mod2 = _load_module()
+    sink2 = []
+    rec2 = _Recorder()
+    mod2._log = rec2
+    mod2._SEND = _fake_send(sink2)
+    # Still a breach (exit 5) — the cooldown gates the SEND, never detection.
+    assert _main(mod2, dbp, sd, *args) == 5
+    assert sink2 == [], "a standing off-host breach paged twice inside the cooldown"
+    assert "alert_channel_watchdog_alert_suppressed_by_cooldown" in rec2.names()
+
+
+def test_offhost_heartbeat_is_unreachable_from_the_shippers_failure_paths():
+    """Pins the coupling this check depends on.
+
+    This watchdog reads a heartbeat and reports the off-host lane healthy. That
+    inference is only sound because the shipper writes the heartbeat AFTER the
+    uploaded object is read back and matched. If a future edit moved the write
+    above the verification, the watchdog would report a healthy lane over a
+    corrupt off-site copy — a green dashboard on a real gap, which is worse
+    than having no check at all.
+
+    Asserted structurally: every `_write_heartbeat` call in the s3 branch is
+    preceded by a verification statement, and no call sits between the upload
+    and the verification."""
+    sh = (REPO_ROOT / "scripts" / "gecko-backup-offhost.sh").read_text()
+    s3_branch = sh.split("# Transport: s3", 1)[1]
+    lines = s3_branch.splitlines()
+    calls = [i for i, ln in enumerate(lines) if ln.strip() == "_write_heartbeat"]
+    assert calls, "no heartbeat call found in the s3 branch"
+    for idx in calls:
+        preceding = "\n".join(lines[max(0, idx - 12) : idx]).lower()
+        assert "verified" in preceding, (
+            "a heartbeat write in the s3 branch is not preceded by a "
+            f"verification statement:\n{preceding}"
+        )

@@ -14,6 +14,15 @@
 #                                on the newest 'refresh_completed' row
 #                                (ALERT_EVENTS_SLO_HOURS, default 27). §12a
 #                                pairing shipped with the F3 ledger itself.
+#   6. offhost-last-ok         — off-host backup shipper heartbeat FILE
+#                                (OFFHOST_BACKUP_SLO_HOURS, default 48; path
+#                                OFFHOST_BACKUP_HEARTBEAT_FILE). Opt-in via
+#                                OFFHOST_BACKUP_WATCH_ENABLED — off-host
+#                                shipping is disabled by default, so a
+#                                default-on check would page on a box that has
+#                                simply not configured a destination. Turn it
+#                                on in the same change that configures the B2
+#                                bucket, never before.
 #
 # Context: the Telegram alert channel went silent 2026-06-25 -> 07-08 (14
 # days, zero 'sent' rows) AND the daily digest stopped writing after
@@ -77,6 +86,10 @@ ALERT_EVENTS_SLO_HOURS="${ALERT_EVENTS_SLO_HOURS:-27}"
 # ALR-08 dispatch-activity qualifier for check 1 (default 0: any open with 0
 # sent pages; raise to tolerate the 24h-dedup tail). From the cron env, not .env.
 DISPATCH_ACTIVITY_THRESHOLD="${ALERT_DISPATCH_ACTIVITY_THRESHOLD:-0}"
+# Off-host backup shipper freshness (B2 lane). From the cron env, not .env.
+OFFHOST_BACKUP_SLO_HOURS="${OFFHOST_BACKUP_SLO_HOURS:-48}"
+OFFHOST_BACKUP_HEARTBEAT_FILE="${OFFHOST_BACKUP_HEARTBEAT_FILE:-/var/lib/gecko-alpha/backup-rotation/offhost-last-ok}"
+OFFHOST_BACKUP_WATCH_ENABLED="${OFFHOST_BACKUP_WATCH_ENABLED:-false}"
 COOLDOWN_HOURS="${ALERT_CHANNEL_WATCHDOG_COOLDOWN_HOURS:-24}"
 STATE_DIR="${ALERT_CHANNEL_WATCHDOG_STATE_DIR:-/var/lib/gecko-alpha/alert-channel-watchdog}"
 
@@ -104,4 +117,7 @@ exec "${PYTHON}" "${SCRIPT_DIR}/alert_channel_watchdog.py" \
     --tg-channel-stale-days "${TG_CHANNEL_STALE_DAYS}" \
     --alert-events-slo-hours "${ALERT_EVENTS_SLO_HOURS}" \
     --dispatch-activity-threshold "${DISPATCH_ACTIVITY_THRESHOLD}" \
+    --offhost-backup-slo-hours "${OFFHOST_BACKUP_SLO_HOURS}" \
+    --offhost-heartbeat-file "${OFFHOST_BACKUP_HEARTBEAT_FILE}" \
+    --offhost-backup-watch-enabled "${OFFHOST_BACKUP_WATCH_ENABLED}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"

@@ -1,0 +1,49 @@
+[Unit]
+Description=Gecko-Alpha — ship the newest completed scout.db backup off-host
+# NOT clock-coupled. This unit is triggered by gecko-backup.service via
+# OnSuccess=, so it runs when — and only when — a backup has just been created
+# and rotated SUCCESSFULLY.
+#
+# The rejected alternative was a timer 30 minutes after the backup timer. That
+# is a guess about duration dressed up as a schedule: gecko-backup.timer sets
+# AccuracySec=1h so the backup may start anywhere in 03:00-04:00,
+# Persistent=true also fires missed runs at boot, and the backup itself can run
+# for many minutes (TimeoutStartSec=1800, chosen because 600s expired mid-
+# `.backup` on a 6.82 GB database on 2026-08-08). Best case the shipper had
+# zero margin; on any deferred day it would ship YESTERDAY's backup — a lane
+# that looks healthy while being permanently one day stale, which no
+# behavioural test can see because every individual run succeeds.
+#
+# OnSuccess= removes the class rather than widening the gap: there is no
+# interval to get wrong, and a failed backup ships nothing rather than
+# re-shipping the previous day's file.
+After=gecko-backup.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+StateDirectory=gecko-alpha
+StateDirectoryMode=0750
+Environment=GECKO_BACKUP_DIR=/root/gecko-alpha
+Environment=GECKO_OFFHOST_BACKUP_HEARTBEAT_FILE=/var/lib/gecko-alpha/backup-rotation/offhost-last-ok
+Environment=GECKO_OFFHOST_CONFIGURED_MARKER=/var/lib/gecko-alpha/backup-rotation/offhost-configured
+# Destination + credentials. The leading `-` makes a missing file a no-op, so
+# this unit is safe to install BEFORE the lane is configured: with no
+# destination set the script prints "off-host backup disabled" and exits 0.
+# That ordering is deliberate — install the plumbing, watch it no-op, and only
+# then introduce a credential.
+#
+# The application key lives here and ONLY here (mode 0600, root:root). It is
+# never placed on a command line, never in the crontab, and never on the
+# dashboard's unit — see the marker file below.
+EnvironmentFile=-/etc/gecko-alpha/offhost.env
+ExecStartPre=/usr/bin/test -x /usr/local/bin/gecko-backup-offhost.sh
+ExecStart=/usr/local/bin/gecko-backup-offhost.sh
+# A 6.8 GB upload over a home-grade uplink, plus a full md5 of the local file
+# and two metadata round-trips. Sized for headroom over an unmeasured duration,
+# same reasoning as gecko-backup.service: this bounds a hung transfer rather
+# than fitting a known one. Revise once a real upload has been timed.
+TimeoutStartSec=7200
+StandardOutput=journal
+StandardError=journal
