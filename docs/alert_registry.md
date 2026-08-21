@@ -77,6 +77,7 @@ not yet a runtime field.
 | WAL checkpoint-busy watchdog | `sqlite_wal_checkpoint_busy` | WAL checkpoint repeatedly busy | trading | None | warning | Y |
 | Suppression event | `suppression` | Suppression event alert | trading | None | warning | N |
 | Suppression-cost rollup (script) | `suppression_cost_rollup` | Weekly suppression-cost rollup digest | trading | None | info | Y |
+| CoinGecko budget pace | `cg_budget_pace` | Projected month-end CoinGecko credit consumption exceeds the plan allowance — discovery halts at its own envelope while the critical reserve is preserved | health | None | warning | Y |
 | Primary trader alert | `tg_alert_dispatch` | Paper-trade opportunity alert (the core trader alert) | trading | None | info | Y |
 | TG allowlist announcement | `tg_allowlist_announce` | One-time TG allowlist announcement sentinel | trading | None | info | N |
 | Trade-expiry anomaly | `trade_expiry_anomaly` | Trade-expiry anomaly detected | trading | None | warning | Y |
