@@ -29,6 +29,7 @@ import aiohttp
 import structlog
 
 from scout import cg_api
+from scout.coingecko_budget import BUCKET_CRITICAL
 from scout.ingestion.coingecko import _get_with_backoff
 
 # GA-01: heuristic extracted to scout.token_ids so the trading engine's
@@ -167,6 +168,11 @@ async def _fetch_simple_price_batch(
         session,
         f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/simple/price",
         params=params,
+        # CRITICAL, not discovery: this lane re-prices OPEN positions, and the
+        # live trailing-stop evaluator reads only the price_cache rows it
+        # writes. It draws on the reserved envelope so an exhausted discovery
+        # budget can never leave an open position unpriceable.
+        bucket=BUCKET_CRITICAL,
     )
     if not isinstance(result, dict):
         return {}

@@ -283,3 +283,29 @@ def token_factory():
         return CandidateToken(**defaults)
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _reset_cg_process_state():
+    """Isolate the process-global CoinGecko cadence counter and credit ledger.
+
+    Both are module-level singletons by design (they are consulted on every CG
+    call, so a per-call DB round-trip would be its own budget problem). That
+    makes them leak across tests: without this, whether a test's cycle lands on
+    the discovery cadence depends on how many CG cycles earlier tests happened
+    to run, and a test asserting on credits inherits another test's spend.
+
+    Resetting per test reproduces what a freshly-started process sees, so
+    cadence and budget assertions are about the code rather than test order.
+    """
+    import scout.main as _main
+    from scout import coingecko_budget as _budget
+    from scout.ingestion import coingecko as _cg
+
+    _main._cg_discovery_cycle_counter = 0
+    _cg.reset_discovery_raw()
+    _budget.budget.__init__()
+    yield
+    _main._cg_discovery_cycle_counter = 0
+    _cg.reset_discovery_raw()
+    _budget.budget.__init__()

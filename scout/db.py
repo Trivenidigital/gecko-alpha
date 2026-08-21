@@ -346,6 +346,10 @@ class Database:
             # GA-19: durable per-source consecutive-miss counters so the
             # ingest-starvation watchdog survives gecko-pipeline restarts.
             await self._migrate_ingest_watchdog_state_v1()
+            # 2026-08-21 monthly-budget repair: durable CoinGecko credit
+            # accounting. Module counters reset on restart, and a budget you can
+            # zero by bouncing the service is not a budget.
+            await self._migrate_cg_credit_ledger_v1()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -7402,6 +7406,114 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "source_call_price_snapshot_runs_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_cg_credit_ledger_v1(self) -> None:
+        """Monthly-credit accounting for the CoinGecko provider budget.
+
+        2026-08-21: the Basic plan's 100,000 monthly credits hit 100.0% with 11
+        days to the reset. Nothing counted them — the system modeled
+        calls/MINUTE (the rate limiter) while the hard constraint was
+        calls/MONTH. Those are independent limits at the provider.
+
+        Durable because module counters reset on restart, and a budget you can
+        zero by bouncing the service is not a budget.
+
+        Two measures per (month, bucket), because ATTEMPTS ARE NOT CREDITS:
+          * ``attempts`` — every request issued. Rate/backoff observability.
+          * ``credits``  — successful billable calls only. CoinGecko deducts a
+            monthly credit on HTTP 200; 4xx/5xx do NOT deduct one, though they
+            still count against the per-minute rate limit.
+
+        ``month`` is the provider's billing period key (``YYYY-MM``, UTC) —
+        credits replenish on the 1st. ``bucket`` partitions the allowance so
+        discovery cannot consume the reserve that keeps held positions
+        re-priceable.
+
+        Additive + idempotent, mirroring _migrate_ingest_watchdog_state_v1.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "cg_credit_ledger_v1"
+        schema_version = 20260821
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("cg_credit_ledger_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for cg_credit_ledger_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS cg_credit_ledger (
+                    month TEXT NOT NULL,
+                    bucket TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (month, bucket)
+                )
+                """)
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "cg_credit_ledger_v1_migration_complete", table="cg_credit_ledger"
+            )
+        except BaseException as e:
+            _log.exception(
+                "cg_credit_ledger_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

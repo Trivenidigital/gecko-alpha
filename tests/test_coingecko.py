@@ -7,6 +7,7 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.ingestion import coingecko as cg_module
+from scout.coingecko_budget import BUCKET_DISCOVERY
 from scout.ingestion.coingecko import (
     fetch_top_movers,
     fetch_trending,
@@ -218,7 +219,9 @@ async def test_429_enters_global_cooldown_without_retry_amplification(
         mocked.get(MARKETS_PATTERN, status=429)
         mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets")
+            data = await _get_with_backoff(
+                session, f"{CG_BASE}/coins/markets", bucket=BUCKET_DISCOVERY
+            )
 
     assert data is None
     assert len(mocked.requests) == 1

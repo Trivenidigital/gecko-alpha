@@ -255,6 +255,12 @@ async def test_cg_token_open_unaffected_by_gate(db, engine_settings, monkeypatch
     _install_fake_alerter(monkeypatch, [])
     engine = TradingEngine(mode="paper", db=db, settings=engine_settings)
 
+    # The step-0d liveness gate needs a recent CoinGecko write SOMEWHERE in
+    # price_cache; this test is about the step-0c REGISTRY rule, i.e. that a
+    # CG-shaped token with no row OF ITS OWN still opens. Seeding an unrelated
+    # fresh row keeps that distinction intact: CG is live, this token has no row.
+    await _seed_price_cache(db, "__liveness_sentinel__", 1.0, age_seconds=30)
+
     # entry_price path, no price_cache row (trending/gainers pattern)
     trade_id = await engine.open_trade(
         token_id="trending-coin",

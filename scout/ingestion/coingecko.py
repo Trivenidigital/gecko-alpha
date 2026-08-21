@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -11,6 +12,11 @@ import structlog
 from scout import cg_api
 from scout.heartbeat import IngestSourceSample, increment_mcap_null_with_price
 from scout.models import CandidateToken
+from scout.coingecko_budget import (
+    BUCKET_DISCOVERY,
+    BUCKET_OPERATIONAL,
+    budget as cg_budget,
+)
 from scout.ratelimit import coingecko_limiter
 
 if TYPE_CHECKING:
@@ -101,11 +107,26 @@ async def _get_with_backoff(
     session: aiohttp.ClientSession,
     url: str,
     params: dict | None = None,
+    *,
+    bucket: str,
 ) -> dict | list | None:
-    """GET with shared limiter/cooldown. Returns parsed JSON or None."""
+    """GET with shared limiter/cooldown. Returns parsed JSON or None.
+
+    ``bucket`` is REQUIRED and keyword-only on purpose. This is the single
+    choke point for CoinGecko traffic, so it is where monthly credits are
+    counted; a default would let a new call site silently land in someone
+    else's envelope — the same "nobody was counting" failure that exhausted the
+    plan on 2026-08-21. Required turns that into a TypeError instead.
+
+    ATTEMPTS ARE NOT CREDITS. CoinGecko deducts a monthly credit on HTTP 200
+    only; 4xx/5xx do not deduct one though they still consume the per-minute
+    rate limit. Every path here records an attempt; only 200 records a credit.
+    Note `== 200`, not `< 400`: a 3xx is not a billable success either.
+    """
     await coingecko_limiter.acquire()
     try:
         async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
+            cg_budget.record(bucket, billable=(resp.status == 200))
             if resp.status == 429:
                 logger.warning("cg_429_backoff", attempt=0)
                 await coingecko_limiter.report_429()
@@ -115,9 +136,74 @@ async def _get_with_backoff(
                 return None
             return await resp.json()
     except Exception as exc:
+        # A transport failure never reached the provider, so it bills nothing —
+        # but it IS an attempt, and a lane failing this way is invisible if we
+        # only ever count successes.
+        cg_budget.record(bucket, billable=False)
         logger.warning("cg_request_error", error=str(exc), url=url)
         return None
     return None
+
+
+async def reconcile_monthly_credits(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+) -> dict | None:
+    """Reconcile the local credit ledger against CoinGecko's /key endpoint.
+
+    THE PROVIDER IS THE ACCEPTANCE TRUTH; the local ledger is the diagnostic
+    truth. They are compared rather than assumed equal, because a divergence
+    means our model of what BILLS is wrong — and a wrong billing model is
+    precisely what exhausted the plan on 2026-08-21 while every local number
+    looked reasonable.
+
+    Charged to the OPERATIONAL envelope: reconciliation must not consume the
+    discovery budget it is measuring, nor the critical reserve.
+
+    Returns the parsed payload, or None when unavailable. Note that /key
+    itself returns 429 once the monthly limit is hit, so "cannot reconcile"
+    is an expected state at exactly the moment reconciliation matters most —
+    which is why the local ledger has to stand on its own.
+    """
+    params = dict(
+        cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
+    )
+    data = await _get_with_backoff(
+        session,
+        f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/key",
+        params=params,
+        bucket=BUCKET_OPERATIONAL,
+    )
+    if not isinstance(data, dict):
+        logger.warning(
+            "cg_budget_reconcile_unavailable",
+            month=cg_budget.month,
+            local_credits=cg_budget.total_credits(),
+            hint="/key is itself rate/credit limited; local ledger stands alone",
+        )
+        return None
+
+    used = data.get("monthly_call_credit_used")
+    total = data.get("monthly_call_credit")
+    if used is not None:
+        try:
+            cg_budget.provider_credits_used = int(used)
+            cg_budget.provider_checked_at = datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            cg_budget.provider_credits_used = None
+
+    local = cg_budget.total_credits()
+    provider = cg_budget.provider_credits_used
+    drift = (provider - local) if provider is not None else None
+    logger.info(
+        "cg_budget_reconciled",
+        month=cg_budget.month,
+        local_credits=local,
+        provider_credits_used=provider,
+        provider_monthly_total=total,
+        drift=drift,
+    )
+    return data
 
 
 async def fetch_top_movers(
@@ -154,12 +240,14 @@ async def fetch_top_movers(
     params_volume = {**base_params, "order": "volume_desc"}
 
     data_small = await _get_with_backoff(
-        session, f"{_base(settings)}/coins/markets", params_small
+        session, f"{_base(settings)}/coins/markets", params_small,
+        bucket=BUCKET_DISCOVERY,
     )
     data_volume = None
     if not coingecko_limiter.is_backing_off():
         data_volume = await _get_with_backoff(
-            session, f"{_base(settings)}/coins/markets", params_volume
+            session, f"{_base(settings)}/coins/markets", params_volume,
+            bucket=BUCKET_DISCOVERY,
         )
 
     # Union both result sets, dedup by CG id
@@ -242,7 +330,8 @@ async def fetch_trending(
     )
 
     data = await _get_with_backoff(
-        session, f"{_base(settings)}/search/trending", params or None
+        session, f"{_base(settings)}/search/trending", params or None,
+        bucket=BUCKET_DISCOVERY,
     )
     if not data or not isinstance(data, dict):
         _set_watchdog_sample(
@@ -279,7 +368,8 @@ async def fetch_trending(
             cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
         )
         market_data = await _get_with_backoff(
-            session, f"{_base(settings)}/coins/markets", market_params
+            session, f"{_base(settings)}/coins/markets", market_params,
+            bucket=BUCKET_DISCOVERY,
         )
         if isinstance(market_data, list):
             market_rows_by_id = {
@@ -379,6 +469,7 @@ async def fetch_by_volume(
                 session,
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
+                bucket=BUCKET_DISCOVERY,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -503,6 +594,7 @@ async def fetch_midcap_gainers(
                 session,
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
+                bucket=BUCKET_DISCOVERY,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -645,7 +737,8 @@ async def fetch_deep_volume(
     )
 
     data = await _get_with_backoff(
-        session, f"{_base(settings)}/coins/markets", {**base_params, "page": str(page)}
+        session, f"{_base(settings)}/coins/markets", {**base_params, "page": str(page)},
+        bucket=BUCKET_DISCOVERY,
     )
     if isinstance(data, Exception) or not data or not isinstance(data, list):
         _set_watchdog_sample(

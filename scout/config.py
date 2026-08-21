@@ -235,6 +235,33 @@ class Settings(BaseSettings):
     # rounds. Set to 0 to disable the gate entirely (NOT recommended — that
     # restores the unmonitored-position class).
     PAPER_OPEN_CG_PRICING_MAX_AGE_SEC: int = Field(default=1800, ge=0, le=86_400)
+
+    # -------- CoinGecko MONTHLY-CREDIT budget (2026-08-21 repair) --------
+    # The provider enforces calls/minute and calls/MONTH as INDEPENDENT limits.
+    # coingecko_limiter owns the first; these own the second. Modeling only the
+    # first is what exhausted the Basic plan's 100,000 credits at 100.0% on
+    # 2026-08-21 with 11 days to the reset.
+    #
+    # Partitioned rather than one shared pool, because a single number lets
+    # discovery spend the allowance that keeps held positions re-priceable —
+    # and an unpriceable open position is the GA-01 failure class.
+    #
+    #   discovery  65,000  <- C profile projects ~62k, so this is the working cap
+    #   critical   30,000  <- reserved for held-position re-pricing
+    #   operational 5,000  <- reconciliation / margin for model error
+    #   ------------------
+    #   total     100,000
+    #
+    # v1 deliberately does NOT let unused critical reserve spill back into
+    # discovery. That optimization needs a measured billing month behind it.
+    COINGECKO_MONTHLY_CREDIT_ALLOWANCE: int = Field(default=100_000, ge=0)
+    COINGECKO_MONTHLY_DISCOVERY_CREDITS: int = Field(default=65_000, ge=0)
+    COINGECKO_MONTHLY_CRITICAL_CREDITS: int = Field(default=30_000, ge=0)
+    COINGECKO_MONTHLY_OPERATIONAL_CREDITS: int = Field(default=5_000, ge=0)
+    # Pace alarm: page when PROJECTED month-end consumption exceeds the
+    # allowance by this fraction. Projection beats absolute 50/75/90% marks —
+    # 60% spent on day 3 is an emergency, 60% on day 27 is fine.
+    COINGECKO_BUDGET_PACE_ALERT_RATIO: float = Field(default=1.10, ge=1.0, le=10.0)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.
@@ -2390,6 +2417,32 @@ class Settings(BaseSettings):
                     f"backtest CLI default --days=30. Lower retention silently "
                     f"truncates backtest cohorts."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cg_monthly_envelopes_fit_the_allowance(self) -> "Settings":
+        """Envelope sum must not exceed the plan's monthly credit allowance.
+
+        Pinned as a validator because over-subscription is SILENT: each envelope
+        looks reasonable alone, discovery stops at its own cap, and the plan
+        still runs dry — which is exactly the shape of the 2026-08-21 incident,
+        one axis un-modelled while every visible number looked fine.
+        """
+        allowance = self.COINGECKO_MONTHLY_CREDIT_ALLOWANCE
+        if allowance <= 0:
+            return self
+        total = (
+            self.COINGECKO_MONTHLY_DISCOVERY_CREDITS
+            + self.COINGECKO_MONTHLY_CRITICAL_CREDITS
+            + self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        )
+        if total > allowance:
+            raise ValueError(
+                f"CoinGecko monthly envelopes sum to {total} which exceeds "
+                f"COINGECKO_MONTHLY_CREDIT_ALLOWANCE={allowance}. Over-subscribing "
+                f"the allowance means discovery can stop at its own cap while the "
+                f"plan still runs dry."
+            )
         return self
 
     @model_validator(mode="after")

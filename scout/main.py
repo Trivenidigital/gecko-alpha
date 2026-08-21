@@ -37,6 +37,11 @@ from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion.coingecko import fetch_midcap_gainers as cg_fetch_midcap_gainers
 from scout.ingestion.coingecko import fetch_deep_volume as cg_fetch_deep_volume
+from scout.coingecko_budget import (
+    BUCKET_CRITICAL,
+    BUCKET_DISCOVERY,
+    budget as cg_budget,
+)
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion import dexscreener as _dex_module
 from scout.ingestion import geckoterminal as _gt_module
@@ -750,6 +755,27 @@ async def _fetch_coingecko_lanes(
     # and main.py would then republish it as this cycle's data — restamping
     # price_cache as fresh and re-inserting duplicate volume_history_cg rows
     # under a new recorded_at. See reset_discovery_raw's docstring.
+    # Monthly-credit envelope. Checked BEFORE the cadence gate so an exhausted
+    # discovery budget stops discovery on every cycle, not only on the 5th.
+    # Only DISCOVERY stops — held_position ran above and draws on the reserved
+    # critical envelope, so an exhausted discovery budget can never leave an
+    # open position unpriceable.
+    if cg_budget.discovery_exhausted(settings):
+        _cg_module.reset_discovery_raw()
+        logger.warning(
+            "coingecko_discovery_budget_exhausted",
+            month=cg_budget.month,
+            discovery_credits=cg_budget.credits(BUCKET_DISCOVERY),
+            discovery_cap=settings.COINGECKO_MONTHLY_DISCOVERY_CREDITS,
+            critical_credits=cg_budget.credits(BUCKET_CRITICAL),
+            hint=(
+                "discovery halted for the remainder of the billing month; "
+                "the critical reserve remains spendable so held positions "
+                "stay re-priceable"
+            ),
+        )
+        return [], [], [], [], [], held_position_raw
+
     global _cg_discovery_cycle_counter
     _cg_discovery_cycle_counter += 1
     discovery_interval = max(1, int(settings.COINGECKO_DISCOVERY_INTERVAL_CYCLES))
@@ -1597,6 +1623,66 @@ async def _run_narrative_resolution_watchdog(db, settings, logger) -> list[str]:
     return n_alarms
 
 
+async def _send_cg_budget_pace_alert(
+    session,
+    settings,
+    *,
+    projected: float,
+    allowance: int,
+    ratio: float,
+    snapshot: dict,
+) -> None:
+    """§12b operator page: this month's CoinGecko pace overshoots the allowance.
+
+    Fires on PROJECTION, not on an absolute mark. The 2026-08-21 exhaustion was
+    visible in the logs for three days as a rising 429 rate and nobody was told,
+    because nothing was watching the monthly axis at all. A pace alarm is the
+    piece that turns "we ran out" into "we are going to run out".
+
+    Never raises: a failed alert must not break the maintenance pass.
+    """
+    if session is None:
+        logger.warning("cg_budget_pace_alert_skipped_no_session", ratio=round(ratio, 2))
+        return
+
+    # Deferred import: scout.alerter pulls aiohttp at module level (Windows
+    # OpenSSL Applink) — same pattern as auto_suspend / evaluator.
+    from scout import alerter
+
+    body = "\n".join(
+        [
+            "WARNING: CoinGecko monthly credit pace exceeds the plan allowance",
+            f"month: {snapshot.get('month')}",
+            f"credits used so far: {snapshot.get('total_credits')}",
+            f"projected month-end: {round(projected)}",
+            f"allowance: {allowance}",
+            f"projected overshoot: {ratio:.2f}x",
+            (
+                f"discovery: {snapshot.get('discovery_credits')} credits "
+                f"({snapshot.get('discovery_attempts')} attempts)"
+            ),
+            f"critical: {snapshot.get('critical_credits')} credits",
+            "Discovery halts at its own envelope; the critical reserve is preserved.",
+        ]
+    )
+    try:
+        logger.info("cg_budget_pace_alert_dispatched", ratio=round(ratio, 2), **snapshot)
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            # parse_mode=None: bucket names and keys contain `_`, which Telegram
+            # MarkdownV1 silently mangles into italics (§12b Class-3 rendering).
+            parse_mode=None,
+            source="cg_budget_pace",
+        )
+        logger.info("cg_budget_pace_alert_delivered", ratio=round(ratio, 2))
+    except Exception:
+        # Logged, never fatal. The default alerter is silent on success, so the
+        # dispatched/delivered pair above is what makes "no logs" unambiguous.
+        logger.exception("cg_budget_pace_alert_failed", ratio=round(ratio, 2))
+
+
 async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     """Hourly maintenance: outcome check + table prunes.
 
@@ -1780,6 +1866,39 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             )
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
+
+    # --- CoinGecko monthly-credit governor: persist + PACE check ---
+    # Emitted unconditionally, like the prunes above: a budget report that only
+    # appears when something is wrong is indistinguishable from a governor that
+    # stopped running, which is the failure mode this whole repair exists to
+    # close.
+    try:
+        await cg_budget.persist(db)
+        snapshot = cg_budget.snapshot()
+        projected = cg_budget.projected_month_end_credits()
+        allowance = int(settings.COINGECKO_MONTHLY_CREDIT_ALLOWANCE or 0)
+        logger.info(
+            "cg_budget_status",
+            projected_month_end=(round(projected) if projected else None),
+            allowance=allowance,
+            **snapshot,
+        )
+        # PACE, not an absolute mark. 60% spent on day 3 is an emergency and
+        # 60% on day 27 is fine, so the alarm compares where this pace LANDS
+        # against the allowance rather than where we are today.
+        if projected is not None and allowance > 0:
+            ratio = projected / allowance
+            if ratio >= float(settings.COINGECKO_BUDGET_PACE_ALERT_RATIO):
+                await _send_cg_budget_pace_alert(
+                    session,
+                    settings,
+                    projected=projected,
+                    allowance=allowance,
+                    ratio=ratio,
+                    snapshot=snapshot,
+                )
+    except Exception:
+        logger.exception("cg_budget_maintenance_failed")
 
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4 + BL-NEW-SQLITE-DURABLE-MAINTENANCE
     # (P0 Part B): probe the WAL/freelist state ONCE (after all 12 prunes so
@@ -2606,6 +2725,15 @@ async def main(argv: list[str] | None = None) -> int:
         await hydrate_ingest_watchdog_state(db, settings)
     except Exception:
         logger.exception("ingest_watchdog_state_hydrate_failed")
+
+    # Same rationale as GA-19 above, one axis over: the CoinGecko monthly-credit
+    # counters live in memory (they are read on every CG call), so without this
+    # a restart would zero the month's spend and the envelopes would silently
+    # reset on every deploy. A budget a service bounce clears is not a budget.
+    try:
+        await cg_budget.hydrate(db)
+    except Exception:
+        logger.exception("cg_budget_hydrate_failed")
 
     try:
         async with aiohttp.ClientSession(
