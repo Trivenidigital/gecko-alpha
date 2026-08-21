@@ -488,6 +488,14 @@ class Database:
             # gone, which is the gap this closes going forward.
             await self._migrate_alert_payloads_v1()
 
+            # INF-08: signal_events index migration. schema_version 20260821.
+            # Option D from retention rulings: drop idx_sig_events_type (466MB),
+            # add idx_sig_events_created_at. load_recent_events queries created_at;
+            # idx_sig_events_type serves NO WHERE clause anywhere. Measure NET
+            # occupied-page reduction. Run BEFORE retire_dead_tables as a schema
+            # index change (not destructive data-level pruning).
+            await self._migrate_signal_events_indexes_v1()
+
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
             # DROPs are irreversible — the flag IS the recorded-approval hook. Runs
@@ -2289,8 +2297,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_sig_events_token
                 ON signal_events(token_id, pipeline, created_at);
-            CREATE INDEX IF NOT EXISTS idx_sig_events_type
-                ON signal_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sig_events_created_at
+                ON signal_events(created_at);
 
             CREATE TABLE IF NOT EXISTS chain_patterns (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6661,6 +6669,94 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "alert_payloads_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_signal_events_indexes_v1(self) -> None:
+        """Drop idx_sig_events_type, add idx_sig_events_created_at.
+
+        Option D from retention rulings 2026-08-16: idx_sig_events_type (466 MB)
+        serves NO WHERE clause anywhere; load_recent_events does a full-scan +
+        temp-sort every cycle because it filters on created_at. Swapping them
+        gives both size and latency wins.
+
+        Migration runs EXCLUSIVE to gate the index operations. Both indexes exist
+        by schema definition, but the DROP happens only once; subsequent runs
+        check paper_migrations and skip.
+
+        The new index helps:
+        - load_recent_events: WHERE created_at >= ? ORDER BY created_at ASC
+        - tracker MIN queries: WHERE ... AND datetime(created_at) < ...
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "signal_events_indexes_v1"
+        schema_version = 20260821
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+
+            # Check if already applied
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            if await cur.fetchone() is not None:
+                await conn.execute("COMMIT")
+                _log.info(
+                    "signal_events_indexes_v1_migration_skip_already_applied",
+                )
+                return
+
+            # Drop the old index (serves no WHERE clause)
+            await conn.execute("DROP INDEX IF EXISTS idx_sig_events_type")
+
+            # Create the new index (helps with created_at filters)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sig_events_created_at "
+                "ON signal_events(created_at)"
+            )
+
+            # Record the migration
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "signal_events_indexes_v1_migration_complete",
+                dropped="idx_sig_events_type",
+                created="idx_sig_events_created_at",
+            )
+        except BaseException as e:
+            _log.exception(
+                "signal_events_indexes_v1_migration_failed",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
