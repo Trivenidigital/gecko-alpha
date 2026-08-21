@@ -202,7 +202,24 @@ class Settings(BaseSettings):
     # held-position refresh can add 1 when enabled, and midcap scan averages
     # +1/min under its default 3-cycle cadence. Raise only with rate-budget
     # review against the 25/min limiter.
-    COINGECKO_VOLUME_SCAN_PAGES: int = 3
+    # 2026-08-21 monthly-budget repair: 3 -> 2. See
+    # tasks/plan_cg_monthly_budget_governor.md. The comment ABOVE reasons
+    # entirely about "the 25/min limiter" — a RATE constraint. The account also
+    # has a MONTHLY CREDIT ceiling (Basic = 100k/mo) which that model ignored
+    # entirely, and which is what actually ran out on 2026-08-21 at 100.0%.
+    # Restore to 3 only after a full measured billing month AND evidence of
+    # discovery-quality loss from 2 pages — not by spending headroom by default.
+    COINGECKO_VOLUME_SCAN_PAGES: int = 2
+
+    # CG DISCOVERY cadence, decoupled from the 60s main cycle. The free leading
+    # sources (DexScreener / GeckoTerminal) stay at 60s; only the paid CG
+    # discovery lanes are throttled, because CG is the LAGGING source.
+    #
+    # held-position pricing is deliberately NOT gated by this — it keeps its own
+    # HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES cadence and its
+    # no_open_trades no-op, because it is the operationally critical surface
+    # (the live trailing-stop evaluator reads the price_cache rows it writes).
+    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=5, ge=1, le=1440)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.

@@ -119,6 +119,13 @@ logger = structlog.get_logger()
 # completes — without a stored reference, the task can be GC'd mid-flight
 # and never reach the callback.
 _counter_followup_tasks: set[asyncio.Task] = set()
+# CG discovery cadence counter (monthly-budget repair 2026-08-21). Increments on
+# every pipeline cycle that reaches the CG lanes; the discovery fan-out runs only
+# when it divides COINGECKO_DISCOVERY_INTERVAL_CYCLES. Deliberately a COUNTER,
+# not a wall-clock deadline: it makes the cadence deterministic in tests and
+# matches the existing idiom in fetch_midcap_gainers / fetch_held_position_prices.
+# Resets to 0 on restart, which only ever costs one extra discovery round.
+_cg_discovery_cycle_counter: int = 0
 # ALR-02 detection-time alert lane fire-and-forget tasks. Same GC-protection
 # rationale as the sets above — hold a strong ref so a spawned task can't be
 # collected before its done-callback runs.
@@ -729,7 +736,41 @@ async def _fetch_coingecko_lanes(
         logger.warning(
             "coingecko_lanes_stopped_for_backoff", after="held_position_prices"
         )
+        _cg_module.reset_discovery_raw()
         return [], [], [], [], [], held_position_raw
+
+    # --- CG DISCOVERY cadence gate (monthly-budget repair 2026-08-21) ---
+    # held_position ran ABOVE this gate on purpose: it is the critical surface
+    # and keeps its own cadence + no_open_trades no-op. Only the paid DISCOVERY
+    # lanes are throttled here. The free leading sources (DexScreener /
+    # GeckoTerminal) are not touched by this function at all.
+    #
+    # reset_discovery_raw() is REQUIRED, not tidiness: the fetchers clear their
+    # own globals on entry, so skipping them leaves the PREVIOUS payload live,
+    # and main.py would then republish it as this cycle's data — restamping
+    # price_cache as fresh and re-inserting duplicate volume_history_cg rows
+    # under a new recorded_at. See reset_discovery_raw's docstring.
+    global _cg_discovery_cycle_counter
+    _cg_discovery_cycle_counter += 1
+    discovery_interval = max(1, int(settings.COINGECKO_DISCOVERY_INTERVAL_CYCLES))
+    if _cg_discovery_cycle_counter % discovery_interval != 0:
+        _cg_module.reset_discovery_raw()
+        logger.debug(
+            "coingecko_discovery_skipped_off_cadence",
+            cycle=_cg_discovery_cycle_counter,
+            interval=discovery_interval,
+        )
+        return [], [], [], [], [], held_position_raw
+
+    # Start every discovery round from a clean slate. Each fetch_* clears its
+    # OWN global on entry, so this is redundant for a lane that runs — and
+    # essential for one that does not. The backoff early-returns below abort the
+    # sequence part-way; without this, the lanes that never ran would still be
+    # holding the PREVIOUS round's payload, and main.py (which reads the globals,
+    # not this function's return value) would republish it as current. That is a
+    # pre-existing defect, not one the cadence gate introduced — it fires on
+    # every backoff-truncated cycle, and CG has been backing off constantly.
+    _cg_module.reset_discovery_raw()
 
     cg_movers = await _call("top_movers", cg_fetch_top_movers, session, settings)
     if coingecko_limiter.is_backing_off():

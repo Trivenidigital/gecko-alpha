@@ -49,6 +49,40 @@ _deep_volume_page_cursor: int = 0
 _last_watchdog_samples: dict[str, IngestSourceSample] = {}
 
 
+def reset_discovery_raw() -> None:
+    """Clear every DISCOVERY raw-response global. Held-position is not one.
+
+    Each fetch_* function already clears its own global on entry, so a global
+    reflects the lane's own last RUN. That invariant breaks the moment a lane is
+    SKIPPED rather than called: the global then still holds the previous run's
+    payload, and main.py's downstream consumers cannot tell the difference.
+
+    That matters because three consumers read these globals, and every one of
+    them would silently fabricate data from a skipped cycle:
+
+      1. `db.cache_prices(all_raw)` stamps `updated_at = now()` unconditionally,
+         so re-feeding a retained payload republishes minutes-old prices as
+         fresh — defeating the exit evaluator's own staleness guard.
+      2. `_combine_coin_market_rows(...)` would re-drive gainers/candidate
+         surfaces from data that was not fetched this cycle.
+      3. `record_volume(_raw_for_history)` would insert the SAME coins into
+         `volume_history_cg` again under a new `recorded_at` — fabricated
+         observations in the exact series that feeds `detect_spikes`' 7d average
+         and the ledger's `peak7d` window.
+
+    So a cadence gate MUST clear these, not merely decline to call the fetchers.
+    Calling this leaves the downstream combines empty, which is the truthful
+    representation of "no discovery ran this cycle".
+    """
+    global last_raw_markets, last_raw_trending, last_raw_by_volume
+    global last_raw_midcap_gainers, last_raw_deep_volume
+    last_raw_markets = []
+    last_raw_trending = []
+    last_raw_by_volume = []
+    last_raw_midcap_gainers = []
+    last_raw_deep_volume = []
+
+
 def _set_watchdog_sample(sample: IngestSourceSample) -> None:
     _last_watchdog_samples[sample.source] = sample
 
