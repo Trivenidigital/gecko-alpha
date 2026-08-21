@@ -220,6 +220,21 @@ class Settings(BaseSettings):
     # no_open_trades no-op, because it is the operationally critical surface
     # (the live trailing-stop evaluator reads the price_cache rows it writes).
     COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=5, ge=1, le=1440)
+
+    # Open-boundary pricing LIVENESS bound (monthly-budget repair 2026-08-21).
+    # The engine's step-0c gate is a REGISTRY check ("a CG lane serves this
+    # token_id shape"); this is the LIVENESS check ("a CG lane actually wrote
+    # price_cache recently"). With CG dark — exhausted monthly credits, a
+    # suspended account, a spent discovery envelope — a position can open and
+    # then be unmonitored (no trailing stop, no SL) until max_duration
+    # force-closes it at entry_price with a fabricated pnl_pct=0.
+    #
+    # Sized against COINGECKO_DISCOVERY_INTERVAL_CYCLES: at a 5-cycle/60s
+    # cadence price_cache should be written every ~5 min, so 1800s is ~6x
+    # headroom and will not trip on ordinary jitter or a couple of skipped
+    # rounds. Set to 0 to disable the gate entirely (NOT recommended — that
+    # restores the unmonitored-position class).
+    PAPER_OPEN_CG_PRICING_MAX_AGE_SEC: int = Field(default=1800, ge=0, le=86_400)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.

@@ -28,10 +28,29 @@ from scout.trading.signals import (
 )
 
 
+
+# 2026-08-21 monthly-budget repair: the engine's step-0d pricing-LIVENESS gate
+# refuses to open a position when no CoinGecko lane has written price_cache
+# recently, because price_cache is the ONLY source the exit evaluator can
+# re-price from. These tests exercise signal dispatch, not liveness, and in
+# production there is always a recent CG write — so seed one sentinel row.
+# The gate stays ENABLED here (not zeroed) so it keeps protecting these paths;
+# it is pinned directly by tests/test_engine_pricing_liveness_gate.py.
+async def _seed_pricing_liveness_sentinel(d):
+    from datetime import datetime, timezone
+
+    await d._conn.execute(
+        "INSERT OR REPLACE INTO price_cache "
+        "(coin_id, current_price, updated_at) VALUES (?, ?, ?)",
+        ("__liveness_sentinel__", 1.0, datetime.now(timezone.utc).isoformat()),
+    )
+    await d._conn.commit()
+
 @pytest.fixture
 async def db(tmp_path):
     d = Database(tmp_path / "test.db")
     await d.initialize()
+    await _seed_pricing_liveness_sentinel(d)
     yield d
     await d.close()
 
