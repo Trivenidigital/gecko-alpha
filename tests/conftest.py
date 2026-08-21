@@ -285,27 +285,38 @@ def token_factory():
     return _make
 
 
+# Imported once at module load, not per test: this reset runs for every test in
+# the suite (~7k), so anything done inside the fixture body is multiplied by 7000.
+import scout.main as _scout_main  # noqa: E402
+from scout import coingecko_budget as _scout_cg_budget  # noqa: E402
+from scout.ingestion import coingecko as _scout_cg  # noqa: E402
+
+
 @pytest.fixture(autouse=True)
 def _reset_cg_process_state():
     """Isolate the process-global CoinGecko cadence counter and credit ledger.
 
-    Both are module-level singletons by design (they are consulted on every CG
-    call, so a per-call DB round-trip would be its own budget problem). That
-    makes them leak across tests: without this, whether a test's cycle lands on
-    the discovery cadence depends on how many CG cycles earlier tests happened
-    to run, and a test asserting on credits inherits another test's spend.
+    Both are module-level singletons by design (consulted on every CG call, so a
+    per-call DB round-trip would be its own budget problem). That makes them leak
+    across tests: without this, whether a test lands on the discovery cadence
+    depends on how many CG cycles earlier tests ran, and a test asserting on
+    credits inherits another test's spend.
 
-    Resetting per test reproduces what a freshly-started process sees, so
-    cadence and budget assertions are about the code rather than test order.
+    Deliberately does the minimum work possible — plain assignments, no object
+    construction, imports hoisted to module scope. An autouse fixture is paid by
+    every test in the suite, and CI runs against a 25-minute wall.
     """
-    import scout.main as _main
-    from scout import coingecko_budget as _budget
-    from scout.ingestion import coingecko as _cg
-
-    _main._cg_discovery_cycle_counter = 0
-    _cg.reset_discovery_raw()
-    _budget.budget.__init__()
+    _scout_main._cg_discovery_cycle_counter = 0
+    _scout_cg.last_raw_markets = []
+    _scout_cg.last_raw_trending = []
+    _scout_cg.last_raw_by_volume = []
+    _scout_cg.last_raw_midcap_gainers = []
+    _scout_cg.last_raw_deep_volume = []
+    _b = _scout_cg_budget.budget
+    _b._month = _scout_cg_budget.billing_month()
+    for _k in _b._counts:
+        _b._counts[_k][0] = 0
+        _b._counts[_k][1] = 0
+    _b._dirty = False
+    _b.provider_credits_used = None
     yield
-    _main._cg_discovery_cycle_counter = 0
-    _cg.reset_discovery_raw()
-    _budget.budget.__init__()
