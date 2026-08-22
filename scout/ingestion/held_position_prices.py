@@ -173,6 +173,7 @@ async def _fetch_simple_price_batch(
         # writes. It draws on the reserved envelope so an exhausted discovery
         # budget can never leave an open position unpriceable.
         bucket=BUCKET_CRITICAL,
+        settings=settings,
     )
     if not isinstance(result, dict):
         return {}

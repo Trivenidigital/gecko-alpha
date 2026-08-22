@@ -182,6 +182,7 @@ async def narrative_agent_loop(
                 session,
                 api_key=settings.COINGECKO_API_KEY,
                 api_tier=settings.COINGECKO_API_TIER,
+                settings=settings,
             )
             if not raw_categories:
                 logger.warning("narrative.observe_empty")
@@ -297,6 +298,7 @@ async def narrative_agent_loop(
                         accel.category_id,
                         api_key=settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
 
                     # Cache laggard prices for dashboard (zero extra API calls)
@@ -354,6 +356,7 @@ async def narrative_agent_loop(
                             token.coin_id,
                             settings.COINGECKO_API_KEY,
                             api_tier=settings.COINGECKO_API_TIER,
+                            settings=settings,
                         )
                         token_cdata = (
                             extract_counter_data(token_detail) if token_detail else None
@@ -580,6 +583,7 @@ async def narrative_agent_loop(
                             token.coin_id,
                             settings.COINGECKO_API_KEY,
                             api_tier=settings.COINGECKO_API_TIER,
+                            settings=settings,
                         )
                         control_watchlist = 0
                         if control_detail:
@@ -695,6 +699,7 @@ async def narrative_agent_loop(
                         strategy,
                         api_key=settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
                     last_eval_at = now
                     await strategy.set_timestamp("last_eval_at", now)

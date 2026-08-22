@@ -13,6 +13,7 @@ import structlog
 from scout import cg_api
 from scout.db import Database
 from scout.narrative.strategy import Strategy
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
@@ -55,6 +56,7 @@ async def fetch_prices_batch(
     coin_ids: list[str],
     api_key: str = "",
     api_tier: str = "demo",
+    settings=None,
 ) -> dict[str, float]:
     """Fetch current USD prices for a list of CoinGecko coin IDs.
 
@@ -84,9 +86,16 @@ async def fetch_prices_batch(
             "ids": ids_param,
             "per_page": str(_BATCH_SIZE),
         }
+        # Governed: hand-rolled loop, so it borrows the accounting and
+        # enforcement instead of _get_with_backoff. DISCOVERY bucket
+        # (non-critical) so it can never eat the re-pricing reserve.
+        _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+        if not _call.allowed:
+            break
         await coingecko_limiter.acquire()
         try:
             async with session.get(url, params=params, headers=headers) as resp:
+                _call.finish(resp.status)
                 if resp.status == 429:
                     log.warning(
                         "coingecko_rate_limited",
@@ -121,6 +130,7 @@ async def evaluate_pending(
     strategy: Strategy,
     api_key: str = "",
     api_tier: str = "demo",
+    settings=None,
 ) -> None:
     """Evaluate all pending predictions against current prices.
 
@@ -157,7 +167,7 @@ async def evaluate_pending(
     # Collect unique coin IDs and batch-fetch prices
     unique_ids = list({row[1] for row in rows})
     prices = await fetch_prices_batch(
-        session, unique_ids, api_key=api_key, api_tier=api_tier
+        session, unique_ids, api_key=api_key, api_tier=api_tier, settings=settings
     )
 
     # Tokens missing from batch fetch — try direct CoinGecko /simple/price
@@ -172,6 +182,12 @@ async def evaluate_pending(
             )
         for chunk_start in range(0, min(len(missing_ids), 60), 20):
             chunk = missing_ids[chunk_start : chunk_start + 20]
+            # Governed: the /simple/price fallback is a SECOND direct CoinGecko
+            # path in this function, separate from fetch_prices_batch above.
+            # It bills real credits and must be counted and refusable too.
+            _fb_call = governed_cg_call(BUCKET_DISCOVERY, settings)
+            if not _fb_call.allowed:
+                break
             try:
                 await coingecko_limiter.acquire()
                 ids_param = ",".join(chunk)
@@ -182,6 +198,7 @@ async def evaluate_pending(
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
+                    _fb_call.finish(resp.status)
                     if resp.status == 429:
                         await coingecko_limiter.report_429()
                         break  # stop fetching more chunks

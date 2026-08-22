@@ -36,6 +36,10 @@ def settings(settings_factory):
     return settings_factory(
         COINGECKO_DISCOVERY_INTERVAL_CYCLES=5,
         HELD_POSITION_PRICE_REFRESH_ENABLED=True,
+        # These tests are about CADENCE. The dark-until-reset activation gate
+        # (default False, so a deploy before the September 1 credit reset cannot
+        # resume discovery) is a separate concern with its own tests below.
+        COINGECKO_DISCOVERY_ENABLED=True,
     )
 
 
@@ -170,3 +174,40 @@ def test_discovery_interval_is_settings_sourced_not_hardcoded(settings_factory):
     assert s.COINGECKO_DISCOVERY_INTERVAL_CYCLES == 3
     with pytest.raises(ValueError):
         settings_factory(COINGECKO_DISCOVERY_INTERVAL_CYCLES=0)
+
+
+# ---------------------------------------------------------------------------
+# Dark-until-reset activation gate
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_stays_dark_when_not_activated(settings_factory):
+    """THE deployment-boundary guarantee.
+
+    The ruling is "no CoinGecko discovery before the September 1 credit reset".
+    Without a default-off flag that is only a promise about deployment TIMING: a
+    deploy before the reset starts with an EMPTY local ledger, so every envelope
+    looks available and discovery resumes on the 5th cycle. The provider would
+    answer 429 because its real quota is gone -- but attempting and being
+    refused is not "dark", it just moves the failure somewhere the local ledger
+    cannot see.
+    """
+    settings = settings_factory(
+        COINGECKO_DISCOVERY_INTERVAL_CYCLES=1,     # would fire EVERY cycle
+        COINGECKO_DISCOVERY_ENABLED=False,
+        HELD_POSITION_PRICE_REFRESH_ENABLED=True,
+    )
+    db = MagicMock()
+    for _ in range(10):
+        calls, _ = await _run_cycle(settings, db)
+        assert "top_movers" not in calls
+        assert "trending" not in calls
+        assert "by_volume" not in calls
+        # ...and the critical lane is UNAFFECTED: held positions must stay
+        # re-priceable while discovery is dark.
+        assert "held_position_prices" in calls
+
+
+def test_discovery_activation_defaults_to_off(settings_factory):
+    """Default-off, so the guarantee holds even if nobody sets anything."""
+    assert settings_factory().COINGECKO_DISCOVERY_ENABLED is False

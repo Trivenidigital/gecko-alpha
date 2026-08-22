@@ -49,7 +49,10 @@ async def fetch_fear_greed(session: aiohttp.ClientSession) -> dict | None:
 
 
 async def fetch_cg_global(
-    session: aiohttp.ClientSession, api_key: str = "", api_tier: str = "demo"
+    session: aiohttp.ClientSession,
+    api_key: str = "",
+    api_tier: str = "demo",
+    settings=None,
 ) -> dict | None:
     """Fetch CoinGecko /global endpoint for market overview.
 
@@ -57,12 +60,23 @@ async def fetch_cg_global(
     """
     try:
         from scout import cg_api
+        from scout.coingecko_budget import (
+            BUCKET_OPERATIONAL,
+            governed_cg_call,
+        )
         from scout.ratelimit import coingecko_limiter
 
+        # Governed: briefing is a reporting surface, not discovery or
+        # re-pricing, so it draws on the OPERATIONAL envelope and stops there
+        # rather than eating discovery or the critical reserve.
+        _call = governed_cg_call(BUCKET_OPERATIONAL, settings)
+        if not _call.allowed:
+            return None
         await coingecko_limiter.acquire()
         url = f"{cg_api.base_url(api_tier)}/global"
         headers = dict(cg_api.auth_headers(api_key, api_tier))
         async with session.get(url, headers=headers, timeout=_TIMEOUT) as resp:
+            _call.finish(resp.status)
             if resp.status != 200:
                 logger.warning("cg_global_fetch_failed", status=resp.status)
                 return None
@@ -439,7 +453,9 @@ async def collect_briefing_data(
         news,
     ) = await asyncio.gather(
         fetch_fear_greed(session),
-        fetch_cg_global(session, api_key=cg_api_key, api_tier=cg_tier),
+        fetch_cg_global(
+            session, api_key=cg_api_key, api_tier=cg_tier, settings=settings
+        ),
         fetch_funding_rates(session, api_key=coinglass_key),
         fetch_liquidations(session, api_key=coinglass_key),
         fetch_defi_tvl(session),

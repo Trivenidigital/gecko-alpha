@@ -11,6 +11,7 @@ import structlog
 from scout import cg_api
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, CategorySnapshot
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 
 logger = structlog.get_logger(__name__)
@@ -21,15 +22,24 @@ async def fetch_categories(
     api_key: str = "",
     max_retries: int = 3,
     api_tier: str = "demo",
+    settings=None,
 ) -> list[dict]:
     """GET CoinGecko /coins/categories with exponential backoff on 429."""
     headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
     categories_url = f"{cg_api.base_url(api_tier)}/coins/categories"
 
     for attempt in range(max_retries):
+        # Governed: this lane owns its retry loop so it cannot use
+        # _get_with_backoff, but it must still be counted and refusable.
+        # DISCOVERY bucket (non-critical) so it can never eat the reserve
+        # that keeps open positions re-priceable.
+        _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+        if not _call.allowed:
+            return []
         await coingecko_limiter.acquire()
         try:
             async with session.get(categories_url, headers=headers) as resp:
+                _call.finish(resp.status)
                 if resp.status == 429:
                     wait = 2 ** (attempt + 1)
                     logger.warning("coingecko_429_retry", attempt=attempt, wait=wait)

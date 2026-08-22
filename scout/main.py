@@ -755,6 +755,26 @@ async def _fetch_coingecko_lanes(
     # and main.py would then republish it as this cycle's data — restamping
     # price_cache as fresh and re-inserting duplicate volume_history_cg rows
     # under a new recorded_at. See reset_discovery_raw's docstring.
+    # DARK-UNTIL-RESET gate. Default-off, checked before everything else.
+    # The operator ruling is "no CoinGecko discovery before the September 1
+    # credit reset". Without this flag that is only a promise about deployment
+    # timing: a deploy before the reset starts with an EMPTY local ledger, so
+    # every envelope looks available and discovery resumes on the 5th cycle. The
+    # provider would answer 429 because its real quota is gone — but attempting
+    # and being refused is not "dark", it just moves the failure to a place the
+    # local ledger cannot see. Flipping this to true is the activation step.
+    if not settings.COINGECKO_DISCOVERY_ENABLED:
+        _cg_module.reset_discovery_raw()
+        logger.debug(
+            "coingecko_discovery_disabled",
+            hint=(
+                "COINGECKO_DISCOVERY_ENABLED is false — CG discovery stays dark "
+                "regardless of local ledger state; set it in the same change "
+                "that activates the lane after the monthly credit reset"
+            ),
+        )
+        return [], [], [], [], [], held_position_raw
+
     # Monthly-credit envelope. Checked BEFORE the cadence gate so an exhausted
     # discovery budget stops discovery on every cycle, not only on the 5th.
     # Only DISCOVERY stops — held_position ran above and draws on the reserved
@@ -958,6 +978,16 @@ async def run_cycle(
             settings,
             dry_run=dry_run,
         )
+
+    # Bounded credit-durability flush. The hourly maintenance pass is too
+    # coarse to be the only persistence: a crash or deploy between flushes would
+    # discard up to an hour of spend and the process would restart believing it
+    # has capacity it already burned. Flushes by CREDITS rather than clock,
+    # because the exposure scales with spend, not with time.
+    try:
+        await cg_budget.maybe_persist(db, settings)
+    except Exception:
+        logger.exception("cg_budget_flush_failed")
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)
@@ -1867,12 +1897,21 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
 
-    # --- CoinGecko monthly-credit governor: persist + PACE check ---
+    # --- CoinGecko monthly-credit governor: reconcile + persist + PACE ---
     # Emitted unconditionally, like the prunes above: a budget report that only
     # appears when something is wrong is indistinguishable from a governor that
-    # stopped running, which is the failure mode this whole repair exists to
-    # close.
+    # stopped running, which is the failure mode this repair exists to close.
     try:
+        # Provider is the ACCEPTANCE truth. Reconcile BEFORE reading the
+        # snapshot so pacing, enforcement and the report all see the corrected
+        # figure — a /key call that only produced a log line would leave the
+        # local ledger authoritative, which is precisely the wrong direction.
+        if session is not None and settings.COINGECKO_BUDGET_RECONCILE_ENABLED:
+            try:
+                await _cg_module.reconcile_monthly_credits(session, settings)
+            except Exception:
+                logger.exception("cg_budget_reconcile_failed")
+
         await cg_budget.persist(db)
         snapshot = cg_budget.snapshot()
         projected = cg_budget.projected_month_end_credits()
@@ -1883,20 +1922,20 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             allowance=allowance,
             **snapshot,
         )
-        # PACE, not an absolute mark. 60% spent on day 3 is an emergency and
-        # 60% on day 27 is fine, so the alarm compares where this pace LANDS
-        # against the allowance rather than where we are today.
-        if projected is not None and allowance > 0:
-            ratio = projected / allowance
-            if ratio >= float(settings.COINGECKO_BUDGET_PACE_ALERT_RATIO):
-                await _send_cg_budget_pace_alert(
-                    session,
-                    settings,
-                    projected=projected,
-                    allowance=allowance,
-                    ratio=ratio,
-                    snapshot=snapshot,
-                )
+        # PACE, not an absolute mark, and on the CROSSING rather than the
+        # condition: this pass runs hourly, so paging whenever the projection is
+        # over threshold would produce ~24 pages/day for one unchanged fact.
+        if projected is not None and allowance > 0 and cg_budget.should_page_on_pace(
+            settings
+        ):
+            await _send_cg_budget_pace_alert(
+                session,
+                settings,
+                projected=projected,
+                allowance=allowance,
+                ratio=projected / allowance,
+                snapshot=snapshot,
+            )
     except Exception:
         logger.exception("cg_budget_maintenance_failed")
 

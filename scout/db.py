@@ -7493,6 +7493,14 @@ class Database:
                     bucket TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     credits INTEGER NOT NULL DEFAULT 0,
+                    -- When CoinGecko itself last returned HTTP 200. This is the
+                    -- PROVIDER liveness heartbeat the open-boundary gate reads.
+                    -- Deliberately not derived from price_cache: that table is
+                    -- also written by DexScreener (outcome_ledger's dex
+                    -- enrollment poller), so its freshness says nothing about
+                    -- CoinGecko. Durable so a restart does not present a dead
+                    -- provider as merely unobserved.
+                    last_success_at TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (month, bucket)
                 )

@@ -10,6 +10,7 @@ import aiohttp
 import structlog
 
 from scout import cg_api
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 
 logger = structlog.get_logger()
@@ -24,6 +25,7 @@ async def fetch_coin_detail(
     coin_id: str,
     api_key: str = "",
     api_tier: str = "demo",
+    settings=None,
 ) -> dict | None:
     """Fetch full coin detail from CoinGecko, with 30-min in-memory cache.
 
@@ -50,9 +52,16 @@ async def fetch_coin_detail(
     headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
 
     url = f"{cg_api.base_url(api_tier)}/coins/{coin_id}"
+    # Governed: hand-rolled call, so it borrows the accounting and
+    # enforcement instead of _get_with_backoff. DISCOVERY bucket
+    # (non-critical) so it can never eat the re-pricing reserve.
+    _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+    if not _call.allowed:
+        return None
     await coingecko_limiter.acquire()
     try:
         async with session.get(url, params=params, headers=headers) as resp:
+            _call.finish(resp.status)
             if resp.status == 429:
                 logger.warning("cg_detail_rate_limited", coin_id=coin_id)
                 await coingecko_limiter.report_429()

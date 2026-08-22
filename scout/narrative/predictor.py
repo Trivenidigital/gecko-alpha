@@ -15,6 +15,7 @@ from scout import cg_api
 from scout.db import Database
 from scout.narrative.models import CategoryAcceleration, LaggardToken
 from scout.narrative.prompts import NARRATIVE_FIT_SYSTEM, NARRATIVE_FIT_TEMPLATE
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 
 log = structlog.get_logger()
@@ -30,6 +31,7 @@ async def fetch_laggards(
     category_id: str,
     api_key: str = "",
     api_tier: str = "demo",
+    settings=None,
 ) -> list[dict]:
     """Fetch coins in a CoinGecko category sorted by market cap descending.
 
@@ -46,6 +48,13 @@ async def fetch_laggards(
     headers: dict[str, str] = {}
     headers.update(cg_api.auth_headers(api_key, api_tier))
     for attempt in range(2):  # 1 retry on 429
+        # Governed: this lane owns its retry loop so it cannot use
+        # _get_with_backoff, but it must still be counted and refusable.
+        # DISCOVERY bucket (non-critical) so it can never eat the reserve
+        # that keeps open positions re-priceable.
+        _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+        if not _call.allowed:
+            return []
         await coingecko_limiter.acquire()
         try:
             async with session.get(
@@ -53,6 +62,7 @@ async def fetch_laggards(
                 params=params,
                 headers=headers,
             ) as resp:
+                _call.finish(resp.status)
                 if resp.status == 429:
                     log.warning(
                         "fetch_laggards_rate_limited",

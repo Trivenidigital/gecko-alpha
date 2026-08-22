@@ -1,27 +1,40 @@
-"""A position must not open when CoinGecko pricing is not LIVE.
+"""A position must not open when the CoinGecko PROVIDER is not live.
 
-Mandatory pre-September safety check for the 2026-08-21 monthly-budget repair.
+Mandatory pre-September safety check for the 2026-08-21 monthly-budget repair,
+corrected after review.
 
-The engine's step-0c gate (`PAPER_REQUIRE_PRICEABLE_TOKEN_ID` +
-`resolve_price_source`) is a REGISTRY check: a token is admitted iff it is
+The engine's step-0c gate (``PAPER_REQUIRE_PRICEABLE_TOKEN_ID`` +
+``resolve_price_source``) is a REGISTRY check: a token is admitted iff it is
 CG-id-shaped ("the CG lanes serve it") OR a price_cache row exists. That proves
 a source exists IN PRINCIPLE. It does not prove one can price the token TODAY,
-and the premise is false whenever CG is unavailable — on 2026-08-21 the Basic
-plan hit 100.0% of its 100,000 monthly credits with 11 days to the reset.
+and the premise is false whenever CoinGecko is unavailable -- on 2026-08-21 the
+Basic plan hit 100.0% of its 100,000 monthly credits with 11 days to the reset.
 
-Why that is dangerous rather than merely inconvenient: `price_cache` is written
-EXCLUSIVELY by CG lanes (main.py `all_raw`, narrative/agent.py,
-outcome_ledger.py) — DexScreener and GeckoTerminal do NOT write it — and the
-exit evaluator reads ONLY price_cache. A position opened while CG is dark is
-therefore unmonitored: no trailing stop, no stop-loss, until max_duration
-force-closes it at entry_price with a fabricated pnl_pct=0
-(`exit_reason='expired_stale_no_price'`).
+Why that is dangerous rather than inconvenient: the exit evaluator re-prices
+only from ``price_cache``. A position opened while CoinGecko is dark is
+unmonitored -- no trailing stop, no stop-loss -- until ``max_duration``
+force-closes it at ``entry_price`` with a fabricated ``pnl_pct=0``
+(``exit_reason='expired_stale_no_price'``).
+
+WHY THE FIRST VERSION OF THIS GATE WAS WRONG
+--------------------------------------------
+It read ``MAX(price_cache.updated_at)`` and assumed every writer was CoinGecko.
+False: ``outcome_ledger._poll_dex_enrollments`` prices ``dex:`` tokens from
+DEXSCREENER and writes them through ``Database.cache_prices``. So a fresh
+DexScreener row made a dead CoinGecko look alive -- admitting exactly the
+unpriceable position the gate exists to prevent -- and a quiet price_cache could
+block a healthy Dex-backed token for an unrelated provider's silence.
+
+Liveness is now asked of the PROVIDER (``cg_budget.last_success_at``, set only
+by a CoinGecko HTTP 200) and applied only to CG-SERVED positions.
 """
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from scout.coingecko_budget import BUCKET_CRITICAL, BUCKET_DISCOVERY
+from scout.coingecko_budget import budget as cg_budget
 from scout.config import Settings
 from scout.db import Database
 from scout.trading.engine import TradingEngine
@@ -57,6 +70,16 @@ def _settings(tmp_path, **over):
     return Settings(**base)
 
 
+def _cg_alive(seconds_ago: float = 30) -> None:
+    cg_budget.last_success_at = datetime.now(timezone.utc) - timedelta(
+        seconds=seconds_ago
+    )
+
+
+def _cg_dead() -> None:
+    cg_budget.last_success_at = None
+
+
 async def _seed_price_cache(db, coin_id, price, age_seconds=0):
     ts = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
     await db._conn.execute(
@@ -83,83 +106,122 @@ async def _open(engine, token_id="bitcoin", entry_price=100.0):
 
 
 # ---------------------------------------------------------------------------
-# The age helper
-# ---------------------------------------------------------------------------
-
-
-async def test_age_helper_returns_none_on_empty_cache(db, tmp_path):
-    """Unknown must be distinguishable from fresh — and treated as not live."""
-    engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    assert await engine._newest_price_cache_age_seconds() is None
-
-
-async def test_age_helper_reads_the_freshest_row_not_an_arbitrary_one(db, tmp_path):
-    """Whole-table liveness: one fresh write means the provider is alive."""
-    engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    await _seed_price_cache(db, "old-coin", 1.0, age_seconds=99_000)
-    await _seed_price_cache(db, "new-coin", 2.0, age_seconds=30)
-    age = await engine._newest_price_cache_age_seconds()
-    assert age is not None and age < 120
-
-
-# ---------------------------------------------------------------------------
 # The gate
 # ---------------------------------------------------------------------------
 
 
-async def test_open_blocked_when_price_cache_is_entirely_empty(db, tmp_path):
-    """CG never wrote anything — nothing can ever be re-priced."""
+async def test_open_blocked_when_coingecko_has_never_answered(db, tmp_path):
+    """Unknown is NOT live. Conflating it with fresh is how this class recurs."""
+    _cg_dead()
     engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
     assert await _open(engine) is None
 
 
-async def test_open_blocked_when_newest_write_is_older_than_the_bound(db, tmp_path):
-    """THE September scenario: CG dark, cache frozen at the moment it died."""
+async def test_open_blocked_when_last_cg_success_is_older_than_the_bound(db, tmp_path):
+    """THE September scenario: CoinGecko refusing everything for days."""
+    _cg_alive(seconds_ago=7 * 24 * 3600)
     engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    await _seed_price_cache(db, "bitcoin", 100.0, age_seconds=7 * 24 * 3600)
     assert await _open(engine) is None
 
 
-async def test_open_allowed_when_a_recent_cg_write_exists(db, tmp_path):
+async def test_open_allowed_when_coingecko_answered_recently(db, tmp_path):
     """The gate must not block normal operation."""
+    _cg_alive(seconds_ago=60)
     engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    await _seed_price_cache(db, "bitcoin", 100.0, age_seconds=60)
     assert await _open(engine) is not None
 
 
 async def test_gate_applies_even_when_caller_supplies_entry_price(db, tmp_path):
     """THE BYPASS this gate exists to close.
 
-    The pre-existing `trade_skipped_stale_price` check lives in the `else` arm
-    of `if entry_price is not None`, so supplying entry_price skips it — and
-    EVERY production signal in scout/trading/signals.py supplies one. A
+    The pre-existing ``trade_skipped_stale_price`` check lives in the ``else``
+    arm of ``if entry_price is not None``, so supplying entry_price skips it --
+    and EVERY production signal in scout/trading/signals.py supplies one. A
     caller-supplied price says what the token was worth at SIGHTING; it says
     nothing about whether we can re-price it to EXIT.
     """
+    _cg_alive(seconds_ago=30 * 24 * 3600)
     engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    await _seed_price_cache(db, "bitcoin", 100.0, age_seconds=30 * 24 * 3600)
     assert await _open(engine, entry_price=123.45) is None
+
+
+# ---------------------------------------------------------------------------
+# The two-source falsifier -- the defect review found
+# ---------------------------------------------------------------------------
+
+
+async def test_fresh_dex_price_cache_does_NOT_admit_a_cg_token(db, tmp_path):
+    """Discriminator 1. This is the exact bug the first version shipped.
+
+    ``outcome_ledger._poll_dex_enrollments`` writes DexScreener prices through
+    ``Database.cache_prices``. Under the old ``MAX(price_cache.updated_at)``
+    gate this row made CoinGecko look alive and admitted a CG-only position
+    nothing could re-price.
+    """
+    _cg_dead()
+    # A DexScreener-written row, fresher than any threshold.
+    await _seed_price_cache(db, "dex:solana:So11111111111111111111111111111111111111112", 1.0, age_seconds=1)
+    await _seed_price_cache(db, "some-dex-token", 2.0, age_seconds=1)
+
+    engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
+    assert await _open(engine) is None, (
+        "a fresh DexScreener price_cache row must not present CoinGecko as live"
+    )
+
+
+async def test_stale_price_cache_does_NOT_block_when_coingecko_is_healthy(db, tmp_path):
+    """Discriminator 2, the reverse error.
+
+    The old gate would refuse every open whenever price_cache went quiet, even
+    with CoinGecko answering perfectly -- e.g. a lull in discovery writes.
+    Provider health is the question, so an empty price_cache must not block.
+    """
+    _cg_alive(seconds_ago=30)
+    engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
+    # price_cache deliberately EMPTY.
+    assert await _open(engine) is not None
+
+
+# ---------------------------------------------------------------------------
+# Critical reserve gates NEW opens (not re-pricing)
+# ---------------------------------------------------------------------------
+
+
+async def test_exhausted_critical_reserve_blocks_new_opens(db, tmp_path, settings_factory):
+    """More open positions means more re-pricing demand against a spent reserve.
+
+    Re-pricing itself is NOT stopped (that would recreate the fabricated close)
+    -- see tests/test_coingecko_budget_enforcement.py. Taking on NEW demand is.
+    """
+    _cg_alive(seconds_ago=30)
+    s = _settings(tmp_path, COINGECKO_MONTHLY_CRITICAL_CREDITS=2)
+    for _ in range(2):
+        cg_budget.record(BUCKET_CRITICAL, billable=True)
+    engine = TradingEngine(mode="paper", db=db, settings=s)
+    assert await _open(engine) is None
+
+
+# ---------------------------------------------------------------------------
+# Configurability
+# ---------------------------------------------------------------------------
 
 
 async def test_bound_is_settings_sourced_and_disablable(db, tmp_path):
     """0 disables the gate; the threshold is never hardcoded."""
+    _cg_alive(seconds_ago=30 * 24 * 3600)
     engine_off = TradingEngine(
         mode="paper",
         db=db,
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=0),
     )
-    await _seed_price_cache(db, "bitcoin", 100.0, age_seconds=30 * 24 * 3600)
-    assert await engine_off.open_trade(
-        token_id="bitcoin", symbol="BTC", name="Bitcoin", chain="coingecko",
-        signal_type="volume_spike", signal_data={"mcap": 1_000_000},
-        entry_price=100.0, signal_combo="volume_spike",
-    ) is not None, "gate should be disablable for an explicit operator override"
+    assert await _open(engine_off) is not None, (
+        "gate should be disablable for an explicit operator override"
+    )
 
 
 async def test_tight_bound_blocks_what_a_loose_bound_admits(db, tmp_path):
     """The decision tracks the CONFIGURED bound, not a fixed constant."""
-    await _seed_price_cache(db, "bitcoin", 100.0, age_seconds=3600)
-
+    _cg_alive(seconds_ago=3600)
     loose = TradingEngine(
         mode="paper", db=db,
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=7200),
@@ -171,3 +233,14 @@ async def test_tight_bound_blocks_what_a_loose_bound_admits(db, tmp_path):
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=600),
     )
     assert await _open(tight) is None
+
+
+def test_only_a_billable_200_refreshes_the_heartbeat(tmp_path):
+    """A 429 storm is CoinGecko REFUSING us -- the opposite of live."""
+    s = _settings(tmp_path)
+    _cg_dead()
+    for _ in range(100):
+        cg_budget.record(BUCKET_DISCOVERY, billable=False)
+    assert cg_budget.cg_pricing_live(s) is False
+    cg_budget.record(BUCKET_DISCOVERY, billable=True)
+    assert cg_budget.cg_pricing_live(s) is True

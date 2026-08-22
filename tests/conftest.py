@@ -287,6 +287,7 @@ def token_factory():
 
 # Imported once at module load, not per test: this reset runs for every test in
 # the suite (~7k), so anything done inside the fixture body is multiplied by 7000.
+import datetime as _dt  # noqa: E402
 import scout.main as _scout_main  # noqa: E402
 from scout import coingecko_budget as _scout_cg_budget  # noqa: E402
 from scout.ingestion import coingecko as _scout_cg  # noqa: E402
@@ -319,4 +320,11 @@ def _reset_cg_process_state():
         _b._counts[_k][1] = 0
     _b._dirty = False
     _b.provider_credits_used = None
+    # Default to a HEALTHY CoinGecko provider, because that is the normal
+    # production state and the open-boundary liveness gate reads this rather
+    # than price_cache. Tests that exercise a DEAD provider set
+    # `last_success_at = None` (or an old timestamp) explicitly -- opting into
+    # the failure is clearer than every unrelated test having to opt out of it.
+    _b.last_success_at = _dt.datetime.now(_dt.timezone.utc)
+    _b._pace_alerted = False
     yield

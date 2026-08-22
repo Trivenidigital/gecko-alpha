@@ -22,7 +22,8 @@ from scout.outcome_ledger import (
     liquidity_from_signal_data,
     record_emission as _ledger_record_emission,
 )
-from scout.price_sources import resolve_price_source
+from scout.coingecko_budget import BUCKET_CRITICAL, budget as cg_budget
+from scout.price_sources import PRICE_SOURCE_CG_LANE, resolve_price_source
 from scout.trading.trust_sizing import resolve_paper_trust_size
 
 log = structlog.get_logger()
@@ -508,51 +509,69 @@ class TradingEngine:
         # 0c above is a REGISTRY check — it admits a token iff it is CG-id-shaped
         # ("the CG lanes serve it") or a price_cache row exists. That proves a
         # source exists IN PRINCIPLE, never that one can price this token TODAY.
-        # The "CG lanes serve it" premise is false whenever CG is unavailable: an
-        # exhausted monthly credit allowance (2026-08-21: 100.0% used, 11 days to
-        # the reset), a suspended account, or a spent discovery envelope.
         #
-        # price_cache is written EXCLUSIVELY by CG lanes (main.py `all_raw`,
-        # narrative/agent.py, outcome_ledger.py). DexScreener and GeckoTerminal do
-        # NOT write it, and the exit evaluator reads ONLY price_cache. So with CG
-        # dark a position opened here is UNMONITORED — no trailing stop, no
-        # stop-loss — until max_duration force-closes it at entry_price with a
-        # fabricated pnl_pct=0 (`expired_stale_no_price`).
+        # Liveness is asked of the PROVIDER, not of price_cache. The first
+        # version of this gate read MAX(price_cache.updated_at) and assumed every
+        # writer was CoinGecko. That was false: outcome_ledger's
+        # _poll_dex_enrollments prices dex: tokens from DEXSCREENER and writes
+        # them through Database.cache_prices. So a fresh DexScreener row would
+        # have made a dead CoinGecko look alive and admitted a CG-only position
+        # nothing could re-price — and a stale price_cache would have blocked a
+        # perfectly healthy Dex-backed token for an unrelated provider's silence.
         #
-        # This sits ABOVE the entry_price branch deliberately. The per-token
+        # cg_budget.last_success_at is set only by a CoinGecko HTTP 200, so it
+        # answers the question actually being asked.
+        #
+        # Applied only to CG-SERVED positions: `price_source` was resolved at 0c,
+        # so a dex: token is judged on its own source, not CoinGecko's health.
+        #
+        # Sits ABOVE the entry_price branch deliberately: the per-token
         # `trade_skipped_stale_price` check below lives in the `else` arm, so it
         # is BYPASSED whenever a caller supplies entry_price — which every
         # production signal in scout/trading/signals.py does. A caller-supplied
         # price says what the token was worth at SIGHTING; it says nothing about
-        # whether we can ever re-price it to exit.
-        #
-        # Global rather than per-token: if no CG lane has written price_cache
-        # recently then NO token is re-priceable, including one holding an old row.
-        _pricing_max_age = int(
-            getattr(self.settings, "PAPER_OPEN_CG_PRICING_MAX_AGE_SEC", 0) or 0
-        )
-        if _pricing_max_age > 0:
-            _age = await self._newest_price_cache_age_seconds()
-            # Absent/unparseable is NOT live: an empty price_cache is precisely
-            # the state in which nothing can be re-priced.
-            if _age is None or _age > _pricing_max_age:
-                log.warning(
-                    "trade_skipped_pricing_not_live",
-                    token_id=token_id,
-                    signal_type=signal_type,
-                    newest_price_cache_age_sec=(
-                        round(_age) if _age is not None else None
-                    ),
-                    max_age_sec=_pricing_max_age,
-                    hint=(
-                        "no fresh CoinGecko write in price_cache, so exit "
-                        "monitoring could not re-price this position; opening "
-                        "would create an unmonitored trade that force-closes "
-                        "at a fabricated 0% PnL"
-                    ),
-                )
-                await _emit_decision("blocked", "pricing_not_live")
-                return None
+        # whether we can re-price it to EXIT.
+        if price_source == PRICE_SOURCE_CG_LANE and not cg_budget.cg_pricing_live(
+            self.settings
+        ):
+            log.warning(
+                "trade_skipped_pricing_not_live",
+                token_id=token_id,
+                signal_type=signal_type,
+                price_source=price_source,
+                last_cg_success_at=(
+                    cg_budget.last_success_at.isoformat()
+                    if cg_budget.last_success_at
+                    else None
+                ),
+                max_age_sec=self.settings.PAPER_OPEN_CG_PRICING_MAX_AGE_SEC,
+                hint=(
+                    "CoinGecko has not served a successful response recently, so "
+                    "exit monitoring could not re-price this position; opening "
+                    "would create an unmonitored trade that force-closes at a "
+                    "fabricated 0% PnL"
+                ),
+            )
+            await _emit_decision("blocked", "pricing_not_live")
+            return None
+
+        # The critical reserve being spent does not stop RE-PRICING (that would
+        # recreate the fabricated close), but it must stop taking on NEW
+        # re-pricing demand.
+        if cg_budget.critical_reserve_exceeded(self.settings):
+            log.warning(
+                "trade_skipped_critical_reserve_exhausted",
+                token_id=token_id,
+                signal_type=signal_type,
+                critical_credits=cg_budget.credits(BUCKET_CRITICAL),
+                hint=(
+                    "the CoinGecko re-pricing reserve for this billing month is "
+                    "spent; opening more positions adds re-pricing demand that "
+                    "cannot be funded"
+                ),
+            )
+            await _emit_decision("blocked", "critical_reserve_exhausted")
+            return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:
@@ -964,39 +983,6 @@ class TradingEngine:
                 "separate": True,
             }
         return result
-
-    async def _newest_price_cache_age_seconds(self) -> float | None:
-        """Age in seconds of the freshest price_cache row, or None if unknown.
-
-        Whole-table, not per-token: price_cache has exactly one family of
-        writers (the CoinGecko lanes), so the newest row across the table is a
-        direct liveness reading on that provider. If it is stale, no token can
-        be re-priced — including one that still holds an old row of its own.
-
-        None means "cannot establish liveness" (empty table, unreadable
-        connection, unparseable timestamp) and callers MUST treat that as not
-        live. Returning a large number instead would conflate "provably stale"
-        with "unknown", and the safe reading of unknown here is the same.
-        """
-        conn = self.db._conn
-        if conn is None:
-            return None
-        try:
-            cursor = await conn.execute("SELECT MAX(updated_at) FROM price_cache")
-            row = await cursor.fetchone()
-        except Exception:
-            log.exception("newest_price_cache_age_query_failed")
-            return None
-        if not row or row[0] in (None, ""):
-            return None
-        try:
-            newest = datetime.fromisoformat(str(row[0]))
-        except ValueError:
-            log.warning("newest_price_cache_age_unparseable", raw=str(row[0]))
-            return None
-        if newest.tzinfo is None:
-            newest = newest.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - newest).total_seconds()
 
     async def _get_current_price_with_age(
         self, token_id: str

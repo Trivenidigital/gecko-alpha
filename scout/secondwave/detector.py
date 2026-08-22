@@ -11,6 +11,7 @@ import structlog
 from scout import cg_api
 from scout.config import Settings
 from scout.db import Database
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 from scout.secondwave.alerts import format_secondwave_alert
 
@@ -159,11 +160,18 @@ async def fetch_current_prices(
         # Honor the shared CoinGecko rate limit (25/min token bucket) so the
         # second-wave detector never bypasses the global budget.
         await coingecko_limiter.acquire()
+        # Governed: secondwave re-scans previously-alerted tokens — a
+        # DISCOVERY-class surface, so it stops with discovery rather than
+        # eating the reserve that keeps open positions re-priceable.
+        _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+        if not _call.allowed:
+            return {}
         async with session.get(
             f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/coins/markets",
             params=params,
             headers=headers,
         ) as resp:
+            _call.finish(resp.status)
             if resp.status == 429:
                 await coingecko_limiter.report_429()
                 logger.warning(

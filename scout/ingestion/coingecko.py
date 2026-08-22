@@ -109,24 +109,43 @@ async def _get_with_backoff(
     params: dict | None = None,
     *,
     bucket: str,
+    settings: Settings | None = None,
 ) -> dict | list | None:
-    """GET with shared limiter/cooldown. Returns parsed JSON or None.
+    """The ONLY governed CoinGecko request primitive. Returns JSON or None.
 
-    ``bucket`` is REQUIRED and keyword-only on purpose. This is the single
-    choke point for CoinGecko traffic, so it is where monthly credits are
-    counted; a default would let a new call site silently land in someone
-    else's envelope — the same "nobody was counting" failure that exhausted the
-    plan on 2026-08-21. Required turns that into a TypeError instead.
+    ``bucket`` is REQUIRED and keyword-only. A default would let a new call site
+    silently land in someone else's envelope -- the same "nobody was counting"
+    failure that exhausted the plan on 2026-08-21. Required makes it a TypeError.
+
+    ENFORCEMENT lives here, not at any caller. A lane that forgets to consult
+    the governor still cannot spend, which is what makes the envelopes real
+    rather than advisory. `settings` is optional only so legacy callers keep
+    working; without it the request is still COUNTED, just not refused.
 
     ATTEMPTS ARE NOT CREDITS. CoinGecko deducts a monthly credit on HTTP 200
     only; 4xx/5xx do not deduct one though they still consume the per-minute
-    rate limit. Every path here records an attempt; only 200 records a credit.
-    Note `== 200`, not `< 400`: a 3xx is not a billable success either.
+    rate limit. Each issued request is counted EXACTLY ONCE as an attempt, with
+    its billable outcome recorded against that same attempt -- so a response
+    that arrives and then fails to parse cannot inflate the attempt count.
     """
+    if settings is not None:
+        allowed, reason = cg_budget.allow(bucket, settings)
+        if not allowed:
+            logger.warning(
+                "cg_request_refused_by_budget",
+                bucket=bucket,
+                reason=reason,
+                url=url,
+                month=cg_budget.month,
+                bucket_credits=cg_budget.credits(bucket),
+                effective_used=cg_budget.effective_used(),
+            )
+            return None
+
     await coingecko_limiter.acquire()
+    billable = False
     try:
         async with session.get(url, params=params, timeout=REQUEST_TIMEOUT) as resp:
-            cg_budget.record(bucket, billable=(resp.status == 200))
             if resp.status == 429:
                 logger.warning("cg_429_backoff", attempt=0)
                 await coingecko_limiter.report_429()
@@ -134,15 +153,20 @@ async def _get_with_backoff(
             if resp.status >= 400:
                 logger.warning("cg_http_error", status=resp.status, url=url)
                 return None
+            # `== 200`, not `< 400`: a 3xx is not a billable success either.
+            billable = resp.status == 200
             return await resp.json()
     except Exception as exc:
-        # A transport failure never reached the provider, so it bills nothing —
-        # but it IS an attempt, and a lane failing this way is invisible if we
-        # only ever count successes.
-        cg_budget.record(bucket, billable=False)
+        # A transport failure never reached the provider so it bills nothing --
+        # but it IS an attempt, and a lane failing this way is invisible if only
+        # successes are counted. `billable` stays False unless a 200 was already
+        # observed; if resp.json() raised AFTER a 200, the credit was really
+        # spent and must still be recorded.
         logger.warning("cg_request_error", error=str(exc), url=url)
         return None
-    return None
+    finally:
+        # Exactly one record per issued request, on every exit path.
+        cg_budget.record(bucket, billable=billable)
 
 
 async def reconcile_monthly_credits(
@@ -173,6 +197,7 @@ async def reconcile_monthly_credits(
         f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/key",
         params=params,
         bucket=BUCKET_OPERATIONAL,
+        settings=settings,
     )
     if not isinstance(data, dict):
         logger.warning(
@@ -242,12 +267,14 @@ async def fetch_top_movers(
     data_small = await _get_with_backoff(
         session, f"{_base(settings)}/coins/markets", params_small,
         bucket=BUCKET_DISCOVERY,
+        settings=settings,
     )
     data_volume = None
     if not coingecko_limiter.is_backing_off():
         data_volume = await _get_with_backoff(
             session, f"{_base(settings)}/coins/markets", params_volume,
             bucket=BUCKET_DISCOVERY,
+            settings=settings,
         )
 
     # Union both result sets, dedup by CG id
@@ -332,6 +359,7 @@ async def fetch_trending(
     data = await _get_with_backoff(
         session, f"{_base(settings)}/search/trending", params or None,
         bucket=BUCKET_DISCOVERY,
+        settings=settings,
     )
     if not data or not isinstance(data, dict):
         _set_watchdog_sample(
@@ -370,6 +398,7 @@ async def fetch_trending(
         market_data = await _get_with_backoff(
             session, f"{_base(settings)}/coins/markets", market_params,
             bucket=BUCKET_DISCOVERY,
+            settings=settings,
         )
         if isinstance(market_data, list):
             market_rows_by_id = {
@@ -470,6 +499,7 @@ async def fetch_by_volume(
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
                 bucket=BUCKET_DISCOVERY,
+            settings=settings,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -595,6 +625,7 @@ async def fetch_midcap_gainers(
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
                 bucket=BUCKET_DISCOVERY,
+            settings=settings,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -739,6 +770,7 @@ async def fetch_deep_volume(
     data = await _get_with_backoff(
         session, f"{_base(settings)}/coins/markets", {**base_params, "page": str(page)},
         bucket=BUCKET_DISCOVERY,
+        settings=settings,
     )
     if isinstance(data, Exception) or not data or not isinstance(data, list):
         _set_watchdog_sample(

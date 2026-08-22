@@ -262,6 +262,20 @@ class Settings(BaseSettings):
     # allowance by this fraction. Projection beats absolute 50/75/90% marks —
     # 60% spent on day 3 is an emergency, 60% on day 27 is fine.
     COINGECKO_BUDGET_PACE_ALERT_RATIO: float = Field(default=1.10, ge=1.0, le=10.0)
+    # Durability window for the credit ledger, in CREDITS rather than minutes.
+    # Persisting only in the hourly pass would lose up to an hour of spend to a
+    # crash/deploy, and the process would come back believing it has capacity it
+    # already burned. 25 bounds the loss to well under one discovery round.
+    COINGECKO_BUDGET_FLUSH_EVERY_CREDITS: int = Field(default=25, ge=0, le=10_000)
+    # /key reconciliation. Provider is the ACCEPTANCE truth; positive drift is
+    # real capacity gone that no local counter explains, so it reduces
+    # non-critical capacity rather than only being logged.
+    COINGECKO_BUDGET_RECONCILE_ENABLED: bool = True
+    # Discovery activation. Default FALSE so a deploy before the September 1
+    # credit reset cannot resume CoinGecko discovery merely because the local
+    # ledger starts empty. "Dark until the reset" is then a property of the
+    # tree, not of an operator remembering not to deploy.
+    COINGECKO_DISCOVERY_ENABLED: bool = False
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.

@@ -1,4 +1,4 @@
-**New primitives introduced:** `CoinGeckoBudgetGovernor` (monthly-credit ledger + envelope enforcement), `cg_credit_ledger` table, `COINGECKO_DISCOVERY_INTERVAL_CYCLES` / `COINGECKO_MONTHLY_CREDIT_*` settings, `cg_pricing_live` open-gate liveness predicate.
+**New primitives introduced:** `CoinGeckoBudget` (monthly-credit ledger + per-bucket enforcement + provider heartbeat), `governed_cg_call` (borrowed accounting/enforcement for callers owning a retry loop), `cg_credit_ledger` table, `COINGECKO_DISCOVERY_INTERVAL_CYCLES` / `COINGECKO_DISCOVERY_ENABLED` / `COINGECKO_MONTHLY_*` / `COINGECKO_BUDGET_*` settings, `cg_pricing_live` provider-liveness predicate.
 
 # CoinGecko monthly-budget repair
 
@@ -86,11 +86,17 @@ v1. That optimization waits for one measured month.
 
 ### 3. Open-gate liveness (the mandatory pre-September safety check)
 
-**Finding.** `price_cache` is written EXCLUSIVELY from CG lanes
-(`main.py` `all_raw` = markets + trending + by_volume + midcap + deep_volume +
-held_position; plus `narrative/agent.py` and `outcome_ledger.py`, both CG).
-DexScreener/GeckoTerminal do NOT write it. The exit evaluator reads only
-`price_cache`.
+**Finding.** The exit evaluator re-prices only from `price_cache`.
+
+> ~~`price_cache` is written EXCLUSIVELY from CG lanes ... DexScreener/
+> GeckoTerminal do NOT write it.~~ **RETRACTED 2026-08-21 (review round 2).**
+> This was asserted, not audited, and it is false:
+> `outcome_ledger._poll_dex_enrollments` prices `dex:` tokens from DEXSCREENER
+> and writes them through `Database.cache_prices`. The retraction matters
+> because the first version of the gate was BUILT on the false claim — it read
+> `MAX(price_cache.updated_at)` as a CoinGecko liveness signal, so a fresh
+> DexScreener row could present a dead CoinGecko as alive. Liveness is now taken
+> from `cg_budget.last_success_at`, set only by a CoinGecko HTTP 200.
 
 `resolve_price_source` admits a token iff it is CG-id-shaped ("the CG lanes
 serve it") OR a `price_cache` row exists. That is a **registry** check, not a
@@ -131,3 +137,52 @@ stands: do not discover the dependency after a position opens.
 - Discovery halts at its envelope while critical reserve remains spendable.
 - Open gate refuses a CG-only token when CG pricing is not obtainable.
 - Every threshold sourced from Settings.
+
+
+## Review round 2 (2026-08-21) — five blockers, corrected
+
+Green CI was not discriminating against any of these.
+
+**S1 liveness used the wrong axis.** The gate read
+`MAX(price_cache.updated_at)` and asserted price_cache had a single writer
+family. FALSE: `outcome_ledger._poll_dex_enrollments` prices `dex:` tokens from
+DEXSCREENER and writes them through `Database.cache_prices`. A fresh Dex row
+made a dead CoinGecko look live. Liveness is now
+`cg_budget.last_success_at` — set ONLY by a CoinGecko HTTP 200 — applied only to
+`price_source == cg_lane`. Both discriminators are pinned.
+
+**S1 the "single choke point" was not single.** Review named three ungoverned
+direct CG paths. The full sweep found **eight**: `narrative/observer`,
+`narrative/predictor`, `narrative/evaluator` (TWO — `fetch_prices_batch` and a
+separate `/simple/price` fallback), `counter/detail`, plus three the review did
+not list — `briefing/collector`, `secondwave/detector`,
+`social/telegram/resolver`. All now route through `_get_with_backoff` or
+`governed_cg_call`, and `tests/test_no_ungoverned_coingecko_paths.py` is a
+STRUCTURAL tripwire (with a self-test proving it can fail) so a new direct path
+cannot be added silently.
+
+**S1 envelopes were accounting, not enforcement.** Enforcement moved to the HTTP
+primitive, so a lane that never consults the budget still cannot spend. All three
+buckets enforce, plus the overall allowance. `critical` is deliberately SOFT:
+refusing to re-price an open position is worse than overspending a reserve
+because it recreates the fabricated-$0 close; exceeding it blocks NEW opens.
+
+**S2 `/key` reconciliation was dead code.** Now called from the hourly pass
+BEFORE the snapshot is read, and positive drift feeds `effective_used()`, which
+gates the allowance and is charged to DISCOVERY for cap purposes. Provider truth
+changes capacity rather than producing a log line.
+
+**S2 durability was weaker than claimed.** Persisting only hourly lost up to an
+hour of spend to a crash. Added `maybe_persist` on the per-cycle hook, bounded by
+CREDITS (`COINGECKO_BUDGET_FLUSH_EVERY_CREDITS=25`) because exposure scales with
+spend, not clock. Tested through the runtime path, not by calling `persist()`
+from the test.
+
+**Operability/truth fixes.** `_get_with_backoff` now records exactly once via
+`finally` (it previously double-counted when `resp.json()` threw after a 200).
+The pace alert fires on the CROSSING with hysteresis rearm, not every hour.
+
+**Deployment boundary.** `COINGECKO_DISCOVERY_ENABLED` defaults **False**, so
+"dark until the September 1 reset" is a property of the tree rather than of
+deployment timing — a pre-reset deploy starts with an empty ledger and would
+otherwise resume discovery on the 5th cycle.
