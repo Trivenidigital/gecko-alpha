@@ -36,16 +36,17 @@ accidentally acting as a governor.
 - Main pipeline cadence stays **60s**. Unchanged.
 - DexScreener / GeckoTerminal and all other free leading sources stay at 60s.
   Untouched.
-- CG **discovery** lanes (`top_movers`, `trending`, `by_volume`, `deep_volume`,
-  `midcap_gainers`) run every **5th** main cycle
-  (`COINGECKO_DISCOVERY_INTERVAL_CYCLES=5`).
+- CG **discovery** lanes run every **8th** main cycle
+  (`COINGECKO_DISCOVERY_INTERVAL_CYCLES=8`). See the round-4 section: 5 was
+  derived from the main bundle alone and is untenable once the other
+  discovery-class consumers are counted.
 - `COINGECKO_VOLUME_SCAN_PAGES`: **3 -> 2**.
 - **held-position pricing is NOT subject to the discovery cadence gate.** It
   keeps its independent cadence (`HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES`)
   and its existing `no_open_trades` no-op.
 
-Projected discovery: (top_movers 2 + trending 2 + by_volume 2 + deep_volume 1)
-= 7 calls per discovery round x 288 rounds/day = **2,016/day ~= 62k/month**.
+~~Projected discovery ... ~62k/month~~ **SUPERSEDED — that figure counted the
+main bundle ALONE.** The corrected full model is in the round-4 section below.
 
 ### 2. Monthly-credit governor
 
@@ -186,3 +187,65 @@ The pace alert fires on the CROSSING with hysteresis rearm, not every hour.
 "dark until the September 1 reset" is a property of the tree rather than of
 deployment timing — a pre-reset deploy starts with an empty ledger and would
 otherwise resume discovery on the 5th cycle.
+
+
+## Review round 4 (2026-08-22) — the model, corrected
+
+**The 62k headline was wrong three times, each for a different reason.** Round 4
+found the third: the model used FIXED per-pass estimates for consumers whose call
+count is a LOOP BOUND.
+
+`fetch_laggards` runs once per heating category; `fetch_coin_detail` runs for
+every scored token AND again for every control token. Worse, the multipliers are
+**learner-tunable** — `strategy_bounds` permits `max_heating_per_cycle` and
+`max_picks_per_category` up to 10 each:
+
+    1 + 1 + 10 + (10x10) + (10x10) = 212 calls/pass
+    x 48 passes/day x 31 = ~315,000/month   from ONE consumer, against a 100,000 plan
+
+Even at today's 5x5 defaults it is 84,816/month — more than the entire 65,000
+discovery envelope. **No main-bundle cadence can absorb that**, so the fan-out
+itself is now capped: `NARRATIVE_MAX_CG_CALLS_PER_PASS=8` covers laggards and
+both detail loops, degrading the pass (fewer tokens enriched) rather than failing
+it. The model then holds regardless of learner tuning.
+
+**Measured production activation was NOT used as the bound.** 2026-08-19 shows
+`narrative.observe_empty` x44 with zero heating/laggard/detail events — the pass
+aborts on an empty `/coins/categories`, so today's cost is ~1 call/pass. That is
+an artifact of a failing upstream and would vanish the moment categories returns
+data. Modelling on it would repeat the original mistake.
+
+### Corrected complete model (structural bounds, `COINGECKO_DISCOVERY_INTERVAL_CYCLES=8`)
+
+| consumer | bucket | /month |
+|---|---|---:|
+| main discovery bundle (7 calls, every 8th cycle) | discovery | 39,060 |
+| narrative (capped: 2 + 8 per pass, 48 passes/day) | discovery | 14,880 |
+| secondwave (1 call, 1800s loop) | discovery | 1,488 |
+| **discovery total** | | **55,428 / 65,000 — 14.7% margin** |
+| ledger CG enrollment poll (every 15th cycle) | operational | 2,976 |
+| /key reconciliation (hourly) | operational | 744 |
+| telegram resolver (event-driven estimate) | operational | 620 |
+| **operational total** | | **4,340 / 5,000 — 13.2% margin** |
+| held-position re-pricing (0 open positions) | critical | 0 / 30,000 |
+| **plan total** | | **59,768 / 100,000** |
+
+### Also corrected in round 4
+
+- **Critical reserve is provider-aware for NEW demand.** `critical_reserve_exceeded`
+  compared local critical credits to the local cap only, so provider=90k/100k with
+  local critical 0/30k read "reserve healthy" while just 10k of real capacity
+  remained. New CG-dependent opens now also require provider-corrected remaining
+  capacity to still cover the unspent reserve. Re-pricing an EXISTING position
+  stays soft.
+- **Tripwire is callsite-scoped.** Function-level still passed a function holding
+  one governed AND one raw request. Raw `session.get` calls must now be covered by
+  `governed_cg_call` wrappers specifically — `_get_with_backoff` REPLACES a raw
+  request rather than wrapping one, so counting it as cover was the hole.
+- **Dark-gate test is behavioural.** It now invokes
+  `secondwave.fetch_current_prices` with an exploding session and asserts zero
+  calls, plus a complement proving the same caller DOES reach HTTP when enabled —
+  otherwise an inert caller would satisfy the zero-HTTP assertion.
+- **Attempts are recorded at ISSUE time**, via `issued()` immediately before the
+  HTTP op, not in the constructor. Constructing before the rate limiter and
+  counting there turned a cancellation-while-waiting into a phantom attempt.

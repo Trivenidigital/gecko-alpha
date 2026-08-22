@@ -97,6 +97,8 @@ async def fetch_prices_batch(
         # still records one attempt with zero credits. Counting only the
         # request paths that produced a response makes a lane that is failing
         # at the transport layer invisible in the attempt rate.
+        # Attempt recorded immediately before the request, after the limiter.
+        _call.issued()
         await coingecko_limiter.acquire()
         try:
             async with session.get(url, params=params, headers=headers) as resp:
@@ -195,6 +197,7 @@ async def evaluate_pending(
                 break
             try:
                 await coingecko_limiter.acquire()
+                _fb_call.issued()
                 ids_param = ",".join(chunk)
                 headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
                 async with session.get(

@@ -119,8 +119,9 @@ async def _get_with_backoff(
 
     ENFORCEMENT lives here, not at any caller. A lane that forgets to consult
     the governor still cannot spend, which is what makes the envelopes real
-    rather than advisory. `settings` is optional only so legacy callers keep
-    working; without it the request is still COUNTED, just not refused.
+    rather than advisory. `settings` is REQUIRED: an optional Settings meant
+    "counted, just not refused", a silent hole that let a caller keep spending
+    while appearing governed.
 
     ATTEMPTS ARE NOT CREDITS. CoinGecko deducts a monthly credit on HTTP 200
     only; 4xx/5xx do not deduct one though they still consume the per-minute
@@ -128,23 +129,18 @@ async def _get_with_backoff(
     its billable outcome recorded against that same attempt -- so a response
     that arrives and then fails to parse cannot inflate the attempt count.
     """
-    # `settings` is REQUIRED, not optional. An optional Settings meant
-    # "counted, just not refused" — a silent hole that let a caller keep
-    # spending while looking governed. A TypeError at the call site beats
-    # unenforced operation.
-    if True:
-        allowed, reason = cg_budget.allow(bucket, settings)
-        if not allowed:
-            logger.warning(
-                "cg_request_refused_by_budget",
-                bucket=bucket,
-                reason=reason,
-                url=url,
-                month=cg_budget.month,
-                bucket_credits=cg_budget.credits(bucket),
-                effective_used=cg_budget.effective_used(),
-            )
-            return None
+    allowed, reason = cg_budget.allow(bucket, settings)
+    if not allowed:
+        logger.warning(
+            "cg_request_refused_by_budget",
+            bucket=bucket,
+            reason=reason,
+            url=url,
+            month=cg_budget.month,
+            bucket_credits=cg_budget.credits(bucket),
+            effective_used=cg_budget.effective_used(),
+        )
+        return None
 
     await coingecko_limiter.acquire()
     billable = False

@@ -447,15 +447,39 @@ class CoinGeckoBudget:
             return True, f"{bucket}_envelope_exceeded_soft"
         return True, "ok"
 
-    def critical_reserve_exceeded(self, settings) -> bool:
-        """True when the critical reserve is spent.
+    def can_accept_new_critical_demand(self, settings) -> tuple[bool, str]:
+        """May we take on a NEW position that will need CoinGecko re-pricing?
 
-        Does NOT stop re-pricing (see ``allow``). It is the signal to stop
-        opening NEW positions and to page: more open positions means more
-        re-pricing demand against a reserve that is already gone.
+        Deliberately NOT the same question as "may an existing position be
+        re-priced". Re-pricing an open position stays soft, always: refusing it
+        recreates the fabricated-$0 close. Accepting NEW demand is a choice, and
+        it must respect what the PROVIDER says is left, not only what we spent
+        locally out of the reserve.
+
+        The earlier version compared local critical credits against the local
+        cap alone. That reads "reserve healthy" in exactly the state where it is
+        not: provider says 90k of 100k used, local critical says 0/30k, so only
+        10k of real capacity remains but the whole 30k reserve appears intact
+        and another CG-dependent position is admitted.
         """
         cap = self._cap_for(BUCKET_CRITICAL, settings)
-        return cap > 0 and self.credits(BUCKET_CRITICAL) >= cap
+        if cap > 0 and self.credits(BUCKET_CRITICAL) >= cap:
+            return False, "critical_reserve_spent"
+
+        allowance = int(getattr(settings, "COINGECKO_MONTHLY_CREDIT_ALLOWANCE", 0) or 0)
+        if allowance > 0 and cap > 0:
+            # Provider-corrected capacity actually left in the plan.
+            remaining = allowance - self.effective_used()
+            # What the reserve still needs to be able to cover.
+            reserve_unspent = cap - self.credits(BUCKET_CRITICAL)
+            if remaining < reserve_unspent:
+                return False, "plan_capacity_below_critical_reserve"
+        return True, "ok"
+
+    def critical_reserve_exceeded(self, settings) -> bool:
+        """Back-compat wrapper: True when NEW critical demand must be refused."""
+        allowed, _ = self.can_accept_new_critical_demand(settings)
+        return not allowed
 
     def discovery_exhausted(self, settings) -> bool:
         allowed, _ = self.allow(BUCKET_DISCOVERY, settings)
@@ -538,13 +562,22 @@ class governed_cg_call:
     CoinGecko call that adopts neither route fails that test.
     """
 
-    __slots__ = ("bucket", "settings", "allowed", "reason", "billable", "_recorded")
+    __slots__ = (
+        "bucket",
+        "settings",
+        "allowed",
+        "reason",
+        "billable",
+        "_recorded",
+        "_issued",
+    )
 
     def __init__(self, bucket: str, settings=None) -> None:
         self.bucket = bucket
         self.settings = settings
         self.billable = False
         self._recorded = False
+        self._issued = False
         if settings is None:
             # FAIL CLOSED. "Counted but not refused" was a silent hole: a caller
             # that forgot to thread Settings kept spending while appearing
@@ -556,24 +589,36 @@ class governed_cg_call:
                 "un-refusably"
             )
         self.allowed, self.reason = budget.allow(bucket, settings)
-        # Record the ATTEMPT now, at issue time. Whether it BILLED is learned
-        # later via finish(), and may never be learned if the connection dies
-        # before a response — in which case this attempt still stands, with no
-        # credit, which is exactly right. Recording only on response made every
-        # transport failure invisible in the attempt rate, hiding precisely the
-        # lanes that are broken.
-        if self.allowed:
-            budget.record(bucket, billable=False)
+        # NOT recorded here. Construction happens before the rate limiter is
+        # acquired and before any request is issued, so counting at construction
+        # turns a cancellation-while-waiting — or any early return between here
+        # and session.get — into a phantom provider attempt. The contract is one
+        # attempt per ISSUED request, so the attempt is recorded by issued(),
+        # called immediately before the HTTP operation.
+
+    def issued(self) -> None:
+        """Record the attempt. Call IMMEDIATELY before the HTTP operation.
+
+        Separated from construction so that a cancellation while waiting on the
+        rate limiter, or any early return before the request, cannot invent an
+        attempt the provider never saw. Idempotent.
+        """
+        if self._issued or not self.allowed:
+            return
+        self._issued = True
+        budget.record(self.bucket, billable=False)
 
     def finish(self, status: int | None) -> None:
-        """Upgrade this request to billable when the provider actually billed.
+        """Upgrade an issued request to billable when the provider billed it.
 
-        The attempt was already recorded at construction. Idempotent, so a
-        retry loop that reuses an instance cannot double-count credits.
+        Also records the attempt if issued() was somehow skipped, so a caller
+        that only calls finish() still accounts correctly. Idempotent, so a
+        retry loop reusing an instance cannot double-count credits.
         """
         if self._recorded or not self.allowed:
             return
         self._recorded = True
+        self.issued()
         if status == 200:
             budget.mark_billable(self.bucket)
 
@@ -590,10 +635,11 @@ class governed_cg_call:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # The attempt was recorded at construction; this only settles whether it
-        # billed. An exception on the way out leaves billable False, so a
-        # transport failure is one attempt / zero credits.
-        self.finish(200 if self.billable else None)
+        # Settles the request on EVERY path. An exception on the way out leaves
+        # billable False, so a transport failure is one attempt / zero credits —
+        # but only if the request was actually issued.
+        if self._issued:
+            self.finish(200 if self.billable else None)
         return False
 
 

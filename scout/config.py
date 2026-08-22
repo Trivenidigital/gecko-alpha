@@ -242,7 +242,7 @@ class Settings(BaseSettings):
     # deviation — set COINGECKO_DISCOVERY_INTERVAL_CYCLES=5 in .env to restore
     # the original profile, accepting that discovery will then hit its envelope
     # partway through the month and stop.
-    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=7, ge=1, le=1440)
+    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=8, ge=1, le=1440)
 
     # Open-boundary pricing LIVENESS bound (monthly-budget repair 2026-08-21).
     # The engine's step-0c gate is a REGISTRY check ("a CG lane serves this
@@ -258,10 +258,10 @@ class Settings(BaseSettings):
     # then be unmonitored (no trailing stop, no SL) until max_duration
     # force-closes it at entry_price with a fabricated pnl_pct=0.
     #
-    # Sized against COINGECKO_DISCOVERY_INTERVAL_CYCLES: at a 5-cycle/60s
-    # cadence price_cache should be written every ~5 min, so 1800s is ~6x
-    # headroom and will not trip on ordinary jitter or a couple of skipped
-    # rounds. Set to 0 to disable the gate entirely (NOT recommended — that
+    # Sized against the discovery cadence: at 8 cycles x 60s a discovery round
+    # runs every ~8 min, so 1800s is >3x headroom and will not trip on ordinary
+    # jitter or a couple of skipped rounds. Note this bounds PROVIDER silence,
+    # not price_cache staleness. Set to 0 to disable the gate entirely (NOT recommended — that
     # restores the unmonitored-position class).
     PAPER_OPEN_CG_PRICING_MAX_AGE_SEC: int = Field(default=1800, ge=0, le=86_400)
 
@@ -275,7 +275,7 @@ class Settings(BaseSettings):
     # discovery spend the allowance that keeps held positions re-priceable —
     # and an unpriceable open position is the GA-01 failure class.
     #
-    #   discovery  65,000  <- C profile projects ~62k, so this is the working cap
+    #   discovery  65,000  <- corrected full model projects 55,428 (14.7% margin)
     #   critical   30,000  <- reserved for held-position re-pricing
     #   operational 5,000  <- reconciliation / margin for model error
     #   ------------------
@@ -297,7 +297,7 @@ class Settings(BaseSettings):
     # already burned. Bounded by spend rather than clock because the exposure
     # scales with spend.
     #
-    # 25 credits is roughly 3.5 discovery rounds at the ~7-call C profile — so
+    # 25 credits is roughly 3.5 discovery rounds at the 7-call bundle — so
     # the worst-case loss is a few rounds, not the ~60 rounds an hourly-only
     # flush could discard. (An earlier comment claimed "well under one discovery
     # round", which was simply wrong: 25 > 7.)
@@ -311,6 +311,43 @@ class Settings(BaseSettings):
     # ledger starts empty. "Dark until the reset" is then a property of the
     # tree, not of an operator remembering not to deploy.
     COINGECKO_DISCOVERY_ENABLED: bool = False
+
+    # -------- Executable caps on the VARIABLE CoinGecko consumers --------
+    # Round-4 finding: the budget model had fixed per-pass estimates for
+    # consumers whose call count is a LOOP BOUND, not a constant. The narrative
+    # pass fans out as:
+    #
+    #   1 /coins/categories
+    # + 1 /search/trending
+    # + max_heating_per_cycle                           -> fetch_laggards
+    # + max_heating * max_picks_per_category            -> scored-token detail
+    # + max_heating * max_picks_per_category            -> control-token detail
+    #
+    # And the multipliers are LEARNER-TUNABLE, so the default (5,5 -> 57/pass)
+    # is not the bound. scout/narrative/strategy_bounds.py permits
+    # max_heating_per_cycle up to 10 and max_picks_per_category up to 10, i.e.
+    # 1 + 1 + 10 + 100 + 100 = 212 calls/pass ~= 315,000/month from ONE
+    # consumer, against a 100,000 plan. Even at the defaults it is 84,816/month
+    # — more than the entire 65,000 discovery envelope. No main-bundle cadence
+    # can absorb that, so the fan-out itself has to be bounded.
+    #
+    # This cap covers the whole per-pass fan-out (laggards AND both detail
+    # loops), so the monthly model is 2 + this number per pass regardless of
+    # how the learner tunes the strategy knobs.
+    #
+    # Today's production measurement (2026-08-19: narrative.observe_empty x44,
+    # zero heating/laggard/detail events) shows the pass aborting right after an
+    # empty /coins/categories — so the observed cost is ~1 call/pass. That is an
+    # artifact of a failing upstream, NOT a bound, and it would vanish the moment
+    # categories starts returning data. Modelling on it would repeat exactly the
+    # mistake that produced the 62k headline.
+    #
+    # These caps degrade the pass (fewer tokens enriched) rather than failing it.
+    NARRATIVE_MAX_CG_CALLS_PER_PASS: int = Field(default=8, ge=0, le=200)
+    # /simple/price fallback chunks in evaluate_pending. The loop is already
+    # bounded at 3 chunks (min(len(missing),60) step 20); this makes the bound a
+    # SETTING so the budget model can cite it instead of re-deriving it.
+    NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS: int = Field(default=4, ge=0, le=100)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.

@@ -133,24 +133,66 @@ def test_discovery_disabled_does_not_disable_critical_or_operational(
 async def test_a_direct_discovery_caller_makes_ZERO_http_when_disabled(
     settings_factory,
 ):
-    """The falsifier: a caller OUTSIDE the main lane orchestrator.
+    """THE behavioural falsifier: actually INVOKE a caller outside the main lanes.
 
-    `secondwave.detector` reaches CoinGecko on its own 30-minute loop. With the
-    flag false it must issue no HTTP at all — not merely be refused later.
+    `secondwave.fetch_current_prices` reaches CoinGecko on its own 30-minute
+    loop, nowhere near `_fetch_coingecko_lanes`. With discovery disabled it must
+    issue NO HTTP AT ALL — not merely be refused somewhere downstream.
+
+    The previous version of this test only constructed a `governed_cg_call` and
+    compared source-string positions; `session.get` was never exercised, so a
+    mutant deleting the `if not _call.allowed: return` early return would have
+    passed it while happily issuing requests.
     """
     from scout.secondwave import detector
 
     settings = settings_factory(COINGECKO_DISCOVERY_ENABLED=False)
-    session = MagicMock()
-    session.get = MagicMock(side_effect=AssertionError("HTTP must not be issued"))
 
-    call = governed_cg_call(BUCKET_DISCOVERY, settings)
-    assert call.allowed is False
-    # And the module honours it: the guard sits before the request.
-    src = __import__("pathlib").Path(detector.__file__).read_text(encoding="utf-8")
-    guard = src.index("governed_cg_call(BUCKET_DISCOVERY, settings)")
-    request = src.index("async with session.get(")
-    assert guard < request, "the budget guard must precede the request"
+    calls = []
+
+    class _ExplodingSession:
+        def get(self, *a, **k):
+            calls.append((a, k))
+            raise AssertionError(
+                "HTTP was issued with COINGECKO_DISCOVERY_ENABLED=False"
+            )
+
+    result = await detector.fetch_current_prices(
+        _ExplodingSession(), ["bitcoin", "ethereum"], settings
+    )
+
+    assert calls == [], "discovery-disabled must mean zero requests issued"
+    assert result == {}
+
+
+async def test_the_same_caller_DOES_issue_http_when_discovery_is_enabled(
+    settings_factory,
+):
+    """The complement, so the test above cannot pass by the caller being inert.
+
+    Without this, `fetch_current_prices` returning {} for an unrelated reason
+    would satisfy the zero-HTTP assertion and prove nothing.
+    """
+    from scout.secondwave import detector
+
+    settings = settings_factory(COINGECKO_DISCOVERY_ENABLED=True)
+
+    calls = []
+
+    class _RecordingSession:
+        def get(self, *a, **k):
+            calls.append((a, k))
+            raise RuntimeError("stop here — reaching HTTP is the assertion")
+
+    try:
+        await detector.fetch_current_prices(_RecordingSession(), ["bitcoin"], settings)
+    except RuntimeError:
+        pass
+
+    assert len(calls) == 1, (
+        "with discovery enabled the same caller must reach the request; "
+        "otherwise the zero-HTTP test above proves nothing"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,20 +225,53 @@ def test_get_with_backoff_requires_settings():
 # ---------------------------------------------------------------------------
 
 
-def test_transport_failure_records_an_attempt_and_no_credit(settings_factory):
-    """A connection/timeout dies before any response, so `finish(status)` is
-    never reached. Recording only on response made every transport failure
-    invisible in the attempt rate — hiding exactly the lanes that are broken."""
+def test_construction_alone_is_NOT_an_attempt(settings_factory):
+    """Construction happens before the limiter and before any request.
+
+    Counting there turned a cancellation while waiting on the rate limiter --
+    or any early return between construction and session.get -- into a phantom
+    provider attempt, violating the "one attempt per ISSUED request" contract.
+    """
+    s = settings_factory(COINGECKO_DISCOVERY_ENABLED=True)
+    before = cg_budget.attempts(BUCKET_DISCOVERY)
+    governed_cg_call(BUCKET_DISCOVERY, s)  # constructed, never issued
+    assert cg_budget.attempts(BUCKET_DISCOVERY) == before
+
+
+def test_transport_failure_is_one_attempt_and_no_credit(settings_factory):
+    """The request WAS issued, then the connection died before any response.
+
+    `finish(status)` is never reached, so recording only on response made every
+    transport failure invisible in the attempt rate -- hiding exactly the lanes
+    that are broken.
+    """
     s = settings_factory(COINGECKO_DISCOVERY_ENABLED=True)
     before_a = cg_budget.attempts(BUCKET_DISCOVERY)
     before_c = cg_budget.credits(BUCKET_DISCOVERY)
 
-    call = governed_cg_call(BUCKET_DISCOVERY, s)  # request issued...
+    call = governed_cg_call(BUCKET_DISCOVERY, s)
+    call.issued()  # about to hit the wire...
     # ...connection dies here; finish() is never called.
 
     assert cg_budget.attempts(BUCKET_DISCOVERY) == before_a + 1
     assert cg_budget.credits(BUCKET_DISCOVERY) == before_c
-    assert call.allowed is True
+
+
+def test_transport_failure_through_the_context_manager_settles_the_same(
+    settings_factory,
+):
+    """The `with` form must reach the same 1 attempt / 0 credits on an exception."""
+    s = settings_factory(COINGECKO_DISCOVERY_ENABLED=True)
+    before_a = cg_budget.attempts(BUCKET_DISCOVERY)
+    before_c = cg_budget.credits(BUCKET_DISCOVERY)
+
+    with pytest.raises(RuntimeError):
+        with governed_cg_call(BUCKET_DISCOVERY, s) as call:
+            call.issued()
+            raise RuntimeError("connection reset")
+
+    assert cg_budget.attempts(BUCKET_DISCOVERY) == before_a + 1
+    assert cg_budget.credits(BUCKET_DISCOVERY) == before_c
 
 
 def test_a_200_upgrades_the_same_attempt_rather_than_adding_one(settings_factory):
@@ -205,6 +280,7 @@ def test_a_200_upgrades_the_same_attempt_rather_than_adding_one(settings_factory
     before_c = cg_budget.credits(BUCKET_DISCOVERY)
 
     call = governed_cg_call(BUCKET_DISCOVERY, s)
+    call.issued()
     call.finish(200)
 
     assert (
@@ -219,6 +295,7 @@ def test_a_429_is_an_attempt_with_no_credit(settings_factory):
     before_c = cg_budget.credits(BUCKET_DISCOVERY)
 
     call = governed_cg_call(BUCKET_DISCOVERY, s)
+    call.issued()
     call.finish(429)
 
     assert cg_budget.attempts(BUCKET_DISCOVERY) == before_a + 1
@@ -349,63 +426,108 @@ async def test_exhausted_reserve_does_not_block_an_independently_priced_position
 
 _CYCLES_PER_DAY = 1440  # 60s SCAN_INTERVAL_SECONDS
 _DAYS = 31
-
-#: Every discovery-class CoinGecko consumer OTHER than the main lane bundle,
-#: in calls per day at prod settings (NARRATIVE_POLL_INTERVAL=1800 -> 48
-#: passes/day; secondwave loop 1800s -> 48/day). These are the consumers the
-#: original "~62k fits in 65k" figure omitted entirely.
-_OTHER_DISCOVERY_PER_DAY = (
-    48 * 1  # narrative observer /coins/categories
-    + 48 * 1  # narrative trending tracker /search/trending
-    + 48 * 2  # narrative predictor /coins/markets
-    + 48 * 2  # narrative evaluator batch + /simple/price fallback
-    + 48 * 1  # counter detail /coins/{id}
-    + 48 * 1  # secondwave /coins/markets
-)
-
 _MAIN_BUNDLE_CALLS = 7  # top_movers 2 + trending 2 + by_volume 2 + deep_volume 1
+_NARRATIVE_PASSES = 48  # NARRATIVE_POLL_INTERVAL=1800
+_SECONDWAVE_PER_DAY = 48  # 1800s loop, 1 call
 
 
 def _monthly(per_day: float) -> int:
     return round(per_day * _DAYS)
 
 
+def _narrative_max_calls_per_pass(s) -> int:
+    """STRUCTURAL maximum, from executable bounds -- not an estimate.
+
+    The previous model hardcoded "48 x 1" for detail and "48 x 2" for the
+    predictor. Both are LOOP BOUNDS: `fetch_laggards` runs once per heating
+    category and `fetch_coin_detail` runs for every scored token AND again for
+    every control token. Worse, the multipliers are LEARNER-TUNABLE --
+    strategy_bounds permits max_heating_per_cycle and max_picks_per_category up
+    to 10 each, so the true uncapped fan-out is 1 + 1 + 10 + 100 + 100 = 212
+    calls/pass, ~315,000/month from one consumer against a 100,000 plan.
+
+    Production activation today is ~1 call/pass because `/coins/categories`
+    returns empty and the pass aborts (2026-08-19: narrative.observe_empty x44,
+    zero heating/laggard/detail events). That is an artifact of a failing
+    upstream, NOT a bound; modelling on it would repeat the mistake that
+    produced the 62k headline.
+
+    So the model uses the CAP, which now covers the entire fan-out.
+    """
+    return 1 + 1 + s.NARRATIVE_MAX_CG_CALLS_PER_PASS
+
+
+def _narrative_uncapped_per_pass() -> int:
+    """What the fan-out reaches with the learner at its permitted maximum."""
+    from scout.narrative.strategy_bounds import STRATEGY_BOUNDS
+
+    max_heating = STRATEGY_BOUNDS["max_heating_per_cycle"][1]
+    max_picks = STRATEGY_BOUNDS["max_picks_per_category"][1]
+    return int(1 + 1 + max_heating + 2 * (max_heating * max_picks))
+
+
 def test_planned_discovery_workload_fits_its_envelope(settings_factory):
     """Hard caps protect against estimation error; they do not make a workload fit.
 
-    The original C profile projected ~62k against a 65k envelope from the MAIN
-    BUNDLE ALONE. Adding the six other discovery-class consumers — all enabled
-    in prod — puts every-5th at 74,400/month, 9,400 OVER.
+    Built from STRUCTURAL bounds now: every variable consumer contributes its
+    executable maximum, not a fixed guess.
     """
     s = settings_factory()
     interval = s.COINGECKO_DISCOVERY_INTERVAL_CYCLES
-    rounds_per_day = _CYCLES_PER_DAY / interval
-    main = _monthly(rounds_per_day * _MAIN_BUNDLE_CALLS)
-    other = _monthly(_OTHER_DISCOVERY_PER_DAY)
-    total = main + other
+    main = _monthly((_CYCLES_PER_DAY / interval) * _MAIN_BUNDLE_CALLS)
+    narrative = _monthly(_narrative_max_calls_per_pass(s) * _NARRATIVE_PASSES)
+    secondwave = _monthly(_SECONDWAVE_PER_DAY)
+    total = main + narrative + secondwave
 
-    assert total <= s.COINGECKO_MONTHLY_DISCOVERY_CREDITS, (
-        f"planned discovery {total:,}/month exceeds the "
-        f"{s.COINGECKO_MONTHLY_DISCOVERY_CREDITS:,} envelope at "
-        f"interval={interval} (main {main:,} + other {other:,})"
+    envelope = s.COINGECKO_MONTHLY_DISCOVERY_CREDITS
+    assert total <= envelope, (
+        f"planned discovery {total:,}/month exceeds the {envelope:,} envelope at "
+        f"interval={interval} (main {main:,} + narrative {narrative:,} + "
+        f"secondwave {secondwave:,})"
+    )
+    # Meaningful margin, not a hairline fit: the per-invocation counts above are
+    # bounds on loops, and a bound that is only just satisfied is one product
+    # tweak away from a mid-month discovery shutdown.
+    margin = 1 - (total / envelope)
+    assert margin >= 0.05, (
+        f"only {margin:.1%} headroom at interval={interval}; the model needs "
+        "room for estimation error in the variable consumers"
     )
 
 
-def test_the_omitted_consumers_are_what_broke_the_original_profile(settings_factory):
-    """Pin the arithmetic so the next cadence change re-checks it.
+def test_narrative_is_bounded_and_would_not_fit_unbounded(settings_factory):
+    """Pin WHY the cap exists, at the LEARNER-PERMITTED maximum.
 
-    At every-5th the main bundle alone is ~62k — which is why it looked like it
-    fit. This asserts the OTHER consumers are large enough to matter, so nobody
-    re-derives a cadence from the bundle in isolation again.
+    The knobs are tunable, so the default 5x5 is not the bound. At the permitted
+    10x10 the uncapped fan-out is ~315,000/month against a 100,000 plan.
     """
     s = settings_factory()
-    other = _monthly(_OTHER_DISCOVERY_PER_DAY)
-    assert other > 10_000, "the omitted consumers are not a rounding error"
+    uncapped = _monthly(_narrative_uncapped_per_pass() * _NARRATIVE_PASSES)
+    assert uncapped > s.COINGECKO_MONTHLY_CREDIT_ALLOWANCE * 3, (
+        "the uncapped narrative fan-out must be demonstrably larger than the "
+        "whole plan -- that is the round-4 finding"
+    )
+    capped = _monthly(_narrative_max_calls_per_pass(s) * _NARRATIVE_PASSES)
+    assert capped < s.COINGECKO_MONTHLY_DISCOVERY_CREDITS / 2
 
-    at_five = _monthly((_CYCLES_PER_DAY / 5) * _MAIN_BUNDLE_CALLS) + other
-    assert (
-        at_five > s.COINGECKO_MONTHLY_DISCOVERY_CREDITS
-    ), "every-5th must be demonstrably over the envelope — that is the finding"
+
+def test_the_cap_is_independent_of_learner_tuning(settings_factory):
+    """The model must not depend on strategy knobs the learner can move.
+
+    A cap expressed in CALLS holds whatever max_heating_per_cycle and
+    max_picks_per_category become; a model derived from those knobs does not.
+    """
+    s = settings_factory()
+    assert _narrative_max_calls_per_pass(s) == 2 + s.NARRATIVE_MAX_CG_CALLS_PER_PASS
+
+
+def test_interval_five_is_untenable_under_the_corrected_model(settings_factory):
+    """The original C profile, re-checked against structural bounds."""
+    s = settings_factory()
+    main5 = _monthly((_CYCLES_PER_DAY / 5) * _MAIN_BUNDLE_CALLS)
+    narrative = _monthly(_narrative_max_calls_per_pass(s) * _NARRATIVE_PASSES)
+    secondwave = _monthly(_SECONDWAVE_PER_DAY)
+    assert main5 + narrative + secondwave > s.COINGECKO_MONTHLY_DISCOVERY_CREDITS
 
 
 def test_planned_operational_workload_fits_its_envelope(settings_factory):
@@ -414,25 +536,19 @@ def test_planned_operational_workload_fits_its_envelope(settings_factory):
 
     s = settings_factory()
     ledger_poll = _monthly(_CYCLES_PER_DAY / ledger._ENROLLMENT_CG_POLL_INTERVAL_CYCLES)
-    reconcile = _monthly(24)  # hourly
-    resolver = _monthly(20)  # event-driven estimate
+    reconcile = _monthly(24)
+    resolver = _monthly(20)
     total = ledger_poll + reconcile + resolver
-
     assert total <= s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS, (
-        f"planned operational {total:,}/month exceeds the "
-        f"{s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS:,} envelope "
+        f"planned operational {total:,}/month exceeds "
+        f"{s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS:,} "
         f"(ledger {ledger_poll:,} + reconcile {reconcile:,} + resolver {resolver:,})"
     )
 
 
 def test_unthrottled_ledger_poll_would_not_have_fit_anything(settings_factory):
-    """The defect, quantified: 1,440/day is ~43.2k/month.
-
-    That is larger than the entire 30k critical reserve it was charged to, and
-    ~43% of the whole 100k plan.
-    """
+    """The round-3 defect, quantified: 1,440/day is ~43.2k/month."""
     s = settings_factory()
     unthrottled = _monthly(_CYCLES_PER_DAY)
     assert unthrottled > s.COINGECKO_MONTHLY_CRITICAL_CREDITS
     assert unthrottled > s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
-    assert unthrottled > s.COINGECKO_MONTHLY_CREDIT_ALLOWANCE * 0.4

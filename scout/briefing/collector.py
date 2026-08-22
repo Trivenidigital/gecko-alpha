@@ -78,6 +78,10 @@ async def fetch_cg_global(
         # request paths that produced a response makes a lane that is failing
         # at the transport layer invisible in the attempt rate.
         await coingecko_limiter.acquire()
+        # Record the attempt IMMEDIATELY before the request, after the
+        # limiter. Counting at construction would invent an attempt for a
+        # cancellation while waiting here.
+        _call.issued()
         url = f"{cg_api.base_url(api_tier)}/global"
         headers = dict(cg_api.auth_headers(api_key, api_tier))
         async with session.get(url, headers=headers, timeout=_TIMEOUT) as resp:

@@ -64,6 +64,10 @@ async def fetch_coin_detail(
     # request paths that produced a response makes a lane that is failing
     # at the transport layer invisible in the attempt rate.
     await coingecko_limiter.acquire()
+    # Record the attempt IMMEDIATELY before the request, after the
+    # limiter. Counting at construction would invent an attempt for a
+    # cancellation while waiting here.
+    _call.issued()
     try:
         async with session.get(url, params=params, headers=headers) as resp:
             _call.finish(resp.status)

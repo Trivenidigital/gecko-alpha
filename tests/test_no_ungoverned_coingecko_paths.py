@@ -65,6 +65,45 @@ def _issues_http(node) -> bool:
     return False
 
 
+def _raw_cg_requests(node, fn_src: str) -> int:
+    """Count session.get/post calls in this function that are NOT the governed
+    primitive's own call.
+
+    Callsite-level, not function-level. A function containing one governed
+    request AND one raw request was previously judged safe purely because the
+    marker appeared SOMEWHERE in its body -- which is the tightest, most likely
+    version of the leak: someone adds one more request to a function that
+    already has a correct one.
+    """
+    return sum(
+        1
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Attribute)
+        and sub.attr in ("get", "post")
+        and "session"
+        in str(
+            getattr(sub.value, "id", None) or getattr(sub.value, "attr", "") or ""
+        ).lower()
+    )
+
+
+#: The governed primitive itself necessarily contains a raw request.
+_PRIMITIVE_FUNCTIONS = {"_get_with_backoff"}
+
+
+def _wrapper_count(fn_src: str) -> int:
+    """How many `governed_cg_call` wrappers this function declares.
+
+    Counts ONLY `governed_cg_call`, not `_get_with_backoff`. The distinction is
+    the whole point: `_get_with_backoff` REPLACES a raw request (it issues the
+    HTTP itself, so a caller delegating to it has zero raw requests of its own),
+    whereas `governed_cg_call` WRAPS one the caller still issues. Counting the
+    former as cover let a function make one delegated call plus one raw call and
+    balance the books -- the exact same-function leak this must catch.
+    """
+    return fn_src.count("governed_cg_call(")
+
+
 def ungoverned_cg_functions(src: str) -> set:
     """FUNCTIONS that issue CoinGecko HTTP without a governed primitive.
 
@@ -90,7 +129,13 @@ def ungoverned_cg_functions(src: str) -> set:
             continue
         if not _issues_http(node):
             continue
-        if not any(m in fn_src for m in _GOVERNED_MARKERS):
+        if node.name in _PRIMITIVE_FUNCTIONS:
+            continue  # the primitive is where the governed request lives
+        raw = _raw_cg_requests(node, fn_src)
+        wrappers = _wrapper_count(fn_src)
+        # Every RAW request needs its own wrapper. A function that only
+        # delegates to _get_with_backoff has raw == 0 and is trivially fine.
+        if raw > wrappers:
             bad.add(node.name)
     return bad
 
@@ -228,3 +273,54 @@ def test_known_coingecko_callers_stay_governed(module):
     assert (
         ungoverned_cg_functions(src) == set()
     ), f"{module} has an ungoverned CoinGecko callsite again"
+
+
+def test_tripwire_kills_a_leak_in_the_SAME_FUNCTION():
+    """THE tightest mutant: one governed AND one raw request in ONE function.
+
+    The function-scoped version passed this, because a single governed marker
+    anywhere in the body whitelisted every raw request in it. That is the most
+    likely real leak of all: not a new module, not even a new function -- one
+    more request added to a function that already does the right thing once.
+    """
+    same_fn = NL.join(
+        [
+            "from scout import cg_api",
+            "from scout.ingestion.coingecko import _get_with_backoff",
+            "from scout.coingecko_budget import BUCKET_DISCOVERY",
+            "async def half_governed(session, settings, tier):",
+            "    a = await _get_with_backoff(",
+            "        session, f'{cg_api.base_url(tier)}/coins/markets',",
+            "        bucket=BUCKET_DISCOVERY, settings=settings,",
+            "    )",
+            "    url = f'{cg_api.base_url(tier)}/coins/categories'",
+            "    async with session.get(url) as resp:",
+            "        return a, await resp.json()",
+        ]
+    )
+    bad = ungoverned_cg_functions(same_fn)
+    assert bad == {"half_governed"}, (
+        "a raw CoinGecko request must be caught even when the SAME function "
+        f"also makes a governed one; got {bad}"
+    )
+
+
+def test_a_fully_governed_function_with_two_calls_is_not_flagged():
+    """No false positive on a function that governs BOTH of its requests."""
+    both = NL.join(
+        [
+            "from scout import cg_api",
+            "from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call",
+            "async def two_governed(session, settings, tier):",
+            "    c1 = governed_cg_call(BUCKET_DISCOVERY, settings)",
+            "    c1.issued()",
+            "    async with session.get(f'{cg_api.base_url(tier)}/a') as r1:",
+            "        c1.finish(r1.status)",
+            "    c2 = governed_cg_call(BUCKET_DISCOVERY, settings)",
+            "    c2.issued()",
+            "    async with session.get(f'{cg_api.base_url(tier)}/b') as r2:",
+            "        c2.finish(r2.status)",
+            "    return r1, r2",
+        ]
+    )
+    assert ungoverned_cg_functions(both) == set()
