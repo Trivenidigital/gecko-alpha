@@ -78,6 +78,7 @@ number to appear in the table below.
 | 20260816 | alert_events_dedup_index_v1 | index-only; `parole_denied` first-occurrence probe |
 | 20260817 | alert_payloads_v1 | content-addressed alert-body preimages; no backfill possible |
 | 20260821 | cg_credit_ledger_v1 | durable CoinGecko monthly-credit accounting (attempts vs billable credits, per envelope); additive, no backfill |
+| 20260822 | signal_events_indexes_v1 | drop `idx_sig_events_type` (466 MB dead index), add `signal_events(created_at)`; index-only, no VACUUM bundled |
 
 ## Notes / gaps
 
