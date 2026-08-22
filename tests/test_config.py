@@ -554,7 +554,7 @@ def test_volume_snapshots_retention_default():
         TELEGRAM_CHAT_ID="c",
         ANTHROPIC_API_KEY="k",
     )
-    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 14  # ruling B, 2026-08-22
 
 
 def test_score_history_retention_env_override():
@@ -791,7 +791,7 @@ def test_load_settings_returns_normally_on_valid_input():
         ANTHROPIC_API_KEY="k",
     )
     assert s.SCORE_HISTORY_RETENTION_DAYS == 21
-    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 21
+    assert s.VOLUME_SNAPSHOTS_RETENTION_DAYS == 14  # ruling B, 2026-08-22
 
 
 def test_retention_equality_to_cooldown_passes():
