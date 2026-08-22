@@ -175,6 +175,7 @@ async def maybe_minara_command(
             coin_id=coin_id,
             api_key=getattr(settings, "COINGECKO_API_KEY", "") or "",
             api_tier=getattr(settings, "COINGECKO_API_TIER", "demo"),
+            settings=settings,
         )
     except Exception:
         log.exception("minara_alert_detail_fetch_failed", coin_id=coin_id)

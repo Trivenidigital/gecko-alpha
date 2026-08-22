@@ -182,6 +182,7 @@ async def narrative_agent_loop(
                 session,
                 api_key=settings.COINGECKO_API_KEY,
                 api_tier=settings.COINGECKO_API_TIER,
+                settings=settings,
             )
             if not raw_categories:
                 logger.warning("narrative.observe_empty")
@@ -217,6 +218,7 @@ async def narrative_agent_loop(
                         db,
                         settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
                     # trending_catch historically net-loses (-$339 / 86 trades);
                     # disabled in prod via PAPER_SIGNAL_TRENDING_CATCH_ENABLED=False.
@@ -245,6 +247,17 @@ async def narrative_agent_loop(
             # ----------------------------------------------------------
             # PREDICT
             # ----------------------------------------------------------
+            # Per-pass CoinGecko detail budget. The two fetch_coin_detail
+            # loops below are bounded only by max_heating_per_cycle x
+            # max_picks_per_category (5x5), i.e. up to 50 calls/pass across
+            # scored + control tokens. At 48 passes/day that is the single
+            # largest CoinGecko consumer in the system and on its own exceeds
+            # the whole discovery envelope. Cap it explicitly so the monthly
+            # model has an executable bound rather than an estimate.
+            _cg_pass_budget = int(
+                getattr(settings, "NARRATIVE_MAX_CG_CALLS_PER_PASS", 8) or 0
+            )
+
             heating = [a for a in accelerations if a.is_heating]
             heating.sort(key=lambda a: a.acceleration, reverse=True)
             max_heating = int(strategy.get("max_heating_per_cycle"))  # type: ignore[arg-type]
@@ -292,11 +305,20 @@ async def narrative_agent_loop(
                         continue
 
                     # Fetch and filter laggards
+                    if _cg_pass_budget <= 0:
+                        logger.debug(
+                            "narrative.cg_pass_budget_exhausted",
+                            category=accel.category_id,
+                            scope="laggards",
+                        )
+                        break
+                    _cg_pass_budget -= 1
                     raw_laggards = await fetch_laggards(
                         session,
                         accel.category_id,
                         api_key=settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
 
                     # Cache laggard prices for dashboard (zero extra API calls)
@@ -349,12 +371,24 @@ async def narrative_agent_loop(
                         # Fetch detail up-front to get watchlist_portfolio_users
                         # for the narrative scoring prompt. Reused below for
                         # counter-narrative scoring (cache makes this cheap).
-                        token_detail = await fetch_coin_detail(
-                            session,
-                            token.coin_id,
-                            settings.COINGECKO_API_KEY,
-                            api_tier=settings.COINGECKO_API_TIER,
-                        )
+                        if _cg_pass_budget > 0:
+                            _cg_pass_budget -= 1
+                            token_detail = await fetch_coin_detail(
+                                session,
+                                token.coin_id,
+                                settings.COINGECKO_API_KEY,
+                                api_tier=settings.COINGECKO_API_TIER,
+                                settings=settings,
+                            )
+                        else:
+                            # Degrade the pass, do not fail it: scoring proceeds
+                            # without the watchlist enrichment.
+                            token_detail = None
+                            logger.debug(
+                                "narrative.cg_detail_budget_exhausted",
+                                coin_id=token.coin_id,
+                                scope="scored",
+                            )
                         token_cdata = (
                             extract_counter_data(token_detail) if token_detail else None
                         )
@@ -575,12 +609,22 @@ async def narrative_agent_loop(
                     # time. The detail fetcher has a 30-min cache so this is
                     # essentially free when a token also appeared in scoring.
                     for token in control_laggards:
-                        control_detail = await fetch_coin_detail(
-                            session,
-                            token.coin_id,
-                            settings.COINGECKO_API_KEY,
-                            api_tier=settings.COINGECKO_API_TIER,
-                        )
+                        if _cg_pass_budget > 0:
+                            _cg_pass_budget -= 1
+                            control_detail = await fetch_coin_detail(
+                                session,
+                                token.coin_id,
+                                settings.COINGECKO_API_KEY,
+                                api_tier=settings.COINGECKO_API_TIER,
+                                settings=settings,
+                            )
+                        else:
+                            control_detail = None
+                            logger.debug(
+                                "narrative.cg_detail_budget_exhausted",
+                                coin_id=token.coin_id,
+                                scope="control",
+                            )
                         control_watchlist = 0
                         if control_detail:
                             ccdata = extract_counter_data(control_detail)
@@ -695,6 +739,7 @@ async def narrative_agent_loop(
                         strategy,
                         api_key=settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
                     last_eval_at = now
                     await strategy.set_timestamp("last_eval_at", now)

@@ -118,6 +118,20 @@ async def test_run_cycle_cryptopanic_disabled_skips_fetch():
     assert stats["tokens_scanned"] == 1
 
 
+_MIDCAP_RAW = {"id": "playnance-like", "price_change_percentage_24h": 96.4}
+
+
+async def _midcap_fetch_setting_global(*args, **kwargs):
+    """Stand-in for fetch_midcap_gainers that honours its real side effect."""
+    from scout.ingestion import coingecko as _cg
+
+    _cg.last_raw_midcap_gainers = [_MIDCAP_RAW]
+    return _MIDCAP_FETCH_RETURN[0]
+
+
+_MIDCAP_FETCH_RETURN: list = [[]]
+
+
 async def test_run_cycle_includes_midcap_gainers_in_aggregate_and_raw_cache():
     """Midcap rows reach both candidate scoring and raw-market signal surfaces."""
     midcap = _mk_token(
@@ -129,11 +143,19 @@ async def test_run_cycle_includes_midcap_gainers_in_aggregate_and_raw_cache():
         volume_24h_usd=840_000,
         price_change_24h=96.4,
     )
+    _MIDCAP_FETCH_RETURN[0] = [midcap]
     db = _mk_db()
     settings = _mk_settings(
         VOLUME_SPIKE_ENABLED=True,
         GAINERS_TRACKER_ENABLED=True,
         MOMENTUM_7D_ENABLED=True,
+        # This test asserts an AGGREGATION invariant (midcap rows reach both
+        # candidate scoring and the raw-market surfaces), not a cadence one.
+        # The 2026-08-21 monthly-budget repair defaults CG discovery to every
+        # 5th cycle, so a single-cycle test would otherwise be off-cadence and
+        # fetch nothing. Pin the interval to 1 to isolate what is under test;
+        # the cadence itself is covered by tests/test_cg_discovery_cadence.py.
+        COINGECKO_DISCOVERY_INTERVAL_CYCLES=1,
     )
     session = AsyncMock()
 
@@ -147,10 +169,15 @@ async def test_run_cycle_includes_midcap_gainers_in_aggregate_and_raw_cache():
         ),
         patch("scout.main.cg_fetch_trending", new_callable=AsyncMock, return_value=[]),
         patch("scout.main.cg_fetch_by_volume", new_callable=AsyncMock, return_value=[]),
+        # Mirror the REAL fetcher's contract: it sets its module global AND
+        # returns. Pre-seeding the global instead (as this test used to) is not
+        # faithful — the discovery round now clears the globals up-front so a
+        # lane that never runs cannot leave a stale payload behind, which would
+        # re-drive record_volume/cache_prices from data not fetched this cycle.
         patch(
             "scout.main.cg_fetch_midcap_gainers",
             new_callable=AsyncMock,
-            return_value=[midcap],
+            side_effect=_midcap_fetch_setting_global,
         ),
         patch(
             "scout.main.fetch_held_position_prices",
@@ -163,10 +190,7 @@ async def test_run_cycle_includes_midcap_gainers_in_aggregate_and_raw_cache():
         ),
         patch("scout.main._cg_module.last_raw_trending", []),
         patch("scout.main._cg_module.last_raw_by_volume", []),
-        patch(
-            "scout.main._cg_module.last_raw_midcap_gainers",
-            [{"id": "playnance-like", "price_change_percentage_24h": 96.4}],
-        ),
+        patch("scout.main._cg_module.last_raw_midcap_gainers", []),
         patch("scout.main.record_volume", new_callable=AsyncMock) as mock_record_volume,
         patch("scout.main.detect_spikes", new_callable=AsyncMock, return_value=[]),
         patch(

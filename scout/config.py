@@ -202,7 +202,170 @@ class Settings(BaseSettings):
     # held-position refresh can add 1 when enabled, and midcap scan averages
     # +1/min under its default 3-cycle cadence. Raise only with rate-budget
     # review against the 25/min limiter.
-    COINGECKO_VOLUME_SCAN_PAGES: int = 3
+    # 2026-08-21 monthly-budget repair: 3 -> 2. See
+    # tasks/plan_cg_monthly_budget_governor.md. The comment ABOVE reasons
+    # entirely about "the 25/min limiter" — a RATE constraint. The account also
+    # has a MONTHLY CREDIT ceiling (Basic = 100k/mo) which that model ignored
+    # entirely, and which is what actually ran out on 2026-08-21 at 100.0%.
+    # Restore to 3 only after a full measured billing month AND evidence of
+    # discovery-quality loss from 2 pages — not by spending headroom by default.
+    COINGECKO_VOLUME_SCAN_PAGES: int = 2
+
+    # CG DISCOVERY cadence, decoupled from the 60s main cycle. The free leading
+    # sources (DexScreener / GeckoTerminal) stay at 60s; only the paid CG
+    # discovery lanes are throttled, because CG is the LAGGING source.
+    #
+    # held-position pricing is deliberately NOT gated by this — it keeps its own
+    # HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES cadence and its
+    # no_open_trades no-op, because it is the operationally critical surface
+    # (the live trailing-stop evaluator reads the price_cache rows it writes).
+    # 8, NOT the 5 of the original C profile. That figure was derived from the
+    # main discovery bundle ALONE (7 calls x 288 rounds/day = ~62k/month, said
+    # to fit the 65k envelope). It omitted every OTHER discovery-class CoinGecko
+    # consumer, all of which are enabled in prod today:
+    #
+    #   narrative observer /coins/categories        1,488/mo
+    #   narrative trending tracker                  1,488/mo
+    #   narrative predictor /coins/markets          2,976/mo
+    #   narrative evaluator (batch + fallback)      2,976/mo
+    #   counter detail /coins/{id}                  1,488/mo
+    #   secondwave /coins/markets                   1,488/mo
+    #                                              ----------
+    #                                              11,904/mo
+    #
+    # Under the CORRECTED model (bounded narrative fan-out + the evaluator,
+    # which the first model omitted entirely) the discovery structural maximum
+    # at every-8th is 55,924/month against the 65,000 envelope — 14.0% margin.
+    # every-5th remains demonstrably impossible; 7 was retired in favour of 8
+    # because the margin has to survive estimation error in bounds on loops.
+    #
+    # Hard caps protect against an estimation mistake; they are not a substitute
+    # for a planned workload that fits. Operator ratification is wanted for this
+    # deviation — set COINGECKO_DISCOVERY_INTERVAL_CYCLES=5 in .env to restore
+    # the original profile, accepting that discovery will then hit its envelope
+    # partway through the month and stop.
+    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=8, ge=1, le=1440)
+
+    # Open-boundary pricing LIVENESS bound (monthly-budget repair 2026-08-21).
+    # The engine's step-0c gate is a REGISTRY check ("a CG lane serves this
+    # token_id shape"); this is the LIVENESS check ("CoinGecko ITSELF answered
+    # recently").
+    #
+    # Deliberately NOT price_cache freshness. price_cache is also written by
+    # DexScreener (outcome_ledger's dex enrollment poller), so its freshness
+    # says nothing about CoinGecko: a fresh Dex row would present a dead
+    # provider as alive. The signal is cg_budget.last_success_at, set only by a
+    # CoinGecko HTTP 200. With CG dark — exhausted monthly credits, a
+    # suspended account, a spent discovery envelope — a position can open and
+    # then be unmonitored (no trailing stop, no SL) until max_duration
+    # force-closes it at entry_price with a fabricated pnl_pct=0.
+    #
+    # Sized against the discovery cadence: at 8 cycles x 60s a discovery round
+    # runs every ~8 min, so 1800s is >3x headroom and will not trip on ordinary
+    # jitter or a couple of skipped rounds. Note this bounds PROVIDER silence,
+    # not price_cache staleness. Set to 0 to disable the gate entirely (NOT recommended — that
+    # restores the unmonitored-position class).
+    PAPER_OPEN_CG_PRICING_MAX_AGE_SEC: int = Field(default=1800, ge=0, le=86_400)
+
+    # -------- CoinGecko MONTHLY-CREDIT budget (2026-08-21 repair) --------
+    # The provider enforces calls/minute and calls/MONTH as INDEPENDENT limits.
+    # coingecko_limiter owns the first; these own the second. Modeling only the
+    # first is what exhausted the Basic plan's 100,000 credits at 100.0% on
+    # 2026-08-21 with 11 days to the reset.
+    #
+    # Partitioned rather than one shared pool, because a single number lets
+    # discovery spend the allowance that keeps held positions re-priceable —
+    # and an unpriceable open position is the GA-01 failure class.
+    #
+    #   discovery  65,000  <- corrected full model projects 55,428 (14.7% margin)
+    #   critical   30,000  <- reserved for held-position re-pricing
+    #   operational 5,000  <- reconciliation / margin for model error
+    #   ------------------
+    #   total     100,000
+    #
+    # v1 deliberately does NOT let unused critical reserve spill back into
+    # discovery. That optimization needs a measured billing month behind it.
+    COINGECKO_MONTHLY_CREDIT_ALLOWANCE: int = Field(default=100_000, ge=0)
+    COINGECKO_MONTHLY_DISCOVERY_CREDITS: int = Field(default=65_000, ge=0)
+    COINGECKO_MONTHLY_CRITICAL_CREDITS: int = Field(default=30_000, ge=0)
+    COINGECKO_MONTHLY_OPERATIONAL_CREDITS: int = Field(default=5_000, ge=0)
+    # Pace alarm: page when PROJECTED month-end consumption exceeds the
+    # allowance by this fraction. Projection beats absolute 50/75/90% marks —
+    # 60% spent on day 3 is an emergency, 60% on day 27 is fine.
+    COINGECKO_BUDGET_PACE_ALERT_RATIO: float = Field(default=1.10, ge=1.0, le=10.0)
+    # Durability window for the credit ledger, in CREDITS rather than minutes.
+    # Persisting only in the hourly pass would lose up to an hour of spend to a
+    # crash/deploy, and the process would come back believing it has capacity it
+    # already burned. Bounded by spend rather than clock because the exposure
+    # scales with spend.
+    #
+    # 25 credits is roughly 3.5 discovery rounds at the 7-call bundle — so
+    # the worst-case loss is a few rounds, not the ~60 rounds an hourly-only
+    # flush could discard. (An earlier comment claimed "well under one discovery
+    # round", which was simply wrong: 25 > 7.)
+    COINGECKO_BUDGET_FLUSH_EVERY_CREDITS: int = Field(default=25, ge=0, le=10_000)
+    # /key reconciliation. Provider is the ACCEPTANCE truth; positive drift is
+    # real capacity gone that no local counter explains, so it reduces
+    # non-critical capacity rather than only being logged.
+    COINGECKO_BUDGET_RECONCILE_ENABLED: bool = True
+    # Discovery activation. Default FALSE so a deploy before the September 1
+    # credit reset cannot resume CoinGecko discovery merely because the local
+    # ledger starts empty. "Dark until the reset" is then a property of the
+    # tree, not of an operator remembering not to deploy.
+    COINGECKO_DISCOVERY_ENABLED: bool = False
+
+    # -------- Executable caps on the VARIABLE CoinGecko consumers --------
+    # Round-4 finding: the budget model had fixed per-pass estimates for
+    # consumers whose call count is a LOOP BOUND, not a constant. The narrative
+    # pass fans out as:
+    #
+    #   1 /coins/categories
+    # + 1 /search/trending
+    # + max_heating_per_cycle                           -> fetch_laggards
+    # + max_heating * max_picks_per_category            -> scored-token detail
+    # + max_heating * max_picks_per_category            -> control-token detail
+    #
+    # And the multipliers are LEARNER-TUNABLE, so the default (5,5 -> 57/pass)
+    # is not the bound. scout/narrative/strategy_bounds.py permits
+    # max_heating_per_cycle up to 10 and max_picks_per_category up to 10, i.e.
+    # 1 + 1 + 10 + 100 + 100 = 212 calls/pass ~= 315,000/month from ONE
+    # consumer, against a 100,000 plan. Even at the defaults it is 84,816/month
+    # — more than the entire 65,000 discovery envelope. No main-bundle cadence
+    # can absorb that, so the fan-out itself has to be bounded.
+    #
+    # This cap covers the whole per-pass fan-out (laggards AND both detail
+    # loops), so the monthly model is 2 + this number per pass regardless of
+    # how the learner tunes the strategy knobs.
+    #
+    # Today's production measurement (2026-08-19: narrative.observe_empty x44,
+    # zero heating/laggard/detail events) shows the pass aborting right after an
+    # empty /coins/categories — so the observed cost is ~1 call/pass. That is an
+    # artifact of a failing upstream, NOT a bound, and it would vanish the moment
+    # categories starts returning data. Modelling on it would repeat exactly the
+    # mistake that produced the 62k headline.
+    #
+    # These caps degrade the pass (fewer tokens enriched) rather than failing it.
+    NARRATIVE_MAX_CG_CALLS_PER_PASS: int = Field(default=8, ge=0, le=200)
+    # /simple/price fallback chunks in evaluate_pending. The loop is already
+    # bounded at 3 chunks (min(len(missing),60) step 20); this makes the bound a
+    # SETTING so the budget model can cite it instead of re-deriving it.
+    NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS: int = Field(default=4, ge=0, le=100)
+
+    # Telegram resolver monthly CoinGecko ceiling. The resolver is EVENT-DRIVEN
+    # (TG_SOCIAL_ENABLED=true in prod), so it has no natural cadence: a contract
+    # can cost one lookup, a cashtag path costs search + markets, and misses can
+    # be retried. The budget table previously carried "620/month" for it as an
+    # ESTIMATE while calling the table a bound — the exact error this repair
+    # exists to stop.
+    #
+    # Capping it inside OPERATIONAL is not enough on its own: TG volume could
+    # consume the whole 5,000 bucket and starve /key reconciliation and the
+    # outcome-ledger poller, which are FIXED duties sharing it. So the resolver
+    # gets its own sub-ceiling and those two keep a guaranteed floor.
+    COINGECKO_TG_RESOLVER_MONTHLY_CREDITS: int = Field(default=1_000, ge=0)
+    # Reserved for /key reconciliation (~744/mo) + the ledger enrollment poll
+    # (~2,976/mo). Nothing discretionary may push OPERATIONAL below this.
+    COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS: int = Field(default=3_800, ge=0)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.
@@ -2358,6 +2521,62 @@ class Settings(BaseSettings):
                     f"backtest CLI default --days=30. Lower retention silently "
                     f"truncates backtest cohorts."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cg_operational_floor_and_tg_ceiling(self) -> "Settings":
+        """The TG ceiling must be ENFORCEABLE by the floor, not a parallel number.
+
+        Discretionary OPERATIONAL traffic is stopped at
+        ``operational_cap - fixed_floor``. If the declared TG ceiling exceeded
+        that, the table would claim a bound the code does not enforce -- exactly
+        the "620/month estimate presented as a bound" defect. If the floor were
+        smaller than the fixed duties it protects, it would protect nothing.
+        """
+        cap = self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        floor = self.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS
+        if cap <= 0:
+            return self
+        if floor > cap:
+            raise ValueError(
+                f"COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS={floor} exceeds "
+                f"COINGECKO_MONTHLY_OPERATIONAL_CREDITS={cap}"
+            )
+        discretionary = cap - floor
+        if self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS > discretionary:
+            raise ValueError(
+                f"COINGECKO_TG_RESOLVER_MONTHLY_CREDITS="
+                f"{self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS} exceeds the "
+                f"{discretionary} of discretionary operational capacity that the "
+                f"reserved floor actually leaves. A ceiling the code cannot "
+                f"enforce is an estimate wearing a bound's clothes."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cg_monthly_envelopes_fit_the_allowance(self) -> "Settings":
+        """Envelope sum must not exceed the plan's monthly credit allowance.
+
+        Pinned as a validator because over-subscription is SILENT: each envelope
+        looks reasonable alone, discovery stops at its own cap, and the plan
+        still runs dry — which is exactly the shape of the 2026-08-21 incident,
+        one axis un-modelled while every visible number looked fine.
+        """
+        allowance = self.COINGECKO_MONTHLY_CREDIT_ALLOWANCE
+        if allowance <= 0:
+            return self
+        total = (
+            self.COINGECKO_MONTHLY_DISCOVERY_CREDITS
+            + self.COINGECKO_MONTHLY_CRITICAL_CREDITS
+            + self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        )
+        if total > allowance:
+            raise ValueError(
+                f"CoinGecko monthly envelopes sum to {total} which exceeds "
+                f"COINGECKO_MONTHLY_CREDIT_ALLOWANCE={allowance}. Over-subscribing "
+                f"the allowance means discovery can stop at its own cap while the "
+                f"plan still runs dry."
+            )
         return self
 
     @model_validator(mode="after")

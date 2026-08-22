@@ -217,6 +217,13 @@ def settings_factory():
             TELEGRAM_BOT_TOKEN="t",
             TELEGRAM_CHAT_ID="c",
             ANTHROPIC_API_KEY="k",
+            # Tests describe an OPERATING system. COINGECKO_DISCOVERY_ENABLED
+            # ships False so a deploy before the September 1 credit reset cannot
+            # resume discovery, but that is a deployment-time state: leaving it
+            # off here would make every fetch test assert against a refused
+            # request instead of the behaviour it means to cover. Tests for the
+            # dark gate itself pass COINGECKO_DISCOVERY_ENABLED=False explicitly.
+            COINGECKO_DISCOVERY_ENABLED=True,
         )
         defaults.update(overrides)
         return Settings(**defaults)
@@ -283,3 +290,48 @@ def token_factory():
         return CandidateToken(**defaults)
 
     return _make
+
+
+# Imported once at module load, not per test: this reset runs for every test in
+# the suite (~7k), so anything done inside the fixture body is multiplied by 7000.
+import datetime as _dt  # noqa: E402
+import scout.main as _scout_main  # noqa: E402
+from scout import coingecko_budget as _scout_cg_budget  # noqa: E402
+from scout.ingestion import coingecko as _scout_cg  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_cg_process_state():
+    """Isolate the process-global CoinGecko cadence counter and credit ledger.
+
+    Both are module-level singletons by design (consulted on every CG call, so a
+    per-call DB round-trip would be its own budget problem). That makes them leak
+    across tests: without this, whether a test lands on the discovery cadence
+    depends on how many CG cycles earlier tests ran, and a test asserting on
+    credits inherits another test's spend.
+
+    Deliberately does the minimum work possible — plain assignments, no object
+    construction, imports hoisted to module scope. An autouse fixture is paid by
+    every test in the suite, and CI runs against a 25-minute wall.
+    """
+    _scout_main._cg_discovery_cycle_counter = 0
+    _scout_cg.last_raw_markets = []
+    _scout_cg.last_raw_trending = []
+    _scout_cg.last_raw_by_volume = []
+    _scout_cg.last_raw_midcap_gainers = []
+    _scout_cg.last_raw_deep_volume = []
+    _b = _scout_cg_budget.budget
+    _b._month = _scout_cg_budget.billing_month()
+    for _k in _b._counts:
+        _b._counts[_k][0] = 0
+        _b._counts[_k][1] = 0
+    _b._dirty = False
+    _b.provider_credits_used = None
+    # Default to a HEALTHY CoinGecko provider, because that is the normal
+    # production state and the open-boundary liveness gate reads this rather
+    # than price_cache. Tests that exercise a DEAD provider set
+    # `last_success_at = None` (or an old timestamp) explicitly -- opting into
+    # the failure is clearer than every unrelated test having to opt out of it.
+    _b.last_success_at = _dt.datetime.now(_dt.timezone.utc)
+    _b._pace_alerted = False
+    yield

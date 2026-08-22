@@ -29,6 +29,7 @@ import aiohttp
 import structlog
 
 from scout import cg_api
+from scout.coingecko_budget import BUCKET_CRITICAL
 from scout.ingestion.coingecko import _get_with_backoff
 
 # GA-01: heuristic extracted to scout.token_ids so the trading engine's
@@ -150,8 +151,26 @@ async def _fetch_simple_price_batch(
     session: aiohttp.ClientSession,
     settings: "Settings",
     coin_ids: list[str],
+    *,
+    bucket: str,
+    fixed_duty: bool = False,
 ) -> dict:
-    """Single batched /simple/price call. Returns CG response dict or {} on failure."""
+    """Single batched /simple/price call. Returns CG response dict or {} on failure.
+
+    ``bucket`` is REQUIRED and keyword-only because this helper has TWO callers
+    with different budget semantics, and the difference is invisible from here:
+
+    * held-position refresh (this module) re-prices ALREADY-OPEN positions and
+      is genuinely CRITICAL.
+    * ``outcome_ledger.poll_enrollments`` is forward-labelling — evidence
+      collection for research. It is NOT re-pricing an open position.
+
+    Hardcoding CRITICAL made the ledger poller spend the held-position reserve.
+    The ledger runs once per 60s main cycle, so at sustained CG enrollments that
+    is 1,440/day = ~43.2k/month against a 30,000 reserve: it would exhaust the
+    reserve in ~21 days and then `critical_reserve_exceeded` would block every
+    new open — a self-inflicted outage caused by the guard meant to prevent one.
+    """
     if not coin_ids:
         return {}
     params = {
@@ -167,6 +186,9 @@ async def _fetch_simple_price_batch(
         session,
         f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/simple/price",
         params=params,
+        bucket=bucket,
+        fixed_duty=fixed_duty,
+        settings=settings,
     )
     if not isinstance(result, dict):
         return {}
@@ -255,7 +277,11 @@ async def fetch_held_position_prices(
     aggregated: dict = {}
     for i in range(0, len(cg_ids), SIMPLE_PRICE_BATCH_SIZE):
         batch = cg_ids[i : i + SIMPLE_PRICE_BATCH_SIZE]
-        resp = await _fetch_simple_price_batch(session, settings, batch)
+        # CRITICAL: this lane re-prices OPEN positions and the live
+        # trailing-stop evaluator reads only the price_cache rows it writes.
+        resp = await _fetch_simple_price_batch(
+            session, settings, batch, bucket=BUCKET_CRITICAL
+        )
         aggregated.update(resp)
 
     raw_coins = _shape_for_cache_prices(aggregated)

@@ -9,6 +9,7 @@ import aiohttp
 import structlog
 
 from scout import cg_api
+from scout.coingecko_budget import BUCKET_DISCOVERY
 from scout.ingestion.coingecko import _get_with_backoff
 from scout.trending.models import TrendingComparison, TrendingSnapshot, TrendingStats
 
@@ -84,6 +85,8 @@ async def fetch_and_store_trending(
     db: "Database",
     api_key: str = "",
     api_tier: str = "demo",
+    *,
+    settings,
 ) -> list[TrendingSnapshot]:
     """Fetch /search/trending and store each coin as a snapshot row.
 
@@ -92,7 +95,14 @@ async def fetch_and_store_trending(
     params: dict[str, str] = dict(cg_api.auth_query(api_key, api_tier))
 
     data = await _get_with_backoff(
-        session, f"{cg_api.base_url(api_tier)}/search/trending", params or None
+        session,
+        f"{cg_api.base_url(api_tier)}/search/trending",
+        params or None,
+        # DISCOVERY: the trending tracker is a scanner surface, not a
+        # held-position re-pricing path, so it draws on the discovery envelope
+        # and stops with the rest of discovery when that envelope is spent.
+        bucket=BUCKET_DISCOVERY,
+        settings=settings,
     )
     if not data or not isinstance(data, dict):
         logger.warning("trending_tracker.fetch_empty")
