@@ -389,11 +389,17 @@ class CoinGeckoBudget:
             getattr(settings, f"COINGECKO_MONTHLY_{bucket.upper()}_CREDITS", 0) or 0
         )
 
-    def allow(self, bucket: str, settings) -> tuple[bool, str]:
+    def allow(
+        self, bucket: str, settings, *, fixed_duty: bool = False
+    ) -> tuple[bool, str]:
         """May a request in ``bucket`` be issued? Returns (allowed, reason).
 
         The single enforcement predicate, consulted at the HTTP choke point so a
         caller that forgets to ask still cannot spend.
+
+        ``fixed_duty`` marks the non-discretionary OPERATIONAL duties (/key
+        reconciliation, ledger enrollment polling). They may draw on the
+        reserved floor; discretionary operational traffic may not.
         """
         if settings is None:
             # Loud, not silently refused. A None Settings previously made every
@@ -433,6 +439,19 @@ class CoinGeckoBudget:
 
         cap = self._cap_for(bucket, settings)
         used = self.credits(bucket)
+        if bucket == BUCKET_OPERATIONAL and cap > 0:
+            # Protect the FIXED operational duties (/key reconciliation and the
+            # ledger enrollment poll) from discretionary operational traffic.
+            # Without this, event-driven TG resolver volume could consume the
+            # whole bucket and silently stop reconciliation — which is how we
+            # would lose provider truth exactly when spend is highest.
+            floor = int(
+                getattr(settings, "COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS", 0) or 0
+            )
+            if floor > 0 and used >= max(0, cap - floor):
+                # Fixed duties still proceed; only discretionary callers stop.
+                if not fixed_duty:
+                    return False, "operational_reserved_for_fixed_duties"
         if bucket == BUCKET_DISCOVERY:
             # Unattributed provider drift is charged to DISCOVERY. It is real
             # capacity gone that no local counter explains, and it has to land
@@ -564,6 +583,7 @@ class governed_cg_call:
 
     __slots__ = (
         "bucket",
+        "fixed_duty",
         "settings",
         "allowed",
         "reason",
@@ -572,9 +592,10 @@ class governed_cg_call:
         "_issued",
     )
 
-    def __init__(self, bucket: str, settings=None) -> None:
+    def __init__(self, bucket: str, settings=None, *, fixed_duty: bool = False) -> None:
         self.bucket = bucket
         self.settings = settings
+        self.fixed_duty = fixed_duty
         self.billable = False
         self._recorded = False
         self._issued = False
@@ -588,7 +609,9 @@ class governed_cg_call:
                 "monthly budget cannot be enforced and the call would spend "
                 "un-refusably"
             )
-        self.allowed, self.reason = budget.allow(bucket, settings)
+        self.allowed, self.reason = budget.allow(
+            bucket, settings, fixed_duty=fixed_duty
+        )
         # NOT recorded here. Construction happens before the rate limiter is
         # acquired and before any request is issued, so counting at construction
         # turns a cancellation-while-waiting — or any early return between here

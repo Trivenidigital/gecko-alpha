@@ -918,7 +918,14 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
             # research poller could exhaust the capacity that keeps live
             # positions exitable, and then block every new open.
             resp = await _fetch_simple_price_batch(
-                session, settings, batch, bucket=BUCKET_OPERATIONAL
+                session,
+                settings,
+                batch,
+                bucket=BUCKET_OPERATIONAL,
+                # FIXED duty: forward-labelling is what makes outcomes
+                # computable at all, so it draws on the reserved floor rather
+                # than competing with discretionary operational traffic.
+                fixed_duty=True,
             )
             raw_coins = _shape_for_cache_prices(resp)
             if raw_coins:

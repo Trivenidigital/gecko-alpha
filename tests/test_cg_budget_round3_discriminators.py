@@ -50,7 +50,7 @@ async def test_ledger_enrollment_poll_cannot_spend_the_critical_bucket(
 
     seen_buckets = []
 
-    async def _fake_batch(session, settings, coin_ids, *, bucket):
+    async def _fake_batch(session, settings, coin_ids, *, bucket, fixed_duty=False):
         seen_buckets.append(bucket)
         return {}
 
@@ -466,32 +466,115 @@ def _narrative_uncapped_per_pass() -> int:
     return int(1 + 1 + max_heating + 2 * (max_heating * max_picks))
 
 
-def test_planned_discovery_workload_fits_its_envelope(settings_factory):
-    """Hard caps protect against estimation error; they do not make a workload fit.
+_EVALS_PER_DAY = 4  # NARRATIVE_EVAL_INTERVAL=21600 (6h)
 
-    Built from STRUCTURAL bounds now: every variable consumer contributes its
-    executable maximum, not a fixed guess.
+
+def _discovery_structural_max(s) -> dict:
+    """Every DISCOVERY-class consumer at its executable maximum.
+
+    "Complete" means every KNOWN consumer appears, including ones contributing
+    zero today — a table that lists only positive contributors cannot be checked
+    for omissions, which is how the 62k headline survived three rounds.
+    """
+    main = _monthly(
+        (_CYCLES_PER_DAY / s.COINGECKO_DISCOVERY_INTERVAL_CYCLES) * _MAIN_BUNDLE_CALLS
+    )
+    narrative = _monthly(_narrative_max_calls_per_pass(s) * _NARRATIVE_PASSES)
+    # Evaluator: a SHARED total budget across the 250-id batch loop and the
+    # /simple/price fallback, so the executable maximum is exactly the cap.
+    evaluator = _monthly(s.NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS * _EVALS_PER_DAY)
+    secondwave = _monthly(_SECONDWAVE_PER_DAY)
+    return {
+        "main_bundle": main,
+        "narrative_prediction_pass": narrative,
+        "narrative_evaluator": evaluator,
+        "secondwave": secondwave,
+        # Dormant, flag-default OFF. Present as explicit zeros so "complete"
+        # means every known consumer is represented, and so activation is
+        # visibly a budget decision rather than a silent one.
+        "instrumentation_dex_resolver_DISABLED": 0,
+        "market_briefing_DISABLED": 0,
+    }
+
+
+def _operational_structural_max(s) -> dict:
+    import scout.outcome_ledger as ledger
+
+    return {
+        "ledger_cg_enrollment_poll": _monthly(
+            _CYCLES_PER_DAY / ledger._ENROLLMENT_CG_POLL_INTERVAL_CYCLES
+        ),
+        "key_reconciliation": _monthly(24),
+        "tg_resolver_capped": s.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS,
+    }
+
+
+def test_planned_discovery_workload_fits_its_envelope(settings_factory):
+    """Structural maxima, every consumer, with margin that survives error."""
+    s = settings_factory()
+    parts = _discovery_structural_max(s)
+    total = sum(parts.values())
+    envelope = s.COINGECKO_MONTHLY_DISCOVERY_CREDITS
+
+    assert total <= envelope, (
+        f"discovery structural max {total:,}/month exceeds {envelope:,} at "
+        f"interval={s.COINGECKO_DISCOVERY_INTERVAL_CYCLES}: {parts}"
+    )
+    margin = 1 - (total / envelope)
+    assert margin >= 0.10, (
+        f"only {margin:.1%} headroom; the ratification condition is >=10% "
+        f"because these are bounds on loops, not measurements: {parts}"
+    )
+
+
+def test_operational_structural_max_fits_and_protects_its_floor(settings_factory):
+    """Fixed duties must remain fundable after discretionary traffic."""
+    s = settings_factory()
+    parts = _operational_structural_max(s)
+    total = sum(parts.values())
+    envelope = s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+    assert total <= envelope, f"operational {total:,} exceeds {envelope:,}: {parts}"
+
+    fixed = parts["ledger_cg_enrollment_poll"] + parts["key_reconciliation"]
+    assert fixed <= s.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS, (
+        f"the reserved floor {s.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS:,} must "
+        f"cover the fixed duties ({fixed:,}) or it protects nothing"
+    )
+    assert (
+        s.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS
+        <= envelope - s.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS
+    ), "the TG ceiling must fit in what is left above the reserved floor"
+
+
+def test_the_evaluator_is_in_the_model_at_all(settings_factory):
+    """Round-5 finding: the evaluator was missing from the table entirely.
+
+    Its cap also existed only in config — `evaluate_pending` never read it — so
+    the batch loop was bounded by the pending-prediction count, not by budget.
     """
     s = settings_factory()
-    interval = s.COINGECKO_DISCOVERY_INTERVAL_CYCLES
-    main = _monthly((_CYCLES_PER_DAY / interval) * _MAIN_BUNDLE_CALLS)
-    narrative = _monthly(_narrative_max_calls_per_pass(s) * _NARRATIVE_PASSES)
-    secondwave = _monthly(_SECONDWAVE_PER_DAY)
-    total = main + narrative + secondwave
+    parts = _discovery_structural_max(s)
+    assert parts["narrative_evaluator"] > 0
+    assert "narrative_evaluator" in parts
 
-    envelope = s.COINGECKO_MONTHLY_DISCOVERY_CREDITS
-    assert total <= envelope, (
-        f"planned discovery {total:,}/month exceeds the {envelope:,} envelope at "
-        f"interval={interval} (main {main:,} + narrative {narrative:,} + "
-        f"secondwave {secondwave:,})"
-    )
-    # Meaningful margin, not a hairline fit: the per-invocation counts above are
-    # bounds on loops, and a bound that is only just satisfied is one product
-    # tweak away from a mid-month discovery shutdown.
-    margin = 1 - (total / envelope)
-    assert margin >= 0.05, (
-        f"only {margin:.1%} headroom at interval={interval}; the model needs "
-        "room for estimation error in the variable consumers"
+
+def test_reserved_posture_is_reported_not_just_current_state(settings_factory):
+    """TWO axes, because 59,768 was a current-state projection, not a design max.
+
+    It assumed CRITICAL=0 on the basis of today's zero open positions. The
+    posture we actually designed capacity for includes the full reserve.
+    """
+    s = settings_factory()
+    discovery = sum(_discovery_structural_max(s).values())
+    operational = sum(_operational_structural_max(s).values())
+
+    current_state = discovery + operational  # 0 held positions today
+    reserved_posture = discovery + operational + s.COINGECKO_MONTHLY_CRITICAL_CREDITS
+
+    assert reserved_posture > current_state, "the two axes must differ"
+    assert reserved_posture <= s.COINGECKO_MONTHLY_CREDIT_ALLOWANCE, (
+        f"reserved posture {reserved_posture:,} exceeds the "
+        f"{s.COINGECKO_MONTHLY_CREDIT_ALLOWANCE:,} plan"
     )
 
 
@@ -552,3 +635,124 @@ def test_unthrottled_ledger_poll_would_not_have_fit_anything(settings_factory):
     unthrottled = _monthly(_CYCLES_PER_DAY)
     assert unthrottled > s.COINGECKO_MONTHLY_CRITICAL_CREDITS
     assert unthrottled > s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+
+
+# ---------------------------------------------------------------------------
+# S1 · The evaluator cap must be REAL and TOTAL, and truncate FAIRLY
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluator_batch_loop_honours_the_shared_budget(
+    monkeypatch, settings_factory
+):
+    """The cap existed only in config; `evaluate_pending` never read it.
+
+    `fetch_prices_batch` looped over ALL unique ids in 250-id batches, so with a
+    large pending backlog it was bounded by the backlog, not by budget.
+    """
+    from scout.narrative import evaluator
+
+    calls = []
+
+    async def _fake_get(*a, **k):
+        raise AssertionError("should not reach HTTP in this test")
+
+    async def _counting_backoff(*a, **k):
+        calls.append(1)
+        return None
+
+    # Drive fetch_prices_batch directly with a shared budget of 2 and 10 batches
+    # worth of ids (2,500 ids / 250 per call).
+    monkeypatch.setattr(evaluator, "governed_cg_call", lambda *a, **k: _AllowAll())
+    monkeypatch.setattr(
+        evaluator.coingecko_limiter, "acquire", AsyncMock(return_value=None)
+    )
+
+    class _Resp:
+        status = 429
+
+        async def __aenter__(self):
+            calls.append(1)
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def json(self):
+            return []
+
+    class _Session:
+        def get(self, *a, **k):
+            return _Resp()
+
+    budget = [2]
+    ids = [f"coin-{i}" for i in range(2500)]  # 10 batches if unbounded
+    await evaluator.fetch_prices_batch(
+        _Session(), ids, settings=settings_factory(), budget=budget
+    )
+    assert len(calls) == 2, f"budget of 2 must cap the batch loop; got {len(calls)}"
+    assert budget[0] == 0
+
+
+class _AllowAll:
+    allowed = True
+    reason = "ok"
+    billable = False
+
+    def issued(self):
+        pass
+
+    def finish(self, status):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_evaluator_orders_pending_oldest_due_first():
+    """Truncation decides WHICH predictions mature, so the order is load-bearing.
+
+    An arbitrary order would right-censor narrative outcome evidence by whatever
+    the DB happened to return -- a measurement bias introduced by an API-budget
+    repair. This repo already has one invisible maturity backlog; a second one
+    created to fit an API quota would be worse than the quota problem.
+    """
+    import pathlib
+
+    from scout.narrative import evaluator
+
+    src = pathlib.Path(evaluator.__file__).read_text(encoding="utf-8")
+    assert "ORDER BY datetime(predicted_at) ASC" in src, (
+        "pending predictions must be selected oldest-due first so budget "
+        "truncation defers the NEWEST, deterministically"
+    )
+    # And the id list must preserve that order rather than going through a set.
+    assert "dict.fromkeys" in src, (
+        "unique_ids must preserve the oldest-due ordering; list(set(...)) "
+        "would randomise which predictions get funded"
+    )
+
+
+def test_evaluator_budget_is_TOTAL_across_batch_and_fallback():
+    """One budget, not one each -- otherwise the real cap is 2x the number."""
+    import pathlib
+
+    from scout.narrative import evaluator
+
+    src = pathlib.Path(evaluator.__file__).read_text(encoding="utf-8")
+    assert "budget=eval_budget" in src, "the batch loop must share the budget"
+    assert "eval_budget[0] <= 0" in src, "the fallback must check the SAME budget"
+
+
+def test_evaluator_emits_budget_accounting():
+    """A budget that silently drops work is indistinguishable from no data."""
+    import pathlib
+
+    from scout.narrative import evaluator
+
+    src = pathlib.Path(evaluator.__file__).read_text(encoding="utf-8")
+    for field in ("eligible", "attempted", "deferred_due_to_budget"):
+        assert field in src, f"missing {field} in the budget accounting log"

@@ -58,15 +58,62 @@ def test_discovery_is_a_hard_stop(settings_factory):
 
 
 def test_operational_is_a_hard_stop(settings_factory):
-    """Reconciliation must not be allowed to eat the plan it measures."""
+    """Reconciliation must not be allowed to eat the plan it measures.
+
+    Floor set to 0 here so the ENVELOPE is the binding constraint; the reserved
+    floor has its own tests below.
+    """
     s = settings_factory(
-        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_OPERATIONAL_CREDITS=3
+        COINGECKO_DISCOVERY_ENABLED=True,
+        COINGECKO_MONTHLY_OPERATIONAL_CREDITS=3,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=0,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=0,
     )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_OPERATIONAL, 3)
     allowed, reason = b.allow(BUCKET_OPERATIONAL, s)
     assert allowed is False
     assert reason == "operational_envelope_exhausted"
+
+
+def test_discretionary_operational_traffic_cannot_eat_the_fixed_floor(
+    settings_factory,
+):
+    """TG resolver volume must not starve /key reconciliation or the ledger poll.
+
+    Those two are FIXED duties sharing OPERATIONAL with event-driven Telegram
+    traffic. Capping TG inside the bucket is not enough on its own — without a
+    reserved floor, TG volume could consume the whole 5,000 and silently stop
+    reconciliation, losing provider truth exactly when spend is highest.
+    """
+    s = settings_factory(
+        COINGECKO_MONTHLY_OPERATIONAL_CREDITS=100,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=40,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=60,
+    )
+    b = CoinGeckoBudget()
+    _spend(b, BUCKET_OPERATIONAL, 60)  # discretionary traffic up to the floor
+
+    discretionary = b.allow(BUCKET_OPERATIONAL, s)
+    assert discretionary == (False, "operational_reserved_for_fixed_duties")
+
+    # ...but the fixed duties still proceed.
+    assert b.allow(BUCKET_OPERATIONAL, s, fixed_duty=True)[0] is True
+
+
+def test_the_fixed_floor_still_respects_the_envelope(settings_factory):
+    """A fixed duty may use the floor, not exceed the bucket."""
+    s = settings_factory(
+        COINGECKO_MONTHLY_OPERATIONAL_CREDITS=100,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=40,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=60,
+    )
+    b = CoinGeckoBudget()
+    _spend(b, BUCKET_OPERATIONAL, 100)
+    assert b.allow(BUCKET_OPERATIONAL, s, fixed_duty=True) == (
+        False,
+        "operational_envelope_exhausted",
+    )
 
 
 def test_critical_is_SOFT_and_keeps_repricing_past_its_reserve(settings_factory):
@@ -109,6 +156,8 @@ def test_overall_allowance_stops_noncritical_even_with_bucket_headroom(
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=4,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=3,
         COINGECKO_MONTHLY_OPERATIONAL_CREDITS=3,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=0,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=0,
     )
     b = CoinGeckoBudget()
     # Spend lands in CRITICAL (soft, no hard cap) so the DISCOVERY refusal below
@@ -243,6 +292,8 @@ def test_pace_alert_fires_once_per_crossing_not_every_hour(settings_factory):
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=650,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=300,
         COINGECKO_MONTHLY_OPERATIONAL_CREDITS=50,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=0,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=0,
         COINGECKO_BUDGET_PACE_ALERT_RATIO=1.10,
     )
     b = CoinGeckoBudget()
@@ -261,6 +312,8 @@ def test_pace_alert_rearms_only_after_recovering_clear_of_threshold(settings_fac
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=650,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=300,
         COINGECKO_MONTHLY_OPERATIONAL_CREDITS=50,
+        COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS=0,
+        COINGECKO_TG_RESOLVER_MONTHLY_CREDITS=0,
         COINGECKO_BUDGET_PACE_ALERT_RATIO=1.10,
     )
     b = CoinGeckoBudget()

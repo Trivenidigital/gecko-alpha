@@ -57,6 +57,7 @@ async def fetch_prices_batch(
     api_key: str = "",
     api_tier: str = "demo",
     settings=None,
+    budget: list[int] | None = None,
 ) -> dict[str, float]:
     """Fetch current USD prices for a list of CoinGecko coin IDs.
 
@@ -77,7 +78,22 @@ async def fetch_prices_batch(
 
     headers: dict[str, str] = dict(cg_api.auth_headers(api_key, api_tier))
 
+    # Shared per-evaluation CoinGecko budget. This loop is bounded only by the
+    # number of pending predictions (250 ids per call), so with a large backlog
+    # it is unbounded from the budget's point of view. `budget` is a mutable
+    # one-element list so the caller's remaining allowance is decremented here
+    # AND by the /simple/price fallback -- one TOTAL cap across both, not one
+    # each.
     for i in range(0, len(coin_ids), _BATCH_SIZE):
+        if budget is not None and budget[0] <= 0:
+            log.info(
+                "eval_price_batch_budget_exhausted",
+                fetched_ids=i,
+                total_ids=len(coin_ids),
+            )
+            break
+        if budget is not None:
+            budget[0] -= 1
         batch = coin_ids[i : i + _BATCH_SIZE]
         ids_param = ",".join(batch)
         url = f"{cg_api.base_url(api_tier)}/coins/markets"
@@ -98,8 +114,10 @@ async def fetch_prices_batch(
         # request paths that produced a response makes a lane that is failing
         # at the transport layer invisible in the attempt rate.
         # Attempt recorded immediately before the request, after the limiter.
-        _call.issued()
         await coingecko_limiter.acquire()
+        # AFTER the limiter: a cancellation while queued must not invent an
+        # attempt the provider never saw.
+        _call.issued()
         try:
             async with session.get(url, params=params, headers=headers) as resp:
                 _call.finish(resp.status)
@@ -158,28 +176,63 @@ async def evaluate_pending(
     hit_pct = float(strategy.get("hit_threshold_pct"))  # type: ignore[arg-type]
     miss_pct = float(strategy.get("miss_threshold_pct"))  # type: ignore[arg-type]
 
-    # Fetch all pending predictions (outcome_class IS NULL)
+    # Fetch all pending predictions (outcome_class IS NULL).
+    #
+    # ORDER BY predicted_at ASC is load-bearing, not cosmetic. The CoinGecko
+    # call budget below can truncate this pass, and truncation decides WHICH
+    # predictions mature. An arbitrary order would right-censor narrative
+    # outcome evidence by whatever the DB happened to return -- a
+    # measurement bias created by an API-budget repair, which is precisely the
+    # kind of invisible maturity backlog this repo already has elsewhere.
+    # Oldest-due first is deterministic and preserves evidence in the order it
+    # was created; anything deferred is the newest, and is retried next pass.
     cursor = await conn.execute(
         """SELECT id, coin_id, price_at_prediction, predicted_at,
                   outcome_6h_class, outcome_24h_class, outcome_48h_class,
                   peak_price, peak_change_pct, peak_at,
                   eval_retry_count
            FROM predictions
-           WHERE outcome_class IS NULL"""
+           WHERE outcome_class IS NULL
+           ORDER BY datetime(predicted_at) ASC"""
     )
     rows = await cursor.fetchall()
     if not rows:
         return
 
-    # Collect unique coin IDs and batch-fetch prices
-    unique_ids = list({row[1] for row in rows})
+    # Collect unique coin IDs, oldest-due first (dict preserves insertion order,
+    # so this keeps the ORDER BY above rather than the arbitrary order of a set).
+    unique_ids = list(dict.fromkeys(row[1] for row in rows))
+
+    # ONE total CoinGecko budget for this evaluation, shared by the batch loop
+    # and the /simple/price fallback below.
+    eval_budget = [
+        int(getattr(settings, "NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS", 4) or 0)
+    ]
+    _budget_at_start = eval_budget[0]
+
     prices = await fetch_prices_batch(
-        session, unique_ids, api_key=api_key, api_tier=api_tier, settings=settings
+        session,
+        unique_ids,
+        api_key=api_key,
+        api_tier=api_tier,
+        settings=settings,
+        budget=eval_budget,
     )
 
     # Tokens missing from batch fetch — try direct CoinGecko /simple/price
     # Process in chunks of 20 (API limit per call)
     missing_ids = [cid for cid in unique_ids if cid not in prices]
+    # Make the truncation VISIBLE. A budget that silently drops work looks
+    # identical to an upstream with no data, and deferred predictions are a
+    # maturity backlog nobody is watching unless it is reported.
+    log.info(
+        "eval_price_budget_accounting",
+        eligible=len(unique_ids),
+        attempted=len(unique_ids) - len(missing_ids),
+        deferred_due_to_budget=(len(missing_ids) if eval_budget[0] <= 0 else 0),
+        cg_calls_budget=_budget_at_start,
+        cg_calls_remaining=eval_budget[0],
+    )
     if missing_ids:
         if len(missing_ids) > 20:
             log.info(
@@ -188,6 +241,13 @@ async def evaluate_pending(
                 fetching=min(len(missing_ids), 60),
             )
         for chunk_start in range(0, min(len(missing_ids), 60), 20):
+            if eval_budget[0] <= 0:
+                log.info(
+                    "eval_price_fallback_budget_exhausted",
+                    remaining_missing=len(missing_ids) - chunk_start,
+                )
+                break
+            eval_budget[0] -= 1
             chunk = missing_ids[chunk_start : chunk_start + 20]
             # Governed: the /simple/price fallback is a SECOND direct CoinGecko
             # path in this function, separate from fetch_prices_batch above.

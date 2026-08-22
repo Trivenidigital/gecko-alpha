@@ -96,8 +96,10 @@ async def _get_json(
                 # TRANSIENT, not AUTH_ERROR: the budget refusal is ours, not
                 # CoinGecko's, and it clears when the envelope resets.
                 return (_Outcome.TRANSIENT, None)
-            _call.issued()
             await coingecko_limiter.acquire()
+            # AFTER the limiter: a cancellation while queued must not invent an
+            # attempt the provider never saw.
+            _call.issued()
             auth = cg_api.auth_query(
                 settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER
             )

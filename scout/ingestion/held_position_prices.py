@@ -153,6 +153,7 @@ async def _fetch_simple_price_batch(
     coin_ids: list[str],
     *,
     bucket: str,
+    fixed_duty: bool = False,
 ) -> dict:
     """Single batched /simple/price call. Returns CG response dict or {} on failure.
 
@@ -186,6 +187,7 @@ async def _fetch_simple_price_batch(
         f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/simple/price",
         params=params,
         bucket=bucket,
+        fixed_duty=fixed_duty,
         settings=settings,
     )
     if not isinstance(result, dict):

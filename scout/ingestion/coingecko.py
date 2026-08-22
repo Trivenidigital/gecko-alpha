@@ -110,6 +110,7 @@ async def _get_with_backoff(
     *,
     bucket: str,
     settings: Settings,
+    fixed_duty: bool = False,
 ) -> dict | list | None:
     """The ONLY governed CoinGecko request primitive. Returns JSON or None.
 
@@ -129,7 +130,7 @@ async def _get_with_backoff(
     its billable outcome recorded against that same attempt -- so a response
     that arrives and then fails to parse cannot inflate the attempt count.
     """
-    allowed, reason = cg_budget.allow(bucket, settings)
+    allowed, reason = cg_budget.allow(bucket, settings, fixed_duty=fixed_duty)
     if not allowed:
         logger.warning(
             "cg_request_refused_by_budget",
@@ -198,6 +199,9 @@ async def reconcile_monthly_credits(
         params=params,
         bucket=BUCKET_OPERATIONAL,
         settings=settings,
+        # FIXED duty: losing reconciliation means losing provider truth exactly
+        # when spend is highest, so it draws on the reserved operational floor.
+        fixed_duty=True,
     )
     if not isinstance(data, dict):
         logger.warning(

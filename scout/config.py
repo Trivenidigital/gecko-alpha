@@ -219,7 +219,7 @@ class Settings(BaseSettings):
     # HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES cadence and its
     # no_open_trades no-op, because it is the operationally critical surface
     # (the live trailing-stop evaluator reads the price_cache rows it writes).
-    # 7, NOT the 5 of the original C profile. That figure was derived from the
+    # 8, NOT the 5 of the original C profile. That figure was derived from the
     # main discovery bundle ALONE (7 calls x 288 rounds/day = ~62k/month, said
     # to fit the 65k envelope). It omitted every OTHER discovery-class CoinGecko
     # consumer, all of which are enabled in prod today:
@@ -233,9 +233,11 @@ class Settings(BaseSettings):
     #                                              ----------
     #                                              11,904/mo
     #
-    # At every-5th the discovery total is 74,400/mo — 9,400 OVER the envelope.
-    # every-6th gives 63,984 (1.6% headroom, inside my own estimation error on
-    # the per-pass counts). every-7th gives 56,544 with 8,456 to spare.
+    # Under the CORRECTED model (bounded narrative fan-out + the evaluator,
+    # which the first model omitted entirely) the discovery structural maximum
+    # at every-8th is 55,924/month against the 65,000 envelope — 14.0% margin.
+    # every-5th remains demonstrably impossible; 7 was retired in favour of 8
+    # because the margin has to survive estimation error in bounds on loops.
     #
     # Hard caps protect against an estimation mistake; they are not a substitute
     # for a planned workload that fits. Operator ratification is wanted for this
@@ -348,6 +350,22 @@ class Settings(BaseSettings):
     # bounded at 3 chunks (min(len(missing),60) step 20); this makes the bound a
     # SETTING so the budget model can cite it instead of re-deriving it.
     NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS: int = Field(default=4, ge=0, le=100)
+
+    # Telegram resolver monthly CoinGecko ceiling. The resolver is EVENT-DRIVEN
+    # (TG_SOCIAL_ENABLED=true in prod), so it has no natural cadence: a contract
+    # can cost one lookup, a cashtag path costs search + markets, and misses can
+    # be retried. The budget table previously carried "620/month" for it as an
+    # ESTIMATE while calling the table a bound — the exact error this repair
+    # exists to stop.
+    #
+    # Capping it inside OPERATIONAL is not enough on its own: TG volume could
+    # consume the whole 5,000 bucket and starve /key reconciliation and the
+    # outcome-ledger poller, which are FIXED duties sharing it. So the resolver
+    # gets its own sub-ceiling and those two keep a guaranteed floor.
+    COINGECKO_TG_RESOLVER_MONTHLY_CREDITS: int = Field(default=1_000, ge=0)
+    # Reserved for /key reconciliation (~744/mo) + the ledger enrollment poll
+    # (~2,976/mo). Nothing discretionary may push OPERATIONAL below this.
+    COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS: int = Field(default=3_800, ge=0)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.
@@ -2503,6 +2521,36 @@ class Settings(BaseSettings):
                     f"backtest CLI default --days=30. Lower retention silently "
                     f"truncates backtest cohorts."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cg_operational_floor_and_tg_ceiling(self) -> "Settings":
+        """The TG ceiling must be ENFORCEABLE by the floor, not a parallel number.
+
+        Discretionary OPERATIONAL traffic is stopped at
+        ``operational_cap - fixed_floor``. If the declared TG ceiling exceeded
+        that, the table would claim a bound the code does not enforce -- exactly
+        the "620/month estimate presented as a bound" defect. If the floor were
+        smaller than the fixed duties it protects, it would protect nothing.
+        """
+        cap = self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        floor = self.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS
+        if cap <= 0:
+            return self
+        if floor > cap:
+            raise ValueError(
+                f"COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS={floor} exceeds "
+                f"COINGECKO_MONTHLY_OPERATIONAL_CREDITS={cap}"
+            )
+        discretionary = cap - floor
+        if self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS > discretionary:
+            raise ValueError(
+                f"COINGECKO_TG_RESOLVER_MONTHLY_CREDITS="
+                f"{self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS} exceeds the "
+                f"{discretionary} of discretionary operational capacity that the "
+                f"reserved floor actually leaves. A ceiling the code cannot "
+                f"enforce is an estimate wearing a bound's clothes."
+            )
         return self
 
     @model_validator(mode="after")

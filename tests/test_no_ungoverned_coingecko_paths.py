@@ -324,3 +324,78 @@ def test_a_fully_governed_function_with_two_calls_is_not_flagged():
         ]
     )
     assert ungoverned_cg_functions(both) == set()
+
+
+# ---------------------------------------------------------------------------
+# Attempt-accounting ORDER: allow -> limiter.acquire -> issued -> HTTP
+# ---------------------------------------------------------------------------
+
+
+def _issued_before_acquire(src: str) -> list:
+    """Functions where `.issued()` precedes `coingecko_limiter.acquire()`.
+
+    `issued()` records the provider attempt. Recording it before the limiter
+    means a cancellation while QUEUED — which never reaches the wire — still
+    counts as an attempt the provider never saw, breaking the "one attempt per
+    ISSUED request" contract this repair states.
+
+    Structural rather than a comment, because round 4 fixed five sites by hand
+    and left two (`narrative/evaluator.fetch_prices_batch` and the TG resolver)
+    in the wrong order — the comment said one thing and the code did another,
+    which is the failure mode this whole PR exists to stop.
+    """
+    tree = ast.parse(src)
+    lines = src.splitlines()
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        fn_src = _fn_source(node, lines)
+        if ".issued()" not in fn_src or "coingecko_limiter.acquire()" not in fn_src:
+            continue
+        if fn_src.index(".issued()") < fn_src.index("coingecko_limiter.acquire()"):
+            offenders.append(node.name)
+    return offenders
+
+
+def test_attempt_is_recorded_after_the_limiter_everywhere():
+    """Sweep every governed hand-rolled site for the correct order."""
+    bad = []
+    for path in _python_files():
+        src = path.read_text(encoding="utf-8")
+        if ".issued()" not in src:
+            continue
+        for fn in _issued_before_acquire(src):
+            bad.append(f"{path.relative_to(SCOUT.parent)}::{fn}")
+    assert not bad, (
+        "issued() must come AFTER coingecko_limiter.acquire(), immediately "
+        f"before the request; a cancellation while queued would otherwise "
+        f"invent a provider attempt: {sorted(bad)}"
+    )
+
+
+def test_the_order_tripwire_can_detect_a_violation():
+    """The guard must be able to fail, or it is decoration."""
+    wrong = NL.join(
+        [
+            "async def bad(session, settings):",
+            "    _call = governed_cg_call('discovery', settings)",
+            "    _call.issued()",
+            "    await coingecko_limiter.acquire()",
+            "    async with session.get('x') as r:",
+            "        return r",
+        ]
+    )
+    assert _issued_before_acquire(wrong) == ["bad"]
+
+    right = NL.join(
+        [
+            "async def good(session, settings):",
+            "    _call = governed_cg_call('discovery', settings)",
+            "    await coingecko_limiter.acquire()",
+            "    _call.issued()",
+            "    async with session.get('x') as r:",
+            "        return r",
+        ]
+    )
+    assert _issued_before_acquire(right) == []
