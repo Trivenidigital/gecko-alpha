@@ -20,6 +20,24 @@ from scout import cg_api
 # ---------------------------------------------------------------- cg_api unit
 
 
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    `fetch_and_store_trending` takes settings keyword-only with no default: a
+    `settings=None` default failed CLOSED but SILENTLY (zero snapshots), which
+    is indistinguishable from a quiet CoinGecko.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 def test_base_url_demo():
     assert cg_api.base_url("demo") == "https://api.coingecko.com/api/v3"
 
@@ -130,7 +148,11 @@ async def test_tracker_fetch_trending_pro_tier(tmp_path):
         )
         async with aiohttp.ClientSession() as session:
             snaps = await fetch_and_store_trending(
-                session, db, api_key="CG-prokey", api_tier="pro"
+                session,
+                db,
+                api_key="CG-prokey",
+                api_tier="pro",
+                settings=_budget_settings(),
             )
     assert snaps == []
     await db.close()
