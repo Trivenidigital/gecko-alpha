@@ -47,7 +47,9 @@ def _spend(b, bucket, n, billable=True):
 
 
 def test_discovery_is_a_hard_stop(settings_factory):
-    s = settings_factory(COINGECKO_MONTHLY_DISCOVERY_CREDITS=5)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_DISCOVERY_CREDITS=5
+    )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_DISCOVERY, 5)
     allowed, reason = b.allow(BUCKET_DISCOVERY, s)
@@ -57,7 +59,9 @@ def test_discovery_is_a_hard_stop(settings_factory):
 
 def test_operational_is_a_hard_stop(settings_factory):
     """Reconciliation must not be allowed to eat the plan it measures."""
-    s = settings_factory(COINGECKO_MONTHLY_OPERATIONAL_CREDITS=3)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_OPERATIONAL_CREDITS=3
+    )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_OPERATIONAL, 3)
     allowed, reason = b.allow(BUCKET_OPERATIONAL, s)
@@ -72,7 +76,9 @@ def test_critical_is_SOFT_and_keeps_repricing_past_its_reserve(settings_factory)
     overspending a soft envelope: it recreates the fabricated-$0 close that the
     whole GA-01 class is about. So critical must NOT hard-stop.
     """
-    s = settings_factory(COINGECKO_MONTHLY_CRITICAL_CREDITS=2)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_CRITICAL_CREDITS=2
+    )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_CRITICAL, 10)
     allowed, reason = b.allow(BUCKET_CRITICAL, s)
@@ -82,7 +88,9 @@ def test_critical_is_SOFT_and_keeps_repricing_past_its_reserve(settings_factory)
 
 def test_exceeding_the_critical_reserve_blocks_new_opens_instead(settings_factory):
     """The reserve being spent is a signal to stop TAKING ON re-pricing demand."""
-    s = settings_factory(COINGECKO_MONTHLY_CRITICAL_CREDITS=2)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_CRITICAL_CREDITS=2
+    )
     b = CoinGeckoBudget()
     assert b.critical_reserve_exceeded(s) is False
     _spend(b, BUCKET_CRITICAL, 2)
@@ -96,6 +104,7 @@ def test_overall_allowance_stops_noncritical_even_with_bucket_headroom(
     # Envelopes deliberately UNDER-subscribed so only the overall allowance
     # can be the binding constraint here (the validator forbids the reverse).
     s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True,
         COINGECKO_MONTHLY_CREDIT_ALLOWANCE=10,
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=4,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=3,
@@ -125,7 +134,9 @@ def test_provider_drift_reduces_discovery_capacity(settings_factory):
     consumer of the key. If it only produced a log line, the budget would keep
     authorising spend that does not exist.
     """
-    s = settings_factory(COINGECKO_MONTHLY_DISCOVERY_CREDITS=100)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_DISCOVERY_CREDITS=100
+    )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_DISCOVERY, 50)
     assert b.allow(BUCKET_DISCOVERY, s)[0] is True
@@ -170,7 +181,9 @@ def test_dead_cg_is_not_live_no_matter_what_price_cache_says(settings_factory):
     it. That is the fix: the old gate read price_cache and could be fooled by a
     DexScreener write.
     """
-    s = settings_factory(PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800
+    )
     b = CoinGeckoBudget()
     b.last_success_at = datetime.now(timezone.utc) - timedelta(hours=6)
     assert b.cg_pricing_live(s) is False
@@ -178,7 +191,9 @@ def test_dead_cg_is_not_live_no_matter_what_price_cache_says(settings_factory):
 
 def test_never_observed_cg_is_not_live(settings_factory):
     """Unknown is not fresh. Conflating them is how this class recurs."""
-    s = settings_factory(PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800
+    )
     assert CoinGeckoBudget().cg_pricing_live(s) is False
 
 
@@ -188,7 +203,9 @@ def test_only_a_billable_cg_200_marks_the_provider_live(settings_factory):
     A 429 storm is heavy CG traffic that proves the provider is REFUSING us --
     the opposite of live.
     """
-    s = settings_factory(PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800
+    )
     b = CoinGeckoBudget()
     _spend(b, BUCKET_DISCOVERY, 50, billable=False)  # 50 x 429
     assert b.cg_pricing_live(s) is False
@@ -202,13 +219,15 @@ def test_dex_writes_cannot_reach_the_cg_liveness_signal(settings_factory, db):
     Seed price_cache the way outcome_ledger's DexScreener poller does. Under the
     old MAX(updated_at) gate this made CoinGecko look alive. It must not now.
     """
-    s = settings_factory(PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=1800
+    )
     b = CoinGeckoBudget()
     b.last_success_at = datetime.now(timezone.utc) - timedelta(days=3)
     # A DexScreener-written row, fresh as of right now.
-    assert b.cg_pricing_live(s) is False, (
-        "a fresh dex: price_cache row must not present CoinGecko as live"
-    )
+    assert (
+        b.cg_pricing_live(s) is False
+    ), "a fresh dex: price_cache row must not present CoinGecko as live"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +238,7 @@ def test_dex_writes_cannot_reach_the_cg_liveness_signal(settings_factory, db):
 def test_pace_alert_fires_once_per_crossing_not_every_hour(settings_factory):
     """An operator who learns to ignore the pager is worse off than one without it."""
     s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True,
         COINGECKO_MONTHLY_CREDIT_ALLOWANCE=1000,
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=650,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=300,
@@ -236,6 +256,7 @@ def test_pace_alert_fires_once_per_crossing_not_every_hour(settings_factory):
 
 def test_pace_alert_rearms_only_after_recovering_clear_of_threshold(settings_factory):
     s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True,
         COINGECKO_MONTHLY_CREDIT_ALLOWANCE=1000,
         COINGECKO_MONTHLY_DISCOVERY_CREDITS=650,
         COINGECKO_MONTHLY_CRITICAL_CREDITS=300,
@@ -269,7 +290,9 @@ async def test_bounded_flush_persists_without_an_explicit_persist_call(
     of spend. This exercises the path production actually uses -- maybe_persist
     on the per-cycle hook -- and asserts a replacement instance sees the spend.
     """
-    s = settings_factory(COINGECKO_BUDGET_FLUSH_EVERY_CREDITS=10)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_BUDGET_FLUSH_EVERY_CREDITS=10
+    )
     b = CoinGeckoBudget()
     for _ in range(10):
         b.record(BUCKET_DISCOVERY, billable=True)
@@ -282,7 +305,9 @@ async def test_bounded_flush_persists_without_an_explicit_persist_call(
 
 async def test_flush_does_not_fire_before_the_threshold(db, settings_factory):
     """Bounded, not per-call: the flush must not become a DB write per request."""
-    s = settings_factory(COINGECKO_BUDGET_FLUSH_EVERY_CREDITS=50)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_BUDGET_FLUSH_EVERY_CREDITS=50
+    )
     b = CoinGeckoBudget()
     for _ in range(5):
         b.record(BUCKET_DISCOVERY, billable=True)
@@ -301,7 +326,9 @@ async def test_provider_liveness_survives_a_restart(db, settings_factory):
     would block every CG position after a routine restart until the next
     successful call. Persisting it keeps the signal honest in both directions.
     """
-    s = settings_factory(PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=3600)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=3600
+    )
     b = CoinGeckoBudget()
     b.record(BUCKET_DISCOVERY, billable=True)
     await b.persist(db)

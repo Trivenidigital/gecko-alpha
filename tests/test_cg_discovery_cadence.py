@@ -44,8 +44,14 @@ def settings(settings_factory):
 
 
 def _coin(cid):
-    return {"id": cid, "current_price": 1.0, "market_cap": 1000.0,
-            "total_volume": 500.0, "symbol": "x", "name": "X"}
+    return {
+        "id": cid,
+        "current_price": 1.0,
+        "market_cap": 1000.0,
+        "total_volume": 500.0,
+        "symbol": "x",
+        "name": "X",
+    }
 
 
 async def _run_cycle(settings, db, held_return=None):
@@ -58,6 +64,7 @@ async def _run_cycle(settings, db, held_return=None):
             if global_attr:
                 setattr(cg_mod, global_attr, [_coin(f"{name}-coin")])
             return [_coin(f"{name}-coin")]
+
         return _fn
 
     patches = {
@@ -72,10 +79,13 @@ async def _run_cycle(settings, db, held_return=None):
         calls.append("held_position_prices")
         return held_return if held_return is not None else []
 
-    with patch.multiple(main_mod, **patches), \
-         patch.object(main_mod, "fetch_held_position_prices", _held), \
-         patch.object(main_mod.coingecko_limiter, "is_backing_off",
-                      MagicMock(return_value=False)):
+    with (
+        patch.multiple(main_mod, **patches),
+        patch.object(main_mod, "fetch_held_position_prices", _held),
+        patch.object(
+            main_mod.coingecko_limiter, "is_backing_off", MagicMock(return_value=False)
+        ),
+    ):
         result = await main_mod._fetch_coingecko_lanes(AsyncMock(), settings, db)
     return calls, result
 
@@ -88,7 +98,9 @@ async def test_discovery_runs_only_every_nth_cycle(settings):
         calls, _ = await _run_cycle(settings, db)
         if "top_movers" in calls:
             discovery_rounds += 1
-    assert discovery_rounds == 2, f"expected 2 discovery rounds in 10 cycles, got {discovery_rounds}"
+    assert (
+        discovery_rounds == 2
+    ), f"expected 2 discovery rounds in 10 cycles, got {discovery_rounds}"
 
 
 async def test_held_position_runs_every_cycle_even_off_cadence(settings):
@@ -116,7 +128,9 @@ async def test_skipped_cycle_leaves_no_stale_discovery_payload(settings):
     for _ in range(5):
         calls, _ = await _run_cycle(settings, db)
     assert "top_movers" in calls
-    assert cg_mod.last_raw_markets, "precondition: discovery cycle should populate globals"
+    assert (
+        cg_mod.last_raw_markets
+    ), "precondition: discovery cycle should populate globals"
 
     # Cycle 6 -> off cadence. Globals MUST be empty, not retained.
     calls, _ = await _run_cycle(settings, db)
@@ -152,9 +166,11 @@ async def test_backoff_midsequence_leaves_no_stale_payload_for_unrun_lanes(setti
         return []
 
     backoff = MagicMock(side_effect=[False, True, True, True, True, True])
-    with patch.object(main_mod, "cg_fetch_top_movers", _movers), \
-         patch.object(main_mod, "fetch_held_position_prices", _held), \
-         patch.object(main_mod.coingecko_limiter, "is_backing_off", backoff):
+    with (
+        patch.object(main_mod, "cg_fetch_top_movers", _movers),
+        patch.object(main_mod, "fetch_held_position_prices", _held),
+        patch.object(main_mod.coingecko_limiter, "is_backing_off", backoff),
+    ):
         for _ in range(5):
             main_mod._cg_discovery_cycle_counter += 1
         main_mod._cg_discovery_cycle_counter -= 1
@@ -193,7 +209,7 @@ async def test_discovery_stays_dark_when_not_activated(settings_factory):
     cannot see.
     """
     settings = settings_factory(
-        COINGECKO_DISCOVERY_INTERVAL_CYCLES=1,     # would fire EVERY cycle
+        COINGECKO_DISCOVERY_INTERVAL_CYCLES=1,  # would fire EVERY cycle
         COINGECKO_DISCOVERY_ENABLED=False,
         HELD_POSITION_PRICE_REFRESH_ENABLED=True,
     )
@@ -208,6 +224,21 @@ async def test_discovery_stays_dark_when_not_activated(settings_factory):
         assert "held_position_prices" in calls
 
 
-def test_discovery_activation_defaults_to_off(settings_factory):
-    """Default-off, so the guarantee holds even if nobody sets anything."""
-    assert settings_factory().COINGECKO_DISCOVERY_ENABLED is False
+def test_discovery_activation_defaults_to_off():
+    """Default-off, so the guarantee holds even if nobody sets anything.
+
+    Constructs Settings DIRECTLY rather than via settings_factory: the factory
+    deliberately enables discovery so unrelated fetch tests exercise real
+    behaviour instead of a refused request. Asking the factory what the SHIPPED
+    default is would only echo the factory's own override — a test that cannot
+    observe the thing it names.
+    """
+    from scout.config import Settings
+
+    shipped = Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+    )
+    assert shipped.COINGECKO_DISCOVERY_ENABLED is False

@@ -92,6 +92,11 @@ async def fetch_prices_batch(
         _call = governed_cg_call(BUCKET_DISCOVERY, settings)
         if not _call.allowed:
             break
+        # finish(None) is guaranteed below so a CONNECTION/TIMEOUT failure —
+        # which never reaches a response and so never reaches finish(status) —
+        # still records one attempt with zero credits. Counting only the
+        # request paths that produced a response makes a lane that is failing
+        # at the transport layer invisible in the attempt rate.
         await coingecko_limiter.acquire()
         try:
             async with session.get(url, params=params, headers=headers) as resp:

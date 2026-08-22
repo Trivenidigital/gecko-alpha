@@ -18,6 +18,24 @@ from scout.briefing.collector import (
 )
 
 
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    fetch_cg_global now REQUIRES Settings: governed_cg_call fails closed without
+    it, because "counted but not refused" was a silent hole that let a caller
+    keep spending while appearing governed.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 @pytest.fixture
 def mock_aio():
     with aioresponses() as m:
@@ -88,7 +106,9 @@ class TestFetchCgGlobal:
             },
         )
         async with aiohttp.ClientSession() as session:
-            result = await fetch_cg_global(session, api_key="test-key")
+            result = await fetch_cg_global(
+                session, api_key="test-key", settings=_budget_settings()
+            )
         assert result["total_mcap"] == 2_500_000_000_000
         assert result["mcap_change_24h"] == 3.4
         assert result["btc_dominance"] == 56.9
@@ -97,7 +117,7 @@ class TestFetchCgGlobal:
     async def test_http_error(self, mock_aio):
         mock_aio.get("https://api.coingecko.com/api/v3/global", status=429)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_cg_global(session)
+            result = await fetch_cg_global(session, settings=_budget_settings())
         assert result is None
 
 

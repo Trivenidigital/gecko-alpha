@@ -54,7 +54,6 @@ def _wipe_params_cache():
     clear_cache_for_tests()
 
 
-
 @pytest.fixture
 async def db(tmp_path):
     d = Database(tmp_path / "t.db")

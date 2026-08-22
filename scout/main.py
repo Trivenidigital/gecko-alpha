@@ -1696,7 +1696,9 @@ async def _send_cg_budget_pace_alert(
         ]
     )
     try:
-        logger.info("cg_budget_pace_alert_dispatched", ratio=round(ratio, 2), **snapshot)
+        logger.info(
+            "cg_budget_pace_alert_dispatched", ratio=round(ratio, 2), **snapshot
+        )
         await alerter.send_telegram_message(
             body,
             session,
@@ -1925,8 +1927,10 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         # PACE, not an absolute mark, and on the CROSSING rather than the
         # condition: this pass runs hourly, so paging whenever the projection is
         # over threshold would produce ~24 pages/day for one unchanged fact.
-        if projected is not None and allowance > 0 and cg_budget.should_page_on_pace(
-            settings
+        if (
+            projected is not None
+            and allowance > 0
+            and cg_budget.should_page_on_pace(settings)
         ):
             await _send_cg_budget_pace_alert(
                 session,

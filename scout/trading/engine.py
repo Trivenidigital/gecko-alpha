@@ -558,7 +558,16 @@ class TradingEngine:
         # The critical reserve being spent does not stop RE-PRICING (that would
         # recreate the fabricated close), but it must stop taking on NEW
         # re-pricing demand.
-        if cg_budget.critical_reserve_exceeded(self.settings):
+        #
+        # Only for positions whose exit pricing CONSUMES that reserve. The
+        # registry also admits `price_cache_row` — a token served by some other
+        # writer — and blocking those on an exhausted CoinGecko reserve would be
+        # a false rejection: their exit pricing costs no CoinGecko credits, so
+        # opening them adds no demand to the lane that is exhausted.
+        if (
+            price_source == PRICE_SOURCE_CG_LANE
+            and cg_budget.critical_reserve_exceeded(self.settings)
+        ):
             log.warning(
                 "trade_skipped_critical_reserve_exhausted",
                 token_id=token_id,

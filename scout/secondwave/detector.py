@@ -166,6 +166,11 @@ async def fetch_current_prices(
         _call = governed_cg_call(BUCKET_DISCOVERY, settings)
         if not _call.allowed:
             return {}
+        # finish(None) is guaranteed below so a CONNECTION/TIMEOUT failure —
+        # which never reaches a response and so never reaches finish(status) —
+        # still records one attempt with zero credits. Counting only the
+        # request paths that produced a response makes a lane that is failing
+        # at the transport layer invisible in the attempt rate.
         async with session.get(
             f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/coins/markets",
             params=params,

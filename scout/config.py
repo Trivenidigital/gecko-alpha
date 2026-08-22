@@ -219,12 +219,41 @@ class Settings(BaseSettings):
     # HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES cadence and its
     # no_open_trades no-op, because it is the operationally critical surface
     # (the live trailing-stop evaluator reads the price_cache rows it writes).
-    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=5, ge=1, le=1440)
+    # 7, NOT the 5 of the original C profile. That figure was derived from the
+    # main discovery bundle ALONE (7 calls x 288 rounds/day = ~62k/month, said
+    # to fit the 65k envelope). It omitted every OTHER discovery-class CoinGecko
+    # consumer, all of which are enabled in prod today:
+    #
+    #   narrative observer /coins/categories        1,488/mo
+    #   narrative trending tracker                  1,488/mo
+    #   narrative predictor /coins/markets          2,976/mo
+    #   narrative evaluator (batch + fallback)      2,976/mo
+    #   counter detail /coins/{id}                  1,488/mo
+    #   secondwave /coins/markets                   1,488/mo
+    #                                              ----------
+    #                                              11,904/mo
+    #
+    # At every-5th the discovery total is 74,400/mo — 9,400 OVER the envelope.
+    # every-6th gives 63,984 (1.6% headroom, inside my own estimation error on
+    # the per-pass counts). every-7th gives 56,544 with 8,456 to spare.
+    #
+    # Hard caps protect against an estimation mistake; they are not a substitute
+    # for a planned workload that fits. Operator ratification is wanted for this
+    # deviation — set COINGECKO_DISCOVERY_INTERVAL_CYCLES=5 in .env to restore
+    # the original profile, accepting that discovery will then hit its envelope
+    # partway through the month and stop.
+    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=7, ge=1, le=1440)
 
     # Open-boundary pricing LIVENESS bound (monthly-budget repair 2026-08-21).
     # The engine's step-0c gate is a REGISTRY check ("a CG lane serves this
-    # token_id shape"); this is the LIVENESS check ("a CG lane actually wrote
-    # price_cache recently"). With CG dark — exhausted monthly credits, a
+    # token_id shape"); this is the LIVENESS check ("CoinGecko ITSELF answered
+    # recently").
+    #
+    # Deliberately NOT price_cache freshness. price_cache is also written by
+    # DexScreener (outcome_ledger's dex enrollment poller), so its freshness
+    # says nothing about CoinGecko: a fresh Dex row would present a dead
+    # provider as alive. The signal is cg_budget.last_success_at, set only by a
+    # CoinGecko HTTP 200. With CG dark — exhausted monthly credits, a
     # suspended account, a spent discovery envelope — a position can open and
     # then be unmonitored (no trailing stop, no SL) until max_duration
     # force-closes it at entry_price with a fabricated pnl_pct=0.
@@ -265,7 +294,13 @@ class Settings(BaseSettings):
     # Durability window for the credit ledger, in CREDITS rather than minutes.
     # Persisting only in the hourly pass would lose up to an hour of spend to a
     # crash/deploy, and the process would come back believing it has capacity it
-    # already burned. 25 bounds the loss to well under one discovery round.
+    # already burned. Bounded by spend rather than clock because the exposure
+    # scales with spend.
+    #
+    # 25 credits is roughly 3.5 discovery rounds at the ~7-call C profile — so
+    # the worst-case loss is a few rounds, not the ~60 rounds an hourly-only
+    # flush could discard. (An earlier comment claimed "well under one discovery
+    # round", which was simply wrong: 25 > 7.)
     COINGECKO_BUDGET_FLUSH_EVERY_CREDITS: int = Field(default=25, ge=0, le=10_000)
     # /key reconciliation. Provider is the ACCEPTANCE truth; positive drift is
     # real capacity gone that no local counter explains, so it reduces

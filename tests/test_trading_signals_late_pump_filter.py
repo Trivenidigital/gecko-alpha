@@ -15,7 +15,6 @@ from scout.trading.signals import (
 )
 
 
-
 @pytest.fixture
 async def db(tmp_path):
     d = Database(tmp_path / "test.db")

@@ -10,7 +10,6 @@ from scout.db import Database
 from scout.trading.engine import TradingEngine
 
 
-
 @pytest.fixture
 async def db(tmp_path):
     d = Database(tmp_path / "test.db")

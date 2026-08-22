@@ -218,6 +218,7 @@ async def narrative_agent_loop(
                         db,
                         settings.COINGECKO_API_KEY,
                         api_tier=settings.COINGECKO_API_TIER,
+                        settings=settings,
                     )
                     # trending_catch historically net-loses (-$339 / 86 trades);
                     # disabled in prod via PAPER_SIGNAL_TRENDING_CATCH_ENABLED=False.

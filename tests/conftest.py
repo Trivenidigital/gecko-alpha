@@ -217,6 +217,13 @@ def settings_factory():
             TELEGRAM_BOT_TOKEN="t",
             TELEGRAM_CHAT_ID="c",
             ANTHROPIC_API_KEY="k",
+            # Tests describe an OPERATING system. COINGECKO_DISCOVERY_ENABLED
+            # ships False so a deploy before the September 1 credit reset cannot
+            # resume discovery, but that is a deployment-time state: leaving it
+            # off here would make every fetch test assert against a refused
+            # request instead of the behaviour it means to cover. Tests for the
+            # dark gate itself pass COINGECKO_DISCOVERY_ENABLED=False explicitly.
+            COINGECKO_DISCOVERY_ENABLED=True,
         )
         defaults.update(overrides)
         return Settings(**defaults)

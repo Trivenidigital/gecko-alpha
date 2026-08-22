@@ -7501,6 +7501,12 @@ class Database:
                     -- CoinGecko. Durable so a restart does not present a dead
                     -- provider as merely unobserved.
                     last_success_at TEXT,
+                    -- Reconciled provider truth. Persisted because
+                    -- effective_used() depends on it: without this a restart
+                    -- came back with zero drift and treated unattributed spend
+                    -- as capacity that still existed.
+                    provider_credits_used INTEGER,
+                    provider_checked_at TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (month, bucket)
                 )

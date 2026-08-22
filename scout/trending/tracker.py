@@ -85,6 +85,7 @@ async def fetch_and_store_trending(
     db: "Database",
     api_key: str = "",
     api_tier: str = "demo",
+    settings=None,
 ) -> list[TrendingSnapshot]:
     """Fetch /search/trending and store each coin as a snapshot row.
 
@@ -100,6 +101,7 @@ async def fetch_and_store_trending(
         # held-position re-pricing path, so it draws on the discovery envelope
         # and stops with the rest of discovery when that envelope is spent.
         bucket=BUCKET_DISCOVERY,
+        settings=settings,
     )
     if not data or not isinstance(data, dict):
         logger.warning("trending_tracker.fetch_empty")

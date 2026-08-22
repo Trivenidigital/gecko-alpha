@@ -160,13 +160,15 @@ async def test_fresh_dex_price_cache_does_NOT_admit_a_cg_token(db, tmp_path):
     """
     _cg_dead()
     # A DexScreener-written row, fresher than any threshold.
-    await _seed_price_cache(db, "dex:solana:So11111111111111111111111111111111111111112", 1.0, age_seconds=1)
+    await _seed_price_cache(
+        db, "dex:solana:So11111111111111111111111111111111111111112", 1.0, age_seconds=1
+    )
     await _seed_price_cache(db, "some-dex-token", 2.0, age_seconds=1)
 
     engine = TradingEngine(mode="paper", db=db, settings=_settings(tmp_path))
-    assert await _open(engine) is None, (
-        "a fresh DexScreener price_cache row must not present CoinGecko as live"
-    )
+    assert (
+        await _open(engine) is None
+    ), "a fresh DexScreener price_cache row must not present CoinGecko as live"
 
 
 async def test_stale_price_cache_does_NOT_block_when_coingecko_is_healthy(db, tmp_path):
@@ -187,7 +189,9 @@ async def test_stale_price_cache_does_NOT_block_when_coingecko_is_healthy(db, tm
 # ---------------------------------------------------------------------------
 
 
-async def test_exhausted_critical_reserve_blocks_new_opens(db, tmp_path, settings_factory):
+async def test_exhausted_critical_reserve_blocks_new_opens(
+    db, tmp_path, settings_factory
+):
     """More open positions means more re-pricing demand against a spent reserve.
 
     Re-pricing itself is NOT stopped (that would recreate the fabricated close)
@@ -214,22 +218,24 @@ async def test_bound_is_settings_sourced_and_disablable(db, tmp_path):
         db=db,
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=0),
     )
-    assert await _open(engine_off) is not None, (
-        "gate should be disablable for an explicit operator override"
-    )
+    assert (
+        await _open(engine_off) is not None
+    ), "gate should be disablable for an explicit operator override"
 
 
 async def test_tight_bound_blocks_what_a_loose_bound_admits(db, tmp_path):
     """The decision tracks the CONFIGURED bound, not a fixed constant."""
     _cg_alive(seconds_ago=3600)
     loose = TradingEngine(
-        mode="paper", db=db,
+        mode="paper",
+        db=db,
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=7200),
     )
     assert await _open(loose) is not None
 
     tight = TradingEngine(
-        mode="paper", db=db,
+        mode="paper",
+        db=db,
         settings=_settings(tmp_path, PAPER_OPEN_CG_PRICING_MAX_AGE_SEC=600),
     )
     assert await _open(tight) is None

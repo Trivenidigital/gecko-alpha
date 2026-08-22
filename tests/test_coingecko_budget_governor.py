@@ -74,7 +74,9 @@ def test_unknown_bucket_is_rejected_not_silently_accumulated():
 
 
 def test_discovery_stops_at_its_envelope(settings_factory):
-    s = settings_factory(COINGECKO_MONTHLY_DISCOVERY_CREDITS=10)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_DISCOVERY_CREDITS=10
+    )
     b = CoinGeckoBudget()
     for _ in range(9):
         b.record(BUCKET_DISCOVERY, billable=True)
@@ -89,7 +91,9 @@ def test_critical_spend_does_not_exhaust_discovery(settings_factory):
     The reserve exists so held positions stay re-priceable; an unpriceable open
     position is the GA-01 failure class.
     """
-    s = settings_factory(COINGECKO_MONTHLY_DISCOVERY_CREDITS=10)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_DISCOVERY_CREDITS=10
+    )
     b = CoinGeckoBudget()
     for _ in range(50):
         b.record(BUCKET_CRITICAL, billable=True)
@@ -97,7 +101,9 @@ def test_critical_spend_does_not_exhaust_discovery(settings_factory):
 
 
 def test_exhausted_discovery_leaves_the_critical_reserve_spendable(settings_factory):
-    s = settings_factory(COINGECKO_MONTHLY_DISCOVERY_CREDITS=2)
+    s = settings_factory(
+        COINGECKO_DISCOVERY_ENABLED=True, COINGECKO_MONTHLY_DISCOVERY_CREDITS=2
+    )
     b = CoinGeckoBudget()
     b.record(BUCKET_DISCOVERY, billable=True)
     b.record(BUCKET_DISCOVERY, billable=True)
@@ -109,6 +115,7 @@ def test_exhausted_discovery_leaves_the_critical_reserve_spendable(settings_fact
 def test_envelopes_may_not_oversubscribe_the_allowance(settings_factory):
     with pytest.raises(ValueError, match="exceeds"):
         settings_factory(
+            COINGECKO_DISCOVERY_ENABLED=True,
             COINGECKO_MONTHLY_CREDIT_ALLOWANCE=100_000,
             COINGECKO_MONTHLY_DISCOVERY_CREDITS=80_000,
             COINGECKO_MONTHLY_CRITICAL_CREDITS=30_000,
@@ -117,7 +124,7 @@ def test_envelopes_may_not_oversubscribe_the_allowance(settings_factory):
 
 
 def test_shipped_envelope_profile_matches_the_ruling(settings_factory):
-    s = settings_factory()
+    s = settings_factory(COINGECKO_DISCOVERY_ENABLED=True)
     assert s.COINGECKO_MONTHLY_DISCOVERY_CREDITS == 65_000
     assert s.COINGECKO_MONTHLY_CRITICAL_CREDITS == 30_000
     assert s.COINGECKO_MONTHLY_OPERATIONAL_CREDITS == 5_000

@@ -109,7 +109,7 @@ async def _get_with_backoff(
     params: dict | None = None,
     *,
     bucket: str,
-    settings: Settings | None = None,
+    settings: Settings,
 ) -> dict | list | None:
     """The ONLY governed CoinGecko request primitive. Returns JSON or None.
 
@@ -128,7 +128,11 @@ async def _get_with_backoff(
     its billable outcome recorded against that same attempt -- so a response
     that arrives and then fails to parse cannot inflate the attempt count.
     """
-    if settings is not None:
+    # `settings` is REQUIRED, not optional. An optional Settings meant
+    # "counted, just not refused" — a silent hole that let a caller keep
+    # spending while looking governed. A TypeError at the call site beats
+    # unenforced operation.
+    if True:
         allowed, reason = cg_budget.allow(bucket, settings)
         if not allowed:
             logger.warning(
@@ -265,14 +269,18 @@ async def fetch_top_movers(
     params_volume = {**base_params, "order": "volume_desc"}
 
     data_small = await _get_with_backoff(
-        session, f"{_base(settings)}/coins/markets", params_small,
+        session,
+        f"{_base(settings)}/coins/markets",
+        params_small,
         bucket=BUCKET_DISCOVERY,
         settings=settings,
     )
     data_volume = None
     if not coingecko_limiter.is_backing_off():
         data_volume = await _get_with_backoff(
-            session, f"{_base(settings)}/coins/markets", params_volume,
+            session,
+            f"{_base(settings)}/coins/markets",
+            params_volume,
             bucket=BUCKET_DISCOVERY,
             settings=settings,
         )
@@ -357,7 +365,9 @@ async def fetch_trending(
     )
 
     data = await _get_with_backoff(
-        session, f"{_base(settings)}/search/trending", params or None,
+        session,
+        f"{_base(settings)}/search/trending",
+        params or None,
         bucket=BUCKET_DISCOVERY,
         settings=settings,
     )
@@ -396,7 +406,9 @@ async def fetch_trending(
             cg_api.auth_query(settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER)
         )
         market_data = await _get_with_backoff(
-            session, f"{_base(settings)}/coins/markets", market_params,
+            session,
+            f"{_base(settings)}/coins/markets",
+            market_params,
             bucket=BUCKET_DISCOVERY,
             settings=settings,
         )
@@ -499,7 +511,7 @@ async def fetch_by_volume(
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
                 bucket=BUCKET_DISCOVERY,
-            settings=settings,
+                settings=settings,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -625,7 +637,7 @@ async def fetch_midcap_gainers(
                 f"{_base(settings)}/coins/markets",
                 {**base_params, "page": str(page)},
                 bucket=BUCKET_DISCOVERY,
-            settings=settings,
+                settings=settings,
             )
         )
         if coingecko_limiter.is_backing_off():
@@ -768,7 +780,9 @@ async def fetch_deep_volume(
     )
 
     data = await _get_with_backoff(
-        session, f"{_base(settings)}/coins/markets", {**base_params, "page": str(page)},
+        session,
+        f"{_base(settings)}/coins/markets",
+        {**base_params, "page": str(page)},
         bucket=BUCKET_DISCOVERY,
         settings=settings,
     )

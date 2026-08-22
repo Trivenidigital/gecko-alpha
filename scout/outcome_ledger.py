@@ -54,6 +54,7 @@ from typing import Any
 
 import structlog
 
+from scout.coingecko_budget import BUCKET_OPERATIONAL
 from scout.db import Database
 from scout.token_ids import is_cg_coin_id
 
@@ -720,6 +721,15 @@ async def label_pending(db: Database, settings: Any) -> dict[str, Any]:
 # one CG call per cycle, so the active-CG cohort is truncated to this size
 # (the enrollment cap defaults to 200, comfortably inside one batch).
 _ENROLLMENT_CG_BATCH_MAX = 250
+# CG-enrollment poll cadence, in main cycles. At 60s cycles an unthrottled poll
+# is 1,440 CoinGecko calls/day = ~43.2k/month, which alone is ~43% of the entire
+# Basic plan. The finest labelling horizon is r15m and
+# LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES tolerates 120 minutes of lateness, so
+# 15-minute sampling loses no horizon while costing ~2,976/month.
+# DexScreener enrollment polling is NOT throttled by this — its budget is
+# separate and generous.
+_ENROLLMENT_CG_POLL_INTERVAL_CYCLES = 15
+_enrollment_cg_cycle_counter = 0
 # DexScreener tokens endpoint accepts up to 30 comma-joined addresses/call.
 _ENROLLMENT_DEX_BATCH_MAX = 30
 
@@ -888,7 +898,12 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
         stats["n_dex"] = len(dex_ids)
         stats["n_other"] = len(enrolled) - len(cg_ids) - len(dex_ids)
 
-        if cg_ids:
+        global _enrollment_cg_cycle_counter
+        _enrollment_cg_cycle_counter += 1
+        cg_due = _enrollment_cg_cycle_counter % _ENROLLMENT_CG_POLL_INTERVAL_CYCLES == 0
+        if cg_ids and not cg_due:
+            stats["cg_poll_skipped_off_cadence"] = True
+        if cg_ids and cg_due:
             # Lazy import — held_position_prices imports aiohttp at module
             # load, which aborts on Windows dev boxes (OPENSSL_Applink).
             from scout.ingestion.held_position_prices import (
@@ -896,8 +911,15 @@ async def poll_enrollments(db: Database, session: Any, settings: Any) -> dict[st
                 _shape_for_cache_prices,
             )
 
-            batch = cg_ids[:_ENROLLMENT_CG_BATCH_MAX]  # ONE call per cycle
-            resp = await _fetch_simple_price_batch(session, settings, batch)
+            batch = cg_ids[:_ENROLLMENT_CG_BATCH_MAX]
+            # OPERATIONAL, not CRITICAL. This is forward-LABELLING — evidence
+            # collection so outcomes become computable — not re-pricing an open
+            # position. Charging it to the held-position reserve meant a
+            # research poller could exhaust the capacity that keeps live
+            # positions exitable, and then block every new open.
+            resp = await _fetch_simple_price_batch(
+                session, settings, batch, bucket=BUCKET_OPERATIONAL
+            )
             raw_coins = _shape_for_cache_prices(resp)
             if raw_coins:
                 await db.cache_prices(raw_coins)

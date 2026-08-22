@@ -138,7 +138,8 @@ class CoinGeckoBudget:
             return
         try:
             cur = await conn.execute(
-                "SELECT bucket, attempts, credits, last_success_at "
+                "SELECT bucket, attempts, credits, last_success_at, "
+                "provider_credits_used, provider_checked_at "
                 "FROM cg_credit_ledger WHERE month = ?",
                 (self._month,),
             )
@@ -167,6 +168,37 @@ class CoinGeckoBudget:
                         self.last_success_at = parsed
                 except ValueError:
                     log.warning("cg_budget_bad_last_success_at", raw=str(raw_success))
+            # Provider truth must survive a restart. Without it hydrate() came
+            # back with zero drift, so the first post-restart decisions treated
+            # unattributed spend as capacity that still existed — and
+            # critical_reserve_exceeded() saw 0/30k and admitted new CG-backed
+            # positions as though the whole reserve remained.
+            raw_provider = row["provider_credits_used"]
+            if raw_provider is not None:
+                try:
+                    value = int(raw_provider)
+                except (TypeError, ValueError):
+                    value = None
+                if value is not None and (
+                    self.provider_credits_used is None
+                    or value > self.provider_credits_used
+                ):
+                    self.provider_credits_used = value
+            raw_checked = row["provider_checked_at"]
+            if raw_checked:
+                try:
+                    parsed_chk = datetime.fromisoformat(str(raw_checked))
+                    if parsed_chk.tzinfo is None:
+                        parsed_chk = parsed_chk.replace(tzinfo=timezone.utc)
+                    if (
+                        self.provider_checked_at is None
+                        or parsed_chk > self.provider_checked_at
+                    ):
+                        self.provider_checked_at = parsed_chk
+                except ValueError:
+                    log.warning(
+                        "cg_budget_bad_provider_checked_at", raw=str(raw_checked)
+                    )
         log.info(
             "cg_budget_hydrated",
             month=self._month,
@@ -185,22 +217,39 @@ class CoinGeckoBudget:
         if conn is None:
             return
         now_iso = datetime.now(timezone.utc).isoformat()
-        success_iso = (
-            self.last_success_at.isoformat() if self.last_success_at else None
+        success_iso = self.last_success_at.isoformat() if self.last_success_at else None
+        provider_iso = (
+            self.provider_checked_at.isoformat() if self.provider_checked_at else None
         )
         try:
             for bucket, (attempts, credits) in self._counts.items():
                 await conn.execute(
                     """INSERT INTO cg_credit_ledger
-                         (month, bucket, attempts, credits, last_success_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
+                         (month, bucket, attempts, credits, last_success_at,
+                          provider_credits_used, provider_checked_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(month, bucket) DO UPDATE SET
                          attempts = excluded.attempts,
                          credits = excluded.credits,
                          last_success_at = COALESCE(
                            excluded.last_success_at, cg_credit_ledger.last_success_at),
+                         provider_credits_used = COALESCE(
+                           excluded.provider_credits_used,
+                           cg_credit_ledger.provider_credits_used),
+                         provider_checked_at = COALESCE(
+                           excluded.provider_checked_at,
+                           cg_credit_ledger.provider_checked_at),
                          updated_at = excluded.updated_at""",
-                    (self._month, bucket, attempts, credits, success_iso, now_iso),
+                    (
+                        self._month,
+                        bucket,
+                        attempts,
+                        credits,
+                        success_iso,
+                        self.provider_credits_used,
+                        provider_iso,
+                        now_iso,
+                    ),
                 )
             await conn.commit()
             self._dirty = False
@@ -218,7 +267,9 @@ class CoinGeckoBudget:
         it has capacity it already burned. This bounds that window by CREDITS
         rather than by time, because the risk scales with spend, not with clock.
         """
-        threshold = int(getattr(settings, "COINGECKO_BUDGET_FLUSH_EVERY_CREDITS", 0) or 0)
+        threshold = int(
+            getattr(settings, "COINGECKO_BUDGET_FLUSH_EVERY_CREDITS", 0) or 0
+        )
         if threshold > 0 and self._unpersisted_credits >= threshold:
             await self.persist(db)
 
@@ -243,6 +294,23 @@ class CoinGeckoBudget:
             self._unpersisted_credits += 1
             # A billable 200 IS the CoinGecko liveness heartbeat.
             self.last_success_at = now or datetime.now(timezone.utc)
+        self._dirty = True
+
+    def mark_billable(self, bucket: str, now: datetime | None = None) -> None:
+        """Upgrade an already-recorded attempt to billable.
+
+        Pairs with recording the attempt at REQUEST-ISSUE time rather than at
+        response time. Issuing is what we always know happened; whether it
+        billed is learned later, and may never be learned at all if the
+        connection dies. Splitting it this way means a transport failure is
+        one attempt / zero credits without every caller needing a finally.
+        """
+        if bucket not in self._counts:
+            log.error("cg_budget_unknown_bucket", bucket=bucket, billable=True)
+            return
+        self._counts[bucket][1] += 1
+        self._unpersisted_credits += 1
+        self.last_success_at = now or datetime.now(timezone.utc)
         self._dirty = True
 
     # -- readings ----------------------------------------------------------
@@ -330,9 +398,17 @@ class CoinGeckoBudget:
         if bucket not in self._counts:
             return False, "unknown_bucket"
 
-        allowance = int(
-            getattr(settings, "COINGECKO_MONTHLY_CREDIT_ALLOWANCE", 0) or 0
-        )
+        # The dark-until-reset switch lives HERE, in the central predicate, not
+        # only in the main lane orchestrator. Checking it in one caller made it
+        # a property of that code path rather than of the system: any other
+        # discovery-class caller (the narrative lanes, secondwave, the trending
+        # tracker) would still have issued requests with the flag off.
+        if bucket == BUCKET_DISCOVERY and not getattr(
+            settings, "COINGECKO_DISCOVERY_ENABLED", False
+        ):
+            return False, "discovery_not_enabled"
+
+        allowance = int(getattr(settings, "COINGECKO_MONTHLY_CREDIT_ALLOWANCE", 0) or 0)
         # Overall plan ceiling, corrected by provider truth. Unattributed spend
         # is real capacity gone; letting it be invisible is what allowed the
         # reserve to be eaten silently.
@@ -408,9 +484,7 @@ class CoinGeckoBudget:
         projection recovers below the threshold.
         """
         projected = self.projected_month_end_credits(now)
-        allowance = int(
-            getattr(settings, "COINGECKO_MONTHLY_CREDIT_ALLOWANCE", 0) or 0
-        )
+        allowance = int(getattr(settings, "COINGECKO_MONTHLY_CREDIT_ALLOWANCE", 0) or 0)
         if projected is None or allowance <= 0:
             return False
         ratio = projected / allowance
@@ -461,22 +535,36 @@ class governed_cg_call:
         self.billable = False
         self._recorded = False
         if settings is None:
-            self.allowed, self.reason = True, "unenforced_no_settings"
-        else:
-            self.allowed, self.reason = budget.allow(bucket, settings)
+            # FAIL CLOSED. "Counted but not refused" was a silent hole: a caller
+            # that forgot to thread Settings kept spending while appearing
+            # governed, which is the same invisible-spend failure this module
+            # exists to end. Refusing is safe (the caller degrades) and loud.
+            raise TypeError(
+                f"governed_cg_call({bucket!r}) requires settings; without it the "
+                "monthly budget cannot be enforced and the call would spend "
+                "un-refusably"
+            )
+        self.allowed, self.reason = budget.allow(bucket, settings)
+        # Record the ATTEMPT now, at issue time. Whether it BILLED is learned
+        # later via finish(), and may never be learned if the connection dies
+        # before a response — in which case this attempt still stands, with no
+        # credit, which is exactly right. Recording only on response made every
+        # transport failure invisible in the attempt rate, hiding precisely the
+        # lanes that are broken.
+        if self.allowed:
+            budget.record(bucket, billable=False)
 
     def finish(self, status: int | None) -> None:
-        """Record this issued request exactly once, given its HTTP status.
+        """Upgrade this request to billable when the provider actually billed.
 
-        The non-context-manager form, for callers whose retry loop shape makes
-        a ``with`` block awkward. Idempotent: a second call is ignored, so a
-        retry loop that creates one instance per attempt cannot double-count and
-        one that reuses an instance cannot either.
+        The attempt was already recorded at construction. Idempotent, so a
+        retry loop that reuses an instance cannot double-count credits.
         """
         if self._recorded or not self.allowed:
             return
         self._recorded = True
-        budget.record(self.bucket, billable=(status == 200))
+        if status == 200:
+            budget.mark_billable(self.bucket)
 
     def __enter__(self) -> "governed_cg_call":
         if not self.allowed:
@@ -491,10 +579,10 @@ class governed_cg_call:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        # A refused call was never issued, so it is not an attempt either.
-        if self.allowed and not self._recorded:
-            self._recorded = True
-            budget.record(self.bucket, billable=self.billable)
+        # The attempt was recorded at construction; this only settles whether it
+        # billed. An exception on the way out leaves billable False, so a
+        # transport failure is one attempt / zero credits.
+        self.finish(200 if self.billable else None)
         return False
 
 
