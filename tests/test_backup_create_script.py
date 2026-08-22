@@ -672,3 +672,191 @@ def test_integrity_check_opens_the_backup_immutable(tmp_path):
         f"`mode=ro` alone still creates -shm/-wal; immutable=1 is what "
         f"prevents them: {verify_arg}"
     )
+
+
+# ---------------------------------------------------------------------
+# Pre-flight free-space guard (2026-08-22)
+# ---------------------------------------------------------------------
+#
+# This lane's origin PR (#87) is titled "closes recurring 100%-disk incident",
+# yet nothing checked free space before writing a file the size of the live
+# database. On srilu 2026-08-22 the peak free space DURING the nightly create
+# was 973 MB against a 7,012 MB database — it fit, but nothing was watching and
+# nothing would have said so. A full volume is worse than a missing backup,
+# because the LIVE database shares it.
+
+
+def test_refuses_when_free_space_is_below_db_size_plus_margin(tmp_path):
+    """THE guard: refuse rather than fill the volume.
+
+    Margin is forced absurdly high so the requirement exceeds real free space
+    without needing to actually fill a disk — the arithmetic under test is
+    `free < db_size + margin`, and that is exercised either way.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            # Require an impossible amount of headroom.
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": str(1024 * 1024 * 64),  # 64 TB
+        }
+    )
+    assert proc.returncode == 6, (
+        f"expected the distinct preflight exit code 6; got {proc.returncode}: "
+        f"{proc.stderr}"
+    )
+    assert "insufficient free space" in proc.stderr.lower()
+
+
+def test_refusal_writes_nothing_and_touches_no_existing_backup(tmp_path):
+    """A refusal must be inert.
+
+    create-then-rotate ordering is deliberately NOT inverted: rotating first
+    would halve peak usage but deletes a known-good backup before its
+    replacement is proven, trading a disk risk for a data risk. So the refusal
+    path must leave every existing backup exactly as it found it.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    existing = backup_dir / "scout.db.bak.20260101T000000Z"
+    existing.write_bytes(b"pre-existing backup")
+    before = existing.read_bytes()
+    heartbeat = tmp_path / "hb"
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(heartbeat),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": str(1024 * 1024 * 64),
+        }
+    )
+    assert proc.returncode == 6
+    assert existing.read_bytes() == before, "an existing backup was modified"
+    assert list(backup_dir.iterdir()) == [existing], (
+        "the refusal path must create no files at all, not even a .partial"
+    )
+    assert not heartbeat.exists(), (
+        "a refused run must NOT write the create heartbeat — a fresh heartbeat "
+        "would tell the freshness watchdog a backup succeeded"
+    )
+
+
+def test_sufficient_space_still_creates_normally(tmp_path):
+    """The guard must not block ordinary operation.
+
+    Without this, a guard that always refused would pass the test above and
+    silently end nightly backups.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": "1",
+        }
+    )
+    assert proc.returncode == 0, proc.stderr
+    created = list(backup_dir.glob("scout.db.bak.*"))
+    assert len(created) == 1
+    assert not str(created[0]).endswith(".partial")
+
+
+def test_preflight_reports_its_arithmetic(tmp_path):
+    """The decision must be auditable from the journal, not inferred.
+
+    "No backup last night" and "backup refused for space" look identical in a
+    directory listing; only the log separates them.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": "1",
+        }
+    )
+    combined = proc.stdout + proc.stderr
+    assert "preflight" in combined
+    for token in ("db=", "free=", "need="):
+        assert token in combined, f"preflight log missing {token}"
+
+
+def test_thin_but_sufficient_space_warns_and_still_backs_up(tmp_path):
+    """Degrade, do not cliff.
+
+    A bare refuse-threshold set where the volume is already tight would have
+    stopped the nightly backup on srilu (7,987 MB free, 7,012 MB database,
+    973 MB real headroom) — trading a silent disk risk for a silent backup gap,
+    which is no improvement. The warn band reports thin headroom while still
+    taking the backup.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": "1",           # never refuse
+            "GECKO_BACKUP_WARN_FREE_MARGIN_MB": str(1024 * 1024 * 64),  # always warn
+        }
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "thin" in proc.stderr.lower(), "the thin-headroom warning must fire"
+    assert len(list(backup_dir.glob("scout.db.bak.*"))) == 1, (
+        "a WARNING must not block the backup — that is the difference between "
+        "early notice and an outage"
+    )
+
+
+def test_comfortable_space_does_not_warn(tmp_path):
+    """No crying wolf: a healthy volume must stay quiet.
+
+    A warning that fires every night is one an operator learns to ignore, which
+    is how the alarm stops working before the disk does.
+    """
+    db = tmp_path / "scout.db"
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    _make_seed_db(db)
+
+    proc = _run(
+        {
+            "GECKO_DB_PATH": str(db),
+            "GECKO_BACKUP_DIR": str(backup_dir),
+            "GECKO_BACKUP_CREATE_HEARTBEAT_FILE": str(tmp_path / "hb"),
+            "GECKO_BACKUP_CREATE_LOCK_FILE": str(tmp_path / "lock"),
+            "GECKO_BACKUP_MIN_FREE_MARGIN_MB": "1",
+            "GECKO_BACKUP_WARN_FREE_MARGIN_MB": "1",
+        }
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "thin" not in proc.stderr.lower()

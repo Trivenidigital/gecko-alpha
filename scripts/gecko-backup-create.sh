@@ -24,6 +24,11 @@
 #   GECKO_BACKUP_CREATE_LOCK_FILE      — flock guard path (default
 #                                        /var/lock/gecko-backup-create.lock)
 #   GECKO_BACKUP_SQLITE_BIN            — override sqlite3 binary (test seam)
+#   GECKO_BACKUP_MIN_FREE_MARGIN_MB    — free space required BEYOND the size of
+#                                        the database itself before REFUSING
+#                                        (default 512)
+#   GECKO_BACKUP_WARN_FREE_MARGIN_MB   — headroom below which the run warns but
+#                                        still proceeds (default 2048)
 #
 # Exit codes:
 #   0 = success (backup created + integrity OK + heartbeat written)
@@ -31,6 +36,8 @@
 #   3 = lock contention (another invocation in flight)
 #   4 = sqlite3 .backup command failed
 #   5 = PRAGMA integrity_check did not return "ok"
+#   6 = insufficient free space (pre-flight refusal; nothing written, no
+#       existing backup touched)
 #
 # Naming convention: `scout.db.bak.YYYYMMDDTHHMMSSZ` matches the
 # `scout.db.bak.*` glob used by gecko-backup-rotate.sh so the rotation
@@ -71,6 +78,50 @@ fi
 if ! mkdir -p "$(dirname "$HEARTBEAT_FILE")"; then
     echo "ERROR: cannot create heartbeat parent dir for $HEARTBEAT_FILE" >&2
     exit 2
+fi
+
+# --- PRE-FLIGHT FREE-SPACE GUARD -------------------------------------------
+# This lane's own origin PR (#87) is titled "closes recurring 100%-disk
+# incident", and yet nothing here checked free space before writing a file the
+# size of the live database. `sqlite3 .backup` will happily fill the volume and
+# then fail, and a full volume is far worse than a missing backup: the LIVE
+# database shares it, so a failed write can take out writes to scout.db itself.
+#
+# Measured on srilu 2026-08-22: 7,012 MB database, 7.7 GB free, three retained
+# backups (GECKO_BACKUP_KEEP=3) plus ~18.8 GB of ad-hoc one-off snapshots in
+# /root that no rotation policy manages. Peak free DURING the nightly create was
+# 973 MB. It fits — but nothing was watching, and nothing would have said so.
+#
+# Ordering note: create-then-rotate is deliberate and NOT inverted here.
+# Rotating first would halve peak usage but deletes a known-good backup before
+# the replacement is proven — trading a disk risk for a data risk. So this
+# refuses loudly instead, leaving every existing backup intact.
+# Two bands, so this DEGRADES instead of cliffing. A bare refuse-threshold set
+# where the volume is already tight would have stopped tonight's backup on
+# srilu (7,987 MB free, 7,012 MB database, 973 MB real headroom) — trading a
+# silent disk risk for a silent backup gap, which is no better. The warn band
+# reports thin headroom while still taking the backup; only genuine
+# insufficiency refuses.
+REQUIRED_MARGIN_MB="${GECKO_BACKUP_MIN_FREE_MARGIN_MB:-512}"
+WARN_MARGIN_MB="${GECKO_BACKUP_WARN_FREE_MARGIN_MB:-2048}"
+DB_SIZE_MB="$(( $(stat -c %s "$DB_PATH") / 1024 / 1024 ))"
+FREE_MB="$(df -Pm "$GECKO_BACKUP_DIR" | awk 'NR==2 {print $4}')"
+NEED_MB="$(( DB_SIZE_MB + REQUIRED_MARGIN_MB ))"
+if [[ -z "$FREE_MB" ]]; then
+    echo "ERROR: could not determine free space for $GECKO_BACKUP_DIR" >&2
+    exit 2
+fi
+echo "gecko-backup-create: preflight db=${DB_SIZE_MB}MB free=${FREE_MB}MB need=${NEED_MB}MB (margin ${REQUIRED_MARGIN_MB}MB)"
+WARN_MB="$(( DB_SIZE_MB + WARN_MARGIN_MB ))"
+if (( FREE_MB >= NEED_MB && FREE_MB < WARN_MB )); then
+    echo "WARNING: backup free space is thin — ${FREE_MB}MB free against a ${DB_SIZE_MB}MB database (comfortable would be >=${WARN_MB}MB)." >&2
+    echo "  the backup WILL proceed; this is early notice, not a failure." >&2
+fi
+if (( FREE_MB < NEED_MB )); then
+    echo "ERROR: insufficient free space for backup — refusing to start." >&2
+    echo "  database ${DB_SIZE_MB}MB + margin ${REQUIRED_MARGIN_MB}MB = ${NEED_MB}MB needed, ${FREE_MB}MB free" >&2
+    echo "  no backup was created and no existing backup was touched." >&2
+    exit 6
 fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
