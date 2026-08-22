@@ -85,7 +85,8 @@ async def fetch_and_store_trending(
     db: "Database",
     api_key: str = "",
     api_tier: str = "demo",
-    settings=None,
+    *,
+    settings,
 ) -> list[TrendingSnapshot]:
     """Fetch /search/trending and store each coin as a snapshot row.
 

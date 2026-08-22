@@ -395,6 +395,17 @@ class CoinGeckoBudget:
         The single enforcement predicate, consulted at the HTTP choke point so a
         caller that forgets to ask still cannot spend.
         """
+        if settings is None:
+            # Loud, not silently refused. A None Settings previously made every
+            # bucket look "not enabled", so an unenforced call was
+            # indistinguishable from a quiet upstream — `fetch_and_store_trending`
+            # returned zero snapshots rather than raising, and looked like an
+            # empty CoinGecko response.
+            raise TypeError(
+                f"CoinGeckoBudget.allow({bucket!r}) requires settings; without "
+                "it the monthly budget cannot be evaluated"
+            )
+
         if bucket not in self._counts:
             return False, "unknown_bucket"
 

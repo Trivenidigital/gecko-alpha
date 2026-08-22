@@ -4,6 +4,25 @@ import re
 from datetime import datetime, timedelta, timezone
 
 
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    fetch_and_store_trending now REQUIRES settings (keyword-only, no default):
+    a `settings=None` default failed CLOSED but SILENTLY, returning zero
+    snapshots instead of raising — which is how an unenforced call looks exactly
+    like a quiet upstream.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 def _sqlite_ts(dt: datetime) -> str:
     """Format datetime as SQLite-compatible string (space separator, no tz)."""
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -70,7 +89,9 @@ async def test_fetch_and_store_trending_success(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload=TRENDING_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     assert len(snapshots) == 5
     assert snapshots[0].coin_id == "coin-0"
@@ -89,7 +110,9 @@ async def test_fetch_and_store_trending_empty_response(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, status=500)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     assert snapshots == []
 
@@ -100,7 +123,9 @@ async def test_fetch_and_store_trending_malformed(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload={"coins": [{"item": {}}]})
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     # Entry without id is skipped
     assert len(snapshots) == 0
@@ -112,7 +137,9 @@ async def test_fetch_and_store_trending_with_api_key(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload=TRENDING_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db, api_key="test-key")
+            snapshots = await fetch_and_store_trending(
+                session, db, api_key="test-key", settings=_budget_settings()
+            )
 
     assert len(snapshots) == 5
 
