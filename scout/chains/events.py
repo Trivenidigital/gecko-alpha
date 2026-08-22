@@ -33,12 +33,45 @@ async def emit_event(
         raise ValueError(f"Invalid pipeline: {pipeline!r}")
 
     now = datetime.now(timezone.utc).isoformat()
-    cursor = await conn.execute(
-        """INSERT INTO signal_events
-           (token_id, pipeline, event_type, event_data, source_module, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (token_id, pipeline, event_type, json.dumps(event_data), source_module, now),
-    )
+    # The event insert and the derived-substrate fold are ONE unit.
+    #
+    # They must share a transaction: separate ones leave a window where the
+    # event exists but the substrate does not, and because the writer only ever
+    # LOWERS the minimum, a crash in that window makes this token's first_seen
+    # permanently later than the truth with nothing to detect it.
+    #
+    # The SAVEPOINT is what makes the failure path safe, and it is not
+    # decorative. `conn` is shared and this function did not previously have a
+    # failure point between INSERT and commit; now it does. Without the
+    # savepoint a raising fold leaves the INSERT pending on the connection,
+    # `safe_emit` swallows the exception, and the NEXT emit's commit() launders
+    # the orphaned event into the database -- manufacturing exactly the
+    # committed-event-without-substrate-row divergence this code exists to
+    # prevent. ROLLBACK TO undoes only this unit, so any outer pending work on
+    # the shared connection survives (a bare conn.rollback() would discard it).
+    await conn.execute("SAVEPOINT emit_event")
+    try:
+        cursor = await conn.execute(
+            """INSERT INTO signal_events
+               (token_id, pipeline, event_type, event_data, source_module, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                token_id,
+                pipeline,
+                event_type,
+                json.dumps(event_data),
+                source_module,
+                now,
+            ),
+        )
+        # MIN semantics, so a replayed or out-of-order event still lowers the
+        # minimum correctly rather than being dropped as a duplicate.
+        await db.record_signal_first_seen(token_id, now)
+    except BaseException:
+        await conn.execute("ROLLBACK TO emit_event")
+        await conn.execute("RELEASE emit_event")
+        raise
+    await conn.execute("RELEASE emit_event")
     await conn.commit()
     eid = cursor.lastrowid
     logger.debug(
