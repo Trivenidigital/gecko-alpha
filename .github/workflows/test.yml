@@ -36,8 +36,24 @@ jobs:
           ANTHROPIC_API_KEY: test
 
       - name: Run tests
-        timeout-minutes: 25
-        run: uv run pytest --tb=short -q --timeout=180 --timeout-method=thread
+        # 40, not 25. The suite legitimately runs ~15-16 min on a healthy
+        # ubuntu-latest runner (13.5 / 14.3 / 15.0 / 15.3 / 15.4 / 15.5 min
+        # across the last seven green master runs) but GitHub shared runners
+        # vary by well over 60%: run 32588230863 hit the 25-minute wall with
+        # ZERO test failures, and 32519309039 timed out at 62% complete.
+        #
+        # A timeout is not a test result. Blocking a merge on runner weather
+        # trains people to re-run until it passes, which is how a real failure
+        # eventually gets re-run away too. Real failures still fail; only the
+        # infrastructure ceiling moves.
+        #
+        # --durations makes the next slowdown diagnosable from the log instead
+        # of requiring a bisect: if this budget is ever approached again, the
+        # answer should be visible rather than inferred.
+        timeout-minutes: 40
+        run: >-
+          uv run pytest --tb=short -q --timeout=180 --timeout-method=thread
+          --durations=15
         env:
           TELEGRAM_BOT_TOKEN: test
           TELEGRAM_CHAT_ID: test
