@@ -6706,7 +6706,7 @@ class Database:
             raise RuntimeError("Database not initialized.")
         conn = self._conn
         migration_name = "signal_events_indexes_v1"
-        schema_version = 20260821
+        schema_version = 20260822
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
             await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
