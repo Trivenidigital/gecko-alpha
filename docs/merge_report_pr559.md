@@ -102,6 +102,35 @@ each returns terminal.
 | `coverage_intervals=None` falls back to a global floor | Latent: no runtime caller outside the ops script, which always passes explicit intervals. |
 | Post-archive rows can never be covered | Named in the runbook and counted as `unarchivable` in both the payload and the alert text. |
 
+## 5a. A clearance that was WRONG
+
+Recorded at the reviewer's own request, and it matters more to a future reader
+than any single defect here.
+
+The ops-safety slot cleared `6276d586`. That SHA carried a **blocking
+regression**: the collapse alarm's high-water mark could never rise, and
+because the probe is hourly while the backfill is a manual post-deploy step,
+the first observation arms at `0.0` — which makes `rate < best * FRACTION`
+unsatisfiable for every possible rate. Collapse detection dead on every
+surface, from the first pass after deploy. `dark_surfaces` still fires
+pre-backfill, so the operator is not blind at deploy; the moment the backfill
+runs, `dark` clears and the collapse alarm is silently gone.
+
+Their whole battery ran green against that SHA. The reason is structural and
+they evidenced it rather than guessed: **they had found the original defect on
+the *falling* axis — a mark being lowered — so every scenario they built
+afterwards moves the rate down or holds it flat.** Arm then collapse. Arm then
+dilute. Arm, hold, hold, drop. Not one script ever tested a rate *rising*.
+
+That is the same generator as §5b's harness-axis rule, and they were the
+reviewer who taught it to me — one round after filing it against my harness,
+their own battery had exactly the shape they had described. Diagnosing the
+pattern elsewhere bought no protection against it.
+
+**A superseded clearance and a wrong clearance are different things**, and a
+report that records only the former is misleading. Weight the clearances in §4
+accordingly.
+
 ## 5b. Process rules this review produced
 
 These are not observations about this PR. Each cost a blocking round, and
@@ -145,6 +174,16 @@ actually did:
 | the edit never applied | a clean pass, i.e. a survival | `assert old in source` |
 | the edit applied and broke syntax | pytest exits non-zero — indistinguishable from a kill | `ast.parse(mutated)`, and score on `FAILED`, never on `ERROR` |
 | the edit applied, parsed, ran, and did not express the defect | a survival, or a kill by the wrong test | read what the mutation *does*; no automated guard exists |
+
+The resulting harness contract is four items, each catching a different lie:
+
+1. `assert old in source` — the edit never applied;
+2. `ast.parse(mutated)` — the edit applied and broke syntax;
+3. detect on `FAILED`, never on `ERROR` — `errors during collection` is a broken
+   mutant, not a dead one;
+4. **restore on ENTRY, not only in `finally`** — a hard timeout kills the
+   process before cleanup runs. Both of us hit this; between us it left mutants
+   in the working tree four times.
 
 The second is the nastiest, because the file on disk really did change — it
 *looks* applied. The third has no mechanical guard at all: I substituted a
