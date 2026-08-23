@@ -32,12 +32,12 @@ Operations: `docs/runbook_recompute_coverage.md`.
 
 | gate | state | evidence |
 |---|---|---|
-| exact-head CI | green at `33f9de54`; `f26c412f` running at time of writing | first green after the wrapper tests landed |
-| full production replay | 9 revisions, stable | `c1a50e33` … `f26c412f` |
+| exact-head CI | required green at `f7a200cf` (head) — **not yet satisfied at time of writing** | superseded runs cancelled so the runner reaches head |
+| full production replay | 12 revisions, stable | `c1a50e33` … `2fde4cf8` |
 | totals reconcile | 2,891 statuses = 2,891 written = population | `reconciliation_report` |
-| independent reviewers | 4 dispatched, all reached terminal state and re-verified | see §4 |
+| independent reviewers | 4 dispatched; **2 slots lapsed and are re-running** | see §4 |
 
-**Replay result** (unchanged across all nine revisions except one deliberate
+**Replay result** (unchanged across all twelve revisions except one deliberate
 status split):
 
 | status | rows | earns credit |
@@ -75,22 +75,42 @@ same numbers, different code path.
 
 ## 4. Reviewer slots (ruling D)
 
-| vector | last verdict | measured on |
-|---|---|---|
-| structural / concurrency | **CLEAN, terminal** — regression re-run in full, 4/4 mutants | `97365248` |
-| silent failure / observability | **CLEAN, terminal** — 6/6 mutants, two verified as intended-assertion kills | `b90f66fa` |
-| ops safety / evidence integrity | CLEAN — lapsed, production code moved since | `1076f56d` |
-| recompute logic | classification CLEAN, re-executed — lapsed, production code moved since | `89b070ef` |
+**Production code on this branch ends at `2fde4cf8`.** Everything after it is
+documentation (`git diff --name-only 2fde4cf8..HEAD -- scout/ scripts/` is
+empty), so any clearance measured at `1aa81f7e` or later covers the tree that
+will merge.
 
-Two clearances **hold at HEAD** (production code unchanged since, verified by
-`git diff --name-only <sha>..HEAD`). Two **lapsed** under the rule above and were
-re-requested rather than carried forward.
+Lapse status is **computed, not asserted** — for each clearance SHA, is there a
+`scout/` or `scripts/` delta to head, with an ancestry guard so a non-ancestor
+SHA reports invalid rather than reporting a spurious mass revert:
+
+| vector | last verdict | measured on | holds at `f7a200cf`? |
+|---|---|---|---|
+| structural / concurrency | CLEAN — 4/4 mutants, regression re-run in full | `97365248` | **LAPSED** — `scout/db.py` +134/−94 |
+| silent failure / observability | CLEAN — 6/6 mutants, two verified as intended-assertion kills | `b90f66fa` | **LAPSED** — `scout/db.py` +134/−94 |
+| ops safety / evidence integrity | CLEAN, re-executed | SHA being confirmed by the slot | pending |
+| recompute logic | CLEAN — "ship it"; E1 and the `armed_rate` trap closed | `1aa81f7e` | **HOLDS** |
+
+The three commits that lapsed the first two slots are the entire ratchet
+rework — `6276d586` (name the decision), `d831fb56` (name what replaced a
+discarded mark), `2fde4cf8` (**the mark must be able to rise**). The second and
+third of those exist *because* of findings raised after those clearances, which
+is precisely the case ruling D's re-run requirement is for: both slots cleared a
+`scout/db.py` that no longer exists, and one of the intervening commits fixed a
+blocking regression on the silent-failure vector itself (§5a).
+
+**Merge is blocked.** Two slots are re-running against `f7a200cf`; one is
+confirming its SHA. A clearance is not carried forward across a production
+delta, and the implementer's own review never satisfies an independent slot.
+
+### Findings raised and closed, by slot
+
+| vector | findings | fixed at |
+|---|---|---|
+| structural / concurrency | shared-connection laundering; ratchet write moved to its own connection | `97365248` |
 | silent failure / observability | S1–S4, all fixed | `f2847774` |
 | ops safety / evidence integrity | N-1…N-6 + R1–R5, all fixed | `c8b5e009` |
 | recompute logic | nothing blocking; R1 implemented rather than deferred | `47847f47` |
-
-Final verdicts on `f26c412f` requested from all four; merge is blocked until
-each returns terminal.
 
 ## 5. Open residuals, carried deliberately
 
