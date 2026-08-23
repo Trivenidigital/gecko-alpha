@@ -527,6 +527,9 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                   detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
+                  -- Ruling C: prefix-derived rows must be distinguishable
+                  -- from identity-derived ones by every consumer.
+                  chains_identity_semantics, chains_identity_tier,
                   detected_by_social, social_detected_at, social_lead_minutes,
                   is_gap, detected_price, peak_price, peak_gain_pct, created_at
            FROM trending_comparisons

@@ -359,6 +359,9 @@ class Database:
             # tables. Additive; stamps existing rows `legacy_prefix` WITHOUT
             # recomputing their values.
             await self._migrate_chain_identity_semantics_v1()
+            # Not gated by the migration marker: rows written by OLD code
+            # after the migration ran would otherwise keep NULL forever.
+            await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -7758,6 +7761,51 @@ class Database:
             (token_id, created_at, now),
         )
 
+    async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:
+        """Give any unmarked comparison row its `legacy_prefix` stamp.
+
+        The migration is one-shot: once its `paper_migrations` marker exists it
+        early-returns forever. So rows written by OLD code -- during a rollback,
+        say -- land with the columns NULL and the migration will never reach
+        them. NULL then becomes a third, undocumented semantics state that no
+        consumer knows how to read.
+
+        Those rows were produced by prefix semantics, so `legacy_prefix` is the
+        correct stamp. Idempotent and safe to run every startup: the
+        `IS NULL` predicate cannot touch a row already marked `canonical_v1`.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            if not await cur.fetchone():
+                continue
+            cur = await self._conn.execute(f"PRAGMA table_info({table})")
+            if "chains_identity_semantics" not in {r[1] for r in await cur.fetchall()}:
+                continue
+            cur = await self._conn.execute(
+                f"UPDATE {table} SET chains_identity_semantics = ? "
+                f"WHERE chains_identity_semantics IS NULL",
+                (LEGACY_SEMANTICS,),
+            )
+            if cur.rowcount:
+                out[table] = cur.rowcount
+        # Commit UNCONDITIONALLY. An UPDATE that matches zero rows still opens
+        # an implicit transaction, so a `if out:` guard here leaves one dangling
+        # on the shared connection and the NEXT migration's BEGIN EXCLUSIVE dies
+        # with "cannot start a transaction within a transaction". Same shape as
+        # the `if rows:` prune-logging guard: the guard looks like an
+        # optimisation and is actually a correctness bug.
+        await self._conn.commit()
+        return out
+
     async def _migrate_chain_identity_semantics_v1(self) -> None:
         """Version marker for chain-detection identity semantics (ruling C).
 
@@ -7825,6 +7873,7 @@ class Database:
                 )
 
             stamped = {}
+            archived = {}
             for table in tables:
                 cur = await conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -7861,6 +7910,34 @@ class Database:
                 )
                 stamped[table] = cur.rowcount or 0
 
+                # ARCHIVE the legacy rows. The marker alone does NOT satisfy the
+                # ruling, because the trackers do not UPDATE these rows -- they
+                # `DELETE FROM <table> WHERE coin_id = ?` and re-INSERT on every
+                # recompute. Before this change that was value-neutral (same
+                # semantics recomputed); now the recompute writes CANONICAL
+                # values over a legacy row and the original is simply gone.
+                # "An UPDATE that destroys the previous evidence", spelled
+                # DELETE+INSERT.
+                #
+                # The first time `vanar-chain-2` re-enters the 24h gainers
+                # window its +6.07-day fabricated lead disappears -- the single
+                # most valuable falsification artefact the impact study
+                # produced. Snapshotting here, once, before any tracker can
+                # reach it, is what actually preserves the evidence.
+                archive = f"{table}_legacy_prefix_v1"
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (archive,),
+                )
+                if not await cur.fetchone():
+                    await conn.execute(
+                        f"CREATE TABLE {archive} AS SELECT * FROM {table}"
+                    )
+                    cur = await conn.execute(f"SELECT COUNT(*) FROM {archive}")
+                    archived[table] = (await cur.fetchone())[0]
+                else:
+                    archived[table] = -1  # pre-existing; left untouched
+
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                 "VALUES (?, ?)",
@@ -7875,6 +7952,7 @@ class Database:
             _log.info(
                 "chain_identity_semantics_v1_migration_complete",
                 stamped_legacy=stamped,
+                archived_legacy_rows=archived,
             )
         except BaseException as e:
             _log.exception(

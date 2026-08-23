@@ -141,7 +141,10 @@ def classify_candidate(token_id: str, coin_id: str, symbol: str | None) -> str |
     coin = coin_id.strip().lower()
 
     if tok == coin:
-        return TIER_CONTRACT if _is_contract_shaped(token_id) else TIER_CANONICAL_ID
+        # `tok`, not `token_id`: the equality that got us here was on the
+        # normalised value, so the shape test must use it too or a padded /
+        # upper-case address is mislabelled tier 2.
+        return TIER_CONTRACT if _is_contract_shaped(tok) else TIER_CANONICAL_ID
     if sym and tok == sym:
         return TIER_ALIAS_UNIQUE
     return None
@@ -149,6 +152,8 @@ def classify_candidate(token_id: str, coin_id: str, symbol: str | None) -> str |
 
 def is_prefix_only(token_id: str, coin_id: str, symbol: str | None) -> bool:
     """A match the OLD predicate admitted purely on prefix similarity."""
+    if not token_id or not coin_id:
+        return False
     if classify_candidate(token_id, coin_id, symbol) is not None:
         return False
     sym = (symbol or "").strip().lower()
@@ -192,11 +197,24 @@ def resolve(candidates, coin_id: str, symbol: str | None) -> Resolution:
         hits = by_tier.get(tier)
         if not hits:
             continue
-        distinct = {t for _, t in hits}
+        # NORMALISED. Comparing raw token_ids here inverts the guard: tier-3
+        # membership requires `token_id.strip().lower() == symbol.strip().lower()`,
+        # so raw values can differ ONLY by case or whitespace -- i.e. the SAME
+        # asset. `PEPE` and `pepe` would have read as ambiguity and silently lost
+        # a detection the old predicate made, which is the opposite failure to
+        # the one this module exists to fix.
+        distinct = {t.strip().lower() for _, t in hits}
         if tier == TIER_ALIAS_UNIQUE and len(distinct) > 1:
-            # Ambiguous alias is not an identity assertion -> no credit, and do
-            # NOT fall through to a weaker tier: there is no weaker tier that is
-            # still identity.
+            # UNREACHABLE while tier 3 is bare symbol equality: every alias
+            # candidate normalises to the symbol itself, so `distinct` is always
+            # a single element. `test_alias_ambiguity_is_unreachable_by_construction`
+            # asserts that property rather than pretending to exercise this
+            # branch.
+            #
+            # Kept because it becomes live the moment tier 3 is re-sourced from
+            # a real provenance-backed alias table, where two DIFFERENT assets
+            # genuinely can claim one symbol. Deleting it would leave that
+            # future change silently unguarded.
             res.alias_candidates = sorted(distinct)
             res.tier = TIER_UNRESOLVED
             return res

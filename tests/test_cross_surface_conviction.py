@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from types import SimpleNamespace
 
+from scout.identity import CANONICAL_SEMANTICS, LEGACY_SEMANTICS
 from scout.conviction import (
     SURFACE_LEAD_COLUMNS,
     TIER_ORDER,
@@ -29,6 +30,11 @@ def _row(early=(), lead=2000.0, **extra):
     for surface, col in SURFACE_LEAD_COLUMNS.items():
         r[f"detected_by_{surface}"] = 1 if surface in early else 0
         r[col] = lead if surface in early else None
+    # Ruling C: a chains lead only counts as an early-detection claim when it
+    # was derived by canonical identity. These generic scorer tests use `chains`
+    # incidentally, so they default to canonical; the legacy-exclusion
+    # behaviour has its own tests below.
+    r["chains_identity_semantics"] = CANONICAL_SEMANTICS
     r.update(extra)
     return r
 
@@ -122,10 +128,11 @@ def test_works_on_sqlite_row():
     conn.row_factory = sqlite3.Row
     conn.execute(
         "CREATE TABLE t (detected_by_chains INT, chains_lead_minutes REAL, "
-        "detected_by_momentum INT, momentum_lead_minutes REAL)"
+        "detected_by_momentum INT, momentum_lead_minutes REAL, "
+        "chains_identity_semantics TEXT)"
     )
     conn.execute(
-        "INSERT INTO t VALUES (1, 3000.0, 1, 50.0)"
+        "INSERT INTO t VALUES (1, 3000.0, 1, 50.0, ?)", (CANONICAL_SEMANTICS,)
     )  # chains early, momentum late
     row = conn.execute("SELECT * FROM t").fetchone()
     res = cross_surface_conviction(row, _settings())
@@ -175,3 +182,48 @@ def test_real_settings_defaults_smoke():
     )
     assert res.tier == "high"
     assert TIER_ORDER == ("low", "watch", "high")
+
+
+# ---------------------------------------------------------------------------
+# Ruling C: prefix-derived leads earn no early-detection credit
+# ---------------------------------------------------------------------------
+
+
+def test_a_legacy_prefix_chains_lead_earns_no_conviction_credit():
+    """THE live-scoring consequence of prefix matching.
+
+    `vanar-chain-2` carries a +6.07-day (8736 min) lead fabricated by matching
+    the unrelated token `vanar-chain`. That clears the 1440-minute early gate
+    outright and inflates the conviction tier — which is exactly the
+    "early-detection win claim" the ruling says prefix similarity must not
+    determine.
+    """
+    row = _row(early=("chains",), lead=8736.0)
+    row["chains_identity_semantics"] = LEGACY_SEMANTICS
+    res = cross_surface_conviction(row, _settings())
+    assert "chains" not in res.contributing
+    assert res.early_count == 0
+
+
+def test_unknown_semantics_earns_no_credit_either():
+    """NULL is unverified provenance, not a pass. Fail closed."""
+    row = _row(early=("chains",), lead=8736.0)
+    row["chains_identity_semantics"] = None
+    assert cross_surface_conviction(row, _settings()).early_count == 0
+
+
+def test_a_canonical_chains_lead_still_counts():
+    """The gate must not simply disable the surface."""
+    row = _row(early=("chains",), lead=8736.0)
+    row["chains_identity_semantics"] = CANONICAL_SEMANTICS
+    res = cross_surface_conviction(row, _settings())
+    assert "chains" in res.contributing
+    assert res.early_count == 1
+
+
+def test_other_surfaces_are_unaffected_by_chains_semantics():
+    """Only chains came from the prefix predicate; nothing else should change."""
+    row = _row(early=("pipeline", "spikes"), lead=8736.0)
+    row["chains_identity_semantics"] = LEGACY_SEMANTICS
+    res = cross_surface_conviction(row, _settings())
+    assert set(res.contributing) == {"pipeline", "spikes"}

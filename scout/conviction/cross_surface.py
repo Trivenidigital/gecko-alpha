@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from scout.identity import CANONICAL_SEMANTICS
+
 # The 8 independent detection surfaces tracked in gainers_comparisons, mapped to
 # their lead-minutes column. Order is the tie-break order for `contributing`.
 SURFACE_LEAD_COLUMNS: dict[str, str] = {
@@ -91,6 +93,20 @@ def cross_surface_conviction(row, settings) -> ConvictionResult:
     for surface, lead_col in SURFACE_LEAD_COLUMNS.items():
         if not _row_get(row, f"detected_by_{surface}"):
             continue
+        # Ruling C: prefix similarity must not determine EARLY-DETECTION WIN
+        # CLAIMS, and `early_count` is exactly such a claim. A chains lead on a
+        # `legacy_prefix` row was derived by prefix matching, so it earns no
+        # conviction credit here -- a fabricated 6.07-day lead would otherwise
+        # clear the 1440-minute gate outright and inflate the tier.
+        #
+        # Rows whose semantics is unknown (NULL, e.g. written by rolled-back
+        # code) are treated as legacy: unverified provenance must not earn
+        # credit. Other surfaces are unaffected -- their leads never came from
+        # this predicate.
+        if surface == "chains":
+            semantics = _row_get(row, "chains_identity_semantics")
+            if semantics != CANONICAL_SEMANTICS:
+                continue
         lead = _row_get(row, lead_col)
         try:
             lead_val = float(lead)

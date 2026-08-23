@@ -510,6 +510,11 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                   detected_by_narrative, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_lead_minutes,
                   detected_by_chains, chains_lead_minutes,
+                  -- Ruling C: consumers MUST be able to tell prefix-derived
+                  -- rows from identity-derived ones. Without these the
+                  -- columns are write-only and the conviction gate in
+                  -- scout/conviction/cross_surface.py cannot see them.
+                  chains_identity_semantics, chains_identity_tier,
                   detected_by_spikes, spikes_lead_minutes,
                   detected_by_acceleration, acceleration_lead_minutes,
                   detected_by_momentum, momentum_lead_minutes,

@@ -95,21 +95,38 @@ def test_exact_identity_beats_any_older_fuzzy_candidate():
     assert r.first_seen_at == NEW
 
 
-def test_ambiguous_alias_gives_no_detection_credit():
-    """Two DISTINCT tokens claiming one symbol is not an identity assertion.
+def test_case_variants_of_one_token_are_the_SAME_asset_not_ambiguity():
+    """This test previously asserted the OPPOSITE, and was wrong.
 
-    `token_id` is the substrate's primary key, so ambiguity here means
-    case-variant ids -- `BLESS` and `bless` are different rows that both equal
-    the symbol under LOWER(). Rarer than the prefix problem, but the tier is
-    only sound if it refuses the ambiguous case.
+    Review caught it: the ambiguity check compared RAW token_ids while tier-3
+    membership requires `token_id.lower() == symbol.lower()`. So raw values
+    could differ only by case or whitespace -- the same asset -- and `PEPE` vs
+    `pepe` read as ambiguity, silently withdrawing a detection the old
+    predicate made. That is the opposite failure to the one this module fixes.
+
+    I had "fixed" the earlier failure by rewriting the test to match the code
+    instead of asking whether the code was right.
     """
-    # The same token appearing twice is NOT ambiguous.
-    assert resolve([("pepe", OLD), ("pepe", MID)], "unrelated", "PEPE").detected
+    r = resolve([("PEPE", OLD), ("pepe", MID)], "pepe-coin", "PEPE")
+    assert r.detected is True, "case variants of one token were treated as ambiguous"
+    assert r.tier == TIER_ALIAS_UNIQUE
+    assert r.first_seen_at == OLD
 
-    r = resolve([("BLESS", OLD), ("bless", MID)], "some-coin", "BLESS")
-    assert r.detected is False, "an ambiguous symbol earned detection credit"
-    assert r.tier == TIER_UNRESOLVED
-    assert r.alias_candidates == ["BLESS", "bless"]
+
+def test_alias_ambiguity_is_unreachable_by_construction():
+    """Prove the guard is currently dead rather than pretending to exercise it.
+
+    Tier-3 membership is bare symbol equality, so EVERY alias candidate
+    normalises to the symbol itself and `distinct` can never exceed one. The
+    guard is kept for the day tier 3 is re-sourced from a real alias table --
+    where two genuinely different assets can claim one symbol -- but until then
+    no input can trigger it, and a test claiming otherwise would be theatre.
+    """
+    from scout.identity import TIER_ALIAS_UNIQUE as _T, classify_candidate as _c
+
+    for tok in ("PEPE", "pepe", "  pepe  ", "PePe"):
+        assert _c(tok, "unrelated-coin", "PEPE") == _T
+        assert tok.strip().lower() == "pepe"
 
 
 def test_a_prefix_sibling_does_not_make_a_unique_alias_ambiguous():
@@ -274,3 +291,71 @@ async def test_db_path_is_identical_for_short_and_long_symbols(db):
     assert short.tier == TIER_CANONICAL_ID
     assert long_.token_id == "bitcoin"
     assert long_.tier == TIER_CANONICAL_ID
+
+
+# ---------------------------------------------------------------------------
+# Mutants that survived the whole suite until review found them
+# ---------------------------------------------------------------------------
+
+
+def test_earliest_wins_WITHIN_a_tier():
+    """`hits.sort()` -- half the module's stated core rule, previously unpinned.
+
+    Reversing it survived all 113 related tests: nothing anywhere had two
+    same-tier candidates at different timestamps and asserted the earlier won.
+    Tier-before-age is only half the rule; this is the other half.
+    """
+    r = resolve([("bitcoin", MID), ("bitcoin", OLD)], "bitcoin", "BTC")
+    assert r.first_seen_at == OLD
+
+    r2 = resolve([("btc", NEW), ("btc", MID)], "unrelated", "BTC")
+    assert r2.first_seen_at == MID
+
+
+def test_the_prefix_diagnostic_reports_the_EARLIEST_prefix():
+    """`prefix_hits.sort()` -- reversing it understates the headline measurement.
+
+    The diagnostic exists to quantify the fabricated lead the old semantics
+    handed out. Reporting the LATEST prefix instead of the earliest understates
+    exactly the number this PR is built on.
+    """
+    r = resolve(
+        [("vanar-chain-2", NEW), ("vanar-chain", MID), ("vanar", OLD)],
+        "vanar-chain-2",
+        "VANRY",
+    )
+    assert r.first_seen_at == NEW
+    assert r.prefix_first_seen_at == OLD, "the diagnostic understated the fabrication"
+    assert r.prefix_token_id == "vanar"
+
+
+async def test_BOUND_RAW_LT_is_not_the_datetime_bound(db):
+    """The losers bound was defended in prose and pinned by nothing.
+
+    Swapping it for the `datetime(..., '+5 minutes')` form survived the entire
+    suite. The two are NOT interchangeable: raw `<` compares in the same BINARY
+    order the stored value was minimised under, and the +5min form admits rows
+    the raw form excludes.
+    """
+    from scout.identity import BOUND_DATETIME_PLUS_5M, BOUND_RAW_LT
+
+    # A row 2 minutes AFTER the cutoff: inside the +5min tolerance, outside raw.
+    await _seed(db, [("pepe", "2026-08-01T00:02:00+00:00")])
+    cutoff = "2026-08-01T00:00:00+00:00"
+
+    raw = await resolve_chain_first_seen(
+        db._conn, "pepe", "PEPE", cutoff, bound=BOUND_RAW_LT
+    )
+    tol = await resolve_chain_first_seen(
+        db._conn, "pepe", "PEPE", cutoff, bound=BOUND_DATETIME_PLUS_5M
+    )
+    assert raw.detected is False, "raw `<` admitted a row after the cutoff"
+    assert tol.detected is True, "the +5min tolerance excluded a row inside it"
+
+
+async def test_an_unknown_bound_is_refused(db):
+    """The ValueError branch was unexercised; a typo'd bound must not fall back."""
+    with pytest.raises(ValueError, match="unknown bound"):
+        await resolve_chain_first_seen(
+            db._conn, "pepe", "PEPE", NEW, bound="not_a_bound"
+        )
