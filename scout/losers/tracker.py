@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from scout.identity import (
+    BOUND_RAW_LT,
+    CANONICAL_SEMANTICS,
+    resolve_chain_first_seen,
+)
+
 if TYPE_CHECKING:
     from scout.db import Database
 
@@ -180,26 +186,35 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
         # Option F: consumers must stop depending on unbounded
         # signal_events history, so retention stops silently moving
         # the derived minimum forward.
-        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
-        if len(symbol) >= 4:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                          OR LOWER(token_id) LIKE LOWER(? || '%')
-                          OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND first_seen_at < ?""",
-                (coin_id, symbol, symbol, coin_id, first_loser_at_str),
+        # Ruling C: resolved by ASSET IDENTITY, not prefix similarity.
+        # BOUND_RAW_LT preserves this surface's bare `first_seen_at < ?`
+        # deliberately -- it compares in the same BINARY order the stored value
+        # was minimised under, so aggregation and filter agree by construction.
+        # Wrapping it in datetime() to match the other surfaces would be a
+        # silent behaviour change, not a cleanup.
+        res = await resolve_chain_first_seen(
+            db._conn,
+            coin_id,
+            symbol,
+            first_loser_at_str,
+            prefix_diagnostic=len(symbol) >= 4,
+            bound=BOUND_RAW_LT,
+        )
+        comp["chains_identity_semantics"] = CANONICAL_SEMANTICS
+        comp["chains_identity_tier"] = res.tier
+        if res.prefix_would_have_credited_more:
+            logger.info(
+                "chain_identity_prefix_discarded",
+                surface="losers",
+                coin_id=coin_id,
+                symbol=symbol,
+                resolved_tier=res.tier,
+                resolved_token=res.token_id,
+                discarded_prefix_token=res.prefix_token_id,
+                discarded_prefix_first_seen=res.prefix_first_seen_at,
             )
-        else:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND first_seen_at < ?""",
-                (coin_id, symbol, first_loser_at_str),
-            )
-        sig_row = await cursor.fetchone()
-        if sig_row and sig_row[0]:
-            sig_at = _parse_dt(sig_row[0])
+        if res.detected:
+            sig_at = _parse_dt(res.first_seen_at)
             lead = (first_loser_at - sig_at).total_seconds() / 60.0
             comp["detected_by_chains"] = 1
             comp["chains_lead_minutes"] = round(lead, 1)
@@ -235,8 +250,9 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
                 detected_by_pipeline, pipeline_lead_minutes,
                 detected_by_chains, chains_lead_minutes,
                 detected_by_spikes, spikes_lead_minutes,
-                is_gap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_gap,
+                chains_identity_semantics, chains_identity_tier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -252,6 +268,8 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
                 comp["detected_by_spikes"],
                 comp["spikes_lead_minutes"],
                 comp["is_gap"],
+                comp.get("chains_identity_semantics"),
+                comp.get("chains_identity_tier"),
             ),
         )
     await db._conn.commit()

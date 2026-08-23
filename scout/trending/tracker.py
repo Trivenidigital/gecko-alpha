@@ -8,6 +8,11 @@ from typing import TYPE_CHECKING, Optional
 import aiohttp
 import structlog
 
+from scout.identity import (
+    CANONICAL_SEMANTICS,
+    resolve_chain_first_seen,
+)
+
 from scout import cg_api
 from scout.coingecko_budget import BUCKET_DISCOVERY
 from scout.ingestion.coingecko import _get_with_backoff
@@ -272,52 +277,42 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
             comp.pipeline_lead_minutes = lead
             comp.is_gap = False
 
-        # 2c. Check signal_events table (chain signals)
-        # Match on coin_id (CoinGecko slug) exactly, or symbol via LIKE prefix
-        # to handle cases like token_id="bless" matching coin_id="bless-network".
-        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
-        if len(symbol) >= 4:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                          OR LOWER(token_id) LIKE LOWER(? || '%')
-                          OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, symbol, coin_id, first_trending_at_str),
+        # 2c. Chain-signal detection, resolved by ASSET IDENTITY (ruling C).
+        #
+        # ONE path for every symbol length. The previous `len(symbol) >= 4`
+        # split is what let the short-symbol branch ship un-migrated in #555:
+        # one function derived first-seen from two different historical
+        # boundaries depending on how many characters a ticker had, and neither
+        # site looked wrong on its own. Length now only narrows the DIAGNOSTIC.
+        res = await resolve_chain_first_seen(
+            db._conn,
+            coin_id,
+            symbol,
+            first_trending_at_str,
+            prefix_diagnostic=len(symbol) >= 4,
+        )
+        comp.chains_identity_semantics = CANONICAL_SEMANTICS
+        comp.chains_identity_tier = res.tier
+        if res.prefix_would_have_credited_more:
+            logger.info(
+                "chain_identity_prefix_discarded",
+                surface="trending",
+                coin_id=coin_id,
+                symbol=symbol,
+                resolved_tier=res.tier,
+                resolved_token=res.token_id,
+                discarded_prefix_token=res.prefix_token_id,
+                discarded_prefix_first_seen=res.prefix_first_seen_at,
             )
-            sig_row = await cursor.fetchone()
-            if sig_row and sig_row[0]:
-                sig_at = _parse_dt(sig_row[0])
-                lead_ = (first_trending_at - sig_at).total_seconds() / 60.0
-                if lead_ < 0:
-                    lead_ = 0
-                comp.detected_by_chains = True
-                comp.chains_detected_at = sig_at
-                comp.chains_lead_minutes = lead_
-                comp.is_gap = False
-        else:
-            # Option F: the SHORT-symbol branch must read the same derived
-            # substrate the >= 4 branch does. It was missed in the original
-            # migration, which left one function deriving first-seen from two
-            # different historical boundaries depending on symbol LENGTH --
-            # strictly harder to detect than the uniform retention coupling the
-            # substrate exists to remove, because nothing looks wrong at either
-            # site. Short symbols are not a marginal path: BTC, ETH, SOL, XRP,
-            # BNB, ADA all land here.
-            detected, detected_at, lead = await _check_detector(
-                db,
-                "signal_first_seen",
-                "token_id",
-                coin_id,
-                symbol,
-                first_trending_at_str,
-                symbol_col="token_id",
-            )
-            if detected:
-                comp.detected_by_chains = True
-                comp.chains_detected_at = detected_at
-                comp.chains_lead_minutes = lead
-                comp.is_gap = False
+        if res.detected:
+            sig_at = _parse_dt(res.first_seen_at)
+            lead_ = (first_trending_at - sig_at).total_seconds() / 60.0
+            if lead_ < 0:
+                lead_ = 0
+            comp.detected_by_chains = True
+            comp.chains_detected_at = sig_at
+            comp.chains_lead_minutes = lead_
+            comp.is_gap = False
 
         # 2d. Check social_signals table (LunarCrush 4th tier)
         detected, detected_at, lead = await _check_detector(
@@ -377,8 +372,10 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                 detected_by_chains, chains_detected_at, chains_lead_minutes,
                 detected_by_social, social_detected_at, social_lead_minutes,
-                is_gap, detected_price, peak_price, peak_gain_pct)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_gap, detected_price, peak_price, peak_gain_pct,
+                chains_identity_semantics, chains_identity_tier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?)""",
             (
                 comp.coin_id,
                 comp.symbol,
@@ -416,6 +413,8 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 det_price,
                 old_peak,
                 old_peak_pct,
+                comp.chains_identity_semantics,
+                comp.chains_identity_tier,
             ),
         )
     await db._conn.commit()

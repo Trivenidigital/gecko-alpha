@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 import aiosqlite
 import structlog
 
+from scout.identity import LEGACY_SEMANTICS
+
 _db_log = structlog.get_logger(__name__)
 
 
@@ -353,6 +355,10 @@ class Database:
             # Retention option F: derived first-seen substrate, so
             # consumers stop depending on unbounded signal_events history.
             await self._migrate_signal_first_seen_v1()
+            # Ruling C: identity-semantics version marker on the comparison
+            # tables. Additive; stamps existing rows `legacy_prefix` WITHOUT
+            # recomputing their values.
+            await self._migrate_chain_identity_semantics_v1()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -7751,6 +7757,137 @@ class Database:
                  updated_at = excluded.updated_at""",
             (token_id, created_at, now),
         )
+
+    async def _migrate_chain_identity_semantics_v1(self) -> None:
+        """Version marker for chain-detection identity semantics (ruling C).
+
+        Prefix similarity is not identity, so it stops determining
+        ``detected_by_chains`` / ``chains_lead_minutes``. But historical
+        lead-time evidence must NOT be rewritten in place -- an UPDATE would
+        destroy the very numbers a later analysis needs to judge the change. So
+        each comparison row records WHICH semantics produced it:
+
+          * existing rows -> ``legacy_prefix``, a marker ONLY; their values are
+            left exactly as they were.
+          * rows written from now on -> ``canonical_v1``, plus the identity tier
+            that resolved them.
+
+        Recomputing history under the new semantics is allowed later, but only
+        as a distinct derived dataset carrying its own version -- never as an
+        in-place overwrite of this one.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_semantics_v1"
+        schema_version = 20260824
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_semantics_v1_migration_skip_already_applied")
+                return
+
+        tables = ("gainers_comparisons", "losers_comparisons", "trending_comparisons")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_semantics_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            stamped = {}
+            for table in tables:
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                if not await cur.fetchone():
+                    continue
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in await cur.fetchall()}
+                for col in ("chains_identity_semantics", "chains_identity_tier"):
+                    if col in cols:
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="skip_exists",
+                        )
+                    else:
+                        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="added",
+                        )
+                # Marker ONLY. Deliberately does not touch detected_by_chains,
+                # chains_lead_minutes or any other evidence column.
+                cur = await conn.execute(
+                    f"UPDATE {table} SET chains_identity_semantics = ? "
+                    f"WHERE chains_identity_semantics IS NULL",
+                    (LEGACY_SEMANTICS,),
+                )
+                stamped[table] = cur.rowcount or 0
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "chain_identity_semantics_v1_migration_complete",
+                stamped_legacy=stamped,
+            )
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_semantics_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
 
     async def _migrate_signal_first_seen_v1(self) -> None:
         """Derived first-seen substrate for signal_events (retention option F).

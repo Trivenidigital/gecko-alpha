@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from scout.identity import (
+    CANONICAL_SEMANTICS,
+    resolve_chain_first_seen,
+)
+
 if TYPE_CHECKING:
     from scout.db import Database
 
@@ -275,36 +280,46 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             comp["pipeline_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
 
-        # Check the DERIVED first-seen substrate (chain signals).
-        # Option F: consumers must stop depending on unbounded
-        # signal_events history, so retention stops silently moving
-        # the derived minimum forward.
-        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
-        if len(symbol) >= 4:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                          OR LOWER(token_id) LIKE LOWER(? || '%')
-                          OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, symbol, coin_id, first_gainer_at_str),
-            )
-        else:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, first_gainer_at_str),
-            )
-        sig_row = await cursor.fetchone()
-        if sig_row and sig_row[0]:
-            sig_at = _parse_dt(sig_row[0])
+        # Chain-signal detection, resolved by ASSET IDENTITY (ruling C).
+        #
+        # Option F moved this off unbounded signal_events history; ruling C
+        # stops prefix similarity deciding who it belongs to. Prefix matching
+        # survives only as a diagnostic -- `re` must never again be credited as
+        # `real-world-apparel` merely because it is a prefix and older.
+        #
+        # Symbol length no longer branches the truth path. That split was itself
+        # a defect: it derived first-seen from two different historical
+        # boundaries depending on how many characters a ticker had.
+        res = await resolve_chain_first_seen(
+            db._conn,
+            coin_id,
+            symbol,
+            first_gainer_at_str,
+            prefix_diagnostic=len(symbol) >= 4,
+        )
+        comp["chains_identity_semantics"] = CANONICAL_SEMANTICS
+        comp["chains_identity_tier"] = res.tier
+        if res.detected:
+            sig_at = _parse_dt(res.first_seen_at)
             lead = (first_gainer_at - sig_at).total_seconds() / 60.0
             if lead < 0:
                 lead = 0  # detected after, but within tolerance window
             comp["detected_by_chains"] = 1
             comp["chains_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
+        if res.prefix_would_have_credited_more:
+            # The fabricated lead the old semantics handed out, measured rather
+            # than asserted. Not written to any truth column.
+            logger.info(
+                "chain_identity_prefix_discarded",
+                surface="gainers",
+                coin_id=coin_id,
+                symbol=symbol,
+                resolved_tier=res.tier,
+                resolved_token=res.token_id,
+                discarded_prefix_token=res.prefix_token_id,
+                discarded_prefix_first_seen=res.prefix_first_seen_at,
+            )
 
         # Check volume_spikes table
         cursor = await db._conn.execute(
@@ -416,9 +431,10 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 detected_by_slow_burn, slow_burn_lead_minutes,
                 detected_by_velocity, velocity_lead_minutes,
                 is_gap, detected_price, peak_price, peak_gain_pct,
-                entry_basis_price, entry_basis_at)
+                entry_basis_price, entry_basis_at,
+                chains_identity_semantics, chains_identity_tier)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -447,6 +463,11 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 comp["peak_gain_pct"],
                 comp["entry_basis_price"],
                 comp["entry_basis_at"],
+                # Ruling C: which semantics produced the chain columns on THIS
+                # row. Historical rows carry `legacy_prefix` and are never
+                # recomputed in place.
+                comp.get("chains_identity_semantics"),
+                comp.get("chains_identity_tier"),
             ),
         )
     await db._conn.commit()
