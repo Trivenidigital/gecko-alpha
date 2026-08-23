@@ -141,6 +141,9 @@ STATES = [
 
 
 @pytest.mark.parametrize(
+    "clear_succeeds", [True, False], ids=["clear-ok", "clear-starved"]
+)
+@pytest.mark.parametrize(
     "label,population,recovered,mark,overlay_version,overlay_status",
     STATES,
     ids=[s[0] for s in STATES],
@@ -154,6 +157,7 @@ async def test_both_layers_reach_the_same_verdict(
     mark,
     overlay_version,
     overlay_status,
+    clear_succeeds,
 ):
     """One database, two implementations, one verdict.
 
@@ -171,12 +175,31 @@ async def test_both_layers_reach_the_same_verdict(
     await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     await db._conn.commit()
 
-    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    # The RUNTIME axis. Every state above varies the DATABASE; the discriminating
+    # variable for a whole class of divergence is whether a best-effort write
+    # SUCCEEDED, which is orthogonal to all of them. Without this the harness
+    # held the exact data state that diverges and still could not see it -- a
+    # "both layers agree" harness cannot cover a component whose behaviour
+    # depends on the outcome of a write unless it varies that outcome.
+    from scout.db import Database as _Db
+
+    original = _Db._clear_coverage_baseline
+    if not clear_succeeds:
+
+        async def _starved(_self, _table):
+            return False
+
+        _Db._clear_coverage_baseline = _starved
+    try:
+        probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    finally:
+        _Db._clear_coverage_baseline = original
     probe_pages = bool(probe["not_recovering"])
     checker_pages = _checker_pages(db._db_path)
 
     assert probe_pages == checker_pages, (
-        f"{label}: probe {'pages' if probe_pages else 'is quiet'} while the "
+        f"{label} [clear {'ok' if clear_succeeds else 'starved'}]: probe "
+        f"{'pages' if probe_pages else 'is quiet'} while the "
         f"checker {'pages' if checker_pages else 'is quiet'} — the two windows "
         "an operator has onto this system disagree"
     )

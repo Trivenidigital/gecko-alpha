@@ -8143,6 +8143,54 @@ class Database:
         ("trending_comparisons", "appeared_on_trending_at"),
     )
 
+    async def _classify_coverage_mark(
+        self, source_table: str, row, pop: int
+    ) -> tuple[str, float | None]:
+        """Decide what to do with a stored high-water mark. Three outcomes.
+
+        Exists so the caller cannot forget an arm. The clear is best-effort, so
+        "this mark should go" and "this mark is gone" are DIFFERENT states, and
+        collapsing them is what produced three separate defects at this seam.
+
+          ``rearm``                   -- no usable mark; record today's rate.
+          ``incomparable_unresolved`` -- it should go, but the DELETE failed and
+                                         it is still there. Judge nothing.
+          ``compare``                 -- comparable; run the collapse check.
+
+        The incomparability test is a TRANSITION: the recorded population is
+        below twice the judging floor AND today's is more than double it. The
+        first half is the comparability claim -- a handful of rows is not
+        comparable to a thousand -- and the second is what stops it being a
+        standing state that re-arms every pass.
+        """
+        if row is None:
+            return "rearm", None
+
+        best, recorded_pop = row[0], row[1]
+        incomparable = (
+            recorded_pop < _COLLAPSE_MIN_POPULATION * 2 and pop > recorded_pop * 2
+        )
+        if not incomparable:
+            return "compare", best
+
+        if not await self._clear_coverage_baseline(source_table):
+            return "incomparable_unresolved", best
+
+        # ANNOUNCE it. A cleared mark is the single event that can disarm this
+        # alarm, and the clear used to succeed silently -- only its failure
+        # logged. An automated action that undoes established state says so at
+        # the write site.
+        import structlog
+
+        structlog.get_logger().warning(
+            "recompute_coverage_baseline_cleared",
+            source_table=source_table,
+            discarded_rate=round(best, 4),
+            discarded_population=recorded_pop,
+            current_population=pop,
+        )
+        return "rearm", None
+
     async def _clear_coverage_baseline(self, source_table: str) -> bool:
         """Drop a mark deemed incomparable, on its own connection.
 
@@ -8450,101 +8498,36 @@ class Database:
                 (table,),
             )
             row = await cur.fetchone()
-            best = row[0] if row else None
-            # A mark measured against a much SMALLER population is not
-            # comparable to today's. The rate is a ratio, so a transiently
-            # small sample can carry a high one -- and then a return to the
-            # normal population reads as a collapse. That false page is how a
-            # brand-new alarm earns a mute in its first week. Treat such a mark
-            # as absent and let this observation re-establish it.
-            #
-            # Gated on the RECORDED population being small, NOT on the ratio
-            # between it and today's. The motivation is that the FIRST
-            # observation can land while the population is transiently small --
-            # mid-migration, mid-backfill -- and a rate measured on a handful
-            # of rows is not comparable to one measured on a thousand.
-            #
-            # Written as `row[1] * 2 < pop` it fired on ordinary GROWTH, and
-            # discarding the mark falls into the write branch below, which
-            # upserts unconditionally. So a population that merely doubled
-            # re-baselined the mark DOWNWARD at today's diluted rate:
-            # measured 0.60 -> 0.36 on a 100 -> 250 growth, after which a real
-            # collapse to 0.184 rode underneath the downgraded mark and did not
-            # page -- while it would have paged against the original 0.60.
-            #
-            # "Never lowered" is the invariant this whole ratchet rests on, and
-            # the guard added to prevent false pages was the one thing that
-            # broke it. Trending is where it bites first: it oscillates around
-            # the sub-20 floor, so it doubles routinely.
-            #
-            # STILL ONE-SIDED: this does not cover population SHRINKAGE, where
-            # the surviving remainder is not a random sample and the rate can
-            # fall for benign reasons. That is a separate open question -- do
-            # not read this guard as though it covers it.
-            # A TRANSITION, not a standing state. `recorded < floor * 2`
-            # alone is a property of the recorded population, so for a surface
-            # whose population is stable in [20, 40) it is true on EVERY pass:
-            # clear, re-arm at today's rate, never reach the collapse check.
-            # Measured -- a stable 30-row surface collapsing 0.8 -> 0.1 was
-            # silent, while reporting `rate_judged: True`, which is the field
-            # that exists to say a surface IS being watched.
-            #
-            # And the dead band starts immediately above the judging floor, so
-            # it lands on the surface already identified as most exposed:
-            # trending oscillates around 20.
-            #
-            # `pop > row[1] * 2` restores the docstring's actual claim -- a
-            # rate measured on a handful of rows is not comparable to one
-            # measured on a thousand -- by requiring the larger population to
-            # have actually arrived.
-            if (
-                row is not None
-                and row[1] < _COLLAPSE_MIN_POPULATION * 2
-                and pop > row[1] * 2
-            ):
-                # EXPLICIT delete, not `best = None` alone. With MAX at the
-                # write, clearing the local variable no longer lowers anything
-                # -- so the deliberate re-arm has to say so. This is the one
-                # place a mark is allowed to fall, and it is a decision rather
-                # than a side effect.
-                # Only forget the mark if the DELETE actually happened. The
-                # clear is best-effort (2s give-up under contention), so
-                # nulling `best` unconditionally meant a starved clear left the
-                # old mark in the table while the probe proceeded as though it
-                # were gone -- taking the write branch, skipping the collapse
-                # check entirely, and reporting `collapsed: []` while the
-                # watchdog, which reads the table, paged COLLAPSED against the
-                # surviving mark. Probe quiet, Telegram screaming, on the same
-                # database.
-                if await self._clear_coverage_baseline(table):
-                    best = None
-                    # ANNOUNCE it. A cleared mark is the single event that can
-                    # disarm this alarm, and until now the clear succeeded
-                    # SILENTLY -- only its failure logged. Per the project's
-                    # own rule, an automated action that undoes established
-                    # state says so at the write site. This is also what makes
-                    # the next escape hatch visible on its first pass instead
-                    # of requiring someone to construct the state.
-                    import structlog
 
-                    structlog.get_logger().warning(
-                        "recompute_coverage_baseline_cleared",
-                        source_table=table,
-                        discarded_rate=round(row[0], 4),
-                        discarded_population=row[1],
-                        current_population=pop,
-                    )
+            # THREE outcomes, named, and every one handled. This was a chain of
+            # `if`s over a `best` variable that the clear mutated -- and the
+            # clear is BEST-EFFORT, two outcomes, with the surrounding code
+            # written for one. Three separate defects came out of that single
+            # shape: the payload claiming a mark the write never stored; the
+            # probe forgetting a mark the starved clear left behind; and then
+            # the starved case judging AGAINST the very mark the guard had just
+            # declared incomparable -- inverting the guard's purpose and turning
+            # a lock race into an operator page.
+            #
+            # Each fix corrected the arm it was looking at and left the other,
+            # which is why the count kept rising by one. Naming the decision
+            # makes the unhandled arm unrepresentable instead of merely
+            # currently-handled.
+            decision, best = await self._classify_coverage_mark(table, row, pop)
             v["rate"] = round(rate, 4)
-            if best is None or rate > best:
-                # Report what the TABLE holds, from the write's own result --
-                # not what this observation intended. The write is
-                # best-effort: under a held write lock it gives up after 2s,
-                # and assigning `best_rate` before attempting it made the
-                # payload claim an armed ratchet at a value that was never
-                # stored. The out-of-process alarm said NOT ARMED at the same
-                # instant, so the component with LESS information was the
-                # honest one -- and the probe's version reads as health rather
-                # than as a gap, which is the worse direction to be wrong in.
+
+            if decision == "incomparable_unresolved":
+                # Incomparable AND still present: the DELETE lost a lock race.
+                # Do NOT judge against it -- that is precisely the false page
+                # the guard exists to prevent, and the read-only checker
+                # already handles this case by skipping. Say the pass was
+                # skipped rather than leaving it silently unjudged.
+                v["best_rate"] = round(row[0], 4)
+                v["mark_written"] = False
+                v["comparison_skipped"] = "incomparable_mark_not_cleared"
+                continue
+
+            if decision == "rearm":
                 stored = await self._record_coverage_baseline(table, rate, pop)
                 v["mark_written"] = stored is not None
                 v["best_rate"] = (
@@ -8552,7 +8535,7 @@ class Database:
                     if stored is not None
                     else (round(best, 4) if best is not None else None)
                 )
-            else:
+            else:  # "compare"
                 v["mark_written"] = False
                 v["best_rate"] = round(best, 4)
                 if rate < best * _COLLAPSE_FRACTION:

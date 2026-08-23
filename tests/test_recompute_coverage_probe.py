@@ -1128,9 +1128,16 @@ async def test_a_STARVED_clear_does_not_make_the_probe_disagree_with_the_table(d
     assert stored == 0.88, "fixture did not leave the mark in the table"
     assert v["best_rate"] == 0.88, "the payload forgot a mark the table still holds"
     assert v["mark_written"] is False
-    assert probe["collapsed_surfaces"] == [
-        "gainers_comparisons"
-    ], "the probe skipped the collapse check against a mark that survived"
+
+    # SKIP, do not judge. This previously demanded a PAGE, which was the
+    # wrong direction: the guard had already declared this mark
+    # incomparable, so judging against it is exactly the false page the
+    # guard exists to prevent -- inverted by a lost lock race, which is not
+    # a condition any operator can reason about. The read-only checker
+    # already handles this by skipping; the probe now matches it, and says
+    # why rather than leaving the pass silently unjudged.
+    assert probe["collapsed_surfaces"] == []
+    assert v["comparison_skipped"] == "incomparable_mark_not_cleared"
 
 
 async def test_the_clear_reports_FAILURE_from_its_own_handler(tmp_path):
