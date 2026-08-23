@@ -104,6 +104,15 @@ missing until it cost us:
 2. `git merge-base --is-ancestor <sha> HEAD` — ancestry guard
 3. compare `<sha>:scout` and `<sha>:scripts` tree hashes against head's
 
+**"It landed" is a property of a commit; "you can see it" is a property of a
+revision's ancestry.** A reviewer grepped a head for a section I had just
+committed and correctly reported it absent — the commit existed and was not
+reachable from the revision they were reviewing. Neither of us was wrong; we
+were describing different properties. This is the same shape as the clearance
+rule itself (a clearance is a property of a revision, not of a branch) and the
+same shape as preferring a tree hash to a diff read. It costs nothing to state
+and it is what will bite whoever inherits this on a branchy history.
+
 Step 2 catches *wrong branch named* and is **silent** on *right branch, stale
 ref*. The ops reviewer found the first spelling (`origin/HEAD` resolving to
 `origin/master`, producing a false LAPSED reporting 3,546 deletions) and fixed
