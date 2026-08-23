@@ -80,6 +80,7 @@ number to appear in the table below.
 | 20260821 | cg_credit_ledger_v1 | durable CoinGecko monthly-credit accounting (attempts vs billable credits, per envelope); additive, no backfill |
 | 20260822 | signal_events_indexes_v1 | drop `idx_sig_events_type` (466 MB dead index), add `signal_events(created_at)`; index-only, no VACUUM bundled |
 | 20260823 | signal_first_seen_v1 | derived first-seen substrate (`signal_first_seen`) + grouped backfill, so consumers stop deriving `MIN(created_at)` from `signal_events` and are decoupled from its retention (ruling F) |
+| 20260824 | chain_identity_semantics_v1 | `chains_identity_semantics` + `chains_identity_tier` on the three comparison tables; stamps existing rows `legacy_prefix` as a MARKER ONLY, never recomputing their values (ruling C) |
 
 ## Notes / gaps
 
