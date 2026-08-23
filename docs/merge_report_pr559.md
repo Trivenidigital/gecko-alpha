@@ -232,6 +232,51 @@ that document first.** I wrote a comment naming trending as oscillating around
 20, then shipped a dead band starting at exactly 20. The evidence was already in
 hand, which is precisely why it went unread.
 
+## 5c. The axis inventory — a step, not a principle
+
+Both reviewers and I independently articulated "a matrix built from the code's
+axes cannot see a failure on a different axis", credited it, and wrote it
+down — and then each of us built the *next* artefact from the axis of the bug
+we happened to have in hand. **The principle did not transfer.** It was
+understood by everyone and prevented nothing.
+
+What transferred was a step, contributed by the ops reviewer after their own
+clearance turned out to be wrong:
+
+> **Axis inventory.** List every scenario in the battery as
+> `start-state -> end-state`. Sort by direction. If every row moves the same
+> way, the battery has one axis and the clearance is worth one axis. Then write
+> down the directions with NO row — rising, flat, absent, first-ever-observation
+> — and add one scenario per missing direction **before** clearing.
+
+Their ratchet battery was four rows: `0.8→0.184`, `0.184→0.04`,
+`0.8→0.8→0.8→0.1`, `0.92→0.30`. All falling or flat. Zero rising, zero
+first-observation. **The regression lived in both empty columns.** Two minutes,
+mechanical, and neither of us managed it by noticing.
+
+Run against this PR's probe battery, the same inventory gives:
+
+| direction | rows |
+|---|---|
+| falling | 7 |
+| flat | 2 |
+| **rising** | 1 — `test_the_mark_RISES_when_recovery_improves`, added *by the fix* |
+| **first observation** | 1 — `test_the_production_deploy_ORDER_does_not_freeze_the_mark`, added *by the fix* |
+| population growth | 2 |
+| **population shrinkage** | **0** |
+
+The two columns that were empty are exactly where the dead alarm lived. The one
+still empty — shrinkage — maps to the recorded residual about a non-random
+surviving population, so it is a known open question rather than an untested
+behaviour. That is what an inventory buys: it distinguishes "not covered" from
+"covered by a decision".
+
+The general form, which is why this section exists at all: **an artefact that
+is executable starts working immediately; one that is a principle does not
+work at all.** The four-item harness contract caught things within the hour.
+"Watch out for axis blindness" caught nothing until a reviewer found the dead
+alarm.
+
 ## 6. What this review actually cost, and why
 
 29 commits for one feature is not a good ratio, and the reason is worth
@@ -264,3 +309,19 @@ Three recurring failure shapes in my own work:
 **CI caught two defects my machine structurally could not**, because the shell
 wrapper tests skip on win32. Both were in the alarm that exists precisely
 because nothing on that box reads journald.
+
+---
+
+## 7. What actually made this work
+
+Four vectors meant no single blind spot was load-bearing. But the structure is
+not what found the defects — **disclosure** is. Two reviewers audited their own
+tooling only because someone else disclosed a flaw in theirs first. A reviewer
+asked that their own clearance be recorded as *wrong* rather than superseded. I
+said "my fix caused this" six times, and the framing that predicted five of the
+six seam defects came out of saying it.
+
+None of that is structurally forced. A successor copying the four-vector shape
+without it gets four reviewers agreeing with each other.
+
+*(closing observation contributed by the ops-safety reviewer)*
