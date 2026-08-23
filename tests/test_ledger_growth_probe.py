@@ -405,3 +405,38 @@ def test_empty_string_is_refused_not_silently_treated_as_now():
 
     with pytest.raises(ValueError):
         _normalise_emitted_at("")
+
+
+@pytest.mark.parametrize(
+    "raw,expect_raise,why",
+    [
+        ("2026-08-23", True, "bare date"),
+        ("20260823", True, "compact bare date"),
+        ("  2026-08-23  ", True, "bare date, padded"),
+        ("2026-W34-1", True, "ISO week date — still a date with no time"),
+        ("2026-08-23T00:00:00+00:00", False, "genuine midnight, explicit offset"),
+        ("2026-08-23 00:00:00", False, "genuine midnight, space separator"),
+        ("2026-08-23T00:00:00", False, "genuine midnight, naive"),
+        ("2026-08-23T00:00:00Z", False, "genuine midnight, Z suffix"),
+        ("2026-08-23T00:00", False, "HH:MM only, at midnight"),
+        ("20260823T000000", False, "COMPACT but carries a time component"),
+        ("20260823T120000", False, "compact, noon"),
+        ("2026-08-23T12:00:00+00:00", False, "ordinary"),
+    ],
+)
+def test_bare_date_guard_in_both_directions(raw, expect_raise, why):
+    """The guard is two conditions where one might do, so pin both directions.
+
+    It sits on the ledger write path: a false REFUSAL drops a row, and a false
+    ACCEPT reintroduces the midnight hazard. The dangerous confusion is between
+    "midnight because no time was supplied" and "midnight because that is the
+    actual instant" — the second must always be accepted.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    if expect_raise:
+        with pytest.raises(ValueError):
+            _normalise_emitted_at(raw)
+    else:
+        out = _normalise_emitted_at(raw)
+        assert "T" in out and out.endswith("+00:00"), why
