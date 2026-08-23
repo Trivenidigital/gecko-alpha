@@ -80,8 +80,11 @@ same numbers, different code path.
 
 ## 4. Reviewer slots (ruling D)
 
-**Production code on this branch ends at `2fde4cf8`.** Everything after it is
-documentation. Stated as the corrected rule rather than the name-level one:
+**Production code on this branch ends at `2fde4cf8`.** The delta above it is
+`docs/merge_report_pr559.md` and `backlog.md` — two files, one of which is not
+under `docs/`, so "documentation only" is the loose phrasing and the exact claim
+is *no `scout/` or `scripts/` delta*. Stated as the corrected rule rather than
+the name-level one:
 `git merge-base --is-ancestor <sha> HEAD` for the ancestry guard, then
 `git rev-parse <sha>:scout` and `<sha>:scripts` compared to head's. Name-level
 diffing misses a file restored to the wrong baseline; tree hashes cannot.
@@ -305,6 +308,16 @@ did, and the fourth by a reviewer turning the third against their own sweep:
 | the edit applied and broke syntax | pytest exits non-zero — indistinguishable from a kill | `ast.parse(mutated)`, and score on `FAILED`, never on `ERROR` |
 | the edit applied, parsed, ran, and did not express the defect | a survival, or a kill by the wrong test | read what the mutation *does*; no automated guard exists |
 | the mutant died for a reason that is **not** the defect it is named for | a clean kill — nothing in the output looks wrong | check the mutant fails *the way the defect failed* |
+
+**Read row four first.** The rows are in discovery order, but the concurrency
+reviewer's ranking is the useful one for a successor: rows one to three produce
+mutants that are *visibly* wrong once you read the output. Row four produces one
+that looks right. A false result that reads as a genuine kill is the one that
+survives review — and both reviewers hit it against their own instruments within
+the same hour, on different vectors, which says the generator is the instrument
+rather than the operator. That is the argument for a discriminating negative
+control being mandatory rather than good practice: a detector that only ever
+says "clean" has not been shown to be able to say anything else.
 
 **The fourth row is a different kind of lie.** Rows one to three produce false
 *kills* or false survivals. The fourth is a genuine kill that is a false
