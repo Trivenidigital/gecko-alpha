@@ -1,7 +1,7 @@
 # Merge report — PR #559, versioned legacy-provenance recomputation
 
-**Candidate:** `89b070ef` · **Base:** `master` · 31 commits, 35 files,
-12 new test files.
+**Candidate:** `b34e41b4` · **Base:** `origin/master` (`f05dd47f`) · 56 commits, 36 files,
+13 new test files. Branch is **0 behind / 56 ahead** — no rebase pending.
 
 Every cleared item below records **the SHA it was measured on**. That is not
 bookkeeping: across nine revisions, four reviewer clearances were invalidated by
@@ -76,9 +76,17 @@ same numbers, different code path.
 ## 4. Reviewer slots (ruling D)
 
 **Production code on this branch ends at `2fde4cf8`.** Everything after it is
-documentation (`git diff --name-only 2fde4cf8..HEAD -- scout/ scripts/` is
-empty), so any clearance measured at `1aa81f7e` or later covers the tree that
-will merge.
+documentation. Stated as the corrected rule rather than the name-level one:
+`git merge-base --is-ancestor <sha> HEAD` for the ancestry guard, then
+`git rev-parse <sha>:scout` and `<sha>:scripts` compared to head's. Name-level
+diffing misses a file restored to the wrong baseline; tree hashes cannot.
+
+```
+2fde4cf8:scout == 1aa81f7e:scout == 014ce900:scout == HEAD:scout  = a0a2f4b8
+97365248:scout == b90f66fa:scout                                  = e55fc284
+```
+
+So any clearance measured at `2fde4cf8` or later covers the merging tree.
 
 Lapse status is **computed, not asserted** — for each clearance SHA, is there a
 `scout/` or `scripts/` delta to head, with an ancestry guard so a non-ancestor
@@ -88,7 +96,7 @@ SHA reports invalid rather than reporting a spurious mass revert:
 |---|---|---|---|
 | structural / concurrency | CLEAN — 4/4 mutants, regression re-run in full | `97365248` | **LAPSED** — `scout/db.py` +134/−94 |
 | silent failure / observability | CLEAN — 6/6 mutants, two verified as intended-assertion kills | `b90f66fa` | **LAPSED** — `scout/db.py` +134/−94 |
-| ops safety / evidence integrity | CLEAN, re-executed | SHA being confirmed by the slot | pending |
+| ops safety / evidence integrity | **CLEAN, terminal** — S1–S7, N-1…N-6, R1–R5, T1, U1/U2, W1/W2, Y1 | `014ce900` | **HOLDS** |
 | recompute logic | CLEAN — "ship it"; E1 and the `armed_rate` trap closed | `1aa81f7e` | **HOLDS** |
 
 The three commits that lapsed the first two slots are the entire ratchet
@@ -102,6 +110,16 @@ blocking regression on the silent-failure vector itself (§5a).
 **Merge is blocked.** Two slots are re-running against `f7a200cf`; one is
 confirming its SHA. A clearance is not carried forward across a production
 delta, and the implementer's own review never satisfies an independent slot.
+
+**A stale local ref made the branch look like it carried other PRs' work.**
+Recomputing the header against `master` gave 66 commits / 91 files, including
+CG-governor and first-seen-substrate files that belong to already-merged PRs.
+The local `master` ref was pinned at `3e936cd8` while `origin/master` had moved
+to `f05dd47f`. Against the real base the branch is 56 commits / 36 files and
+**0 behind**. Recorded because the failure is silent in the direction that
+matters: it *overstates* footprint, so it reads as diligence rather than as an
+error, and the same stale ref would make a rebase check report "up to date"
+against a base that no longer exists.
 
 ### Findings raised and closed, by slot
 
