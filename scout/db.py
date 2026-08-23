@@ -23,6 +23,9 @@ _COLLAPSE_MIN_POPULATION = 20
 #: Deliberately generous -- this is a cliff detector, not a drift detector,
 #: and an alarm that fires on drift is one that gets muted.
 _COLLAPSE_FRACTION = 0.5
+#: Write timeout for the ratchet mark. Short on purpose -- see
+#: `_record_coverage_baseline`.
+_BASELINE_WRITE_TIMEOUT_MS = 2000
 
 _db_log = structlog.get_logger(__name__)
 
@@ -8140,6 +8143,64 @@ class Database:
         ("trending_comparisons", "appeared_on_trending_at"),
     )
 
+    async def _record_coverage_baseline(
+        self, source_table: str, rate: float, population: int
+    ) -> None:
+        """Write the ratchet mark on its OWN connection, never the shared one.
+
+        This was the probe's first write, and putting it on `self._conn` made
+        the probe a laundering hazard: `commit()` on a shared connection
+        commits EVERYTHING pending, including a sibling's half-finished unit.
+        `scout/chains/tracker.py` opens a bare `BEGIN` on this connection and
+        calls `rollback()` on failure -- by its own comment, several times a
+        day in production -- so an hourly probe committing in between makes the
+        sibling's rollback a no-op and its partial row durable.
+
+        `self._txn_lock` does NOT fix this. It serialises the writers that take
+        it, and chains/tracker does not take it: it BEGINs directly. A lock
+        only the polite callers hold cannot stop the impolite one, so the write
+        has to leave the connection entirely.
+
+        Best-effort by design. A failure here loses one observation of a mark
+        the next hourly pass re-records, and it must never take the probe --
+        or the maintenance pass around it -- down with it.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                # SHORT timeout, deliberately unlike the pipeline's 90s. Moving
+                # this write off the shared connection means it now CONTENDS
+                # for the write lock instead of riding along on it -- and a
+                # sibling holding an open transaction would otherwise stall the
+                # hourly maintenance pass for a minute and a half to record a
+                # number the next pass will record anyway. Give up fast; the
+                # ratchet is best-effort and only ever moves upward.
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "INSERT INTO recompute_coverage_baseline "
+                    "(source_table, best_rate, population, recorded_at) "
+                    "VALUES (?, ?, ?, datetime('now')) "
+                    "ON CONFLICT(source_table) DO UPDATE SET "
+                    "best_rate=excluded.best_rate, population=excluded.population, "
+                    "recorded_at=excluded.recorded_at",
+                    (source_table, rate, population),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_write_failed",
+                source_table=source_table,
+                rate=rate,
+            )
+
     async def chain_identity_recompute_coverage_probe(
         self, *, gate_minutes: float = 1440.0
     ) -> dict[str, object]:
@@ -8305,9 +8366,21 @@ class Database:
         collapsed: list[str] = []
         for table, v in per_surface.items():
             pop, rec = v["credit_bearing"], v["credit_recovered"]
+            # Computed BEFORE the floor check: the branch below reports it,
+            # and referencing it there used the PREVIOUS surface's value.
+            rate = (rec / pop) if pop else None
             if pop < _COLLAPSE_MIN_POPULATION:
-                continue  # too small to distinguish a collapse from noise
-            rate = rec / pop
+                # Say so, rather than omitting the keys. Production's trending
+                # surface drains as coins re-appear and are rewritten
+                # canonical_v1; when it crosses the floor it would simply stop
+                # reporting a rate, and an operator seeing two surfaces with
+                # rates and one without cannot tell "too small to judge" from
+                # "something went wrong".
+                v["rate"] = round(rate, 4) if rate is not None else None
+                v["best_rate"] = None
+                v["rate_judged"] = False
+                continue
+            v["rate_judged"] = True
             cur = await self._conn.execute(
                 "SELECT best_rate, population FROM recompute_coverage_baseline "
                 "WHERE source_table = ?",
@@ -8329,16 +8402,7 @@ class Database:
             # just recorded, and the payload disagrees with the table.
             v["best_rate"] = round(max(rate, best) if best is not None else rate, 4)
             if best is None or rate > best:
-                await self._conn.execute(
-                    "INSERT INTO recompute_coverage_baseline "
-                    "(source_table, best_rate, population, recorded_at) "
-                    "VALUES (?, ?, ?, datetime('now')) "
-                    "ON CONFLICT(source_table) DO UPDATE SET "
-                    "best_rate=excluded.best_rate, population=excluded.population, "
-                    "recorded_at=excluded.recorded_at",
-                    (table, rate, pop),
-                )
-                await self._conn.commit()
+                await self._record_coverage_baseline(table, rate, pop)
             elif rate < best * _COLLAPSE_FRACTION:
                 collapsed.append(table)
 

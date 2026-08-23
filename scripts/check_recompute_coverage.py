@@ -87,6 +87,19 @@ def main() -> int:
         # uncheckpointed rows and report a stale all-clear. Anything else gets
         # immutable=1 so no sidecar is created beside it.
         uri = f"file:{args.db}?mode=ro" if live else f"file:{args.db}?immutable=1"
+        if not live and Path(str(args.db) + "-wal").exists():
+            wal_bytes = Path(str(args.db) + "-wal").stat().st_size
+            if wal_bytes:
+                # `immutable=1` IGNORES the -wal, so everything committed but
+                # not yet checkpointed is invisible and this reads stale --
+                # while printing the most reassuring message in the script.
+                # A scratch copy of a live database is exactly this shape, and
+                # a scratch copy is what the backfill's refusal recommends.
+                print(
+                    f"WARNING: {args.db} has a {wal_bytes}-byte -wal that "
+                    "immutable=1 cannot see; results may be stale. Checkpoint "
+                    "it, or point --db at the live database."
+                )
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error as exc:
         print(f"cannot open {args.db}: {exc}")
@@ -196,6 +209,7 @@ def main() -> int:
         # silently produced "no collapse" forever. A silent failure inside the
         # code added to fix silent failures.
         collapsed = []
+        have_baseline = False
         for table, _anchor in SURFACES:
             try:
                 row = conn.execute(
@@ -205,6 +219,8 @@ def main() -> int:
                 ).fetchone()
             except sqlite3.Error:
                 break  # baseline table absent (pre-deploy): nothing to compare
+            if row:
+                have_baseline = True
             pop, rec = per_surface.get(table, (0, 0))
             if not row or pop < COLLAPSE_MIN_POPULATION:
                 continue
@@ -241,9 +257,19 @@ def main() -> int:
             f"their credit, {unarchivable} unarchivable ({summary}). {remedy}"
         )
         return 1
+    # Name the un-armed state. The collapse half of this alarm is gated on the
+    # in-process probe having recorded a mark -- this script is read-only by
+    # design and cannot bootstrap one. Without saying so, "no baseline yet"
+    # reads identically to "no collapse", which is the wrong reassurance for an
+    # alarm built because the in-process log is operationally silence.
+    armed = (
+        ""
+        if have_baseline
+        else "  [collapse detection NOT ARMED: no baseline recorded yet]"
+    )
     print(
         f"recovered {recovered} of {population}, "
-        f"{unarchivable} unarchivable ({summary})"
+        f"{unarchivable} unarchivable ({summary}){armed}"
     )
     return 0
 

@@ -430,3 +430,59 @@ def test_a_dotdot_spelling_of_the_live_db_still_sees_WAL_rows(tmp_path, monkeypa
         f"hiding the uncheckpointed WAL rows: {out!r}"
     )
     assert rc == 0
+
+
+def test_it_says_when_collapse_detection_is_NOT_ARMED(tmp_path):
+    """The collapse half is gated on the in-process probe having run.
+
+    This script is read-only by design and cannot bootstrap its own mark. With
+    the pipeline down and a backfill that degraded rather than zeroed, "no
+    baseline yet" would read identically to "no collapse" — the wrong
+    reassurance from the alarm built because the in-process log is silence.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=25)
+
+    r = _run(db)
+
+    assert r.returncode == 0, r.stdout
+    assert "NOT ARMED" in r.stdout
+
+
+def test_it_does_not_say_not_armed_once_a_mark_exists(tmp_path):
+    db = _build(tmp_path, overlay_status="verified_canonical", population=25)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 1.0, 25, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert "NOT ARMED" not in r.stdout
+
+
+def test_it_warns_when_immutable_cannot_see_a_non_empty_wal(tmp_path):
+    """A scratch copy of a live database carries uncheckpointed rows.
+
+    `immutable=1` ignores the -wal, so the read is stale while the message is
+    the most reassuring one in the script. A scratch copy is exactly what the
+    backfill's refusal recommends, so every rehearsal against one hits this.
+    """
+    db = _build(
+        tmp_path, overlay_status="verified_canonical", population=25, checkpoint=False
+    )
+    keeper = sqlite3.connect(db)
+    keeper.execute("PRAGMA journal_mode=WAL")
+    keeper.execute(
+        "INSERT INTO chain_identity_recompute_v1 VALUES "
+        "('gainers_comparisons', 9999, 'x', '2026-08-01T00:00:00+00:00', "
+        "'verified_canonical', 8740.0, 'chain_identity_recompute_v1')"
+    )
+    keeper.commit()
+
+    r = _run(db)
+    keeper.close()
+
+    assert "-wal that immutable=1 cannot see" in r.stdout, r.stdout

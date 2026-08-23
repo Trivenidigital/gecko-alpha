@@ -708,3 +708,85 @@ async def test_an_absent_archive_makes_every_row_unarchivable(db):
         probe["unarchivable"] == 3
     ), "the probe reported 0 unarchivable with no archive to be archived in"
     assert probe["not_recovering"] is True
+
+
+async def test_the_ratchet_write_cannot_LAUNDER_a_sibling_transaction(db):
+    """The probe writes; the connection is shared; `commit()` commits everything.
+
+    `_run_hourly_maintenance` runs concurrently with the chain tracker, which
+    opens a bare `BEGIN` on this same connection and calls `rollback()` on
+    failure — by its own comment, several times a day in production. A probe
+    that commits in between makes that rollback a no-op and the sibling's
+    half-finished row durable.
+
+    `_txn_lock` does not fix it: chains/tracker BEGINs directly and never takes
+    the lock, so a lock only the polite callers hold cannot stop the impolite
+    one. The write has to be on its own connection.
+    """
+    await _bulk(db, 25, 20)
+
+    # A sibling opens a unit of work it will abandon.
+    await db._conn.execute("BEGIN")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, appeared_on_gainers_at, detected_by_chains,
+            chains_lead_minutes, is_gap, created_at)
+           VALUES ('sibling-half-finished', 'S', 'S', ?, 0, NULL, 0, ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    assert db._conn.in_transaction, "fixture did not open a sibling transaction"
+
+    # The hourly probe fires in the middle of it and records a mark.
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # The sibling then fails and rolls back, as it does in production.
+    await db._conn.rollback()
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM gainers_comparisons WHERE coin_id='sibling-half-finished'"
+    )
+    assert (await cur.fetchone())[0] == 0, (
+        "the probe committed a sibling's in-flight unit -- its rollback was "
+        "laundered into a no-op"
+    )
+
+    # The mark is NOT required here: with a sibling holding the write lock the
+    # separate connection cannot get it, and it gives up fast rather than
+    # stalling the maintenance pass for the pipeline's full 90s timeout. The
+    # next hourly pass records it. That is the trade moving off the shared
+    # connection buys -- contention instead of laundering -- and the fast
+    # give-up is what keeps it cheap.
+
+
+async def test_a_surface_below_the_floor_says_so_rather_than_going_quiet(db):
+    """Omitting the keys makes "too small to judge" look like "something broke"."""
+    await _bulk(db, 5, 3)
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    v = probe["per_surface"]["gainers_comparisons"]
+
+    assert v["rate_judged"] is False
+    assert v["rate"] == 0.6, "the rate is still reported, just not judged"
+    assert v["best_rate"] is None
+    assert probe["per_surface"]["losers_comparisons"]["rate_judged"] is False
+
+
+async def test_the_mark_IS_written_when_nothing_holds_the_lock(db):
+    """The other half: with no contention the ratchet must actually record.
+
+    Paired with the laundering test deliberately — that one asserts the write
+    is skipped under contention, and on its own it would pass just as happily
+    if the write never worked at all.
+    """
+    await _bulk(db, 25, 20)
+
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT best_rate, population FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "the ratchet never recorded a mark"
+    assert row[0] == 0.8
+    assert row[1] == 25
