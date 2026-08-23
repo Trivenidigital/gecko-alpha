@@ -7556,12 +7556,20 @@ class Database:
         rows = (await cur.fetchone())[0]
 
         # No datetime() on the COLUMN side: it is non-sargable and forces a full
-        # scan (measured 203 ms vs 0.19 ms on a 511k-row clone). Safe only
-        # because `record_emission` is the sole writer and always stores
-        # `datetime.now(timezone.utc).isoformat()`, so the column is uniformly
-        # isoformat-T/UTC and a lexicographic compare is a chronological one.
-        # If that ever stops being true this must go back to datetime() --
-        # this is the isoformat-vs-datetime trap the project has hit before.
+        # scan (measured 203 ms vs 0.19 ms on a 511k-row clone).
+        #
+        # This is a LEXICOGRAPHIC compare standing in for a chronological one,
+        # which is only valid while every stored value is canonical
+        # isoformat-T/UTC. An earlier version of this comment justified that on
+        # "record_emission always stores datetime.now(timezone.utc).isoformat()"
+        # -- which was FALSE: `record_emission_with_status` takes an
+        # `emitted_at` parameter for backfills and stored it unvalidated, so a
+        # space-separated or negative-offset value would sort below 'T' and be
+        # silently dropped from the window (growth undercounts -> under-alarm).
+        #
+        # The invariant is now ENFORCED at the writer by
+        # `scout.outcome_ledger._normalise_emitted_at`, not asserted here. If
+        # that normalisation is ever removed, this must go back to datetime().
         cur = await self._conn.execute(
             "SELECT COUNT(*) FROM signal_outcome_ledger "
             "WHERE emitted_at >= strftime('%Y-%m-%dT%H:%M:%S','now','-1 day')"

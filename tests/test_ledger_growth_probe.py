@@ -199,7 +199,10 @@ async def test_over_the_ceiling_reopens_even_with_ZERO_growth(db, monkeypatch):
     # logic. The condition under test is `bytes_total >= ceiling`, which does
     # not care which side moved.
     await _emit(db, "volume_spike", "dispatch", days_ago=40, n=1000)
-    monkeypatch.setattr(Database, "_LEDGER_SIZE_CEILING_BYTES", 1000 * 454 - 1)
+    # EXACTLY equal, not one byte under: the condition is `>=`, and a fixture
+    # that sets the ceiling BELOW the table passes under `>` too, leaving the
+    # boundary itself unpinned.
+    monkeypatch.setattr(Database, "_LEDGER_SIZE_CEILING_BYTES", 1000 * 454)
 
     r = await db.signal_outcome_ledger_growth_probe()
     assert (
@@ -231,6 +234,9 @@ async def test_growth_is_a_RATE_not_a_running_total(db):
     the unit -- and the unit is what the whole projection is denominated in.
     """
     await _emit(db, "gainers_early", "dispatch", days_ago=0.5, n=10)
+    # 1.5 days: just OUTSIDE a one-day window. Without it any width between 0.5
+    # and 5 days passes -- a 2-day window survived mutation.
+    await _emit(db, "gainers_early", "dispatch", days_ago=1.5, n=77)
     await _emit(db, "gainers_early", "dispatch", days_ago=5, n=500)
     r = await db.signal_outcome_ledger_growth_probe()
     assert (
@@ -284,3 +290,88 @@ async def test_the_probe_can_see_a_crossing_at_all(db):
     need = db._LEDGER_REOPEN_RECLAIMABLE_BYTES // db._LEDGER_BYTES_PER_ROW + 10
     await _emit(db, "volume_spike", "dispatch", days_ago=40, n=need)
     assert (await db.signal_outcome_ledger_growth_probe())["reopen"] is True
+
+
+# ---------------------------------------------------------------------------
+# The invariant the sargable rewrite depends on
+# ---------------------------------------------------------------------------
+
+
+async def test_a_caller_supplied_emitted_at_is_normalised_not_stored_verbatim(db):
+    """The growth query compares `emitted_at` LEXICOGRAPHICALLY.
+
+    That is only equivalent to a chronological compare while every stored value
+    is canonical isoformat-T/UTC. `record_emission_with_status` exposes
+    `emitted_at` for backfills, and backfills source timestamps from other
+    tables and journals -- a space separator (0x20) or a negative offset both
+    sort BELOW 'T' (0x54), so a row chronologically inside the 24h window falls
+    lexicographically below the threshold and is silently dropped. Growth then
+    undercounts, `days_to_1gb` inflates, and the probe UNDER-alarms.
+
+    Note the timestamps below share a DATE. Vary the date instead and the date
+    field dominates before the comparison ever reaches the separator, which is
+    how this hides.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    space = _normalise_emitted_at("2026-08-22 06:54:00")
+    offset = _normalise_emitted_at("2026-08-22T01:54:00-05:00")
+    canonical = _normalise_emitted_at("2026-08-22T06:54:00+00:00")
+
+    assert space == canonical, "space-separated value was not normalised"
+    assert offset == canonical, "non-UTC offset was not normalised to UTC"
+    assert "T" in canonical and canonical.endswith("+00:00")
+
+    # All three now sort identically against a text threshold.
+    threshold = "2026-08-22T05:54:00"
+    for value in (space, offset, canonical):
+        assert value >= threshold
+
+
+def test_an_unparseable_emitted_at_is_refused_rather_than_guessed():
+    """A timestamp we cannot place in time must not enter the durable record."""
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError, match="ISO-8601"):
+        _normalise_emitted_at("last tuesday")
+
+
+def test_a_naive_emitted_at_is_treated_as_UTC():
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    assert _normalise_emitted_at("2026-08-22T06:54:00") == "2026-08-22T06:54:00+00:00"
+
+
+async def test_the_PUBLIC_API_normalises_a_backfill_timestamp(db, settings_factory):
+    """Drives `record_emission_with_status`, not the helper.
+
+    Testing the normaliser directly proves the function works; it does NOT prove
+    the writer calls it. Removing the call from the writer left every other test
+    in this file green, because they all reached the helper directly -- the
+    fixture could not see the defect it existed to rule out.
+
+    This asserts what is actually IN the column after a backfill-shaped call.
+    """
+    from scout.outcome_ledger import record_emission_with_status
+
+    s = settings_factory(LEDGER_ENABLED=True)
+    result = await record_emission_with_status(
+        db,
+        s,
+        kind="alert",
+        token_id="pepe",
+        surface="gainers_early",
+        emitted_at="2026-08-22 06:54:00",  # space-separated, as a backfill gives
+    )
+    assert (
+        result is not None
+    ), "the emission did not record; fixture is not exercising it"
+
+    cur = await db._conn.execute(
+        "SELECT emitted_at FROM signal_outcome_ledger WHERE token_id='pepe'"
+    )
+    stored = (await cur.fetchone())[0]
+    assert (
+        stored == "2026-08-22T06:54:00+00:00"
+    ), f"stored {stored!r} verbatim -- a lexicographic compare will mis-sort it"
+    assert stored >= "2026-08-22T05:54:00", "row fell below a threshold it is inside"

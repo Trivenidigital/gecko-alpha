@@ -311,6 +311,29 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
     return price
 
 
+def _normalise_emitted_at(emitted_at: str | None) -> str:
+    """Canonical UTC isoformat-T, or raise.
+
+    Returning the value unparsed would push a lexicographic-ordering hazard into
+    a column other code compares as text. Raising is right rather than
+    silently coercing: a timestamp we cannot parse is one we cannot place in
+    time, and guessing would put a wrong instant in the durable record.
+    """
+    if emitted_at is None:
+        return datetime.now(timezone.utc).isoformat()
+    try:
+        parsed = datetime.fromisoformat(str(emitted_at).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"emitted_at={emitted_at!r} is not an ISO-8601 timestamp. "
+            "signal_outcome_ledger.emitted_at is compared lexicographically, "
+            "so a non-canonical value silently mis-sorts."
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 async def record_emission_with_status(
     db: Database,
     settings: Any,
@@ -368,7 +391,25 @@ async def record_emission_with_status(
         if conn is None or db._txn_lock is None:
             log.warning("ledger_record_skipped_db_closed", kind=kind, token_id=token_id)
             return None
-        emitted = emitted_at or datetime.now(timezone.utc).isoformat()
+        # NORMALISE a caller-supplied emitted_at. `emitted_at` exists so a
+        # backfill can supply a historical timestamp, and backfills source them
+        # from other tables and journals -- the sibling
+        # scripts/backfill_minara_alert_emissions.py takes a journalctl-derived
+        # string. Stored verbatim, a space-separated or non-UTC-offset value
+        # breaks a LEXICOGRAPHIC comparison elsewhere, because ' ' (0x20) and
+        # the digits of a negative offset both sort below 'T' (0x54).
+        #
+        # Concretely: the ledger growth probe compares
+        # `emitted_at >= strftime('%Y-%m-%dT%H:%M:%S', ...)` -- deliberately
+        # sargable, worth 203ms -> 0.19ms -- and its safety rests on this
+        # column being uniformly isoformat-T/UTC. A same-day row that is
+        # chronologically INSIDE the 24h window sorts below the threshold and
+        # is silently dropped, so growth undercounts, `days_to_1gb` inflates,
+        # and the probe UNDER-alarms. That is the dangerous direction.
+        #
+        # So the invariant is enforced here rather than asserted in a comment
+        # the next writer cannot see.
+        emitted = _normalise_emitted_at(emitted_at)
         verdicts_json = (
             json.dumps(gate_verdicts, sort_keys=True, default=str)
             if gate_verdicts is not None

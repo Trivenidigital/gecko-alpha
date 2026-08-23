@@ -237,10 +237,49 @@ tables, not a row-by-row diff. A row is unique to bak only if it falls inside
 bak's range but inside neither neighbour's, which premises 1–3 exclude for these
 six tables.
 
-**Why six tables and not more:** only age-pruned tables can hold rows that live
-no longer does. Tables without retention are strict supersets in live, so they
-cannot contain bak-only rows. The six were enumerated from the prune call sites
-in `_run_hourly_maintenance` (`scout/main.py`), not asserted.
+**Why age-pruned tables:** only a table with retention can hold rows that the
+live DB no longer has. Tables without retention are strict supersets in live, so
+they cannot contain bak-only rows.
+
+**SCOPE OF THE VERIFICATION — READ THIS BEFORE RELYING ON THE CLAIM ABOVE.**
+Six tables were verified. They are **not** an exhaustive enumeration of the
+age-pruned tables, and an earlier version of this entry wrongly said they were
+"enumerated from the prune call sites in `_run_hourly_maintenance`". They were
+not: that function reaches **17** age-pruned tables, and three of the six
+(`signal_events`, `trending_snapshots`, `volume_spikes`) are invoked through a
+table-driven `getattr(db, prune_name)` loop that a `db.prune_` grep does not
+find at all. The stated method could not have produced this list. The six were
+chosen as representative during the forensics pass; the method sentence was
+written afterwards and was false.
+
+**Verified (6):** `signal_events`, `score_history`, `volume_snapshots`,
+`trending_snapshots`, `volume_spikes`, `trade_decision_events`.
+
+**NOT verified (11), all age-pruned and all reachable from the same function:**
+`candidates`, `chain_matches`, `conviction_watchlist_snapshots`,
+`cryptopanic_posts`, `detection_decision_receipts`, `holder_snapshots`,
+`learn_logs`, `momentum_7d`, `perp_anomalies`, `txns_h1_buys_snapshots`,
+**`volume_history_cg`**.
+
+`volume_history_cg` is the one that matters. It is the labeler's price substrate
+(`SELECT price, recorded_at FROM volume_history_cg`, `scout/outcome_ledger.py`),
+so it is exactly the material the "only surviving source of pre-08-08 history"
+note below is about — a return cannot be reconstructed without the price series.
+It was not checked.
+
+**This gap is now permanently uncloseable.** bak is deleted, so no future
+verification can be run. The deletion may well still have been safe — the
+argument for the six is sound and the remaining snapshots are unaffected — but
+the record must not claim a completeness it does not have. If a later
+investigation needs pre-08-08 `volume_history_cg` and cannot find it, this
+paragraph is the reason to stop looking.
+
+**What WAS done, and what the record failed to carry.** The three premises above
+were verified against raw per-snapshot ranges before the `rm`, not after. The
+original entry recorded only the outer hull, from which none of them is
+recoverable — so a reader of that version could only have concluded the check
+was never performed. The check was done; the record failed to preserve it. That
+distinction is the reason the six numbers per table are now printed.
 
 **Pre-deletion revalidation (all green):**
 
