@@ -7515,6 +7515,92 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
+    # Measured 2026-08-23 via dbstat: signal_outcome_ledger 171,900,928 B table
+    # + 59,994,112 B indexes over 511,386 rows = ~454 B/row all-in. Used as a
+    # cheap proxy because dbstat itself scans the whole 7 GB database and takes
+    # minutes -- far too heavy for an hourly probe whose only job is to notice a
+    # threshold crossing.
+    _LEDGER_BYTES_PER_ROW = 454
+    _LEDGER_REOPEN_RECLAIMABLE_BYTES = 100 * 1024 * 1024
+    _LEDGER_REOPEN_PROJECTED_DAYS = 30
+    _LEDGER_SIZE_CEILING_BYTES = 1024 * 1024 * 1024
+
+    async def signal_outcome_ledger_growth_probe(
+        self, *, horizon_days: int = 10
+    ) -> dict:
+        """Lightweight growth watch for the DEFERRED ruling-E pruning work.
+
+        E was deferred on economics, not on correctness: as ruled
+        (cohort-closure only, no age-based pruning) it reclaims ~309 rows of a
+        511,386-row table, and the whole table is ~232 MB of a 7 GB database.
+        Building the cohort registry, closure classifier, durable receipts and
+        byte-identical proof harness for ~140 KB is not a defensible trade.
+
+        Deferral is only safe if something watches for the economics changing,
+        which is what this is. It reports the four measures the ruling names and
+        sets `reopen` when either threshold is crossed. Reopening the
+        INVESTIGATION needs no approval; any destructive pruning still follows
+        the cohort-closure ruling.
+
+        `horizon_days` is the label deadline (r7d horizon + permitted lateness):
+        past it, a labelled row can no longer change, which is what makes it
+        mechanically closed rather than merely old.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
+        rows = (await cur.fetchone())[0]
+
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM signal_outcome_ledger "
+            "WHERE datetime(emitted_at) >= datetime('now', '-1 day')"
+        )
+        growth_rows_per_day = (await cur.fetchone())[0]
+
+        # Safely prunable == fully-dormant (surface, kind) cohorts, per the
+        # cohort-closure ruling. NOT age-based: a cohort still emitting is not
+        # closed no matter how old its oldest row is.
+        cur = await self._conn.execute(f"""SELECT COALESCE(SUM(n), 0) FROM (
+                    SELECT COUNT(*) AS n
+                      FROM signal_outcome_ledger
+                     GROUP BY surface, kind
+                    HAVING datetime(MAX(emitted_at))
+                             < datetime('now', '-{int(horizon_days)} days')
+                       AND SUM(label_status = 'pending') = 0)""")
+        reclaimable_rows = (await cur.fetchone())[0]
+
+        bytes_total = rows * self._LEDGER_BYTES_PER_ROW
+        reclaimable_bytes = reclaimable_rows * self._LEDGER_BYTES_PER_ROW
+        growth_bytes_per_day = growth_rows_per_day * self._LEDGER_BYTES_PER_ROW
+
+        headroom = self._LEDGER_SIZE_CEILING_BYTES - bytes_total
+        if growth_bytes_per_day > 0:
+            days_to_ceiling = max(0.0, headroom / growth_bytes_per_day)
+        else:
+            days_to_ceiling = float("inf")
+
+        reopen_reasons = []
+        if reclaimable_bytes >= self._LEDGER_REOPEN_RECLAIMABLE_BYTES:
+            reopen_reasons.append("reclaimable_bytes")
+        if days_to_ceiling <= self._LEDGER_REOPEN_PROJECTED_DAYS:
+            reopen_reasons.append("projected_size")
+
+        return {
+            "status": "E_DEFERRED_BY_ECONOMICS",
+            "rows": rows,
+            "bytes_total": bytes_total,
+            "growth_rows_per_day": growth_rows_per_day,
+            "growth_bytes_per_day": growth_bytes_per_day,
+            "reclaimable_rows": reclaimable_rows,
+            "reclaimable_bytes": reclaimable_bytes,
+            "days_to_1gb": (
+                None if days_to_ceiling == float("inf") else round(days_to_ceiling, 1)
+            ),
+            "reopen": bool(reopen_reasons),
+            "reopen_reasons": reopen_reasons,
+        }
+
     async def reconcile_signal_first_seen(self) -> dict[str, int]:
         """Re-derive the substrate from surviving events. Idempotent, self-healing.
 

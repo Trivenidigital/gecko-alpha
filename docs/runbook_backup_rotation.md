@@ -180,3 +180,78 @@ ssh srilu-vps '
   Today: if Telegram is down, the watchdog enters `failed` state and the
   operator must observe via `systemctl status` or `journalctl`. Acceptable
   trade-off for v1; documented here as known gap.
+
+---
+
+## Operational ledger — ad-hoc `/root` snapshot deletions
+
+Ad-hoc snapshots live OUTSIDE the rotation policy above (`scout.db.bak.*` inside
+`/root/gecko-alpha`). Nothing ages them out, so each deletion is an explicit,
+operator-authorized, irreversible act and is recorded here with its evidence.
+
+### 2026-08-23 — `/root/scout.db.bak-before-state-fix` DELETED
+
+**Authorization:** operator ruling 2026-08-23, scoped to this single file.
+Explicitly *not* authorized: `pre500.20260802202122`, `kraken_rehearsal`,
+`pre-deploy2-20260703`, `hermes-upgrade-backup-20260801T175814Z`.
+
+**Why it was safe to delete.** Its contents are wholly contained in
+`kraken_rehearsal/scout_copy.db` ∪ `scout.db.pre500.20260802202122`, verified
+across all six age-pruned tables — not just `signal_events`. For every table,
+kraken's left edge predates bak's and pre500's right edge postdates it, and the
+two overlap, so the union is contiguous with no gap inside bak's range:
+
+| table | bak | kraken ∪ pre500 |
+|---|---|---|
+| signal_events | 07-18 → 08-01 | 07-17 → 08-02 |
+| score_history | 07-11 → 08-01 | 07-10 → 08-02 |
+| volume_snapshots | 07-11 → 08-01 | 07-10 → 08-02 |
+| trending_snapshots | 07-02 → 08-01 | 07-01 → 08-02 |
+| volume_spikes | 06-18 → 08-01 | 06-17 → 08-02 |
+| trade_decision_events | 06-17 → 08-01 | 06-16 → 08-02 |
+
+Limit of the claim: range containment over append-only tables, not a row-by-row
+diff. Rows would be unique to bak only if they fell in bak's range but in
+neither neighbour, which the enclosure rules out.
+
+**Pre-deletion revalidation (all green):**
+
+| check | result |
+|---|---|
+| exact path | `/root/scout.db.bak-before-state-fix` |
+| size | 5,615,038,464 B (5.62 GB) |
+| sha256 | `ccd716dc23cc706717ce8b71d67e85511aeb5fcb14c443343bc16eadc938c5da` — matches the 08-23 forensics classification |
+| managed backup set | 3 retained (08-21, 08-22, 08-23) |
+| latest managed backup `quick_check` | ok |
+| live DB `quick_check` | ok |
+| pipeline | active running, NRestarts 0 |
+| WAL sidecars in `/root` | none (the 08-15 backup-destroying mechanism) |
+| backup heartbeats | fresh, 2026-08-23T03:07:34Z |
+
+**Post-deletion verification (all green):**
+
+| measure | before | after |
+|---|---|---|
+| free bytes | 12,084,363,264 | 17,699,401,728 |
+| reclaimed | — | **5,615,038,464 B — exactly the file size** |
+| `df` utilization | 85% | **78%** |
+| live DB `quick_check` | ok | ok |
+| latest managed backup `quick_check` | ok | ok (unchanged) |
+| managed backup count | 3 | 3 |
+| pipeline / dashboard / trade-alert-watcher | active | active |
+| Tracebacks / CRITICAL / "No space" | — | **0** |
+| `signal_first_seen` rows / missing | 2594 / 0 | 2594 / 0 |
+
+Other ad-hoc snapshots confirmed untouched at their original sizes.
+
+**Remaining ad-hoc snapshots (~13.2 GB, all PRESERVE):** these are the only
+surviving source of pre-2026-08-08 history — live `signal_events` starts at the
+14-day retention boundary, so they are also the only material from which a
+truthful pre-08-08 `signal_first_seen` could ever be reconstructed. Union gaps
+that no snapshot covers: **07-03 → 07-17** and **08-02 → 08-08**.
+
+**Reading for the next operator:** the backup peak, not the steady state, is the
+number that governs headroom. Four backups plus the live DB coexist mid-run — on
+2026-08-23 that peaked at **95% used / 3.9 GB free**, recovering to 85% only
+after rotation deleted the oldest. Judge any change to keep-N or DB size against
+that peak.
