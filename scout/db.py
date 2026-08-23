@@ -8397,12 +8397,30 @@ class Database:
             # brand-new alarm earns a mute in its first week. Treat such a mark
             # as absent and let this observation re-establish it.
             #
-            # ONE-SIDED on purpose: this guards population GROWTH. The expected
-            # direction here is shrinkage, as rows drain to `canonical_v1`, and
-            # that is a separate open question (the surviving remainder is not
-            # a random sample, so its rate can fall for benign reasons). This
-            # guard does not cover it -- do not read it as though it does.
-            if row is not None and row[1] * 2 < pop:
+            # Gated on the RECORDED population being small, NOT on the ratio
+            # between it and today's. The motivation is that the FIRST
+            # observation can land while the population is transiently small --
+            # mid-migration, mid-backfill -- and a rate measured on a handful
+            # of rows is not comparable to one measured on a thousand.
+            #
+            # Written as `row[1] * 2 < pop` it fired on ordinary GROWTH, and
+            # discarding the mark falls into the write branch below, which
+            # upserts unconditionally. So a population that merely doubled
+            # re-baselined the mark DOWNWARD at today's diluted rate:
+            # measured 0.60 -> 0.36 on a 100 -> 250 growth, after which a real
+            # collapse to 0.184 rode underneath the downgraded mark and did not
+            # page -- while it would have paged against the original 0.60.
+            #
+            # "Never lowered" is the invariant this whole ratchet rests on, and
+            # the guard added to prevent false pages was the one thing that
+            # broke it. Trending is where it bites first: it oscillates around
+            # the sub-20 floor, so it doubles routinely.
+            #
+            # STILL ONE-SIDED: this does not cover population SHRINKAGE, where
+            # the surviving remainder is not a random sample and the rate can
+            # fall for benign reasons. That is a separate open question -- do
+            # not read this guard as though it covers it.
+            if row is not None and row[1] < _COLLAPSE_MIN_POPULATION * 2:
                 best = None
             v["rate"] = round(rate, 4)
             if best is None or rate > best:

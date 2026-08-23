@@ -685,6 +685,18 @@ async def test_a_mark_from_a_much_smaller_population_does_not_false_page(db):
     ), "a mark from a 25-row sample was applied to a 225-row population"
     assert probe["not_recovering"] is False
 
+    # And say what happened to the MARK. This fixture demonstrated the
+    # downgrade defect in its own setup -- 1.00 becoming 0.20 -- and asserted
+    # only that nothing paged, so it was silent about the thing that was
+    # actually wrong. Re-establishing at today's rate is correct HERE,
+    # because the discarded mark was measured on 25 rows and genuinely is
+    # not comparable.
+    cur = await db._conn.execute(
+        "SELECT best_rate, population FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    assert tuple(await cur.fetchone()) == (0.2, 225)
+
 
 async def test_an_absent_archive_makes_every_row_unarchivable(db):
     """Probe and watchdog must agree, or the runbook's rule is undecidable.
@@ -874,3 +886,48 @@ async def test_the_probe_ignores_a_SUPERSEDED_generations_verdict(db):
         probe["credit_recovered"] == 0
     ), "the probe counted a superseded generation's verdict as recovered"
     assert probe["not_recovering"] is True
+
+
+async def test_a_mark_from_a_LARGE_population_survives_growth(db):
+    """The invariant the whole ratchet rests on: never lowered.
+
+    The growth guard was written as `recorded * 2 < current`, so an ordinary
+    doubling discarded the mark — and discarding it falls into the write
+    branch, which upserts unconditionally. A 100 → 250 growth therefore
+    re-baselined 0.60 down to 0.36, and a real collapse to 0.184 then rode
+    underneath the downgraded mark without paging, when it would have paged
+    against the original.
+
+    The guard exists because a FIRST observation can land while the population
+    is transiently small. That is a statement about the recorded population
+    being small, not about the ratio.
+    """
+    await _bulk(db, 100, 60)  # mark 0.60 on a population well above the floor
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # Ordinary growth, at a lower rate: 90/250 = 0.36.
+    await _bulk(db, 150, 30, prefix="grown")
+    after = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT best_rate, population FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    best, pop = await cur.fetchone()
+    assert (best, pop) == (0.6, 100), (
+        f"growth re-baselined the mark downward to {best}; 'never lowered' is "
+        "the invariant the ratchet rests on"
+    )
+    assert after["collapsed_surfaces"] == [], "0.36 vs a 0.60 mark is not a cliff"
+
+    # And a real collapse underneath it is still caught.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 45 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    collapsed = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert collapsed["collapsed_surfaces"] == ["gainers_comparisons"]
+    assert collapsed["not_recovering"] is True
