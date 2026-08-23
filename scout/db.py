@@ -363,6 +363,7 @@ class Database:
             # after the migration ran would otherwise keep NULL forever.
             # Ungated by the migration marker: the migration early-returns
             # forever once applied, and this is the IRREVERSIBLE half.
+            await self._migrate_chain_identity_recompute_v1()
             await self.archive_legacy_prefix_comparisons()
             await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
@@ -7763,6 +7764,106 @@ class Database:
                  updated_at = excluded.updated_at""",
             (token_id, created_at, now),
         )
+
+    async def _migrate_chain_identity_recompute_v1(self) -> None:
+        """Versioned derived store for recomputed legacy provenance (ruling C).
+
+        SEPARATE from the archived legacy rows on purpose. The ruling allows
+        historical recomputation "only as a distinct derived dataset with
+        explicit semantic version -- not an UPDATE that destroys the previous
+        evidence", so this table carries the recomputed answer beside the
+        archive rather than rewriting it.
+
+        Keyed on (source_table, source_row_id) against the IMMUTABLE archive, so
+        a rerun REPLACEs in place and cannot double-count.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_v1"
+        schema_version = 20260825
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_recompute_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chain_identity_recompute_v1 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    PRIMARY KEY (source_table, source_row_id)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing = await cur.fetchone()
+            if existing is not None and existing["description"] != migration_name:
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_recompute_v1: "
+                    f"version={schema_version} description={existing['description']}"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_v1_migration_complete")
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_recompute_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
 
     async def archive_legacy_prefix_comparisons(self) -> dict[str, int]:
         """Snapshot the pre-cutover comparison rows. NOT gated by any marker.

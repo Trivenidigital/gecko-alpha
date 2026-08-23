@@ -523,7 +523,7 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
         raise RuntimeError("Database not initialized.")
 
     cursor = await db._conn.execute(
-        """SELECT coin_id, symbol, name, appeared_on_trending_at,
+        """SELECT trending_comparisons.coin_id, trending_comparisons.symbol, name, appeared_on_trending_at,
                   detected_by_narrative, narrative_detected_at, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_detected_at, pipeline_lead_minutes,
                   detected_by_chains, chains_detected_at, chains_lead_minutes,
@@ -531,8 +531,17 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                   -- from identity-derived ones by every consumer.
                   chains_identity_semantics, chains_identity_tier,
                   detected_by_social, social_detected_at, social_lead_minutes,
-                  is_gap, detected_price, peak_price, peak_gain_pct, created_at
+                  is_gap, detected_price, peak_price, peak_gain_pct, created_at,
+                  -- Ruling C: the recomputed provenance overlay for LEGACY rows.
+                  -- Joined on coin_id, not row id: the tracker deletes and
+                  -- re-inserts by coin_id on every recompute, so ids do not
+                  -- survive. Only legacy rows consult it; canonical_v1 rows
+                  -- carry their own tier.
+                  cir.evidence_status AS chains_recompute_status
            FROM trending_comparisons
+           LEFT JOIN chain_identity_recompute_v1 cir
+                  ON cir.source_table = 'trending_comparisons'
+                 AND cir.coin_id = trending_comparisons.coin_id
            ORDER BY COALESCE(social_detected_at, chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
         (limit,),

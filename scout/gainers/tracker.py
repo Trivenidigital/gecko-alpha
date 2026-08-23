@@ -505,7 +505,7 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
         raise RuntimeError("Database not initialized.")
 
     cursor = await db._conn.execute(
-        """SELECT coin_id, symbol, name, price_change_24h,
+        """SELECT gainers_comparisons.coin_id, gainers_comparisons.symbol, name, price_change_24h,
                   appeared_on_gainers_at,
                   detected_by_narrative, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_lead_minutes,
@@ -520,8 +520,17 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                   detected_by_momentum, momentum_lead_minutes,
                   detected_by_slow_burn, slow_burn_lead_minutes,
                   detected_by_velocity, velocity_lead_minutes,
-                  is_gap, detected_price, peak_price, peak_gain_pct, created_at
+                  is_gap, detected_price, peak_price, peak_gain_pct, created_at,
+                  -- Ruling C: the recomputed provenance overlay for LEGACY rows.
+                  -- Joined on coin_id, not row id: the tracker deletes and
+                  -- re-inserts by coin_id on every recompute, so ids do not
+                  -- survive. Only legacy rows consult it; canonical_v1 rows
+                  -- carry their own tier.
+                  cir.evidence_status AS chains_recompute_status
            FROM gainers_comparisons
+           LEFT JOIN chain_identity_recompute_v1 cir
+                  ON cir.source_table = 'gainers_comparisons'
+                 AND cir.coin_id = gainers_comparisons.coin_id
            ORDER BY appeared_on_gainers_at DESC
            LIMIT ?""",
         (limit,),

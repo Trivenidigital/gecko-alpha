@@ -307,7 +307,7 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
         raise RuntimeError("Database not initialized.")
 
     cursor = await db._conn.execute(
-        """SELECT coin_id, symbol, name, price_change_24h,
+        """SELECT losers_comparisons.coin_id, losers_comparisons.symbol, name, price_change_24h,
                   appeared_on_losers_at,
                   detected_by_narrative, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_lead_minutes,
@@ -318,8 +318,17 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
                   -- scout/conviction/cross_surface.py cannot see them.
                   chains_identity_semantics, chains_identity_tier,
                   detected_by_spikes, spikes_lead_minutes,
-                  is_gap, created_at
+                  is_gap, created_at,
+                  -- Ruling C: the recomputed provenance overlay for LEGACY rows.
+                  -- Joined on coin_id, not row id: the tracker deletes and
+                  -- re-inserts by coin_id on every recompute, so ids do not
+                  -- survive. Only legacy rows consult it; canonical_v1 rows
+                  -- carry their own tier.
+                  cir.evidence_status AS chains_recompute_status
            FROM losers_comparisons
+           LEFT JOIN chain_identity_recompute_v1 cir
+                  ON cir.source_table = 'losers_comparisons'
+                 AND cir.coin_id = losers_comparisons.coin_id
            ORDER BY appeared_on_losers_at DESC
            LIMIT ?""",
         (limit,),

@@ -14,6 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from scout.identity import CANONICAL_SEMANTICS
+from scout.identity_recompute import (
+    CREDIT_BEARING as RECOMPUTE_CREDIT_BEARING,
+)
 
 # The 8 independent detection surfaces tracked in gainers_comparisons, mapped to
 # their lead-minutes column. Order is the tie-break order for `contributing`.
@@ -79,6 +82,32 @@ def _tier(early_count: int, settings) -> str:
     return "low"
 
 
+def _chains_evidence_is_trusted(row) -> bool:
+    """Ruling C's effective rule for whether a chains lead may earn credit.
+
+    ``legacy_prefix`` does NOT mean "bad". It means the row predates the tier
+    column and its provenance needs resolving -- which the versioned
+    recomputation does. Treating every legacy row as untrusted would drop 826 of
+    1188 production rows and take tier_high from 341 to 187, mostly as a
+    metadata artefact rather than a change in detection quality.
+
+        native canonical_v1                        -> trust
+        legacy + recompute says verified canonical -> trust
+        legacy + recompute says prefix-only        -> refuse (the ~4% target)
+        legacy + ambiguous / indeterminate         -> refuse, but as UNRESOLVED
+                                                      rather than as disproven
+        legacy + no recompute available yet        -> refuse
+
+    The last two are refusals of the same shape and deliberately so: unverified
+    provenance earns nothing. But they are not claims that the detection was
+    fuzzy, and the recompute table records which is which so the distinction
+    survives in the evidence even though it does not change the score.
+    """
+    if _row_get(row, "chains_identity_semantics") == CANONICAL_SEMANTICS:
+        return True
+    return _row_get(row, "chains_recompute_status") in RECOMPUTE_CREDIT_BEARING
+
+
 def cross_surface_conviction(row, settings) -> ConvictionResult:
     """Score one gainers_comparisons-shaped row by early cross-surface confirmation.
 
@@ -106,10 +135,8 @@ def cross_surface_conviction(row, settings) -> ConvictionResult:
         # Counterpart to the note in scout/gainers/tracker.py::get_gainers_stats,
         # which deliberately does NOT filter: that reports the historical record
         # of what the system did, this computes a forward-looking score now.
-        if surface == "chains":
-            semantics = _row_get(row, "chains_identity_semantics")
-            if semantics != CANONICAL_SEMANTICS:
-                continue
+        if surface == "chains" and not _chains_evidence_is_trusted(row):
+            continue
         lead = _row_get(row, lead_col)
         try:
             lead_val = float(lead)
