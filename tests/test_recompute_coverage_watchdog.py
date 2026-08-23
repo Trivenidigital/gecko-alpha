@@ -239,6 +239,14 @@ def test_the_watchdog_constants_match_the_application(tmp_path):
     # in this tranche that the artifact did not satisfy.
     import scout.db as _dbmod
 
+    from scout.identity_recompute import RECOMPUTE_SEMANTICS as _APP_SEMANTICS
+
+    # Named in this test's own comment as covered, and it was not. That is
+    # the FIFTH instance in this tranche of a parity claim the artifact did
+    # not satisfy -- and it appeared inside the fix for the fourth.
+    assert (
+        wd.RECOMPUTE_SEMANTICS == _APP_SEMANTICS
+    ), "the watchdog reads a different semantics generation than the app writes"
     assert (
         wd.COLLAPSE_MIN_POPULATION == _dbmod._COLLAPSE_MIN_POPULATION
     ), "the watchdog judges a different minimum population than the probe"
@@ -599,3 +607,44 @@ def test_each_surfaces_mark_lands_on_its_own_row(tmp_path):
     assert "gainers_comparisons=25/25 mark=none" in out, out
     assert "losers_comparisons=0/0 mark=0.1234" in out, out
     assert "trending_comparisons=0/0 mark=0.5678" in out, out
+
+
+def test_the_checker_ignores_a_SUPERSEDED_generations_verdict(tmp_path):
+    """The paging layer's version filter, which nothing held.
+
+    Pinned in the trackers and in the probe; unpinned here. Dropping it let the
+    checker count a superseded, more generous verdict as recovered — the R2
+    divergence, on the one layer an operator actually hears. Demonstrated:
+    unmutated `overlay recovering NOTHING ... 0 of 30` and exit 1; mutated
+    `recovered 30 of 30` and exit 0.
+
+    The sixth instance in this tranche of a fix reaching for the layer being
+    edited rather than the layer that pages — which is why this test exists
+    even though nothing is broken today: the pattern's next occurrence is more
+    likely here than anywhere else.
+    """
+    db = _build(tmp_path, overlay_status=None, population=30)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE gainers_comparisons_legacy_prefix_v1 "
+        "(id INTEGER, coin_id TEXT, appeared_on_gainers_at TEXT)"
+    )
+    for i in range(30):
+        conn.execute(
+            "INSERT INTO gainers_comparisons_legacy_prefix_v1 VALUES (?, ?, ?)",
+            (i + 1, f"coin-{i}", ANCHOR),
+        )
+        # Every overlay row belongs to a SUPERSEDED generation.
+        conn.execute(
+            "INSERT INTO chain_identity_recompute_v1 VALUES "
+            "('gainers_comparisons', ?, ?, ?, 'verified_canonical', 8740.0, ?)",
+            (i + 5000, f"coin-{i}", ANCHOR, "superseded_v0"),
+        )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "recovering NOTHING" in r.stdout
+    assert "0 of 30" in r.stdout
