@@ -13,6 +13,7 @@ import aiosqlite
 import structlog
 
 from scout.identity import LEGACY_SEMANTICS
+from scout.identity_recompute import CREDIT_BEARING
 
 _db_log = structlog.get_logger(__name__)
 
@@ -7937,27 +7938,37 @@ class Database:
     )
 
     async def chain_identity_recompute_coverage_probe(self) -> dict[str, object]:
-        """Report whether the legacy-provenance overlay is actually populated.
+        """Report whether the legacy-provenance overlay is actually WORKING.
 
-        This exists because of the specific failure this PR is meant to
-        PREVENT, not one it might cause. Nothing in the runtime writes
-        `chain_identity_recompute_v1` -- it is filled by an offline ops step
-        (`scripts/backfill_chain_identity_recompute.py`). So a deploy that
-        ships the code and skips the script leaves the overlay empty, and an
-        empty overlay is not a neutral state: every credit-bearing
-        `legacy_prefix` row fails `_chains_evidence_is_trusted` and silently
-        loses its chains credit. That IS the naive cutover -- the 341 -> 187
-        tier_high collapse -- arriving quietly, under green logs, looking
-        exactly like a real drop in detection quality.
+        `chain_identity_recompute_v1` has no runtime writer -- it is filled by
+        an offline ops step. So a deploy that ships the code and skips the
+        backfill leaves the overlay empty, and an empty overlay is not a
+        neutral state: every credit-bearing `legacy_prefix` row fails the trust
+        check and loses its chains credit. That is the naive cutover this
+        overlay exists to prevent (tier_high 341 -> 187), arriving quietly,
+        under green logs, looking exactly like a real decline in detection.
 
-        Deploy-without-activate has bitten this project before, and the tell
-        each time was a table that was empty for a reason no alarm knew about.
+        The escalation is `credit_recovered == 0` against a non-empty
+        population, NOT `overlay_rows == 0`. Row presence is the wrong
+        question, and asking it was this probe's original defect: an overlay
+        can be fully populated and still recover nothing, because only
+        `verified_canonical` earns credit. That is not a corner case -- it is
+        the likeliest real outcome, since the reconstruction depends on
+        preserved `/root` snapshots that are being deleted over time. Rerun the
+        backfill once they are gone and roughly four rows in five land
+        `indeterminate_history`: overlay full, credit zero, tier_high collapsed.
+        Counting rows would have printed a green line through all of it.
 
-        `uncovered` counts credit-bearing legacy rows with no overlay row at
-        their own anchor -- the same anchor-matched correlation the trackers
-        use, so a row the trackers cannot join is a row this counts. Partial
-        coverage is expected and fine (history genuinely runs out); ZERO
-        coverage against a non-zero population is the alarm.
+        Coverage is correlated the way the READERS correlate it -- on
+        `(source_table, coin_id, historical_anchor)`. Not on `source_row_id`:
+        the trackers DELETE and re-insert by coin_id on every recompute, so ids
+        do not survive, and the archives are `CREATE TABLE ... AS SELECT`
+        copies with no primary key, where `id` is not a key at all. A probe
+        keyed on the row id measures a wire nothing reads.
+
+        Partial coverage is the expected steady state -- history genuinely runs
+        out for older anchors -- and must never page, or the alarm gets muted
+        before the day it matters.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
@@ -7969,33 +7980,66 @@ class Database:
 
         credit_bearing = 0
         uncovered = 0
+        credit_recovered = 0
+        per_surface: dict[str, dict[str, int]] = {}
+
         for table, anchor in self._RECOMPUTE_SURFACES:
-            cur = await self._conn.execute(
-                f"SELECT COUNT(*) FROM {table} "
-                "WHERE chains_identity_semantics = 'legacy_prefix' "
-                "AND detected_by_chains = 1"
+            # COALESCE, matching what the readers do: `cross_surface` trusts
+            # ONLY 'canonical_v1', so a NULL semantics row -- written by
+            # rolled-back old code -- is untrusted there. Filtering on
+            # `= 'legacy_prefix'` made those rows invisible here while they
+            # silently lost credit in the reader.
+            untrusted = (
+                "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
+                "!= 'canonical_v1'"
             )
-            credit_bearing += (await cur.fetchone())[0]
+            matched = (
+                "SELECT 1 FROM chain_identity_recompute_v1 AS r "
+                "  WHERE r.source_table = ? AND r.coin_id = c.coin_id "
+                f"  AND r.historical_anchor = c.{anchor}"
+            )
             cur = await self._conn.execute(
                 f"SELECT COUNT(*) FROM {table} AS c "
-                "WHERE c.chains_identity_semantics = 'legacy_prefix' "
-                "AND c.detected_by_chains = 1 "
-                "AND NOT EXISTS (SELECT 1 FROM chain_identity_recompute_v1 AS r "
-                "  WHERE r.source_table = ? AND r.source_row_id = c.id "
-                f"  AND r.historical_anchor = c.{anchor})",
+                f"WHERE {untrusted} AND c.detected_by_chains = 1"
+            )
+            pop = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND NOT EXISTS ({matched})",
                 (table,),
             )
-            uncovered += (await cur.fetchone())[0]
+            unc = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND EXISTS ({matched} AND r.evidence_status IN "
+                f"({','.join('?' * len(CREDIT_BEARING))}))",
+                (table, *sorted(CREDIT_BEARING)),
+            )
+            rec = (await cur.fetchone())[0]
 
-        # Distinguish the two failure shapes. `not_activated` is the deploy
-        # error -- actionable, one command fixes it. A partially-covered
-        # overlay is the expected steady state and must NOT page.
-        not_activated = credit_bearing > 0 and overlay_rows == 0
+            credit_bearing += pop
+            uncovered += unc
+            credit_recovered += rec
+            per_surface[table] = {
+                "credit_bearing": pop,
+                "uncovered": unc,
+                "credit_recovered": rec,
+            }
+
+        # One predicate, covering every shape of "the overlay is not doing its
+        # job": never populated, populated for one surface only, populated at
+        # anchors nothing joins, or populated entirely with statuses that earn
+        # nothing. Each of those collapses tier_high identically.
+        not_recovering = credit_bearing > 0 and credit_recovered == 0
         return {
             "overlay_rows": overlay_rows,
             "credit_bearing_legacy_rows": credit_bearing,
+            "credit_recovered": credit_recovered,
             "uncovered": uncovered,
-            "not_activated": not_activated,
+            "not_recovering": not_recovering,
+            "per_surface": per_surface,
         }
 
     async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:

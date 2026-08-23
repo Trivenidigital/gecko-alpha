@@ -31,6 +31,7 @@ import sqlite3
 import aiosqlite
 
 from scout.config import get_settings
+from scout.identity_recompute import CREDIT_BEARING
 from pathlib import Path
 
 #: Preserved snapshots, newest first. Absent files are skipped, not fatal --
@@ -43,6 +44,19 @@ SNAPSHOT_SOURCES = (
 )
 
 LIVE_DB = "/root/gecko-alpha/scout.db"
+
+
+def _is_live(path: str) -> bool:
+    """Only the real production database counts as live.
+
+    Compared against the LIVE_DB constant, deliberately never against `--db`.
+    Keying off the argument meant ANY target was treated as live and opened
+    `mode=ro`, so rehearsing the backfill against a BACKUP -- the cautious
+    thing `--dry-run` exists to allow -- planted `-wal`/`-shm` sidecars beside
+    that backup. That precise bug destroyed the real backups on 2026-08-15 and
+    had shipped in three separate readers before it was found.
+    """
+    return Path(path) == Path(LIVE_DB)
 
 
 def _open_read_only(path: str, *, live: bool) -> sqlite3.Connection:
@@ -82,7 +96,7 @@ def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
         if not Path(path).exists():
             continue
         try:
-            live = path == live_db
+            live = _is_live(path)
             conn = _open_read_only(path, live=live)
             # Each source's interval must describe the SAME table that source's
             # history was read from, or the two disagree: a token whose
@@ -153,7 +167,7 @@ def collect_history(sources, *, live_db: str) -> dict[str, str]:
             print(f"  {path}: MISSING (skipped — coverage degrades, not an error)")
             continue
         try:
-            conn = _open_read_only(path, live=(path == live_db))
+            conn = _open_read_only(path, live=_is_live(path))
             n = 0
             for token_id, first in conn.execute(query):
                 if not token_id or not first:
@@ -192,10 +206,17 @@ async def main() -> int:
     ap.add_argument(
         "--gate-minutes",
         type=float,
-        default=float(get_settings().CONVICTION_EARLY_LEAD_MINUTES),
+        # Resolved AFTER parsing (below). Calling get_settings() here runs at
+        # argparse-construction time -- unconditionally, before any argument is
+        # read -- so on a box without a complete .env the script died with a raw
+        # pydantic ValidationError even for --help, --dry-run, and the refusal
+        # path that exists to print guidance.
+        default=None,
         help="early-detection gate; defaults to CONVICTION_EARLY_LEAD_MINUTES",
     )
     args = ap.parse_args()
+    if args.gate_minutes is None:
+        args.gate_minutes = float(get_settings().CONVICTION_EARLY_LEAD_MINUTES)
 
     from scout.identity_recompute import recompute_legacy_provenance
 
@@ -241,6 +262,18 @@ async def main() -> int:
     print("\nEvidence status:")
     for status, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {status:42s} {n}")
+
+    recovered = sum(counts.get(st, 0) for st in CREDIT_BEARING)
+    print(f"\n  credit-bearing results: {recovered} of {sum(counts.values())}")
+    if not recovered:
+        # Exit NONZERO. This run is the operator's remediation for a
+        # NOT_RECOVERING page; reporting success while resolving nothing would
+        # let them tick the box and walk away from an unfixed collapse.
+        print(
+            "  NOTHING RECOVERED -- this overlay will not restore any chains "
+            "credit. Check that the history snapshots are still present."
+        )
+        return 3
     return 0
 
 

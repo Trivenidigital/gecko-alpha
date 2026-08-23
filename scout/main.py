@@ -1810,14 +1810,15 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     # running it leaves every pre-cutover chains detection untrusted and
     # collapses tier_high silently -- the exact outcome the overlay exists to
     # prevent. Logged unconditionally so "populated and healthy" stays
-    # distinguishable from "never checked"; only `not_activated` escalates,
-    # because partial coverage is the expected steady state (history runs out)
-    # and must never be trained into background noise.
+    # distinguishable from "never checked"; only `not_recovering` escalates --
+    # RECOVERED CREDIT, not row count, because a fully-populated overlay that
+    # resolved nothing produces the identical collapse. Partial coverage is the
+    # expected steady state (history runs out) and must never page.
     try:
         cov = await db.chain_identity_recompute_coverage_probe()
         logger.info("chain_identity_recompute_coverage", **cov)
-        if cov["not_activated"]:
-            logger.error("chain_identity_recompute_NOT_ACTIVATED", **cov)
+        if cov["not_recovering"]:
+            logger.error("chain_identity_recompute_NOT_RECOVERING", **cov)
     except Exception:
         logger.exception("chain_identity_recompute_coverage_probe_failed")
 

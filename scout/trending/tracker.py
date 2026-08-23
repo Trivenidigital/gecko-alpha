@@ -542,8 +542,14 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                     WHERE cir.source_table = 'trending_comparisons'
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
-                             WHEN 'verified_canonical' THEN 1 ELSE 0 END
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END
                     LIMIT 1) AS chains_recompute_status,
                   -- The VERIFIED lead, not the legacy prefix-derived one.
                   -- Scoring chains_lead_minutes after verifying canonical_lead
@@ -553,8 +559,14 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                     WHERE cir.source_table = 'trending_comparisons'
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
-                             WHEN 'verified_canonical' THEN 1 ELSE 0 END
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END
                     LIMIT 1) AS chains_canonical_lead
            FROM trending_comparisons
            ORDER BY COALESCE(social_detected_at, chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC

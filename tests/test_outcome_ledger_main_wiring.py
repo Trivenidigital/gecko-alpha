@@ -215,3 +215,97 @@ async def test_hourly_maintenance_invokes_labeler(mock_db, mock_session):
         await _run_hourly_maintenance(mock_db, mock_session, settings, logger)
 
     mock_label.assert_awaited_once_with(mock_db, settings)
+
+
+async def test_hourly_maintenance_runs_the_recompute_coverage_probe(
+    mock_db, mock_session
+):
+    """The probe must actually be CALLED from the hourly pass.
+
+    Without this, deleting the probe call -- or just the one line that
+    escalates -- leaves the entire suite green. Review demonstrated exactly
+    that: two mutants, `drop the logger.error` and `drop the call from
+    main.py`, both survived every test written for the probe. The probe's whole
+    value is that one branch, so the branch is what has to be pinned.
+    """
+    settings = MagicMock()
+    settings.DB_PATH = MagicMock()
+    settings.DB_PATH.exists.return_value = False
+    settings.CRYPTOPANIC_ENABLED = False
+    settings.SQLITE_WAL_PROFILE_ENABLED = False
+    settings.SQLITE_WAL_CHECKPOINT_ENABLED = False
+    settings.SQLITE_INCREMENTAL_VACUUM_ENABLED = False
+    settings.SQLITE_STALE_READER_WATCHDOG_ENABLED = False
+    settings.CONVICTION_PROSPECTIVE_ENABLED = False
+    settings.DEX_INSTRUMENTATION_ENABLED = False
+    settings.NARRATIVE_ENABLED = False
+    mock_db.get_unchecked_alerts = AsyncMock(return_value=[])
+    mock_db.chain_identity_recompute_coverage_probe = AsyncMock(
+        return_value={
+            "overlay_rows": 0,
+            "credit_bearing_legacy_rows": 7,
+            "credit_recovered": 0,
+            "uncovered": 7,
+            "not_recovering": True,
+            "per_surface": {},
+        }
+    )
+
+    logger = MagicMock()
+    with patch("scout.main.label_pending", new_callable=AsyncMock, return_value={}):
+        await _run_hourly_maintenance(mock_db, mock_session, settings, logger)
+
+    mock_db.chain_identity_recompute_coverage_probe.assert_awaited_once()
+
+    # And the ESCALATION fired -- not merely the unconditional info line.
+    escalations = [
+        c
+        for c in logger.error.call_args_list
+        if c.args and c.args[0] == "chain_identity_recompute_NOT_RECOVERING"
+    ]
+    assert len(escalations) == 1, (
+        f"expected exactly one NOT_RECOVERING escalation, got "
+        f"{[c.args[0] for c in logger.error.call_args_list if c.args]}"
+    )
+
+
+async def test_hourly_maintenance_does_NOT_escalate_when_credit_is_recovering(
+    mock_db, mock_session
+):
+    """The other half: a healthy overlay must not page.
+
+    Asserting only that the error fires would pass just as happily if the code
+    escalated unconditionally, which is the shape that gets an alarm muted.
+    """
+    settings = MagicMock()
+    settings.DB_PATH = MagicMock()
+    settings.DB_PATH.exists.return_value = False
+    settings.CRYPTOPANIC_ENABLED = False
+    settings.SQLITE_WAL_PROFILE_ENABLED = False
+    settings.SQLITE_WAL_CHECKPOINT_ENABLED = False
+    settings.SQLITE_INCREMENTAL_VACUUM_ENABLED = False
+    settings.SQLITE_STALE_READER_WATCHDOG_ENABLED = False
+    settings.CONVICTION_PROSPECTIVE_ENABLED = False
+    settings.DEX_INSTRUMENTATION_ENABLED = False
+    settings.NARRATIVE_ENABLED = False
+    mock_db.get_unchecked_alerts = AsyncMock(return_value=[])
+    mock_db.chain_identity_recompute_coverage_probe = AsyncMock(
+        return_value={
+            "overlay_rows": 900,
+            "credit_bearing_legacy_rows": 1000,
+            "credit_recovered": 540,
+            "uncovered": 460,
+            "not_recovering": False,
+            "per_surface": {},
+        }
+    )
+
+    logger = MagicMock()
+    with patch("scout.main.label_pending", new_callable=AsyncMock, return_value={}):
+        await _run_hourly_maintenance(mock_db, mock_session, settings, logger)
+
+    assert not [
+        c
+        for c in logger.error.call_args_list
+        if c.args and c.args[0] == "chain_identity_recompute_NOT_RECOVERING"
+    ], "partial coverage paged; that is how an alarm gets muted"
