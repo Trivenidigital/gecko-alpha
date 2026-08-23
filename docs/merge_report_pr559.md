@@ -1,12 +1,17 @@
 # Merge report — PR #559, versioned legacy-provenance recomputation
 
-**Candidate:** `b34e41b4` · **Base:** `origin/master` (`f05dd47f`) · 56 commits, 36 files,
-13 new test files. Branch is **0 behind / 56 ahead** — no rebase pending.
+**Base:** `origin/master` (`f05dd47f`) · **footprint measured at `d14a704f`:**
+57 commits, 36 files, 13 new test files · **0 behind**, no rebase pending.
+(The SHA is stamped because both numbers are only meaningful against one — §5b.)
 
 Every cleared item below records **the SHA it was measured on**. That is not
-bookkeeping: across nine revisions, four reviewer clearances were invalidated by
-changes that were themselves fixes for other findings, and none of those
-invalidations was visible from the diff that caused them. "A clearance is a
+bookkeeping: across twelve revisions, **four reviewer clearances lapsed and a
+fifth was wrong** — invalidated by changes that were themselves fixes for other
+findings, and none of those invalidations visible from the diff that caused
+them. The lapsed four are `1076f56d`, `89b070ef`, `97365248`, `b90f66fa`; the
+wrong one is `6276d586`, a fully green battery over a blocking regression
+(§5a). Collapsing those two categories into one count would undo the only
+distinction §5a exists to draw. "A clearance is a
 property of a revision, not of a component" is the single most useful sentence
 produced by this review, and it came from a reviewer flagging it against their
 own earlier verdict.
@@ -32,10 +37,10 @@ Operations: `docs/runbook_recompute_coverage.md`.
 
 | gate | state | evidence |
 |---|---|---|
-| exact-head CI | required green at `f7a200cf` (head) — **not yet satisfied at time of writing** | superseded runs cancelled so the runner reaches head |
+| exact-head CI | required green at the final head | production tree already green at `2fde4cf8`; head is docs-only above it |
 | full production replay | 12 revisions, stable | `c1a50e33` … `2fde4cf8` |
 | totals reconcile | 2,891 statuses = 2,891 written = population | `reconciliation_report` |
-| independent reviewers | 4 dispatched; **2 slots lapsed and are re-running** | see §4 |
+| independent reviewers | 4 dispatched; **all four terminal and holding at head** | see §4 |
 
 **Replay result** (unchanged across all twelve revisions except one deliberate
 status split):
@@ -89,13 +94,23 @@ diffing misses a file restored to the wrong baseline; tree hashes cannot.
 So any clearance measured at `2fde4cf8` or later covers the merging tree.
 
 Lapse status is **computed, not asserted** — for each clearance SHA, is there a
-`scout/` or `scripts/` delta to head, with an ancestry guard so a non-ancestor
-SHA reports invalid rather than reporting a spurious mass revert:
+`scout/` or `scripts/` delta to head. Three steps, in order, and the first was
+missing until it cost us:
+
+1. **`git fetch origin`** — the base ref itself may be stale
+2. `git merge-base --is-ancestor <sha> HEAD` — ancestry guard
+3. compare `<sha>:scout` and `<sha>:scripts` tree hashes against head's
+
+Step 2 catches *wrong branch named* and is **silent** on *right branch, stale
+ref*. The ops reviewer found the first spelling (`origin/HEAD` resolving to
+`origin/master`, producing a false LAPSED reporting 3,546 deletions) and fixed
+that spelling without asking whether the base ref was current — the same
+root-cause family, one step over. Step 1 is what closes it.
 
 | vector | last verdict | measured on | holds at `f7a200cf`? |
 |---|---|---|---|
-| structural / concurrency | CLEAN — 4/4 mutants, regression re-run in full | `97365248` | **LAPSED** — `scout/db.py` +134/−94 |
-| silent failure / observability | CLEAN — 6/6 mutants, two verified as intended-assertion kills | `b90f66fa` | **LAPSED** — `scout/db.py` +134/−94 |
+| structural / concurrency | **CLEAN, terminal** — re-run after lapse; 4 questions answered with discriminating controls | `f7a200cf` | **HOLDS** |
+| silent failure / observability | **CLEAN, terminal** — re-run after lapse; 7/7 mutants, defect reproduced then confirmed fixed | `1aa81f7e` | **HOLDS** |
 | ops safety / evidence integrity | **CLEAN, terminal** — S1–S7, N-1…N-6, R1–R5, T1, U1/U2, W1/W2, Y1 | `014ce900` | **HOLDS** |
 | recompute logic | CLEAN — "ship it"; E1 and the `armed_rate` trap closed | `1aa81f7e` | **HOLDS** |
 
@@ -107,9 +122,24 @@ is precisely the case ruling D's re-run requirement is for: both slots cleared a
 `scout/db.py` that no longer exists, and one of the intervening commits fixed a
 blocking regression on the silent-failure vector itself (§5a).
 
-**Merge is blocked.** Two slots are re-running against `f7a200cf`; one is
-confirming its SHA. A clearance is not carried forward across a production
-delta, and the implementer's own review never satisfies an independent slot.
+**All four slots terminal and holding at head.** Both lapsed slots re-ran
+against the current tree rather than being carried forward — and the rule earned
+itself on its first live occasion: it caught a real code change (the entire
+ratchet rework, including a blocking regression on the silent-failure vector)
+rather than documentation churn. A clearance is not carried forward across a
+production delta, and the implementer's own review never satisfies an
+independent slot.
+
+**Stamp the SHA whenever citing a commit count or a file count.** Measured at
+three heads on this branch: 55/36, 56/36, 57/36 — the commit count moves with
+every documentation commit, the file count does not. The tempting conclusion is
+"cite files, they are stable." That is wrong, and the ops reviewer caught it
+before it shipped: 36 is stable *because production froze at `2fde4cf8`*. It is
+stable while the tree is, not intrinsically. If production moves, a reader
+trusting the file count is misled in the other direction — by a number this
+report recommended. The durable rule is the stamp; the choice of metric is
+secondary. *(My first version of this paragraph asserted the metric property.
+It is recorded as the fifth instance in §5b-iii.)*
 
 **A stale local ref made the branch look like it carried other PRs' work.**
 Recomputing the header against `master` gave 66 commits / 91 files, including
@@ -129,6 +159,43 @@ against a base that no longer exists.
 | silent failure / observability | S1–S4, all fixed | `f2847774` |
 | ops safety / evidence integrity | N-1…N-6 + R1–R5, all fixed | `c8b5e009` |
 | recompute logic | nothing blocking; R1 implemented rather than deferred | `47847f47` |
+
+### The re-run found something the first pass could not
+
+The concurrency slot's re-run answered four questions with discriminating
+controls rather than clean results — a detector that only ever says "clean"
+proves nothing, so they ran it against a subject that *does* launder:
+
+```
+cache_prices (shared connection)        sibling rows surviving rollback: 1  LAUNDERED
+_record_coverage_baseline (own conn)    sibling rows surviving rollback: 0  clean
+detector discriminates: YES
+```
+
+That settles the question I could not settle myself: the dedicated connection is
+an **escape**, not a relocation, because connection A's `COMMIT` cannot commit
+connection B's pending work — which is also why the read-back is sound here
+while the same pattern on a shared connection was not.
+
+**And one question came back against them.** I asked whether making a guarded
+commit unconditional widened its blast radius. It does: the `count == 0` path
+now commits, and it launders. Reachability is low — all four call sites guard
+with a non-empty check (`main.py:1004`, `agent.py:325`, `outcome_ledger.py:978`
+and `:1065`), so it needs a non-empty list in which every element lacks `id`,
+i.e. malformed API data. Not blocking.
+
+The reviewer's own framing of it is the part worth keeping: they had recommended
+that change having verified the concurrency context of one of the two call sites
+and generalised to the other from its shape — *"same shape, second instance,"*
+the exact reasoning they had spent the review flagging in other people's work.
+That is the sixth instance of §5b-iii's generator and the second contributed by
+a reviewer against their own recommendation.
+
+**A larger pre-existing defect surfaced while measuring it**, and it is not this
+PR's: `cache_prices` launders on its *dominant* path, every pipeline cycle from
+`main.py:1006`, concurrently with `run_chain_tracker`'s bare `BEGIN`/
+`rollback()`. It predates this branch and widening it from "most calls" to "all
+calls" does not change its character. Ticketed, not merged against.
 
 ## 5. Open residuals, carried deliberately
 
@@ -228,15 +295,40 @@ construction. The explicit-clear added to reconcile two fixes opened a dead
 band on the first try and a starved-clear contradiction on the second.
 
 **Mutation evidence is asymmetric, in the direction opposite to intuition.**
-Three distinct ways a mutation run lies, all found in this review — two in my
-harness, one in a reviewer's, and the third only by reading what a mutant
-actually did:
+Four distinct ways a mutation run lies, all found in this review — two in my
+harness, one in a reviewer's, the third only by reading what a mutant actually
+did, and the fourth by a reviewer turning the third against their own sweep:
 
 | failure | what it looks like | guard |
 |---|---|---|
 | the edit never applied | a clean pass, i.e. a survival | `assert old in source` |
 | the edit applied and broke syntax | pytest exits non-zero — indistinguishable from a kill | `ast.parse(mutated)`, and score on `FAILED`, never on `ERROR` |
 | the edit applied, parsed, ran, and did not express the defect | a survival, or a kill by the wrong test | read what the mutation *does*; no automated guard exists |
+| the mutant died for a reason that is **not** the defect it is named for | a clean kill — nothing in the output looks wrong | check the mutant fails *the way the defect failed* |
+
+**The fourth row is a different kind of lie.** Rows one to three produce false
+*kills* or false survivals. The fourth is a genuine kill that is a false
+negative about **test quality** — which is worse, because the run looks healthy.
+The silent-failure reviewer found it by applying row three to their own sweep: a
+mutant dropping `raise_mark` from the write arm died with `AssertionError:
+unhandled coverage-mark decision: 'raise_mark'` — the exhaustiveness guard
+firing, not a test observing a frozen mark. A real kill of that mutant, and no
+evidence at all that the tests can see the production defect, because the real
+defect never produced an unhandled decision: **the arm did not exist to be
+unhandled.** Their corrected mutant modelled the original shape — classifier
+routes improvements to `compare`, every arm still handled, nothing rises — and
+failed on stored state with `assert 0.0 == 0.53`.
+
+Their rule, which is the executable form: **when a mutant is named for a
+historical defect, check that it fails the way the defect failed. If the failure
+signature is a guard rather than an observation, the guard is doing the work and
+the observation is still unpinned.**
+
+There is a second-order consequence worth naming. The exhaustiveness guard was
+itself one of my fixes, and it made the mutation harness *look* healthier by
+converting an observation failure into a guard failure. A fix that raised the
+kill count while degrading what the kill count meant — the only defect here that
+landed on the measuring instrument rather than on the code.
 
 The third row produced a false result in **both** harnesses independently, which
 is what makes it a property of the technique rather than carelessness. Mine: a
@@ -296,9 +388,24 @@ Two findings in this review turn out to be one shape, and it is the shape that
 neither discipline nor an agreement harness can catch:
 
 ```
-anchor_covered           asserts PER-TOKEN coverage      from a GLOBAL span
-the exhaustiveness assert  asserts DECISION completeness   from ARM completeness
+anchor_covered             asserts PER-TOKEN coverage      from a GLOBAL span
+the exhaustiveness assert   asserts DECISION completeness    from ARM completeness
 ```
+
+**The recognition test**, because the shape above is only usable by someone who
+already recognises it:
+
+1. find the level at which the guarantee is **stated**
+2. find the level at which the thing is **determined**
+3. if they are not the same level, the check restates its own premise
+
+Stated without those three steps the formulation is close to unfalsifiable —
+any check can be described that way by a reader motivated to dismiss it, and no
+reader can tell which of *their* checks it indicts. That warning came from the
+evidence-semantics reviewer, and it is the same failure this tranche kept
+producing in another medium: a claim recorded at a higher level of generality
+than what was actually verified. Committing that into the lessons section itself
+would have been a poor ending.
 
 In both, the check exists, runs, and passes — while evaluating a restatement of
 its own premise rather than the thing the premise is about. An exhaustiveness
@@ -316,6 +423,54 @@ per-token question, the per-axis question.
 Recorded because I asserted the false guarantee and the evidence-semantics
 reviewer endorsed it in writing one message later — two people, both looking
 directly at it, neither deriving it. It took the defect.
+
+## 5b-iii. Why the vectors must be orthogonal, not merely numerous
+
+The usual argument for multiple reviewers is that more people find more. That is
+not what happened here, and it is not why the structure worked. The
+recompute-logic reviewer put it correctly:
+
+> Attention doesn't scale against your own premises, because the premise is what
+> is doing the looking. A second reviewer isn't more attention — it's a
+> different premise.
+
+Four reviewers on one axis would have found none of the five generality defects.
+The evidence is who caught each:
+
+| # | instance | caught by |
+|---|---|---|
+| 1 | ops reviewer's falling-axis battery | the defect surfacing |
+| 2 | ops reviewer's `origin/HEAD` stale-ref sibling | me, accidentally, chasing a stale header |
+| 3 | my false-guarantee commit message | the defect — the logic reviewer had *endorsed* it one message later |
+| 4 | my false enumeration, written while fixing a false-enumeration finding | review |
+| 5 | my file-count over-generalisation | the ops reviewer, pre-ship |
+
+**5/5, and not one of them caught by its author re-reading their own claim.**
+Stated as 5/5 with the list rather than as "never," because a bare "never" is
+the same move this section is about. Two were caught by accident rather than by
+review, which weakens the structural argument and is left in for that reason.
+
+This also explains the one result that would otherwise read as a process
+failure: the logic reviewer endorsing my false guarantee was not inattention. It
+was a shared premise, and no amount of care on either side would have separated
+them from it.
+
+## 5b-iv. The report is authoritative; messages are lossy
+
+Three attributions in a message I sent a reviewer were wrong — I credited them
+with a finding that was another reviewer's, with a thread that was not theirs at
+all, and with a refinement that was mine. **The report had all three right.** The
+error existed only in the correspondence.
+
+The ops reviewer drew the structural point, and it is better than the resolution
+I had reached ("be more careful in messages," which is a wish, not a mechanism):
+a report defect has many readers; a correspondence defect has exactly one, so it
+survives unless that one reader happens to be checking. Keep the report as the
+authoritative artefact and treat messages as lossy by design.
+
+Worth noting they caught it by *declining credit twice in one message*,
+including for the three-readings column in §5c — which, had it stayed
+misattributed, would have made §5c fail inside its own worked example.
 
 ## 5c. The axis inventory — a step, not a principle
 
@@ -418,9 +573,21 @@ six seam defects came out of saying it.
 None of that is structurally forced. A successor copying the four-vector shape
 without it gets four reviewers agreeing with each other.
 
+**But "be candid" is a virtue, and virtues do not survive a deadline.** The
+version worth copying has a mechanism attached: *"my fix caused this" was the
+framing that predicted where the next defect would be* — six defects at one
+seam, five of them anticipated by it. (Five is what was verified; the sixth was
+not checked, and is not rounded up here.) A successor cannot be exhorted into
+candour, but can adopt a framing that pays for itself.
+
+The general form, contributed by the ops-safety reviewer and one level up from
+§5c: **prefer the version of a virtue that has a mechanism attached.** §5c says
+an executable artefact starts working immediately while a principle does not
+work at all; this is the same claim about dispositions rather than checks.
+
 And the practice that made the disclosures *possible* is worth copying more
 than the disposition: every reviewer reproduction was **kept, namespaced, and
-re-runnable across nine SHAs**. That is why a reviewer could re-check their own
+re-runnable across every revision of this branch**. That is why a reviewer could re-check their own
 record in four minutes instead of rebuilding a harness — and a reviewer who
 discards their scripts cannot audit themselves even if they want to. The
 willingness costs nothing if the evidence is gone.
