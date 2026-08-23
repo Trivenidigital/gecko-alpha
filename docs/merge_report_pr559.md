@@ -96,6 +96,45 @@ each returns terminal.
 | `coverage_intervals=None` falls back to a global floor | Latent: no runtime caller outside the ops script, which always passes explicit intervals. |
 | Post-archive rows can never be covered | Named in the runbook and counted as `unarchivable` in both the payload and the alert text. |
 
+## 5b. Process rules this review produced
+
+These are not observations about this PR. Each cost a blocking round, and
+each is a rule about how review itself is run.
+
+**A clearance is a property of a revision, not of a component.** Four reviewer
+clearances were invalidated by later changes that were themselves fixes for
+other findings, and none of those invalidations was visible from the diff that
+caused them. A clearance with a SHA beside it is a *record*, not a gate — so
+**the head at merge must equal the head that was cleared, or the slot reopens
+automatically.** I proved the need for the automatic form by failing the manual
+one: I closed a reviewer's slot citing their clean verdict on an older SHA while
+their verdict on the current one had two blockers.
+
+**A reconciliation is new code and needs its own pass.** When two reviewers
+converge on one root cause from opposite ends and their fixes conflict, what
+ships is a third design *neither of them reviewed* — and the seam is the
+least-attacked code in the change. Both of the last two blocking findings lived
+exactly there. This is a dispatch rule, not a coding one.
+
+**Ask whether a fix created a new sanctioned exception to the invariant it just
+closed.** A deliberately-left hole is load-bearing and under-tested by
+construction. The explicit-clear added to reconcile two fixes opened a dead
+band on the first try and a starved-clear contradiction on the second.
+
+**Mutation evidence is asymmetric, in the direction opposite to intuition.**
+A *survival* is strong evidence — a mutant that passes is one nothing caught. A
+*kill* is weak: the mutant may have failed for the wrong reason. I recorded a
+kill that was a binding-count `ProgrammingError`, not detection; the clause was
+unpinned for two more rounds. Two mitigations, both adopted here: neutralise a
+predicate in place rather than deleting it, so arity is preserved by
+construction; and verify a kill failed on the intended assertion rather than on
+any error.
+
+**When someone documents where a risk bites hardest, check the new code against
+that document first.** I wrote a comment naming trending as oscillating around
+20, then shipped a dead band starting at exactly 20. The evidence was already in
+hand, which is precisely why it went unread.
+
 ## 6. What this review actually cost, and why
 
 29 commits for one feature is not a good ratio, and the reason is worth
