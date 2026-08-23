@@ -61,12 +61,44 @@ Both escalate on **recovered credit**, never on row count, and neither pages on
 partial coverage — history genuinely runs out for older anchors, and an alarm
 that fires on the steady state gets muted before the day it matters.
 
-Install:
+### Install — and arm it
+
+A watchdog nothing schedules is deploy-without-activate one level up, which is
+the failure class this whole subsystem exists to close. The timer ships in the
+repo for that reason.
 
 ```bash
 install -m 0755 scripts/recompute-coverage-watchdog.sh /usr/local/bin/
-# scripts run from /usr/local/bin, so `git pull` alone deploys NOTHING here
+install -m 0644 scripts/recompute-coverage-watchdog.{timer,service} /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now recompute-coverage-watchdog.timer
+systemctl list-timers recompute-coverage-watchdog.timer   # VERIFY it is armed
 ```
+
+Scripts run from `/usr/local/bin`, so `git pull` alone deploys **nothing**
+here. That split has already caused a deploy that shipped nothing on this box.
+
+### Exit contract
+
+Only exit 1 notifies. Everything else is a failure **of the watchdog**, which
+nothing else reports — so they are distinct codes rather than a shared one.
+
+| code | meaning | Telegram |
+|---:|---|:--:|
+| 0 | healthy, or nothing to recover | no |
+| 1 | **alarm** — a surface is recovering nothing | yes |
+| 2 | the check could not run (unreadable DB) | no |
+| 3 | `.env` missing | no |
+| 4 | Telegram credentials missing — the alarm fired and could not be delivered | no |
+| 5 | `APP_DIR` invalid | no |
+| 6 | python interpreter missing | no |
+
+Codes 5 and 6 exist because `cd "$APP_DIR"` under `set -euo pipefail` exits
+**1** — the same code the alarm path uses after a successful send. A dead
+watchdog and a firing watchdog were indistinguishable to anything downstream.
+
+The systemd unit sets `SuccessExitStatus=0 1`, so an alarm is not a service
+failure but 2–6 surface in `systemctl status`.
 
 ## Reading the status breakdown
 
@@ -79,5 +111,21 @@ install -m 0755 scripts/recompute-coverage-watchdog.sh /usr/local/bin/
 | `no_legacy_credit` | never held chains credit; outside the population | n/a |
 | `unjoinable_row` | archived row with no coin_id or no anchor | n/a |
 
-Statuses always sum to the archived population. If they do not, a row was
-dropped rather than classified — that is a defect, not a rounding artefact.
+Statuses always sum to the **replayed** population — archived rows minus those
+already stamped `canonical_v1`, which have no legacy provenance to recompute.
+`reconciliation_report` emits `population`, `skipped_canonical`, `replayed` and
+per-surface `stored` so the numbers can be checked rather than assumed. If they
+do not reconcile, a row was dropped rather than classified — a defect, not a
+rounding artefact.
+
+## When the backfill cannot help
+
+The alert reports `unarchivable` separately. Those are rows written **after**
+the archives were taken: the archive step self-guards and never re-runs, the
+stamp step runs every startup, and the backfill only reads archives. Re-running
+`--apply` will not clear them.
+
+If `credit_recovered` is 0 and `unarchivable` equals the population, the page is
+not telling you to run the backfill — it is telling you the population has
+drained to rows that predate no archive. That is a design limit, not an
+incident.
