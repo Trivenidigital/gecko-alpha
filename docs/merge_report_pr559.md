@@ -145,11 +145,31 @@ nothing. The SHA-tagged verdict lines in §4 are what prevent that, and they onl
 work if the report carries the SHA every time it carries the word "clean".
 
 **A clearance is a property of a revision, not of a component** — and the cheap
-mechanical form is a tree hash, not a filename diff:
-`git rev-parse <cleared-sha>:scout` and `:scripts` against HEAD. If both match,
-the clearance carries without another pass; if either differs, the slot
-reopens. A name-level diff misses a file restored to the *wrong* baseline,
-which is exactly the failure mode a killed mutation harness produces. Four reviewer
+mechanical form is a tree hash, not a filename diff. A name-level diff misses a
+file restored to the *wrong* baseline, which is exactly what a killed mutation
+harness leaves behind.
+
+```bash
+B=origin/fix/canonical-identity-semantics     # NAME the branch; never origin/HEAD
+git merge-base --is-ancestor "$SHA" "$B" || echo "WRONG TARGET — not a revert"
+[ "$(git rev-parse $SHA:scout)"   = "$(git rev-parse $B:scout)" ] &&
+[ "$(git rev-parse $SHA:scripts)" = "$(git rev-parse $B:scripts)" ] &&
+  echo CARRIES || echo LAPSED
+```
+
+**The ancestry guard is the load-bearing line, and it was missing from the first
+version of this rule** — which I published here before running it. `origin/HEAD`
+resolves to `origin/master`, which does not contain this tranche, so the tree
+hashes differ and the check reports 15 files and 3,546 deletions. That reads as
+a mass revert of the entire feature. It is the tranche's *absence* from the
+wrong branch. Without the guard, "production moved" and "you asked the wrong
+branch" are indistinguishable — and the wrong-branch case is far louder, being
+the one result likely to trigger an emergency response.
+
+Found by the reviewer who proposed the rule, by executing it once, one message
+after handing it over. **The artefact either of us was most confident about was
+the one neither of us had run** — which is the same lesson as §5c, at the
+smallest possible scale, and the cheapest instance of it in the review. Four reviewer
 clearances were invalidated by later changes that were themselves fixes for
 other findings, and none of those invalidations was visible from the diff that
 caused them. A clearance with a SHA beside it is a *record*, not a gate — so
