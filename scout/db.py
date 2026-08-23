@@ -8174,7 +8174,7 @@ class Database:
 
     async def _record_coverage_baseline(
         self, source_table: str, rate: float, population: int
-    ) -> bool:
+    ) -> float | None:
         """Write the ratchet mark on its OWN connection, never the shared one.
 
         This was the probe's first write, and putting it on `self._conn` made
@@ -8235,7 +8235,21 @@ class Database:
                     (source_table, rate, population),
                 )
                 await conn.commit()
-                return True
+                # Read BACK, rather than returning True and letting the caller
+                # assume the stored value equals `rate`. With MAX at the write
+                # that assumption is false whenever the clear failed: the
+                # upsert keeps the OLD value while the caller reports today's,
+                # so the payload claims a mark that was never stored -- the
+                # exact defect `mark_written` was added to close, reintroduced
+                # by the fix for a different one. The checker reads the table,
+                # so probe and checker would disagree about the same surface.
+                cur = await conn.execute(
+                    "SELECT best_rate FROM recompute_coverage_baseline "
+                    "WHERE source_table = ?",
+                    (source_table,),
+                )
+                stored = await cur.fetchone()
+                return stored[0] if stored else None
             finally:
                 await conn.close()
         except Exception:
@@ -8246,7 +8260,7 @@ class Database:
                 source_table=source_table,
                 rate=rate,
             )
-            return False
+            return None
 
     async def chain_identity_recompute_coverage_probe(
         self, *, gate_minutes: float = 1440.0
@@ -8465,7 +8479,27 @@ class Database:
             # the surviving remainder is not a random sample and the rate can
             # fall for benign reasons. That is a separate open question -- do
             # not read this guard as though it covers it.
-            if row is not None and row[1] < _COLLAPSE_MIN_POPULATION * 2:
+            # A TRANSITION, not a standing state. `recorded < floor * 2`
+            # alone is a property of the recorded population, so for a surface
+            # whose population is stable in [20, 40) it is true on EVERY pass:
+            # clear, re-arm at today's rate, never reach the collapse check.
+            # Measured -- a stable 30-row surface collapsing 0.8 -> 0.1 was
+            # silent, while reporting `rate_judged: True`, which is the field
+            # that exists to say a surface IS being watched.
+            #
+            # And the dead band starts immediately above the judging floor, so
+            # it lands on the surface already identified as most exposed:
+            # trending oscillates around 20.
+            #
+            # `pop > row[1] * 2` restores the docstring's actual claim -- a
+            # rate measured on a handful of rows is not comparable to one
+            # measured on a thousand -- by requiring the larger population to
+            # have actually arrived.
+            if (
+                row is not None
+                and row[1] < _COLLAPSE_MIN_POPULATION * 2
+                and pop > row[1] * 2
+            ):
                 # EXPLICIT delete, not `best = None` alone. With MAX at the
                 # write, clearing the local variable no longer lowers anything
                 # -- so the deliberate re-arm has to say so. This is the one
@@ -8484,11 +8518,11 @@ class Database:
                 # instant, so the component with LESS information was the
                 # honest one -- and the probe's version reads as health rather
                 # than as a gap, which is the worse direction to be wrong in.
-                wrote = await self._record_coverage_baseline(table, rate, pop)
-                v["mark_written"] = wrote
+                stored = await self._record_coverage_baseline(table, rate, pop)
+                v["mark_written"] = stored is not None
                 v["best_rate"] = (
-                    round(rate, 4)
-                    if wrote
+                    round(stored, 4)
+                    if stored is not None
                     else (round(best, 4) if best is not None else None)
                 )
             else:

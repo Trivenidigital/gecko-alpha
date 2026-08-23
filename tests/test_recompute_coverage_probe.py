@@ -998,3 +998,64 @@ async def test_an_incomparable_mark_is_CLEARED_deliberately(db):
         225,
     ), "the incomparable 25-row mark was not cleared, so MAX pinned it forever"
     assert probe["collapsed_surfaces"] == []
+
+
+async def test_a_STABLE_small_population_is_still_judged(db):
+    """The clear must be a transition, not a standing state.
+
+    `recorded < floor * 2` alone is a property of the recorded population, so
+    for a surface whose population is stable in [20, 40) it is true on EVERY
+    pass: clear, re-arm at today's rate, never reach the collapse check. A
+    stable 30-row surface collapsing 0.8 → 0.1 was silent — while reporting
+    `rate_judged: True`, the field that exists to say a surface IS watched.
+
+    The dead band starts immediately above the judging floor, so it landed on
+    the surface already identified as most exposed: trending oscillates
+    around 20.
+    """
+    await _bulk(db, 30, 24)  # population 30, rate 0.80
+
+    for _ in range(3):
+        probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+        assert probe["per_surface"]["gainers_comparisons"]["best_rate"] == 0.8
+
+    # Collapse on the SAME population — no growth, no shrinkage.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 2 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    v = probe["per_surface"]["gainers_comparisons"]
+
+    assert v["rate"] == 0.1
+    assert v["best_rate"] == 0.8, "the mark re-armed itself at the collapsed rate"
+    assert probe["collapsed_surfaces"] == ["gainers_comparisons"]
+    assert probe["not_recovering"] is True
+
+
+async def test_the_payload_reports_what_the_TABLE_holds_after_MAX(db):
+    """`mark_written: True` must not imply the stored value equals `rate`.
+
+    With MAX at the write that is false whenever the clear failed: the upsert
+    keeps the OLD value while the caller reports today's. The checker reads the
+    table, so probe and checker would disagree about the same surface — and
+    this is the defect `mark_written` was added to close, reintroduced by the
+    fix for a different one.
+    """
+    await _bulk(db, 40, 32)  # 0.80
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # A lower write, as a failed clear would leave: MAX keeps 0.80.
+    stored = await db._record_coverage_baseline("gainers_comparisons", 0.10, 40)
+
+    assert stored == 0.8, (
+        "the write reported its own intent rather than reading back what MAX "
+        "actually stored"
+    )
+    cur = await db._conn.execute(
+        "SELECT best_rate FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    assert (await cur.fetchone())[0] == 0.8
