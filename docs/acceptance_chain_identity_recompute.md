@@ -1,6 +1,6 @@
 # Acceptance report — versioned legacy-provenance recomputation
 
-**Candidate:** `552ef6f6` (`fix/canonical-identity-semantics`, PR #559)
+**Candidate:** `599be775` (`fix/canonical-identity-semantics`, PR #559)
 **Method:** full replay of the entire archived population against a trimmed
 copy of production, taken in the pre-migration shape so `initialize()`
 exercises the real upgrade-with-data path.
@@ -17,11 +17,21 @@ Every archived row lands in exactly one status, and the statuses sum to the
 population. This is asserted, not observed: rows with no join key used to be
 skipped silently, which made the totals fail to sum with nothing saying why.
 
-| | rows |
-|---|---:|
-| archived population | 2,891 |
-| statuses, summed | **2,891** |
-| overlay rows written | **2,891** |
+Three numbers can each reasonably be called "the population" and they are not
+the same. `reconciliation_report` emits all of them rather than leaving the
+denominator implicit:
+
+| | rows | what it means |
+|---|---:|---|
+| `population` | 2,891 | every archived row |
+| `skipped_canonical` | 0 | already `canonical_v1`; never prefix-derived, nothing to replay |
+| `replayed` | 2,891 | the denominator the status table below uses |
+| statuses, summed | **2,891** | |
+| `stored` | **2,891** | rows actually in the overlay |
+
+They coincide here only because production has no `canonical_v1` archived rows
+and no unjoinable rows. They will diverge on any future run, which is why the
+report states which one it used.
 
 | status | rows | earns credit |
 |---|---:|:--:|
@@ -85,10 +95,9 @@ The resolver is declining to assert negatives where history does not reach — i
 is not silently failing to find matches. Had that split come back the other way
 it would have meant the opposite.
 
-## 5. What was actually fabricated
+## 5. What the prefix-only rows do and do not establish
 
-Only **4 rows** across the entire population are demonstrated prefix-only
-collisions:
+Only **4 rows** across the entire population classify as `verified_prefix_only`:
 
 | coin | symbol | anchor | fabricated lead |
 |---|---|---|---:|
@@ -100,19 +109,40 @@ collisions:
 All four carry 12–13 day "leads", the signature of a prefix match against an
 unrelated token.
 
+**Read this status precisely.** It means: a prefix candidate explains the
+legacy credit, and no canonical match for the coin exists in our substrate
+within a covered window. It does **not** amount to proof of fabrication,
+because the coverage predicate is a *global* span over all tokens' events — it
+establishes that we were recording during the window, not that this specific
+coin's canonical-id token would have been seen. The direction is safe (it
+withholds credit rather than granting it), and the same objection is why the
+`alias_unique` tier no longer produces verified positives at all. Making the
+coverage predicate per-token is the residual work that would let these four be
+called proven.
+
 **This is the finding that changes what can be claimed.** The pre-ruling
 framing was that the 45% `tier_high` drop is *mostly a provenance-metadata
 artefact*. The replay does not support that, and does not support its opposite
 either. What it supports:
 
-- 1,543 rows are confirmed genuine,
-- 4 are confirmed fabricated,
+- 1,543 rows are confirmed genuine — all at `contract` or `canonical_id` tier,
+  where censoring cannot manufacture the win,
+- 4 are best explained by a prefix collision, with the caveat above,
 - 1,220 cannot be decided in either direction, because the history that would
   decide them predates every surviving source.
 
 The honest statement is that the drop is **dominated by unverifiable history,
 not by demonstrated fabrication** — and that no experiment available to us can
 close the remaining 1,220. That gap is permanent.
+
+### Tier discipline
+
+Every one of the 1,543 verified rows resolved at `canonical_id` tier. **Zero**
+were promoted through `alias_unique` (symbol equality), which is now recorded
+as indeterminate unconditionally — a tier-3 win is exactly what censored
+history fabricates, and the module's own worked example (`terra-luna-2 <-
+luna`) produced a 7,200-minute lead that collapses to 60 once real history is
+restored.
 
 ## 6. Left-censoring
 
@@ -130,12 +160,13 @@ first-seen *after* its anchor slipped through the time bounds.
 
 ## 7. Sensitivity
 
-The replay was run on three successive revisions of the code (`c1a50e33`,
-`19dd27da`, `552ef6f6`), across a change of live history source
+The replay was run on four successive revisions of the code (`c1a50e33`,
+`19dd27da`, `552ef6f6`, `599be775`), across a change of live history source
 (`signal_events` → `signal_first_seen`), a rewrite of the coverage probe, and a
-change from one transaction to per-surface commits.
+change from one transaction to per-surface commits, the removal of
+`alias_unique` promotion, and a semantics filter on the tracker overlay.
 
-**Every status count was identical on all three.** The result is insensitive to
+**Every status count was identical on all four.** The result is insensitive to
 those corrections, which is why they could be made late without re-opening the
 measurement.
 
