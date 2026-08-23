@@ -777,7 +777,32 @@ class Settings(BaseSettings):
     # >= SECONDWAVE_COOLDOWN_MAX_DAYS to avoid truncating secondwave's
     # evidence window. Validator below enforces.
     SCORE_HISTORY_RETENTION_DAYS: int = 21
-    VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 21
+    # Ruling B (2026-08-16), executed 2026-08-22 after a verified backup.
+    #
+    # 21 -> 14 is a DESTRUCTIVE change: once the shorter cutoff has deleted
+    # rows, restoring the value does not restore them.
+    #
+    # It is authorized because BOTH readers of volume_snapshots are bounded at
+    # <= 14 days, which is what distinguishes B from ruling A:
+    #   * get_vol_7d_avg      -- scanned_at >= now-7d  (hard 7-day window)
+    #   * get_volume_history  -- scanned_at >= now-`days`, and the only
+    #                            production caller (secondwave/detector.py)
+    #                            passes days=SECONDWAVE_COOLDOWN_MAX_DAYS=14.
+    # A was falsified because ITS binding reader, get_recent_scores(limit=3),
+    # has no date window at all -- so retention silently supplied the boundary
+    # and 22.8% of tokens changed. Here, hiding >14d rows cannot change either
+    # reader's output by construction; the prod replay agreed exactly (1668
+    # vol_7d-eligible contracts before and after, delta 0).
+    #
+    # Both boundaries are TRAILING from `now` -- the prune deletes
+    # scanned_at <= now-14d and the readers ask for scanned_at >= now-Nd -- so
+    # they abut without a gap and no lateness margin is required. This is the
+    # structural difference from #548's volume_history_cg, whose window was
+    # RETROSPECTIVE ([emitted, emitted+7d]) and therefore truncated from the
+    # left at zero margin. If a future reader anchors its window to an event
+    # time instead of `now`, that equivalence breaks and this floor must be
+    # re-derived as horizon + measured lateness margin.
+    VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 14
 
     # -------- Narrative-owned table retention (BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION) --------
     # Hourly prune via main._run_hourly_maintenance. V8 plan-review fold:
@@ -2607,6 +2632,14 @@ class Settings(BaseSettings):
             )
         return self
 
+    # Ruling B pinned this at 14 as a HARD floor -- "never below 14 without a
+    # new consumer study." The secondwave validator below is necessary but NOT
+    # sufficient for that: it compares against SECONDWAVE_COOLDOWN_MAX_DAYS,
+    # so lowering that knob would silently drag the permitted retention floor
+    # down with it and re-open the deletion the ruling bounded. Pin the
+    # absolute floor separately from the relative one.
+    VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS: int = 14
+
     @model_validator(mode="after")
     def _validate_retention_covers_secondwave_window(self) -> "Settings":
         """V2#3 fold: prevent silent mis-config where prune retention <
@@ -2628,6 +2661,28 @@ class Settings(BaseSettings):
                     f"SECONDWAVE_COOLDOWN_MAX_DAYS={self.SECONDWAVE_COOLDOWN_MAX_DAYS}. "
                     f"Lower retention silently truncates secondwave's evidence window."
                 )
+        return self
+
+    # Ordered AFTER the relative check on purpose: when both are violated the
+    # secondwave message names the actual consumer and is the more actionable
+    # one, so this floor only speaks in the case the relative check CANNOT
+    # catch -- someone lowering SECONDWAVE_COOLDOWN_MAX_DAYS, which would
+    # otherwise drag the permitted retention floor down with it.
+    @model_validator(mode="after")
+    def _validate_volume_snapshots_retention_floor(self) -> "Settings":
+        if (
+            self.VOLUME_SNAPSHOTS_RETENTION_DAYS
+            < self.VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS
+        ):
+            raise ValueError(
+                f"VOLUME_SNAPSHOTS_RETENTION_DAYS="
+                f"{self.VOLUME_SNAPSHOTS_RETENTION_DAYS} is below the ruling-B "
+                f"hard floor of {self.VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS} "
+                f"days. Going lower requires a new consumer study: the readers "
+                f"are bounded at 7d and SECONDWAVE_COOLDOWN_MAX_DAYS, and "
+                f"deleted snapshots cannot be restored by raising the value "
+                f"back."
+            )
         return self
 
     @model_validator(mode="after")

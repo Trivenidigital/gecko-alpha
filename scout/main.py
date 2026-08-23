@@ -1764,25 +1764,31 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             pruned_cp = await db.prune_cryptopanic_posts(
                 keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
             )
-            if pruned_cp:
-                logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
+            logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
         except Exception:
             logger.exception("cryptopanic_prune_failed")
 
     # BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING:
-    # parameterized + decoupled from narrative daily loop. Follow cryptopanic
-    # pattern (V4#4 fold): info-when-rows>0, silent-when-zero — structlog at
-    # main.py has no filter_by_level so debug would still emit.
+    # parameterized + decoupled from narrative daily loop.
+    #
+    # These log UNCONDITIONALLY, including rows_deleted=0. The former
+    # info-when-rows>0 / silent-when-zero pattern made "the prune ran and
+    # deleted nothing" and "the prune never ran" write byte-identical journals,
+    # so a silent stop was undetectable at the only rate that could reveal it.
+    # #547 removed that guard from the loop-driven prunes below; these
+    # hand-written siblings in the same function kept it, so the blind spot
+    # survived where #547 was believed to have closed it. Ruling B's retention
+    # evidence depends on reading the prune's effect from the journal, which
+    # requires the zero case to be visible.
     try:
         pruned_sh = await db.prune_score_history(
             keep_days=settings.SCORE_HISTORY_RETENTION_DAYS
         )
-        if pruned_sh:
-            logger.info(
-                "score_history_pruned",
-                rows_deleted=pruned_sh,
-                keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
-            )
+        logger.info(
+            "score_history_pruned",
+            rows_deleted=pruned_sh,
+            keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("score_history_prune_failed")
 
@@ -1790,12 +1796,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         pruned_vs = await db.prune_volume_snapshots(
             keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS
         )
-        if pruned_vs:
-            logger.info(
-                "volume_snapshots_pruned",
-                rows_deleted=pruned_vs,
-                keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "volume_snapshots_pruned",
+            rows_deleted=pruned_vs,
+            keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("volume_snapshots_prune_failed")
 
@@ -1806,12 +1811,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         pruned_tde = await db.prune_trade_decision_events(
             keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS
         )
-        if pruned_tde:
-            logger.info(
-                "trade_decision_events_pruned",
-                rows_deleted=pruned_tde,
-                keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "trade_decision_events_pruned",
+            rows_deleted=pruned_tde,
+            keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("trade_decision_events_prune_failed")
 
@@ -1823,12 +1827,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         pruned_vh = await db.prune_volume_history_cg(
             keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS
         )
-        if pruned_vh:
-            logger.info(
-                "volume_history_cg_pruned",
-                rows_deleted=pruned_vh,
-                keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,
-            )
+        logger.info(
+            "volume_history_cg_pruned",
+            rows_deleted=pruned_vh,
+            keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("volume_history_cg_prune_failed")
 
@@ -1843,12 +1846,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
             cohort_closed_at=settings.DETECTION_RECEIPTS_COHORT_CLOSED_AT or None,
         )
-        if pruned_ddr:
-            logger.info(
-                "detection_decision_receipts_pruned",
-                rows_deleted=pruned_ddr,
-                keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "detection_decision_receipts_pruned",
+            rows_deleted=pruned_ddr,
+            keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("detection_decision_receipts_prune_failed")
 

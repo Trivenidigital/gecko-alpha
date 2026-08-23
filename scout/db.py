@@ -10499,17 +10499,49 @@ class Database:
         await self._conn.commit()
         return cur.rowcount or 0
 
-    async def prune_volume_snapshots(self, *, keep_days: int) -> int:
-        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount."""
+    async def prune_volume_snapshots(
+        self, *, keep_days: int, batch_size: int = 50_000
+    ) -> int:
+        """Delete ``volume_snapshots`` rows older than ``keep_days``.
+
+        Batched, and the batching is not premature. Ruling B drops retention
+        21 -> 14, which makes the FIRST prune after cutover delete 3,283,124
+        rows -- 39% of the table -- where the steady state is ~17K/hour. A
+        single DELETE of that size holds the write lock while it rewrites the
+        table plus both indexes; the read-only index scan alone measures 3.9s
+        on prod, so the write can plausibly exceed the 90s ``busy_timeout`` and
+        cascade ``database is locked`` into the pipeline sharing this
+        connection -- the same failure shape as the Solana watchdog incident.
+
+        Batching trades atomicity for bounded lock-hold time, which is the
+        right trade for a retention prune: a partially-completed prune is
+        indistinguishable from one that ran an hour earlier, and the next pass
+        finishes it.
+
+        Returns the total rows deleted across batches.
+        """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
-            (cutoff,),
-        )
-        await self._conn.commit()
-        return cur.rowcount or 0
+        total = 0
+        # Bound the loop independently of the exit condition: a driver that
+        # reports rowcount as -1 would otherwise spin forever.
+        for _ in range(10_000):
+            cur = await self._conn.execute(
+                "DELETE FROM volume_snapshots WHERE rowid IN ("
+                "  SELECT rowid FROM volume_snapshots WHERE scanned_at <= ? LIMIT ?)",
+                (cutoff, batch_size),
+            )
+            await self._conn.commit()
+            deleted = cur.rowcount or 0
+            if deleted <= 0:
+                break
+            total += deleted
+            if deleted < batch_size:
+                break
+        return total
 
     async def prune_trade_decision_events(self, *, keep_days: int) -> int:
         """Delete ``trade_decision_events`` rows older than ``keep_days`` (INF-02).
