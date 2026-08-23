@@ -144,7 +144,12 @@ in six months, against a branch that has moved eleven commits, and re-runs
 nothing. The SHA-tagged verdict lines in §4 are what prevent that, and they only
 work if the report carries the SHA every time it carries the word "clean".
 
-**A clearance is a property of a revision, not of a component.** Four reviewer
+**A clearance is a property of a revision, not of a component** — and the cheap
+mechanical form is a tree hash, not a filename diff:
+`git rev-parse <cleared-sha>:scout` and `:scripts` against HEAD. If both match,
+the clearance carries without another pass; if either differs, the slot
+reopens. A name-level diff misses a file restored to the *wrong* baseline,
+which is exactly the failure mode a killed mutation harness produces. Four reviewer
 clearances were invalidated by later changes that were themselves fixes for
 other findings, and none of those invalidations was visible from the diff that
 caused them. A clearance with a SHA beside it is a *record*, not a gate — so
@@ -174,6 +179,26 @@ actually did:
 | the edit never applied | a clean pass, i.e. a survival | `assert old in source` |
 | the edit applied and broke syntax | pytest exits non-zero — indistinguishable from a kill | `ast.parse(mutated)`, and score on `FAILED`, never on `ERROR` |
 | the edit applied, parsed, ran, and did not express the defect | a survival, or a kill by the wrong test | read what the mutation *does*; no automated guard exists |
+
+The third row produced a false result in **both** harnesses independently, which
+is what makes it a property of the technique rather than carelessness. Mine: a
+re-audit mutant that added a stray `SELECT` instead of the original's inline
+write *and commit*, so it exercised nothing and survived. Theirs: flipping one
+of two independent `source_table ==` checks for the losers time bound, leaving
+the second, so the mutant was too weak to express the defect and survived. In
+both cases the only thing that caught it was re-reading what the edit actually
+changed.
+
+That yields the sharper statement of the asymmetry, and it is symmetric in
+obligation rather than in strength:
+
+- a **survival** obliges you to prove the mutant was strong enough to express
+  the defect — a weak mutant and a genuine gap are indistinguishable;
+- a **kill** obliges you to prove it failed for the right reason — a broken
+  mutant and a detected one are indistinguishable.
+
+Neither direction is self-certifying, and the two guards are different. That is
+why the third row has no mechanical entry and cannot get one.
 
 The resulting harness contract is four items, each catching a different lie:
 
