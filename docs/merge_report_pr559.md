@@ -285,11 +285,20 @@ Run against this PR's probe battery, the same inventory gives:
 | population growth | 2 |
 | **population shrinkage** | **0** |
 
-The two columns that were empty are exactly where the dead alarm lived. The one
-still empty — shrinkage — maps to the recorded residual about a non-random
-surviving population, so it is a known open question rather than an untested
-behaviour. That is what an inventory buys: it distinguishes "not covered" from
-"covered by a decision".
+An empty column has **three** readings, not two, and the third is what keeps the
+step usable:
+
+| reading | meaning | action |
+|---|---|---|
+| covered | a row exists | none |
+| **not covered** | no row, no reason | **defect — add a scenario before clearing** |
+| covered by a decision | no row, but a recorded residual explains why | none; cite the residual |
+
+Shrinkage is the third case here: empty, but mapped to the recorded residual
+about a non-random surviving population — untested on purpose, not by omission.
+Without that distinction the inventory flags every gap equally, manufactures
+work, and gets ignored within two uses. With it, the two genuinely empty columns
+stand out — and they are exactly where the dead alarm lived.
 
 The general form, which is why this section exists at all: **an artefact that
 is executable starts working immediately; one that is a principle does not
@@ -344,4 +353,11 @@ six seam defects came out of saying it.
 None of that is structurally forced. A successor copying the four-vector shape
 without it gets four reviewers agreeing with each other.
 
-*(closing observation contributed by the ops-safety reviewer)*
+And the practice that made the disclosures *possible* is worth copying more
+than the disposition: every reviewer reproduction was **kept, namespaced, and
+re-runnable across nine SHAs**. That is why a reviewer could re-check their own
+record in four minutes instead of rebuilding a harness — and a reviewer who
+discards their scripts cannot audit themselves even if they want to. The
+willingness costs nothing if the evidence is gone.
+
+*(closing observations contributed by the ops-safety reviewer)*
