@@ -103,15 +103,15 @@ async def test_probe_reports_the_four_measures_the_ruling_names(db):
 
     assert r["status"] == "E_DEFERRED_BY_ECONOMICS"
     for key in (
-        "bytes_total",
+        "bytes_total_est",
         "growth_rows_per_day",
-        "reclaimable_bytes",
+        "reclaimable_bytes_est",
         "days_to_1gb",
     ):
         assert key in r, f"probe is missing the ruling's {key}"
     assert r["rows"] == 5
     assert r["growth_rows_per_day"] == 5
-    assert r["bytes_total"] > 0
+    assert r["bytes_total_est"] > 0
 
 
 async def test_a_still_emitting_cohort_is_NOT_reclaimable(db):
@@ -182,7 +182,7 @@ async def test_zero_growth_does_not_project_a_false_crossing(db):
     assert r["growth_rows_per_day"] == 0
     assert r["days_to_1gb"] is None
     assert "projected_size" not in r["reopen_reasons"]
-    assert r["bytes_total"] < Database._LEDGER_SIZE_CEILING_BYTES
+    assert r["bytes_total_est"] < Database._LEDGER_SIZE_CEILING_BYTES
 
 
 async def test_over_the_ceiling_reopens_even_with_ZERO_growth(db, monkeypatch):
@@ -208,7 +208,7 @@ async def test_over_the_ceiling_reopens_even_with_ZERO_growth(db, monkeypatch):
     assert (
         r["growth_rows_per_day"] == 0
     ), "fixture grew; the zero-growth path is untested"
-    assert r["bytes_total"] >= Database._LEDGER_SIZE_CEILING_BYTES
+    assert r["bytes_total_est"] >= Database._LEDGER_SIZE_CEILING_BYTES
     assert r["reopen"] is True, "over the ceiling and silent"
     assert "over_ceiling" in r["reopen_reasons"]
 

@@ -7523,6 +7523,14 @@ class Database:
     # cheap proxy because dbstat itself scans the whole 7 GB database and takes
     # minutes -- far too heavy for an hourly probe whose only job is to notice a
     # threshold crossing.
+    #
+    # RE-MEASURE TRIGGER: the drift risk is `gate_verdicts`, a variable-length
+    # JSON blob -- adding gates raises the true per-row cost with nothing here
+    # noticing. (The label columns matter less: measured 257.7 B/row all-pending
+    # vs 342.5 B/row all-complete, and at a 7-day finalize the table sits ~94%
+    # complete.) Re-measure via dbstat if the gate set changes materially. The
+    # pinning test asserts the constant against a 2026-08-23 measurement; it
+    # cannot detect that the measurement went stale.
     _LEDGER_BYTES_PER_ROW = 454
     _LEDGER_REOPEN_RECLAIMABLE_BYTES = 100 * 1024 * 1024
     _LEDGER_REOPEN_PROJECTED_DAYS = 30
@@ -7616,11 +7624,19 @@ class Database:
         return {
             "status": "E_DEFERRED_BY_ECONOMICS",
             "rows": rows,
-            "bytes_total": bytes_total,
+            # `_est` because these are rows x a measured proxy, not dbstat. An
+            # operator grepping journald for `bytes_total=` would otherwise read
+            # them as measured.
+            "bytes_total_est": bytes_total,
+            "bytes_per_row_proxy": self._LEDGER_BYTES_PER_ROW,
             "growth_rows_per_day": growth_rows_per_day,
-            "growth_bytes_per_day": growth_bytes_per_day,
+            "growth_bytes_per_day_est": growth_bytes_per_day,
             "reclaimable_rows": reclaimable_rows,
-            "reclaimable_bytes": reclaimable_bytes,
+            # Drops the ruling's "non-protected" qualifier: no protection
+            # mechanism exists yet, so this counts closed cohorts regardless.
+            # Safe direction -- it OVERSTATES what is reclaimable, so the alarm
+            # fires early -- but the name promises more than it delivers.
+            "reclaimable_bytes_est": reclaimable_bytes,
             "days_to_1gb": (
                 None if days_to_ceiling == float("inf") else round(days_to_ceiling, 1)
             ),

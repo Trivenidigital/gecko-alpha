@@ -47,6 +47,19 @@ reviewer to attack:
 - **Cohort key = `(surface, kind)`.** The table has no cohort or generation
   column, so a key had to be chosen. `surface` × `kind` is the only pair that
   partitions emissions by their originating lane.
+
+  **This is adequate for OBSERVABILITY and is explicitly NOT the key a pruner
+  may delete on.** The ruling's vocabulary is richer than lane — it speaks of
+  *cohort/generation identity*, *active/frozen-cohort outputs*, and
+  *historical incident/evidence cohorts are explicitly protectable*. Generation,
+  frozen and protected are lifecycle properties that `(surface, kind)` cannot
+  express. For a probe that fails safe (ignoring protection OVERSTATES what is
+  reclaimable, so the alarm fires early); for a pruner it is insufficient,
+  because the ruling's receipts require cohort/generation identity and
+  protection status that this key cannot carry.
+- **`unlabelable` counts as CLOSED.** The labeler never re-selects it, so it is
+  terminal in the same mechanical sense `complete` is. Named here because the
+  two obvious states get discussed and this third one is easy to leave implicit.
 - **`partial` counts as OPEN, not closed.** The labeler's own queue is
   `WHERE label_status IN ('pending','partial')`, so a partial row is work the
   system has not finished. Treating it as closed would let a prune race the
