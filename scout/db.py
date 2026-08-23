@@ -350,6 +350,9 @@ class Database:
             # accounting. Module counters reset on restart, and a budget you can
             # zero by bouncing the service is not a budget.
             await self._migrate_cg_credit_ledger_v1()
+            # Retention option F: derived first-seen substrate, so
+            # consumers stop depending on unbounded signal_events history.
+            await self._migrate_signal_first_seen_v1()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -7502,6 +7505,162 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "source_call_price_snapshot_runs_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def record_signal_first_seen(self, token_id: str, created_at: str) -> None:
+        """Fold one observation into the derived first-seen substrate.
+
+        MIN semantics, NOT insert-once. `emit_event` stamps `created_at` in
+        Python, so two concurrent callers can interleave and produce an event
+        whose timestamp is EARLIER than one already written; replay and
+        backfill paths write historical rows deliberately. An insert-once cache
+        would keep whichever row happened to land first and be permanently
+        wrong about the minimum, with nothing to signal it.
+
+        Idempotent and order-independent: applying the same observations in any
+        order, any number of times, converges on the same value.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        if not token_id or not created_at:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(token_id) DO UPDATE SET
+                 first_seen_at = MIN(
+                   signal_first_seen.first_seen_at, excluded.first_seen_at),
+                 updated_at = excluded.updated_at""",
+            (token_id, created_at, now),
+        )
+
+    async def _migrate_signal_first_seen_v1(self) -> None:
+        """Derived first-seen substrate for signal_events (retention option F).
+
+        Several consumers derive "when did we first see this token" with
+        ``MIN(created_at)`` over the whole of ``signal_events``. That makes
+        RETENTION the implicit historical boundary: shorten it and the derived
+        minimum silently moves forward, changing lead-time attribution with no
+        error anywhere. The ruling's requirement is to build the derived state
+        FIRST, migrate the consumers, prove parity, and only then reopen
+        retention separately -- which this migration does not touch.
+
+        MONOTONIC BY CONSTRUCTION. The writer takes ``MIN(existing, incoming)``,
+        not insert-once. An insert-once cache would be wrong the first time an
+        event arrives carrying an earlier timestamp than one already recorded --
+        a replay, an out-of-order insert, or a backfill -- and the repository
+        cannot prove those impossible: ``emit_event`` stamps ``created_at`` in
+        Python, so two callers can interleave, and the ledger/backfill paths
+        write historical rows by design.
+
+        Backfill is a single grouped scan of the existing table, so the
+        substrate starts equal to what the consumers compute today. That
+        equality is what the differential tests assert.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "signal_first_seen_v1"
+        schema_version = 20260823
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("signal_first_seen_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for signal_first_seen_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_first_seen (
+                    token_id TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """)
+            # Backfill from whatever history still exists. Runs BEFORE any
+            # retention change, which is the whole point of ordering F ahead of
+            # a shortening: once rows are gone the true minimum is
+            # unrecoverable.
+            await conn.execute(
+                """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+                   SELECT token_id, MIN(created_at), ?
+                     FROM signal_events
+                    WHERE token_id IS NOT NULL
+                    GROUP BY token_id
+                   ON CONFLICT(token_id) DO UPDATE SET
+                     first_seen_at = MIN(
+                       signal_first_seen.first_seen_at, excluded.first_seen_at),
+                     updated_at = excluded.updated_at""",
+                (now_iso,),
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signal_first_seen_at "
+                "ON signal_first_seen(first_seen_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            cur = await conn.execute("SELECT COUNT(*) FROM signal_first_seen")
+            n = (await cur.fetchone())[0]
+            _log.info(
+                "signal_first_seen_v1_migration_complete",
+                table="signal_first_seen",
+                backfilled_tokens=n,
+            )
+        except BaseException as e:
+            _log.exception(
+                "signal_first_seen_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,

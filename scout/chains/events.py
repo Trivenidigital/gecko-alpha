@@ -33,6 +33,31 @@ async def emit_event(
         raise ValueError(f"Invalid pipeline: {pipeline!r}")
 
     now = datetime.now(timezone.utc).isoformat()
+    # ORDER MATTERS: fold the derived substrate BEFORE inserting the event.
+    #
+    # The two writes share a transaction so they commit together. The ordering
+    # is what makes the FAILURE path safe, and it replaces an earlier attempt
+    # that wrapped both in a SAVEPOINT. That attempt was wrong: `conn` is
+    # shared by concurrently scheduled tasks (_pipeline_loop, run_chain_tracker
+    # and the narrative agent all emit), savepoints are a STACK rather than a
+    # per-coroutine scope, and interleaved emits do not nest LIFO. A failing
+    # emit's ROLLBACK TO would discard a SIBLING emit's insert while keeping
+    # its own -- and unique savepoint names do not help, because rolling back
+    # to an outer savepoint still undoes the inner coroutine's work.
+    #
+    # With the fold first, neither failure can understate history:
+    #   * fold raises  -> nothing of ours is pending; identical to the
+    #     behaviour before the substrate existed.
+    #   * insert raises -> the fold may be committed by a sibling's commit,
+    #     leaving a first_seen for an event row that never landed. That records
+    #     "we observed this token at time T", which is TRUE -- we tried to emit
+    #     for it -- and the writer only ever LOWERS the minimum, so it cannot
+    #     push first_seen later than the truth. Later is the harmful direction:
+    #     it silently understates how early we saw a token.
+    #
+    # MIN semantics, so a replayed or out-of-order event still lowers the
+    # minimum correctly rather than being dropped as a duplicate.
+    await db.record_signal_first_seen(token_id, now)
     cursor = await conn.execute(
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)

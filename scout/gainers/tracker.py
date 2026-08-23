@@ -275,22 +275,25 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             comp["pipeline_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
 
-        # Check signal_events table (chain signals)
+        # Check the DERIVED first-seen substrate (chain signals).
+        # Option F: consumers must stop depending on unbounded
+        # signal_events history, so retention stops silently moving
+        # the derived minimum forward.
         # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
         if len(symbol) >= 4:
             cursor = await db._conn.execute(
-                """SELECT MIN(created_at) FROM signal_events
+                """SELECT MIN(first_seen_at) FROM signal_first_seen
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
                           OR LOWER(token_id) LIKE LOWER(? || '%')
                           OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND datetime(created_at) < datetime(?, '+5 minutes')""",
+                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, symbol, coin_id, first_gainer_at_str),
             )
         else:
             cursor = await db._conn.execute(
-                """SELECT MIN(created_at) FROM signal_events
+                """SELECT MIN(first_seen_at) FROM signal_first_seen
                    WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND datetime(created_at) < datetime(?, '+5 minutes')""",
+                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
                 (coin_id, symbol, first_gainer_at_str),
             )
         sig_row = await cursor.fetchone()

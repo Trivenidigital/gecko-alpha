@@ -331,6 +331,12 @@ async def test_compare_credits_same_day_isoformat_chain_signal(db):
             earlier.isoformat(),
         ),
     )
+    # `emit_event` writes the event AND folds signal_first_seen in one
+    # transaction, and the tracker now derives first-seen from that substrate.
+    # A raw INSERT alone builds a state production cannot reach (the savepoint
+    # in emit_event makes an event without its substrate row unreachable), so
+    # the fixture would be testing an impossible shape rather than this branch.
+    await db.record_signal_first_seen("coin-isoc", earlier.isoformat())
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
         ("coin-isoc", "CISO", "Coin IsoC", now.isoformat()),
@@ -593,6 +599,10 @@ async def test_compare_signal_events_like_matching(db):
            VALUES (?, ?, ?, ?, ?, ?)""",
         ("bless", "memecoin", "candidate_scored", "{}", "scorer", _sqlite_ts(earlier)),
     )
+    # Mirror emit_event's atomic unit -- see the note in the isoformat test.
+    # The LIKE matching under test is unchanged: signal_first_seen.token_id
+    # holds the same values signal_events.token_id does.
+    await db.record_signal_first_seen("bless", _sqlite_ts(earlier))
 
     # Trending snapshot uses CoinGecko slug (long form)
     await db._conn.execute(
