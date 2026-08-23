@@ -337,17 +337,18 @@ def test_an_unparseable_emitted_at_is_refused_rather_than_guessed():
 
 
 def test_a_naive_emitted_at_is_treated_as_UTC():
-    """KNOWN LIMITATION: this assertion is environment-masked.
+    """Naive means UTC here, and the naive path never touches `astimezone()`.
 
-    The code stamps `tzinfo=utc` explicitly before converting. A mutant that
-    removes that stamp falls through to `astimezone()`, which interprets a NAIVE
-    datetime as LOCAL time -- and because this host and CI both run UTC, the
-    mutant produces identical output and survives.
+    This assertion used to be environment-masked: the naive branch fell through
+    to `astimezone()`, which reads a naive datetime as LOCAL time, so a
+    regression dropping the explicit stamp produced identical output on a UTC
+    host and survived every test. Returning directly from the naive branch does
+    not make that bug detectable — it makes it impossible, because the API that
+    performs local-time reads is no longer on the path.
 
-    The assertion is still correct and would catch the mutant on any non-UTC
-    host; it simply cannot fail here. Recorded rather than left as a silently
-    surviving mutant, because "no test failed" and "no test could fail" are
-    different statements and only one of them is evidence.
+    Keeping the general form of the old caveat, because it outlives this
+    function: "no test failed" and "no test could fail" are different
+    statements, and only one of them is evidence.
     """
     from datetime import datetime as _dt
     from datetime import timezone as _tz

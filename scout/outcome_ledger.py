@@ -383,7 +383,18 @@ def _normalise_emitted_at(emitted_at: str | None) -> str:
             "parse; the shape pattern and the parser have diverged."
         ) from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        # Return HERE rather than falling through. `astimezone()` reads a NAIVE
+        # datetime as LOCAL time, so routing the naive path through it makes the
+        # result host-dependent -- and because this host and CI both run UTC, a
+        # regression that dropped the explicit stamp would produce identical
+        # output and survive every test.
+        #
+        # Keeping that API off the naive path entirely does not make the bug
+        # detectable, it makes it impossible: a future edit cannot reintroduce a
+        # local-time read on a path that never calls the function which does one.
+        # Behaviour-identical to the fall-through form on any host, since
+        # astimezone(utc) on an already-UTC value is a no-op.
+        return parsed.replace(tzinfo=timezone.utc).isoformat()
     try:
         return parsed.astimezone(timezone.utc).isoformat()
     except (OverflowError, OSError) as exc:
