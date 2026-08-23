@@ -217,7 +217,7 @@ def test_a_DROPPED_overlay_table_is_not_reported_as_not_deployed(tmp_path):
 
 def test_the_watchdog_constants_match_the_application(tmp_path):
     """The watchdog is stdlib-only on purpose -- it must run when the app is
-    broken -- so it hand-copies two constants. Copies drift.
+    broken -- so it hand-copies FIVE constants. Copies drift.
 
     A mutant dropping losers and trending from the script's SURFACES survived
     the whole suite: the gap closed in the in-process probe had reopened in
@@ -232,6 +232,19 @@ def test_the_watchdog_constants_match_the_application(tmp_path):
     wd = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(wd)
 
+    # All FIVE copied constants, not two. The script's own comments claimed
+    # "(parity asserted by test)" for RECOMPUTE_SEMANTICS,
+    # COLLAPSE_MIN_POPULATION and COLLAPSE_FRACTION while this test covered
+    # only SURFACES and CREDIT_BEARING -- the fourth documented-parity claim
+    # in this tranche that the artifact did not satisfy.
+    import scout.db as _dbmod
+
+    assert (
+        wd.COLLAPSE_MIN_POPULATION == _dbmod._COLLAPSE_MIN_POPULATION
+    ), "the watchdog judges a different minimum population than the probe"
+    assert (
+        wd.COLLAPSE_FRACTION == _dbmod._COLLAPSE_FRACTION
+    ), "the watchdog uses a different collapse threshold than the probe"
     assert dict(wd.SURFACES) == dict(
         Database._RECOMPUTE_SURFACES
     ), "the watchdog watches a different set of surfaces than the application"
@@ -486,3 +499,66 @@ def test_it_warns_when_immutable_cannot_see_a_non_empty_wal(tmp_path):
     keeper.close()
 
     assert "-wal that immutable=1 cannot see" in r.stdout, r.stdout
+
+
+def test_the_watchdog_applies_the_population_comparability_guard(tmp_path):
+    """A mark from a much smaller population is not comparable to today's.
+
+    Closed in the probe and left open here — in the layer that actually sends
+    Telegram — so the two windows an operator has onto this system
+    contradicted each other: journald quiet, Telegram screaming COLLAPSED.
+    Same shape as the `unarchivable` counter landing in the logging layer and
+    not the paging one.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=100)
+    conn = sqlite3.connect(db)
+    # Mark recorded when the population was 10; today it is 100.
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 0.9, 10, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute("DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > 5029")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert (
+        "COLLAPSED" not in r.stdout
+    ), "paged against a mark measured on a tenth of the population"
+    assert r.returncode == 0, r.stdout
+
+
+def test_a_comparable_mark_still_pages(tmp_path):
+    """The other direction, so the guard cannot just disable the alarm."""
+    db = _build(tmp_path, overlay_status="verified_canonical", population=100)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 0.9, 100, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute("DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > 5029")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "COLLAPSED" in r.stdout
+
+
+def test_the_summary_names_the_mark_each_surface_was_compared_against(tmp_path):
+    """Otherwise a collapse page cannot be told from a wrong mark."""
+    db = _build(tmp_path, overlay_status="verified_canonical", population=100)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 0.9, 100, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert "mark=0.9000" in r.stdout, r.stdout
+    assert "mark=none" in r.stdout, "unarmed surfaces must say so per surface"

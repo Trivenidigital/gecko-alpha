@@ -737,7 +737,11 @@ async def test_the_ratchet_write_cannot_LAUNDER_a_sibling_transaction(db):
     assert db._conn.in_transaction, "fixture did not open a sibling transaction"
 
     # The hourly probe fires in the middle of it and records a mark.
-    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    import time
+
+    started = time.monotonic()
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    elapsed = time.monotonic() - started
 
     # The sibling then fails and rolls back, as it does in production.
     await db._conn.rollback()
@@ -748,6 +752,26 @@ async def test_the_ratchet_write_cannot_LAUNDER_a_sibling_transaction(db):
     assert (await cur.fetchone())[0] == 0, (
         "the probe committed a sibling's in-flight unit -- its rollback was "
         "laundered into a no-op"
+    )
+
+    # The payload must not claim a mark the table does not hold. Assigning
+    # `best_rate` before attempting the write made the probe report an armed
+    # ratchet at a value that was never stored, while the out-of-process alarm
+    # said NOT ARMED at the same instant -- the component with less information
+    # being the honest one, and the probe's version reading as health.
+    v = probe["per_surface"]["gainers_comparisons"]
+    assert v["mark_written"] is False
+    assert v["best_rate"] is None
+    cur = await db._conn.execute("SELECT COUNT(*) FROM recompute_coverage_baseline")
+    assert (await cur.fetchone())[0] == 0
+
+    # And the give-up is FAST. Reverting the 2s timeout to the pipeline's 90s
+    # costs 96 seconds of suite time and zero failures, so "the suite got
+    # slower" was the only signal -- the one nobody watches, and how the 114s
+    # version reached review in the first place.
+    assert elapsed < 10.0, (
+        f"the best-effort mark write blocked the maintenance pass for "
+        f"{elapsed:.1f}s; it must give up fast"
     )
 
     # The mark is NOT required here: with a sibling holding the write lock the
@@ -790,3 +814,63 @@ async def test_the_mark_IS_written_when_nothing_holds_the_lock(db):
     assert row is not None, "the ratchet never recorded a mark"
     assert row[0] == 0.8
     assert row[1] == 25
+
+
+async def test_ordinary_attrition_below_the_mark_rides_underneath_it(db):
+    """Pins the threshold itself, not just that a threshold exists.
+
+    Under `_COLLAPSE_FRACTION = 1.0` ANY decline below the high-water becomes a
+    collapse — and "ordinary attrition must ride underneath the mark" is the
+    entire design rationale for a ratchet rather than a floor. No test
+    distinguished 0.5 from 1.0 until this one.
+    """
+    await _bulk(db, 100, 60)  # mark 0.60
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # A real but ordinary decline: 0.55 against a 0.60 mark. Below the mark,
+    # comfortably above half of it.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 54 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["per_surface"]["gainers_comparisons"]["rate"] == 0.55
+    assert probe["per_surface"]["gainers_comparisons"]["best_rate"] == 0.6
+    assert (
+        probe["collapsed_surfaces"] == []
+    ), "a 0.55 rate against a 0.60 mark paged; that is drift, not a cliff"
+    assert probe["not_recovering"] is False
+
+
+async def test_the_probe_ignores_a_SUPERSEDED_generations_verdict(db):
+    """The probe's own version filter, which nothing held.
+
+    It is pinned in the trackers and reachable in the checker through
+    functional tests, but removing it from the probe let it count a
+    superseded, more generous verdict as recovered while the correctly-filtered
+    readers refuse it — probe green, readers blind, which is precisely the
+    divergence version scoping was added to eliminate.
+    """
+    row_id = await _credit_bearing_legacy_row(db, "superseded-only")
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('gainers_comparisons', ?, 'superseded-only', 'X', ?, 1, 8740.0,
+                   1, 9000.0, 'canonical_id', 'verified_canonical',
+                   'superseded_v0', ?)""",
+        (row_id, ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["credit_bearing_legacy_rows"] == 1
+    assert (
+        probe["credit_recovered"] == 0
+    ), "the probe counted a superseded generation's verdict as recovered"
+    assert probe["not_recovering"] is True

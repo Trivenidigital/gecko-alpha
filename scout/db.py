@@ -8145,7 +8145,7 @@ class Database:
 
     async def _record_coverage_baseline(
         self, source_table: str, rate: float, population: int
-    ) -> None:
+    ) -> bool:
         """Write the ratchet mark on its OWN connection, never the shared one.
 
         This was the probe's first write, and putting it on `self._conn` made
@@ -8190,6 +8190,7 @@ class Database:
                     (source_table, rate, population),
                 )
                 await conn.commit()
+                return True
             finally:
                 await conn.close()
         except Exception:
@@ -8200,6 +8201,7 @@ class Database:
                 source_table=source_table,
                 rate=rate,
             )
+            return False
 
     async def chain_identity_recompute_coverage_probe(
         self, *, gate_minutes: float = 1440.0
@@ -8394,17 +8396,37 @@ class Database:
             # normal population reads as a collapse. That false page is how a
             # brand-new alarm earns a mute in its first week. Treat such a mark
             # as absent and let this observation re-establish it.
+            #
+            # ONE-SIDED on purpose: this guards population GROWTH. The expected
+            # direction here is shrinkage, as rows drain to `canonical_v1`, and
+            # that is a separate open question (the surviving remainder is not
+            # a random sample, so its rate can fall for benign reasons). This
+            # guard does not cover it -- do not read it as though it does.
             if row is not None and row[1] * 2 < pop:
                 best = None
             v["rate"] = round(rate, 4)
-            # Report the mark IN FORCE AFTER this observation, not the one
-            # before it -- otherwise the first run reports None for a mark it
-            # just recorded, and the payload disagrees with the table.
-            v["best_rate"] = round(max(rate, best) if best is not None else rate, 4)
             if best is None or rate > best:
-                await self._record_coverage_baseline(table, rate, pop)
-            elif rate < best * _COLLAPSE_FRACTION:
-                collapsed.append(table)
+                # Report what the TABLE holds, from the write's own result --
+                # not what this observation intended. The write is
+                # best-effort: under a held write lock it gives up after 2s,
+                # and assigning `best_rate` before attempting it made the
+                # payload claim an armed ratchet at a value that was never
+                # stored. The out-of-process alarm said NOT ARMED at the same
+                # instant, so the component with LESS information was the
+                # honest one -- and the probe's version reads as health rather
+                # than as a gap, which is the worse direction to be wrong in.
+                wrote = await self._record_coverage_baseline(table, rate, pop)
+                v["mark_written"] = wrote
+                v["best_rate"] = (
+                    round(rate, 4)
+                    if wrote
+                    else (round(best, 4) if best is not None else None)
+                )
+            else:
+                v["mark_written"] = False
+                v["best_rate"] = round(best, 4)
+                if rate < best * _COLLAPSE_FRACTION:
+                    collapsed.append(table)
 
         # PER SURFACE, not global. The comment here used to claim a global
         # predicate covered "populated for one surface only"; it did not, and

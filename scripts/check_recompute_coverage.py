@@ -145,6 +145,7 @@ def main() -> int:
         detail = []
         dark: list[str] = []
         unarchivable = 0
+        marks: dict[str, float] = {}
         per_surface: dict[str, tuple[int, int]] = {}
         placeholders = ",".join("?" * len(CREDIT_BEARING))
         for table, anchor in SURFACES:
@@ -213,7 +214,7 @@ def main() -> int:
         for table, _anchor in SURFACES:
             try:
                 row = conn.execute(
-                    "SELECT best_rate FROM recompute_coverage_baseline "
+                    "SELECT best_rate, population FROM recompute_coverage_baseline "
                     "WHERE source_table = ?",
                     (table,),
                 ).fetchone()
@@ -221,8 +222,18 @@ def main() -> int:
                 break  # baseline table absent (pre-deploy): nothing to compare
             if row:
                 have_baseline = True
+                marks[table] = row[0]
             pop, rec = per_surface.get(table, (0, 0))
             if not row or pop < COLLAPSE_MIN_POPULATION:
+                continue
+            # The SAME population-comparability guard the probe applies. A mark
+            # measured against a much smaller population is not comparable to
+            # today's, so the return to a normal population reads as a
+            # collapse. That false page was closed in the probe and left open
+            # here -- in the layer that actually sends Telegram -- so the two
+            # windows an operator has onto this system contradicted each other,
+            # with journald quiet and Telegram screaming.
+            if row[1] * 2 < pop:
                 continue
             if rec / pop < row[0] * COLLAPSE_FRACTION:
                 collapsed.append(table)
@@ -232,6 +243,14 @@ def main() -> int:
     finally:
         conn.close()
 
+    # Name the mark each surface was compared against. Without it an operator
+    # reading a collapse page cannot tell a real collapse from a wrong mark
+    # without opening the database, and an unarmed surface reads identically
+    # to a healthy one.
+    detail = [
+        f"{d} mark={marks[t]:.4f}" if t in marks else f"{d} mark=none"
+        for d, t in zip(detail, [tbl for tbl, _ in SURFACES])
+    ]
     summary = " ".join(detail)
     if population == 0:
         print(f"no pre-cutover chains credit to recover ({summary})")
