@@ -229,6 +229,14 @@ async def main() -> int:
     for start, end in intervals:
         print(f"  {start}  ..  {end}")
 
+    if args.apply and any(Path(args.db) == Path(src) for src in SNAPSHOT_SOURCES):
+        print(
+            f"REFUSING: {args.db} is a preserved forensic snapshot. --apply "
+            "would write overlay rows into it. Point --db at the live "
+            "database or at a scratch copy."
+        )
+        return 2
+
     if not args.apply:
         print("\nDRY RUN — nothing written. Re-run with --apply.")
         return 0
@@ -239,6 +247,13 @@ async def main() -> int:
     # production tables -- the deploy does that, in its own window, once.
     # Attach to what is already there, and refuse if the schema has not landed.
     conn = await aiosqlite.connect(args.db)
+    # Match the pipeline's busy_timeout. aiosqlite defaults to 5s while the
+    # pipeline sets 90s, and that asymmetry decides who loses: if the pipeline
+    # holds the write lock when this script's first INSERT fires, the BACKFILL
+    # dies -- after it has already scanned several GB of snapshots, with no
+    # retry. Nothing is corrupted (uncommitted work is discarded), but the
+    # operator's remediation for a page fails on a lock and starts over.
+    await conn.execute("PRAGMA busy_timeout = 90000")
     try:
         cur = await conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "

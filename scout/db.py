@@ -7823,6 +7823,19 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_cir_status "
                 "ON chain_identity_recompute_v1(evidence_status)"
             )
+            # The READ path's key. The trackers correlate on
+            # (source_table, coin_id, historical_anchor) and the implicit
+            # primary-key index is on (source_table, source_row_id), so
+            # without this every dashboard row scanned all overlay rows for
+            # its surface and built a temp b-tree for the ORDER BY -- twice,
+            # once per scalar subquery. Measured by review as
+            # "SEARCH cir USING INDEX ... (source_table=?)
+            #  + USE TEMP B-TREE FOR ORDER BY".
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS paper_migrations ("
                 "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"

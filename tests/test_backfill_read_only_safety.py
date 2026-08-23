@@ -85,3 +85,56 @@ def test_the_sidecar_check_can_actually_fail(tmp_path):
         "misclassifying a backup as live produced no sidecars, so the guard "
         "test above proves nothing on this platform"
     )
+
+
+def test_apply_refuses_to_write_into_a_forensic_snapshot(tmp_path, monkeypatch, capsys):
+    """`--apply` opens `--db` READ-WRITE, so a snapshot path would be mutated.
+
+    Pointing --db at a scratch copy is legitimate (that is how the replay is
+    measured), so the guard names the preserved snapshots rather than demanding
+    identity with LIVE_DB.
+    """
+    import asyncio
+
+    import backfill_chain_identity_recompute as mod
+
+    snap = tmp_path / "scout.db.pre500.20260802202122"
+    _make_wal_db(snap)
+    monkeypatch.setattr(mod, "SNAPSHOT_SOURCES", (str(snap),))
+    monkeypatch.setattr(
+        sys, "argv", ["prog", "--db", str(snap), "--apply", "--gate-minutes", "1440"]
+    )
+
+    rc = asyncio.run(mod.main())
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    # WHICH gate refused, not merely THAT one did. Both refusal paths return 2,
+    # and this fixture's database also lacks the overlay table -- so asserting
+    # the code alone passed with the snapshot guard removed entirely. The
+    # sidecar check did not discriminate either: SQLite deletes -wal/-shm on
+    # last close, so they were gone by the time the test looked.
+    assert "preserved forensic snapshot" in out
+    assert "does not exist" not in out, (
+        "refused at the SCHEMA gate, not the snapshot gate -- this test would "
+        "pass with the snapshot guard deleted"
+    )
+
+
+def test_help_works_without_a_populated_env(tmp_path, monkeypatch):
+    """--help must not need Telegram and Anthropic keys.
+
+    `default=float(get_settings()...)` evaluated at parser-construction time,
+    so the sole writer of the overlay -- the one step that must be rehearsed
+    with --dry-run before --apply -- was unrunnable on any dev box, rehearsal
+    host or CI runner, and failed with a wall of missing-key errors that reads
+    as "wrong script" rather than "missing .env".
+    """
+    import asyncio
+
+    import backfill_chain_identity_recompute as mod
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--help"])
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(mod.main())
+    assert exc.value.code == 0

@@ -308,6 +308,11 @@ async def recompute_legacy_provenance(
             by_token[token_id] = (token_id, earliest, nfs, jd)
         substrate = list(by_token.values())
 
+    # Built ONCE. This is loop-invariant -- the substrate does not change
+    # while the replay runs -- and every millisecond it wasted was spent
+    # holding the write transaction open against a live pipeline.
+    jd_by_value = {first_seen: jd for _t, first_seen, _n, jd in substrate}
+
     for source_table, anchor_col in _SURFACES.items():
         archive = f"{source_table}_legacy_prefix_v1"
         cur = await conn.execute(
@@ -349,7 +354,17 @@ async def recompute_legacy_provenance(
             # asserting in a comment that the bound was "identical to the one
             # that produced the legacy value" -- so losers rows could be
             # verified on candidates the canonical losers path would refuse.
-            if source_table == "losers_comparisons":
+            #
+            # ONE decision, used for both halves. The cutoff EXPRESSION and the
+            # comparison it feeds have to move together: written as two
+            # independent `source_table ==` checks, flipping only the first
+            # left a `datetime()` cutoff (space-separated) being compared
+            # against raw isoformat-`T` values, and `'T'`(0x54) > `' '`(0x20).
+            # Review showed that mutant surviving the whole suite -- the two
+            # halves silently disagreeing is exactly the failure the
+            # per-surface split was introduced to prevent.
+            raw_bound = source_table == "losers_comparisons"
+            if raw_bound:
                 cur = await conn.execute("SELECT ?, julianday(?)", (anchor, anchor))
             else:
                 cur = await conn.execute(
@@ -357,14 +372,12 @@ async def recompute_legacy_provenance(
                 )
             cutoff, anchor_jd = await cur.fetchone()
 
-            raw_bound = source_table == "losers_comparisons"
             candidates = [
                 (token_id, first_seen)
                 for token_id, first_seen, nfs, _jd in substrate
                 if cutoff is not None
                 and ((first_seen < cutoff) if raw_bound else (nfs < cutoff))
             ]
-            jd_by_value = {first_seen: jd for _t, first_seen, _n, jd in substrate}
 
             res = resolve(candidates, coin_id, symbol or "")
 
@@ -407,5 +420,11 @@ async def recompute_legacy_provenance(
                 ),
             )
 
-    await conn.commit()
+        # Commit PER SURFACE, not once at the end. A single transaction
+        # spanning all three held the write lock for the entire replay --
+        # measured at 6.6s against a live pipeline, which blocked for 5.7s
+        # behind it. Three shorter transactions bound how long anything
+        # else waits, and let completed surfaces survive a later failure.
+        await conn.commit()
+
     return counts

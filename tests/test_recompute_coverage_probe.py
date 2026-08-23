@@ -284,3 +284,51 @@ async def test_coverage_is_correlated_on_coin_id_the_way_the_READERS_are(db):
     assert probe["uncovered"] == 0
     assert probe["credit_recovered"] == 1
     assert probe["not_recovering"] is False
+
+
+async def test_canonical_rows_are_not_counted_as_uncovered(db):
+    """Post-cutover the surfaces fill with `canonical_v1` rows.
+
+    They carry their own tier and consult no overlay, so counting them as
+    uncovered would make the metric grow without bound as normal traffic
+    accumulates. A mutant dropping the semantics filter from the `uncovered`
+    query alone survived the suite until this test existed.
+    """
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, appeared_on_gainers_at, detected_by_chains,
+            chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+           VALUES ('post-cutover', 'X', 'X', ?, 1, 8740.0, 0, ?, 'canonical_v1')""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe()
+
+    assert probe["credit_bearing_legacy_rows"] == 0
+    assert probe["uncovered"] == 0
+    assert probe["not_recovering"] is False
+
+
+async def test_the_reader_index_exists(db):
+    """The trackers' correlation must be index-backed.
+
+    Without it each dashboard row scans every overlay row for its surface and
+    builds a temp b-tree for the ORDER BY, twice. At ~2,900 overlay rows and
+    50-100 rows per page that is the difference between a query and a stall.
+    """
+    cur = await db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='chain_identity_recompute_v1'"
+    )
+    names = {r[0] for r in await cur.fetchall()}
+    assert "idx_cir_reader" in names
+
+    cur = await db._conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT evidence_status FROM chain_identity_recompute_v1 "
+        "WHERE source_table='gainers_comparisons' AND coin_id='x' "
+        "AND historical_anchor='y'"
+    )
+    plan = " ".join(str(r[-1]) for r in await cur.fetchall())
+    assert "idx_cir_reader" in plan, f"reader query is not using the index: {plan}"
