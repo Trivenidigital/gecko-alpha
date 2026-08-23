@@ -1,6 +1,6 @@
 # Acceptance report — versioned legacy-provenance recomputation
 
-**Candidate:** `f2847774` (`fix/canonical-identity-semantics`, PR #559)
+**Candidate:** `89b070ef` (`fix/canonical-identity-semantics`, PR #559)
 **Method:** full replay of the entire archived population against a trimmed
 copy of production, taken in the pre-migration shape so `initialize()`
 exercises the real upgrade-with-data path.
@@ -177,13 +177,13 @@ first-seen *after* its anchor slipped through the time bounds.
 
 The replay was run on seven successive revisions of the code (`c1a50e33`,
 `19dd27da`, `552ef6f6`, `599be775`, `47847f47`, `c8b5e009`, `4693c563`,
-`f2847774`), across a change of live history source
+`f2847774`, `89b070ef`), across a change of live history source
 (`signal_events` → `signal_first_seen`), a rewrite of the coverage probe, and a
 change from one transaction to per-surface commits, the removal of
 `alias_unique` promotion, a semantics filter on the tracker overlay, and a
 gate re-check in the coverage probe.
 
-**Every status count was identical on all eight**, with one deliberate
+**Every status count was identical on all nine**, with one deliberate
 exception: the last revision split `alias_tier_not_verifiable` out of
 `canonical_below_gate_indeterminate` (252 → 249 + 3), because that label
 asserted a gate comparison never performed for the alias tier. The total,

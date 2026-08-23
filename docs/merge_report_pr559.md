@@ -1,7 +1,7 @@
 # Merge report — PR #559, versioned legacy-provenance recomputation
 
-**Candidate:** `f26c412f` · **Base:** `master` · 29 commits, 34 files,
-+8,442 / −125, 12 new test files.
+**Candidate:** `89b070ef` · **Base:** `master` · 31 commits, 35 files,
+12 new test files.
 
 Every cleared item below records **the SHA it was measured on**. That is not
 bookkeeping: across nine revisions, four reviewer clearances were invalidated by
@@ -78,6 +78,7 @@ same numbers, different code path.
 | vector | last verdict | measured on |
 |---|---|---|
 | structural / concurrency | no blocking findings; 2 MEDIUM, both fixed | `33f9de54` |
+| recompute logic (final) | classification CLEAN, re-executed; one ratchet defect (R2), fixed | `f26c412f` |
 | silent failure / observability | S1–S4, all fixed | `f2847774` |
 | ops safety / evidence integrity | N-1…N-6 + R1–R5, all fixed | `c8b5e009` |
 | recompute logic | nothing blocking; R1 implemented rather than deferred | `47847f47` |
@@ -90,6 +91,7 @@ each returns terminal.
 | residual | why not closed |
 |---|---|
 | Coverage is a global span, not per-token | A design change. Every outcome it produces is conservative now that `alias_unique` cannot promote. |
+| Ratchet's population guard is one-sided | It re-establishes a mark recorded against a transiently small population. It does **not** cover shrinkage — see the row below. Written as a ratio it silently *lowered* the mark on ordinary growth (0.60 → 0.36 measured), which is the defect R2 caught. |
 | Ratchet has no downward re-calibration | The surviving population is not a random sample — rows that never re-appear skew toward old anchors that resolve indeterminate, so the rate over a shrinking remainder can fall benignly. `population` is recorded, so the hook exists; the composition cannot be measured before a post-deploy population exists. |
 | `coverage_intervals=None` falls back to a global floor | Latent: no runtime caller outside the ops script, which always passes explicit intervals. |
 | Post-archive rows can never be covered | Named in the runbook and counted as `unarchivable` in both the payload and the alert text. |
@@ -112,10 +114,13 @@ Three recurring failure shapes in my own work:
 - **Fixes landing in the layer that logs rather than the layer that pages** —
   three times (`unarchivable`, the population-comparability guard, per-surface
   escalation). I reach for the component I am already editing.
-- **Fixtures that cannot see the defect they were written for** — five times,
-  including one where I added a `mkdir` that created the directory a test
-  existed to find *missing*, turning a working test green against a broken
-  wrapper.
+- **Fixtures that cannot see the defect they were written for** — six times.
+  Once I added a `mkdir` that created the directory a test existed to find
+  *missing*, turning a working test green against a broken wrapper. Worse, the
+  last one had the defect **in its own output**: a test drove the ratchet's
+  population guard, watched the high-water mark fall from 1.00 to 0.20 in its
+  own fixture, and asserted only that nothing paged. Five of the six were mine,
+  so this is a pattern in how I write fixtures, not six unrelated slips.
 - **Asserting a method rather than running it** — false parity claims in
   comments four separate times, each stating that a guard covered something it
   did not.
