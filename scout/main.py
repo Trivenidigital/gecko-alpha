@@ -1792,6 +1792,19 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("score_history_prune_failed")
 
+    # Ruling E is DEFERRED_BY_ECONOMICS, and a deferral is only safe while
+    # something watches for the economics changing. Logged unconditionally so
+    # "watched and nothing crossed" stays distinguishable from "stopped
+    # watching"; `reopen` escalates to a warning. Reopening the investigation
+    # needs no approval -- destructive pruning still follows the ruling.
+    try:
+        e_probe = await db.signal_outcome_ledger_growth_probe()
+        logger.info("signal_outcome_ledger_growth", **e_probe)
+        if e_probe["reopen"]:
+            logger.warning("signal_outcome_ledger_REOPEN_E", **e_probe)
+    except Exception:
+        logger.exception("signal_outcome_ledger_growth_probe_failed")
+
     # Repair the derived first-seen substrate. See
     # Database.reconcile_signal_first_seen: the per-write fold is not atomic
     # against a foreign rollback on the shared connection, so the substrate is

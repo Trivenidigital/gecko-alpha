@@ -7515,6 +7515,135 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
+    # Measured 2026-08-23 via dbstat: signal_outcome_ledger 171,900,928 B table
+    # + 59,994,112 B indexes over 511,386 rows = 453.42 B/row all-in, rounded UP
+    # to 454. The direction is deliberate: an overestimate makes the reopen
+    # threshold fire slightly EARLY, and late is the direction that lets a
+    # deferral quietly stop being safe. Used as a
+    # cheap proxy because dbstat itself scans the whole 7 GB database and takes
+    # minutes -- far too heavy for an hourly probe whose only job is to notice a
+    # threshold crossing.
+    #
+    # RE-MEASURE TRIGGER: the drift risk is `gate_verdicts`, a variable-length
+    # JSON blob -- adding gates raises the true per-row cost with nothing here
+    # noticing. (The label columns matter less: measured 257.7 B/row all-pending
+    # vs 342.5 B/row all-complete, and at a 7-day finalize the table sits ~94%
+    # complete.) Re-measure via dbstat if the gate set changes materially. The
+    # pinning test asserts the constant against a 2026-08-23 measurement; it
+    # cannot detect that the measurement went stale.
+    _LEDGER_BYTES_PER_ROW = 454
+    _LEDGER_REOPEN_RECLAIMABLE_BYTES = 100 * 1024 * 1024
+    _LEDGER_REOPEN_PROJECTED_DAYS = 30
+    _LEDGER_SIZE_CEILING_BYTES = 1024 * 1024 * 1024
+
+    async def signal_outcome_ledger_growth_probe(
+        self, *, horizon_days: int = 10
+    ) -> dict:
+        """Lightweight growth watch for the DEFERRED ruling-E pruning work.
+
+        E was deferred on economics, not on correctness: as ruled
+        (cohort-closure only, no age-based pruning) it reclaims ~309 rows of a
+        511,386-row table, and the whole table is ~232 MB of a 7 GB database.
+        Building the cohort registry, closure classifier, durable receipts and
+        byte-identical proof harness for ~140 KB is not a defensible trade.
+
+        Deferral is only safe if something watches for the economics changing,
+        which is what this is. It reports the four measures the ruling names and
+        sets `reopen` when either threshold is crossed. Reopening the
+        INVESTIGATION needs no approval; any destructive pruning still follows
+        the cohort-closure ruling.
+
+        `horizon_days` is the label deadline (r7d horizon + permitted lateness):
+        past it, a labelled row can no longer change, which is what makes it
+        mechanically closed rather than merely old.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
+        rows = (await cur.fetchone())[0]
+
+        # No datetime() on the COLUMN side: it is non-sargable and forces a full
+        # scan (measured 203 ms vs 0.19 ms on a 511k-row clone).
+        #
+        # This is a LEXICOGRAPHIC compare standing in for a chronological one,
+        # which is only valid while every stored value is canonical
+        # isoformat-T/UTC. An earlier version of this comment justified that on
+        # "record_emission always stores datetime.now(timezone.utc).isoformat()"
+        # -- which was FALSE: `record_emission_with_status` takes an
+        # `emitted_at` parameter for backfills and stored it unvalidated, so a
+        # space-separated or negative-offset value would sort below 'T' and be
+        # silently dropped from the window (growth undercounts -> under-alarm).
+        #
+        # The invariant is now ENFORCED at the writer by
+        # `scout.outcome_ledger._normalise_emitted_at`, not asserted here. If
+        # that normalisation is ever removed, this must go back to datetime().
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM signal_outcome_ledger "
+            "WHERE emitted_at >= strftime('%Y-%m-%dT%H:%M:%S','now','-1 day')"
+        )
+        growth_rows_per_day = (await cur.fetchone())[0]
+
+        # Safely prunable == fully-dormant (surface, kind) cohorts, per the
+        # cohort-closure ruling. NOT age-based: a cohort still emitting is not
+        # closed no matter how old its oldest row is.
+        cur = await self._conn.execute(f"""SELECT COALESCE(SUM(n), 0) FROM (
+                    SELECT COUNT(*) AS n
+                      FROM signal_outcome_ledger
+                     GROUP BY surface, kind
+                    HAVING datetime(MAX(emitted_at))
+                             < datetime('now', '-{int(horizon_days)} days')
+                       AND SUM(label_status IN ('pending','partial')) = 0)""")
+        reclaimable_rows = (await cur.fetchone())[0]
+
+        bytes_total = rows * self._LEDGER_BYTES_PER_ROW
+        reclaimable_bytes = reclaimable_rows * self._LEDGER_BYTES_PER_ROW
+        growth_bytes_per_day = growth_rows_per_day * self._LEDGER_BYTES_PER_ROW
+
+        headroom = self._LEDGER_SIZE_CEILING_BYTES - bytes_total
+        if growth_bytes_per_day > 0:
+            days_to_ceiling = max(0.0, headroom / growth_bytes_per_day)
+        else:
+            days_to_ceiling = float("inf")
+
+        reopen_reasons = []
+        if reclaimable_bytes >= self._LEDGER_REOPEN_RECLAIMABLE_BYTES:
+            reopen_reasons.append("reclaimable_bytes")
+        # ALREADY over the ceiling. This is a separate condition from the
+        # projection on purpose: the projection is gated on
+        # `growth_bytes_per_day > 0`, so without this clause a table that has
+        # crossed 1 GB and then stopped growing -- the kill switch flipped off,
+        # or any >24h outage -- reports `reopen: False` and the hourly line
+        # reads green. The watch would go quiet at exactly the moment the thing
+        # it watches for had already happened.
+        if bytes_total >= self._LEDGER_SIZE_CEILING_BYTES:
+            reopen_reasons.append("over_ceiling")
+        if days_to_ceiling <= self._LEDGER_REOPEN_PROJECTED_DAYS:
+            reopen_reasons.append("projected_size")
+
+        return {
+            "status": "E_DEFERRED_BY_ECONOMICS",
+            "rows": rows,
+            # `_est` because these are rows x a measured proxy, not dbstat. An
+            # operator grepping journald for `bytes_total=` would otherwise read
+            # them as measured.
+            "bytes_total_est": bytes_total,
+            "bytes_per_row_proxy": self._LEDGER_BYTES_PER_ROW,
+            "growth_rows_per_day": growth_rows_per_day,
+            "growth_bytes_per_day_est": growth_bytes_per_day,
+            "reclaimable_rows": reclaimable_rows,
+            # Drops the ruling's "non-protected" qualifier: no protection
+            # mechanism exists yet, so this counts closed cohorts regardless.
+            # Safe direction -- it OVERSTATES what is reclaimable, so the alarm
+            # fires early -- but the name promises more than it delivers.
+            "reclaimable_bytes_est": reclaimable_bytes,
+            "days_to_1gb": (
+                None if days_to_ceiling == float("inf") else round(days_to_ceiling, 1)
+            ),
+            "reopen": bool(reopen_reasons),
+            "reopen_reasons": reopen_reasons,
+        }
+
     async def reconcile_signal_first_seen(self) -> dict[str, int]:
         """Re-derive the substrate from surviving events. Idempotent, self-healing.
 

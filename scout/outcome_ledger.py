@@ -48,6 +48,7 @@ NOT related to scout/source_quality/ledger.py (source-call quality ledger).
 
 from __future__ import annotations
 
+import re
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -311,6 +312,117 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
     return price
 
 
+#: The ONLY accepted shape for a caller-supplied `emitted_at`.
+#:
+#: ANCHORING LIVES AT THE CALL SITE. The pattern carries no `^`/`$`; the
+#: single consumer uses `fullmatch`, which anchors both ends and avoids the
+#: `$`-matches-before-a-trailing-newline quirk. A second consumer reaching
+#: for `.match` or `.search` would silently get prefix or substring
+#: semantics instead -- use `fullmatch`, or re-add the anchors.
+#:
+#: Declarative on purpose. The previous guard reasoned about the PARSE RESULT
+#: (`parsed.time() == midnight`) plus character-sniffing the raw string, which
+#: requires predicting `datetime.fromisoformat` -- and it is more permissive and
+#: more surprising than that model. Review found the miss: given "2026-08-23+05:00"
+#: it reads the offset as the TIME COMPONENT and returns a NAIVE
+#: `2026-08-23 05:00:00`. The old guard saw 05:00, decided "not midnight, must be
+#: a real timestamp", accepted it, and stamped UTC -- silently storing 05:00Z for
+#: what a caller meant as a date in +05:00. Worse than the bare-date hazard it was
+#: built to stop: that one is wrong-but-coherent, this one reinterprets the offset
+#: digits as a clock and does not raise, so fail-soft never sees it.
+#:
+#: Adding a third condition would have kept producing this class. Matching the raw
+#: string against an explicit shape BEFORE parsing does not.
+#:
+#: Deliberately tighter than fromisoformat: the compact `20260823T000000` family
+#: is now refused. No producer emits it, and a loud refusal on something
+#: unexpected beats a heuristic that mispredicts the parser.
+_EMITTED_AT_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[ Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:?\d{2})?",
+    re.ASCII,
+)
+
+
+def _normalise_emitted_at(emitted_at: str | None) -> str:
+    """Canonical UTC isoformat-T, or raise.
+
+    `signal_outcome_ledger.emitted_at` is compared LEXICOGRAPHICALLY by the
+    growth probe (a deliberate sargable rewrite worth 203ms -> 0.19ms), which is
+    equivalent to a chronological compare only while every stored value is
+    canonical isoformat-T/UTC. Storing a caller's value unparsed would push that
+    ordering hazard into the column; ' ' (0x20) and the digits of a negative
+    offset both sort below 'T' (0x54).
+
+    Raising beats coercing for anything that does not match the accepted shape:
+    a timestamp we cannot place in time is one a guess would misplace, and this
+    is a durable record.
+
+    Two deliberate edges:
+
+    * **A naive value is assumed UTC.** This IS a guess, and it sits awkwardly
+      beside the paragraph above, so the asymmetry is owned rather than hidden:
+      every producer reaching this column is UTC. In a system with local-time
+      producers this assumption would be wrong.
+    * **Empty string raises** where it previously fell through to `now()`. `""`
+      is falsy but not `None`; an empty timestamp is not a request for the
+      current time. A behaviour change, so recorded rather than discovered.
+
+    Lowercase `t`/`z` separators are accepted and normalised, because ISO 8601
+    permits them and silently dropping such a row would be the worse failure.
+    """
+    if emitted_at is None:
+        return datetime.now(timezone.utc).isoformat()
+    raw = str(emitted_at).strip()
+    if not _EMITTED_AT_RE.fullmatch(raw):
+        raise ValueError(
+            f"emitted_at={emitted_at!r} is not an accepted timestamp shape "
+            f"(YYYY-MM-DD[T ]HH:MM[:SS[.ffffff]][offset]). "
+            "signal_outcome_ledger.emitted_at is compared lexicographically, so "
+            "a non-canonical value silently mis-sorts -- and a bare date, with "
+            "or without a trailing offset, is misread rather than rejected by "
+            "the ISO parser."
+        )
+    try:
+        parsed = datetime.fromisoformat(raw.replace("t", "T").replace("z", "Z"))
+    except (TypeError, ValueError) as exc:
+        # REACHABLE, and not rare: the pattern checks SHAPE, and `\d{2}` cannot
+        # check a calendar. "2026-02-30T00:00:00", month 13, hour 25, an offset
+        # of +24:00 and year 0 all match the shape and fail here -- February 30
+        # being exactly what a bad backfill produces. An earlier version marked
+        # this `# pragma: no cover - shape already checked` and blamed a
+        # regex/parser divergence, which would send whoever reads it at 2am to
+        # audit the pattern instead of the input.
+        raise ValueError(
+            f"emitted_at={emitted_at!r} has the right shape but is not a real "
+            "instant (check the calendar date, the clock values and the UTC "
+            "offset range)."
+        ) from exc
+    if parsed.tzinfo is None:
+        # Return HERE rather than falling through. `astimezone()` reads a NAIVE
+        # datetime as LOCAL time, so routing the naive path through it makes the
+        # result host-dependent -- and because this host and CI both run UTC, a
+        # regression that dropped the explicit stamp would produce identical
+        # output and survive every test.
+        #
+        # Keeping that API off the naive path entirely does not make the bug
+        # detectable, it makes it impossible: a future edit cannot reintroduce a
+        # local-time read on a path that never calls the function which does one.
+        # Behaviour-identical to the fall-through form on any host, since
+        # astimezone(utc) on an already-UTC value is a no-op.
+        return parsed.replace(tzinfo=timezone.utc).isoformat()
+    try:
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (OverflowError, OSError) as exc:
+        # `astimezone` raises OverflowError near datetime.min/max -- e.g.
+        # "0001-01-01T00:00:00+05:30" underflows shifting to UTC. Contained
+        # either way by the caller's `except Exception`, but this function's
+        # contract is ValueError and a caller catching only that would miss it.
+        raise ValueError(
+            f"emitted_at={emitted_at!r} cannot be converted to UTC without "
+            "overflowing the representable datetime range."
+        ) from exc
+
+
 async def record_emission_with_status(
     db: Database,
     settings: Any,
@@ -368,7 +480,29 @@ async def record_emission_with_status(
         if conn is None or db._txn_lock is None:
             log.warning("ledger_record_skipped_db_closed", kind=kind, token_id=token_id)
             return None
-        emitted = emitted_at or datetime.now(timezone.utc).isoformat()
+        # NORMALISE a caller-supplied emitted_at.
+        #
+        # The parameter exists so a backfill can supply a historical
+        # timestamp, and backfills source them from other tables and
+        # journals. (The sibling scripts/backfill_minara_alert_emissions.py
+        # is the SHAPE of that risk rather than an instance of it -- it
+        # writes minara_alert_emissions, not this table.)
+        #
+        # Stored verbatim, a space-separated or non-UTC-offset value breaks
+        # a LEXICOGRAPHIC comparison elsewhere: ' ' (0x20) and the digits of
+        # a negative offset both sort below 'T' (0x54).
+        #
+        # Concretely: the ledger growth probe compares
+        # `emitted_at >= strftime('%Y-%m-%dT%H:%M:%S', ...)` -- deliberately
+        # sargable, worth 203ms -> 0.19ms -- and its safety rests on this
+        # column being uniformly isoformat-T/UTC. A same-day row that is
+        # chronologically INSIDE the 24h window sorts below the threshold and
+        # is silently dropped, so growth undercounts, `days_to_1gb` inflates,
+        # and the probe UNDER-alarms. That is the dangerous direction.
+        #
+        # So the invariant is enforced here rather than asserted in a comment
+        # the next writer cannot see.
+        emitted = _normalise_emitted_at(emitted_at)
         verdicts_json = (
             json.dumps(gate_verdicts, sort_keys=True, default=str)
             if gate_verdicts is not None
