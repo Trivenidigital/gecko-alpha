@@ -64,6 +64,12 @@ _LITERAL_ALLOWED = {
     "dashboard/db.py": "table-freshness registry entry",
     # Read-only audit; boolean EXISTS bounded by a tolerance window.
     "scripts/audit_missed_gainers.py": "read-only window-bounded audit",
+    # Offline provenance backfill. Its LIVE-database query reads
+    # signal_first_seen; it names signal_events only for the FROZEN /root
+    # snapshots, which predate the signal_first_seen table (migration
+    # 20260823) and whose contents can never change -- so the retention
+    # coupling this guard exists to prevent cannot arise there.
+    "scripts/backfill_chain_identity_recompute.py": "frozen snapshots only",
 }
 
 
@@ -188,9 +194,22 @@ def test_no_module_names_the_events_table_without_an_explicit_reason():
 
 
 def test_the_allowlist_is_not_silently_stale():
-    """An entry that no longer matches implies a review that no longer applies."""
-    sites = _table_literal_sites(_read_all())
-    stale = set(_LITERAL_ALLOWED) - set(sites)
+    """An entry that no longer matches implies a review that no longer applies.
+
+    Judged against BOTH detectors, because both tests consult this one
+    allowlist and they do not see the same files. `_table_literal_sites` wants
+    an ast.Constant exactly equal to the table name; `_DERIVE_RE` matches the
+    name embedded in a longer SQL string. A file caught only by the regex --
+    the ordinary shape, `"... MIN(created_at) FROM signal_events ..."` -- could
+    therefore never be allowlisted: adding it silenced the derive guard and
+    immediately failed this one as stale. Checking one detector while gating
+    on two is the bug; the allowlist is stale only when NEITHER finds the file.
+    """
+    texts = _read_all()
+    seen = set(_table_literal_sites(texts)) | {
+        h.relative_to(_ROOT).as_posix() for h in _scan_re(_DERIVE_RE, texts)
+    }
+    stale = set(_LITERAL_ALLOWED) - seen
     assert (
         not stale
     ), f"allowlist names files that no longer reference {_TABLE}: {stale}"

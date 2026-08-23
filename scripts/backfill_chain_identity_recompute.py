@@ -82,9 +82,17 @@ def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
         if not Path(path).exists():
             continue
         try:
-            conn = _open_read_only(path, live=(path == live_db))
+            live = path == live_db
+            conn = _open_read_only(path, live=live)
+            # Each source's interval must describe the SAME table that source's
+            # history was read from, or the two disagree: a token whose
+            # first-seen came from `signal_first_seen` could fall outside an
+            # interval derived from `signal_events` and be marked uncovered on
+            # evidence that never applied to it.
             row = conn.execute(
-                "SELECT MIN(created_at), MAX(created_at) FROM signal_events"
+                "SELECT MIN(first_seen_at), MAX(first_seen_at) FROM signal_first_seen"
+                if live
+                else "SELECT MIN(created_at), MAX(created_at) FROM signal_events"
             ).fetchone()
             conn.close()
             if row and row[0] and row[1]:
@@ -109,13 +117,29 @@ def collect_history(sources, *, live_db: str) -> dict[str, str]:
     can stop qualifying.
     """
     earliest: dict[str, str] = {}
+
+    # The LIVE database reads `signal_first_seen`, never `signal_events`.
+    # Deriving a first-seen from the events table re-couples it to RETENTION:
+    # the age prune keeps roughly 14 days, so `MIN(created_at)` there is not
+    # "when the token was first seen", it is "the oldest row retention has not
+    # deleted yet" -- a floor that walks forward every night. Using it would
+    # have quietly shortened every reconstructed lead on the live side.
+    # `test_signal_first_seen_sole_writer.py` enforces this repo-wide; it
+    # caught this exact mistake here.
     queries = [
         (
             live_db,
-            "SELECT token_id, MIN(created_at) FROM signal_events "
-            "WHERE token_id IS NOT NULL AND token_id != '' GROUP BY token_id",
+            "SELECT token_id, first_seen_at FROM signal_first_seen "
+            "WHERE token_id IS NOT NULL AND token_id != ''",
         ),
     ]
+    # The SNAPSHOTS are the documented exception, and the retention argument
+    # does not apply to them: each is a frozen file whose contents can never
+    # change, so nothing can move its derived minimum. They also PREDATE the
+    # `signal_first_seen` table entirely (migration 20260823), so the events
+    # table is the only history they carry. Falling back is not a shortcut --
+    # it is the sole source, and refusing it would discard the June/July
+    # coverage that resolves most of the population.
     queries += [
         (
             src,
