@@ -20,15 +20,22 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_recompute_cove
 ANCHOR = "2026-08-01T00:00:00+00:00"
 
 
-def _run(db_path):
+def _run(db_path, *extra):
     return subprocess.run(
-        [sys.executable, str(SCRIPT), "--db", str(db_path)],
+        [sys.executable, str(SCRIPT), "--db", str(db_path), *extra],
         capture_output=True,
         text=True,
     )
 
 
-def _build(tmp_path, *, overlay_status=None, population=1, semantics="legacy_prefix"):
+def _build(
+    tmp_path,
+    *,
+    overlay_status=None,
+    population=1,
+    semantics="legacy_prefix",
+    canonical_lead=8740.0,
+):
     db = tmp_path / "scout.db"
     conn = sqlite3.connect(db)
     conn.execute(
@@ -47,7 +54,7 @@ def _build(tmp_path, *, overlay_status=None, population=1, semantics="legacy_pre
     conn.execute(
         "CREATE TABLE chain_identity_recompute_v1 (source_table TEXT, "
         "source_row_id INTEGER, coin_id TEXT, historical_anchor TEXT, "
-        "evidence_status TEXT)"
+        "evidence_status TEXT, canonical_lead REAL)"
     )
     for i in range(population):
         conn.execute(
@@ -57,8 +64,8 @@ def _build(tmp_path, *, overlay_status=None, population=1, semantics="legacy_pre
         if overlay_status:
             conn.execute(
                 "INSERT INTO chain_identity_recompute_v1 VALUES "
-                "('gainers_comparisons', ?, ?, ?, ?)",
-                (i + 1, f"coin-{i}", ANCHOR, overlay_status),
+                "('gainers_comparisons', ?, ?, ?, ?, ?)",
+                (i + 1, f"coin-{i}", ANCHOR, overlay_status, canonical_lead),
             )
     conn.commit()
     conn.close()
@@ -128,3 +135,79 @@ def test_the_watchdog_never_creates_wal_sidecars(tmp_path):
         Path(str(db) + s).unlink(missing_ok=True)
     _run(db)
     assert [s for s in ("-wal", "-shm") if Path(str(db) + s).exists()] == []
+
+
+def test_pointing_the_watchdog_at_a_COPY_creates_no_sidecars(tmp_path):
+    """This is the script an operator reaches for while diagnosing.
+
+    That is exactly when a tool gets pointed at a copy, and `mode=ro` creates
+    `-wal`/`-shm` beside whatever it opens. Sidecars beside backups caused the
+    integrity checker to delete every real backup on 2026-08-15, and the same
+    bug was found live in three more readers a day later -- one carrying a
+    comment claiming parity with the other two. This was a fourth.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical")
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.commit()
+    conn.close()
+    for s in ("-wal", "-shm"):
+        Path(str(db) + s).unlink(missing_ok=True)
+
+    _run(db)
+
+    assert [s for s in ("-wal", "-shm") if Path(str(db) + s).exists()] == []
+
+
+def test_a_raised_gate_is_visible_to_the_watchdog(tmp_path):
+    """`evidence_status` freezes the gate as it stood at backfill time."""
+    db = _build(tmp_path, overlay_status="verified_canonical", population=4)
+
+    assert _run(db, "--gate-minutes", "1440").returncode == 0
+    raised = _run(db, "--gate-minutes", "99999")
+    assert raised.returncode == 1, raised.stdout
+    assert "0 of 4" in raised.stdout
+
+
+def test_a_DROPPED_overlay_table_is_not_reported_as_not_deployed(tmp_path):
+    """Absent means two different things, and only one of them is fine.
+
+    Before the deploy it is normal. After it, something dropped the table --
+    the loudest state there is, previously reported as an all-clear.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE gainers_comparisons_legacy_prefix_v1 (id INTEGER)")
+    conn.execute("DROP TABLE chain_identity_recompute_v1")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "dropped after deploy" in r.stdout
+
+
+def test_the_watchdog_constants_match_the_application(tmp_path):
+    """The watchdog is stdlib-only on purpose -- it must run when the app is
+    broken -- so it hand-copies two constants. Copies drift.
+
+    A mutant dropping losers and trending from the script's SURFACES survived
+    the whole suite: the gap closed in the in-process probe had reopened in
+    the out-of-process alarm, which is the one that actually pages.
+    """
+    import importlib.util
+
+    from scout.db import Database
+    from scout.identity_recompute import CREDIT_BEARING as APP_CREDIT_BEARING
+
+    spec = importlib.util.spec_from_file_location("wd", SCRIPT)
+    wd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wd)
+
+    assert dict(wd.SURFACES) == dict(
+        Database._RECOMPUTE_SURFACES
+    ), "the watchdog watches a different set of surfaces than the application"
+    assert set(wd.CREDIT_BEARING) == set(
+        APP_CREDIT_BEARING
+    ), "the watchdog counts a different set of statuses as credit-bearing"

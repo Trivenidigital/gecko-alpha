@@ -18,9 +18,20 @@ DB_PATH="${GECKO_DB_PATH:-$APP_DIR/scout.db}"
 ENV_FILE="${GECKO_ENV_FILE:-$APP_DIR/.env}"
 PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 
+# The gate must match what the READERS use. `evidence_status` is a frozen
+# decision about the gate as it stood when the backfill ran; cross_surface
+# re-tests the lead against CONVICTION_EARLY_LEAD_MINUTES at scoring time.
+# Sourced from .env when present so raising the setting cannot leave the
+# alarm measuring the old threshold.
+GATE=1440
+if [[ -f "$ENV_FILE" ]]; then
+    env_gate="$(grep -E '^CONVICTION_EARLY_LEAD_MINUTES=' "$ENV_FILE" | tail -1 | cut -d= -f2)"
+    [[ -n "${env_gate:-}" ]] && GATE="$env_gate"
+fi
+
 cd "$APP_DIR"
 set +e
-result="$("$PYTHON" scripts/check_recompute_coverage.py --db "$DB_PATH" 2>&1)"
+result="$("$PYTHON" scripts/check_recompute_coverage.py --db "$DB_PATH"     --gate-minutes "$GATE" 2>&1)"
 status=$?
 set -e
 

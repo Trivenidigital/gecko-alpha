@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sqlite3
+from datetime import datetime
 
 import aiosqlite
 
@@ -228,6 +229,42 @@ async def main() -> int:
     print("coverage intervals (anchors OUTSIDE these stay indeterminate):")
     for start, end in intervals:
         print(f"  {start}  ..  {end}")
+    if not intervals:
+        # Loud, because the run still "succeeds": it writes a full overlay of
+        # indeterminate rows, which is a populated table that grants credit to
+        # nothing.
+        print("  *** NO COVERAGE INTERVALS -- every row will be indeterminate ***")
+
+    # Per-source spans, printed so they can be eyeballed against the retention
+    # window rather than trusted through the merge. A span is not coverage: it
+    # asserts "this file holds events between T0 and T1", not "every token in
+    # that window is recorded here". The specific failure it cannot rule out is
+    # ONE stale surviving row stretching a source's span back to its date and
+    # fabricating a wide interval. A span materially wider than the retention
+    # window is that tell. (Checked 2026-08-23: all four sources span 14.0
+    # days, exactly the prune window.)
+    print("per-source spans (each should be ~= the retention window):")
+    for path in [args.db, *SNAPSHOT_SOURCES]:
+        if not Path(path).exists():
+            continue
+        try:
+            conn = _open_read_only(path, live=_is_live(path))
+            live_src = _is_live(path)
+            col, tbl = (
+                ("first_seen_at", "signal_first_seen")
+                if live_src
+                else ("created_at", "signal_events")
+            )
+            row = conn.execute(f"SELECT MIN({col}), MAX({col}) FROM {tbl}").fetchone()
+            conn.close()
+            if row and row[0] and row[1]:
+                days = (
+                    datetime.fromisoformat(row[1]) - datetime.fromisoformat(row[0])
+                ).total_seconds() / 86400.0
+                flag = "  <-- WIDER THAN RETENTION" if days > 21 else ""
+                print(f"  {Path(path).name:44s} {days:5.1f}d{flag}")
+        except (sqlite3.Error, ValueError):
+            continue
 
     if args.apply and any(Path(args.db) == Path(src) for src in SNAPSHOT_SOURCES):
         print(

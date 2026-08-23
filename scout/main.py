@@ -1815,7 +1815,9 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     # resolved nothing produces the identical collapse. Partial coverage is the
     # expected steady state (history runs out) and must never page.
     try:
-        cov = await db.chain_identity_recompute_coverage_probe()
+        cov = await db.chain_identity_recompute_coverage_probe(
+            gate_minutes=float(getattr(settings, "CONVICTION_EARLY_LEAD_MINUTES", 1440))
+        )
         logger.info("chain_identity_recompute_coverage", **cov)
         if cov["not_recovering"]:
             logger.error("chain_identity_recompute_NOT_RECOVERING", **cov)

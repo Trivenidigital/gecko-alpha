@@ -332,3 +332,63 @@ async def test_the_reader_index_exists(db):
     )
     plan = " ".join(str(r[-1]) for r in await cur.fetchall())
     assert "idx_cir_reader" in plan, f"reader query is not using the index: {plan}"
+
+    # The PROBE's query shape too, not only the reader's. It runs the same
+    # correlation on the hourly pass over the shared pipeline connection, and
+    # unindexed it is O(live_rows x overlay_rows_per_surface) -- measured at
+    # 371ms vs 5.5ms at production scale, a 68x difference on the connection
+    # everything else is waiting for.
+    cur = await db._conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT COUNT(*) FROM gainers_comparisons AS c WHERE EXISTS ("
+        "  SELECT 1 FROM chain_identity_recompute_v1 AS r "
+        "  WHERE r.source_table = 'gainers_comparisons' AND r.coin_id = c.coin_id "
+        "  AND r.historical_anchor = c.appeared_on_gainers_at)"
+    )
+    probe_plan = " ".join(str(r[-1]) for r in await cur.fetchall())
+    assert (
+        "idx_cir_reader" in probe_plan
+    ), f"probe query is not using the index: {probe_plan}"
+
+
+async def test_a_RAISED_GATE_is_visible_to_the_probe(db):
+    """`evidence_status` is a frozen decision about the gate at backfill time.
+
+    The reader re-tests `chains_canonical_lead` against
+    CONVICTION_EARLY_LEAD_MINUTES at scoring time. So counting statuses alone
+    measures TRUST, not credit, and the two agree only while the gate has not
+    moved. Review measured readers granting 0 of 10 while the probe reported
+    10 recovered and stayed green.
+    """
+    for coin in ("a", "b", "c"):
+        row_id = await _credit_bearing_legacy_row(db, coin)
+        await _overlay_row(db, row_id, coin, ANCHOR)  # canonical_lead 8740
+
+    at_ship = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert at_ship["credit_recovered"] == 3
+    assert at_ship["not_recovering"] is False
+
+    # Operator raises the gate past every stored lead. The rows are still
+    # stamped `verified_canonical`; the readers now refuse all of them.
+    raised = await db.chain_identity_recompute_coverage_probe(gate_minutes=99999.0)
+    assert raised["credit_recovered"] == 0
+    assert (
+        raised["not_recovering"] is True
+    ), "the gate moved past every recovered lead and the probe stayed green"
+
+
+async def test_a_verified_row_with_no_lead_earns_nothing(db):
+    """`canonical_lead IS NULL` cannot satisfy the reader's comparison.
+
+    Counting the status alone would credit a row the reader must refuse.
+    """
+    row_id = await _credit_bearing_legacy_row(db, "no-lead")
+    await _overlay_row_with_status(
+        db, row_id, "no-lead", ANCHOR, "verified_canonical"
+    )  # inserts canonical_lead NULL
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["overlay_rows"] == 1
+    assert probe["credit_recovered"] == 0
+    assert probe["not_recovering"] is True

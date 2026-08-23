@@ -552,7 +552,17 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                     -- silently discarding verified credit in favour of a
                     -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
-                             WHEN 'verified_canonical' THEN 0 ELSE 1 END
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
                     LIMIT 1) AS chains_recompute_status,
                   -- The VERIFIED lead, not the legacy prefix-derived one.
                   -- Scoring chains_lead_minutes after verifying canonical_lead
@@ -583,7 +593,17 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                     -- silently discarding verified credit in favour of a
                     -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
-                             WHEN 'verified_canonical' THEN 0 ELSE 1 END
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
                     LIMIT 1) AS chains_canonical_lead
            FROM gainers_comparisons
            ORDER BY appeared_on_gainers_at DESC

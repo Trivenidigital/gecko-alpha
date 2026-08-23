@@ -7938,8 +7938,19 @@ class Database:
             )
             cur = await self._conn.execute(f"SELECT COUNT(*) FROM {archive}")
             out[archive] = (await cur.fetchone())[0]
-        if out:
-            await self._conn.commit()
+        # UNCONDITIONAL. The `if out:` guard was safe only by accident of the
+        # connection mode: under legacy `isolation_level=''` a bare SELECT
+        # opens no transaction, so the nothing-to-do path left nothing
+        # dangling. Under `autocommit=False` (PEP 249 strict, available since
+        # 3.12; this repo runs 3.14) the same guard SELECT DOES open one.
+        #
+        # The failure that produces is quieter than the sibling's "cannot
+        # start a transaction within a transaction": a dangling READ
+        # transaction on the shared connection pins the WAL snapshot, so the
+        # hourly `wal_checkpoint(TRUNCATE)` returns BUSY and reclaims zero
+        # pages -- measured -- and it surfaces as unexplained WAL growth
+        # nowhere near this function, on a box already at 90% disk.
+        await self._conn.commit()
         return out
 
     #: Surfaces whose pre-cutover chains credit depends on the recompute
@@ -7950,7 +7961,9 @@ class Database:
         ("trending_comparisons", "appeared_on_trending_at"),
     )
 
-    async def chain_identity_recompute_coverage_probe(self) -> dict[str, object]:
+    async def chain_identity_recompute_coverage_probe(
+        self, *, gate_minutes: float = 1440.0
+    ) -> dict[str, object]:
         """Report whether the legacy-provenance overlay is actually WORKING.
 
         `chain_identity_recompute_v1` has no runtime writer -- it is filled by
@@ -7978,6 +7991,16 @@ class Database:
         do not survive, and the archives are `CREATE TABLE ... AS SELECT`
         copies with no primary key, where `id` is not a key at all. A probe
         keyed on the row id measures a wire nothing reads.
+
+        `gate_minutes` is re-checked against each row's `canonical_lead`
+        rather than trusting `evidence_status` alone. That status is a FROZEN
+        decision about the gate as it stood at backfill time; the reader
+        re-tests the lead against `CONVICTION_EARLY_LEAD_MINUTES` at scoring
+        time. Counting statuses alone measures TRUST, not credit, and the two
+        coincide only while the gate has not moved. Raise the setting and
+        every reader silently refuses rows the probe still reports as
+        recovered -- measured: readers grant 0 of 10 while the probe reports
+        10. Pass the setting the readers use.
 
         Partial coverage is the expected steady state -- history genuinely runs
         out for older anchors -- and must never page, or the alarm gets muted
@@ -8027,8 +8050,9 @@ class Database:
                 f"SELECT COUNT(*) FROM {table} AS c "
                 f"WHERE {untrusted} AND c.detected_by_chains = 1 "
                 f"AND EXISTS ({matched} AND r.evidence_status IN "
-                f"({','.join('?' * len(CREDIT_BEARING))}))",
-                (table, *sorted(CREDIT_BEARING)),
+                f"({','.join('?' * len(CREDIT_BEARING))}) "
+                "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
+                (table, *sorted(CREDIT_BEARING), gate_minutes),
             )
             rec = (await cur.fetchone())[0]
 
@@ -11101,8 +11125,12 @@ class Database:
                 ),
             )
             count += 1
-        if count:
-            await self._conn.commit()
+        # Unconditional, for the reason given in
+        # archive_legacy_prefix_comparisons: a guarded commit is safe only
+        # while a bare SELECT opens no transaction, which is a property of the
+        # connection mode rather than of this loop. These two were the only
+        # guarded commits in this file.
+        await self._conn.commit()
         return count
 
     async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:

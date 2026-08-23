@@ -124,3 +124,49 @@ async def test_a_canonical_row_does_NOT_consult_the_overlay(
     assert (
         "chains" in result.contributing
     ), "the canonical row lost its chains credit to an archived row's replay"
+
+
+@pytest.mark.parametrize("table,anchor_col,reader", SURFACES)
+async def test_status_and_lead_come_from_the_SAME_overlay_row(
+    db, table, anchor_col, reader
+):
+    """Two independent scalar subqueries can select two different rows.
+
+    Sorting only by the CASE leaves rows sharing a CASE value unordered, so
+    `LIMIT 1` may take the status from one and the lead from another --
+    reintroducing exactly the claim/value decoupling the pair exists to
+    prevent, at the SQL layer instead of the Python one.
+
+    Both non-credit rows here share a CASE value and carry DIFFERENT leads, so
+    any row-selection disagreement shows up as a mismatched pair.
+    """
+    await db._conn.execute(
+        f"""INSERT INTO {table}
+            (coin_id, symbol, name, {anchor_col}, detected_by_chains,
+             chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+            VALUES ('multi-row', 'MR', 'MR', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+        (ANCHOR, ANCHOR),
+    )
+    await _overlay(db, table, "multi-row", 1, "no_legacy_credit", 111.0)
+    await _overlay(db, table, "multi-row", 2, "indeterminate_history", 222.0)
+    await _overlay(
+        db, table, "multi-row", 3, "canonical_below_gate_indeterminate", 333.0
+    )
+    await db._conn.commit()
+
+    rows = await reader(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "multi-row")
+
+    pairs = {
+        "no_legacy_credit": 111.0,
+        "indeterminate_history": 222.0,
+        "canonical_below_gate_indeterminate": 333.0,
+    }
+    assert row["chains_recompute_status"] in pairs
+    assert row["chains_canonical_lead"] == pytest.approx(
+        pairs[row["chains_recompute_status"]]
+    ), (
+        f"status {row['chains_recompute_status']!r} came with lead "
+        f"{row['chains_canonical_lead']!r} -- the two subqueries selected "
+        "different overlay rows"
+    )
