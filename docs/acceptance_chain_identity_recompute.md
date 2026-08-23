@@ -1,6 +1,6 @@
 # Acceptance report — versioned legacy-provenance recomputation
 
-**Candidate:** `599be775` (`fix/canonical-identity-semantics`, PR #559)
+**Candidate:** `47847f47` (`fix/canonical-identity-semantics`, PR #559)
 **Method:** full replay of the entire archived population against a trimmed
 copy of production, taken in the pre-migration shape so `initialize()`
 exercises the real upgrade-with-data path.
@@ -160,13 +160,14 @@ first-seen *after* its anchor slipped through the time bounds.
 
 ## 7. Sensitivity
 
-The replay was run on four successive revisions of the code (`c1a50e33`,
-`19dd27da`, `552ef6f6`, `599be775`), across a change of live history source
+The replay was run on five successive revisions of the code (`c1a50e33`,
+`19dd27da`, `552ef6f6`, `599be775`, `47847f47`), across a change of live history source
 (`signal_events` → `signal_first_seen`), a rewrite of the coverage probe, and a
 change from one transaction to per-surface commits, the removal of
-`alias_unique` promotion, and a semantics filter on the tracker overlay.
+`alias_unique` promotion, a semantics filter on the tracker overlay, and a
+gate re-check in the coverage probe.
 
-**Every status count was identical on all four.** The result is insensitive to
+**Every status count was identical on all five.** The result is insensitive to
 those corrections, which is why they could be made late without re-opening the
 measurement.
 
@@ -178,4 +179,20 @@ measurement.
   **recovered credit** rather than row count — see
   `docs/runbook_recompute_coverage.md`.
 - Any claim about rows written after the archive snapshot was taken. They are
-  stamped legacy but have no archived twin and cannot be covered.
+  stamped legacy but have no archived twin and cannot be covered. The
+  documented remediation (re-run the backfill) cannot fix that state.
+- Whether every token present in a source's window is actually recorded there.
+  Coverage intervals are built from each source's `MIN..MAX` event span, and a
+  span is not coverage — retention leaves a source sparse inside its own span.
+  What *was* ruled out is the specific fabrication mode where one stale
+  surviving row stretches a span backwards: all four sources span 14.0 days,
+  exactly the prune window, and the backfill now prints these every run and
+  warns above 21 days.
+
+## 9. Known residuals
+
+| residual | why it is not closed here |
+|---|---:|
+| Coverage is a global span, not per-token | Per-token coverage is a design change; the current predicate only ever produces conservative outcomes now that `alias_unique` cannot promote. |
+| `coverage_intervals=None` falls back to a global substrate floor | Latent: there is no runtime caller of `recompute_legacy_provenance` outside the ops script, which always passes explicit intervals. Removing the default would be a silent behaviour change for a caller that does not exist yet. |
+| Recovery falls to the substrate-only rate once the `/root` snapshots are deleted | Unavoidable. This is why the watchdog escalates on recovered credit rather than row count. |
