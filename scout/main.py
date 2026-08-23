@@ -1792,6 +1792,23 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("score_history_prune_failed")
 
+    # Repair the derived first-seen substrate. See
+    # Database.reconcile_signal_first_seen: the per-write fold is not atomic
+    # against a foreign rollback on the shared connection, so the substrate is
+    # kept correct by repair rather than by prevention. The fold only lowers
+    # the minimum, so this can never make first_seen later than the truth.
+    #
+    # repaired > 0 is a REAL SIGNAL, not routine noise -- it means the write
+    # path dropped something. Logged unconditionally (including the zero) so
+    # "ran and repaired nothing" stays distinguishable from "never ran".
+    try:
+        recon = await db.reconcile_signal_first_seen()
+        logger.info("signal_first_seen_reconciled", **recon)
+        if recon["repaired"] or recon["poisoned_removed"]:
+            logger.warning("signal_first_seen_drift_detected", **recon)
+    except Exception:
+        logger.exception("signal_first_seen_reconcile_failed")
+
     try:
         pruned_vs = await db.prune_volume_snapshots(
             keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS

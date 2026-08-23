@@ -7515,6 +7515,73 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
+    async def reconcile_signal_first_seen(self) -> dict[str, int]:
+        """Re-derive the substrate from surviving events. Idempotent, self-healing.
+
+        The substrate's per-write path is NOT atomic against the shared
+        connection, and no savepoint can make it so. `scout/chains/tracker.py`
+        opens an explicit `BEGIN` on `db._conn` and calls `conn.rollback()` on
+        any failure in its pass -- and that failure fires several times a day
+        in production. A concurrent `emit_event` whose fold is pending when
+        that FOREIGN rollback lands loses the fold, then commits its own event
+        insert: a committed event with no substrate row, reading as "never
+        detected by chains" at every consumer.
+
+        Ordering the fold before the insert does not help; neither does
+        insert-first. The two writes are simply not atomic against a foreign
+        rollback, so the durable answer is repair rather than prevention.
+
+        This is that repair, and it is safe precisely because the fold can only
+        ever LOWER the minimum: re-running it can restore a lost row or correct
+        a late one, and can never push a first_seen later than the truth. It
+        also repairs a truncated/restored table, which the one-shot migration
+        cannot -- that early-returns forever once its marker exists.
+
+        Returns counts for observability; `repaired` > 0 is a real signal that
+        the write path dropped something, not routine noise.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT token_id FROM signal_events "
+            "WHERE token_id IS NOT NULL AND token_id != '' "
+            "EXCEPT SELECT token_id FROM signal_first_seen)"
+        )
+        missing = (await cur.fetchone())[0]
+        cur = await self._conn.execute("""SELECT COUNT(*) FROM signal_first_seen s
+                 JOIN (SELECT token_id, MIN(created_at) m FROM signal_events
+                        WHERE token_id IS NOT NULL AND token_id != ''
+                        GROUP BY token_id) e ON e.token_id = s.token_id
+                WHERE s.first_seen_at > e.m""")
+        late = (await cur.fetchone())[0]
+
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+               SELECT token_id, MIN(created_at), ?
+                 FROM signal_events
+                WHERE token_id IS NOT NULL AND token_id != ''
+                GROUP BY token_id
+               ON CONFLICT(token_id) DO UPDATE SET
+                 first_seen_at = MIN(
+                   signal_first_seen.first_seen_at, excluded.first_seen_at),
+                 updated_at = excluded.updated_at""",
+            (now,),
+        )
+        # An '' row poisons every consumer via LIKE '%'; nothing prunes this
+        # table, so sweep it here rather than hoping it never lands.
+        cur = await self._conn.execute(
+            "DELETE FROM signal_first_seen WHERE token_id IS NULL OR token_id = ''"
+        )
+        poisoned = cur.rowcount or 0
+        await self._conn.commit()
+        return {
+            "repaired": missing + late,
+            "missing": missing,
+            "late": late,
+            "poisoned_removed": poisoned,
+        }
+
     async def record_signal_first_seen(self, token_id: str, created_at: str) -> None:
         """Fold one observation into the derived first-seen substrate.
 
@@ -7531,7 +7598,20 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized")
         if not token_id or not created_at:
-            return
+            # RAISE, do not return. `signal_events.token_id` is TEXT NOT NULL
+            # but '' satisfies that, so a silent no-op here commits an event
+            # with no substrate row -- the exact divergence this table exists
+            # to prevent, and invisible because the write "succeeded".
+            #
+            # An empty token_id in the substrate is separately destructive:
+            # consumers match with `LOWER(?) LIKE LOWER(token_id || '%')`,
+            # which for '' degenerates to LIKE '%' and matches EVERY coin. MIN
+            # then makes that row win everywhere, and nothing prunes this table
+            # so it would never age out.
+            raise ValueError(
+                f"record_signal_first_seen requires a non-empty token_id and "
+                f"created_at, got token_id={token_id!r} created_at={created_at!r}"
+            )
         now = datetime.now(timezone.utc).isoformat()
         await self._conn.execute(
             """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
@@ -7628,7 +7708,7 @@ class Database:
                 """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
                    SELECT token_id, MIN(created_at), ?
                      FROM signal_events
-                    WHERE token_id IS NOT NULL
+                    WHERE token_id IS NOT NULL AND token_id != ''
                     GROUP BY token_id
                    ON CONFLICT(token_id) DO UPDATE SET
                      first_seen_at = MIN(

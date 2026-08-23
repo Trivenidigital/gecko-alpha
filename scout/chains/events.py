@@ -33,37 +33,42 @@ async def emit_event(
         raise ValueError(f"Invalid pipeline: {pipeline!r}")
 
     now = datetime.now(timezone.utc).isoformat()
-    # ORDER MATTERS: fold the derived substrate BEFORE inserting the event.
+    # The EVENT is written first, then the derived substrate folded, then one
+    # commit. Both orders were wrong for different reasons, and neither could
+    # be made atomic:
     #
-    # The two writes share a transaction so they commit together. The ordering
-    # is what makes the FAILURE path safe, and it replaces an earlier attempt
-    # that wrapped both in a SAVEPOINT. That attempt was wrong: `conn` is
-    # shared by concurrently scheduled tasks (_pipeline_loop, run_chain_tracker
-    # and the narrative agent all emit), savepoints are a STACK rather than a
-    # per-coroutine scope, and interleaved emits do not nest LIFO. A failing
-    # emit's ROLLBACK TO would discard a SIBLING emit's insert while keeping
-    # its own -- and unique savepoint names do not help, because rolling back
-    # to an outer savepoint still undoes the inner coroutine's work.
+    #   * A SAVEPOINT cannot scope this. `conn` is shared by concurrently
+    #     scheduled tasks, savepoints are a stack rather than a per-coroutine
+    #     scope, and a failing emit's ROLLBACK TO would discard a SIBLING's
+    #     insert. Unique names do not help either.
+    #   * Fold-first bounded the failure better, but made the DERIVED table a
+    #     hard dependency of primary data: if `record_signal_first_seen` ever
+    #     raised (missing table, SQLITE_BUSY), `safe_emit` swallows it and
+    #     every signal_events write stops silently. A derived table must never
+    #     be able to halt the thing it is derived from.
+    #   * Neither order survives `scout/chains/tracker.py`, which opens its own
+    #     BEGIN on this connection and calls rollback() on failure -- several
+    #     times a day in production. A foreign rollback discards whatever this
+    #     unit has pending regardless of ordering.
     #
-    # With the fold first, neither failure can understate history:
-    #   * fold raises  -> nothing of ours is pending; identical to the
-    #     behaviour before the substrate existed.
-    #   * insert raises -> the fold may be committed by a sibling's commit,
-    #     leaving a first_seen for an event row that never landed. That records
-    #     "we observed this token at time T", which is TRUE -- we tried to emit
-    #     for it -- and the writer only ever LOWERS the minimum, so it cannot
-    #     push first_seen later than the truth. Later is the harmful direction:
-    #     it silently understates how early we saw a token.
+    # So the substrate is kept correct by REPAIR, not prevention:
+    # Database.reconcile_signal_first_seen re-folds from surviving events every
+    # hourly pass. It is idempotent and can only ever LOWER the minimum, so it
+    # restores a lost fold, sweeps a poisoned row and rebuilds a truncated
+    # table alike -- and can never push first_seen later than the truth.
     #
-    # MIN semantics, so a replayed or out-of-order event still lowers the
-    # minimum correctly rather than being dropped as a duplicate.
-    await db.record_signal_first_seen(token_id, now)
+    # Given that net, event-first is strictly better: the primary row always
+    # lands, and the derived row self-heals within the hour.
+    #
+    # MIN semantics on the fold, so a replayed or out-of-order event still
+    # lowers the minimum rather than being dropped as a duplicate.
     cursor = await conn.execute(
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (token_id, pipeline, event_type, json.dumps(event_data), source_module, now),
     )
+    await db.record_signal_first_seen(token_id, now)
     await conn.commit()
     eid = cursor.lastrowid
     logger.debug(

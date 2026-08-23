@@ -3,49 +3,67 @@
 The substrate is only correct because of two structural facts, neither of which
 is visible at any single call site:
 
-1. ``emit_event`` is the ONLY thing that inserts into ``signal_events``. The
-   substrate is folded there, in the same transaction. A future direct INSERT
-   elsewhere would be invisible to every migrated consumer -- the row would
-   exist, lead-time attribution would silently omit it, and nothing would
-   error. That is the silent-failure class this substrate was built to remove,
-   so reintroducing it via a second writer must fail CI instead.
+1. ``emit_event`` is the ONLY thing that inserts into ``signal_events``. A
+   future direct INSERT elsewhere would be invisible to every migrated
+   consumer -- the row would exist, lead-time attribution would silently omit
+   it, and nothing would error.
 
-2. No consumer derives first-seen from ``signal_events`` any more. The whole
-   point of option F is that retention stops being the implicit historical
-   boundary; one un-migrated consumer keeps that coupling alive for itself.
+2. No consumer derives first-seen from ``signal_events`` any more. The point of
+   option F is that retention stops being the implicit historical boundary; one
+   un-migrated consumer keeps that coupling alive for itself.
 
-Both guards scan source text, so each has its own falsifier below: a scanner
-that matches nothing passes vacuously and would protect nothing.
+WHY THIS FILE WAS REWRITTEN
+---------------------------
+The first version scanned for the literal substring
+``MIN(created_at) FROM signal_events``. It passed while SIX live derivations
+sat in the scanned trees, and it is what let the trending tracker's
+short-symbol branch ship un-migrated. Text matching cannot see any of the
+real phrasings:
+
+    f"SELECT MIN({timestamp_col}) FROM {table_name} "   <- table is a variable
+    "MIN(created_at) AS t FROM signal_events"           <- alias breaks adjacency
+    f"SELECT MIN({ts}) FROM {table} {alias}"            <- ts is "e.created_at"
+
+Its "falsifiers" planted the scanner's own literal and asserted it was found,
+which pins the ``in`` operator rather than coverage -- a tautology that reads
+like evidence.
+
+The load-bearing guard here is therefore AST-based and keys on the thing the
+dynamic form cannot hide: the exact string literal ``"signal_events"`` has to
+be written somewhere to reach ``_check_detector``. Exact-match on an AST
+constant also cannot be fooled by a comment or docstring mentioning the table.
 """
 
+import ast
 import re
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _TREES = ("scout", "dashboard", "scripts")
+_TABLE = "signal_" + "events"
 
-# Built by concatenation so this file's own guard text cannot satisfy the
-# scanner when it walks a tree that happens to include tests.
-_INSERT_PAT = "INSERT INTO " + "signal_events"
+_INSERT_PAT = "INSERT INTO " + _TABLE
 
-# Alias-tolerant on purpose. A plain adjacent-substring match misses
-# `MIN(created_at) AS t FROM signal_events`, which is exactly how the one
-# legitimate site in the tree is written -- so the naive pattern would also
-# have missed an aliased RE-introduction. Whitespace-flexible for the same
-# reason (these queries are multi-line).
+# Catches aliased columns and table aliases that adjacency missed:
+#   MIN(created_at) AS t FROM signal_events
+#   MIN(e.created_at) FROM signal_events e
 _DERIVE_RE = re.compile(
-    r"MIN\s*\(\s*created_at\s*\)" r"(?:\s+AS\s+\w+)?" r"\s+FROM\s+" + "signal_events",
+    r"MIN\s*\(\s*[\w.]*created_at\s*\)" r"(?:\s+AS\s+\w+)?" r"\s+FROM\s+" + _TABLE,
     re.I,
 )
 
-# Sites that derive a first-seen from signal_events but are NOT retention-coupled,
-# with the reason each is exempt. Anything NOT on this list must migrate.
-_DERIVE_ALLOWED = {
-    # Lower-bounded (`datetime(created_at) >= datetime(?)`): it asks "first seen
-    # WITHIN this window", so retention is not its implicit historical boundary
-    # the way it was for the migrated consumers -- provided retention stays >=
-    # the window, which is a separate, already-validated constraint.
-    "scout/conviction/prospective.py",
+# Every file permitted to name the table as a string literal, with the reason.
+# Anything NOT here is a new coupling and must be an explicit decision.
+_LITERAL_ALLOWED = {
+    # Lower-bounded lookback window: asks "first seen WITHIN this window", so
+    # retention is not its implicit historical boundary -- provided retention
+    # stays >= the window, which test_prospective_lookback_floor pins.
+    "scout/conviction/prospective.py": "lower-bounded lookback window",
+    # §12a freshness registry: names the table to monitor it, not to read
+    # first-seen from it.
+    "dashboard/db.py": "table-freshness registry entry",
+    # Read-only audit; boolean EXISTS bounded by a tolerance window.
+    "scripts/audit_missed_gainers.py": "read-only window-bounded audit",
 }
 
 
@@ -58,6 +76,10 @@ def _sources() -> list[Path]:
     return out
 
 
+def _read_all() -> dict[Path, str]:
+    return {p: p.read_text(encoding="utf-8", errors="replace") for p in _sources()}
+
+
 def _scan(pattern: str, texts: dict[Path, str]) -> list[Path]:
     return sorted(p for p, t in texts.items() if pattern in t)
 
@@ -66,78 +88,123 @@ def _scan_re(rx: "re.Pattern[str]", texts: dict[Path, str]) -> list[Path]:
     return sorted(p for p, t in texts.items() if rx.search(t))
 
 
-def _read_all() -> dict[Path, str]:
-    return {p: p.read_text(encoding="utf-8", errors="replace") for p in _sources()}
+def _table_literal_sites(texts: dict[Path, str]) -> dict[str, list[int]]:
+    """Files naming the table as an EXACT string literal, with line numbers.
 
-
-def test_the_scanner_actually_sees_a_planted_writer():
-    """Falsifier for guard 1. Pins the detector, not just the tree."""
-    planted = {
-        Path("fake/rogue.py"): f'await conn.execute("""{_INSERT_PAT} (token_id)""")',
-        Path("fake/clean.py"): "await conn.execute('SELECT 1')",
-    }
-    assert _scan(_INSERT_PAT, planted) == [Path("fake/rogue.py")]
-
-
-def test_the_derive_scanner_actually_sees_a_planted_consumer():
-    """Falsifier for guard 2, including the ALIASED form.
-
-    The aliased case is the one a plain substring match misses, and it is not
-    hypothetical -- it is how the single legitimate site in the tree is
-    written. A scanner that cannot see it would not see a re-introduction
-    written the same way.
+    Exact match is what makes this immune to prose: a docstring or comment
+    mentioning signal_events is never a constant equal to it.
     """
+    found: dict[str, list[int]] = {}
+    for path, text in texts.items():
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        lines = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == _TABLE
+        ]
+        if lines:
+            try:
+                key = path.relative_to(_ROOT).as_posix()
+            except ValueError:  # synthetic path in a falsifier
+                key = path.as_posix()
+            found[key] = sorted(lines)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Falsifiers. Each plants a form the PREVIOUS guard could not see.
+# ---------------------------------------------------------------------------
+
+
+def test_the_ast_scanner_sees_a_literal_passed_as_an_argument():
+    """THE case that shipped: a dynamic query built from a passed-in table name.
+
+    No text pattern can match `f"FROM {table_name}"`, but the caller still has
+    to write the table name as a literal somewhere.
+    """
+    src = 'await _check_detector(db, "signal_' + 'events", "token_id", x)\n'
+    tmp = {Path("fake/dynamic.py"): src}
+    assert _table_literal_sites(tmp) == {"fake/dynamic.py": [1]}
+
+
+def test_the_ast_scanner_ignores_prose_mentions():
+    """A comment or docstring naming the table must not trip the guard."""
+    src = '"""Reads from signal_' + 'events history."""\n# signal_' + "events\nx = 1\n"
+    assert _table_literal_sites({Path("fake/prose.py"): src}) == {}
+
+
+def test_the_regex_sees_aliased_and_dotted_derivations():
+    """Both forms the adjacency match missed."""
     planted = {
-        Path("fake/plain.py"): "SELECT MIN(created_at) FROM " + "signal_events",
-        Path("fake/aliased.py"): "SELECT MIN(created_at) AS t FROM " + "signal_events",
-        Path("fake/spaced.py"): "SELECT MIN( created_at )\n   FROM " + "signal_events",
-        Path("fake/new.py"): "SELECT MIN(first_seen_at) FROM signal_first_seen",
+        Path("fake/plain.py"): "SELECT MIN(created_at) FROM " + _TABLE,
+        Path("fake/aliased.py"): "SELECT MIN(created_at) AS t FROM " + _TABLE,
+        Path("fake/dotted.py"): "SELECT MIN(e.created_at) FROM " + _TABLE + " e",
+        Path("fake/clean.py"): "SELECT MIN(first_seen_at) FROM signal_first_seen",
     }
-    hits = _scan_re(_DERIVE_RE, planted)
-    assert hits == [
+    assert _scan_re(_DERIVE_RE, planted) == [
         Path("fake/aliased.py"),
+        Path("fake/dotted.py"),
         Path("fake/plain.py"),
-        Path("fake/spaced.py"),
-    ], hits
+    ]
 
 
 def test_the_scanner_is_reading_a_non_empty_tree():
     """A scanner pointed at nothing passes every assertion below it."""
-    srcs = _sources()
-    assert len(srcs) > 50, f"source scan collected only {len(srcs)} files"
+    assert len(_sources()) > 50, f"source scan collected only {len(_sources())} files"
+
+
+# ---------------------------------------------------------------------------
+# The guards
+# ---------------------------------------------------------------------------
 
 
 def test_emit_event_is_the_only_writer_of_signal_events():
-    hits = _scan(_INSERT_PAT, _read_all())
-    rel = [h.relative_to(_ROOT).as_posix() for h in hits]
+    rel = [h.relative_to(_ROOT).as_posix() for h in _scan(_INSERT_PAT, _read_all())]
     assert rel == ["scout/chains/events.py"], (
-        f"signal_events gained a writer outside emit_event: {rel}. Rows inserted "
-        "there never reach signal_first_seen, so every migrated consumer silently "
-        "under-reports them. Route the write through emit_event, or fold the "
-        "substrate in the same transaction as the new INSERT."
+        f"{_TABLE} gained a writer outside emit_event: {rel}. Rows inserted "
+        "there never reach signal_first_seen, so every migrated consumer "
+        "silently under-reports them."
+    )
+
+
+def test_no_module_names_the_events_table_without_an_explicit_reason():
+    """The guard that would have caught the un-migrated short-symbol branch.
+
+    Naming the table is how a consumer re-couples itself to retention, whether
+    the SQL is a literal or built at runtime. New names must be a decision, not
+    an accident.
+    """
+    sites = _table_literal_sites(_read_all())
+    unexpected = {f: ls for f, ls in sites.items() if f not in _LITERAL_ALLOWED}
+    assert not unexpected, (
+        f"these name {_TABLE} as a string literal without an entry in "
+        f"_LITERAL_ALLOWED: {unexpected}. If it derives a first-seen, migrate "
+        "it to signal_first_seen; if it is window-bounded and genuinely "
+        "exempt, add it with the reason."
     )
 
 
 def test_the_allowlist_is_not_silently_stale():
-    """An allowlist entry that no longer matches is a lie about the tree.
-
-    If the exempt site is refactored away, the entry must go too -- otherwise
-    it sits there implying a site was reviewed when nothing is there.
-    """
-    hits = {h.relative_to(_ROOT).as_posix() for h in _scan_re(_DERIVE_RE, _read_all())}
-    stale = _DERIVE_ALLOWED - hits
-    assert not stale, f"allowlist names sites that no longer derive first-seen: {stale}"
+    """An entry that no longer matches implies a review that no longer applies."""
+    sites = _table_literal_sites(_read_all())
+    stale = set(_LITERAL_ALLOWED) - set(sites)
+    assert (
+        not stale
+    ), f"allowlist names files that no longer reference {_TABLE}: {stale}"
 
 
 def test_no_consumer_still_derives_first_seen_from_signal_events():
-    hits = _scan_re(_DERIVE_RE, _read_all())
+    allowed = set(_LITERAL_ALLOWED)
     rel = [
         h.relative_to(_ROOT).as_posix()
-        for h in hits
-        if h.relative_to(_ROOT).as_posix() not in _DERIVE_ALLOWED
+        for h in _scan_re(_DERIVE_RE, _read_all())
+        if h.relative_to(_ROOT).as_posix() not in allowed
     ]
     assert rel == [], (
-        f"these still derive first-seen from signal_events: {rel}. That re-couples "
+        f"these still derive first-seen from {_TABLE}: {rel}. That re-couples "
         "them to retention -- shortening it would silently move their derived "
         "minimum forward. Read signal_first_seen instead."
     )

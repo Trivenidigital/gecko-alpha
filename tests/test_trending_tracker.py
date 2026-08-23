@@ -270,6 +270,11 @@ async def test_compare_detects_chain_signal(db):
         ),
     )
 
+    # "CC" is a SHORT symbol, so this exercises the branch that now reads the
+    # derived substrate. emit_event writes both rows as one unit; a raw INSERT
+    # alone builds a state production does not produce.
+    await db.record_signal_first_seen("coin-c", _sqlite_ts(earlier))
+
     # Insert trending snapshot
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
@@ -375,6 +380,8 @@ async def test_compare_multiple_detections(db):
             _sqlite_ts(earlier_chain),
         ),
     )
+    # "CD" is a SHORT symbol -- see the note in test_compare_detects_chain_signal.
+    await db.record_signal_first_seen("coin-d", _sqlite_ts(earlier_chain))
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
         ("coin-d", "CD", "Coin D", _sqlite_ts(now)),

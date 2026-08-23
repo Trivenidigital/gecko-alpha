@@ -54,7 +54,12 @@ async def _check_detector(
         defaults = {
             "predictions": "predicted_at",
             "candidates": "first_seen_at",
-            "signal_events": "created_at",
+            # No "signal_events" entry on purpose: every first-seen consumer
+            # now reads the derived substrate, so a caller passing the events
+            # table would be re-coupling to retention. Without a default it
+            # falls through to "detected_at" and fails loudly instead of
+            # silently working.
+            "signal_first_seen": "first_seen_at",
             "social_signals": "detected_at",
         }
         timestamp_col = defaults.get(table_name, "detected_at")
@@ -291,9 +296,17 @@ async def compare_with_signals(db: "Database") -> list[TrendingComparison]:
                 comp.chains_lead_minutes = lead_
                 comp.is_gap = False
         else:
+            # Option F: the SHORT-symbol branch must read the same derived
+            # substrate the >= 4 branch does. It was missed in the original
+            # migration, which left one function deriving first-seen from two
+            # different historical boundaries depending on symbol LENGTH --
+            # strictly harder to detect than the uniform retention coupling the
+            # substrate exists to remove, because nothing looks wrong at either
+            # site. Short symbols are not a marginal path: BTC, ETH, SOL, XRP,
+            # BNB, ADA all land here.
             detected, detected_at, lead = await _check_detector(
                 db,
-                "signal_events",
+                "signal_first_seen",
                 "token_id",
                 coin_id,
                 symbol,
