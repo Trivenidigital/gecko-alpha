@@ -7516,7 +7516,10 @@ class Database:
             raise
 
     # Measured 2026-08-23 via dbstat: signal_outcome_ledger 171,900,928 B table
-    # + 59,994,112 B indexes over 511,386 rows = ~454 B/row all-in. Used as a
+    # + 59,994,112 B indexes over 511,386 rows = 453.42 B/row all-in, rounded UP
+    # to 454. The direction is deliberate: an overestimate makes the reopen
+    # threshold fire slightly EARLY, and late is the direction that lets a
+    # deferral quietly stop being safe. Used as a
     # cheap proxy because dbstat itself scans the whole 7 GB database and takes
     # minutes -- far too heavy for an hourly probe whose only job is to notice a
     # threshold crossing.

@@ -12,6 +12,7 @@ that the probe can actually SEE a crossing, since a watch that always reports
 "nothing to do" is indistinguishable from no watch at all.
 """
 
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,9 +28,21 @@ async def db(tmp_path):
     await d.close()
 
 
+#: A corrupted _LEDGER_BYTES_PER_ROW makes the derived row counts explode --
+#: at 1 byte/row the reopen threshold needs 104,857,600 rows. Without a bound
+#: the suite HANGS instead of failing, which is the worst of both worlds: no
+#: signal and no result. Fail fast and name the likely cause.
+_MAX_FIXTURE_ROWS = 1_000_000
+
+
 async def _emit(db, surface, kind, days_ago, label_status="complete", n=1):
     # executemany: the threshold tests need ~231K rows (100 MB / 454 B), which
     # one-at-a-time inserts make unusably slow.
+    assert n <= _MAX_FIXTURE_ROWS, (
+        f"fixture asked for {n} rows (limit {_MAX_FIXTURE_ROWS}). If this came "
+        "from a threshold divided by _LEDGER_BYTES_PER_ROW, that constant is "
+        "probably wrong."
+    )
     ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
     await db._conn.executemany(
         """INSERT INTO signal_outcome_ledger
@@ -38,6 +51,50 @@ async def _emit(db, surface, kind, days_ago, label_status="complete", n=1):
         [(kind, surface, ts, label_status)] * n,
     )
     await db._conn.commit()
+
+
+def test_the_bytes_per_row_constant_is_pinned_to_its_measurement():
+    """The constant gets its own assertion, derived independently.
+
+    Every threshold test below computes its row count AS
+    `_LEDGER_REOPEN_RECLAIMABLE_BYTES // _LEDGER_BYTES_PER_ROW`, so they stay
+    self-consistent under ANY corruption of the constant and cannot detect a
+    wrong value -- they would simply insert a different number of rows and still
+    pass. That is not hypothetical: a stray edit set it to 1 during review,
+    which would have made every byte figure read 454x low, put
+    `reclaimable_bytes` permanently below the reopen threshold, and projected
+    ~4.7 million days to 1 GB, all while the hourly log looked green.
+
+    Measured 2026-08-23 via dbstat on production:
+        table   171,900,928 B
+        indexes  59,994,112 B
+        rows        511,386
+        -> 231,895,040 / 511,386 == 453.42 B/row
+
+    The constant rounds UP to 454, and the direction is deliberate: an
+    overestimate makes the probe report more bytes than exist, so the reopen
+    threshold fires slightly EARLY. Rounding down would make it fire late, and
+    late is the direction that lets a deferral quietly stop being safe.
+    """
+    measured_bytes = 171_900_928 + 59_994_112
+    measured_rows = 511_386
+    exact = measured_bytes / measured_rows
+    assert Database._LEDGER_BYTES_PER_ROW == math.ceil(exact)
+    assert Database._LEDGER_BYTES_PER_ROW == 454
+    assert (
+        Database._LEDGER_BYTES_PER_ROW >= exact
+    ), "rounding DOWN makes the reopen threshold fire late"
+
+
+def test_thresholds_are_sane_relative_to_each_other():
+    """A corrupted constant also shows up as an absurd row count."""
+    rows_for_reopen = (
+        Database._LEDGER_REOPEN_RECLAIMABLE_BYTES // Database._LEDGER_BYTES_PER_ROW
+    )
+    assert 100_000 < rows_for_reopen < 1_000_000, (
+        f"{rows_for_reopen} rows to reach the reclaimable threshold is not a "
+        "plausible number for a ~232 MB table -- check _LEDGER_BYTES_PER_ROW"
+    )
 
 
 async def test_probe_reports_the_four_measures_the_ruling_names(db):
