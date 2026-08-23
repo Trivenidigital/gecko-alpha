@@ -231,14 +231,22 @@ def main() -> int:
             pop, rec = per_surface.get(table, (0, 0))
             if not row or pop < COLLAPSE_MIN_POPULATION:
                 continue
-            # The SAME population-comparability guard the probe applies. A mark
-            # measured against a much smaller population is not comparable to
-            # today's, so the return to a normal population reads as a
-            # collapse. That false page was closed in the probe and left open
-            # here -- in the layer that actually sends Telegram -- so the two
-            # windows an operator has onto this system contradicted each other,
-            # with journald quiet and Telegram screaming.
-            if row[1] * 2 < pop:
+            # The SAME predicate the probe uses to decide a mark is not
+            # comparable -- and it must stay character-for-character the same,
+            # because the two layers disagreeing is the failure this pair of
+            # guards exists to prevent, in both directions.
+            #
+            # It was `row[1] * 2 < pop` here after the probe's was re-gated,
+            # which skipped the comparison on ANY growth past 2x. So the
+            # collapse the probe had just been fixed to catch went unpaged:
+            # mark 0.60 @ 100, today 46/250 = 0.184 -- probe collapsed, checker
+            # exit 0, printing the very mark it declined to compare against.
+            # Journald screamed, Telegram was quiet, and nothing reads
+            # journald, which is the premise this script exists on.
+            #
+            # Read-only here, so a fired guard means "do not judge against this
+            # mark" rather than "re-establish it"; the probe owns the re-arm.
+            if row[1] < COLLAPSE_MIN_POPULATION * 2 and pop > row[1] * 2:
                 continue
             if rec / pop < row[0] * COLLAPSE_FRACTION:
                 collapsed.append(table)

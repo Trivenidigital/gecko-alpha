@@ -8518,6 +8518,22 @@ class Database:
                 # database.
                 if await self._clear_coverage_baseline(table):
                     best = None
+                    # ANNOUNCE it. A cleared mark is the single event that can
+                    # disarm this alarm, and until now the clear succeeded
+                    # SILENTLY -- only its failure logged. Per the project's
+                    # own rule, an automated action that undoes established
+                    # state says so at the write site. This is also what makes
+                    # the next escape hatch visible on its first pass instead
+                    # of requiring someone to construct the state.
+                    import structlog
+
+                    structlog.get_logger().warning(
+                        "recompute_coverage_baseline_cleared",
+                        source_table=table,
+                        discarded_rate=round(row[0], 4),
+                        discarded_population=row[1],
+                        current_population=pop,
+                    )
             v["rate"] = round(rate, 4)
             if best is None or rate > best:
                 # Report what the TABLE holds, from the write's own result --

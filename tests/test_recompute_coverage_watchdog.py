@@ -648,3 +648,63 @@ def test_the_checker_ignores_a_SUPERSEDED_generations_verdict(tmp_path):
     assert r.returncode == 1, r.stdout
     assert "recovering NOTHING" in r.stdout
     assert "0 of 30" in r.stdout
+
+
+def test_the_checker_judges_against_a_LARGE_population_mark_after_growth(tmp_path):
+    """The checker's guard must be the probe's guard, in both directions.
+
+    Two revisions moved the probe's predicate while the checker kept the
+    original `row[1] * 2 < pop`, which skips the comparison on ANY growth past
+    2×. So the collapse the probe had just been fixed to catch went unpaged —
+    and the checker printed the very mark it declined to compare against.
+
+    The consequence is not symmetric with the probe-side bug: that one lowered
+    the mark and disarmed both layers; this one corrupts no state and only
+    silences the PAGING layer, leaving the correct verdict in journald, which
+    is the channel nobody reads. That is the worst available shape.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=250)
+    conn = sqlite3.connect(db)
+    # A mark from a population well above the floor: comparable, must be used.
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 0.60, 100, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute("DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > 5045")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "COLLAPSED" in r.stdout
+    assert "mark=0.6000" in r.stdout
+
+
+def test_the_checker_still_skips_a_genuinely_incomparable_mark(tmp_path):
+    """The other direction, so the fix cannot land as 'always compare'.
+
+    A mark measured on a sample too small to judge, against a population that
+    has since multiplied, is not evidence of anything. The reviewer's mutant
+    'adopt the probe's guard shape' passed all 119 tests — the guard was
+    unpinned in EITHER direction, so nothing would have caught the fix landing
+    wrong either.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=250)
+    conn = sqlite3.connect(db)
+    # Recorded on 25 rows, below twice the floor, and the population has since
+    # grown tenfold: the probe re-establishes this rather than judging on it.
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 0.99, 25, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute("DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > 5045")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert (
+        "COLLAPSED" not in r.stdout
+    ), "paged against a 25-row mark applied to a 250-row population"
+    assert r.returncode == 0, r.stdout
