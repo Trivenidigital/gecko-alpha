@@ -1,0 +1,1081 @@
+"""Versioned recomputation of legacy chain provenance (ruling C).
+
+`legacy_prefix` means "provenance needs resolution", NOT "evidence is bad".
+Treating the two as the same drops 826 of 1188 production rows and takes
+tier_high from 341 to 187 — mostly a metadata artefact, since the impact study
+found 95.8% of resolved cases were already decided by canonical identity.
+
+The nine falsifiers the ruling names each have a test below, and the hardest
+one is the coverage asymmetry: a missing canonical match is only evidence of
+absence where history actually reaches back far enough to have found one.
+"""
+
+import pytest
+
+from scout.conviction import cross_surface_conviction
+from scout.db import Database
+from scout.identity import CANONICAL_SEMANTICS, LEGACY_SEMANTICS
+from scout.identity_recompute import (
+    CREDIT_BEARING,
+    STATUS_ALIAS_NOT_VERIFIABLE,
+    STATUS_AMBIGUOUS,
+    STATUS_CANONICAL_SUB_GATE,
+    STATUS_INDETERMINATE,
+    STATUS_NO_LEGACY_CREDIT,
+    STATUS_PREFIX_ONLY,
+    STATUS_UNJOINABLE_ROW,
+    STATUS_VERIFIED_CANONICAL,
+    RECOMPUTE_SEMANTICS,
+    recompute_legacy_provenance,
+    reconciliation_report,
+)
+
+GATE = 1440.0
+ANCHOR = "2026-08-20T00:00:00+00:00"
+EARLY = "2026-08-15T00:00:00+00:00"  # 7200 min before ANCHOR — clears the gate
+LATE = "2026-08-19T23:00:00+00:00"  # 60 min before ANCHOR — below the gate
+FLOOR = "2026-08-09T00:40:48+00:00"
+
+
+@pytest.fixture
+async def db(tmp_path):
+    d = Database(tmp_path / "test.db")
+    await d.initialize()
+    yield d
+    await d.close()
+
+
+async def _substrate(db, rows):
+    await db._conn.executemany(
+        "INSERT OR REPLACE INTO signal_first_seen (token_id, first_seen_at, updated_at) "
+        "VALUES (?, ?, ?)",
+        [(t, f, f) for t, f in rows],
+    )
+    await db._conn.commit()
+
+
+async def _legacy(db, coin_id, symbol, *, anchor=ANCHOR, detected=1, lead=5000.0):
+    """Write an archived legacy row. The archive is what the recompute reads."""
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES ((SELECT COALESCE(MAX(id),0)+1 FROM gainers_comparisons_legacy_prefix_v1),
+                   ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+        (coin_id, symbol, coin_id, anchor, detected, lead, LEGACY_SEMANTICS, anchor),
+    )
+    await db._conn.commit()
+
+
+async def _status(db, coin_id):
+    cur = await db._conn.execute(
+        "SELECT evidence_status FROM chain_identity_recompute_v1 WHERE coin_id=?",
+        (coin_id,),
+    )
+    row = await cur.fetchone()
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------------------
+# The nine falsifiers
+# ---------------------------------------------------------------------------
+
+
+async def test_a_legacy_exact_canonical_row_RECOVERS_credit(db):
+    """The whole point: ~96% of legacy rows were canonical and must not be lost."""
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    assert await _status(db, "pepe") == STATUS_VERIFIED_CANONICAL
+
+    row = {
+        "detected_by_chains": 1,
+        "chains_lead_minutes": 5000.0,
+        "chains_identity_semantics": LEGACY_SEMANTICS,
+        "chains_recompute_status": STATUS_VERIFIED_CANONICAL,
+    }
+    assert "chains" in cross_surface_conviction(row, _settings()).contributing
+
+
+async def test_recovery_does_NOT_rewrite_the_archived_evidence(db):
+    """The archive is the evidence. Recomputing must sit beside it, not on it."""
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE", lead=9999.0)
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    cur = await db._conn.execute(
+        "SELECT chains_lead_minutes, chains_identity_semantics "
+        "FROM gainers_comparisons_legacy_prefix_v1 WHERE coin_id='pepe'"
+    )
+    lead, semantics = await cur.fetchone()
+    assert lead == 9999.0, "the archived lead was rewritten"
+    assert semantics == LEGACY_SEMANTICS, "the archive was restamped canonical"
+
+
+async def test_a_known_prefix_only_case_does_NOT_recover(db):
+    """`real-world-apparel <- re`, straight from the production impact study."""
+    await _substrate(db, [("re", EARLY)])
+    await _legacy(db, "real-world-apparel", "JACKET")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    assert await _status(db, "real-world-apparel") == STATUS_PREFIX_ONLY
+
+    row = {
+        "detected_by_chains": 1,
+        "chains_lead_minutes": 5000.0,
+        "chains_identity_semantics": LEGACY_SEMANTICS,
+        "chains_recompute_status": STATUS_PREFIX_ONLY,
+    }
+    assert "chains" not in cross_surface_conviction(row, _settings()).contributing
+
+
+async def test_identity_tier_beats_age_in_the_recompute_too(db):
+    """An exact match must win over an OLDER prefix candidate."""
+    await _substrate(
+        db, [("terra-luna", "2020-01-01T00:00:00+00:00"), ("terra-luna-2", EARLY)]
+    )
+    await _legacy(db, "terra-luna-2", "LUNA")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    cur = await db._conn.execute(
+        "SELECT identity_tier, canonical_lead FROM chain_identity_recompute_v1 "
+        "WHERE coin_id='terra-luna-2'"
+    )
+    tier, lead = await cur.fetchone()
+    assert tier == "canonical_id"
+    # 7200 min from EARLY, not the ~2.4M minutes the 2020 prefix row would give.
+    assert lead == pytest.approx(7200.0, abs=1.0)
+
+
+async def test_insufficient_coverage_is_INDETERMINATE_not_a_false_negative(db):
+    """THE asymmetry that makes this safe.
+
+    An anchor older than the substrate floor cannot be resolved either way:
+    the whole pre-anchor window is invisible. Calling that "prefix-only" would
+    manufacture false negatives — the same error as the false positives this
+    workstream exists to remove, in the other direction.
+    """
+    # The fixture must make the two outcomes DISTINGUISHABLE. A prefix candidate
+    # has to exist, otherwise the classifier reaches "indeterminate" by a second
+    # route and removing the coverage guard changes nothing -- which is exactly
+    # what my first version of this test did: the mutant survived.
+    #
+    # "ancient" is a PREFIX of "ancient-coin" and is NOT the symbol, so it is a
+    # prefix-only candidate. (My first attempt used "anc", which EQUALS the
+    # symbol and is therefore an alias-tier match -- the fixture was testing a
+    # different tier than the one it named.)
+    #
+    # WITHOUT the coverage guard this row is confidently mislabelled
+    # verified_prefix_only: a false negative asserted on evidence that does not
+    # exist for this era.
+    await _substrate(db, [("ancient", EARLY)])
+    await _legacy(db, "ancient-coin", "XYZ", anchor="2026-05-01T00:00:00+00:00")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    assert (
+        await _status(db, "ancient-coin") == STATUS_INDETERMINATE
+    ), "an anchor predating all coverage was given a verdict"
+
+
+def test_coverage_decides_between_INDETERMINATE_and_a_real_negative():
+    """Tested at the classifier, and the reason is worth recording.
+
+    Through the DB path the coverage guard is currently REDUNDANT: an anchor
+    older than the substrate floor also puts the `+5 minutes` cutoff below every
+    substrate row, so there are no candidates at all and the classifier reaches
+    `indeterminate` by a second route. Removing the guard changed nothing, and
+    two attempts at a DB-level fixture failed to discriminate before I stopped
+    guessing and traced it.
+
+    That redundancy is a property of TODAY's single history source, not of the
+    rule. The moment coverage and candidate-availability diverge — snapshot-
+    extended history being the obvious case — the guard is the only thing
+    standing between "we cannot see that far" and a confident false negative.
+
+    So it is pinned where it actually discriminates: identical inputs, coverage
+    the only difference.
+    """
+    from scout.identity import Resolution, TIER_UNRESOLVED
+    from scout.identity_recompute import classify
+
+    prefix_hit = Resolution(
+        tier=TIER_UNRESOLVED,
+        prefix_token_id="ancient",
+        prefix_first_seen_at=EARLY,
+    )
+    common = dict(
+        resolution=prefix_hit,
+        legacy_detected=True,
+        legacy_lead=5000.0,
+        canonical_lead=None,
+        gate_minutes=GATE,
+    )
+
+    assert (
+        classify(**common, anchor_covered=False) == STATUS_INDETERMINATE
+    ), "an uncovered anchor was given a verdict on evidence that cannot exist"
+    assert (
+        classify(**common, anchor_covered=True) == STATUS_PREFIX_ONLY
+    ), "a covered anchor with a prefix candidate is a REAL negative"
+
+
+async def test_a_canonical_lead_at_or_above_the_gate_survives_left_censoring(db):
+    """The monotonic shortcut: missing older history only makes a lead LARGER.
+
+    So an OBSERVED lead >= the gate is safe even though earlier canonical
+    history may be gone — the true lead is at least what we can see.
+    """
+    await _substrate(db, [("pepe", EARLY)])  # 7200 min >= 1440
+    await _legacy(db, "pepe", "PEPE")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    assert await _status(db, "pepe") == STATUS_VERIFIED_CANONICAL
+
+
+async def test_a_canonical_lead_BELOW_the_gate_is_indeterminate_not_negative(db):
+    """The converse does NOT hold.
+
+    An observed lead under the gate cannot be called a failure, because the
+    canonical history that would have cleared it may simply have been pruned.
+    """
+    await _substrate(db, [("shib", LATE)])  # 60 min < 1440
+    await _legacy(db, "shib", "SHIB")
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    assert await _status(db, "shib") == STATUS_CANONICAL_SUB_GATE
+
+    row = {
+        "detected_by_chains": 1,
+        "chains_lead_minutes": 5000.0,
+        "chains_identity_semantics": LEGACY_SEMANTICS,
+        "chains_recompute_status": STATUS_CANONICAL_SUB_GATE,
+    }
+    assert "chains" not in cross_surface_conviction(row, _settings()).contributing
+
+
+def test_ambiguous_identity_earns_nothing():
+    """Tested at the classifier, because the DB path cannot reach this state.
+
+    Tier 3 is bare symbol equality, so every alias candidate normalises to the
+    symbol itself and the distinctness set can never exceed one -- the same
+    unreachability `test_alias_ambiguity_is_unreachable_by_construction` pins in
+    tests/test_canonical_identity.py. A fixture pretending otherwise would be
+    asserting against a state production cannot produce.
+
+    The branch is kept because it becomes live the moment tier 3 is re-sourced
+    from a real provenance-backed alias table, where two genuinely different
+    assets can claim one symbol.
+    """
+    from scout.identity import TIER_UNRESOLVED, Resolution
+    from scout.identity_recompute import classify
+
+    ambiguous = Resolution(tier=TIER_UNRESOLVED, alias_candidates=["bless", "blessed"])
+    assert (
+        classify(
+            resolution=ambiguous,
+            legacy_detected=True,
+            legacy_lead=5000.0,
+            canonical_lead=None,
+            anchor_covered=True,
+            gate_minutes=GATE,
+        )
+        == STATUS_AMBIGUOUS
+    )
+
+
+async def test_a_row_with_no_legacy_credit_has_nothing_to_recover(db):
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE", detected=0, lead=None)
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    assert await _status(db, "pepe") == STATUS_NO_LEGACY_CREDIT
+
+
+async def test_rerun_is_idempotent(db):
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE")
+
+    first = await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    cur = await db._conn.execute(
+        "SELECT source_table, source_row_id, evidence_status, canonical_lead "
+        "FROM chain_identity_recompute_v1 ORDER BY source_table, source_row_id"
+    )
+    snap1 = await cur.fetchall()
+
+    second = await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    cur = await db._conn.execute(
+        "SELECT source_table, source_row_id, evidence_status, canonical_lead "
+        "FROM chain_identity_recompute_v1 ORDER BY source_table, source_row_id"
+    )
+    snap2 = await cur.fetchall()
+
+    assert first == second
+    assert [tuple(r) for r in snap1] == [tuple(r) for r in snap2]
+    cur = await db._conn.execute("SELECT COUNT(*) FROM chain_identity_recompute_v1")
+    assert (await cur.fetchone())[0] == 1, "rerun double-counted"
+
+
+async def test_result_does_not_depend_on_processing_order(db):
+    """Order-independence: the same inputs in any insertion order agree."""
+    await _substrate(db, [("aaa", EARLY), ("zzz", EARLY), ("mmm", LATE)])
+    for coin in ("zzz", "aaa", "mmm"):
+        await _legacy(db, coin, coin.upper())
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    cur = await db._conn.execute(
+        "SELECT coin_id, evidence_status FROM chain_identity_recompute_v1 ORDER BY coin_id"
+    )
+    got = {c: s for c, s in await cur.fetchall()}
+    assert got["aaa"] == STATUS_VERIFIED_CANONICAL
+    assert got["zzz"] == STATUS_VERIFIED_CANONICAL
+    assert got["mmm"] == STATUS_CANONICAL_SUB_GATE
+
+
+async def test_removing_the_overlay_for_ONE_row_changes_its_score(db):
+    """Proves the integration is load-bearing, not decorative."""
+    row = {
+        "detected_by_chains": 1,
+        "chains_lead_minutes": 5000.0,
+        "chains_identity_semantics": LEGACY_SEMANTICS,
+        "chains_recompute_status": STATUS_VERIFIED_CANONICAL,
+    }
+    with_overlay = cross_surface_conviction(row, _settings())
+
+    row_without = dict(row, chains_recompute_status=None)
+    without = cross_surface_conviction(row_without, _settings())
+
+    assert with_overlay.early_count == 1
+    assert (
+        without.early_count == 0
+    ), "dropping the overlay changed nothing — the integration is not wired"
+
+
+def _settings():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        CONVICTION_EARLY_LEAD_MINUTES=1440,
+        CONVICTION_HIGH_TIER_MIN_SURFACES=4,
+        CONVICTION_WATCH_TIER_MIN_SURFACES=2,
+    )
+
+
+def test_rejecting_all_legacy_reproduces_the_CLIFF_and_must_fail():
+    """The forbidden implementation, stated as a test.
+
+    Treating every non-canonical row as untrusted is what produced 826 -> 0 and
+    tier_high 341 -> 187. A verified-canonical legacy row MUST earn credit; if
+    this assertion ever fails, the cliff has been reintroduced.
+    """
+    row = {
+        "detected_by_chains": 1,
+        "chains_lead_minutes": 8736.0,
+        "chains_identity_semantics": LEGACY_SEMANTICS,
+        "chains_recompute_status": STATUS_VERIFIED_CANONICAL,
+    }
+    assert cross_surface_conviction(row, _settings()).early_count == 1
+
+
+async def test_extra_history_recovers_a_row_the_substrate_alone_cannot(db):
+    """The measured difference between 18.8% and 65.1% recovery.
+
+    The live substrate's floor is 2026-08-09 while legacy anchors reach back to
+    April, so 913 of 1188 production rows are indeterminate on substrate history
+    alone. The preserved /root snapshots reach to 2026-06-19 and resolve most of
+    June-August.
+    """
+    old_anchor = "2026-07-01T00:00:00+00:00"
+    await _substrate(db, [("pepe", EARLY)])  # 2026-08-15, AFTER the anchor
+    await _legacy(db, "pepe", "PEPE", anchor=old_anchor)
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    assert (
+        await _status(db, "pepe") == STATUS_INDETERMINATE
+    ), "substrate-only should not be able to resolve a July anchor"
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=GATE,
+        extra_history={"pepe": "2026-06-20T00:00:00+00:00"},
+    )
+    assert await _status(db, "pepe") == STATUS_VERIFIED_CANONICAL
+
+
+async def test_extra_history_only_moves_a_first_seen_EARLIER(db):
+    """The merge must never discard a better (earlier) substrate value.
+
+    Moving a first-seen later would shrink a lead and could un-qualify a row
+    that already passed — the one direction that can withdraw legitimate credit.
+    """
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE")
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=GATE,
+        extra_history={"pepe": "2026-08-19T23:59:00+00:00"},  # LATER than EARLY
+    )
+    cur = await db._conn.execute(
+        "SELECT canonical_lead FROM chain_identity_recompute_v1 WHERE coin_id='pepe'"
+    )
+    assert (await cur.fetchone())[0] == pytest.approx(
+        7200.0, abs=1.0
+    ), "a later extra-history value overwrote the earlier substrate value"
+
+
+async def test_extra_history_extends_the_COVERAGE_floor_too(db):
+    """Extending history must also extend what counts as decidable.
+
+    Leaving the floor at the substrate's would keep calling rows
+    `indeterminate` that the extra history can now actually resolve — the
+    verdict would silently ignore the evidence just supplied. Verified here on
+    the branch where coverage is the deciding factor: no canonical match
+    exists, so the answer turns entirely on whether we can see far enough back
+    to call the absence meaningful.
+    """
+    anchor = "2026-07-01T00:00:00+00:00"
+    # "ancient" is a prefix of the coin_id and is NOT the symbol.
+    await _substrate(db, [("ancient", EARLY)])  # 2026-08-15: after the anchor
+    await _legacy(db, "ancient-coin", "XYZ", anchor=anchor)
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    assert await _status(db, "ancient-coin") == STATUS_INDETERMINATE
+
+    # Now history reaches 2026-06-20, before the anchor: the prefix candidate is
+    # visible AND the absence of a canonical match becomes meaningful.
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=GATE,
+        extra_history={"ancient": "2026-06-20T00:00:00+00:00"},
+        coverage_intervals=[("2026-06-19T00:00:00+00:00", "2026-08-02T20:21:10+00:00")],
+    )
+    assert (
+        await _status(db, "ancient-coin") == STATUS_PREFIX_ONLY
+    ), "declared coverage was ignored, so resolvable evidence went unused"
+
+
+async def test_an_anchor_inside_a_COVERAGE_GAP_is_indeterminate(db):
+    """The gap case a global floor cannot express.
+
+    2026-07-03..07-17 is covered by no source. An anchor there sits far above
+    any global floor, so the old predicate called it covered and read absence
+    as proof — manufacturing a false negative in the one window where we are
+    blindest.
+    """
+    await _substrate(db, [("ancient", EARLY)])
+    await _legacy(db, "ancient-coin", "XYZ", anchor="2026-07-10T00:00:00+00:00")
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=GATE,
+        extra_history={"ancient": "2026-06-20T00:00:00+00:00"},
+        coverage_intervals=[
+            ("2026-06-19T00:00:00+00:00", "2026-07-03T00:26:52+00:00"),
+            ("2026-07-17T19:32:46+00:00", "2026-08-02T20:21:10+00:00"),
+        ],
+    )
+    assert (
+        await _status(db, "ancient-coin") == STATUS_INDETERMINATE
+    ), "an anchor inside a known blind window was given a verdict"
+
+
+async def test_duplicate_coin_ids_cannot_FAN_OUT_the_reader(db):
+    """Caught on production data, not by reasoning: losers_comparisons has 2
+    duplicate coin_ids today.
+
+    The overlay was first wired as a LEFT JOIN on coin_id. With two archived
+    rows sharing a coin_id, the recompute table gets two rows for it and every
+    matching comparison row is returned TWICE — silently inflating every
+    dashboard count and any aggregate over these readers, with nothing
+    erroring.
+
+    A scalar subquery cannot fan out by construction, which is why it replaced
+    the join rather than the join being deduplicated.
+    """
+    from scout.losers.tracker import get_losers_comparisons
+
+    for anchor in (ANCHOR, "2026-08-21T00:00:00+00:00"):
+        await db._conn.execute(
+            """INSERT INTO losers_comparisons
+               (coin_id, symbol, name, price_change_24h, appeared_on_losers_at,
+                detected_by_chains, chains_lead_minutes, is_gap)
+               VALUES ('dupe', 'DUP', 'Dupe', -10.0, ?, 1, 5000.0, 0)""",
+            (anchor,),
+        )
+        await db._conn.execute(
+            """INSERT INTO chain_identity_recompute_v1
+               (source_table, source_row_id, coin_id, symbol, historical_anchor,
+                legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+                identity_tier, evidence_status, semantics_version, computed_at)
+               VALUES ('losers_comparisons', ?, 'dupe', 'DUP', ?, 1, 5000.0, 1, 5000.0,
+                       'canonical_id', ?, ?, '2026-08-23')""",
+            (
+                1 if anchor == ANCHOR else 2,
+                anchor,
+                STATUS_VERIFIED_CANONICAL,
+                RECOMPUTE_SEMANTICS,
+            ),
+        )
+    await db._conn.commit()
+
+    rows = await get_losers_comparisons(db, limit=50)
+    dupes = [r for r in rows if r["coin_id"] == "dupe"]
+    assert (
+        len(dupes) == 2
+    ), f"expected the 2 comparison rows, got {len(dupes)} — the overlay fanned out"
+    assert all(r["chains_recompute_status"] == STATUS_VERIFIED_CANONICAL for r in dupes)
+
+
+async def test_the_overlay_matches_on_ANCHOR_not_just_coin_id(db):
+    """Two historical observations of one coin are different rows of evidence.
+
+    Matching on coin_id alone would apply one anchor's verdict to the other's
+    row — and could hand credit to a row whose own provenance was never
+    established.
+    """
+    from scout.losers.tracker import get_losers_comparisons
+
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_losers_at,
+            detected_by_chains, chains_lead_minutes, is_gap)
+           VALUES ('split', 'SPL', 'Split', -5.0, ?, 1, 5000.0, 0)""",
+        (ANCHOR,),
+    )
+    # A recompute row for a DIFFERENT anchor of the same coin.
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('losers_comparisons', 99, 'split', 'SPL', '2026-01-01T00:00:00+00:00',
+                   1, 5000.0, 1, 5000.0, 'canonical_id', ?, ?, '2026-08-23')""",
+        (STATUS_VERIFIED_CANONICAL, RECOMPUTE_SEMANTICS),
+    )
+    await db._conn.commit()
+
+    rows = await get_losers_comparisons(db, limit=50)
+    row = next(r for r in rows if r["coin_id"] == "split")
+    assert (
+        row["chains_recompute_status"] is None
+    ), "another anchor's verdict was applied to this row"
+
+
+async def test_END_TO_END_archive_to_recompute_to_reader_to_conviction(db):
+    """The cliff guard that can actually SEE the cliff.
+
+    Every other conviction assertion in this file hand-builds the row dict, so
+    none of them observes whether the overlay is produced by the SQL at all.
+    Review proved it: severing the join predicate in the reader left the entire
+    suite green — and that mutant IS the production cliff (overlay never joins
+    -> all legacy credit refused -> 826 rows, tier_high 341 -> 187).
+
+    This walks the real path: archive row -> recompute -> reader -> scorer.
+    """
+    from scout.gainers.tracker import get_gainers_comparisons
+
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE", lead=100.0)  # legacy lead BELOW the gate
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics)
+           VALUES ('pepe','PEPE','Pepe',10.0,?,1,100.0,0,?)""",
+        (ANCHOR, LEGACY_SEMANTICS),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    rows = await get_gainers_comparisons(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "pepe")
+
+    assert (
+        row["chains_recompute_status"] == STATUS_VERIFIED_CANONICAL
+    ), "the overlay never reached the reader — this is the cliff"
+    # D3: the VERIFIED lead must be what gets scored, not the legacy 100.
+    assert row["chains_canonical_lead"] == pytest.approx(7200.0, abs=1.0)
+
+    res = cross_surface_conviction(row, _settings())
+    assert (
+        "chains" in res.contributing
+    ), "a verified-canonical row was refused end to end"
+
+
+async def test_END_TO_END_a_prefix_only_row_is_refused(db):
+    """The other direction, through the same real path."""
+    from scout.gainers.tracker import get_gainers_comparisons
+
+    await _substrate(db, [("re", EARLY)])
+    await _legacy(db, "real-world-apparel", "JACKET")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics)
+           VALUES ('real-world-apparel','JACKET','RWA',10.0,?,1,8736.0,0,?)""",
+        (ANCHOR, LEGACY_SEMANTICS),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    rows = await get_gainers_comparisons(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "real-world-apparel")
+
+    assert row["chains_recompute_status"] == STATUS_PREFIX_ONLY
+    assert "chains" not in cross_surface_conviction(row, _settings()).contributing
+
+
+async def test_an_alias_win_is_NOT_verified_under_censored_history(db):
+    """D1: the monotonic argument does not hold ACROSS tiers.
+
+    `luna` is a different asset from `terra-luna-2`. Under censoring it wins on
+    alias tier with an earlier first_seen; restoring history reinstates the
+    canonical token with a LATER one and the lead collapses. So an alias win
+    can be an artefact of what is missing.
+    """
+    await _substrate(db, [("luna", EARLY)])
+    await _legacy(db, "terra-luna-2", "LUNA", anchor=ANCHOR)
+
+    # No declared coverage -> the alias win must not be promoted to verified.
+    await recompute_legacy_provenance(
+        db._conn, gate_minutes=GATE, coverage_intervals=[]
+    )
+    assert (
+        await _status(db, "terra-luna-2") == STATUS_ALIAS_NOT_VERIFIABLE
+    ), "an alias-tier win was verified while a canonical token could be hidden"
+
+
+# ---------------------------------------------------------------------------
+# Residuals flagged during implementation, closed here
+# ---------------------------------------------------------------------------
+
+
+async def test_the_gate_is_INCLUSIVE_at_exactly_the_boundary(db):
+    """`>=`, matching the consumer. One row sits exactly on 1440.
+
+    `cross_surface` documents its own gate as ">= CONVICTION_EARLY_LEAD_MINUTES
+    (inclusive)". If the overlay used `>` instead, a row whose canonical lead
+    lands exactly on the boundary would be stamped indeterminate here while the
+    consumer would happily count it -- the two halves disagreeing about the
+    same row, with each internally consistent.
+    """
+    anchor = "2026-08-01T00:00:00+00:00"
+    # first_seen exactly 1440 minutes (24h) before the anchor
+    await _substrate(db, [("exact-boundary-coin", "2026-07-31T00:00:00+00:00")])
+    await _legacy(db, "exact-boundary-coin", "EBC", anchor=anchor)
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-07-01T00:00:00+00:00", "2026-08-02T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT canonical_lead, evidence_status FROM chain_identity_recompute_v1 "
+        "WHERE coin_id='exact-boundary-coin'"
+    )
+    lead, status = await cur.fetchone()
+    assert lead == pytest.approx(1440.0)
+    assert status == STATUS_VERIFIED_CANONICAL
+
+
+async def test_every_archived_row_lands_in_exactly_one_status(db):
+    """The acceptance report reconciles counts against the population.
+
+    A row that is neither written nor counted makes the totals silently fail to
+    sum, and "the numbers don't add up" is the least debuggable form of a
+    missing row. Rows with no join key are the case that used to vanish.
+    """
+    await _substrate(db, [("has-history", "2026-07-31T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "no-history-at-all", "NH")
+    # Unjoinable: an archived row carrying no coin_id.
+    await _legacy(db, "", "EMPTY")
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM gainers_comparisons_legacy_prefix_v1"
+    )
+    population = (await cur.fetchone())[0]
+    assert population == 3
+    assert (
+        sum(counts.values()) == population
+    ), f"statuses {dict(counts)} sum to {sum(counts.values())}, not {population}"
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 1
+
+
+async def test_rows_already_marked_canonical_are_left_out_of_the_replay(db):
+    """A `canonical_v1` row was never derived by prefix matching.
+
+    It has nothing to recompute and no legacy evidence to reconstruct, so
+    replaying it would fabricate an overlay row asserting provenance about a
+    row whose provenance was never in question.
+    """
+    await _substrate(db, [("already-canonical", "2026-07-31T00:00:00+00:00")])
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9001, 'already-canonical', 'AC', 'AC', ?, 1, 5000.0, 0,
+                   'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    assert await _status(db, "already-canonical") is None
+    assert sum(counts.values()) == 0
+
+
+@pytest.mark.parametrize(
+    "surface,anchor_col",
+    [
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ],
+)
+async def test_the_other_two_surfaces_are_replayed_too(db, surface, anchor_col):
+    """Coverage of gainers alone would leave two thirds of the population dark.
+
+    Both of these carry credit-bearing legacy rows in production, and losers in
+    particular uses a DIFFERENT time bound, so it cannot be assumed to behave
+    like gainers just because the code path is shared.
+    """
+    coin = f"{surface}-coin"
+    await _substrate(db, [(coin, "2026-07-25T00:00:00+00:00")])
+    await db._conn.execute(
+        f"""INSERT INTO {surface}_legacy_prefix_v1
+            (id, coin_id, symbol, name, {anchor_col},
+             detected_by_chains, chains_lead_minutes, is_gap,
+             chains_identity_semantics, created_at)
+            VALUES (9100, ?, 'S', 'S', ?, 1, 5000.0, 0, ?, ?)""",
+        (coin, ANCHOR, LEGACY_SEMANTICS, ANCHOR),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-07-01T00:00:00+00:00", "2026-08-02T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT source_table, evidence_status FROM chain_identity_recompute_v1 "
+        "WHERE coin_id=?",
+        (coin,),
+    )
+    row = await cur.fetchone()
+    assert row is not None, f"{surface} was never replayed"
+    assert row[0] == surface
+    assert row[1] == STATUS_VERIFIED_CANONICAL
+
+
+async def test_losers_uses_its_OWN_time_bound_not_the_gainers_tolerance(db):
+    """The two bounds are not interchangeable, and a comment is not a test.
+
+    `scout/identity.py` defines two: gainers/trending accept
+    `datetime(first_seen_at) < datetime(anchor, '+5 minutes')`, losers accepts
+    a bare `first_seen_at < anchor`. An earlier version of this loop applied
+    the +5-minute form uniformly while asserting in a comment that the bound
+    was "identical to the one that produced the legacy value". Review caught
+    it; the fix then sat here UNPINNED, and a mutant restoring the uniform
+    bound passed all 28 tests.
+
+    The discriminating case is a first-seen landing INSIDE the tolerance
+    window -- two minutes after the anchor. The losers path must refuse it (a
+    candidate cannot be first seen after the appearance it supposedly
+    predicts); the gainers path would accept it and derive a negative lead.
+    """
+    anchor = "2026-08-20T00:00:00+00:00"
+    inside_tolerance = "2026-08-20T00:02:00+00:00"
+    await _substrate(db, [("late-candidate", inside_tolerance)])
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_losers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9200, 'late-candidate', 'LC', 'LC', ?, 1, 5000.0, 0, ?, ?)""",
+        (anchor, LEGACY_SEMANTICS, anchor),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-08-01T00:00:00+00:00", "2026-08-25T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT canonical_detected, canonical_lead, evidence_status "
+        "FROM chain_identity_recompute_v1 WHERE coin_id='late-candidate'"
+    )
+    detected, lead, status = await cur.fetchone()
+
+    # Under the losers bound the candidate is out of range entirely.
+    assert detected == 0, (
+        "losers accepted a candidate first seen AFTER the anchor -- that is the "
+        "gainers +5min tolerance leaking into the losers path"
+    )
+    assert lead is None
+    # INDETERMINATE, not PREFIX_ONLY: with the candidate out of range there is
+    # no prefix match either, so the replay cannot affirm the negative -- it can
+    # only report that it could not reconstruct. That is the conservative
+    # direction the ruling requires ("a reconstructed lead below the gate cannot
+    # be treated as a negative"), and it is a DIFFERENT status from the one the
+    # uniform-bound mutant produces (canonical_below_gate_indeterminate, off a
+    # candidate first seen two minutes after the anchor).
+    assert status == STATUS_INDETERMINATE
+
+
+async def test_an_ALIAS_UNIQUE_win_is_never_a_verified_positive(db):
+    """The module's own worked example, and its own stated rule.
+
+    `terra-luna-2 <- luna` is one of the eight named production identity
+    errors this workstream exists to remove. Under censored history the symbol
+    token `luna` is the only survivor, so it wins on tier 3 with a long lead.
+    Restore the real history and `terra-luna-2` appears, outranks it on tier,
+    and carries a far later first_seen -- the lead collapses.
+
+    The branch used to promote on `anchor_covered`, but coverage intervals are
+    a GLOBAL span over all tokens' events: they establish that we were
+    recording, never that THIS coin's canonical-id token would have been seen.
+    A tier-3 win is exactly the case that censoring fabricates.
+    """
+    anchor = "2026-08-20T00:00:00+00:00"
+    # Censored substrate: only the short symbol token survives.
+    await _substrate(db, [("luna", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "terra-luna-2", "LUNA", anchor=anchor)
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-08-01T00:00:00+00:00", "2026-08-25T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT identity_tier, canonical_lead, evidence_status "
+        "FROM chain_identity_recompute_v1 WHERE coin_id='terra-luna-2'"
+    )
+    tier, lead, status = await cur.fetchone()
+
+    assert tier == "alias_unique", f"fixture did not produce a tier-3 win: {tier}"
+    # The lead is large and the anchor is covered -- every precondition the old
+    # branch promoted on. It must still not be a verified positive.
+    assert lead is not None and lead >= 1440.0
+    assert (
+        status == STATUS_ALIAS_NOT_VERIFIABLE
+    ), "an alias win was recorded as a VERIFIED positive on censored history"
+    assert status not in CREDIT_BEARING
+    # And the status names the REAL reason. `canonical_below_gate_indeterminate`
+    # asserted a comparison never performed for this tier: this lead is FIVE
+    # TIMES the gate, and that label called it "below" it.
+    assert lead == pytest.approx(5 * 1440.0)
+
+
+async def test_reconciliation_report_names_its_denominators(db):
+    """Three numbers can each be called "the population"; they disagree.
+
+    `sum(counts)` covers only the NON-canonical archived rows. `unjoinable_row`
+    is counted but never written. And `INSERT OR REPLACE` on
+    (source_table, source_row_id) collapses a duplicate pair silently, so rows
+    written and rows stored are different claims. An acceptance table that does
+    not say which denominator it used cannot be checked against the table it
+    describes.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "", "UNJOINABLE")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9001, 'already-canonical', 'AC', 'AC', ?, 1, 5000.0, 0,
+                   'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["population"] == 3  # every archived row
+    assert rep["skipped_canonical"] == 1  # never prefix-derived, nothing to replay
+    assert rep["replayed"] == 2
+    assert (
+        sum(counts.values()) == rep["replayed"]
+    ), "the status breakdown does not cover the replayed population"
+    # One row was unjoinable: counted as a status, never written.
+    assert rep["stored"] == 1
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 1
+    assert rep["stored"] + counts[STATUS_UNJOINABLE_ROW] == rep["replayed"]
+
+
+async def test_a_stale_overlay_row_cannot_cancel_a_missing_evidence_row(db):
+    """`stored` was unscoped, so two errors produced a clean bill of health.
+
+    `INSERT OR REPLACE` never deletes, so an overlay row whose source archive
+    no longer exists survives forever. Counting the whole table meant one
+    archived row with no evidence row and one orphan overlay row cancelled to
+    `replayed - stored == 0` -- precisely the gap the reconciliation exists to
+    make visible.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "", "UNJOINABLE")  # counted, never written
+    await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    # An orphan from a surface that is not being replayed.
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('a_table_that_no_longer_exists', 1, 'ghost', 'G', ?, 1,
+                   1.0, 1, 1.0, 'canonical_id', 'verified_canonical', 'v0', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["population"] == 2
+    assert rep["replayed"] == 2
+    assert (
+        rep["stored"] == 1
+    ), "the orphan was counted, cancelling the unjoinable row's shortfall"
+    assert rep["replayed"] - rep["stored"] == 1
+
+
+async def test_a_surface_the_replay_SKIPPED_is_not_counted_as_population(db):
+    """The replay skips a surface whose archive lacks a required column.
+
+    Counting it here produced a shortfall attributed to no status at all.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await db._conn.execute("DROP TABLE losers_comparisons_legacy_prefix_v1")
+    await db._conn.execute(
+        "CREATE TABLE losers_comparisons_legacy_prefix_v1 "
+        "(id INTEGER, coin_id TEXT, detected_by_chains INTEGER)"  # no symbol/anchor
+    )
+    await db._conn.execute(
+        "INSERT INTO losers_comparisons_legacy_prefix_v1 VALUES (1, 'x', 1)"
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["per_surface"]["losers_comparisons"] == {"skipped_by_replay": 1}
+    assert (
+        sum(counts.values()) == rep["replayed"]
+    ), f"{dict(counts)} sums to {sum(counts.values())}, replayed={rep['replayed']}"
+
+
+async def test_a_crashed_replay_names_the_surfaces_it_never_reached(db):
+    """Per-surface `stored` distinguishes a crash from an unjoinable shortfall.
+
+    Globally the two are the same number. Per-surface commits made a partial
+    replay reachable, so the difference matters.
+    """
+    await _substrate(db, [("g", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "g", "G")
+    for surface, col in (
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        await db._conn.execute(
+            f"""INSERT INTO {surface}_legacy_prefix_v1
+               (id, coin_id, symbol, name, {col}, detected_by_chains,
+                chains_lead_minutes, is_gap, chains_identity_semantics, created_at)
+               VALUES (1, 'x', 'X', 'X', ?, 1, 5000.0, 0, ?, ?)""",
+            (ANCHOR, LEGACY_SEMANTICS, ANCHOR),
+        )
+    await db._conn.commit()
+
+    # Only gainers was replayed -- the shape a mid-run failure leaves behind.
+    await recompute_legacy_provenance(
+        db._conn, gate_minutes=1440.0, coverage_intervals=[]
+    )
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_table != 'gainers_comparisons'"
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["surfaces_never_written"] == [
+        "losers_comparisons",
+        "trending_comparisons",
+    ]
+
+
+async def test_an_all_unjoinable_archive_is_NOT_reported_as_a_crash(db):
+    """A clean run that correctly writes nothing must not look like a crash.
+
+    `surfaces_never_written` says "the replay died before reaching it". An
+    archive whose every row lacks a join key is replayed to completion and
+    writes nothing — the exact ambiguity the field was added to remove,
+    inverted.
+    """
+    await _legacy(db, "", "NOKEY1")
+    await _legacy(db, "", "NOKEY2")
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 2
+    assert rep["unjoinable"] == 2
+    assert rep["stored"] == 0
+    assert (
+        rep["surfaces_never_written"] == []
+    ), "a completed replay that correctly wrote nothing was reported as a crash"
+
+
+async def test_an_EMPTY_or_all_canonical_archive_is_not_reported_as_a_crash(db):
+    """The other two shapes that produce stored == 0 legitimately."""
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_losers_at, detected_by_chains,
+            chains_lead_minutes, is_gap, chains_identity_semantics, created_at)
+           VALUES (1, 'already', 'A', 'A', ?, 1, 5000.0, 0, 'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    # gainers archive is empty; losers holds only canonical_v1 rows.
+    assert rep["surfaces_never_written"] == []
+
+
+async def test_a_row_under_a_FOREIGN_semantics_version_is_not_counted_as_stored(db):
+    """`stored` is scoped by version, and that scoping needs a test.
+
+    Without it a v1 report counts v2 rows and reports a surface as written
+    when this version wrote nothing.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('gainers_comparisons', 1, 'has-history', 'HH', ?, 1, 100.0,
+                   1, 9000.0, 'canonical_id', 'verified_canonical',
+                   'some_future_version', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["stored"] == 0, "a foreign-version row was counted as this version's"
+    assert rep["surfaces_never_written"] == ["gainers_comparisons"]

@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from scout.identity_recompute import RECOMPUTE_SEMANTICS
+from scout.identity import (
+    CANONICAL_SEMANTICS,
+    resolve_chain_first_seen,
+)
+
 if TYPE_CHECKING:
     from scout.db import Database
 
@@ -275,36 +281,46 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
             comp["pipeline_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
 
-        # Check the DERIVED first-seen substrate (chain signals).
-        # Option F: consumers must stop depending on unbounded
-        # signal_events history, so retention stops silently moving
-        # the derived minimum forward.
-        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
-        if len(symbol) >= 4:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                          OR LOWER(token_id) LIKE LOWER(? || '%')
-                          OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, symbol, coin_id, first_gainer_at_str),
-            )
-        else:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND datetime(first_seen_at) < datetime(?, '+5 minutes')""",
-                (coin_id, symbol, first_gainer_at_str),
-            )
-        sig_row = await cursor.fetchone()
-        if sig_row and sig_row[0]:
-            sig_at = _parse_dt(sig_row[0])
+        # Chain-signal detection, resolved by ASSET IDENTITY (ruling C).
+        #
+        # Option F moved this off unbounded signal_events history; ruling C
+        # stops prefix similarity deciding who it belongs to. Prefix matching
+        # survives only as a diagnostic -- `re` must never again be credited as
+        # `real-world-apparel` merely because it is a prefix and older.
+        #
+        # Symbol length no longer branches the truth path. That split was itself
+        # a defect: it derived first-seen from two different historical
+        # boundaries depending on how many characters a ticker had.
+        res = await resolve_chain_first_seen(
+            db._conn,
+            coin_id,
+            symbol,
+            first_gainer_at_str,
+            prefix_diagnostic=len(symbol) >= 4,
+        )
+        comp["chains_identity_semantics"] = CANONICAL_SEMANTICS
+        comp["chains_identity_tier"] = res.tier
+        if res.detected:
+            sig_at = _parse_dt(res.first_seen_at)
             lead = (first_gainer_at - sig_at).total_seconds() / 60.0
             if lead < 0:
                 lead = 0  # detected after, but within tolerance window
             comp["detected_by_chains"] = 1
             comp["chains_lead_minutes"] = round(lead, 1)
             comp["is_gap"] = 0
+        if res.prefix_would_have_credited_more:
+            # The fabricated lead the old semantics handed out, measured rather
+            # than asserted. Not written to any truth column.
+            logger.info(
+                "chain_identity_prefix_discarded",
+                surface="gainers",
+                coin_id=coin_id,
+                symbol=symbol,
+                resolved_tier=res.tier,
+                resolved_token=res.token_id,
+                discarded_prefix_token=res.prefix_token_id,
+                discarded_prefix_first_seen=res.prefix_first_seen_at,
+            )
 
         # Check volume_spikes table
         cursor = await db._conn.execute(
@@ -416,9 +432,10 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 detected_by_slow_burn, slow_burn_lead_minutes,
                 detected_by_velocity, velocity_lead_minutes,
                 is_gap, detected_price, peak_price, peak_gain_pct,
-                entry_basis_price, entry_basis_at)
+                entry_basis_price, entry_basis_at,
+                chains_identity_semantics, chains_identity_tier)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -447,6 +464,11 @@ async def compare_gainers_with_signals(db: "Database") -> list[dict]:
                 comp["peak_gain_pct"],
                 comp["entry_basis_price"],
                 comp["entry_basis_at"],
+                # Ruling C: which semantics produced the chain columns on THIS
+                # row. Historical rows carry `legacy_prefix` and are never
+                # recomputed in place.
+                comp.get("chains_identity_semantics"),
+                comp.get("chains_identity_tier"),
             ),
         )
     await db._conn.commit()
@@ -484,21 +506,150 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
         raise RuntimeError("Database not initialized.")
 
     cursor = await db._conn.execute(
-        """SELECT coin_id, symbol, name, price_change_24h,
+        """SELECT gainers_comparisons.coin_id, gainers_comparisons.symbol, name, price_change_24h,
                   appeared_on_gainers_at,
                   detected_by_narrative, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_lead_minutes,
                   detected_by_chains, chains_lead_minutes,
+                  -- Ruling C: consumers MUST be able to tell prefix-derived
+                  -- rows from identity-derived ones. Without these the
+                  -- columns are write-only and the conviction gate in
+                  -- scout/conviction/cross_surface.py cannot see them.
+                  chains_identity_semantics, chains_identity_tier,
                   detected_by_spikes, spikes_lead_minutes,
                   detected_by_acceleration, acceleration_lead_minutes,
                   detected_by_momentum, momentum_lead_minutes,
                   detected_by_slow_burn, slow_burn_lead_minutes,
                   detected_by_velocity, velocity_lead_minutes,
-                  is_gap, detected_price, peak_price, peak_gain_pct, created_at
+                  is_gap, detected_price, peak_price, peak_gain_pct, created_at,
+                  -- Ruling C: the recomputed provenance overlay for LEGACY rows.
+                  -- Joined on coin_id, not row id: the tracker deletes and
+                  -- re-inserts by coin_id on every recompute, so ids do not
+                  -- survive. Only legacy rows consult it; canonical_v1 rows
+                  -- carry their own tier.
+                  (SELECT cir.evidence_status
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'gainers_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
+                      AND cir.coin_id = gainers_comparisons.coin_id
+                      AND cir.historical_anchor = gainers_comparisons.appeared_on_gainers_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(gainers_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
+                    LIMIT 1) AS chains_recompute_status,
+                  -- The VERIFIED lead, not the legacy prefix-derived one.
+                  -- Scoring chains_lead_minutes after verifying canonical_lead
+                  -- would decouple the claim from the value.
+                  (SELECT cir.canonical_lead
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'gainers_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
+                      AND cir.coin_id = gainers_comparisons.coin_id
+                      AND cir.historical_anchor = gainers_comparisons.appeared_on_gainers_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(gainers_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
+                    LIMIT 1) AS chains_canonical_lead
            FROM gainers_comparisons
            ORDER BY appeared_on_gainers_at DESC
            LIMIT ?""",
-        (limit,),
+        (RECOMPUTE_SEMANTICS, RECOMPUTE_SEMANTICS, limit),
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
@@ -551,12 +702,43 @@ async def get_gainers_stats(db: "Database") -> dict:
 
     hit_rate = round((caught / total * 100) if total > 0 else 0, 1)
 
+    # SPLIT, do not exclude.
+    #
+    # `avg_lead_minutes` UNIONs eight surfaces into one scalar and
+    # `hit_rate_pct` counts any non-gap row, so both currently mix
+    # prefix-derived chains credit with identity-derived credit. Dropping the
+    # legacy rows would move the headline for a compositional reason no reader
+    # can see -- and with CG ingest quota-stalled there are ~0 canonical rows
+    # yet, so the average would silently become a seven-surface number with
+    # nothing saying so. That is the "every headline needs its selection axis"
+    # failure, not a fix for it.
+    #
+    # So the aggregates stay as-recorded and the MIX becomes visible instead.
+    # Note the deliberate asymmetry with scout/conviction/cross_surface.py,
+    # which DOES refuse prefix-derived chains credit: conviction is a
+    # forward-looking score being computed now, while these are the historical
+    # record of what the system actually did. Rewriting the record is the
+    # evidence destruction the ruling forbids; scoring off unverified
+    # provenance is what it forbids. Both sites are governed by that one
+    # distinction -- if it ever stops holding, change them together.
+    cursor = await db._conn.execute("""
+        SELECT
+            SUM(chains_identity_semantics = 'canonical_v1'),
+            SUM(chains_identity_semantics = 'legacy_prefix'),
+            SUM(chains_identity_semantics IS NULL)
+        FROM gainers_comparisons WHERE detected_by_chains = 1""")
+    mix = await cursor.fetchone() or (0, 0, 0)
+
     return {
         "total_tracked": total,
         "caught": caught,
         "missed": missed,
         "hit_rate_pct": hit_rate,
         "avg_lead_minutes": avg_lead,
+        # Provenance mix of the chains contribution to the two figures above.
+        "n_chains_canonical": mix[0] or 0,
+        "n_chains_legacy_prefix": mix[1] or 0,
+        "n_chains_unstamped": mix[2] or 0,
     }
 
 

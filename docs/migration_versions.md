@@ -80,6 +80,9 @@ number to appear in the table below.
 | 20260821 | cg_credit_ledger_v1 | durable CoinGecko monthly-credit accounting (attempts vs billable credits, per envelope); additive, no backfill |
 | 20260822 | signal_events_indexes_v1 | drop `idx_sig_events_type` (466 MB dead index), add `signal_events(created_at)`; index-only, no VACUUM bundled |
 | 20260823 | signal_first_seen_v1 | derived first-seen substrate (`signal_first_seen`) + grouped backfill, so consumers stop deriving `MIN(created_at)` from `signal_events` and are decoupled from its retention (ruling F) |
+| 20260824 | chain_identity_semantics_v1 | `chains_identity_semantics` + `chains_identity_tier` on the three comparison tables; stamps existing rows `legacy_prefix` as a MARKER ONLY, never recomputing their values. The `*_legacy_prefix_v1` archives are taken by an UNGATED startup step, deliberately NOT by this migration — a one-shot migration would skip them on any DB that already applied it (ruling C) |
+| 20260825 | chain_identity_recompute_v1 | versioned derived store for RECOMPUTED legacy chain provenance; separate table, never an UPDATE of the archived rows (ruling C) |
+| 20260826 | chain_identity_recompute_pk_v2 | Rebuilds `chain_identity_recompute_v1` with `semantics_version` in the PRIMARY KEY. The v1 key was `(source_table, source_row_id)` with the version as a plain column, so under `INSERT OR REPLACE` the "versioned derived store" could hold exactly ONE version -- a replay under a bumped `RECOMPUTE_SEMANTICS` overwrote the earlier verdict in place. That is the destroys-the-previous-evidence shape ruling C forbids, deferred from the archive to the overlay. Detects the old shape from the stored DDL rather than a marker, so a database that applied the earlier build is upgraded and a fresh install is left alone. |
 
 ## Notes / gaps
 

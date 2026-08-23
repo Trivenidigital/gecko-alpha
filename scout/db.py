@@ -12,6 +12,21 @@ from typing import TYPE_CHECKING
 import aiosqlite
 import structlog
 
+from scout.identity import LEGACY_SEMANTICS
+from scout.identity_recompute import CREDIT_BEARING, RECOMPUTE_SEMANTICS
+
+#: A surface must hold at least this many credit-bearing rows before its
+#: recovery rate is judged; below it, one row moves the rate enough to be
+#: noise.
+_COLLAPSE_MIN_POPULATION = 20
+#: Fraction of the high-water rate below which a surface is "collapsed".
+#: Deliberately generous -- this is a cliff detector, not a drift detector,
+#: and an alarm that fires on drift is one that gets muted.
+_COLLAPSE_FRACTION = 0.5
+#: Write timeout for the ratchet mark. Short on purpose -- see
+#: `_record_coverage_baseline`.
+_BASELINE_WRITE_TIMEOUT_MS = 2000
+
 _db_log = structlog.get_logger(__name__)
 
 
@@ -353,6 +368,32 @@ class Database:
             # Retention option F: derived first-seen substrate, so
             # consumers stop depending on unbounded signal_events history.
             await self._migrate_signal_first_seen_v1()
+            # Ruling C: identity-semantics version marker on the comparison
+            # tables. Additive; stamps existing rows `legacy_prefix` WITHOUT
+            # recomputing their values.
+            await self._migrate_chain_identity_semantics_v1()
+            # Not gated by the migration marker: rows written by OLD code
+            # after the migration ran would otherwise keep NULL forever.
+            # Ungated by the migration marker: the migration early-returns
+            # forever once applied, and this is the IRREVERSIBLE half.
+            await self._migrate_chain_identity_recompute_v1()
+            await self._migrate_chain_identity_recompute_pk_v2()
+            # Ungated, like the archive step below and for the same reason: a
+            # migration early-returns forever once its marker exists, so
+            # putting this inside one meant every database that had already
+            # applied it never got the table. That is the gating mistake this
+            # tranche opened with, and I repeated it here.
+            await self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS recompute_coverage_baseline (
+                    source_table  TEXT PRIMARY KEY,
+                    best_rate     REAL NOT NULL,
+                    population    INTEGER NOT NULL,
+                    recorded_at   TEXT NOT NULL
+                )
+            """)
+            await self._conn.commit()
+            await self.archive_legacy_prefix_comparisons()
+            await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -7752,6 +7793,1019 @@ class Database:
             (token_id, created_at, now),
         )
 
+    async def _migrate_chain_identity_recompute_pk_v2(self) -> None:
+        """Put `semantics_version` in the overlay's PRIMARY KEY.
+
+        The v1 table stored the version as a plain column and keyed on
+        (source_table, source_row_id). With `INSERT OR REPLACE` that made the
+        "versioned derived store" able to hold exactly ONE version: replaying
+        under a bumped `RECOMPUTE_SEMANTICS` overwrote the v1 verdict in place
+        and the earlier evidence was simply gone.
+
+        That is the shape ruling C forbids -- "only as a distinct derived
+        dataset with explicit semantic version, not an UPDATE that destroys the
+        previous evidence" -- deferred one level. The archive/overlay split was
+        built so the archive would never be rewritten, and it is not; the
+        overlay then reproduced the same defect against itself.
+
+        Latent when found (one version exists, so nothing had been destroyed),
+        and it goes live the first time anyone bumps the constant -- which is
+        the normal way this table is meant to evolve. Cheapest to fix now, for
+        exactly that reason.
+
+        Rebuild rather than ALTER: SQLite cannot add a column to a PRIMARY KEY
+        in place.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_pk_v2"
+        schema_version = 20260826
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                return
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='chain_identity_recompute_v1'"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return
+        # Already the v2 shape (a fresh install creates it directly). Detected
+        # from the stored DDL rather than from a marker, so a database that
+        # applied the earlier build is upgraded and a fresh one is left alone.
+        ddl = " ".join((row[0] or "").split())
+        if "semantics_version)" in ddl:
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.commit()
+            return
+
+        try:
+            # BEGIN EXCLUSIVE so the rebuild is actually atomic. DDL runs in
+            # AUTOCOMMIT under this connection mode -- the same property behind
+            # the archive-commit finding -- so without it the scratch CREATE is
+            # already durable and `rollback()` cannot undo it. Any failure
+            # (exception, OOM, SIGTERM, a deploy restart while it copies
+            # production's 2,891 rows) then left an orphan
+            # `..._pk2` table, and EVERY subsequent boot raised
+            # "table already exists" out of `initialize()`, which no caller
+            # catches, until someone dropped it by hand.
+            #
+            # That is the concurrent-startup crash this tranche opened with,
+            # reintroduced in its newest migration -- and only on the path that
+            # runs against databases carrying real data, since a fresh install
+            # takes the early return above.
+            await conn.execute("BEGIN EXCLUSIVE")
+            # And drop first, so a database already wedged by an earlier failed
+            # attempt recovers on the next boot instead of needing hands.
+            await conn.execute("DROP TABLE IF EXISTS chain_identity_recompute_v1_pk2")
+            await conn.execute("""
+                CREATE TABLE chain_identity_recompute_v1_pk2 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO chain_identity_recompute_v1_pk2 "
+                "SELECT * FROM chain_identity_recompute_v1"
+            )
+            await conn.execute("DROP TABLE chain_identity_recompute_v1")
+            await conn.execute(
+                "ALTER TABLE chain_identity_recompute_v1_pk2 "
+                "RENAME TO chain_identity_recompute_v1"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, datetime('now'), ?)",
+                (
+                    schema_version,
+                    "chain_identity_recompute PK includes semantics_version",
+                ),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_pk_v2_migration_complete")
+        except Exception:
+            await conn.rollback()
+            _log.exception("chain_identity_recompute_pk_v2_migration_rollback")
+            raise
+
+    async def _migrate_chain_identity_recompute_v1(self) -> None:
+        """Versioned derived store for recomputed legacy provenance (ruling C).
+
+        SEPARATE from the archived legacy rows on purpose. The ruling allows
+        historical recomputation "only as a distinct derived dataset with
+        explicit semantic version -- not an UPDATE that destroys the previous
+        evidence", so this table carries the recomputed answer beside the
+        archive rather than rewriting it.
+
+        Keyed on (source_table, source_row_id, semantics_version) against the
+        IMMUTABLE archive, so a rerun of the SAME version REPLACEs in place and
+        cannot double-count, while a DIFFERENT version lands beside the old
+        verdict instead of destroying it. See
+        `_migrate_chain_identity_recompute_pk_v2` for why the version had to be
+        in the key rather than merely stored on the row.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_v1"
+        schema_version = 20260825
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_recompute_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chain_identity_recompute_v1 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    -- semantics_version IS PART OF THE KEY. Without it the
+                    -- "versioned derived store" could hold exactly one
+                    -- version: `INSERT OR REPLACE` keyed on
+                    -- (source_table, source_row_id) meant a v2 replay
+                    -- OVERWROTE the v1 verdict in place, destroying the
+                    -- evidence it was supposed to sit beside. That is the
+                    -- shape ruling C forbids -- "not an UPDATE that destroys
+                    -- the previous evidence" -- deferred one level, from the
+                    -- archive to the overlay. The archive is genuinely
+                    -- immutable; the derived store was not versioned in the
+                    -- only sense that matters.
+                    --
+                    -- Re-running the SAME version still replaces, so the
+                    -- backfill stays idempotent.
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            # The READ path's key. The trackers correlate on
+            # (source_table, coin_id, historical_anchor) and the implicit
+            # primary-key index is on (source_table, source_row_id), so
+            # without this every dashboard row scanned all overlay rows for
+            # its surface and built a temp b-tree for the ORDER BY -- twice,
+            # once per scalar subquery. Measured by review as
+            # "SEARCH cir USING INDEX ... (source_table=?)
+            #  + USE TEMP B-TREE FOR ORDER BY".
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing = await cur.fetchone()
+            if existing is not None and existing["description"] != migration_name:
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_recompute_v1: "
+                    f"version={schema_version} description={existing['description']}"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_v1_migration_complete")
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_recompute_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def archive_legacy_prefix_comparisons(self) -> dict[str, int]:
+        """Snapshot the pre-cutover comparison rows. NOT gated by any marker.
+
+        The semantics marker alone does not preserve this evidence, because the
+        trackers do not UPDATE these rows -- all three
+        `DELETE FROM <table> WHERE coin_id = ?` and re-INSERT on every
+        recompute. After the semantics change that recompute writes canonical
+        values over a legacy row and the original is gone.
+
+        This lives OUTSIDE `_migrate_chain_identity_semantics_v1` on purpose,
+        and that is the second half of a lesson I only half-learned. The
+        migration early-returns forever once its `paper_migrations` marker
+        exists -- so retrofitting the archive INSIDE it meant any database that
+        had already run the earlier build skipped the archive silently, under a
+        log line reading `..._skip_already_applied`. I had already fixed exactly
+        that gating for the stamping step and left it in place for archiving,
+        which is the IRREVERSIBLE half.
+
+        Self-guarding via `sqlite_master`, so running it every startup is free
+        once the archives exist.
+
+        SCOPE, stated honestly: this is the PRE-CUTOVER SNAPSHOT, not a promise
+        that every `legacy_prefix` row ever written has an archived twin. Rows
+        created later by rolled-back old code are stamped legacy by
+        `stamp_unmarked_chain_semantics` but arrive after this snapshot was
+        taken. `CREATE TABLE ... AS SELECT *` also copies values only -- no
+        primary key, constraints or indexes -- which is right for a forensic
+        snapshot but means `id` is not a key here.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                (table, archive),
+            )
+            names = {r[0] for r in await cur.fetchall()}
+            if table not in names or archive in names:
+                continue
+            # IF NOT EXISTS is load-bearing, not decoration. The
+            # `sqlite_master` check above and this CREATE are separated by an
+            # await, and on the FIRST boot after deploy several processes call
+            # initialize() on this database at once -- pipeline, dashboard and
+            # a handful of cron entry points. Both can observe "archive absent"
+            # and both proceed; without this the loser raises
+            # "table ... already exists" straight out of initialize(), which no
+            # caller catches. Concurrent startup migrations have taken this box
+            # down before.
+            await self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {archive} AS SELECT * FROM {table}"
+            )
+            cur = await self._conn.execute(f"SELECT COUNT(*) FROM {archive}")
+            out[archive] = (await cur.fetchone())[0]
+        # UNCONDITIONAL. The `if out:` guard was safe only by accident of the
+        # connection mode: under legacy `isolation_level=''` a bare SELECT
+        # opens no transaction, so the nothing-to-do path left nothing
+        # dangling. Under `autocommit=False` (PEP 249 strict, available since
+        # 3.12; this repo runs 3.14) the same guard SELECT DOES open one.
+        #
+        # The failure that produces is quieter than the sibling's "cannot
+        # start a transaction within a transaction": a dangling READ
+        # transaction on the shared connection pins the WAL snapshot, so the
+        # hourly `wal_checkpoint(TRUNCATE)` returns BUSY and reclaims zero
+        # pages -- measured -- and it surfaces as unexplained WAL growth
+        # nowhere near this function, on a box already at 90% disk.
+        await self._conn.commit()
+        return out
+
+    #: Surfaces whose pre-cutover chains credit depends on the recompute
+    #: overlay, paired with the anchor column the overlay is correlated on.
+    _RECOMPUTE_SURFACES = (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    )
+
+    async def _classify_coverage_mark(
+        self, source_table: str, row, pop: int, rate: float
+    ) -> tuple[str, float | None, dict | None]:
+        """Decide what to do with a stored high-water mark. Three outcomes.
+
+        Exists so the caller cannot forget an arm. The clear is best-effort, so
+        "this mark should go" and "this mark is gone" are DIFFERENT states, and
+        collapsing them is what produced three separate defects at this seam.
+
+          ``rearm``                   -- no usable mark; record today's rate.
+          ``incomparable_unresolved`` -- it should go, but the DELETE failed and
+                                         it is still there. Judge nothing.
+          ``raise_mark``              -- comparable, and today IMPROVES it; the
+                                         ratchet rises.
+          ``compare``                 -- comparable, today does not improve it;
+                                         run the collapse check.
+
+        FOUR arms, not three, and the missing one cost a blocking round. The
+        boolean chain this replaced branched on TWO axes -- is the mark
+        comparable, and does today's rate improve it -- while the first version
+        of this taxonomy named only the first. The improvement axis then had no
+        arm to be unhandled in, so it vanished silently and every arm was still
+        "handled": the mark froze at the FIRST observation and could never rise.
+
+        In production that is worse than a mis-calibration. The probe is hourly
+        and the backfill is a manual post-deploy step, so the first observation
+        lands before any credit exists -- a mark of 0.0, which makes
+        ``rate < best * FRACTION`` unsatisfiable for every rate. Collapse
+        detection would have been off on every surface, permanently, from the
+        first pass after deploy.
+
+        The lesson generalises past this function: making an unhandled arm
+        unrepresentable only works for the axis the taxonomy names. When a
+        refactor replaces a boolean chain with a taxonomy, the check is not
+        whether every arm is handled -- it is whether every BEHAVIOUR of the
+        old code maps onto an arm.
+
+        The incomparability test is a TRANSITION: the recorded population is
+        below twice the judging floor AND today's is more than double it. The
+        first half is the comparability claim -- a handful of rows is not
+        comparable to a thousand -- and the second is what stops it being a
+        standing state that re-arms every pass.
+        """
+        if row is None:
+            return "rearm", None, None
+
+        best, recorded_pop = row[0], row[1]
+        incomparable = (
+            recorded_pop < _COLLAPSE_MIN_POPULATION * 2 and pop > recorded_pop * 2
+        )
+        if not incomparable:
+            # The second axis, explicit. `rate > best` is the ratchet rising,
+            # which is the whole mechanism -- calibrating on the BEST
+            # observation, so ordinary attrition rides underneath it.
+            if rate > best:
+                return "raise_mark", best, None
+            return "compare", best, None
+
+        if not await self._clear_coverage_baseline(source_table):
+            return "incomparable_unresolved", best, None
+
+        # The discard facts go BACK to the caller rather than being logged
+        # here, because the field an operator actually needs -- the rate being
+        # ARMED in this one's place -- is not knowable yet. The clear precedes
+        # the write, and if that write is starved by its 2s give-up the table
+        # ends up with NO mark at all. Logging the observed rate here would
+        # name a mark that does not exist, which is the trap `mark_written`
+        # exists to avoid one function over.
+        return (
+            "rearm",
+            None,
+            {
+                "discarded_rate": round(best, 4),
+                "discarded_population": recorded_pop,
+                "current_population": pop,
+            },
+        )
+
+    async def _clear_coverage_baseline(self, source_table: str) -> bool:
+        """Drop a mark deemed incomparable, on its own connection.
+
+        The only sanctioned way a high-water mark falls. Best-effort for the
+        same reason the write is: a failure here leaves the old mark in place
+        for one more pass, which is the safe direction.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "DELETE FROM recompute_coverage_baseline WHERE source_table = ?",
+                    (source_table,),
+                )
+                await conn.commit()
+                return True
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_clear_failed", source_table=source_table
+            )
+            return False
+
+    async def _record_coverage_baseline(
+        self, source_table: str, rate: float, population: int
+    ) -> float | None:
+        """Write the ratchet mark on its OWN connection, never the shared one.
+
+        This was the probe's first write, and putting it on `self._conn` made
+        the probe a laundering hazard: `commit()` on a shared connection
+        commits EVERYTHING pending, including a sibling's half-finished unit.
+        `scout/chains/tracker.py` opens a bare `BEGIN` on this connection and
+        calls `rollback()` on failure -- by its own comment, several times a
+        day in production -- so an hourly probe committing in between makes the
+        sibling's rollback a no-op and its partial row durable.
+
+        `self._txn_lock` does NOT fix this. It serialises the writers that take
+        it, and chains/tracker does not take it: it BEGINs directly. A lock
+        only the polite callers hold cannot stop the impolite one, so the write
+        has to leave the connection entirely.
+
+        Best-effort by design. A failure here loses one observation of a mark
+        the next hourly pass re-records, and it must never take the probe --
+        or the maintenance pass around it -- down with it.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                # SHORT timeout, deliberately unlike the pipeline's 90s. Moving
+                # this write off the shared connection means it now CONTENDS
+                # for the write lock instead of riding along on it -- and a
+                # sibling holding an open transaction would otherwise stall the
+                # hourly maintenance pass for a minute and a half to record a
+                # number the next pass will record anyway. Give up fast; the
+                # ratchet is best-effort and only ever moves upward.
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "INSERT INTO recompute_coverage_baseline "
+                    "(source_table, best_rate, population, recorded_at) "
+                    "VALUES (?, ?, ?, datetime('now')) "
+                    # MAX at the WRITE, so "never lowered" is enforced where
+                    # the docstring says it lives rather than by a caller
+                    # guard. It was enforced only by the read
+                    # (`best is None or rate > best`), so ANY path that made
+                    # the read return None -- the population guard did -- let
+                    # an unconditional upsert rewrite a durable high mark with
+                    # today's rate. Same collapsed recovery, one pass apart:
+                    # the first fires, the second is silent and STAYS silent,
+                    # because the baseline it would fire against has been
+                    # overwritten with the collapsed value.
+                    #
+                    # A deliberate re-arm is a DELETE (see the guard), not a
+                    # side effect of an upsert. That keeps the downgrade a
+                    # decision someone made.
+                    "ON CONFLICT(source_table) DO UPDATE SET "
+                    "best_rate=MAX(recompute_coverage_baseline.best_rate, "
+                    "              excluded.best_rate), "
+                    "population=excluded.population, "
+                    "recorded_at=excluded.recorded_at",
+                    (source_table, rate, population),
+                )
+                await conn.commit()
+                # Read BACK, rather than returning True and letting the caller
+                # assume the stored value equals `rate`. With MAX at the write
+                # that assumption is false whenever the clear failed: the
+                # upsert keeps the OLD value while the caller reports today's,
+                # so the payload claims a mark that was never stored -- the
+                # exact defect `mark_written` was added to close, reintroduced
+                # by the fix for a different one. The checker reads the table,
+                # so probe and checker would disagree about the same surface.
+                cur = await conn.execute(
+                    "SELECT best_rate FROM recompute_coverage_baseline "
+                    "WHERE source_table = ?",
+                    (source_table,),
+                )
+                stored = await cur.fetchone()
+                return stored[0] if stored else None
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_write_failed",
+                source_table=source_table,
+                rate=rate,
+            )
+            return None
+
+    async def chain_identity_recompute_coverage_probe(
+        self, *, gate_minutes: float = 1440.0
+    ) -> dict[str, object]:
+        """Report whether the legacy-provenance overlay is actually WORKING.
+
+        `chain_identity_recompute_v1` has no runtime writer -- it is filled by
+        an offline ops step. So a deploy that ships the code and skips the
+        backfill leaves the overlay empty, and an empty overlay is not a
+        neutral state: every credit-bearing `legacy_prefix` row fails the trust
+        check and loses its chains credit. That is the naive cutover this
+        overlay exists to prevent (tier_high 341 -> 187), arriving quietly,
+        under green logs, looking exactly like a real decline in detection.
+
+        The escalation is `credit_recovered == 0` against a non-empty
+        population, NOT `overlay_rows == 0`. Row presence is the wrong
+        question, and asking it was this probe's original defect: an overlay
+        can be fully populated and still recover nothing, because only
+        `verified_canonical` earns credit. That is not a corner case -- it is
+        the likeliest real outcome, since the reconstruction depends on
+        preserved `/root` snapshots that are being deleted over time. Rerun the
+        backfill once they are gone and roughly four rows in five land
+        `indeterminate_history`: overlay full, credit zero, tier_high collapsed.
+        Counting rows would have printed a green line through all of it.
+
+        Coverage is correlated the way the READERS correlate it -- on
+        `(source_table, coin_id, historical_anchor)`. Not on `source_row_id`:
+        the trackers DELETE and re-insert by coin_id on every recompute, so ids
+        do not survive, and the archives are `CREATE TABLE ... AS SELECT`
+        copies with no primary key, where `id` is not a key at all. A probe
+        keyed on the row id measures a wire nothing reads.
+
+        `gate_minutes` is re-checked against each row's `canonical_lead`
+        rather than trusting `evidence_status` alone. That status is a FROZEN
+        decision about the gate as it stood at backfill time; the reader
+        re-tests the lead against `CONVICTION_EARLY_LEAD_MINUTES` at scoring
+        time. Counting statuses alone measures TRUST, not credit, and the two
+        coincide only while the gate has not moved. Raise the setting and
+        every reader silently refuses rows the probe still reports as
+        recovered -- measured: readers grant 0 of 10 while the probe reports
+        10. Pass the setting the readers use.
+
+        Partial coverage is the expected steady state -- history genuinely runs
+        out for older anchors -- and must never page, or the alarm gets muted
+        before the day it matters.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM chain_identity_recompute_v1"
+        )
+        overlay_rows = (await cur.fetchone())[0]
+
+        credit_bearing = 0
+        uncovered = 0
+        credit_recovered = 0
+        per_surface: dict[str, dict[str, int]] = {}
+
+        for table, anchor in self._RECOMPUTE_SURFACES:
+            # COALESCE, matching what the readers do: `cross_surface` trusts
+            # ONLY 'canonical_v1', so a NULL semantics row -- written by
+            # rolled-back old code -- is untrusted there. Filtering on
+            # `= 'legacy_prefix'` made those rows invisible here while they
+            # silently lost credit in the reader.
+            untrusted = (
+                "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
+                "!= 'canonical_v1'"
+            )
+            # CURRENT version only. The version is in the primary key now, so
+            # the overlay holds every generation at once -- and an unfiltered
+            # read would let a superseded, more generous verdict keep counting
+            # as recovered after a version bump tightened the semantics.
+            matched = (
+                "SELECT 1 FROM chain_identity_recompute_v1 AS r "
+                "  WHERE r.source_table = ? AND r.coin_id = c.coin_id "
+                "  AND r.semantics_version = ? "
+                f"  AND r.historical_anchor = c.{anchor}"
+            )
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1"
+            )
+            pop = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND NOT EXISTS ({matched})",
+                (table, RECOMPUTE_SEMANTICS),
+            )
+            unc = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND EXISTS ({matched} AND r.evidence_status IN "
+                f"({','.join('?' * len(CREDIT_BEARING))}) "
+                "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
+                (table, RECOMPUTE_SEMANTICS, *sorted(CREDIT_BEARING), gate_minutes),
+            )
+            rec = (await cur.fetchone())[0]
+
+            # Rows with no archived twin. `archive_legacy_prefix_comparisons`
+            # self-guards on sqlite_master and never re-runs once the archives
+            # exist, while `stamp_unmarked_chain_semantics` runs every startup
+            # -- so a row written by rolled-back old code AFTER the archives
+            # were taken enters this population permanently and can never be
+            # covered, because the backfill only reads archives. Meanwhile the
+            # archived rows drain out as the trackers re-insert them
+            # `canonical_v1`. In the limit the population is entirely
+            # unarchivable: credit_bearing > 0, credit_recovered == 0, an
+            # hourly page forever, and `--apply` cannot clear it.
+            #
+            # Counted separately so the alert says "0 recovered of 7, 7
+            # unarchivable" rather than presenting an unfixable page as though
+            # re-running the backfill would help. That distinction is the
+            # difference between an alarm an operator acts on and one they mute.
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (archive,),
+            )
+            # Archive ABSENT means no row has an archived twin -- every one
+            # of them is unarchivable, not zero of them. The checker learned
+            # this and the probe did not, so on the same database the
+            # runbook's own decision rule ("credit_recovered 0 and
+            # unarchivable == population means design limit, not incident")
+            # returned INCIDENT from journald and DESIGN LIMIT from Telegram.
+            unarchivable = pop
+            if await cur.fetchone():
+                cur = await self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} AS c "
+                    f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                    f"AND NOT EXISTS (SELECT 1 FROM {archive} AS a "
+                    f"  WHERE a.coin_id = c.coin_id "
+                    f"  AND a.{anchor} = c.{anchor})"
+                )
+                unarchivable = (await cur.fetchone())[0]
+
+            credit_bearing += pop
+            uncovered += unc
+            credit_recovered += rec
+            per_surface[table] = {
+                "credit_bearing": pop,
+                "uncovered": unc,
+                "credit_recovered": rec,
+                "unarchivable": unarchivable,
+            }
+
+        # COLLAPSE detection, on top of the zero case.
+        #
+        # `dark` fires only at EXACTLY zero recovery, and that misses the
+        # degradation this probe's own docstring predicts: delete the /root
+        # snapshots, re-run the backfill, and roughly four rows in five land
+        # indeterminate. Four in five is 20% -- not zero -- so a fall from the
+        # measured 53% baseline to 5% is silent on every layer while 95% of
+        # readers go blind.
+        #
+        # History running out is GRADUAL; a snapshot-less or failed backfill is
+        # a CLIFF. Only the second should page, so this compares against a
+        # high-water RATE per surface rather than a fixed threshold: the mark
+        # self-calibrates on the first healthy observation and never lowers
+        # itself, so ordinary attrition rides underneath it and a collapse
+        # crosses it. Reset by deleting the surface's row.
+        collapsed: list[str] = []
+        for table, v in per_surface.items():
+            pop, rec = v["credit_bearing"], v["credit_recovered"]
+            # Computed BEFORE the floor check: the branch below reports it,
+            # and referencing it there used the PREVIOUS surface's value.
+            rate = (rec / pop) if pop else None
+            if pop < _COLLAPSE_MIN_POPULATION:
+                # Say so, rather than omitting the keys. Production's trending
+                # surface drains as coins re-appear and are rewritten
+                # canonical_v1; when it crosses the floor it would simply stop
+                # reporting a rate, and an operator seeing two surfaces with
+                # rates and one without cannot tell "too small to judge" from
+                # "something went wrong".
+                v["rate"] = round(rate, 4) if rate is not None else None
+                v["best_rate"] = None
+                v["rate_judged"] = False
+                continue
+            v["rate_judged"] = True
+            cur = await self._conn.execute(
+                "SELECT best_rate, population FROM recompute_coverage_baseline "
+                "WHERE source_table = ?",
+                (table,),
+            )
+            row = await cur.fetchone()
+
+            # THREE outcomes, named, and every one handled. This was a chain of
+            # `if`s over a `best` variable that the clear mutated -- and the
+            # clear is BEST-EFFORT, two outcomes, with the surrounding code
+            # written for one. Three separate defects came out of that single
+            # shape: the payload claiming a mark the write never stored; the
+            # probe forgetting a mark the starved clear left behind; and then
+            # the starved case judging AGAINST the very mark the guard had just
+            # declared incomparable -- inverting the guard's purpose and turning
+            # a lock race into an operator page.
+            #
+            # Each fix corrected the arm it was looking at and left the other,
+            # which is why the count kept rising by one. Naming the decision
+            # makes the unhandled arm unrepresentable instead of merely
+            # currently-handled.
+            decision, best, discarded = await self._classify_coverage_mark(
+                table, row, pop, rate
+            )
+            v["rate"] = round(rate, 4)
+
+            if decision == "incomparable_unresolved":
+                # Incomparable AND still present: the DELETE lost a lock race.
+                # Do NOT judge against it -- that is precisely the false page
+                # the guard exists to prevent, and the read-only checker
+                # already handles this case by skipping. Say the pass was
+                # skipped rather than leaving it silently unjudged.
+                v["best_rate"] = round(row[0], 4)
+                v["mark_written"] = False
+                v["comparison_skipped"] = "incomparable_mark_not_cleared"
+                continue
+
+            if decision in ("rearm", "raise_mark"):
+                stored = await self._record_coverage_baseline(table, rate, pop)
+                v["mark_written"] = stored is not None
+                v["best_rate"] = (
+                    round(stored, 4)
+                    if stored is not None
+                    else (round(best, 4) if best is not None else None)
+                )
+                if discarded is not None:
+                    # ANNOUNCE the disarm, AFTER the write, carrying what
+                    # actually replaced the discarded mark. This line used to
+                    # name every field except the one the ratchet is about --
+                    # an operator could see what was thrown away but not what
+                    # took its place, and had to join to another log line to
+                    # judge whether the discard was reasonable. `armed_rate`
+                    # is None when the write was starved, which is the honest
+                    # answer: the table has no mark at all.
+                    import structlog
+
+                    structlog.get_logger().warning(
+                        "recompute_coverage_baseline_cleared",
+                        source_table=table,
+                        armed_rate=round(stored, 4) if stored is not None else None,
+                        **discarded,
+                    )
+            elif decision == "compare":
+                v["mark_written"] = False
+                v["best_rate"] = round(best, 4)
+                if rate < best * _COLLAPSE_FRACTION:
+                    collapsed.append(table)
+            else:
+                # "Unrepresentable" was overclaimed: a bare `else` put any
+                # future decision into the JUDGING arm, where it would crash on
+                # `round(None, 4)` -- and that crash is swallowed by the
+                # maintenance pass, so the coverage probe would silently stop
+                # running. That is the deploy-without-activate class this
+                # component exists to prevent. Fail loudly at the edit instead.
+                raise AssertionError(f"unhandled coverage-mark decision: {decision!r}")
+
+        # PER SURFACE, not global. The comment here used to claim a global
+        # predicate covered "populated for one surface only"; it did not, and
+        # per-surface commits made that reachable. A replay that fails partway
+        # leaves earlier surfaces durable, so gainers alone satisfies a global
+        # `credit_recovered == 0` while losers and trending sit fully stripped
+        # -- measured: recovered 5 of 15, two surfaces at zero, alarm silent.
+        # The reporting was already per-surface while the predicate was not,
+        # so the watchdog printed `losers=0/5 trending=0/5` in its own alert
+        # text and exited 0.
+        #
+        # A surface with a population that recovered NOTHING is the alarm,
+        # whatever the other surfaces did. Partial coverage within a surface
+        # still must not page -- history genuinely runs out.
+        dark = sorted(
+            t
+            for t, v in per_surface.items()
+            if v["credit_bearing"] > 0 and v["credit_recovered"] == 0
+        )
+        unarchivable_total = sum(v["unarchivable"] for v in per_surface.values())
+        not_recovering = bool(dark) or bool(collapsed)
+        return {
+            "overlay_rows": overlay_rows,
+            "credit_bearing_legacy_rows": credit_bearing,
+            "credit_recovered": credit_recovered,
+            "uncovered": uncovered,
+            "not_recovering": not_recovering,
+            "dark_surfaces": dark,
+            "collapsed_surfaces": sorted(collapsed),
+            "unarchivable": unarchivable_total,
+            "per_surface": per_surface,
+        }
+
+    async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:
+        """Give any unmarked comparison row its `legacy_prefix` stamp.
+
+        The migration is one-shot: once its `paper_migrations` marker exists it
+        early-returns forever. So rows written by OLD code -- during a rollback,
+        say -- land with the columns NULL and the migration will never reach
+        them. NULL then becomes a third, undocumented semantics state that no
+        consumer knows how to read.
+
+        Those rows were produced by prefix semantics, so `legacy_prefix` is the
+        correct stamp. Idempotent and safe to run every startup: the
+        `IS NULL` predicate cannot touch a row already marked `canonical_v1`.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            if not await cur.fetchone():
+                continue
+            cur = await self._conn.execute(f"PRAGMA table_info({table})")
+            if "chains_identity_semantics" not in {r[1] for r in await cur.fetchall()}:
+                continue
+            cur = await self._conn.execute(
+                f"UPDATE {table} SET chains_identity_semantics = ? "
+                f"WHERE chains_identity_semantics IS NULL",
+                (LEGACY_SEMANTICS,),
+            )
+            if cur.rowcount:
+                out[table] = cur.rowcount
+        # Commit UNCONDITIONALLY. An UPDATE that matches zero rows still opens
+        # an implicit transaction, so a `if out:` guard here leaves one dangling
+        # on the shared connection and the NEXT migration's BEGIN EXCLUSIVE dies
+        # with "cannot start a transaction within a transaction". Same shape as
+        # the `if rows:` prune-logging guard: the guard looks like an
+        # optimisation and is actually a correctness bug.
+        await self._conn.commit()
+        return out
+
+    async def _migrate_chain_identity_semantics_v1(self) -> None:
+        """Version marker for chain-detection identity semantics (ruling C).
+
+        Prefix similarity is not identity, so it stops determining
+        ``detected_by_chains`` / ``chains_lead_minutes``. But historical
+        lead-time evidence must NOT be rewritten in place -- an UPDATE would
+        destroy the very numbers a later analysis needs to judge the change. So
+        each comparison row records WHICH semantics produced it:
+
+          * existing rows -> ``legacy_prefix``, a marker ONLY; their values are
+            left exactly as they were.
+          * rows written from now on -> ``canonical_v1``, plus the identity tier
+            that resolved them.
+
+        Recomputing history under the new semantics is allowed later, but only
+        as a distinct derived dataset carrying its own version -- never as an
+        in-place overwrite of this one.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_semantics_v1"
+        schema_version = 20260824
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_semantics_v1_migration_skip_already_applied")
+                return
+
+        tables = ("gainers_comparisons", "losers_comparisons", "trending_comparisons")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_semantics_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            stamped = {}
+            for table in tables:
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                if not await cur.fetchone():
+                    continue
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in await cur.fetchall()}
+                for col in ("chains_identity_semantics", "chains_identity_tier"):
+                    if col in cols:
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="skip_exists",
+                        )
+                    else:
+                        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="added",
+                        )
+                # Marker ONLY. Deliberately does not touch detected_by_chains,
+                # chains_lead_minutes or any other evidence column.
+                cur = await conn.execute(
+                    f"UPDATE {table} SET chains_identity_semantics = ? "
+                    f"WHERE chains_identity_semantics IS NULL",
+                    (LEGACY_SEMANTICS,),
+                )
+                stamped[table] = cur.rowcount or 0
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "chain_identity_semantics_v1_migration_complete",
+                stamped_legacy=stamped,
+            )
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_semantics_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
     async def _migrate_signal_first_seen_v1(self) -> None:
         """Derived first-seen substrate for signal_events (retention option F).
 
@@ -10622,8 +11676,12 @@ class Database:
                 ),
             )
             count += 1
-        if count:
-            await self._conn.commit()
+        # Unconditional, for the reason given in
+        # archive_legacy_prefix_comparisons: a guarded commit is safe only
+        # while a bare SELECT opens no transaction, which is a property of the
+        # connection mode rather than of this loop. These two were the only
+        # guarded commits in this file.
+        await self._conn.commit()
         return count
 
     async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:

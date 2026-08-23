@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from scout.identity_recompute import RECOMPUTE_SEMANTICS
+from scout.identity import (
+    BOUND_RAW_LT,
+    CANONICAL_SEMANTICS,
+    resolve_chain_first_seen,
+)
+
 if TYPE_CHECKING:
     from scout.db import Database
 
@@ -180,26 +187,35 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
         # Option F: consumers must stop depending on unbounded
         # signal_events history, so retention stops silently moving
         # the derived minimum forward.
-        # Only use LIKE for symbols >= 4 chars to avoid short-symbol false positives.
-        if len(symbol) >= 4:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?)
-                          OR LOWER(token_id) LIKE LOWER(? || '%')
-                          OR LOWER(?) LIKE LOWER(token_id || '%'))
-                     AND first_seen_at < ?""",
-                (coin_id, symbol, symbol, coin_id, first_loser_at_str),
+        # Ruling C: resolved by ASSET IDENTITY, not prefix similarity.
+        # BOUND_RAW_LT preserves this surface's bare `first_seen_at < ?`
+        # deliberately -- it compares in the same BINARY order the stored value
+        # was minimised under, so aggregation and filter agree by construction.
+        # Wrapping it in datetime() to match the other surfaces would be a
+        # silent behaviour change, not a cleanup.
+        res = await resolve_chain_first_seen(
+            db._conn,
+            coin_id,
+            symbol,
+            first_loser_at_str,
+            prefix_diagnostic=len(symbol) >= 4,
+            bound=BOUND_RAW_LT,
+        )
+        comp["chains_identity_semantics"] = CANONICAL_SEMANTICS
+        comp["chains_identity_tier"] = res.tier
+        if res.prefix_would_have_credited_more:
+            logger.info(
+                "chain_identity_prefix_discarded",
+                surface="losers",
+                coin_id=coin_id,
+                symbol=symbol,
+                resolved_tier=res.tier,
+                resolved_token=res.token_id,
+                discarded_prefix_token=res.prefix_token_id,
+                discarded_prefix_first_seen=res.prefix_first_seen_at,
             )
-        else:
-            cursor = await db._conn.execute(
-                """SELECT MIN(first_seen_at) FROM signal_first_seen
-                   WHERE (token_id = ? OR LOWER(token_id) = LOWER(?))
-                     AND first_seen_at < ?""",
-                (coin_id, symbol, first_loser_at_str),
-            )
-        sig_row = await cursor.fetchone()
-        if sig_row and sig_row[0]:
-            sig_at = _parse_dt(sig_row[0])
+        if res.detected:
+            sig_at = _parse_dt(res.first_seen_at)
             lead = (first_loser_at - sig_at).total_seconds() / 60.0
             comp["detected_by_chains"] = 1
             comp["chains_lead_minutes"] = round(lead, 1)
@@ -235,8 +251,9 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
                 detected_by_pipeline, pipeline_lead_minutes,
                 detected_by_chains, chains_lead_minutes,
                 detected_by_spikes, spikes_lead_minutes,
-                is_gap)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                is_gap,
+                chains_identity_semantics, chains_identity_tier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 comp["coin_id"],
                 comp["symbol"],
@@ -252,6 +269,8 @@ async def compare_losers_with_signals(db: "Database") -> list[dict]:
                 comp["detected_by_spikes"],
                 comp["spikes_lead_minutes"],
                 comp["is_gap"],
+                comp.get("chains_identity_semantics"),
+                comp.get("chains_identity_tier"),
             ),
         )
     await db._conn.commit()
@@ -289,17 +308,146 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
         raise RuntimeError("Database not initialized.")
 
     cursor = await db._conn.execute(
-        """SELECT coin_id, symbol, name, price_change_24h,
+        """SELECT losers_comparisons.coin_id, losers_comparisons.symbol, name, price_change_24h,
                   appeared_on_losers_at,
                   detected_by_narrative, narrative_lead_minutes,
                   detected_by_pipeline, pipeline_lead_minutes,
                   detected_by_chains, chains_lead_minutes,
+                  -- Ruling C: consumers MUST be able to tell prefix-derived
+                  -- rows from identity-derived ones. Without these the
+                  -- columns are write-only and the conviction gate in
+                  -- scout/conviction/cross_surface.py cannot see them.
+                  chains_identity_semantics, chains_identity_tier,
                   detected_by_spikes, spikes_lead_minutes,
-                  is_gap, created_at
+                  is_gap, created_at,
+                  -- Ruling C: the recomputed provenance overlay for LEGACY rows.
+                  -- Joined on coin_id, not row id: the tracker deletes and
+                  -- re-inserts by coin_id on every recompute, so ids do not
+                  -- survive. Only legacy rows consult it; canonical_v1 rows
+                  -- carry their own tier.
+                  (SELECT cir.evidence_status
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'losers_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
+                      AND cir.coin_id = losers_comparisons.coin_id
+                      AND cir.historical_anchor = losers_comparisons.appeared_on_losers_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(losers_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
+                    LIMIT 1) AS chains_recompute_status,
+                  -- The VERIFIED lead, not the legacy prefix-derived one.
+                  -- Scoring chains_lead_minutes after verifying canonical_lead
+                  -- would decouple the claim from the value.
+                  (SELECT cir.canonical_lead
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'losers_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
+                      AND cir.coin_id = losers_comparisons.coin_id
+                      AND cir.historical_anchor = losers_comparisons.appeared_on_losers_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(losers_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
+                    -- canonical FIRST: this ORDER BY is ascending, so the
+                    -- credit-bearing status must sort LOWEST. Written the
+                    -- other way round it preferred the non-credit-bearing
+                    -- row wherever both exist at one (coin_id, anchor) --
+                    -- silently discarding verified credit in favour of a
+                    -- prefix-only sibling.
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
+                             -- Deterministic TOTAL order. These are two
+                             -- INDEPENDENT scalar subqueries, and with only the
+                             -- CASE to sort by, rows sharing a CASE value are
+                             -- unordered -- so LIMIT 1 could take the status
+                             -- from one overlay row and the lead from another.
+                             -- That is the claim/value decoupling this pair was
+                             -- written to prevent, reintroduced at the SQL
+                             -- layer. Tie-breaking on the row id forces both
+                             -- subqueries to select the SAME row.
+                             cir.source_row_id
+                    LIMIT 1) AS chains_canonical_lead
            FROM losers_comparisons
            ORDER BY appeared_on_losers_at DESC
            LIMIT ?""",
-        (limit,),
+        (RECOMPUTE_SEMANTICS, RECOMPUTE_SEMANTICS, limit),
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]

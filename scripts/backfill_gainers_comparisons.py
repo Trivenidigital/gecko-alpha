@@ -46,21 +46,25 @@ SURFACES = [
         "(c.contract_address=gainers_comparisons.coin_id OR LOWER(c.ticker)=LOWER(gainers_comparisons.symbol))",
         "c.first_seen_at",
     ),
-    # Option F: read the DERIVED substrate, not signal_events. This row writes
-    # `detected_by_chains` / `chains_lead_minutes` -- the same two columns the
-    # migrated tracker now fills from signal_first_seen. Left on signal_events,
-    # one run of this script after any retention cut would durably OVERWRITE
-    # substrate-derived lead times with truncated-history ones, in the table
-    # the analysis reads. That turns a redundant backfill into an active
-    # corruption path for the column the substrate just decoupled.
-    (
-        "detected_by_chains",
-        "chains_lead_minutes",
-        "signal_first_seen",
-        "e",
-        "(e.token_id=gainers_comparisons.coin_id)",
-        "e.first_seen_at",
-    ),
+    # CHAINS SURFACE DELIBERATELY REMOVED (ruling C).
+    #
+    # This row used to UPDATE detected_by_chains / chains_lead_minutes -- the
+    # columns the trackers now derive by canonical IDENTITY and stamp with a
+    # semantics version. It cannot be made correct here:
+    #
+    #   * its match rule was `e.token_id = coin_id`, canonical-id ONLY, with no
+    #     contract tier and no alias tier -- narrower than the tier its stamp
+    #     would claim;
+    #   * it wrote no semantics stamp at all, so one `--apply` produced two
+    #     classes of lying rows: `legacy_prefix` rows whose values had silently
+    #     been recomputed, and `canonical_v1` rows recomputed under the narrower
+    #     rule;
+    #   * it overwrote `chains_lead_minutes` UNCONDITIONALLY, despite this
+    #     module's docstring claiming the fix only ever ADDS credit. That is
+    #     true of the flag and false of the lead.
+    #
+    # The tracker is the single owner of these two columns. Do not re-add a
+    # chains row here; extend the tracker instead.
     (
         "detected_by_spikes",
         "spikes_lead_minutes",

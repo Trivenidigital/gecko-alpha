@@ -1,0 +1,18 @@
+[Unit]
+Description=Legacy chains-provenance overlay coverage watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Exit 1 is the ALARM path and has already sent Telegram, so it is not a
+# service failure. 2-6 are failures OF THE WATCHDOG and must surface in
+# systemctl status, because nothing else reports them.
+SuccessExitStatus=0 1
+# Runs the REPO copy, not an installed one. Installing the .sh to
+# /usr/local/bin while it invokes the .py from the repo splits the watchdog in
+# half: the python side updates on `git pull`, the shell side needs a re-install
+# and silently does not deploy. That exact trap is already in this project's
+# history with the backup scripts. Pointing systemd at the repo keeps both
+# halves on one deploy path.
+WorkingDirectory=/root/gecko-alpha
+ExecStart=/root/gecko-alpha/scripts/recompute-coverage-watchdog.sh
