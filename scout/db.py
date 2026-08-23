@@ -8143,7 +8143,7 @@ class Database:
         ("trending_comparisons", "appeared_on_trending_at"),
     )
 
-    async def _clear_coverage_baseline(self, source_table: str) -> None:
+    async def _clear_coverage_baseline(self, source_table: str) -> bool:
         """Drop a mark deemed incomparable, on its own connection.
 
         The only sanctioned way a high-water mark falls. Best-effort for the
@@ -8163,6 +8163,7 @@ class Database:
                     (source_table,),
                 )
                 await conn.commit()
+                return True
             finally:
                 await conn.close()
         except Exception:
@@ -8171,6 +8172,7 @@ class Database:
             structlog.get_logger().warning(
                 "recompute_coverage_baseline_clear_failed", source_table=source_table
             )
+            return False
 
     async def _record_coverage_baseline(
         self, source_table: str, rate: float, population: int
@@ -8505,8 +8507,17 @@ class Database:
                 # -- so the deliberate re-arm has to say so. This is the one
                 # place a mark is allowed to fall, and it is a decision rather
                 # than a side effect.
-                best = None
-                await self._clear_coverage_baseline(table)
+                # Only forget the mark if the DELETE actually happened. The
+                # clear is best-effort (2s give-up under contention), so
+                # nulling `best` unconditionally meant a starved clear left the
+                # old mark in the table while the probe proceeded as though it
+                # were gone -- taking the write branch, skipping the collapse
+                # check entirely, and reporting `collapsed: []` while the
+                # watchdog, which reads the table, paged COLLAPSED against the
+                # surviving mark. Probe quiet, Telegram screaming, on the same
+                # database.
+                if await self._clear_coverage_baseline(table):
+                    best = None
             v["rate"] = round(rate, 4)
             if best is None or rate > best:
                 # Report what the TABLE holds, from the write's own result --

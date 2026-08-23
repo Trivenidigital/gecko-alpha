@@ -1059,3 +1059,101 @@ async def test_the_payload_reports_what_the_TABLE_holds_after_MAX(db):
         "WHERE source_table='gainers_comparisons'"
     )
     assert (await cur.fetchone())[0] == 0.8
+
+
+@pytest.mark.parametrize("population", [20, 25, 30, 39, 40, 41, 60])
+async def test_no_population_band_is_silently_unarmed(db, population):
+    """The whole band, swept, because the last dead band was found by sweeping.
+
+    A guard written against the recorded population alone raised the effective
+    ARMING floor to twice the documented judging floor, leaving 20-39 unarmed
+    while `_COLLAPSE_MIN_POPULATION` advertised 20. Two numbers, nothing
+    reconciling them, and the gap sat exactly where trending lives.
+
+    Parametrised across the boundary rather than spot-checked: a single
+    population proves one point, and the defect was a range.
+    """
+    recovered = max(1, int(population * 0.9))
+    await _bulk(db, population, recovered)
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # Collapse to a single recovered row, on an unchanged population.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["collapsed_surfaces"] == [
+        "gainers_comparisons"
+    ], f"population {population} is silently unarmed"
+    assert probe["not_recovering"] is True
+
+
+async def test_a_STARVED_clear_does_not_make_the_probe_disagree_with_the_table(db):
+    """`best = None` was assigned before the best-effort DELETE was attempted.
+
+    Under a held write lock the clear gives up after 2s, so the mark survives
+    in the table — while the probe proceeded as though it were gone, took the
+    write branch, skipped the collapse check, and reported `collapsed: []`. The
+    watchdog reads the table and paged COLLAPSED against the surviving mark.
+    Probe quiet, Telegram screaming, same database, same instant.
+    """
+    await _bulk(db, 25, 22)  # mark 0.88 on a sample below twice the floor
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    await _bulk(db, 200, 3, prefix="grown")  # growth past the guard, collapsed rate
+
+    async def failing_clear(_self, _table):
+        return False  # the 2s give-up
+
+    from scout.db import Database as _Db
+
+    original = _Db._clear_coverage_baseline
+    _Db._clear_coverage_baseline = failing_clear
+    try:
+        probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    finally:
+        _Db._clear_coverage_baseline = original
+
+    cur = await db._conn.execute(
+        "SELECT best_rate FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    stored = (await cur.fetchone())[0]
+    v = probe["per_surface"]["gainers_comparisons"]
+
+    assert stored == 0.88, "fixture did not leave the mark in the table"
+    assert v["best_rate"] == 0.88, "the payload forgot a mark the table still holds"
+    assert v["mark_written"] is False
+    assert probe["collapsed_surfaces"] == [
+        "gainers_comparisons"
+    ], "the probe skipped the collapse check against a mark that survived"
+
+
+async def test_the_clear_reports_FAILURE_from_its_own_handler(tmp_path):
+    """Drive the real `except` block, not a monkeypatched stand-in.
+
+    The starved-clear test above replaces `_clear_coverage_baseline` wholesale,
+    so it never exercises the handler's return value — and a mutant making that
+    handler return True (claiming a delete that did not happen) survived the
+    whole suite. Handlers are code, and this project has been bitten by
+    untested ones before.
+
+    The failure is real, not simulated: the path is a directory, so the connect
+    raises inside the function.
+    """
+    from scout.db import Database
+
+    bad = Database(tmp_path)  # a directory, not a database file
+    assert await bad._clear_coverage_baseline("gainers_comparisons") is False
+
+
+async def test_the_write_reports_FAILURE_from_its_own_handler(tmp_path):
+    """Same for the write's handler, which returns the stored value or None."""
+    from scout.db import Database
+
+    bad = Database(tmp_path)
+    assert await bad._record_coverage_baseline("gainers_comparisons", 0.5, 40) is None
