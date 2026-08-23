@@ -72,9 +72,11 @@ indeterminate — 20%, not 0% — so a fall from the measured ~53% baseline to 5
 would page on neither. That is 95% of readers going blind under a green alarm.
 
 The high-water mark is a **ratchet**: recorded from the first observation of a
-surface, raised when recovery improves, never lowered. The one exception is a
-mark recorded against a population below twice the judging floor — measured on
-a handful of rows, it is not comparable to a full one and is re-established.
+surface, raised when recovery improves, never lowered — enforced by the write
+itself (`best_rate = MAX(stored, new)`), not by the caller. The one exception is
+a mark recorded against a population below twice the judging floor: measured on
+a handful of rows it is not comparable to a full one, so it is **deleted** and
+re-established. A deliberate re-arm is a delete; nothing else can lower a mark.
 Note that this covers a transiently small FIRST observation, not population
 shrinkage; see the residuals in the acceptance report. Ordinary attrition rides
 underneath it (archived rows draining to `canonical_v1` shrink population and

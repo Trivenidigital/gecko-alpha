@@ -931,3 +931,70 @@ async def test_a_mark_from_a_LARGE_population_survives_growth(db):
 
     assert collapsed["collapsed_surfaces"] == ["gainers_comparisons"]
     assert collapsed["not_recovering"] is True
+
+
+async def test_the_stored_mark_can_never_be_lowered_by_a_WRITE(db):
+    """The invariant belongs at the write, not in a caller's read.
+
+    "Never lowered" was enforced only by `if best is None or rate > best`, so
+    any path that made the read return None let an unconditional upsert rewrite
+    a durable high mark with today's rate. Same collapsed recovery, one pass
+    apart: the first fires, the second is silent and STAYS silent, because the
+    baseline it would fire against has been overwritten with the collapsed
+    value. That is the silent collapse of the alarm itself.
+
+    Drives the write directly, so it pins the SQL rather than the caller guard
+    that happens to sit in front of it today.
+    """
+    await _bulk(db, 40, 32)  # 0.80
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    async def mark():
+        cur = await db._conn.execute(
+            "SELECT best_rate FROM recompute_coverage_baseline "
+            "WHERE source_table='gainers_comparisons'"
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+    assert await mark() == 0.8
+
+    # A lower value, written directly. The read guard is bypassed entirely.
+    await db._record_coverage_baseline("gainers_comparisons", 0.2286, 140)
+    assert await mark() == 0.8, "an upsert lowered the high-water mark"
+
+    # A higher one still raises it.
+    await db._record_coverage_baseline("gainers_comparisons", 0.91, 140)
+    assert await mark() == 0.91
+
+
+async def test_an_incomparable_mark_is_CLEARED_deliberately(db):
+    """The one sanctioned way a mark falls, and it must be explicit.
+
+    With MAX at the write, clearing the local variable no longer lowers
+    anything — so a deliberate re-arm has to delete the row. Without that this
+    fix would strand a 1.00 mark measured on 25 rows forever, false-paging
+    every pass, which is the risk the guard was built for.
+    """
+    await _bulk(db, 25, 25)  # 1.00 on a sample below twice the floor
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT best_rate, population FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    assert tuple(await cur.fetchone()) == (1.0, 25)
+
+    await _bulk(db, 200, 20, prefix="second")
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT best_rate, population FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    best, pop = await cur.fetchone()
+    assert (best, pop) == (
+        0.2,
+        225,
+    ), "the incomparable 25-row mark was not cleared, so MAX pinned it forever"
+    assert probe["collapsed_surfaces"] == []

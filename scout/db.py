@@ -8143,6 +8143,35 @@ class Database:
         ("trending_comparisons", "appeared_on_trending_at"),
     )
 
+    async def _clear_coverage_baseline(self, source_table: str) -> None:
+        """Drop a mark deemed incomparable, on its own connection.
+
+        The only sanctioned way a high-water mark falls. Best-effort for the
+        same reason the write is: a failure here leaves the old mark in place
+        for one more pass, which is the safe direction.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "DELETE FROM recompute_coverage_baseline WHERE source_table = ?",
+                    (source_table,),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_clear_failed", source_table=source_table
+            )
+
     async def _record_coverage_baseline(
         self, source_table: str, rate: float, population: int
     ) -> bool:
@@ -8184,8 +8213,24 @@ class Database:
                     "INSERT INTO recompute_coverage_baseline "
                     "(source_table, best_rate, population, recorded_at) "
                     "VALUES (?, ?, ?, datetime('now')) "
+                    # MAX at the WRITE, so "never lowered" is enforced where
+                    # the docstring says it lives rather than by a caller
+                    # guard. It was enforced only by the read
+                    # (`best is None or rate > best`), so ANY path that made
+                    # the read return None -- the population guard did -- let
+                    # an unconditional upsert rewrite a durable high mark with
+                    # today's rate. Same collapsed recovery, one pass apart:
+                    # the first fires, the second is silent and STAYS silent,
+                    # because the baseline it would fire against has been
+                    # overwritten with the collapsed value.
+                    #
+                    # A deliberate re-arm is a DELETE (see the guard), not a
+                    # side effect of an upsert. That keeps the downgrade a
+                    # decision someone made.
                     "ON CONFLICT(source_table) DO UPDATE SET "
-                    "best_rate=excluded.best_rate, population=excluded.population, "
+                    "best_rate=MAX(recompute_coverage_baseline.best_rate, "
+                    "              excluded.best_rate), "
+                    "population=excluded.population, "
                     "recorded_at=excluded.recorded_at",
                     (source_table, rate, population),
                 )
@@ -8421,7 +8466,13 @@ class Database:
             # fall for benign reasons. That is a separate open question -- do
             # not read this guard as though it covers it.
             if row is not None and row[1] < _COLLAPSE_MIN_POPULATION * 2:
+                # EXPLICIT delete, not `best = None` alone. With MAX at the
+                # write, clearing the local variable no longer lowers anything
+                # -- so the deliberate re-arm has to say so. This is the one
+                # place a mark is allowed to fall, and it is a decision rather
+                # than a side effect.
                 best = None
+                await self._clear_coverage_baseline(table)
             v["rate"] = round(rate, 4)
             if best is None or rate > best:
                 # Report what the TABLE holds, from the write's own result --
