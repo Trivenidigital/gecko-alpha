@@ -252,6 +252,33 @@ that document first.** I wrote a comment naming trending as oscillating around
 20, then shipped a dead band starting at exactly 20. The evidence was already in
 hand, which is precisely why it went unread.
 
+## 5b-ii. A check that restates its own premise will always pass
+
+Two findings in this review turn out to be one shape, and it is the shape that
+neither discipline nor an agreement harness can catch:
+
+```
+anchor_covered           asserts PER-TOKEN coverage      from a GLOBAL span
+the exhaustiveness assert  asserts DECISION completeness   from ARM completeness
+```
+
+In both, the check exists, runs, and passes — while evaluating a restatement of
+its own premise rather than the thing the premise is about. An exhaustiveness
+check over a taxonomy proves the taxonomy's **arms** are handled; it says
+nothing about whether the taxonomy covers the decision's **axes**. The boolean
+chain branched on comparability *and* improvement; the taxonomy named
+comparability; the improvement axis had no arm to be unhandled in, so it
+vanished while the assert stayed satisfied.
+
+Neither is a skipped check, so discipline does not find them. An agreement
+harness does not either — both layers hold the same premise and agree while
+both are wrong. **Only running the underlying question can fail:** the
+per-token question, the per-axis question.
+
+Recorded because I asserted the false guarantee and the evidence-semantics
+reviewer endorsed it in writing one message later — two people, both looking
+directly at it, neither deriving it. It took the defect.
+
 ## 5c. The axis inventory — a step, not a principle
 
 Both reviewers and I independently articulated "a matrix built from the code's
