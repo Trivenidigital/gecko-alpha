@@ -562,3 +562,40 @@ def test_the_summary_names_the_mark_each_surface_was_compared_against(tmp_path):
 
     assert "mark=0.9000" in r.stdout, r.stdout
     assert "mark=none" in r.stdout, "unarmed surfaces must say so per surface"
+
+
+def test_each_surfaces_mark_lands_on_its_own_row(tmp_path):
+    """Each surface's mark appears on its own row.
+
+    HONEST SCOPE: this pins the observable property, and it does NOT
+    discriminate between the current implementation and the positional zip it
+    replaced. I checked by running it — restoring the zip passes all 27 tests,
+    because nothing in the population loop can currently skip a surface, so the
+    two lists always align. The coupling was latent, not reachable.
+
+    The change is kept anyway because the failure it forecloses is a
+    misattributed mark in an alert, which is what makes an operator stop
+    trusting the alert entirely — and the cost of removing the coupling is
+    three lines. But this test is evidence of correct attribution, not evidence
+    that the refactor was load-bearing, and those are different claims.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=25)
+    conn = sqlite3.connect(db)
+    # Only losers and trending have marks; gainers has none. Zipped
+    # positionally, gainers would take losers' number.
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('losers_comparisons', 0.1234, 25, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('trending_comparisons', 0.5678, 25, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    out = _run(db).stdout
+
+    assert "gainers_comparisons=25/25 mark=none" in out, out
+    assert "losers_comparisons=0/0 mark=0.1234" in out, out
+    assert "trending_comparisons=0/0 mark=0.5678" in out, out

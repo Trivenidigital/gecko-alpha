@@ -194,7 +194,12 @@ def main() -> int:
             recovered += rec
             unarchivable += unarch
             per_surface[table] = (pop, rec)
-            detail.append(f"{table}={rec}/{pop}")
+            # Mark appended INSIDE the loop, beside the surface it belongs to.
+            # Zipping a `detail` list against SURFACES afterwards was a
+            # parallel-list alignment: correct only while nothing in this loop
+            # can skip a surface, and a misattributed mark in an alert is
+            # exactly what makes an operator stop trusting the alert.
+            detail.append(f"{table}={rec}/{pop} mark={{{table}}}")
             # PER SURFACE. A global "recovered nothing" is satisfied by one
             # healthy surface while the others sit stripped -- reachable
             # because the replay commits per surface, so a mid-run failure
@@ -243,15 +248,12 @@ def main() -> int:
     finally:
         conn.close()
 
-    # Name the mark each surface was compared against. Without it an operator
-    # reading a collapse page cannot tell a real collapse from a wrong mark
-    # without opening the database, and an unarmed surface reads identically
-    # to a healthy one.
-    detail = [
-        f"{d} mark={marks[t]:.4f}" if t in marks else f"{d} mark=none"
-        for d, t in zip(detail, [tbl for tbl, _ in SURFACES])
-    ]
-    summary = " ".join(detail)
+    # Substitute each surface's mark now that they are all known. The
+    # placeholder carries the surface name, so a mark can only ever land on
+    # the row it was read for.
+    summary = " ".join(detail).format(
+        **{t: (f"{marks[t]:.4f}" if t in marks else "none") for t, _ in SURFACES}
+    )
     if population == 0:
         print(f"no pre-cutover chains credit to recover ({summary})")
         return 0
