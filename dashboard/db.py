@@ -914,6 +914,12 @@ async def get_system_health(db_path: str, *, now: datetime | None = None) -> dic
         # so a stale created_at here means the combo-refresh pass itself stopped
         # — the same signal the alert-channel watchdog pages on.
         ("alert_events", "created_at"),
+        # Ruling F: derived first-seen substrate §12a freshness surface. Its
+        # `updated_at` advances on every fold, so a stale value means
+        # emit_event stopped folding -- which is invisible at the consumers,
+        # because a substrate that simply stops updating still answers every
+        # query with a plausible (just increasingly late) value.
+        ("signal_first_seen", "updated_at"),
     ]
     result = {}
     async with _ro_db(db_path) as conn:

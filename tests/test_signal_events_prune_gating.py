@@ -62,8 +62,14 @@ async def _insert_event_aged(db: Database, token_id: str, age_days: float) -> No
         """INSERT INTO signal_events
            (token_id, pipeline, event_type, event_data, source_module, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (token_id, "memecoin", "candidate_scored", json.dumps({}), "scorer",
-         when.isoformat()),
+        (
+            token_id,
+            "memecoin",
+            "candidate_scored",
+            json.dumps({}),
+            "scorer",
+            when.isoformat(),
+        ),
     )
     await db._conn.commit()
 
@@ -155,7 +161,15 @@ async def test_retention_boundary_unchanged_at_fourteen_days(db, settings):
 async def test_prune_signal_events_honours_non_default_retention(db, settings_factory):
     """keep_days is read from Settings, not hardcoded."""
     settings = settings_factory(
-        DB_PATH=db._db_path, **{**_PRUNE_DEFAULTS, "CHAIN_EVENT_RETENTION_DAYS": 3}
+        DB_PATH=db._db_path,
+        **{
+            **_PRUNE_DEFAULTS,
+            "CHAIN_EVENT_RETENTION_DAYS": 3,
+            # Ruling F residual: signal_events retention must cover the
+            # prospective watchlist's lookback, which still derives first-seen
+            # from that table. Lowering retention alone is now a config error.
+            "CONVICTION_PROSPECTIVE_LOOKBACK_DAYS": 3,
+        },
     )
 
     await _insert_event_aged(db, "0xday5", age_days=5)

@@ -209,49 +209,18 @@ async def test_emit_event_keeps_the_earliest_across_many_emits(db):
     assert (await cur.fetchone())[0] == 1
 
 
-async def test_a_failing_fold_leaves_NOTHING_pending_on_the_connection(db, monkeypatch):
-    """The fold runs BEFORE the insert, so its failure cannot orphan an event.
+async def test_the_insert_precedes_the_fold(db, monkeypatch):
+    """Pins the ORDER, which was deliberately REVERSED after review.
 
-    Asserting "the row is absent" on emit_event's own connection would prove
-    nothing -- an uncommitted INSERT is visible to the connection that made it.
-    The discriminating question is what a SUBSEQUENT successful commit does
-    with anything left pending, so that is what this asserts.
+    An earlier version folded first, on the argument that a failing fold then
+    left nothing pending. That argument was refuted: `scout/chains/tracker.py`
+    opens its own BEGIN on this shared connection and rolls back on failure, so
+    a foreign rollback discards this unit's pending work whatever the order.
 
-    If the order were reversed, the insert would already be pending when the
-    fold raised, `safe_emit` would swallow the error, and the next emit's
-    commit() would launder in a committed event with no substrate row -- the
-    exact divergence the substrate exists to prevent.
-    """
-    real = Database.record_signal_first_seen
-
-    async def fail_for_dead(self, token_id, created_at):
-        if token_id == "0xdead":
-            raise RuntimeError("substrate write failed")
-        return await real(self, token_id, created_at)
-
-    monkeypatch.setattr(Database, "record_signal_first_seen", fail_for_dead)
-
-    with pytest.raises(RuntimeError):
-        await emit_event(db, "0xdead", "memecoin", "candidate_scored", {}, "scorer")
-
-    # A later, unrelated, SUCCESSFUL emit commits the connection.
-    await emit_event(db, "0xgood", "memecoin", "candidate_scored", {}, "scorer")
-
-    cur = await db._conn.execute("SELECT token_id FROM signal_events ORDER BY token_id")
-    tokens = [r[0] for r in await cur.fetchall()]
-    assert tokens == [
-        "0xgood"
-    ], f"a failed emit was laundered into the DB by a later commit: {tokens}"
-    assert await _first_seen(db, "0xdead") is None
-    assert await _first_seen(db, "0xgood") is not None
-
-
-async def test_the_fold_precedes_the_insert(db, monkeypatch):
-    """Pins the ORDER directly, not just one of its consequences.
-
-    The safety argument rests entirely on the fold running first. A refactor
-    that swaps them keeps every other test in this file green while silently
-    restoring the orphan-event window, so the order gets its own assertion.
+    Once repair (not prevention) became the correctness mechanism, fold-first
+    was strictly worse: it made the DERIVED table a hard dependency of primary
+    data, so a substrate failure would silently stop every signal_events write
+    via safe_emit's swallow. The event must always land.
     """
     order: list[str] = []
     real_fold = Database.record_signal_first_seen
@@ -271,16 +240,43 @@ async def test_the_fold_precedes_the_insert(db, monkeypatch):
     await emit_event(db, "0xorder", "memecoin", "candidate_scored", {}, "scorer")
 
     assert order == [
-        "fold",
         "insert",
-    ], f"expected the substrate fold before the event insert, got {order}"
+        "fold",
+    ], f"expected the event insert before the substrate fold, got {order}"
 
 
-async def test_safe_emit_swallowing_does_not_hide_a_divergence(db, monkeypatch):
-    """`safe_emit` swallows by design -- so the unit must be safe on its own.
+async def test_a_substrate_failure_does_not_stop_event_emission(db, monkeypatch):
+    """THE reason the order was reversed.
 
-    This is the production shape: nothing re-raises, so a laundered orphan
-    would never surface. Every committed event must have a substrate row.
+    A derived table must never be able to halt the thing it is derived from.
+    With `safe_emit` swallowing, fold-first would have turned any substrate
+    fault into a silent, total stop of signal_events writes.
+    """
+    from scout.chains.events import safe_emit
+
+    monkeypatch.setattr("scout.config.get_settings", lambda: _chains_on())
+
+    async def boom(self, token_id, created_at):
+        raise RuntimeError("substrate unavailable")
+
+    monkeypatch.setattr(Database, "record_signal_first_seen", boom)
+    await safe_emit(db, "0xa", "memecoin", "candidate_scored", {}, "scorer")
+    await safe_emit(db, "0xb", "memecoin", "candidate_scored", {}, "scorer")
+    await db._conn.commit()
+
+    cur = await db._conn.execute("SELECT COUNT(*) FROM signal_events")
+    assert (await cur.fetchone())[
+        0
+    ] >= 1, "a substrate fault stopped event emission entirely"
+
+
+async def test_reconciliation_closes_the_divergence_safe_emit_hides(db, monkeypatch):
+    """The honest end-to-end contract: transiently divergent, then repaired.
+
+    `safe_emit` swallows by design, so a failed fold surfaces nowhere. This
+    asserts the state production actually reaches -- an orphaned event -- and
+    then that the hourly repair removes it. Claiming the orphan is unreachable
+    would be the false version of this test.
     """
     from scout.chains.events import safe_emit
 
@@ -293,16 +289,24 @@ async def test_safe_emit_swallowing_does_not_hide_a_divergence(db, monkeypatch):
         return await real(self, token_id, created_at)
 
     monkeypatch.setattr(Database, "record_signal_first_seen", fail_for_dead)
-    assert await safe_emit(db, "0xdead", "memecoin", "x", {}, "scorer") is None
-    assert await safe_emit(db, "0xgood", "memecoin", "x", {}, "scorer") is not None
+    await safe_emit(db, "0xdead", "memecoin", "x", {}, "scorer")
+    await safe_emit(db, "0xgood", "memecoin", "x", {}, "scorer")
+    await db._conn.commit()
 
+    # The divergence is real -- assert it exists before asserting it is fixed,
+    # so the repair below cannot pass against a state that never diverged.
+    assert await _first_seen(db, "0xdead") is None
+    monkeypatch.setattr(Database, "record_signal_first_seen", real)
+
+    result = await db.reconcile_signal_first_seen()
+    assert result["repaired"] >= 1
     cur = await db._conn.execute("SELECT DISTINCT token_id FROM signal_events")
     rows = await cur.fetchall()
     assert rows, "no events committed -- the test proves nothing"
     for (token,) in rows:
         assert (
             await _first_seen(db, token) is not None
-        ), f"committed event for {token} has no substrate row"
+        ), f"committed event for {token} still has no substrate row after repair"
 
 
 # ---------------------------------------------------------------------------

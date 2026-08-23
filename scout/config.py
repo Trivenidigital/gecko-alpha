@@ -2641,6 +2641,31 @@ class Settings(BaseSettings):
     VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS: int = 14
 
     @model_validator(mode="after")
+    def _validate_chain_retention_covers_prospective_lookback(self) -> "Settings":
+        """Ruling F residual: the ONE consumer left reading signal_events.
+
+        `scout/conviction/prospective.py` derives its chains surface with
+        `MIN(created_at) ... WHERE created_at >= now - LOOKBACK_DAYS`. It is
+        window-bounded, so it is exempt from the first-seen migration -- but
+        only while retention actually covers that window. Today the two knobs
+        merely COINCIDE at 14; nothing enforced it, so the first cut of
+        CHAIN_EVENT_RETENTION_DAYS below the lookback would silently truncate
+        it, with no error, which is exactly the harm ruling F exists to remove.
+
+        Making the coincidence an invariant is what lets that consumer stay
+        un-migrated honestly.
+        """
+        if self.CHAIN_EVENT_RETENTION_DAYS < self.CONVICTION_PROSPECTIVE_LOOKBACK_DAYS:
+            raise ValueError(
+                f"CHAIN_EVENT_RETENTION_DAYS={self.CHAIN_EVENT_RETENTION_DAYS} "
+                f"must be >= CONVICTION_PROSPECTIVE_LOOKBACK_DAYS="
+                f"{self.CONVICTION_PROSPECTIVE_LOOKBACK_DAYS}. The prospective "
+                f"watchlist derives first-seen from signal_events over that "
+                f"lookback; lower retention truncates it silently."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_retention_covers_secondwave_window(self) -> "Settings":
         """V2#3 fold: prevent silent mis-config where prune retention <
         secondwave's evidence-window upper bound. The secondwave detector
