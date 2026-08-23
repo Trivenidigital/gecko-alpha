@@ -136,6 +136,25 @@ construction. The explicit-clear added to reconcile two fixes opened a dead
 band on the first try and a starved-clear contradiction on the second.
 
 **Mutation evidence is asymmetric, in the direction opposite to intuition.**
+Three distinct ways a mutation run lies, all found in this review — two in my
+harness, one in a reviewer's, and the third only by reading what a mutant
+actually did:
+
+| failure | what it looks like | guard |
+|---|---|---|
+| the edit never applied | a clean pass, i.e. a survival | `assert old in source` |
+| the edit applied and broke syntax | pytest exits non-zero — indistinguishable from a kill | `ast.parse(mutated)`, and score on `FAILED`, never on `ERROR` |
+| the edit applied, parsed, ran, and did not express the defect | a survival, or a kill by the wrong test | read what the mutation *does*; no automated guard exists |
+
+The second is the nastiest, because the file on disk really did change — it
+*looks* applied. The third has no mechanical guard at all: I substituted a
+weaker mutant during a re-audit, it survived, and reporting that at face value
+would have been a false negative sitting beside my false positives. A fourth,
+operational: **restore must survive the harness being killed** — `finally` does
+not run through a hard timeout, and three of my sweeps left a mutant in the
+working tree that way.
+
+
 A *survival* is strong evidence — a mutant that passes is one nothing caught. A
 *kill* is weak: the mutant may have failed for the wrong reason. I recorded a
 kill that was a binding-count `ProgrammingError`, not detection; the clause was
