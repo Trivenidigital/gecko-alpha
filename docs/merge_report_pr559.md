@@ -135,10 +135,21 @@ is precisely the case ruling D's re-run requirement is for: both slots cleared a
 blocking regression on the silent-failure vector itself (§5a).
 
 **All four slots terminal and holding at head.** Both lapsed slots re-ran
-against the current tree rather than being carried forward — and the rule earned
-itself on its first live occasion: it caught a real code change (the entire
-ratchet rework, including a blocking regression on the silent-failure vector)
-rather than documentation churn. A clearance is not carried forward across a
+against the current tree rather than being carried forward, and both re-runs
+produced findings that did not exist at the clearance I would otherwise have
+carried: the frozen-mark reproduction, the payload-honesty evidence, the fourth
+mutation mode, F3, the battery-shape rule, and the discriminating laundering
+control.
+
+**But the rule did not find those — I did, by choosing to apply it at the exact
+point where accepting a clearance I already had would have been easiest.** The
+concurrency reviewer made this correction and it is the right one: a rule that
+depends on its author electing to enforce it against their own interest, twice,
+is not yet a rule. Nothing here guarantees the next person makes that choice,
+and the moment where it pays is precisely the moment it is most expensive. The
+honest version is that the *discipline* worked once, under observation, with
+four reviewers watching. Ticketed as `BL-NEW-CI-LAPSE-GATE` so the next occasion
+does not depend on anyone's judgement. A clearance is not carried forward across a
 production delta, and the implementer's own review never satisfies an
 independent slot.
 
