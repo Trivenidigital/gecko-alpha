@@ -7555,9 +7555,16 @@ class Database:
         cur = await self._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
         rows = (await cur.fetchone())[0]
 
+        # No datetime() on the COLUMN side: it is non-sargable and forces a full
+        # scan (measured 203 ms vs 0.19 ms on a 511k-row clone). Safe only
+        # because `record_emission` is the sole writer and always stores
+        # `datetime.now(timezone.utc).isoformat()`, so the column is uniformly
+        # isoformat-T/UTC and a lexicographic compare is a chronological one.
+        # If that ever stops being true this must go back to datetime() --
+        # this is the isoformat-vs-datetime trap the project has hit before.
         cur = await self._conn.execute(
             "SELECT COUNT(*) FROM signal_outcome_ledger "
-            "WHERE datetime(emitted_at) >= datetime('now', '-1 day')"
+            "WHERE emitted_at >= strftime('%Y-%m-%dT%H:%M:%S','now','-1 day')"
         )
         growth_rows_per_day = (await cur.fetchone())[0]
 
@@ -7570,7 +7577,7 @@ class Database:
                      GROUP BY surface, kind
                     HAVING datetime(MAX(emitted_at))
                              < datetime('now', '-{int(horizon_days)} days')
-                       AND SUM(label_status = 'pending') = 0)""")
+                       AND SUM(label_status IN ('pending','partial')) = 0)""")
         reclaimable_rows = (await cur.fetchone())[0]
 
         bytes_total = rows * self._LEDGER_BYTES_PER_ROW
@@ -7586,6 +7593,15 @@ class Database:
         reopen_reasons = []
         if reclaimable_bytes >= self._LEDGER_REOPEN_RECLAIMABLE_BYTES:
             reopen_reasons.append("reclaimable_bytes")
+        # ALREADY over the ceiling. This is a separate condition from the
+        # projection on purpose: the projection is gated on
+        # `growth_bytes_per_day > 0`, so without this clause a table that has
+        # crossed 1 GB and then stopped growing -- the kill switch flipped off,
+        # or any >24h outage -- reports `reopen: False` and the hourly line
+        # reads green. The watch would go quiet at exactly the moment the thing
+        # it watches for had already happened.
+        if bytes_total >= self._LEDGER_SIZE_CEILING_BYTES:
+            reopen_reasons.append("over_ceiling")
         if days_to_ceiling <= self._LEDGER_REOPEN_PROJECTED_DAYS:
             reopen_reasons.append("projected_size")
 

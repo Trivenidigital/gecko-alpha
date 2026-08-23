@@ -169,12 +169,106 @@ async def test_reopen_fires_on_projected_size(db):
 
 
 async def test_zero_growth_does_not_project_a_false_crossing(db):
-    """No emissions must mean no projection, not a divide-by-zero or a 0-day ETA."""
+    """No emissions must mean no projection, not a divide-by-zero or a 0-day ETA.
+
+    Scoped deliberately to a SMALL table. An earlier version of this test made
+    the same assertions with no size qualifier, which encoded "zero growth =>
+    never alarm" as intended behaviour -- and that is exactly what hid the
+    over-ceiling defect below. Zero growth suppresses the PROJECTION only; it
+    must never suppress the fact that the ceiling has already been crossed.
+    """
     await _emit(db, "volume_spike", "dispatch", days_ago=40, n=3)
     r = await db.signal_outcome_ledger_growth_probe()
     assert r["growth_rows_per_day"] == 0
     assert r["days_to_1gb"] is None
     assert "projected_size" not in r["reopen_reasons"]
+    assert r["bytes_total"] < Database._LEDGER_SIZE_CEILING_BYTES
+
+
+async def test_over_the_ceiling_reopens_even_with_ZERO_growth(db, monkeypatch):
+    """THE defect the zero-growth test was hiding.
+
+    `reopen` on size fired only through the projection, which is gated on
+    growth > 0. So a table that crossed 1 GB and then stopped growing -- the
+    ledger kill switch flipped off, or any outage longer than 24h -- reported
+    `reopen: False` with a green hourly line. The watch went quiet at exactly
+    the moment the thing it watches for had already happened.
+    """
+    # Lower the CEILING rather than inflating the table: crossing the real 1 GB
+    # needs ~2.37M rows, and a fixture that large tests the machine, not the
+    # logic. The condition under test is `bytes_total >= ceiling`, which does
+    # not care which side moved.
+    await _emit(db, "volume_spike", "dispatch", days_ago=40, n=1000)
+    monkeypatch.setattr(Database, "_LEDGER_SIZE_CEILING_BYTES", 1000 * 454 - 1)
+
+    r = await db.signal_outcome_ledger_growth_probe()
+    assert (
+        r["growth_rows_per_day"] == 0
+    ), "fixture grew; the zero-growth path is untested"
+    assert r["bytes_total"] >= Database._LEDGER_SIZE_CEILING_BYTES
+    assert r["reopen"] is True, "over the ceiling and silent"
+    assert "over_ceiling" in r["reopen_reasons"]
+
+
+async def test_negative_headroom_with_growth_still_reopens(db, monkeypatch):
+    """Pins the max(0.0, ...) clamp, which was wholly untested."""
+    # The ceiling must be far enough below the table that an UNCLAMPED value is
+    # unambiguously negative. My first version set it one byte below, so the
+    # unclamped result was -2.2e-6 and `round(..., 1)` gave -0.0 -- which
+    # compares EQUAL to 0.0, and the mutant deleting the clamp survived.
+    await _emit(db, "gainers_early", "dispatch", days_ago=0.5, n=1000)
+    monkeypatch.setattr(Database, "_LEDGER_SIZE_CEILING_BYTES", 1000)
+
+    r = await db.signal_outcome_ledger_growth_probe()
+    assert r["days_to_1gb"] == 0.0, "negative headroom did not clamp to 0"
+    assert r["reopen"] is True
+
+
+async def test_growth_is_a_RATE_not_a_running_total(db):
+    """`growth_rows_per_day` must mean per DAY.
+
+    Widening the window to 30 days survived every other test, so nothing pinned
+    the unit -- and the unit is what the whole projection is denominated in.
+    """
+    await _emit(db, "gainers_early", "dispatch", days_ago=0.5, n=10)
+    await _emit(db, "gainers_early", "dispatch", days_ago=5, n=500)
+    r = await db.signal_outcome_ledger_growth_probe()
+    assert (
+        r["growth_rows_per_day"] == 10
+    ), "rows outside the 24h window were counted as today's growth"
+
+
+async def test_kind_is_part_of_the_cohort_key(db):
+    """`GROUP BY surface, kind` -- dropping `kind` survived every test.
+
+    Every other fixture uses one kind per surface, so the second axis was never
+    exercised. A dormant dispatch cohort must not be dragged out of closure by
+    a still-active gated_out_sample cohort on the same surface, nor vice versa.
+    """
+    await _emit(db, "volume_spike", "dispatch", days_ago=40, n=7)
+    await _emit(db, "volume_spike", "gated_out_sample", days_ago=0.1, n=3)
+
+    r = await db.signal_outcome_ledger_growth_probe()
+    assert r["reclaimable_rows"] == 7, (
+        "the still-active gated_out_sample cohort suppressed the dormant "
+        "dispatch cohort -- kind is not being grouped"
+    )
+
+
+async def test_partial_rows_are_NOT_closed(db):
+    """`partial` is still in the labeler's own queue.
+
+    outcome_ledger selects `WHERE label_status IN ('pending','partial')`, so a
+    partial row is work the system has not finished. Declaring it safely
+    prunable would let the prune race the labeler whenever the labeler is
+    disabled or backlogged.
+    """
+    await _emit(db, "tg_social", "gated_out_sample", days_ago=40, n=5)
+    await _emit(
+        db, "tg_social", "gated_out_sample", days_ago=40, label_status="partial", n=2
+    )
+    r = await db.signal_outcome_ledger_growth_probe()
+    assert r["reclaimable_rows"] == 0
 
 
 async def test_the_probe_can_see_a_crossing_at_all(db):
