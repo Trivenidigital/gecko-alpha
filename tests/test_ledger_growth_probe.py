@@ -332,14 +332,30 @@ def test_an_unparseable_emitted_at_is_refused_rather_than_guessed():
     """A timestamp we cannot place in time must not enter the durable record."""
     from scout.outcome_ledger import _normalise_emitted_at
 
-    with pytest.raises(ValueError, match="ISO-8601"):
+    with pytest.raises(ValueError, match="accepted timestamp shape"):
         _normalise_emitted_at("last tuesday")
 
 
 def test_a_naive_emitted_at_is_treated_as_UTC():
+    """KNOWN LIMITATION: this assertion is environment-masked.
+
+    The code stamps `tzinfo=utc` explicitly before converting. A mutant that
+    removes that stamp falls through to `astimezone()`, which interprets a NAIVE
+    datetime as LOCAL time -- and because this host and CI both run UTC, the
+    mutant produces identical output and survives.
+
+    The assertion is still correct and would catch the mutant on any non-UTC
+    host; it simply cannot fail here. Recorded rather than left as a silently
+    surviving mutant, because "no test failed" and "no test could fail" are
+    different statements and only one of them is evidence.
+    """
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
     from scout.outcome_ledger import _normalise_emitted_at
 
-    assert _normalise_emitted_at("2026-08-22T06:54:00") == "2026-08-22T06:54:00+00:00"
+    expected = _dt(2026, 8, 22, 6, 54, 0, tzinfo=_tz.utc).isoformat()
+    assert _normalise_emitted_at("2026-08-22T06:54:00") == expected
 
 
 async def test_the_PUBLIC_API_normalises_a_backfill_timestamp(db, settings_factory):
@@ -388,7 +404,7 @@ def test_a_bare_date_is_refused_rather_than_read_as_midnight():
     from scout.outcome_ledger import _normalise_emitted_at
 
     for bare in ("2026-08-23", "20260823"):
-        with pytest.raises(ValueError, match="no time component"):
+        with pytest.raises(ValueError, match="accepted timestamp shape"):
             _normalise_emitted_at(bare)
 
     # A real timestamp that happens to fall AT midnight must still be accepted.
@@ -410,27 +426,45 @@ def test_empty_string_is_refused_not_silently_treated_as_now():
 @pytest.mark.parametrize(
     "raw,expect_raise,why",
     [
+        # --- the two FALSE ACCEPTS review found, which my first guard missed ---
+        # fromisoformat reads a trailing offset after a BARE DATE as the TIME
+        # COMPONENT and returns naive 05:00 -- so a guard keyed on
+        # `parsed.time() == midnight` sees "not midnight, must be real" and
+        # accepts it. Silently stores 05:00Z for what the caller meant as a date
+        # in +05:00: worse than the bare-date hazard, because it does not raise.
+        ("2026-08-23+05:00", True, "offset-after-bare-date misread as a time"),
+        ("20260823+0500", True, "same, compact"),
+        # --- bare dates ---
         ("2026-08-23", True, "bare date"),
         ("20260823", True, "compact bare date"),
         ("  2026-08-23  ", True, "bare date, padded"),
         ("2026-W34-1", True, "ISO week date — still a date with no time"),
+        ("", True, "empty string is not a request for now()"),
+        ("last tuesday", True, "unparseable"),
+        # --- deliberately TIGHTER than fromisoformat ---
+        ("20260823T000000", True, "compact datetime: no producer emits it"),
+        # --- genuine timestamps, all accepted ---
         ("2026-08-23T00:00:00+00:00", False, "genuine midnight, explicit offset"),
         ("2026-08-23 00:00:00", False, "genuine midnight, space separator"),
-        ("2026-08-23T00:00:00", False, "genuine midnight, naive"),
-        ("2026-08-23T00:00:00Z", False, "genuine midnight, Z suffix"),
-        ("2026-08-23T00:00", False, "HH:MM only, at midnight"),
-        ("20260823T000000", False, "COMPACT but carries a time component"),
-        ("20260823T120000", False, "compact, noon"),
-        ("2026-08-23T12:00:00+00:00", False, "ordinary"),
+        ("2026-08-23T00:00:00", False, "genuine midnight, naive -> UTC"),
+        ("2026-08-23T00:00:00Z", False, "Z suffix"),
+        ("2026-08-23t00:00:00z", False, "lowercase t/z — ISO permits it"),
+        ("2026-08-23T00:00", False, "HH:MM only"),
+        ("2026-08-23T12:00:00.123456+00:00", False, "fractional seconds"),
+        ("2026-08-23T00:00:00+05:30", False, "genuine midnight in a NON-UTC zone"),
     ],
 )
-def test_bare_date_guard_in_both_directions(raw, expect_raise, why):
-    """The guard is two conditions where one might do, so pin both directions.
+def test_emitted_at_shape_guard_in_both_directions(raw, expect_raise, why):
+    """The guard validates the RAW SHAPE before parsing, and that is the point.
 
-    It sits on the ledger write path: a false REFUSAL drops a row, and a false
-    ACCEPT reintroduces the midnight hazard. The dangerous confusion is between
-    "midnight because no time was supplied" and "midnight because that is the
-    actual instant" — the second must always be accepted.
+    The first version reasoned about the parse result plus character-sniffing
+    the raw string, which requires predicting `fromisoformat` — and review
+    showed it mispredicts. Adding a third condition would have kept producing
+    that class; matching an explicit shape first does not.
+
+    A false REFUSAL drops a ledger row; a false ACCEPT puts a wrong instant in
+    a durable record and does not raise, so fail-soft never sees it. Both
+    directions are pinned.
     """
     from scout.outcome_ledger import _normalise_emitted_at
 
@@ -440,3 +474,13 @@ def test_bare_date_guard_in_both_directions(raw, expect_raise, why):
     else:
         out = _normalise_emitted_at(raw)
         assert "T" in out and out.endswith("+00:00"), why
+
+
+def test_a_non_utc_offset_is_CONVERTED_not_stripped():
+    """Midnight in +05:30 is 18:30Z the PREVIOUS day, not midnight UTC."""
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    assert (
+        _normalise_emitted_at("2026-08-23T00:00:00+05:30")
+        == "2026-08-22T18:30:00+00:00"
+    )

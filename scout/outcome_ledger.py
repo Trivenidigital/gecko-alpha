@@ -48,6 +48,7 @@ NOT related to scout/source_quality/ledger.py (source-call quality ledger).
 
 from __future__ import annotations
 
+import re
 import json
 from datetime import datetime, timedelta, timezone, time as dt_time
 from typing import Any
@@ -311,47 +312,76 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
     return price
 
 
+#: The ONLY accepted shape for a caller-supplied `emitted_at`.
+#:
+#: Declarative on purpose. The previous guard reasoned about the PARSE RESULT
+#: (`parsed.time() == midnight`) plus character-sniffing the raw string, which
+#: requires predicting `datetime.fromisoformat` -- and it is more permissive and
+#: more surprising than that model. Review found the miss: given "2026-08-23+05:00"
+#: it reads the offset as the TIME COMPONENT and returns a NAIVE
+#: `2026-08-23 05:00:00`. The old guard saw 05:00, decided "not midnight, must be
+#: a real timestamp", accepted it, and stamped UTC -- silently storing 05:00Z for
+#: what a caller meant as a date in +05:00. Worse than the bare-date hazard it was
+#: built to stop: that one is wrong-but-coherent, this one reinterprets the offset
+#: digits as a clock and does not raise, so fail-soft never sees it.
+#:
+#: Adding a third condition would have kept producing this class. Matching the raw
+#: string against an explicit shape BEFORE parsing does not.
+#:
+#: Deliberately tighter than fromisoformat: the compact `20260823T000000` family
+#: is now refused. No producer emits it, and a loud refusal on something
+#: unexpected beats a heuristic that mispredicts the parser.
+_EMITTED_AT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:?\d{2})?$"
+)
+
+
 def _normalise_emitted_at(emitted_at: str | None) -> str:
     """Canonical UTC isoformat-T, or raise.
 
-    Returning the value unparsed would push a lexicographic-ordering hazard into
-    a column other code compares as text. Raising beats coercing for anything we
-    cannot place in time: a guess puts a wrong instant in a durable record.
+    `signal_outcome_ledger.emitted_at` is compared LEXICOGRAPHICALLY by the
+    growth probe (a deliberate sargable rewrite worth 203ms -> 0.19ms), which is
+    equivalent to a chronological compare only while every stored value is
+    canonical isoformat-T/UTC. Storing a caller's value unparsed would push that
+    ordering hazard into the column; ' ' (0x20) and the digits of a negative
+    offset both sort below 'T' (0x54).
 
-    Three deliberate edges, each of which was a silent behaviour until named:
+    Raising beats coercing for anything that does not match the accepted shape:
+    a timestamp we cannot place in time is one a guess would misplace, and this
+    is a durable record.
 
-    * **A bare date is REFUSED**, not read as midnight. `fromisoformat` accepts
-      "2026-08-23" and "20260823" and would return 00:00:00Z -- canonical, so no
-      ordering hazard, but wrong by up to 24h and entirely plausible-looking.
-      That is aimed squarely at the case this parameter exists for: a backfill
-      sourcing a DATE column would land every row at midnight. A loud refusal is
-      better than a silently plausible time.
-    * **A naive value is assumed UTC.** This IS a guess, which sits awkwardly
+    Two deliberate edges:
+
+    * **A naive value is assumed UTC.** This IS a guess, and it sits awkwardly
       beside the paragraph above, so the asymmetry is owned rather than hidden:
-      every producer that reaches this column is UTC, so the assumption is
-      sound here and would not be in a system with local-time producers.
-    * **Empty string now raises** where it previously fell through to `now()`.
-      `""` is falsy but not `None`. Refusing is more correct -- an empty
-      timestamp is not a request for the current time -- but it is a behaviour
-      change, so it is recorded rather than left to be discovered.
+      every producer reaching this column is UTC. In a system with local-time
+      producers this assumption would be wrong.
+    * **Empty string raises** where it previously fell through to `now()`. `""`
+      is falsy but not `None`; an empty timestamp is not a request for the
+      current time. A behaviour change, so recorded rather than discovered.
+
+    Lowercase `t`/`z` separators are accepted and normalised, because ISO 8601
+    permits them and silently dropping such a row would be the worse failure.
     """
     if emitted_at is None:
         return datetime.now(timezone.utc).isoformat()
     raw = str(emitted_at).strip()
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except (TypeError, ValueError) as exc:
+    if not _EMITTED_AT_RE.match(raw):
         raise ValueError(
-            f"emitted_at={emitted_at!r} is not an ISO-8601 timestamp. "
-            "signal_outcome_ledger.emitted_at is compared lexicographically, "
-            "so a non-canonical value silently mis-sorts."
-        ) from exc
-    if parsed.time() == dt_time(0, 0) and not any(c in raw for c in (":", "T", " ")):
-        raise ValueError(
-            f"emitted_at={emitted_at!r} carries no time component. Read as "
-            "midnight UTC it would be wrong by up to 24h while looking "
-            "entirely plausible -- supply a full timestamp."
+            f"emitted_at={emitted_at!r} is not an accepted timestamp shape "
+            f"(YYYY-MM-DD[T ]HH:MM[:SS[.ffffff]][offset]). "
+            "signal_outcome_ledger.emitted_at is compared lexicographically, so "
+            "a non-canonical value silently mis-sorts -- and a bare date, with "
+            "or without a trailing offset, is misread rather than rejected by "
+            "the ISO parser."
         )
+    try:
+        parsed = datetime.fromisoformat(raw.replace("t", "T").replace("z", "Z"))
+    except (TypeError, ValueError) as exc:  # pragma: no cover - shape already checked
+        raise ValueError(
+            f"emitted_at={emitted_at!r} matched the accepted shape but did not "
+            "parse; the shape pattern and the parser have diverged."
+        ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()
