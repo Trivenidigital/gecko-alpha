@@ -1,6 +1,6 @@
 # Acceptance report — versioned legacy-provenance recomputation
 
-**Candidate:** `47847f47` (`fix/canonical-identity-semantics`, PR #559)
+**Candidate:** `4693c563` (`fix/canonical-identity-semantics`, PR #559)
 **Method:** full replay of the entire archived population against a trimmed
 copy of production, taken in the pre-migration shape so `initialize()`
 exercises the real upgrade-with-data path.
@@ -37,7 +37,8 @@ report states which one it used.
 |---|---:|:--:|
 | `verified_canonical` | 1,543 | **yes** |
 | `indeterminate_history` | 968 | no |
-| `canonical_below_gate_indeterminate` | 252 | no |
+| `canonical_below_gate_indeterminate` | 249 | no |
+| `alias_tier_not_verifiable` | 3 | no |
 | `no_legacy_credit` | 124 | n/a |
 | `verified_prefix_only` | 4 | no |
 
@@ -160,16 +161,20 @@ first-seen *after* its anchor slipped through the time bounds.
 
 ## 7. Sensitivity
 
-The replay was run on five successive revisions of the code (`c1a50e33`,
-`19dd27da`, `552ef6f6`, `599be775`, `47847f47`), across a change of live history source
+The replay was run on seven successive revisions of the code (`c1a50e33`,
+`19dd27da`, `552ef6f6`, `599be775`, `47847f47`, `c8b5e009`, `4693c563`), across a change of live history source
 (`signal_events` → `signal_first_seen`), a rewrite of the coverage probe, and a
 change from one transaction to per-surface commits, the removal of
 `alias_unique` promotion, a semantics filter on the tracker overlay, and a
 gate re-check in the coverage probe.
 
-**Every status count was identical on all five.** The result is insensitive to
-those corrections, which is why they could be made late without re-opening the
-measurement.
+**Every status count was identical on all seven**, with one deliberate
+exception: the last revision split `alias_tier_not_verifiable` out of
+`canonical_below_gate_indeterminate` (252 → 249 + 3), because that label
+asserted a gate comparison never performed for the alias tier. The total,
+`verified_canonical`, and the tier_high headline are unchanged. The result is
+otherwise insensitive to these corrections, which is why they could be made
+late without re-opening the measurement.
 
 ## 8. What this does not establish
 
@@ -196,3 +201,5 @@ measurement.
 | Coverage is a global span, not per-token | Per-token coverage is a design change; the current predicate only ever produces conservative outcomes now that `alias_unique` cannot promote. |
 | `coverage_intervals=None` falls back to a global substrate floor | Latent: there is no runtime caller of `recompute_legacy_provenance` outside the ops script, which always passes explicit intervals. Removing the default would be a silent behaviour change for a caller that does not exist yet. |
 | Recovery falls to the substrate-only rate once the `/root` snapshots are deleted | Unavoidable. This is why the watchdog escalates on recovered credit rather than row count. |
+| The alarm cannot fire on *gradual* degradation | `not_recovering` is all-or-nothing per surface. Deleting the snapshots drops recovery to roughly a fifth — **not zero** — so tier_high could collapse ~80% under a green alarm. Right for deploy-without-activate, blind to attrition. Closing it needs a ratchet (persist last run's `credit_recovered` per surface, escalate on a drop beyond some fraction), which is a design decision rather than a bug fix. |
+| Probe and readers now share one correlation *and* one gate predicate | More correct than two independent proxies, but a wrong shared predicate makes them wrong **together and in agreement**, which reads as healthy. The remaining failure mode is deliberate. |
