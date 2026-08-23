@@ -209,21 +209,18 @@ async def test_emit_event_keeps_the_earliest_across_many_emits(db):
     assert (await cur.fetchone())[0] == 1
 
 
-async def test_a_failed_substrate_write_cannot_be_LAUNDERED_by_a_later_commit(
-    db, monkeypatch
-):
-    """The event and its substrate row are one unit, provably.
+async def test_a_failing_fold_leaves_NOTHING_pending_on_the_connection(db, monkeypatch):
+    """The fold runs BEFORE the insert, so its failure cannot orphan an event.
 
-    Asserting "the row is absent" on emit_event's OWN connection proves nothing:
-    an uncommitted INSERT is visible to the connection that made it. The
-    discriminating question is what a SUBSEQUENT successful commit does with the
-    pending write.
+    Asserting "the row is absent" on emit_event's own connection would prove
+    nothing -- an uncommitted INSERT is visible to the connection that made it.
+    The discriminating question is what a SUBSEQUENT successful commit does
+    with anything left pending, so that is what this asserts.
 
-    Without a savepoint the failed emit leaves its INSERT pending, `safe_emit`
-    swallows the error, and the next emit's commit() commits BOTH -- yielding a
-    committed event with no substrate row, which is the divergence the substrate
-    exists to prevent. This test fails on that implementation and passes on the
-    savepoint one.
+    If the order were reversed, the insert would already be pending when the
+    fold raised, `safe_emit` would swallow the error, and the next emit's
+    commit() would launder in a committed event with no substrate row -- the
+    exact divergence the substrate exists to prevent.
     """
     real = Database.record_signal_first_seen
 
@@ -249,11 +246,41 @@ async def test_a_failed_substrate_write_cannot_be_LAUNDERED_by_a_later_commit(
     assert await _first_seen(db, "0xgood") is not None
 
 
+async def test_the_fold_precedes_the_insert(db, monkeypatch):
+    """Pins the ORDER directly, not just one of its consequences.
+
+    The safety argument rests entirely on the fold running first. A refactor
+    that swaps them keeps every other test in this file green while silently
+    restoring the orphan-event window, so the order gets its own assertion.
+    """
+    order: list[str] = []
+    real_fold = Database.record_signal_first_seen
+    real_exec = type(db._conn).execute
+
+    async def traced_fold(self, token_id, created_at):
+        order.append("fold")
+        return await real_fold(self, token_id, created_at)
+
+    async def traced_exec(self, sql, *a, **kw):
+        if "INSERT INTO signal_events" in str(sql):
+            order.append("insert")
+        return await real_exec(self, sql, *a, **kw)
+
+    monkeypatch.setattr(Database, "record_signal_first_seen", traced_fold)
+    monkeypatch.setattr(type(db._conn), "execute", traced_exec)
+    await emit_event(db, "0xorder", "memecoin", "candidate_scored", {}, "scorer")
+
+    assert order == [
+        "fold",
+        "insert",
+    ], f"expected the substrate fold before the event insert, got {order}"
+
+
 async def test_safe_emit_swallowing_does_not_hide_a_divergence(db, monkeypatch):
     """`safe_emit` swallows by design -- so the unit must be safe on its own.
 
-    This is the production shape: nothing re-raises, so a laundered orphan would
-    never surface. Every committed event must have a substrate row.
+    This is the production shape: nothing re-raises, so a laundered orphan
+    would never surface. Every committed event must have a substrate row.
     """
     from scout.chains.events import safe_emit
 
@@ -270,7 +297,9 @@ async def test_safe_emit_swallowing_does_not_hide_a_divergence(db, monkeypatch):
     assert await safe_emit(db, "0xgood", "memecoin", "x", {}, "scorer") is not None
 
     cur = await db._conn.execute("SELECT DISTINCT token_id FROM signal_events")
-    for (token,) in await cur.fetchall():
+    rows = await cur.fetchall()
+    assert rows, "no events committed -- the test proves nothing"
+    for (token,) in rows:
         assert (
             await _first_seen(db, token) is not None
         ), f"committed event for {token} has no substrate row"
