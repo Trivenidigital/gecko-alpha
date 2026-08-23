@@ -1805,6 +1805,22 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     except Exception:
         logger.exception("signal_outcome_ledger_growth_probe_failed")
 
+    # Deploy-without-activate watch for the legacy-provenance overlay. The
+    # overlay is written by an OFFLINE ops step, so shipping the code without
+    # running it leaves every pre-cutover chains detection untrusted and
+    # collapses tier_high silently -- the exact outcome the overlay exists to
+    # prevent. Logged unconditionally so "populated and healthy" stays
+    # distinguishable from "never checked"; only `not_activated` escalates,
+    # because partial coverage is the expected steady state (history runs out)
+    # and must never be trained into background noise.
+    try:
+        cov = await db.chain_identity_recompute_coverage_probe()
+        logger.info("chain_identity_recompute_coverage", **cov)
+        if cov["not_activated"]:
+            logger.error("chain_identity_recompute_NOT_ACTIVATED", **cov)
+    except Exception:
+        logger.exception("chain_identity_recompute_coverage_probe_failed")
+
     # Repair the derived first-seen substrate. See
     # Database.reconcile_signal_first_seen: the per-write fold is not atomic
     # against a foreign rollback on the shared connection, so the substrate is

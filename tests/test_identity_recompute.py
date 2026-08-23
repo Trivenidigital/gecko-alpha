@@ -21,6 +21,7 @@ from scout.identity_recompute import (
     STATUS_INDETERMINATE,
     STATUS_NO_LEGACY_CREDIT,
     STATUS_PREFIX_ONLY,
+    STATUS_UNJOINABLE_ROW,
     STATUS_VERIFIED_CANONICAL,
     recompute_legacy_provenance,
 )
@@ -634,3 +635,188 @@ async def test_an_alias_win_is_NOT_verified_under_censored_history(db):
     assert (
         await _status(db, "terra-luna-2") == STATUS_CANONICAL_SUB_GATE
     ), "an alias-tier win was verified while a canonical token could be hidden"
+
+
+# ---------------------------------------------------------------------------
+# Residuals flagged during implementation, closed here
+# ---------------------------------------------------------------------------
+
+
+async def test_the_gate_is_INCLUSIVE_at_exactly_the_boundary(db):
+    """`>=`, matching the consumer. One row sits exactly on 1440.
+
+    `cross_surface` documents its own gate as ">= CONVICTION_EARLY_LEAD_MINUTES
+    (inclusive)". If the overlay used `>` instead, a row whose canonical lead
+    lands exactly on the boundary would be stamped indeterminate here while the
+    consumer would happily count it -- the two halves disagreeing about the
+    same row, with each internally consistent.
+    """
+    anchor = "2026-08-01T00:00:00+00:00"
+    # first_seen exactly 1440 minutes (24h) before the anchor
+    await _substrate(db, [("exact-boundary-coin", "2026-07-31T00:00:00+00:00")])
+    await _legacy(db, "exact-boundary-coin", "EBC", anchor=anchor)
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-07-01T00:00:00+00:00", "2026-08-02T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT canonical_lead, evidence_status FROM chain_identity_recompute_v1 "
+        "WHERE coin_id='exact-boundary-coin'"
+    )
+    lead, status = await cur.fetchone()
+    assert lead == pytest.approx(1440.0)
+    assert status == STATUS_VERIFIED_CANONICAL
+
+
+async def test_every_archived_row_lands_in_exactly_one_status(db):
+    """The acceptance report reconciles counts against the population.
+
+    A row that is neither written nor counted makes the totals silently fail to
+    sum, and "the numbers don't add up" is the least debuggable form of a
+    missing row. Rows with no join key are the case that used to vanish.
+    """
+    await _substrate(db, [("has-history", "2026-07-31T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "no-history-at-all", "NH")
+    # Unjoinable: an archived row carrying no coin_id.
+    await _legacy(db, "", "EMPTY")
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM gainers_comparisons_legacy_prefix_v1"
+    )
+    population = (await cur.fetchone())[0]
+    assert population == 3
+    assert (
+        sum(counts.values()) == population
+    ), f"statuses {dict(counts)} sum to {sum(counts.values())}, not {population}"
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 1
+
+
+async def test_rows_already_marked_canonical_are_left_out_of_the_replay(db):
+    """A `canonical_v1` row was never derived by prefix matching.
+
+    It has nothing to recompute and no legacy evidence to reconstruct, so
+    replaying it would fabricate an overlay row asserting provenance about a
+    row whose provenance was never in question.
+    """
+    await _substrate(db, [("already-canonical", "2026-07-31T00:00:00+00:00")])
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9001, 'already-canonical', 'AC', 'AC', ?, 1, 5000.0, 0,
+                   'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    assert await _status(db, "already-canonical") is None
+    assert sum(counts.values()) == 0
+
+
+@pytest.mark.parametrize(
+    "surface,anchor_col",
+    [
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ],
+)
+async def test_the_other_two_surfaces_are_replayed_too(db, surface, anchor_col):
+    """Coverage of gainers alone would leave two thirds of the population dark.
+
+    Both of these carry credit-bearing legacy rows in production, and losers in
+    particular uses a DIFFERENT time bound, so it cannot be assumed to behave
+    like gainers just because the code path is shared.
+    """
+    coin = f"{surface}-coin"
+    await _substrate(db, [(coin, "2026-07-25T00:00:00+00:00")])
+    await db._conn.execute(
+        f"""INSERT INTO {surface}_legacy_prefix_v1
+            (id, coin_id, symbol, name, {anchor_col},
+             detected_by_chains, chains_lead_minutes, is_gap,
+             chains_identity_semantics, created_at)
+            VALUES (9100, ?, 'S', 'S', ?, 1, 5000.0, 0, ?, ?)""",
+        (coin, ANCHOR, LEGACY_SEMANTICS, ANCHOR),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-07-01T00:00:00+00:00", "2026-08-02T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT source_table, evidence_status FROM chain_identity_recompute_v1 "
+        "WHERE coin_id=?",
+        (coin,),
+    )
+    row = await cur.fetchone()
+    assert row is not None, f"{surface} was never replayed"
+    assert row[0] == surface
+    assert row[1] == STATUS_VERIFIED_CANONICAL
+
+
+async def test_losers_uses_its_OWN_time_bound_not_the_gainers_tolerance(db):
+    """The two bounds are not interchangeable, and a comment is not a test.
+
+    `scout/identity.py` defines two: gainers/trending accept
+    `datetime(first_seen_at) < datetime(anchor, '+5 minutes')`, losers accepts
+    a bare `first_seen_at < anchor`. An earlier version of this loop applied
+    the +5-minute form uniformly while asserting in a comment that the bound
+    was "identical to the one that produced the legacy value". Review caught
+    it; the fix then sat here UNPINNED, and a mutant restoring the uniform
+    bound passed all 28 tests.
+
+    The discriminating case is a first-seen landing INSIDE the tolerance
+    window -- two minutes after the anchor. The losers path must refuse it (a
+    candidate cannot be first seen after the appearance it supposedly
+    predicts); the gainers path would accept it and derive a negative lead.
+    """
+    anchor = "2026-08-20T00:00:00+00:00"
+    inside_tolerance = "2026-08-20T00:02:00+00:00"
+    await _substrate(db, [("late-candidate", inside_tolerance)])
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_losers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9200, 'late-candidate', 'LC', 'LC', ?, 1, 5000.0, 0, ?, ?)""",
+        (anchor, LEGACY_SEMANTICS, anchor),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-08-01T00:00:00+00:00", "2026-08-25T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT canonical_detected, canonical_lead, evidence_status "
+        "FROM chain_identity_recompute_v1 WHERE coin_id='late-candidate'"
+    )
+    detected, lead, status = await cur.fetchone()
+
+    # Under the losers bound the candidate is out of range entirely.
+    assert detected == 0, (
+        "losers accepted a candidate first seen AFTER the anchor -- that is the "
+        "gainers +5min tolerance leaking into the losers path"
+    )
+    assert lead is None
+    # INDETERMINATE, not PREFIX_ONLY: with the candidate out of range there is
+    # no prefix match either, so the replay cannot affirm the negative -- it can
+    # only report that it could not reconstruct. That is the conservative
+    # direction the ruling requires ("a reconstructed lead below the gate cannot
+    # be treated as a negative"), and it is a DIFFERENT status from the one the
+    # uniform-bound mutant produces (canonical_below_gate_indeterminate, off a
+    # candidate first seen two minutes after the anchor).
+    assert status == STATUS_INDETERMINATE

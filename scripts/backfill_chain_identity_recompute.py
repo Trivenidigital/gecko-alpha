@@ -27,6 +27,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sqlite3
+
+import aiosqlite
+
+from scout.config import get_settings
 from pathlib import Path
 
 #: Preserved snapshots, newest first. Absent files are skipped, not fatal --
@@ -39,6 +43,30 @@ SNAPSHOT_SOURCES = (
 )
 
 LIVE_DB = "/root/gecko-alpha/scout.db"
+
+
+def _open_read_only(path: str, *, live: bool) -> sqlite3.Connection:
+    """Open a history source read-only, picking the mode by what the file IS.
+
+    The distinction matters in both directions.
+
+    ``immutable=1`` promises SQLite the file cannot change, so it skips locking
+    AND ignores any ``-wal``. For the frozen snapshots that is exactly right:
+    it is also what stops a read-only open from CREATING ``-wal``/``-shm``
+    sidecars beside a backup, which is how the real backups were destroyed on
+    2026-08-15.
+
+    For the LIVE database it is wrong. A pipeline is writing to it and the WAL
+    may hold thousands of uncheckpointed rows. Opened immutable those rows are
+    invisible, so the backfill would compute against stale history and
+    under-resolve exactly the most recent anchors -- silently, since fewer
+    resolutions look identical to less history. ``mode=ro`` reads the WAL
+    properly, and the sidecar hazard does not apply: a live database already
+    has them.
+    """
+    if live:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    return sqlite3.connect(f"file:{path}?immutable=1", uri=True)
 
 
 def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
@@ -54,7 +82,7 @@ def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
         if not Path(path).exists():
             continue
         try:
-            conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            conn = _open_read_only(path, live=(path == live_db))
             row = conn.execute(
                 "SELECT MIN(created_at), MAX(created_at) FROM signal_events"
             ).fetchone()
@@ -101,7 +129,7 @@ def collect_history(sources, *, live_db: str) -> dict[str, str]:
             print(f"  {path}: MISSING (skipped — coverage degrades, not an error)")
             continue
         try:
-            conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            conn = _open_read_only(path, live=(path == live_db))
             n = 0
             for token_id, first in conn.execute(query):
                 if not token_id or not first:
@@ -119,15 +147,32 @@ def collect_history(sources, *, live_db: str) -> dict[str, str]:
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default=LIVE_DB)
-    ap.add_argument(
-        "--apply",
+    # --dry-run is accepted explicitly rather than merely implied by omitting
+    # --apply. It is the invocation the module docstring documents, and a
+    # script that rejects its own documented flag with "unrecognized
+    # arguments" reads as broken rather than as safe-by-default -- which
+    # invites reaching for --apply just to make it run.
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="write the results")
+    mode.add_argument(
+        "--dry-run",
         action="store_true",
-        help="write the results; otherwise report and change nothing",
+        help="report coverage and change nothing (the default)",
     )
-    ap.add_argument("--gate-minutes", type=float, default=1440.0)
+    # Default from the SETTING the consumer reads, never from a second literal
+    # 1440. The overlay classifies a row as credit-bearing using this gate and
+    # `cross_surface` re-checks the same threshold; if the operator moves the
+    # setting and the backfill keeps its own copy, rows are stamped
+    # `verified_canonical` that the consumer then refuses -- a disagreement
+    # visible nowhere, because both halves look internally consistent.
+    ap.add_argument(
+        "--gate-minutes",
+        type=float,
+        default=float(get_settings().CONVICTION_EARLY_LEAD_MINUTES),
+        help="early-detection gate; defaults to CONVICTION_EARLY_LEAD_MINUTES",
+    )
     args = ap.parse_args()
 
-    from scout.db import Database
     from scout.identity_recompute import recompute_legacy_provenance
 
     print("Collecting history from every readable source (read-only):")
@@ -143,17 +188,31 @@ async def main() -> int:
         print("\nDRY RUN — nothing written. Re-run with --apply.")
         return 0
 
-    db = Database(Path(args.db))
-    await db.initialize()
+    # Deliberately NOT Database.initialize(): that applies every pending
+    # migration, and this script is pointed at a database with a live pipeline
+    # attached. An ops backfill must not be the thing that decides to ALTER
+    # production tables -- the deploy does that, in its own window, once.
+    # Attach to what is already there, and refuse if the schema has not landed.
+    conn = await aiosqlite.connect(args.db)
     try:
+        cur = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='chain_identity_recompute_v1'"
+        )
+        if not await cur.fetchone():
+            print(
+                "REFUSING: chain_identity_recompute_v1 does not exist. "
+                "Deploy the schema first, then re-run this backfill."
+            )
+            return 2
         counts = await recompute_legacy_provenance(
-            db._conn,
+            conn,
             gate_minutes=args.gate_minutes,
             extra_history=history,
             coverage_intervals=intervals,
         )
     finally:
-        await db.close()
+        await conn.close()
 
     print("\nEvidence status:")
     for status, n in sorted(counts.items(), key=lambda kv: -kv[1]):

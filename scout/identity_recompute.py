@@ -98,6 +98,9 @@ STATUS_AMBIGUOUS = "ambiguous_identity"
 STATUS_INDETERMINATE = "indeterminate_history"
 #: The legacy row never had chains credit; there is nothing to recover.
 STATUS_NO_LEGACY_CREDIT = "no_legacy_credit"
+#: Archived row carrying no usable join key (no coin_id, or no anchor). Not a
+#: history problem -- the row cannot be correlated to anything at all.
+STATUS_UNJOINABLE_ROW = "unjoinable_row"
 
 #: Statuses that earn chains conviction credit. Exactly one.
 CREDIT_BEARING = frozenset({STATUS_VERIFIED_CANONICAL})
@@ -329,6 +332,15 @@ async def recompute_legacy_provenance(
 
         for row_id, coin_id, symbol, anchor, legacy_detected, legacy_lead in rows:
             if not coin_id or not anchor:
+                # Counted, not silently dropped. The acceptance report claims a
+                # FULL replay of the archived population, and a status
+                # breakdown that quietly omits a row cannot be reconciled
+                # against the row count -- the totals would simply fail to sum,
+                # with nothing saying why. A row with no coin_id or no anchor
+                # is unjoinable, so it gets a terminal status of its own rather
+                # than being folded into `indeterminate_history`, which means
+                # something different: history we could not reach.
+                counts[STATUS_UNJOINABLE_ROW] = counts.get(STATUS_UNJOINABLE_ROW, 0) + 1
                 continue
             # PER-SURFACE bound. gainers/trending use the +5min tolerance with
             # both sides normalised; losers uses a bare `first_seen_at < ?`.

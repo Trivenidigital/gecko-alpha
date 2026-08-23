@@ -232,3 +232,61 @@ async def test_archiving_is_idempotent_and_does_not_reset_an_existing_archive(db
     assert (await cur.fetchone())[
         0
     ] == 0, "the archive was retaken, so it is no longer the PRE-CUTOVER snapshot"
+
+
+async def test_concurrent_startup_does_not_crash_the_loser_of_the_archive_race(db):
+    """Two processes both see "archive absent" and both proceed to create it.
+
+    Review found this by running it: the `sqlite_master` check and the CREATE
+    are separated by an await, and on the first boot after deploy the pipeline,
+    the dashboard and several cron entry points all call `initialize()` at
+    once. The loser used to raise `table ... already exists` straight out of
+    `initialize()`, where no caller catches it.
+
+    The race is made deterministic here rather than hoped for: a competitor
+    creates the archive in the exact window, immediately after the guard's
+    SELECT has been issued and before the CREATE runs.
+    """
+    # `initialize()` already archived, so simulate a genuine first boot: drop
+    # the archives, then give the surface a row worth preserving. (Skipping
+    # this is how the first draft of this test failed for the wrong reason --
+    # the competitor collided with a pre-existing table instead of racing.)
+    for t in ("gainers", "losers", "trending"):
+        await db._conn.execute(f"DROP TABLE IF EXISTS {t}_comparisons_legacy_prefix_v1")
+    await db._conn.commit()
+    await _legacy_row(db, "vanar-chain-2", 8740.0)
+
+    # The competitor must win AFTER the guard has read sqlite_master, so hook
+    # the CREATE itself rather than the SELECT. Hooking the SELECT looks
+    # equivalent and is not: aiosqlite runs `fetchall()` later on the
+    # connection thread, so the guard would observe the competitor's table,
+    # take its `continue` branch, and never reach the CREATE at all -- a test
+    # that passes with the fix reverted. It did, until this was corrected.
+    real_execute = db._conn.execute
+    fired = []
+
+    async def racing_execute(sql, *args, **kwargs):
+        if "gainers_comparisons_legacy_prefix_v1 AS SELECT" in sql and not fired:
+            fired.append(sql)
+            await real_execute(
+                "CREATE TABLE gainers_comparisons_legacy_prefix_v1 AS "
+                "SELECT * FROM gainers_comparisons"
+            )
+        return await real_execute(sql, *args, **kwargs)
+
+    db._conn.execute = racing_execute
+    try:
+        out = await db.archive_legacy_prefix_comparisons()
+    finally:
+        db._conn.execute = real_execute
+
+    # Pin that the window was actually hit. A mutation run that never mutated
+    # and a killed mutant look identical without this.
+    assert fired, "the injected race never fired; this test proved nothing"
+
+    # The loser survives, and the winner's archive is intact and complete.
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM gainers_comparisons_legacy_prefix_v1"
+    )
+    assert (await cur.fetchone())[0] == 1
+    assert isinstance(out, dict)

@@ -80,7 +80,7 @@ number to appear in the table below.
 | 20260821 | cg_credit_ledger_v1 | durable CoinGecko monthly-credit accounting (attempts vs billable credits, per envelope); additive, no backfill |
 | 20260822 | signal_events_indexes_v1 | drop `idx_sig_events_type` (466 MB dead index), add `signal_events(created_at)`; index-only, no VACUUM bundled |
 | 20260823 | signal_first_seen_v1 | derived first-seen substrate (`signal_first_seen`) + grouped backfill, so consumers stop deriving `MIN(created_at)` from `signal_events` and are decoupled from its retention (ruling F) |
-| 20260824 | chain_identity_semantics_v1 | `chains_identity_semantics` + `chains_identity_tier` on the three comparison tables; stamps existing rows `legacy_prefix` as a MARKER ONLY, never recomputing their values, AND snapshots each table to `*_legacy_prefix_v1` — the trackers DELETE+re-INSERT by coin_id, so the marker alone would not survive a recompute (ruling C) |
+| 20260824 | chain_identity_semantics_v1 | `chains_identity_semantics` + `chains_identity_tier` on the three comparison tables; stamps existing rows `legacy_prefix` as a MARKER ONLY, never recomputing their values. The `*_legacy_prefix_v1` archives are taken by an UNGATED startup step, deliberately NOT by this migration — a one-shot migration would skip them on any DB that already applied it (ruling C) |
 | 20260825 | chain_identity_recompute_v1 | versioned derived store for RECOMPUTED legacy chain provenance; separate table, never an UPDATE of the archived rows (ruling C) |
 
 ## Notes / gaps

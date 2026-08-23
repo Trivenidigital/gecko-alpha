@@ -7910,12 +7910,93 @@ class Database:
             names = {r[0] for r in await cur.fetchall()}
             if table not in names or archive in names:
                 continue
-            await self._conn.execute(f"CREATE TABLE {archive} AS SELECT * FROM {table}")
+            # IF NOT EXISTS is load-bearing, not decoration. The
+            # `sqlite_master` check above and this CREATE are separated by an
+            # await, and on the FIRST boot after deploy several processes call
+            # initialize() on this database at once -- pipeline, dashboard and
+            # a handful of cron entry points. Both can observe "archive absent"
+            # and both proceed; without this the loser raises
+            # "table ... already exists" straight out of initialize(), which no
+            # caller catches. Concurrent startup migrations have taken this box
+            # down before.
+            await self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {archive} AS SELECT * FROM {table}"
+            )
             cur = await self._conn.execute(f"SELECT COUNT(*) FROM {archive}")
             out[archive] = (await cur.fetchone())[0]
         if out:
             await self._conn.commit()
         return out
+
+    #: Surfaces whose pre-cutover chains credit depends on the recompute
+    #: overlay, paired with the anchor column the overlay is correlated on.
+    _RECOMPUTE_SURFACES = (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    )
+
+    async def chain_identity_recompute_coverage_probe(self) -> dict[str, object]:
+        """Report whether the legacy-provenance overlay is actually populated.
+
+        This exists because of the specific failure this PR is meant to
+        PREVENT, not one it might cause. Nothing in the runtime writes
+        `chain_identity_recompute_v1` -- it is filled by an offline ops step
+        (`scripts/backfill_chain_identity_recompute.py`). So a deploy that
+        ships the code and skips the script leaves the overlay empty, and an
+        empty overlay is not a neutral state: every credit-bearing
+        `legacy_prefix` row fails `_chains_evidence_is_trusted` and silently
+        loses its chains credit. That IS the naive cutover -- the 341 -> 187
+        tier_high collapse -- arriving quietly, under green logs, looking
+        exactly like a real drop in detection quality.
+
+        Deploy-without-activate has bitten this project before, and the tell
+        each time was a table that was empty for a reason no alarm knew about.
+
+        `uncovered` counts credit-bearing legacy rows with no overlay row at
+        their own anchor -- the same anchor-matched correlation the trackers
+        use, so a row the trackers cannot join is a row this counts. Partial
+        coverage is expected and fine (history genuinely runs out); ZERO
+        coverage against a non-zero population is the alarm.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM chain_identity_recompute_v1"
+        )
+        overlay_rows = (await cur.fetchone())[0]
+
+        credit_bearing = 0
+        uncovered = 0
+        for table, anchor in self._RECOMPUTE_SURFACES:
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} "
+                "WHERE chains_identity_semantics = 'legacy_prefix' "
+                "AND detected_by_chains = 1"
+            )
+            credit_bearing += (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                "WHERE c.chains_identity_semantics = 'legacy_prefix' "
+                "AND c.detected_by_chains = 1 "
+                "AND NOT EXISTS (SELECT 1 FROM chain_identity_recompute_v1 AS r "
+                "  WHERE r.source_table = ? AND r.source_row_id = c.id "
+                f"  AND r.historical_anchor = c.{anchor})",
+                (table,),
+            )
+            uncovered += (await cur.fetchone())[0]
+
+        # Distinguish the two failure shapes. `not_activated` is the deploy
+        # error -- actionable, one command fixes it. A partially-covered
+        # overlay is the expected steady state and must NOT page.
+        not_activated = credit_bearing > 0 and overlay_rows == 0
+        return {
+            "overlay_rows": overlay_rows,
+            "credit_bearing_legacy_rows": credit_bearing,
+            "uncovered": uncovered,
+            "not_activated": not_activated,
+        }
 
     async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:
         """Give any unmarked comparison row its `legacy_prefix` stamp.
