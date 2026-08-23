@@ -9,6 +9,7 @@ Exit codes are the contract the shell wrapper reads, so they are what gets
 asserted: 0 healthy / 1 recovering nothing / 2 cannot run.
 """
 
+import os
 import sqlite3
 import subprocess
 import sys
@@ -35,8 +36,13 @@ def _build(
     population=1,
     semantics="legacy_prefix",
     canonical_lead=8740.0,
+    at=None,
+    checkpoint=True,
 ):
-    db = tmp_path / "scout.db"
+    # `at` lets a test build the fixture at an explicit path (needed to make
+    # one the script's LIVE_DB); `checkpoint=False` leaves rows in the WAL,
+    # which is what distinguishes a mode=ro open from an immutable one.
+    db = Path(at) if at else tmp_path / "scout.db"
     conn = sqlite3.connect(db)
     # WAL, explicitly. A `mode=ro` open creates no sidecars against a DELETE-mode
     # database, so the sidecar assertion below would pass vacuously -- it could
@@ -87,6 +93,8 @@ def _build(
                 ),
             )
     conn.commit()
+    if checkpoint:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
     return db
 
@@ -363,3 +371,62 @@ def test_a_healthy_rate_at_the_high_water_mark_does_not_page(tmp_path):
 
     assert r.returncode == 0, r.stdout
     assert "COLLAPSED" not in r.stdout
+
+
+def test_a_dotdot_spelling_of_the_live_db_still_sees_WAL_rows(tmp_path, monkeypatch):
+    """`.resolve()` is a real behaviour difference, and it was unpinned.
+
+    Plain `Path` equality normalises `.` and `//` but not `..`, so the
+    documented invocation from the deploy directory misclassified the LIVE
+    database as non-live. The consequence is not cosmetic: non-live means
+    `immutable=1`, which IGNORES the WAL — so rows committed but not yet
+    checkpointed are invisible and the alarm reports a stale all-clear.
+
+    Asserted on that consequence rather than on `Path.resolve()` agreeing with
+    itself, which is a property of pathlib and not of this script. The
+    backfill's twin of this function got tests; this copy did not.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("wd_resolve", SCRIPT)
+    wd = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wd)
+
+    live = tmp_path / "gecko-alpha" / "scout.db"
+    live.parent.mkdir(parents=True)
+    # Population rows in the MAIN file, overlay rows in the WAL. That split is
+    # what makes the test discriminate: `immutable=1` ignores the WAL, so a
+    # misclassified live database sees the population but none of the recovery.
+    # The first version put both in the main file and passed with `.resolve()`
+    # removed.
+    _build(tmp_path, overlay_status=None, population=3, at=live)
+    keeper = sqlite3.connect(live)
+    keeper.execute("PRAGMA journal_mode=WAL")
+    for i in range(3):
+        keeper.execute(
+            "INSERT INTO chain_identity_recompute_v1 VALUES "
+            "('gainers_comparisons', ?, ?, ?, 'verified_canonical', 8740.0, "
+            "'chain_identity_recompute_v1')",
+            (7000 + i, f"coin-{i}", ANCHOR),
+        )
+    keeper.commit()  # committed, NOT checkpointed -- lives in the -wal
+    monkeypatch.setattr(wd, "LIVE_DB", str(live))
+
+    dotdot = str(live.parent / ".." / "gecko-alpha" / "scout.db")
+    assert Path(dotdot) != Path(str(live)), "fixture is not exercising `..`"
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--db", dotdot, "--gate-minutes", "1440"])
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = wd.main()
+    out = buf.getvalue()
+
+    keeper.close()
+    assert "3 of 3" in out, (
+        f"the `..` spelling was treated as non-live and opened immutable=1, "
+        f"hiding the uncheckpointed WAL rows: {out!r}"
+    )
+    assert rc == 0

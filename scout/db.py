@@ -8260,7 +8260,13 @@ class Database:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                 (archive,),
             )
-            unarchivable = 0
+            # Archive ABSENT means no row has an archived twin -- every one
+            # of them is unarchivable, not zero of them. The checker learned
+            # this and the probe did not, so on the same database the
+            # runbook's own decision rule ("credit_recovered 0 and
+            # unarchivable == population means design limit, not incident")
+            # returned INCIDENT from journald and DESIGN LIMIT from Telegram.
+            unarchivable = pop
             if await cur.fetchone():
                 cur = await self._conn.execute(
                     f"SELECT COUNT(*) FROM {table} AS c "
@@ -8303,11 +8309,20 @@ class Database:
                 continue  # too small to distinguish a collapse from noise
             rate = rec / pop
             cur = await self._conn.execute(
-                "SELECT best_rate FROM recompute_coverage_baseline WHERE source_table = ?",
+                "SELECT best_rate, population FROM recompute_coverage_baseline "
+                "WHERE source_table = ?",
                 (table,),
             )
             row = await cur.fetchone()
             best = row[0] if row else None
+            # A mark measured against a much SMALLER population is not
+            # comparable to today's. The rate is a ratio, so a transiently
+            # small sample can carry a high one -- and then a return to the
+            # normal population reads as a collapse. That false page is how a
+            # brand-new alarm earns a mute in its first week. Treat such a mark
+            # as absent and let this observation re-establish it.
+            if row is not None and row[1] * 2 < pop:
+                best = None
             v["rate"] = round(rate, 4)
             # Report the mark IN FORCE AFTER this observation, not the one
             # before it -- otherwise the first run reports None for a mark it

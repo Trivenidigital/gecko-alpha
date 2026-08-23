@@ -560,12 +560,18 @@ async def test_a_lead_EXACTLY_at_the_gate_counts_as_recovered(db):
     assert probe["not_recovering"] is False
 
 
-async def _bulk(db, n, recovered):
-    """n credit-bearing gainers rows, `recovered` of them with a verified overlay."""
+async def _bulk(db, n, recovered, prefix="bulk"):
+    """n credit-bearing gainers rows, `recovered` of them with a verified overlay.
+
+    `prefix` exists because the overlay correlates on coin_id: two batches
+    sharing coin_ids would let the first batch's overlay rows satisfy the
+    second batch's rows, so the recovered count would not be what the caller
+    asked for.
+    """
     for i in range(n):
-        row_id = await _credit_bearing_legacy_row(db, f"bulk-{i}")
+        row_id = await _credit_bearing_legacy_row(db, f"{prefix}-{i}")
         if i < recovered:
-            await _overlay_row(db, row_id, f"bulk-{i}", ANCHOR)
+            await _overlay_row(db, row_id, f"{prefix}-{i}", ANCHOR)
 
 
 async def test_a_COLLAPSE_in_recovery_rate_pages_even_though_it_is_not_zero(db):
@@ -651,3 +657,54 @@ async def test_the_high_water_mark_never_lowers_itself(db):
         "WHERE source_table='gainers_comparisons'"
     )
     assert (await cur.fetchone())[0] == 0.6, "the mark followed the degradation down"
+
+
+async def test_a_mark_from_a_much_smaller_population_does_not_false_page(db):
+    """A rate measured on a small sample is not comparable to a large one.
+
+    If the first observation lands while the population is transiently small —
+    mid-migration, mid-backfill — it can carry a high rate. A return to the
+    normal population then reads as a collapse, and a false page in an alarm's
+    first week is how it earns a mute.
+    """
+    await _bulk(db, 25, 25)  # small population, perfect recovery
+    first = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert first["per_surface"]["gainers_comparisons"]["best_rate"] == 1.0
+
+    # The real population arrives at a normal rate that is nonetheless FAR
+    # below the small sample's — 45/225 = 0.20 against a mark of 1.00, well
+    # under the 0.5 collapse threshold. Without the guard this pages.
+    await _bulk(db, 200, 20, prefix="second")
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["credit_bearing_legacy_rows"] == 225
+    assert probe["per_surface"]["gainers_comparisons"]["rate"] == 0.2
+    assert (
+        probe["collapsed_surfaces"] == []
+    ), "a mark from a 25-row sample was applied to a 225-row population"
+    assert probe["not_recovering"] is False
+
+
+async def test_an_absent_archive_makes_every_row_unarchivable(db):
+    """Probe and watchdog must agree, or the runbook's rule is undecidable.
+
+    "credit_recovered is 0 and unarchivable equals the population" is the
+    documented test for design-limit-versus-incident. With the archive absent
+    the checker reported `unarchivable = population` while the probe reported
+    0, so the same database answered INCIDENT from journald and DESIGN LIMIT
+    from Telegram.
+    """
+    for i in range(3):
+        await _credit_bearing_legacy_row(db, f"orphan-{i}")
+    await db._conn.execute("DROP TABLE gainers_comparisons_legacy_prefix_v1")
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["credit_bearing_legacy_rows"] == 3
+    assert probe["credit_recovered"] == 0
+    assert (
+        probe["unarchivable"] == 3
+    ), "the probe reported 0 unarchivable with no archive to be archived in"
+    assert probe["not_recovering"] is True
