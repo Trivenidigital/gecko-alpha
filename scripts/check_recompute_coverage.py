@@ -54,7 +54,15 @@ def main() -> int:
     ap.add_argument("--gate-minutes", type=float, default=DEFAULT_GATE_MINUTES)
     args = ap.parse_args()
 
-    live = Path(args.db) == Path(LIVE_DB)
+    # `.resolve()` on both sides: plain Path equality normalises `.` and `//`
+    # but not `..`, and misses a relative spelling entirely -- so running from
+    # the deploy directory would classify the LIVE database as non-live, open
+    # it `immutable=1`, and hide uncheckpointed WAL rows. That is a stale
+    # all-clear from the alarm, which is the direction that matters here.
+    try:
+        live = Path(args.db).resolve() == Path(LIVE_DB).resolve()
+    except OSError:
+        live = False
     # Check existence explicitly. `immutable=1` on a MISSING file does not
     # error -- SQLite opens an empty database, so every table looks absent and
     # this script reported "schema not deployed yet" with exit 0. A missing or
@@ -114,6 +122,7 @@ def main() -> int:
         recovered = 0
         detail = []
         dark: list[str] = []
+        unarchivable = 0
         placeholders = ",".join("?" * len(CREDIT_BEARING))
         for table, anchor in SURFACES:
             untrusted = (
@@ -134,8 +143,31 @@ def main() -> int:
                 "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
                 (table, *CREDIT_BEARING, args.gate_minutes),
             ).fetchone()[0]
+            # Rows with no archived twin: written after the archives were
+            # taken, so the backfill can never reach them. Surfaced IN THE
+            # ALERT, not only in the runbook -- an unfixable page that reads
+            # "run the backfill" sends the operator to a remedy that cannot
+            # work, and that is how an alarm earns a mute.
+            unarch = 0
+            try:
+                unarch = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} AS c WHERE "
+                    "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
+                    "!= 'canonical_v1' AND c.detected_by_chains = 1 "
+                    f"AND NOT EXISTS (SELECT 1 FROM {table}_legacy_prefix_v1 AS a "
+                    f"  WHERE a.coin_id = c.coin_id AND a.{anchor} = c.{anchor})"
+                ).fetchone()[0]
+            except sqlite3.Error:
+                # Archive absent, so NO row has an archived twin -- every one
+                # of them is unarchivable. The first version wrote `pass` under
+                # a comment saying exactly this and then left the count at 0,
+                # which would have told the operator to re-run a backfill that
+                # had nothing to read.
+                unarch = pop
+
             population += pop
             recovered += rec
+            unarchivable += unarch
             detail.append(f"{table}={rec}/{pop}")
             # PER SURFACE. A global "recovered nothing" is satisfied by one
             # healthy surface while the others sit stripped -- reachable
@@ -155,14 +187,21 @@ def main() -> int:
         print(f"no pre-cutover chains credit to recover ({summary})")
         return 0
     if dark:
+        remedy = (
+            "Run scripts/backfill_chain_identity_recompute.py --apply"
+            if unarchivable < population
+            else "THE BACKFILL CANNOT HELP: every row post-dates the archives"
+        )
         print(
             f"overlay recovering NOTHING on {', '.join(dark)}: "
             f"{recovered} of {population} pre-cutover chains detections keep "
-            f"their credit ({summary}). Run "
-            "scripts/backfill_chain_identity_recompute.py --apply"
+            f"their credit, {unarchivable} unarchivable ({summary}). {remedy}"
         )
         return 1
-    print(f"recovered {recovered} of {population} ({summary})")
+    print(
+        f"recovered {recovered} of {population}, "
+        f"{unarchivable} unarchivable ({summary})"
+    )
     return 0
 
 

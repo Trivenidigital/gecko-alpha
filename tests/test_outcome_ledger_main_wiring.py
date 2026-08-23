@@ -240,6 +240,7 @@ async def test_hourly_maintenance_runs_the_recompute_coverage_probe(
     settings.DEX_INSTRUMENTATION_ENABLED = False
     settings.NARRATIVE_ENABLED = False
     mock_db.get_unchecked_alerts = AsyncMock(return_value=[])
+    settings.CONVICTION_EARLY_LEAD_MINUTES = 2880
     mock_db.chain_identity_recompute_coverage_probe = AsyncMock(
         return_value={
             "overlay_rows": 0,
@@ -255,7 +256,14 @@ async def test_hourly_maintenance_runs_the_recompute_coverage_probe(
     with patch("scout.main.label_pending", new_callable=AsyncMock, return_value={}):
         await _run_hourly_maintenance(mock_db, mock_session, settings, logger)
 
-    mock_db.chain_identity_recompute_coverage_probe.assert_awaited_once()
+    # Awaited WITH THE LIVE GATE, not merely awaited. Deleting the kwarg makes
+    # the probe fall back to its own `gate_minutes: float = 1440.0` default and
+    # every test still passes -- the whole gate-drift fix, unpinned. Same shape
+    # as the earlier mutants where dropping the escalation call survived
+    # everything.
+    mock_db.chain_identity_recompute_coverage_probe.assert_awaited_once_with(
+        gate_minutes=float(settings.CONVICTION_EARLY_LEAD_MINUTES)
+    )
 
     # And the ESCALATION fired -- not merely the unconditional info line.
     escalations = [
@@ -289,6 +297,7 @@ async def test_hourly_maintenance_does_NOT_escalate_when_credit_is_recovering(
     settings.DEX_INSTRUMENTATION_ENABLED = False
     settings.NARRATIVE_ENABLED = False
     mock_db.get_unchecked_alerts = AsyncMock(return_value=[])
+    settings.CONVICTION_EARLY_LEAD_MINUTES = 4320
     mock_db.chain_identity_recompute_coverage_probe = AsyncMock(
         return_value={
             "overlay_rows": 900,

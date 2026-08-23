@@ -521,3 +521,32 @@ async def test_an_archived_row_is_not_counted_unarchivable(db):
     assert probe["unarchivable"] == 0
     assert probe["credit_recovered"] == 1
     assert probe["not_recovering"] is False
+
+
+async def test_a_lead_EXACTLY_at_the_gate_counts_as_recovered(db):
+    """The boundary that defines credit, on the shared predicate.
+
+    `cross_surface` skips when `lead_val < early_lead`, so a lead exactly equal
+    to the gate DOES earn credit. A probe using `>` would report that row lost
+    while the reader grants it — the two halves disagreeing about the one
+    number the whole alarm is built on.
+    """
+    row_id = await _credit_bearing_legacy_row(db, "exactly-on-the-gate")
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('gainers_comparisons', ?, 'exactly-on-the-gate', 'X', ?,
+                   1, 8740.0, 1, 1440.0, 'canonical_id', 'verified_canonical',
+                   'v1', ?)""",
+        (row_id, ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert (
+        probe["credit_recovered"] == 1
+    ), "a lead exactly on the gate was reported lost; cross_surface grants it"
+    assert probe["not_recovering"] is False

@@ -17,6 +17,7 @@ from scout.db import Database
 from scout.identity import CANONICAL_SEMANTICS, LEGACY_SEMANTICS
 from scout.identity_recompute import (
     CREDIT_BEARING,
+    STATUS_ALIAS_NOT_VERIFIABLE,
     STATUS_AMBIGUOUS,
     STATUS_CANONICAL_SUB_GATE,
     STATUS_INDETERMINATE,
@@ -635,7 +636,7 @@ async def test_an_alias_win_is_NOT_verified_under_censored_history(db):
         db._conn, gate_minutes=GATE, coverage_intervals=[]
     )
     assert (
-        await _status(db, "terra-luna-2") == STATUS_CANONICAL_SUB_GATE
+        await _status(db, "terra-luna-2") == STATUS_ALIAS_NOT_VERIFIABLE
     ), "an alias-tier win was verified while a canonical token could be hidden"
 
 
@@ -860,9 +861,13 @@ async def test_an_ALIAS_UNIQUE_win_is_never_a_verified_positive(db):
     # branch promoted on. It must still not be a verified positive.
     assert lead is not None and lead >= 1440.0
     assert (
-        status == STATUS_CANONICAL_SUB_GATE
+        status == STATUS_ALIAS_NOT_VERIFIABLE
     ), "an alias win was recorded as a VERIFIED positive on censored history"
     assert status not in CREDIT_BEARING
+    # And the status names the REAL reason. `canonical_below_gate_indeterminate`
+    # asserted a comparison never performed for this tier: this lead is FIVE
+    # TIMES the gate, and that label called it "below" it.
+    assert lead == pytest.approx(5 * 1440.0)
 
 
 async def test_reconciliation_report_names_its_denominators(db):
@@ -1002,3 +1007,69 @@ async def test_a_crashed_replay_names_the_surfaces_it_never_reached(db):
         "losers_comparisons",
         "trending_comparisons",
     ]
+
+
+async def test_an_all_unjoinable_archive_is_NOT_reported_as_a_crash(db):
+    """A clean run that correctly writes nothing must not look like a crash.
+
+    `surfaces_never_written` says "the replay died before reaching it". An
+    archive whose every row lacks a join key is replayed to completion and
+    writes nothing — the exact ambiguity the field was added to remove,
+    inverted.
+    """
+    await _legacy(db, "", "NOKEY1")
+    await _legacy(db, "", "NOKEY2")
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 2
+    assert rep["unjoinable"] == 2
+    assert rep["stored"] == 0
+    assert (
+        rep["surfaces_never_written"] == []
+    ), "a completed replay that correctly wrote nothing was reported as a crash"
+
+
+async def test_an_EMPTY_or_all_canonical_archive_is_not_reported_as_a_crash(db):
+    """The other two shapes that produce stored == 0 legitimately."""
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_losers_at, detected_by_chains,
+            chains_lead_minutes, is_gap, chains_identity_semantics, created_at)
+           VALUES (1, 'already', 'A', 'A', ?, 1, 5000.0, 0, 'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    # gainers archive is empty; losers holds only canonical_v1 rows.
+    assert rep["surfaces_never_written"] == []
+
+
+async def test_a_row_under_a_FOREIGN_semantics_version_is_not_counted_as_stored(db):
+    """`stored` is scoped by version, and that scoping needs a test.
+
+    Without it a v1 report counts v2 rows and reports a surface as written
+    when this version wrote nothing.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('gainers_comparisons', 1, 'has-history', 'HH', ?, 1, 100.0,
+                   1, 9000.0, 'canonical_id', 'verified_canonical',
+                   'some_future_version', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["stored"] == 0, "a foreign-version row was counted as this version's"
+    assert rep["surfaces_never_written"] == ["gainers_comparisons"]

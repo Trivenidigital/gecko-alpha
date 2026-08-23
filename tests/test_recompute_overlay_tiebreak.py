@@ -170,3 +170,46 @@ async def test_status_and_lead_come_from_the_SAME_overlay_row(
         f"{row['chains_canonical_lead']!r} -- the two subqueries selected "
         "different overlay rows"
     )
+
+
+@pytest.mark.parametrize("table,anchor_col,reader", SURFACES)
+async def test_the_reader_picks_the_row_the_PROBE_counted(
+    db, table, anchor_col, reader
+):
+    """The probe and the reader must not disagree about the same data.
+
+    The probe asks `EXISTS(any verified row whose lead clears the gate)`. The
+    reader takes ONE row via `ORDER BY ... LIMIT 1` and then tests THAT row's
+    lead. Ordering only on status and row id left `canonical_lead` uncovered,
+    so with two verified rows at one key the reader could take the sub-gate one
+    and refuse credit the probe had already counted as recovered.
+
+    The lower row id deliberately carries the sub-gate lead, so a tie-break
+    that reaches for the id first picks the wrong row.
+    """
+    await db._conn.execute(
+        f"""INSERT INTO {table}
+            (coin_id, symbol, name, {anchor_col}, detected_by_chains,
+             chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+            VALUES ('two-verified', 'TV', 'TV', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+        (ANCHOR, ANCHOR),
+    )
+    await _overlay(db, table, "two-verified", 1, "verified_canonical", 999.0)
+    await _overlay(db, table, "two-verified", 2, "verified_canonical", 9000.0)
+    await db._conn.commit()
+
+    rows = await reader(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "two-verified")
+
+    assert row["chains_canonical_lead"] == pytest.approx(9000.0), (
+        "the reader took the sub-gate row; the probe's EXISTS would have "
+        "counted this coin as recovered while the reader refuses it"
+    )
+
+    from scout.config import Settings
+    from scout.conviction import cross_surface_conviction
+
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="x", TELEGRAM_CHAT_ID="x", ANTHROPIC_API_KEY="x"
+    )
+    assert "chains" in cross_surface_conviction(row, settings).contributing

@@ -240,3 +240,32 @@ def test_apply_that_recovers_nothing_exits_3(tmp_path, monkeypatch):
     rc = asyncio.run(mod.main())
 
     assert rc == 3, "an --apply that recovered nothing reported success"
+
+
+def test_is_live_survives_relative_and_dotdot_spellings(tmp_path, monkeypatch):
+    """Plain `Path` equality normalises `.` and `//` but not `..`, and misses a
+    relative spelling entirely.
+
+    The previous test asserted only two absolute canonical spellings, which
+    plain equality already handles — so it could not see the defect and a
+    mutant dropping `.resolve()` survived the whole suite. The documented
+    invocation is `cd /root/gecko-alpha && ... --db scout.db`, which is exactly
+    the spelling that missed, opening the LIVE database `immutable=1` and
+    hiding uncheckpointed WAL rows.
+    """
+    import backfill_chain_identity_recompute as mod
+
+    live = tmp_path / "gecko-alpha" / "scout.db"
+    live.parent.mkdir(parents=True)
+    _make_wal_db(live)
+    monkeypatch.setattr(mod, "LIVE_DB", str(live))
+
+    monkeypatch.chdir(live.parent)
+    assert mod._is_live("scout.db") is True, "relative spelling of the live DB missed"
+    assert mod._is_live("./scout.db") is True
+    assert mod._is_live(str(live.parent / ".." / "gecko-alpha" / "scout.db")) is True
+    assert mod._is_live(str(live).replace("scout.db", "//scout.db")) is True
+
+    other = tmp_path / "gecko-alpha" / "backup.db"
+    _make_wal_db(other)
+    assert mod._is_live(str(other)) is False, "a different file resolved as live"

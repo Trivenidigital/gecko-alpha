@@ -68,15 +68,19 @@ the failure class this whole subsystem exists to close. The timer ships in the
 repo for that reason.
 
 ```bash
-install -m 0755 scripts/recompute-coverage-watchdog.sh /usr/local/bin/
+chmod +x scripts/recompute-coverage-watchdog.sh
 install -m 0644 scripts/recompute-coverage-watchdog.{timer,service} /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now recompute-coverage-watchdog.timer
 systemctl list-timers recompute-coverage-watchdog.timer   # VERIFY it is armed
 ```
 
-Scripts run from `/usr/local/bin`, so `git pull` alone deploys **nothing**
-here. That split has already caused a deploy that shipped nothing on this box.
+The unit runs the script **from the repo**, deliberately. Installing the `.sh`
+to `/usr/local/bin` while it invokes the `.py` from the repo splits the
+watchdog across two deploy paths — the python half updates on `git pull`, the
+shell half needs a re-`install` and silently does not deploy. That trap is
+already in this project's history with the backup scripts. Only the unit files
+are installed, and those change rarely.
 
 ### Exit contract
 
@@ -106,6 +110,7 @@ failure but 2–6 surface in `systemctl status`.
 |---|---|---|
 | `verified_canonical` | canonical identity confirms the detection | **yes** |
 | `canonical_below_gate_indeterminate` | canonical match, reconstructed lead under the gate — *not* a proven negative (left-censoring) | no |
+| `alias_tier_not_verifiable` | matched only on symbol equality; the TIER cannot be verified under censored history, whatever the lead | no |
 | `indeterminate_history` | the anchor falls in a coverage gap; absence of a match is not evidence of absence | no |
 | `verified_prefix_only` | demonstrated prefix collision — the lead was fabricated | no |
 | `no_legacy_credit` | never held chains credit; outside the population | n/a |

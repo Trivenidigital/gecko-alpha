@@ -365,6 +365,7 @@ class Database:
             # Ungated by the migration marker: the migration early-returns
             # forever once applied, and this is the IRREVERSIBLE half.
             await self._migrate_chain_identity_recompute_v1()
+            await self._migrate_chain_identity_recompute_pk_v2()
             await self.archive_legacy_prefix_comparisons()
             await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
@@ -7766,6 +7767,125 @@ class Database:
             (token_id, created_at, now),
         )
 
+    async def _migrate_chain_identity_recompute_pk_v2(self) -> None:
+        """Put `semantics_version` in the overlay's PRIMARY KEY.
+
+        The v1 table stored the version as a plain column and keyed on
+        (source_table, source_row_id). With `INSERT OR REPLACE` that made the
+        "versioned derived store" able to hold exactly ONE version: replaying
+        under a bumped `RECOMPUTE_SEMANTICS` overwrote the v1 verdict in place
+        and the earlier evidence was simply gone.
+
+        That is the shape ruling C forbids -- "only as a distinct derived
+        dataset with explicit semantic version, not an UPDATE that destroys the
+        previous evidence" -- deferred one level. The archive/overlay split was
+        built so the archive would never be rewritten, and it is not; the
+        overlay then reproduced the same defect against itself.
+
+        Latent when found (one version exists, so nothing had been destroyed),
+        and it goes live the first time anyone bumps the constant -- which is
+        the normal way this table is meant to evolve. Cheapest to fix now, for
+        exactly that reason.
+
+        Rebuild rather than ALTER: SQLite cannot add a column to a PRIMARY KEY
+        in place.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_pk_v2"
+        schema_version = 20260826
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                return
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='chain_identity_recompute_v1'"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return
+        # Already the v2 shape (a fresh install creates it directly). Detected
+        # from the stored DDL rather than from a marker, so a database that
+        # applied the earlier build is upgraded and a fresh one is left alone.
+        ddl = " ".join((row[0] or "").split())
+        if "semantics_version)" in ddl:
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.commit()
+            return
+
+        try:
+            await conn.execute("""
+                CREATE TABLE chain_identity_recompute_v1_pk2 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO chain_identity_recompute_v1_pk2 "
+                "SELECT * FROM chain_identity_recompute_v1"
+            )
+            await conn.execute("DROP TABLE chain_identity_recompute_v1")
+            await conn.execute(
+                "ALTER TABLE chain_identity_recompute_v1_pk2 "
+                "RENAME TO chain_identity_recompute_v1"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, datetime('now'), ?)",
+                (
+                    schema_version,
+                    "chain_identity_recompute PK includes semantics_version",
+                ),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_pk_v2_migration_complete")
+        except Exception:
+            await conn.rollback()
+            _log.exception("chain_identity_recompute_pk_v2_migration_rollback")
+            raise
+
     async def _migrate_chain_identity_recompute_v1(self) -> None:
         """Versioned derived store for recomputed legacy provenance (ruling C).
 
@@ -7775,8 +7895,12 @@ class Database:
         evidence", so this table carries the recomputed answer beside the
         archive rather than rewriting it.
 
-        Keyed on (source_table, source_row_id) against the IMMUTABLE archive, so
-        a rerun REPLACEs in place and cannot double-count.
+        Keyed on (source_table, source_row_id, semantics_version) against the
+        IMMUTABLE archive, so a rerun of the SAME version REPLACEs in place and
+        cannot double-count, while a DIFFERENT version lands beside the old
+        verdict instead of destroying it. See
+        `_migrate_chain_identity_recompute_pk_v2` for why the version had to be
+        in the key rather than merely stored on the row.
         """
         import structlog
 
@@ -7816,7 +7940,21 @@ class Database:
                     evidence_status     TEXT NOT NULL,
                     semantics_version   TEXT NOT NULL,
                     computed_at         TEXT NOT NULL,
-                    PRIMARY KEY (source_table, source_row_id)
+                    -- semantics_version IS PART OF THE KEY. Without it the
+                    -- "versioned derived store" could hold exactly one
+                    -- version: `INSERT OR REPLACE` keyed on
+                    -- (source_table, source_row_id) meant a v2 replay
+                    -- OVERWROTE the v1 verdict in place, destroying the
+                    -- evidence it was supposed to sit beside. That is the
+                    -- shape ruling C forbids -- "not an UPDATE that destroys
+                    -- the previous evidence" -- deferred one level, from the
+                    -- archive to the overlay. The archive is genuinely
+                    -- immutable; the derived store was not versioned in the
+                    -- only sense that matters.
+                    --
+                    -- Re-running the SAME version still replaces, so the
+                    -- backfill stays idempotent.
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
                 )
                 """)
             await conn.execute(

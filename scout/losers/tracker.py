@@ -351,6 +351,16 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
                     -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
                              WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
                              -- Deterministic TOTAL order. These are two
                              -- INDEPENDENT scalar subqueries, and with only the
                              -- CASE to sort by, rows sharing a CASE value are
@@ -392,6 +402,16 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
                     -- prefix-only sibling.
                     ORDER BY CASE cir.evidence_status
                              WHEN 'verified_canonical' THEN 0 ELSE 1 END,
+                             -- canonical_lead DESC comes BEFORE the row id.
+                             -- The probe asks EXISTS(any verified row whose
+                             -- lead clears the gate); the reader takes ONE row
+                             -- and then tests THAT row's lead. Ordering only
+                             -- on the status and the id left a second term the
+                             -- ordering does not cover, so with two verified
+                             -- rows at one key the reader could pick the
+                             -- sub-gate one and refuse credit the probe had
+                             -- already counted as recovered.
+                             cir.canonical_lead DESC,
                              -- Deterministic TOTAL order. These are two
                              -- INDEPENDENT scalar subqueries, and with only the
                              -- CASE to sort by, rows sharing a CASE value are

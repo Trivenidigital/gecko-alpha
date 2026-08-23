@@ -32,7 +32,8 @@ pytestmark = pytest.mark.skipif(
 
 def _run(tmp_path, *, app_dir=None, python=None, checker_exit=0, env_file=True):
     app = Path(app_dir) if app_dir else tmp_path / "app"
-    if app_dir is None:
+    if app_dir is None or not (app / ".env").exists():
+        app.mkdir(parents=True, exist_ok=True)
         (app / "scripts").mkdir(parents=True, exist_ok=True)
         (app / "scripts" / "check_recompute_coverage.py").write_text(
             "", encoding="utf-8"
@@ -60,6 +61,32 @@ def _run(tmp_path, *, app_dir=None, python=None, checker_exit=0, env_file=True):
     return subprocess.run(
         ["bash", str(WRAPPER)], capture_output=True, text=True, env=env
     )
+
+
+def test_it_runs_against_the_REAL_production_env_shape(tmp_path):
+    """The prod .env has no CONVICTION_EARLY_LEAD_MINUTES. The value is a
+    Python default.
+
+    Sourcing the gate with `grep ... | tail -1 | cut` under `set -euo pipefail`
+    meant grep exited 1 on that file, pipefail propagated it, and `set -e`
+    killed the script before the check ran -- printing NOTHING and exiting 1,
+    which is this wrapper's own alarm code. Dead while looking like it fired,
+    in the alarm that exists because nothing on that box reads journald.
+    """
+    app = tmp_path / "app"
+    (app / "scripts").mkdir(parents=True, exist_ok=True)
+    (app / "scripts" / "check_recompute_coverage.py").write_text("", encoding="utf-8")
+    # Verbatim the production shape: conviction settings present, gate absent.
+    (app / ".env").write_text(
+        "CONVICTION_THRESHOLD=75\nPAPER_CONVICTION_LOCK_ENABLED=true\n"
+        "TELEGRAM_BOT_TOKEN=\nTELEGRAM_CHAT_ID=\n",
+        encoding="utf-8",
+    )
+
+    r = _run(tmp_path, app_dir=str(app), checker_exit=0)
+
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "OK:" in r.stdout, "the wrapper produced no output at all"
 
 
 def test_a_missing_app_dir_is_not_confused_with_an_alarm(tmp_path):

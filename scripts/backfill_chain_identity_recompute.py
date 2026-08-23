@@ -47,6 +47,14 @@ SNAPSHOT_SOURCES = (
 LIVE_DB = "/root/gecko-alpha/scout.db"
 
 
+def _same_file(a: str, b: str) -> bool:
+    """Path identity that survives `..`, `//` and relative spellings."""
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def _is_live(path: str) -> bool:
     """Decides ONE thing: whether to open this path `mode=ro` or `immutable=1`.
 
@@ -65,10 +73,7 @@ def _is_live(path: str) -> bool:
     and silently under-resolves exactly the most recent anchors. Fewer
     resolutions look identical to less history.
     """
-    try:
-        return Path(path).resolve() == Path(LIVE_DB).resolve()
-    except OSError:
-        return False
+    return _same_file(path, LIVE_DB)
 
 
 def _history_table(path: str) -> tuple[str, str]:
@@ -328,7 +333,11 @@ async def main() -> int:
         except (sqlite3.Error, ValueError):
             continue
 
-    if args.apply and any(Path(args.db) == Path(src) for src in SNAPSHOT_SOURCES):
+    # `.resolve()`, matching `_is_live`. Plain Path equality misses a `..`
+    # spelling, and past that refusal `aiosqlite.connect` opens the snapshot
+    # READ-WRITE and plants sidecars beside a forensic file before the schema
+    # check declines. Two comparisons in this file; only one was hardened.
+    if args.apply and any(_same_file(args.db, src) for src in SNAPSHOT_SOURCES):
         print(
             f"REFUSING: {args.db} is a preserved forensic snapshot. --apply "
             "would write overlay rows into it. Point --db at the live "

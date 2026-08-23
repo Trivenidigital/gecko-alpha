@@ -21,12 +21,31 @@ PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 # The gate must match what the READERS use. `evidence_status` is a frozen
 # decision about the gate as it stood when the backfill ran; cross_surface
 # re-tests the lead against CONVICTION_EARLY_LEAD_MINUTES at scoring time.
-# Sourced from .env when present so raising the setting cannot leave the
-# alarm measuring the old threshold.
-GATE=1440
-if [[ -f "$ENV_FILE" ]]; then
-    env_gate="$(grep -E '^CONVICTION_EARLY_LEAD_MINUTES=' "$ENV_FILE" | tail -1 | cut -d= -f2)"
-    [[ -n "${env_gate:-}" ]] && GATE="$env_gate"
+#
+# ASK THE APPLICATION, do not parse .env. Two reasons, both found by running
+# this rather than reading it:
+#
+#   1. The earlier `grep ... | tail -1 | cut` died on the REAL production
+#      .env. That file has no CONVICTION_EARLY_LEAD_MINUTES -- the value is a
+#      Python default -- so grep exited 1, pipefail propagated it, and `set -e`
+#      killed the script before the check ran. It printed nothing and exited
+#      1, which is this wrapper's own ALARM code: dead while looking like it
+#      fired, in the alarm that exists because nothing here reads journald.
+#
+#   2. Even fixed, .env is the wrong source. The value lives in
+#      scout/config.py, so a code change to that default would move the
+#      in-process probe via Settings while this kept a stale literal -- the
+#      same divergence the probe's gate re-check was added to remove, pushed
+#      down into the shell.
+#
+# `check_recompute_coverage.py` stays stdlib-only (it must run when the app is
+# broken); the WRAPPER does the asking, and falls back to the literal only if
+# the interpreter cannot answer.
+cd "$APP_DIR"
+GATE="$("$PYTHON" -c 'from scout.config import get_settings; print(get_settings().CONVICTION_EARLY_LEAD_MINUTES)' 2>/dev/null || true)"
+if [[ -z "${GATE:-}" ]]; then
+    echo "WARN: could not read CONVICTION_EARLY_LEAD_MINUTES from the app; using 1440" >&2
+    GATE=1440
 fi
 
 # Validate before `cd`. Under `set -euo pipefail` a failed `cd` exits 1 --
@@ -52,7 +71,6 @@ if [[ ! -x "$PYTHON" ]]; then
     exit 6
 fi
 
-cd "$APP_DIR"
 set +e
 result="$("$PYTHON" scripts/check_recompute_coverage.py --db "$DB_PATH"     --gate-minutes "$GATE" 2>&1)"
 status=$?

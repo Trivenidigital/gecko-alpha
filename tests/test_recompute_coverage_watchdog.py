@@ -243,3 +243,47 @@ def test_the_watchdog_pages_when_only_ONE_surface_is_dark(tmp_path):
     assert r.returncode == 1, r.stdout
     assert "losers_comparisons" in r.stdout
     assert "recovering NOTHING on" in r.stdout
+
+
+def test_the_alert_says_when_the_backfill_CANNOT_help(tmp_path):
+    """An unfixable page must not send the operator to a remedy that fails.
+
+    Rows written after the archives were taken can never be covered — the
+    archive step self-guards and never re-runs, and the backfill only reads
+    archives. Telling someone to re-run it is how an alarm earns a mute.
+    """
+    db = _build(tmp_path, overlay_status=None, population=3)
+    conn = sqlite3.connect(db)
+    # No archive table at all: every row post-dates it.
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "3 unarchivable" in r.stdout
+    assert "THE BACKFILL CANNOT HELP" in r.stdout
+
+
+def test_a_normal_page_still_points_at_the_backfill(tmp_path):
+    """The other direction: archived rows ARE recoverable, so say so."""
+    db = _build(tmp_path, overlay_status=None, population=2)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE gainers_comparisons_legacy_prefix_v1 "
+        "(id INTEGER, coin_id TEXT, appeared_on_gainers_at TEXT)"
+    )
+    for i in range(2):
+        conn.execute(
+            "INSERT INTO gainers_comparisons_legacy_prefix_v1 VALUES (?, ?, ?)",
+            (i + 1, f"coin-{i}", ANCHOR),
+        )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "0 unarchivable" in r.stdout
+    assert "--apply" in r.stdout
+    assert "CANNOT HELP" not in r.stdout

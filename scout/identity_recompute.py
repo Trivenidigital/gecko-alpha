@@ -105,6 +105,14 @@ STATUS_CANONICAL_SUB_GATE = "canonical_below_gate_indeterminate"
 #: that surplus away would move the design back toward the two outcomes the
 #: ruling rejected.
 STATUS_PREFIX_ONLY = "verified_prefix_only"
+#: An alias-tier (symbol-equality) win. Refused for a reason that has nothing
+#: to do with the gate: the TIER itself is not censoring-proof, because a
+#: hidden canonical-id token would outrank it and could carry a later
+#: first_seen. Stamping these `canonical_below_gate_indeterminate` asserted a
+#: comparison that was never performed -- an alias win at 32,400 minutes was
+#: labelled "below" a 1,440-minute gate. The information was recoverable from
+#: `identity_tier`, so nothing downstream was wrong; the label was just false.
+STATUS_ALIAS_NOT_VERIFIABLE = "alias_tier_not_verifiable"
 #: Two or more distinct tokens claim the identity; not an identity assertion.
 STATUS_AMBIGUOUS = "ambiguous_identity"
 #: History does not reach far enough back to decide either way.
@@ -198,7 +206,7 @@ def classify(
         # asymmetry is the point -- this branch manufactured a false POSITIVE,
         # granting unearned credit, where the same predicate's other uses
         # produce negatives and fail safe.
-        return STATUS_CANONICAL_SUB_GATE
+        return STATUS_ALIAS_NOT_VERIFIABLE
 
     # No canonical identity found.
     if not anchor_covered:
@@ -531,6 +539,19 @@ async def reconciliation_report(conn) -> dict[str, object]:
         pop = (await cur.fetchone())[0]
         out["population"] += pop
 
+        # Rows the replay classifies `unjoinable_row`: counted as a status,
+        # never written. Re-derived here from the archive so
+        # `surfaces_never_written` does not report a CLEAN run as a crash --
+        # an archive whose every row is unjoinable is replayed correctly and
+        # writes nothing, which is exactly what "the replay died" looked like.
+        cur = await conn.execute(
+            f"SELECT COUNT(*) FROM {archive} WHERE "
+            f"coin_id IS NULL OR coin_id = '' OR {anchor_col} IS NULL "
+            f"OR {anchor_col} = ''"
+        )
+        unjoinable = (await cur.fetchone())[0]
+        out["unjoinable"] = out.get("unjoinable", 0) + unjoinable
+
         skipped = 0
         if "chains_identity_semantics" in cols:
             cur = await conn.execute(
@@ -542,6 +563,7 @@ async def reconciliation_report(conn) -> dict[str, object]:
         per_surface[source_table] = {
             "population": pop,
             "skipped_canonical": skipped,
+            "unjoinable": unjoinable,
             "stored": 0,
         }
 
@@ -569,7 +591,10 @@ async def reconciliation_report(conn) -> dict[str, object]:
     out["surfaces_never_written"] = sorted(
         t
         for t, v in per_surface.items()
-        if v.get("population", 0) - v.get("skipped_canonical", 0) > 0
+        if v.get("population", 0)
+        - v.get("skipped_canonical", 0)
+        - v.get("unjoinable", 0)
+        > 0
         and v.get("stored", 0) == 0
     )
     return out
