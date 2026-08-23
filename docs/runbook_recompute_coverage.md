@@ -113,6 +113,8 @@ are installed, and those change rarely.
 
 Only exit 1 notifies. Everything else is a failure **of the watchdog**, which
 nothing else reports — so they are distinct codes rather than a shared one.
+That distinctness is asserted by test: 6 and 7 were the same code until it
+caught them.
 
 | code | meaning | Telegram |
 |---:|---|:--:|
@@ -122,7 +124,8 @@ nothing else reports — so they are distinct codes rather than a shared one.
 | 3 | `.env` missing | no |
 | 4 | Telegram credentials missing — the alarm fired and could not be delivered | no |
 | 5 | `APP_DIR` invalid | no |
-| 6 | interpreter missing, or the app cannot be imported to read the gate | no |
+| 6 | interpreter missing | no |
+| 7 | the app could not be imported to read the gate | no |
 
 Codes 5 and 6 exist because `cd "$APP_DIR"` under `set -euo pipefail` exits
 **1** — the same code the alarm path uses after a successful send. A dead

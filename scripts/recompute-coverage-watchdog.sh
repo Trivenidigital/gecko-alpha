@@ -29,8 +29,9 @@ PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 #
 # EXIT CONTRACT (documented in docs/runbook_recompute_coverage.md):
 #   0  healthy            5  APP_DIR invalid
-#   1  ALARM, Telegram    6  interpreter missing, or the app cannot be
-#   2  check could not run (WARN, no Telegram)   imported to read the gate
+#   1  ALARM, Telegram    6  interpreter missing
+#   2  check could not run (WARN, no Telegram)
+#   7  the app could not be imported to read the gate
 #   3  .env missing       4  Telegram credentials missing
 # Only 1 notifies. 2-6 are operator-visible failures of the watchdog itself.
 if [[ ! -d "$APP_DIR" ]]; then
@@ -90,7 +91,7 @@ if [[ -z "${GATE:-}" ]]; then
     # off an assumed threshold is the failure this whole file exists to
     # prevent.
     echo "FATAL: could not read CONVICTION_EARLY_LEAD_MINUTES from $APP_DIR" >&2
-    exit 6
+    exit 7
 fi
 
 set +e

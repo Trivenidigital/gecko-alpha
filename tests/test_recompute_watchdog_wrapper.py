@@ -32,8 +32,12 @@ pytestmark = pytest.mark.skipif(
 
 def _run(tmp_path, *, app_dir=None, python=None, checker_exit=0, env_file=True):
     app = Path(app_dir) if app_dir else tmp_path / "app"
-    if app_dir is None or not (app / ".env").exists():
-        app.mkdir(parents=True, exist_ok=True)
+    # NEVER create a caller-supplied app_dir. An earlier edit added a mkdir
+    # here so one test could supply its own .env, and it silently created the
+    # directory that `test_a_missing_app_dir...` exists to find MISSING --
+    # turning that test green against a wrapper that no longer detected the
+    # case at all.
+    if app_dir is None:
         (app / "scripts").mkdir(parents=True, exist_ok=True)
         (app / "scripts" / "check_recompute_coverage.py").write_text(
             "", encoding="utf-8"
@@ -145,7 +149,7 @@ def test_every_documented_exit_code_is_distinct():
     # one, which is the whole reason these codes exist.
     dupes = sorted({c for c in codes if codes.count(c) > 1})
     assert dupes == [], f"duplicate exit codes: {dupes}"
-    assert {0, 1, 2, 3, 4, 5, 6} >= set(codes), f"undocumented exit code in {codes}"
+    assert {0, 1, 2, 3, 4, 5, 6, 7} >= set(codes), f"undocumented exit code in {codes}"
 
 
 def test_it_refuses_rather_than_guessing_the_gate(tmp_path):
@@ -168,5 +172,5 @@ def test_it_refuses_rather_than_guessing_the_gate(tmp_path):
 
     r = _run(tmp_path, app_dir=str(app), python=str(py))
 
-    assert r.returncode == 6, (r.returncode, r.stdout, r.stderr)
+    assert r.returncode == 7, (r.returncode, r.stdout, r.stderr)
     assert "could not read CONVICTION_EARLY_LEAD_MINUTES" in r.stderr
