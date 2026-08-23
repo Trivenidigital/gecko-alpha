@@ -485,6 +485,43 @@ Worth noting they caught it by *declining credit twice in one message*,
 including for the three-readings column in §5c — which, had it stayed
 misattributed, would have made §5c fail inside its own worked example.
 
+## 5b-v. A reviewer's battery inherits the shape of the first defect they found
+
+The best generalisation in this review, contributed by the silent-failure
+reviewer as the rule behind both my warning to them and their own last finding:
+
+> A reviewer's battery inherits the shape of the first defect they found. The
+> defence is not more scenarios along the axis you know; it is asking which axis
+> the suite never varies.
+
+The evidence is three batteries, each blind in the shape of its own first catch:
+
+| reviewer | first defect found | axis their battery then never varied |
+|---|---|---|
+| ops safety | a mark being *lowered* | direction — every later scenario fell or held flat |
+| silent failure | *layer divergence* (probe vs checker) | surface — two-layer scenarios, one surface |
+| me | the seam itself | which arm exists at all (§5b-ii) |
+
+I warned the silent-failure slot about the first row's failure and they checked
+before defending — their battery *did* contain two rises, so the axis was not
+absent, but two incidental rises is not coverage. They built a dedicated rising
+battery (six shapes, all correct, including that the ratchet self-heals on the
+pass after a starved write), and then found **F3**: the suite is blind to
+*surface*. A mutant raising the mark only for gainers passes all 116 tests,
+while the real deploy sequence run against two surfaces shows trending frozen at
+the pre-backfill `0.0`, collapse silent, nothing red — the `6276d586` regression
+exactly, hiding on the surface most exposed to it.
+
+No live defect: the shipped classifier has no surface conditional, which is why
+the finding had to add one. It is ticketed
+(`BL-NEW-RECOMPUTE-SUITE-AXIS-COVERAGE`) rather than fixed here, because
+changing `tests/` changes what CI runs and every clearance in this tranche is
+measured on a tree without it.
+
+For this component the axes are **direction, surface, layer, durability of
+stored state.** The suite ranges over three of the four, and that sentence is
+the deliverable — not the count.
+
 ## 5c. The axis inventory — a step, not a principle
 
 Both reviewers and I independently articulated "a matrix built from the code's
