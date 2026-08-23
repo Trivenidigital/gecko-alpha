@@ -8144,7 +8144,7 @@ class Database:
     )
 
     async def _classify_coverage_mark(
-        self, source_table: str, row, pop: int
+        self, source_table: str, row, pop: int, rate: float
     ) -> tuple[str, float | None, dict | None]:
         """Decide what to do with a stored high-water mark. Three outcomes.
 
@@ -8155,7 +8155,30 @@ class Database:
           ``rearm``                   -- no usable mark; record today's rate.
           ``incomparable_unresolved`` -- it should go, but the DELETE failed and
                                          it is still there. Judge nothing.
-          ``compare``                 -- comparable; run the collapse check.
+          ``raise_mark``              -- comparable, and today IMPROVES it; the
+                                         ratchet rises.
+          ``compare``                 -- comparable, today does not improve it;
+                                         run the collapse check.
+
+        FOUR arms, not three, and the missing one cost a blocking round. The
+        boolean chain this replaced branched on TWO axes -- is the mark
+        comparable, and does today's rate improve it -- while the first version
+        of this taxonomy named only the first. The improvement axis then had no
+        arm to be unhandled in, so it vanished silently and every arm was still
+        "handled": the mark froze at the FIRST observation and could never rise.
+
+        In production that is worse than a mis-calibration. The probe is hourly
+        and the backfill is a manual post-deploy step, so the first observation
+        lands before any credit exists -- a mark of 0.0, which makes
+        ``rate < best * FRACTION`` unsatisfiable for every rate. Collapse
+        detection would have been off on every surface, permanently, from the
+        first pass after deploy.
+
+        The lesson generalises past this function: making an unhandled arm
+        unrepresentable only works for the axis the taxonomy names. When a
+        refactor replaces a boolean chain with a taxonomy, the check is not
+        whether every arm is handled -- it is whether every BEHAVIOUR of the
+        old code maps onto an arm.
 
         The incomparability test is a TRANSITION: the recorded population is
         below twice the judging floor AND today's is more than double it. The
@@ -8171,6 +8194,11 @@ class Database:
             recorded_pop < _COLLAPSE_MIN_POPULATION * 2 and pop > recorded_pop * 2
         )
         if not incomparable:
+            # The second axis, explicit. `rate > best` is the ratchet rising,
+            # which is the whole mechanism -- calibrating on the BEST
+            # observation, so ordinary attrition rides underneath it.
+            if rate > best:
+                return "raise_mark", best, None
             return "compare", best, None
 
         if not await self._clear_coverage_baseline(source_table):
@@ -8516,7 +8544,7 @@ class Database:
             # makes the unhandled arm unrepresentable instead of merely
             # currently-handled.
             decision, best, discarded = await self._classify_coverage_mark(
-                table, row, pop
+                table, row, pop, rate
             )
             v["rate"] = round(rate, 4)
 
@@ -8531,7 +8559,7 @@ class Database:
                 v["comparison_skipped"] = "incomparable_mark_not_cleared"
                 continue
 
-            if decision == "rearm":
+            if decision in ("rearm", "raise_mark"):
                 stored = await self._record_coverage_baseline(table, rate, pop)
                 v["mark_written"] = stored is not None
                 v["best_rate"] = (

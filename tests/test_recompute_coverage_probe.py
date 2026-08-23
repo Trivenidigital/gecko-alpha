@@ -1209,7 +1209,7 @@ async def test_an_unknown_decision_fails_LOUDLY(db):
     to be made true rather than left as a comment.
     """
 
-    async def _rogue(_self, _table, _row, _pop):
+    async def _rogue(_self, _table, _row, _pop, _rate):
         return "defer_pending_backfill", None, None
 
     from scout.db import Database as _Db
@@ -1264,3 +1264,71 @@ async def test_armed_rate_is_None_when_the_WRITE_was_starved(db):
     ), "reported an armed rate for a mark the starved write never stored"
     assert cleared[0]["discarded_rate"] == 1.0
     assert probe["per_surface"]["gainers_comparisons"]["mark_written"] is False
+
+
+async def test_the_mark_RISES_when_recovery_improves(db):
+    """The ratchet has to ratchet. Nothing asserted this.
+
+    The whole design calibrates on the BEST observation so ordinary attrition
+    rides underneath it. A refactor dropped the improvement write and every
+    existing test stayed green — the mark froze at the first observation and
+    could only ever be re-established downward by the clear.
+    """
+    await _bulk(db, 100, 20)  # poor first observation
+    first = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert first["per_surface"]["gainers_comparisons"]["best_rate"] == 0.2
+
+    # Recovery improves — a backfill re-run with the snapshots present.
+    for i in range(20, 90):
+        row_id = await _credit_bearing_legacy_row(db, f"extra-{i}")
+        await _overlay_row(db, row_id, f"extra-{i}", ANCHOR)
+
+    better = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    v = better["per_surface"]["gainers_comparisons"]
+
+    assert v["rate"] > 0.2
+    assert v["best_rate"] == v["rate"], "the mark did not rise with recovery"
+    assert v["mark_written"] is True
+
+    cur = await db._conn.execute(
+        "SELECT best_rate FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    # The payload rounds to 4dp; the table holds full precision.
+    assert (await cur.fetchone())[0] == pytest.approx(v["rate"], abs=1e-4)
+
+
+async def test_the_production_deploy_ORDER_does_not_freeze_the_mark(db):
+    """The probe is hourly; the backfill is a manual post-deploy step.
+
+    So the first observation is guaranteed to land before any credit exists. A
+    mark of 0.0 makes `rate < best * FRACTION` unsatisfiable for every possible
+    rate — collapse detection off on every surface, permanently, from the first
+    pass after deploy. This is the sequence, not a contrived one.
+    """
+    ids = [await _credit_bearing_legacy_row(db, f"seq-{i}") for i in range(100)]
+
+    # t0: probe fires before the backfill has run.
+    t0 = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert t0["per_surface"]["gainers_comparisons"]["best_rate"] == 0.0
+    assert t0["dark_surfaces"] == ["gainers_comparisons"], "t0 should page"
+
+    # t1: the operator runs it; recovery reaches the measured production rate.
+    for row_id, coin in [(ids[i], f"seq-{i}") for i in range(53)]:
+        await _overlay_row(db, row_id, coin, ANCHOR)
+    t1 = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert (
+        t1["per_surface"]["gainers_comparisons"]["best_rate"] == 0.53
+    ), "the mark stayed at the pre-backfill 0.0, so nothing can ever collapse"
+
+    # t2: snapshots deleted, re-run — four rows in five indeterminate.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 10 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    t2 = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert t2["collapsed_surfaces"] == ["gainers_comparisons"]
+    assert t2["not_recovering"] is True
