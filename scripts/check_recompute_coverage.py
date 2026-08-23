@@ -81,20 +81,30 @@ def main() -> int:
             "AND name='chain_identity_recompute_v1'"
         ).fetchone()
         if not row:
-            # Absent means two different things. Before the deploy it is
-            # normal. AFTER it, something dropped the table -- which is the
-            # loudest possible state, not an all-clear. Distinguish by whether
-            # the archives exist: they are created at startup by the same
-            # release that creates the overlay.
-            archived = conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-                "AND name LIKE '%_legacy_prefix_v1'"
-            ).fetchone()[0]
-            if archived:
+            # Absent means two different things with opposite consequences.
+            # Before the deploy it is normal. After it, the table was DROPPED
+            # -- and then the trackers' overlay subqueries raise
+            # `no such table` straight out of `get_gainers_comparisons`, so
+            # every consumer is hard-broken while this said all-clear.
+            #
+            # Keyed on the POPULATION, not on whether the archives happen to
+            # exist: archives can be dropped too, and the question that
+            # actually matters is whether any row depends on the overlay.
+            pop = 0
+            for table, _anchor in SURFACES:
+                try:
+                    pop += conn.execute(
+                        f"SELECT COUNT(*) FROM {table} AS c WHERE "
+                        "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
+                        "!= 'canonical_v1' AND c.detected_by_chains = 1"
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    continue
+            if pop:
                 print(
-                    "chain_identity_recompute_v1 is MISSING but the legacy "
-                    f"archives exist ({archived} of 3) -- the overlay table "
-                    "was dropped after deploy"
+                    "chain_identity_recompute_v1 is MISSING while "
+                    f"{pop} rows depend on it -- the overlay was dropped "
+                    "after deploy; the tracker subqueries will raise"
                 )
                 return 1
             print("chain_identity_recompute_v1 absent (schema not deployed yet)")
@@ -103,6 +113,7 @@ def main() -> int:
         population = 0
         recovered = 0
         detail = []
+        dark: list[str] = []
         placeholders = ",".join("?" * len(CREDIT_BEARING))
         for table, anchor in SURFACES:
             untrusted = (
@@ -126,6 +137,13 @@ def main() -> int:
             population += pop
             recovered += rec
             detail.append(f"{table}={rec}/{pop}")
+            # PER SURFACE. A global "recovered nothing" is satisfied by one
+            # healthy surface while the others sit stripped -- reachable
+            # because the replay commits per surface, so a mid-run failure
+            # leaves earlier surfaces durable. This script was printing
+            # `losers=0/5 trending=0/5` in its own alert text and exiting 0.
+            if pop > 0 and rec == 0:
+                dark.append(table)
     except sqlite3.Error as exc:
         print(f"query failed: {exc}")
         return 2
@@ -136,10 +154,11 @@ def main() -> int:
     if population == 0:
         print(f"no pre-cutover chains credit to recover ({summary})")
         return 0
-    if recovered == 0:
+    if dark:
         print(
-            f"overlay recovering NOTHING: 0 of {population} pre-cutover chains "
-            f"detections keep their credit ({summary}). Run "
+            f"overlay recovering NOTHING on {', '.join(dark)}: "
+            f"{recovered} of {population} pre-cutover chains detections keep "
+            f"their credit ({summary}). Run "
             "scripts/backfill_chain_identity_recompute.py --apply"
         )
         return 1

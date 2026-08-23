@@ -1,0 +1,11 @@
+[Unit]
+Description=Legacy chains-provenance overlay coverage watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Exit 1 is the ALARM path and has already sent Telegram, so it is not a
+# service failure. 2-6 are failures OF THE WATCHDOG and must surface in
+# systemctl status, because nothing else reports them.
+SuccessExitStatus=0 1
+ExecStart=/usr/local/bin/recompute-coverage-watchdog.sh

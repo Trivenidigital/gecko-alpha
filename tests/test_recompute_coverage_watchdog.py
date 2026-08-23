@@ -38,6 +38,10 @@ def _build(
 ):
     db = tmp_path / "scout.db"
     conn = sqlite3.connect(db)
+    # WAL, explicitly. A `mode=ro` open creates no sidecars against a DELETE-mode
+    # database, so the sidecar assertion below would pass vacuously -- it could
+    # not have failed. The sibling backfill fixture sets this for the same reason.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         "CREATE TABLE gainers_comparisons (id INTEGER PRIMARY KEY, coin_id TEXT, "
         "appeared_on_gainers_at TEXT, detected_by_chains INTEGER, "
@@ -62,10 +66,14 @@ def _build(
             (i + 1, f"coin-{i}", ANCHOR, semantics),
         )
         if overlay_status:
+            # source_row_id deliberately DISAGREES with the comparison row's
+            # id. With both keys agreeing in every case, a mutant swapping the
+            # correlation from coin_id to source_row_id could not be caught --
+            # the same fixture blindness that hid this defect in the probe.
             conn.execute(
                 "INSERT INTO chain_identity_recompute_v1 VALUES "
                 "('gainers_comparisons', ?, ?, ?, ?, ?)",
-                (i + 1, f"coin-{i}", ANCHOR, overlay_status, canonical_lead),
+                (i + 5000, f"coin-{i}", ANCHOR, overlay_status, canonical_lead),
             )
     conn.commit()
     conn.close()
@@ -211,3 +219,27 @@ def test_the_watchdog_constants_match_the_application(tmp_path):
     assert set(wd.CREDIT_BEARING) == set(
         APP_CREDIT_BEARING
     ), "the watchdog counts a different set of statuses as credit-bearing"
+
+
+def test_the_watchdog_pages_when_only_ONE_surface_is_dark(tmp_path):
+    """It was printing the dark surfaces in its own alert text and exiting 0.
+
+    Reachable because the replay commits per surface: a mid-run failure leaves
+    earlier surfaces durable, so a global "recovered nothing" is satisfied by
+    the one healthy surface.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=3)
+    conn = sqlite3.connect(db)
+    for i in range(3):
+        conn.execute(
+            "INSERT INTO losers_comparisons VALUES (?, ?, ?, 1, 'legacy_prefix')",
+            (i + 1, f"l{i}", ANCHOR),
+        )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "losers_comparisons" in r.stdout
+    assert "recovering NOTHING on" in r.stdout

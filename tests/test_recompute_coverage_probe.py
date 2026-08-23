@@ -215,9 +215,14 @@ async def test_one_surface_backfilled_does_not_disarm_the_others(db):
     assert probe["per_surface"]["gainers_comparisons"]["credit_recovered"] == 1
     assert probe["per_surface"]["losers_comparisons"]["credit_recovered"] == 0
     assert probe["per_surface"]["losers_comparisons"]["uncovered"] == 3
-    # Not paging here is correct -- gainers IS recovering -- but the per-surface
-    # zero must be visible, or "one surface silently dark" reads as healthy.
-    assert probe["not_recovering"] is False
+    # This test originally asserted the alarm stays SILENT here, on the
+    # reasoning that gainers is recovering. That was wrong, and per-surface
+    # commits made it reachable: a replay that fails partway leaves earlier
+    # surfaces durable, so gainers alone satisfied a global predicate while
+    # losers sat fully stripped. Reporting was per-surface; the predicate was
+    # not. A surface with a population that recovered nothing is the alarm.
+    assert probe["not_recovering"] is True
+    assert probe["dark_surfaces"] == ["losers_comparisons"]
 
 
 async def test_NULL_semantics_rows_are_in_the_population(db):
@@ -310,45 +315,49 @@ async def test_canonical_rows_are_not_counted_as_uncovered(db):
     assert probe["not_recovering"] is False
 
 
-async def test_the_reader_index_exists(db):
-    """The trackers' correlation must be index-backed.
+async def test_the_overlay_correlation_uses_a_THREE_COLUMN_seek(db):
+    """Assert the PLAN, not the index name.
 
-    Without it each dashboard row scans every overlay row for its surface and
-    builds a temp b-tree for the ORDER BY, twice. At ~2,900 overlay rows and
-    50-100 rows per page that is the difference between a query and a stall.
+    The first version EXPLAINed a hand-written query and asserted the plan
+    mentioned an index called `idx_cir_reader`. That is a proxy: redefining the
+    index as `(source_table, historical_anchor)` keeps the name, keeps the test
+    green, and costs 34x at production scale (6.1ms -> 209ms) because
+    `historical_anchor` is far less selective than `coin_id`. What matters is
+    that all three columns are used as a seek.
+
+    Both shapes are asserted -- the tracker's subquery AND the probe's EXISTS
+    -- because the probe runs on the hourly pass over the shared pipeline
+    connection, and unindexed it is O(live_rows x overlay_rows_per_surface).
     """
-    cur = await db._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index' "
-        "AND tbl_name='chain_identity_recompute_v1'"
-    )
-    names = {r[0] for r in await cur.fetchall()}
-    assert "idx_cir_reader" in names
-
-    cur = await db._conn.execute(
-        "EXPLAIN QUERY PLAN "
-        "SELECT evidence_status FROM chain_identity_recompute_v1 "
-        "WHERE source_table='gainers_comparisons' AND coin_id='x' "
-        "AND historical_anchor='y'"
-    )
-    plan = " ".join(str(r[-1]) for r in await cur.fetchall())
-    assert "idx_cir_reader" in plan, f"reader query is not using the index: {plan}"
-
-    # The PROBE's query shape too, not only the reader's. It runs the same
-    # correlation on the hourly pass over the shared pipeline connection, and
-    # unindexed it is O(live_rows x overlay_rows_per_surface) -- measured at
-    # 371ms vs 5.5ms at production scale, a 68x difference on the connection
-    # everything else is waiting for.
-    cur = await db._conn.execute(
-        "EXPLAIN QUERY PLAN "
-        "SELECT COUNT(*) FROM gainers_comparisons AS c WHERE EXISTS ("
-        "  SELECT 1 FROM chain_identity_recompute_v1 AS r "
-        "  WHERE r.source_table = 'gainers_comparisons' AND r.coin_id = c.coin_id "
-        "  AND r.historical_anchor = c.appeared_on_gainers_at)"
-    )
-    probe_plan = " ".join(str(r[-1]) for r in await cur.fetchall())
-    assert (
-        "idx_cir_reader" in probe_plan
-    ), f"probe query is not using the index: {probe_plan}"
+    shapes = {
+        "tracker subquery": (
+            "EXPLAIN QUERY PLAN "
+            "SELECT cir.evidence_status FROM chain_identity_recompute_v1 cir "
+            "WHERE cir.source_table = 'gainers_comparisons' "
+            "  AND cir.coin_id = 'x' AND cir.historical_anchor = 'y' "
+            "ORDER BY CASE cir.evidence_status "
+            "  WHEN 'verified_canonical' THEN 0 ELSE 1 END, cir.source_row_id "
+            "LIMIT 1"
+        ),
+        "probe EXISTS": (
+            "EXPLAIN QUERY PLAN "
+            "SELECT COUNT(*) FROM gainers_comparisons AS c WHERE EXISTS ("
+            "  SELECT 1 FROM chain_identity_recompute_v1 AS r "
+            "  WHERE r.source_table = 'gainers_comparisons' "
+            "  AND r.coin_id = c.coin_id "
+            "  AND r.historical_anchor = c.appeared_on_gainers_at)"
+        ),
+    }
+    for label, sql in shapes.items():
+        cur = await db._conn.execute(sql)
+        plan = " ".join(str(r[-1]) for r in await cur.fetchall())
+        for col in ("source_table", "coin_id", "historical_anchor"):
+            assert (
+                col in plan
+            ), f"{label}: {col} is not part of the index seek -- plan was {plan!r}"
+        assert (
+            "SCAN chain_identity_recompute_v1" not in plan
+        ), f"{label} is scanning the overlay: {plan!r}"
 
 
 async def test_a_RAISED_GATE_is_visible_to_the_probe(db):
@@ -392,3 +401,123 @@ async def test_a_verified_row_with_no_lead_earns_nothing(db):
     assert probe["overlay_rows"] == 1
     assert probe["credit_recovered"] == 0
     assert probe["not_recovering"] is True
+
+
+async def test_a_replay_that_died_partway_still_pages(db):
+    """The exact state per-surface commits made reachable.
+
+    Before per-surface commits a mid-replay failure rolled everything back:
+    overlay empty, nothing recovered, alarm fires, operator re-runs. Committing
+    per surface leaves the earlier ones durable — so a global predicate is
+    satisfied by gainers alone while two thirds of the population sits
+    stripped, and the watchdog printed `losers=0/5 trending=0/5` in its own
+    alert text and exited 0.
+    """
+    for i in range(3):
+        row_id = await _credit_bearing_legacy_row(db, f"g{i}")
+        await _overlay_row(db, row_id, f"g{i}", ANCHOR)
+    for surface, col in (
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        for i in range(3):
+            await db._conn.execute(
+                f"""INSERT INTO {surface}
+                   (coin_id, symbol, name, {col}, detected_by_chains,
+                    chains_lead_minutes, is_gap, created_at,
+                    chains_identity_semantics)
+                   VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+                (f"{surface}-{i}", ANCHOR, ANCHOR),
+            )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["credit_recovered"] == 3  # gainers landed...
+    assert probe["credit_bearing_legacy_rows"] == 9
+    assert probe["not_recovering"] is True  # ...and that is not good enough
+    assert probe["dark_surfaces"] == [
+        "losers_comparisons",
+        "trending_comparisons",
+    ]
+
+
+async def test_a_fully_recovering_tree_names_no_dark_surfaces(db):
+    """The other direction, so the predicate cannot just always fire."""
+    for surface, col in (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        cur = await db._conn.execute(
+            f"""INSERT INTO {surface}
+               (coin_id, symbol, name, {col}, detected_by_chains,
+                chains_lead_minutes, is_gap, created_at,
+                chains_identity_semantics)
+               VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+            (f"{surface}-ok", ANCHOR, ANCHOR),
+        )
+        await db._conn.execute(
+            """INSERT INTO chain_identity_recompute_v1
+               (source_table, source_row_id, coin_id, symbol, historical_anchor,
+                legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+                identity_tier, evidence_status, semantics_version, computed_at)
+               VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
+                       'canonical_id', 'verified_canonical', 'v1', ?)""",
+            (surface, cur.lastrowid, f"{surface}-ok", ANCHOR, ANCHOR),
+        )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["dark_surfaces"] == []
+    assert probe["not_recovering"] is False
+
+
+async def test_rows_with_no_archived_twin_are_named_as_unarchivable(db):
+    """The persistent-page shape, arriving by a slow path.
+
+    The archive step self-guards and never re-runs; `stamp_unmarked_chain_semantics`
+    runs every startup. So a row written by rolled-back old code AFTER the
+    archives were taken joins this population permanently and can never be
+    covered — the backfill only reads archives. Meanwhile archived rows drain
+    out as the trackers re-insert them `canonical_v1`. In the limit the
+    population is entirely unarchivable: an hourly page forever that `--apply`
+    cannot clear.
+
+    Counted separately so the alert distinguishes "run the backfill" from
+    "the backfill cannot help you".
+    """
+    await _credit_bearing_legacy_row(db, "born-after-the-archive")
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["credit_bearing_legacy_rows"] == 1
+    assert probe["credit_recovered"] == 0
+    assert probe["unarchivable"] == 1
+    assert probe["per_surface"]["gainers_comparisons"]["unarchivable"] == 1
+    # Still pages -- credit really is being lost -- but the operator can now
+    # tell that re-running the backfill is not the remedy.
+    assert probe["not_recovering"] is True
+
+
+async def test_an_archived_row_is_not_counted_unarchivable(db):
+    """The other direction, so the counter cannot just always fire."""
+    row_id = await _credit_bearing_legacy_row(db, "properly-archived")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (?, 'properly-archived', 'PA', 'PA', ?, 1, 8740.0, 0,
+                   'legacy_prefix', ?)""",
+        (row_id, ANCHOR, ANCHOR),
+    )
+    await _overlay_row(db, row_id, "properly-archived", ANCHOR)
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["unarchivable"] == 0
+    assert probe["credit_recovered"] == 1
+    assert probe["not_recovering"] is False

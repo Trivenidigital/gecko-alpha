@@ -902,3 +902,103 @@ async def test_reconciliation_report_names_its_denominators(db):
     assert rep["stored"] == 1
     assert counts.get(STATUS_UNJOINABLE_ROW) == 1
     assert rep["stored"] + counts[STATUS_UNJOINABLE_ROW] == rep["replayed"]
+
+
+async def test_a_stale_overlay_row_cannot_cancel_a_missing_evidence_row(db):
+    """`stored` was unscoped, so two errors produced a clean bill of health.
+
+    `INSERT OR REPLACE` never deletes, so an overlay row whose source archive
+    no longer exists survives forever. Counting the whole table meant one
+    archived row with no evidence row and one orphan overlay row cancelled to
+    `replayed - stored == 0` -- precisely the gap the reconciliation exists to
+    make visible.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "", "UNJOINABLE")  # counted, never written
+    await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+
+    # An orphan from a surface that is not being replayed.
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('a_table_that_no_longer_exists', 1, 'ghost', 'G', ?, 1,
+                   1.0, 1, 1.0, 'canonical_id', 'verified_canonical', 'v0', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["population"] == 2
+    assert rep["replayed"] == 2
+    assert (
+        rep["stored"] == 1
+    ), "the orphan was counted, cancelling the unjoinable row's shortfall"
+    assert rep["replayed"] - rep["stored"] == 1
+
+
+async def test_a_surface_the_replay_SKIPPED_is_not_counted_as_population(db):
+    """The replay skips a surface whose archive lacks a required column.
+
+    Counting it here produced a shortfall attributed to no status at all.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await db._conn.execute("DROP TABLE losers_comparisons_legacy_prefix_v1")
+    await db._conn.execute(
+        "CREATE TABLE losers_comparisons_legacy_prefix_v1 "
+        "(id INTEGER, coin_id TEXT, detected_by_chains INTEGER)"  # no symbol/anchor
+    )
+    await db._conn.execute(
+        "INSERT INTO losers_comparisons_legacy_prefix_v1 VALUES (1, 'x', 1)"
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["per_surface"]["losers_comparisons"] == {"skipped_by_replay": 1}
+    assert (
+        sum(counts.values()) == rep["replayed"]
+    ), f"{dict(counts)} sums to {sum(counts.values())}, replayed={rep['replayed']}"
+
+
+async def test_a_crashed_replay_names_the_surfaces_it_never_reached(db):
+    """Per-surface `stored` distinguishes a crash from an unjoinable shortfall.
+
+    Globally the two are the same number. Per-surface commits made a partial
+    replay reachable, so the difference matters.
+    """
+    await _substrate(db, [("g", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "g", "G")
+    for surface, col in (
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        await db._conn.execute(
+            f"""INSERT INTO {surface}_legacy_prefix_v1
+               (id, coin_id, symbol, name, {col}, detected_by_chains,
+                chains_lead_minutes, is_gap, chains_identity_semantics, created_at)
+               VALUES (1, 'x', 'X', 'X', ?, 1, 5000.0, 0, ?, ?)""",
+            (ANCHOR, LEGACY_SEMANTICS, ANCHOR),
+        )
+    await db._conn.commit()
+
+    # Only gainers was replayed -- the shape a mid-run failure leaves behind.
+    await recompute_legacy_provenance(
+        db._conn, gate_minutes=1440.0, coverage_intervals=[]
+    )
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_table != 'gainers_comparisons'"
+    )
+    await db._conn.commit()
+
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["surfaces_never_written"] == [
+        "losers_comparisons",
+        "trending_comparisons",
+    ]

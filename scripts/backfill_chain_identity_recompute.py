@@ -48,7 +48,7 @@ LIVE_DB = "/root/gecko-alpha/scout.db"
 
 
 def _is_live(path: str) -> bool:
-    """Only the real production database counts as live.
+    """Decides ONE thing: whether to open this path `mode=ro` or `immutable=1`.
 
     Compared against the LIVE_DB constant, deliberately never against `--db`.
     Keying off the argument meant ANY target was treated as live and opened
@@ -56,8 +56,56 @@ def _is_live(path: str) -> bool:
     thing `--dry-run` exists to allow -- planted `-wal`/`-shm` sidecars beside
     that backup. That precise bug destroyed the real backups on 2026-08-15 and
     had shipped in three separate readers before it was found.
+
+    `.resolve()` on both sides because plain `Path` equality is a string
+    comparison with a little normalisation: it handles `.` and `//` but not
+    `..`, and misses a relative spelling entirely. Running the documented
+    `cd /root/gecko-alpha && ... --db scout.db` compared unequal, so the LIVE
+    database was opened `immutable=1` -- which hides uncheckpointed WAL rows
+    and silently under-resolves exactly the most recent anchors. Fewer
+    resolutions look identical to less history.
     """
-    return Path(path) == Path(LIVE_DB)
+    try:
+        return Path(path).resolve() == Path(LIVE_DB).resolve()
+    except OSError:
+        return False
+
+
+def _history_table(path: str) -> tuple[str, str]:
+    """(column, table) this source's history is read from -- ONE decision.
+
+    Keyed on what the FILE contains, not on whether it is the live database.
+    An earlier version used `_is_live` for both the open mode and the history
+    table, which quietly made the two disagree for any path that is not
+    literally LIVE_DB: `collect_history` read `signal_first_seen` while
+    `collect_intervals` read `signal_events`, so a token first seen in June
+    fell outside an August-derived interval and was marked uncovered on
+    evidence that never applied to it. That is verbatim the failure the
+    comment in `collect_intervals` says this exists to prevent -- and the
+    configuration that triggers it, a scratch copy of the live database, is
+    the one the refusal message recommends and the one the acceptance replay
+    is measured on.
+
+    `signal_first_seen` where it exists: it is the retention-decoupled answer.
+    `signal_events` otherwise: the preserved snapshots predate that table
+    (migration 20260823) and it is the only history they carry.
+    """
+    try:
+        conn = _open_read_only(path, live=_is_live(path))
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='signal_first_seen'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ("created_at", "signal_events")
+    return (
+        ("first_seen_at", "signal_first_seen")
+        if row
+        else ("created_at", "signal_events")
+    )
 
 
 def _open_read_only(path: str, *, live: bool) -> sqlite3.Connection:
@@ -97,22 +145,30 @@ def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
         if not Path(path).exists():
             continue
         try:
-            live = _is_live(path)
-            conn = _open_read_only(path, live=live)
-            # Each source's interval must describe the SAME table that source's
-            # history was read from, or the two disagree: a token whose
-            # first-seen came from `signal_first_seen` could fall outside an
-            # interval derived from `signal_events` and be marked uncovered on
-            # evidence that never applied to it.
-            row = conn.execute(
-                "SELECT MIN(first_seen_at), MAX(first_seen_at) FROM signal_first_seen"
-                if live
-                else "SELECT MIN(created_at), MAX(created_at) FROM signal_events"
-            ).fetchone()
+            conn = _open_read_only(path, live=_is_live(path))
+            # The SAME decision collect_history made for this path, via
+            # the same function. Both were previously keyed on `_is_live`,
+            # which answers a DIFFERENT question -- so for any path except
+            # the literal LIVE_DB, history came from `signal_first_seen`
+            # while the interval came from `signal_events`, and a token
+            # first seen in June fell outside an August-derived interval,
+            # marked uncovered on evidence that never applied to it. That
+            # is verbatim the failure this comment used to claim it
+            # prevented, and the configuration that triggers it -- a
+            # scratch copy -- is what the refusal message recommends and
+            # what the acceptance replay is measured on.
+            col, tbl = _history_table(path)
+            row = conn.execute(f"SELECT MIN({col}), MAX({col}) FROM {tbl}").fetchone()
             conn.close()
             if row and row[0] and row[1]:
                 spans.append((row[0], row[1]))
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            # Printed, not swallowed. Intervals decide `verified` vs
+            # `indeterminate`, so a source dropping out silently narrows
+            # coverage in a way that looks identical to history genuinely
+            # running out -- and `collect_history` prints per source, so the
+            # two halves disagreed about how loud a failure is.
+            print(f"  {path}: INTERVAL UNREADABLE ({exc}) -- coverage narrowed")
             continue
     spans.sort()
     merged: list[tuple[str, str]] = []
@@ -139,15 +195,25 @@ def collect_history(sources, *, live_db: str) -> dict[str, str]:
     # "when the token was first seen", it is "the oldest row retention has not
     # deleted yet" -- a floor that walks forward every night. Using it would
     # have quietly shortened every reconstructed lead on the live side.
-    # `test_signal_first_seen_sole_writer.py` enforces this repo-wide; it
-    # caught this exact mistake here.
-    queries = [
-        (
-            live_db,
-            "SELECT token_id, first_seen_at FROM signal_first_seen "
-            "WHERE token_id IS NOT NULL AND token_id != ''",
-        ),
-    ]
+    # NOTE ON THE GUARD: `test_signal_first_seen_sole_writer.py` caught this
+    # mistake originally, but it cannot catch a REGRESSION here. Its
+    # allowlist is FILE-level, and this file is allowlisted for the snapshot
+    # queries below -- so restoring `MIN(created_at) FROM signal_events` on
+    # the live path passes the entire suite. Review demonstrated that
+    # mutant surviving all 57 tests. The behavioural test in
+    # tests/test_backfill_history_source.py is what actually pins it.
+    live_col, live_tbl = _history_table(live_db)
+    if live_tbl == "signal_events":
+        live_query = (
+            f"SELECT token_id, MIN({live_col}) FROM {live_tbl} "
+            "WHERE token_id IS NOT NULL AND token_id != '' GROUP BY token_id"
+        )
+    else:
+        live_query = (
+            f"SELECT token_id, {live_col} FROM {live_tbl} "
+            "WHERE token_id IS NOT NULL AND token_id != ''"
+        )
+    queries = [(live_db, live_query)]
     # The SNAPSHOTS are the documented exception, and the retention argument
     # does not apply to them: each is a frozen file whose contents can never
     # change, so nothing can move its derived minimum. They also PREDATE the
@@ -216,10 +282,11 @@ async def main() -> int:
         help="early-detection gate; defaults to CONVICTION_EARLY_LEAD_MINUTES",
     )
     args = ap.parse_args()
-    if args.gate_minutes is None:
-        args.gate_minutes = float(get_settings().CONVICTION_EARLY_LEAD_MINUTES)
 
-    from scout.identity_recompute import recompute_legacy_provenance
+    from scout.identity_recompute import (
+        recompute_legacy_provenance,
+        reconciliation_report,
+    )
 
     print("Collecting history from every readable source (read-only):")
     history = collect_history(SNAPSHOT_SOURCES, live_db=args.db)
@@ -249,12 +316,7 @@ async def main() -> int:
             continue
         try:
             conn = _open_read_only(path, live=_is_live(path))
-            live_src = _is_live(path)
-            col, tbl = (
-                ("first_seen_at", "signal_first_seen")
-                if live_src
-                else ("created_at", "signal_events")
-            )
+            col, tbl = _history_table(path)
             row = conn.execute(f"SELECT MIN({col}), MAX({col}) FROM {tbl}").fetchone()
             conn.close()
             if row and row[0] and row[1]:
@@ -283,6 +345,13 @@ async def main() -> int:
     # attached. An ops backfill must not be the thing that decides to ALTER
     # production tables -- the deploy does that, in its own window, once.
     # Attach to what is already there, and refuse if the schema has not landed.
+    # Resolved HERE, not after parse_args(). Settings needs the production
+    # .env, and resolving it earlier meant --dry-run and the refusal path both
+    # died with a raw pydantic ValidationError on any box without one -- the
+    # rehearsal path that --dry-run exists to provide. Only --help worked.
+    if args.gate_minutes is None:
+        args.gate_minutes = float(get_settings().CONVICTION_EARLY_LEAD_MINUTES)
+
     conn = await aiosqlite.connect(args.db)
     # Match the pipeline's busy_timeout. aiosqlite defaults to 5s while the
     # pipeline sets 90s, and that asymmetry decides who loses: if the pipeline
@@ -290,6 +359,14 @@ async def main() -> int:
     # dies -- after it has already scanned several GB of snapshots, with no
     # retry. Nothing is corrupted (uncommitted work is discarded), but the
     # operator's remediation for a page fails on a lock and starts over.
+    # Verified: pipeline holding the lock 12s, backfill waited 11.6s and
+    # proceeded, where at the inherited 5s default it died after 5.6s.
+    #
+    # The failure has MOVED, not gone: with 90s on both sides, whoever arrives
+    # second fails if the other exceeds 90s. The replay runs ~4.5s at current
+    # scale, so roughly 20x headroom -- but that is now the number that
+    # matters, and nothing measures it. It shrinks as the archived population
+    # grows.
     await conn.execute("PRAGMA busy_timeout = 90000")
     try:
         cur = await conn.execute(
@@ -302,12 +379,35 @@ async def main() -> int:
                 "Deploy the schema first, then re-run this backfill."
             )
             return 2
+        # The reconciliation is printed even when the replay RAISES. Per-surface
+        # commits mean a crash leaves earlier surfaces durable, so the operator
+        # needs to know what landed -- and the status breakdown that names the
+        # shortfall lives only in the `counts` dict, which the exception
+        # discards. Without this they get a traceback in exactly the run where
+        # knowing what committed matters most.
         counts = await recompute_legacy_provenance(
             conn,
             gate_minutes=args.gate_minutes,
             extra_history=history,
             coverage_intervals=intervals,
         )
+    except Exception:
+        try:
+            rep = await reconciliation_report(conn)
+            print(f"\nREPLAY FAILED -- what is durable on disk:")
+            print(
+                f"  population {rep['population']}  replayed {rep['replayed']}  "
+                f"stored {rep['stored']}"
+            )
+            if rep["surfaces_never_written"]:
+                print(
+                    "  never written: "
+                    + ", ".join(rep["surfaces_never_written"])
+                    + "  <-- the replay did not reach these; re-run --apply"
+                )
+        except Exception:
+            print("\nREPLAY FAILED and the reconciliation could not be read.")
+        raise
     finally:
         await conn.close()
 

@@ -138,3 +138,105 @@ def test_help_works_without_a_populated_env(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         asyncio.run(mod.main())
     assert exc.value.code == 0
+
+
+def test_dry_run_works_without_a_populated_env(tmp_path, monkeypatch):
+    """--dry-run is the REHEARSAL path; it must not need production secrets.
+
+    The gate was resolved from Settings immediately after `parse_args()`, so
+    `--dry-run` and the refusal path both died with a raw pydantic
+    ValidationError on any box without a complete .env. Only `--help` worked --
+    and the commit message claimed all three did.
+    """
+    import asyncio
+
+    import backfill_chain_identity_recompute as mod
+
+    db = tmp_path / "scout.db"
+    _make_wal_db(db)
+    monkeypatch.setattr(mod, "SNAPSHOT_SOURCES", ())
+    monkeypatch.setattr(sys, "argv", ["prog", "--db", str(db), "--dry-run"])
+
+    # Assert the CALL never happens, rather than deleting env vars and hoping
+    # Settings fails. `get_settings()` memoises, so on a box (or a test
+    # session) where it has already been built successfully, clearing the
+    # environment changes nothing and the test passes with the defect intact --
+    # which is exactly what it did.
+    def _boom():
+        raise AssertionError(
+            "get_settings() was called on the --dry-run path; it needs the "
+            "production .env, which the rehearsal path must not require"
+        )
+
+    monkeypatch.setattr(mod, "get_settings", _boom)
+
+    rc = asyncio.run(mod.main())
+
+    assert rc == 0
+
+
+def test_the_snapshot_refusal_works_without_a_populated_env(tmp_path, monkeypatch):
+    """Same path, same reason: the refusal exists to print guidance."""
+    import asyncio
+
+    import backfill_chain_identity_recompute as mod
+
+    snap = tmp_path / "scout.db.pre500.20260802202122"
+    _make_wal_db(snap)
+    monkeypatch.setattr(mod, "SNAPSHOT_SOURCES", (str(snap),))
+    monkeypatch.setattr(sys, "argv", ["prog", "--db", str(snap), "--apply"])
+
+    def _boom():
+        raise AssertionError("get_settings() was called before the refusal")
+
+    monkeypatch.setattr(mod, "get_settings", _boom)
+
+    assert asyncio.run(mod.main()) == 2
+
+
+def test_apply_that_recovers_nothing_exits_3(tmp_path, monkeypatch):
+    """The runbook documents exit 3 as "do not treat as success". Untested.
+
+    This is the operator's remediation for a NOT_RECOVERING page; reporting
+    success while resolving nothing lets them tick the box and walk away from
+    an unfixed collapse.
+    """
+    import asyncio
+    import sqlite3
+
+    import backfill_chain_identity_recompute as mod
+
+    db = tmp_path / "scout.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE chain_identity_recompute_v1 (source_table TEXT, "
+        "source_row_id INTEGER, coin_id TEXT, symbol TEXT, historical_anchor TEXT, "
+        "legacy_detected INTEGER, legacy_lead REAL, canonical_detected INTEGER, "
+        "canonical_lead REAL, identity_tier TEXT, evidence_status TEXT, "
+        "semantics_version TEXT, computed_at TEXT, "
+        "PRIMARY KEY (source_table, source_row_id))"
+    )
+    conn.execute(
+        "CREATE TABLE gainers_comparisons_legacy_prefix_v1 (id INTEGER, "
+        "coin_id TEXT, symbol TEXT, appeared_on_gainers_at TEXT, "
+        "detected_by_chains INTEGER, chains_lead_minutes REAL)"
+    )
+    conn.execute(
+        "INSERT INTO gainers_comparisons_legacy_prefix_v1 "
+        "VALUES (1, 'nothing-recoverable', 'NR', '2026-08-01T00:00:00+00:00', 1, 5000.0)"
+    )
+    conn.execute(
+        "CREATE TABLE signal_first_seen (token_id TEXT PRIMARY KEY, "
+        "first_seen_at TEXT, updated_at TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(mod, "SNAPSHOT_SOURCES", ())
+    monkeypatch.setattr(
+        sys, "argv", ["prog", "--db", str(db), "--apply", "--gate-minutes", "1440"]
+    )
+
+    rc = asyncio.run(mod.main())
+
+    assert rc == 3, "an --apply that recovered nothing reported success"

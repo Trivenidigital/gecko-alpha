@@ -29,6 +29,29 @@ if [[ -f "$ENV_FILE" ]]; then
     [[ -n "${env_gate:-}" ]] && GATE="$env_gate"
 fi
 
+# Validate before `cd`. Under `set -euo pipefail` a failed `cd` exits 1 --
+# the SAME code the alarm path uses after a successful Telegram send. A dead
+# watchdog and a firing watchdog were indistinguishable to anything
+# downstream. Reachable straight from the runbook's own install step: this
+# script is installed to /usr/local/bin while APP_DIR defaults to
+# /root/gecko-alpha, and that split has already caused a deploy that shipped
+# nothing on this box.
+#
+# EXIT CONTRACT (documented in docs/runbook_recompute_coverage.md):
+#   0  healthy            5  APP_DIR invalid
+#   1  ALARM, Telegram    6  python interpreter missing
+#   2  check could not run (WARN, no Telegram)
+#   3  .env missing       4  Telegram credentials missing
+# Only 1 notifies. 2-6 are operator-visible failures of the watchdog itself.
+if [[ ! -d "$APP_DIR" ]]; then
+    echo "FATAL: APP_DIR does not exist: $APP_DIR" >&2
+    exit 5
+fi
+if [[ ! -x "$PYTHON" ]]; then
+    echo "FATAL: python interpreter not executable: $PYTHON" >&2
+    exit 6
+fi
+
 cd "$APP_DIR"
 set +e
 result="$("$PYTHON" scripts/check_recompute_coverage.py --db "$DB_PATH"     --gate-minutes "$GATE" 2>&1)"

@@ -89,8 +89,21 @@ STATUS_VERIFIED_CANONICAL = "verified_canonical"
 #: NOT a negative: earlier canonical history may be pruned, so the true lead
 #: could clear it. Indeterminate for gate purposes.
 STATUS_CANONICAL_SUB_GATE = "canonical_below_gate_indeterminate"
-#: Coverage is good enough to have found a canonical match, none exists, and a
-#: prefix candidate explains the legacy credit. The old credit was fuzzy.
+#: A prefix candidate explains the legacy credit, and no canonical match exists
+#: in our substrate within a window where we were recording.
+#:
+#: That is LESS than proof of fabrication, and the name overstates it. The
+#: coverage predicate is a GLOBAL span over all tokens' events -- it
+#: establishes that we were recording during the window, never that THIS coin's
+#: canonical-id token would have been seen. Per-token coverage is the named
+#: residual that would let these rows be called proven.
+#:
+#: Kept rather than collapsed into `indeterminate_history` because the
+#: direction is safe -- it withholds credit rather than granting it -- and
+#: because "a prefix candidate explains this AND nothing canonical appeared
+#: while we were watching" is strictly more than "we could not see". Throwing
+#: that surplus away would move the design back toward the two outcomes the
+#: ruling rejected.
 STATUS_PREFIX_ONLY = "verified_prefix_only"
 #: Two or more distinct tokens claim the identity; not an identity assertion.
 STATUS_AMBIGUOUS = "ambiguous_identity"
@@ -192,8 +205,10 @@ def classify(
         # Absence proves nothing this far back.
         return STATUS_INDETERMINATE
     if resolution.prefix_token_id is not None:
-        # Coverage is adequate, nothing canonical matches, and a prefix
-        # candidate explains the old credit.
+        # We were recording across this anchor, nothing canonical matches, and
+        # a prefix candidate explains the old credit. NOT the same as "this
+        # coin's canonical token would have been seen" -- the predicate is a
+        # global span, not per-token. See STATUS_PREFIX_ONLY.
         return STATUS_PREFIX_ONLY
     # Covered, and nothing matches at all -- the legacy credit cannot be
     # reproduced from any identity basis. Not provably prefix, so not a
@@ -226,8 +241,16 @@ def _anchor_is_covered(anchor: str, intervals) -> bool:
         to two, so `indeterminate` would almost never fire and every unmatched
         row became an asserted `verified_prefix_only`.
 
-    Intervals answer the question actually being asked. Outside them the answer
-    is "we cannot see", which is not the same as "it is not there".
+    Intervals narrow the window the old global floor left open. They do NOT
+    make the predicate per-token, and bullet 2 above is still true of them: a
+    token whose only events fell in a gap is in no source at all, while its
+    coin's anchor sits inside a covered interval derived from OTHER tokens.
+    So outside the intervals the answer is "we cannot see"; inside them it is
+    "we were watching" -- not "this coin's canonical id was not there".
+
+    That weaker reading is why `alias_unique` can no longer be promoted on
+    this predicate at all, and why `STATUS_PREFIX_ONLY` documents itself as
+    less than proof.
     """
     if not anchor or not intervals:
         return False
@@ -430,16 +453,30 @@ async def recompute_legacy_provenance(
             )
 
         # Commit PER SURFACE, not once at the end. A single transaction
-        # spanning all three held the write lock for the entire replay --
-        # measured at 6.6s against a live pipeline, which blocked for 5.7s
-        # behind it. Three shorter transactions bound how long anything
-        # else waits, and let completed surfaces survive a later failure.
+        # spanning all three held the write lock for the entire replay.
+        #
+        # What this actually buys, measured, is NOT what an earlier version of
+        # this comment claimed. It does not bound how long anything else
+        # waits: the commit releases the lock, but the next INSERT re-acquires
+        # it microseconds later while a waiting writer is still asleep in
+        # SQLite's exponential-backoff busy handler, so it loses every race and
+        # the lock is effectively held continuously. Measured at production
+        # scale: replay 4.5s, worst competitor block 4.56s -- a ratio of 1.0,
+        # not the 1/3 the comment asserted. (An `asyncio.sleep(0.05)` after
+        # each commit does produce that bound, at ~18% longer runtime. Not
+        # taken: one 4.5s block by hand, during an ops step, is not worth
+        # slowing the step that holds the lock.)
+        #
+        # What it DOES buy, and why it stays: completed surfaces survive a
+        # later failure, so a re-run converges instead of starting over. The
+        # partial state that creates is why the coverage probe escalates per
+        # surface rather than globally.
         await conn.commit()
 
     return counts
 
 
-async def reconciliation_report(conn) -> dict[str, int]:
+async def reconciliation_report(conn) -> dict[str, object]:
     """Denominators for the acceptance table, queried rather than assumed.
 
     `sum(counts)` from a replay cannot be checked against anything on its own.
@@ -453,36 +490,86 @@ async def reconciliation_report(conn) -> dict[str, int]:
     callers sum that dict, so adding non-status keys would silently corrupt
     every `sum(counts.values())`.
 
-    `stored` is read back from the overlay rather than tallied during the
-    write, because `INSERT OR REPLACE` on (source_table, source_row_id)
-    collapses a duplicate pair silently -- two archived rows in, one row out,
-    no error. "Rows we wrote" and "rows that exist" are separate claims.
+    Two scoping bugs review found here, both of which made the report agree
+    with the replay by accident:
+
+    - The replay SKIPS a whole surface whose archive fails the column-subset
+      guard, while this counted it -- a shortfall attributed to no status.
+      The same guard is applied here now.
+    - `stored` counted the WHOLE overlay table, unscoped. A stale row from an
+      archive that no longer exists survives forever (`INSERT OR REPLACE`
+      never deletes), so one missing evidence row and one orphan overlay row
+      cancelled to `replayed - stored == 0` -- a clean bill of health produced
+      by two errors. Scoped by surface and semantics version now.
+
+    `stored` is read back rather than tallied during the write, because
+    `INSERT OR REPLACE` on (source_table, source_row_id) collapses a duplicate
+    pair silently. "Rows we wrote" and "rows that exist" are separate claims.
     """
-    out = {"population": 0, "skipped_canonical": 0, "stored": 0}
-    for source_table in _SURFACES:
+    out: dict[str, object] = {"population": 0, "skipped_canonical": 0, "stored": 0}
+    per_surface: dict[str, dict[str, int]] = {}
+    replayable: list[str] = []
+
+    for source_table, anchor_col in _SURFACES.items():
         archive = f"{source_table}_legacy_prefix_v1"
         cur = await conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (archive,)
         )
         if not await cur.fetchone():
             continue
-        cur = await conn.execute(f"SELECT COUNT(*) FROM {archive}")
-        out["population"] += (await cur.fetchone())[0]
 
         cur = await conn.execute(f"PRAGMA table_info({archive})")
-        if "chains_identity_semantics" in {r[1] for r in await cur.fetchall()}:
+        cols = {r[1] for r in await cur.fetchall()}
+        # The SAME guard the replay applies. Without it a surface the replay
+        # silently skipped still counted toward the population.
+        if not {"coin_id", "symbol", anchor_col}.issubset(cols):
+            per_surface[source_table] = {"skipped_by_replay": 1}
+            continue
+        replayable.append(source_table)
+
+        cur = await conn.execute(f"SELECT COUNT(*) FROM {archive}")
+        pop = (await cur.fetchone())[0]
+        out["population"] += pop
+
+        skipped = 0
+        if "chains_identity_semantics" in cols:
             cur = await conn.execute(
                 f"SELECT COUNT(*) FROM {archive} WHERE "
                 "COALESCE(chains_identity_semantics, 'legacy_prefix') = 'canonical_v1'"
             )
-            out["skipped_canonical"] += (await cur.fetchone())[0]
+            skipped = (await cur.fetchone())[0]
+            out["skipped_canonical"] += skipped
+        per_surface[source_table] = {
+            "population": pop,
+            "skipped_canonical": skipped,
+            "stored": 0,
+        }
 
     cur = await conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='chain_identity_recompute_v1'"
     )
-    if await cur.fetchone():
-        cur = await conn.execute("SELECT COUNT(*) FROM chain_identity_recompute_v1")
-        out["stored"] = (await cur.fetchone())[0]
+    if await cur.fetchone() and replayable:
+        for source_table in replayable:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM chain_identity_recompute_v1 "
+                "WHERE source_table = ? AND semantics_version = ?",
+                (source_table, RECOMPUTE_SEMANTICS),
+            )
+            n = (await cur.fetchone())[0]
+            per_surface[source_table]["stored"] = n
+            out["stored"] += n
+
     out["replayed"] = out["population"] - out["skipped_canonical"]
+    out["per_surface"] = per_surface
+    # A surface with a population and NOTHING stored did not lose rows to
+    # censoring -- the replay died before reaching it. Per-surface `stored` is
+    # what makes a crashed run distinguishable from an unjoinable-row
+    # shortfall; globally the two look identical.
+    out["surfaces_never_written"] = sorted(
+        t
+        for t, v in per_surface.items()
+        if v.get("population", 0) - v.get("skipped_canonical", 0) > 0
+        and v.get("stored", 0) == 0
+    )
     return out

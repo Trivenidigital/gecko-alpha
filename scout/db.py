@@ -8056,6 +8056,37 @@ class Database:
             )
             rec = (await cur.fetchone())[0]
 
+            # Rows with no archived twin. `archive_legacy_prefix_comparisons`
+            # self-guards on sqlite_master and never re-runs once the archives
+            # exist, while `stamp_unmarked_chain_semantics` runs every startup
+            # -- so a row written by rolled-back old code AFTER the archives
+            # were taken enters this population permanently and can never be
+            # covered, because the backfill only reads archives. Meanwhile the
+            # archived rows drain out as the trackers re-insert them
+            # `canonical_v1`. In the limit the population is entirely
+            # unarchivable: credit_bearing > 0, credit_recovered == 0, an
+            # hourly page forever, and `--apply` cannot clear it.
+            #
+            # Counted separately so the alert says "0 recovered of 7, 7
+            # unarchivable" rather than presenting an unfixable page as though
+            # re-running the backfill would help. That distinction is the
+            # difference between an alarm an operator acts on and one they mute.
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (archive,),
+            )
+            unarchivable = 0
+            if await cur.fetchone():
+                cur = await self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} AS c "
+                    f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                    f"AND NOT EXISTS (SELECT 1 FROM {archive} AS a "
+                    f"  WHERE a.coin_id = c.coin_id "
+                    f"  AND a.{anchor} = c.{anchor})"
+                )
+                unarchivable = (await cur.fetchone())[0]
+
             credit_bearing += pop
             uncovered += unc
             credit_recovered += rec
@@ -8063,19 +8094,37 @@ class Database:
                 "credit_bearing": pop,
                 "uncovered": unc,
                 "credit_recovered": rec,
+                "unarchivable": unarchivable,
             }
 
-        # One predicate, covering every shape of "the overlay is not doing its
-        # job": never populated, populated for one surface only, populated at
-        # anchors nothing joins, or populated entirely with statuses that earn
-        # nothing. Each of those collapses tier_high identically.
-        not_recovering = credit_bearing > 0 and credit_recovered == 0
+        # PER SURFACE, not global. The comment here used to claim a global
+        # predicate covered "populated for one surface only"; it did not, and
+        # per-surface commits made that reachable. A replay that fails partway
+        # leaves earlier surfaces durable, so gainers alone satisfies a global
+        # `credit_recovered == 0` while losers and trending sit fully stripped
+        # -- measured: recovered 5 of 15, two surfaces at zero, alarm silent.
+        # The reporting was already per-surface while the predicate was not,
+        # so the watchdog printed `losers=0/5 trending=0/5` in its own alert
+        # text and exited 0.
+        #
+        # A surface with a population that recovered NOTHING is the alarm,
+        # whatever the other surfaces did. Partial coverage within a surface
+        # still must not page -- history genuinely runs out.
+        dark = sorted(
+            t
+            for t, v in per_surface.items()
+            if v["credit_bearing"] > 0 and v["credit_recovered"] == 0
+        )
+        unarchivable_total = sum(v["unarchivable"] for v in per_surface.values())
+        not_recovering = bool(dark)
         return {
             "overlay_rows": overlay_rows,
             "credit_bearing_legacy_rows": credit_bearing,
             "credit_recovered": credit_recovered,
             "uncovered": uncovered,
             "not_recovering": not_recovering,
+            "dark_surfaces": dark,
+            "unarchivable": unarchivable_total,
             "per_surface": per_surface,
         }
 
