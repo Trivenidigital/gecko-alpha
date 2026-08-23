@@ -113,7 +113,7 @@ root-cause family, one step over. Step 1 is what closes it.
 | vector | last verdict | measured on | holds at `f7a200cf`? |
 |---|---|---|---|
 | structural / concurrency | **CLEAN, terminal** — re-run after lapse; 4 questions answered with discriminating controls | `f7a200cf` | **HOLDS** |
-| silent failure / observability | **CLEAN, terminal** — re-run after lapse; 7/7 mutants, defect reproduced then confirmed fixed | `1aa81f7e` | **HOLDS** |
+| silent failure / observability | **CLEAN, terminal** — re-run after lapse; defect reproduced then confirmed fixed; one non-blocking finding (F3, ticketed) | `f7a200cf` | **HOLDS** |
 | ops safety / evidence integrity | **CLEAN, terminal** — S1–S7, N-1…N-6, R1–R5, T1, U1/U2, W1/W2, Y1 | `014ce900` | **HOLDS** |
 | recompute logic | CLEAN — "ship it"; E1 and the `armed_rate` trap closed | `1aa81f7e` | **HOLDS** |
 
@@ -341,7 +341,11 @@ There is a second-order consequence worth naming. The exhaustiveness guard was
 itself one of my fixes, and it made the mutation harness *look* healthier by
 converting an observation failure into a guard failure. A fix that raised the
 kill count while degrading what the kill count meant — the only defect here that
-landed on the measuring instrument rather than on the code.
+landed on the measuring instrument rather than on the code. The reviewer's
+sharper statement of it: **the fix raised the kill count while lowering what a
+kill was worth** — the instrument got quieter about its own blind spot. That
+generalises past mutation testing to any defensive check added near a test
+boundary.
 
 The third row produced a false result in **both** harnesses independently, which
 is what makes it a property of the technique rather than carelessness. Mine: a
@@ -362,6 +366,12 @@ obligation rather than in strength:
 
 Neither direction is self-certifying, and the two guards are different. That is
 why the third row has no mechanical entry and cannot get one.
+
+**The four items below catch a harness that is broken. The second-order check
+above catches a harness working exactly as designed and still telling you less
+than it did yesterday** — which is why it belongs in front of the contract
+rather than after it. The mechanical items are cheap and finite; that one is
+neither, and no automated guard exists for it.
 
 The resulting harness contract is four items, each catching a different lie:
 
