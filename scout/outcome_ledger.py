@@ -49,7 +49,7 @@ NOT related to scout/source_quality/ledger.py (source-call quality ledger).
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from typing import Any
 
 import structlog
@@ -315,20 +315,43 @@ def _normalise_emitted_at(emitted_at: str | None) -> str:
     """Canonical UTC isoformat-T, or raise.
 
     Returning the value unparsed would push a lexicographic-ordering hazard into
-    a column other code compares as text. Raising is right rather than
-    silently coercing: a timestamp we cannot parse is one we cannot place in
-    time, and guessing would put a wrong instant in the durable record.
+    a column other code compares as text. Raising beats coercing for anything we
+    cannot place in time: a guess puts a wrong instant in a durable record.
+
+    Three deliberate edges, each of which was a silent behaviour until named:
+
+    * **A bare date is REFUSED**, not read as midnight. `fromisoformat` accepts
+      "2026-08-23" and "20260823" and would return 00:00:00Z -- canonical, so no
+      ordering hazard, but wrong by up to 24h and entirely plausible-looking.
+      That is aimed squarely at the case this parameter exists for: a backfill
+      sourcing a DATE column would land every row at midnight. A loud refusal is
+      better than a silently plausible time.
+    * **A naive value is assumed UTC.** This IS a guess, which sits awkwardly
+      beside the paragraph above, so the asymmetry is owned rather than hidden:
+      every producer that reaches this column is UTC, so the assumption is
+      sound here and would not be in a system with local-time producers.
+    * **Empty string now raises** where it previously fell through to `now()`.
+      `""` is falsy but not `None`. Refusing is more correct -- an empty
+      timestamp is not a request for the current time -- but it is a behaviour
+      change, so it is recorded rather than left to be discovered.
     """
     if emitted_at is None:
         return datetime.now(timezone.utc).isoformat()
+    raw = str(emitted_at).strip()
     try:
-        parsed = datetime.fromisoformat(str(emitted_at).strip())
+        parsed = datetime.fromisoformat(raw)
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"emitted_at={emitted_at!r} is not an ISO-8601 timestamp. "
             "signal_outcome_ledger.emitted_at is compared lexicographically, "
             "so a non-canonical value silently mis-sorts."
         ) from exc
+    if parsed.time() == dt_time(0, 0) and not any(c in raw for c in (":", "T", " ")):
+        raise ValueError(
+            f"emitted_at={emitted_at!r} carries no time component. Read as "
+            "midnight UTC it would be wrong by up to 24h while looking "
+            "entirely plausible -- supply a full timestamp."
+        )
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()

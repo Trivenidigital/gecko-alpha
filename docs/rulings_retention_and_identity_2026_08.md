@@ -112,3 +112,21 @@ escape hatch is the recomputation clause above; it has not been taken.
 | B `volume_snapshots` 21→14 | **GO, 14d hard floor.** Executed 2026-08-23: span 21.04d → 14.002d, vol7d-eligible contracts 1668 → 1668. |
 | D `signal_events` indexes | **GO.** No VACUUM bundled. |
 | F `signal_events` 14d | **NO-GO on shortening; GO on first-seen substrate.** Substrate built, consumers migrated, parity proven (0 mismatches). Retention itself unchanged. |
+
+
+---
+
+## Verified prod facts underpinning these implementations
+
+Recorded because each was an INFERENCE until it was run, and an unrun scope
+assertion is exactly the failure this file's sibling runbook entry documents.
+
+| claim | check | result (2026-08-23) |
+|---|---|---|
+| `signal_outcome_ledger.emitted_at` is uniformly canonical, so the growth probe's lexicographic compare is chronological | `SELECT COUNT(*) ... WHERE emitted_at NOT LIKE '____-__-__T%+00:00'` | **0 of 511,810** — also 0 space-separated, 0 without UTC offset |
+| the identity-semantics migration has not yet run, so its archive will be taken | `paper_migrations` / `schema_version` / `sqlite_master` | 0 / 0 / 0 archives |
+| ruling B's readers are unaffected at 14d | vol7d-eligible contracts before vs after | 1668 → 1668 |
+
+The first is forward-enforced by `scout.outcome_ledger._normalise_emitted_at`
+for new writes; the check above is what establishes the existing 511,810 rows.
+Sole-writer analysis alone would have been inference.

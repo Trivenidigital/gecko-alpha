@@ -375,3 +375,33 @@ async def test_the_PUBLIC_API_normalises_a_backfill_timestamp(db, settings_facto
         stored == "2026-08-22T06:54:00+00:00"
     ), f"stored {stored!r} verbatim -- a lexicographic compare will mis-sort it"
     assert stored >= "2026-08-22T05:54:00", "row fell below a threshold it is inside"
+
+
+def test_a_bare_date_is_refused_rather_than_read_as_midnight():
+    """Aimed at the case the parameter exists for.
+
+    `fromisoformat` accepts "2026-08-23" and "20260823" and returns 00:00:00Z --
+    canonical, so no ordering hazard, but wrong by up to 24h and entirely
+    plausible-looking. A backfill sourcing a DATE column would land every row at
+    midnight and nothing would look amiss.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    for bare in ("2026-08-23", "20260823"):
+        with pytest.raises(ValueError, match="no time component"):
+            _normalise_emitted_at(bare)
+
+    # A real timestamp that happens to fall AT midnight must still be accepted.
+    assert (
+        _normalise_emitted_at("2026-08-23T00:00:00+00:00")
+        == "2026-08-23T00:00:00+00:00"
+    )
+    assert _normalise_emitted_at("2026-08-23 00:00:00") == "2026-08-23T00:00:00+00:00"
+
+
+def test_empty_string_is_refused_not_silently_treated_as_now():
+    """`""` is falsy but not None; it used to fall through to now()."""
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError):
+        _normalise_emitted_at("")
