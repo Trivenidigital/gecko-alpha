@@ -8145,7 +8145,7 @@ class Database:
 
     async def _classify_coverage_mark(
         self, source_table: str, row, pop: int
-    ) -> tuple[str, float | None]:
+    ) -> tuple[str, float | None, dict | None]:
         """Decide what to do with a stored high-water mark. Three outcomes.
 
         Exists so the caller cannot forget an arm. The clear is best-effort, so
@@ -8164,32 +8164,34 @@ class Database:
         standing state that re-arms every pass.
         """
         if row is None:
-            return "rearm", None
+            return "rearm", None, None
 
         best, recorded_pop = row[0], row[1]
         incomparable = (
             recorded_pop < _COLLAPSE_MIN_POPULATION * 2 and pop > recorded_pop * 2
         )
         if not incomparable:
-            return "compare", best
+            return "compare", best, None
 
         if not await self._clear_coverage_baseline(source_table):
-            return "incomparable_unresolved", best
+            return "incomparable_unresolved", best, None
 
-        # ANNOUNCE it. A cleared mark is the single event that can disarm this
-        # alarm, and the clear used to succeed silently -- only its failure
-        # logged. An automated action that undoes established state says so at
-        # the write site.
-        import structlog
-
-        structlog.get_logger().warning(
-            "recompute_coverage_baseline_cleared",
-            source_table=source_table,
-            discarded_rate=round(best, 4),
-            discarded_population=recorded_pop,
-            current_population=pop,
+        # The discard facts go BACK to the caller rather than being logged
+        # here, because the field an operator actually needs -- the rate being
+        # ARMED in this one's place -- is not knowable yet. The clear precedes
+        # the write, and if that write is starved by its 2s give-up the table
+        # ends up with NO mark at all. Logging the observed rate here would
+        # name a mark that does not exist, which is the trap `mark_written`
+        # exists to avoid one function over.
+        return (
+            "rearm",
+            None,
+            {
+                "discarded_rate": round(best, 4),
+                "discarded_population": recorded_pop,
+                "current_population": pop,
+            },
         )
-        return "rearm", None
 
     async def _clear_coverage_baseline(self, source_table: str) -> bool:
         """Drop a mark deemed incomparable, on its own connection.
@@ -8513,7 +8515,9 @@ class Database:
             # which is why the count kept rising by one. Naming the decision
             # makes the unhandled arm unrepresentable instead of merely
             # currently-handled.
-            decision, best = await self._classify_coverage_mark(table, row, pop)
+            decision, best, discarded = await self._classify_coverage_mark(
+                table, row, pop
+            )
             v["rate"] = round(rate, 4)
 
             if decision == "incomparable_unresolved":
@@ -8535,11 +8539,36 @@ class Database:
                     if stored is not None
                     else (round(best, 4) if best is not None else None)
                 )
-            else:  # "compare"
+                if discarded is not None:
+                    # ANNOUNCE the disarm, AFTER the write, carrying what
+                    # actually replaced the discarded mark. This line used to
+                    # name every field except the one the ratchet is about --
+                    # an operator could see what was thrown away but not what
+                    # took its place, and had to join to another log line to
+                    # judge whether the discard was reasonable. `armed_rate`
+                    # is None when the write was starved, which is the honest
+                    # answer: the table has no mark at all.
+                    import structlog
+
+                    structlog.get_logger().warning(
+                        "recompute_coverage_baseline_cleared",
+                        source_table=table,
+                        armed_rate=round(stored, 4) if stored is not None else None,
+                        **discarded,
+                    )
+            elif decision == "compare":
                 v["mark_written"] = False
                 v["best_rate"] = round(best, 4)
                 if rate < best * _COLLAPSE_FRACTION:
                     collapsed.append(table)
+            else:
+                # "Unrepresentable" was overclaimed: a bare `else` put any
+                # future decision into the JUDGING arm, where it would crash on
+                # `round(None, 4)` -- and that crash is swallowed by the
+                # maintenance pass, so the coverage probe would silently stop
+                # running. That is the deploy-without-activate class this
+                # component exists to prevent. Fail loudly at the edit instead.
+                raise AssertionError(f"unhandled coverage-mark decision: {decision!r}")
 
         # PER SURFACE, not global. The comment here used to claim a global
         # predicate covered "populated for one surface only"; it did not, and

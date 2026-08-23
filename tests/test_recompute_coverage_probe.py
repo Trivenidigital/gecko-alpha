@@ -1164,3 +1164,103 @@ async def test_the_write_reports_FAILURE_from_its_own_handler(tmp_path):
 
     bad = Database(tmp_path)
     assert await bad._record_coverage_baseline("gainers_comparisons", 0.5, 40) is None
+
+
+async def test_the_cleared_warning_names_what_REPLACED_the_mark(db):
+    """The disarm line must carry the rate being armed, not the one observed.
+
+    It named `discarded_rate`, `discarded_population` and `current_population`
+    — every field except the one the ratchet is about. An operator could see
+    what was thrown away but not what took its place, and had to join to
+    another log line to judge whether the discard was reasonable, for the
+    single event that can disarm this alarm.
+
+    Emitted after the WRITE, deliberately: the clear precedes it, so at clear
+    time the armed rate is not knowable, and logging the observed rate would
+    name a mark that may not exist.
+    """
+    from structlog.testing import capture_logs
+
+    await _bulk(db, 25, 25)  # mark 1.00 on a sample below twice the floor
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    await _bulk(db, 200, 20, prefix="grown")  # growth past the guard
+
+    with capture_logs() as events:
+        await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cleared = [
+        e for e in events if e.get("event") == "recompute_coverage_baseline_cleared"
+    ]
+    assert len(cleared) == 1, f"expected one disarm event, got {len(cleared)}"
+    assert cleared[0]["discarded_rate"] == 1.0
+    assert cleared[0]["discarded_population"] == 25
+    assert (
+        cleared[0]["armed_rate"] == 0.2
+    ), "the disarm line does not say what replaced the mark"
+
+
+async def test_an_unknown_decision_fails_LOUDLY(db):
+    """A bare `else` put a future arm into the JUDGING branch.
+
+    There it crashes on `round(None, 4)` — and that crash is swallowed by the
+    maintenance pass, so the probe silently stops running. That is the
+    deploy-without-activate class this component exists to prevent, so the
+    claim that naming the decision makes an unhandled arm unrepresentable had
+    to be made true rather than left as a comment.
+    """
+
+    async def _rogue(_self, _table, _row, _pop):
+        return "defer_pending_backfill", None, None
+
+    from scout.db import Database as _Db
+
+    original = _Db._classify_coverage_mark
+    _Db._classify_coverage_mark = _rogue
+    try:
+        await _bulk(db, 25, 20)
+        with pytest.raises(AssertionError, match="defer_pending_backfill"):
+            await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    finally:
+        _Db._classify_coverage_mark = original
+
+
+async def test_armed_rate_is_None_when_the_WRITE_was_starved(db):
+    """The case that separates "armed" from "observed".
+
+    On the re-arm path the two coincide — the row was just deleted, so the
+    write inserts today's rate. They differ only when the write itself is
+    starved by its 2s give-up: the table then holds NO mark, and reporting the
+    observed rate would name one that does not exist. That is the trap the
+    logic reviewer flagged on their own suggestion, and it is why this field
+    is read from the write's return rather than from `rate`.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.db import Database as _Db
+
+    await _bulk(db, 25, 25)  # mark 1.00, sample below twice the floor
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    await _bulk(db, 200, 20, prefix="grown")
+
+    async def _starved_write(_self, _table, _rate, _pop):
+        return None
+
+    original = _Db._record_coverage_baseline
+    _Db._record_coverage_baseline = _starved_write
+    try:
+        with capture_logs() as events:
+            probe = await db.chain_identity_recompute_coverage_probe(
+                gate_minutes=1440.0
+            )
+    finally:
+        _Db._record_coverage_baseline = original
+
+    cleared = [
+        e for e in events if e.get("event") == "recompute_coverage_baseline_cleared"
+    ]
+    assert len(cleared) == 1
+    assert (
+        cleared[0]["armed_rate"] is None
+    ), "reported an armed rate for a mark the starved write never stored"
+    assert cleared[0]["discarded_rate"] == 1.0
+    assert probe["per_surface"]["gainers_comparisons"]["mark_written"] is False
