@@ -577,12 +577,43 @@ async def get_gainers_stats(db: "Database") -> dict:
 
     hit_rate = round((caught / total * 100) if total > 0 else 0, 1)
 
+    # SPLIT, do not exclude.
+    #
+    # `avg_lead_minutes` UNIONs eight surfaces into one scalar and
+    # `hit_rate_pct` counts any non-gap row, so both currently mix
+    # prefix-derived chains credit with identity-derived credit. Dropping the
+    # legacy rows would move the headline for a compositional reason no reader
+    # can see -- and with CG ingest quota-stalled there are ~0 canonical rows
+    # yet, so the average would silently become a seven-surface number with
+    # nothing saying so. That is the "every headline needs its selection axis"
+    # failure, not a fix for it.
+    #
+    # So the aggregates stay as-recorded and the MIX becomes visible instead.
+    # Note the deliberate asymmetry with scout/conviction/cross_surface.py,
+    # which DOES refuse prefix-derived chains credit: conviction is a
+    # forward-looking score being computed now, while these are the historical
+    # record of what the system actually did. Rewriting the record is the
+    # evidence destruction the ruling forbids; scoring off unverified
+    # provenance is what it forbids. Both sites are governed by that one
+    # distinction -- if it ever stops holding, change them together.
+    cursor = await db._conn.execute("""
+        SELECT
+            SUM(chains_identity_semantics = 'canonical_v1'),
+            SUM(chains_identity_semantics = 'legacy_prefix'),
+            SUM(chains_identity_semantics IS NULL)
+        FROM gainers_comparisons WHERE detected_by_chains = 1""")
+    mix = await cursor.fetchone() or (0, 0, 0)
+
     return {
         "total_tracked": total,
         "caught": caught,
         "missed": missed,
         "hit_rate_pct": hit_rate,
         "avg_lead_minutes": avg_lead,
+        # Provenance mix of the chains contribution to the two figures above.
+        "n_chains_canonical": mix[0] or 0,
+        "n_chains_legacy_prefix": mix[1] or 0,
+        "n_chains_unstamped": mix[2] or 0,
     }
 
 

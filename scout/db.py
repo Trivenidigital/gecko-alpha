@@ -361,6 +361,9 @@ class Database:
             await self._migrate_chain_identity_semantics_v1()
             # Not gated by the migration marker: rows written by OLD code
             # after the migration ran would otherwise keep NULL forever.
+            # Ungated by the migration marker: the migration early-returns
+            # forever once applied, and this is the IRREVERSIBLE half.
+            await self.archive_legacy_prefix_comparisons()
             await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
@@ -7761,6 +7764,58 @@ class Database:
             (token_id, created_at, now),
         )
 
+    async def archive_legacy_prefix_comparisons(self) -> dict[str, int]:
+        """Snapshot the pre-cutover comparison rows. NOT gated by any marker.
+
+        The semantics marker alone does not preserve this evidence, because the
+        trackers do not UPDATE these rows -- all three
+        `DELETE FROM <table> WHERE coin_id = ?` and re-INSERT on every
+        recompute. After the semantics change that recompute writes canonical
+        values over a legacy row and the original is gone.
+
+        This lives OUTSIDE `_migrate_chain_identity_semantics_v1` on purpose,
+        and that is the second half of a lesson I only half-learned. The
+        migration early-returns forever once its `paper_migrations` marker
+        exists -- so retrofitting the archive INSIDE it meant any database that
+        had already run the earlier build skipped the archive silently, under a
+        log line reading `..._skip_already_applied`. I had already fixed exactly
+        that gating for the stamping step and left it in place for archiving,
+        which is the IRREVERSIBLE half.
+
+        Self-guarding via `sqlite_master`, so running it every startup is free
+        once the archives exist.
+
+        SCOPE, stated honestly: this is the PRE-CUTOVER SNAPSHOT, not a promise
+        that every `legacy_prefix` row ever written has an archived twin. Rows
+        created later by rolled-back old code are stamped legacy by
+        `stamp_unmarked_chain_semantics` but arrive after this snapshot was
+        taken. `CREATE TABLE ... AS SELECT *` also copies values only -- no
+        primary key, constraints or indexes -- which is right for a forensic
+        snapshot but means `id` is not a key here.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                (table, archive),
+            )
+            names = {r[0] for r in await cur.fetchall()}
+            if table not in names or archive in names:
+                continue
+            await self._conn.execute(f"CREATE TABLE {archive} AS SELECT * FROM {table}")
+            cur = await self._conn.execute(f"SELECT COUNT(*) FROM {archive}")
+            out[archive] = (await cur.fetchone())[0]
+        if out:
+            await self._conn.commit()
+        return out
+
     async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:
         """Give any unmarked comparison row its `legacy_prefix` stamp.
 
@@ -7873,7 +7928,6 @@ class Database:
                 )
 
             stamped = {}
-            archived = {}
             for table in tables:
                 cur = await conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -7910,34 +7964,6 @@ class Database:
                 )
                 stamped[table] = cur.rowcount or 0
 
-                # ARCHIVE the legacy rows. The marker alone does NOT satisfy the
-                # ruling, because the trackers do not UPDATE these rows -- they
-                # `DELETE FROM <table> WHERE coin_id = ?` and re-INSERT on every
-                # recompute. Before this change that was value-neutral (same
-                # semantics recomputed); now the recompute writes CANONICAL
-                # values over a legacy row and the original is simply gone.
-                # "An UPDATE that destroys the previous evidence", spelled
-                # DELETE+INSERT.
-                #
-                # The first time `vanar-chain-2` re-enters the 24h gainers
-                # window its +6.07-day fabricated lead disappears -- the single
-                # most valuable falsification artefact the impact study
-                # produced. Snapshotting here, once, before any tracker can
-                # reach it, is what actually preserves the evidence.
-                archive = f"{table}_legacy_prefix_v1"
-                cur = await conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (archive,),
-                )
-                if not await cur.fetchone():
-                    await conn.execute(
-                        f"CREATE TABLE {archive} AS SELECT * FROM {table}"
-                    )
-                    cur = await conn.execute(f"SELECT COUNT(*) FROM {archive}")
-                    archived[table] = (await cur.fetchone())[0]
-                else:
-                    archived[table] = -1  # pre-existing; left untouched
-
             await conn.execute(
                 "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
                 "VALUES (?, ?)",
@@ -7952,7 +7978,6 @@ class Database:
             _log.info(
                 "chain_identity_semantics_v1_migration_complete",
                 stamped_legacy=stamped,
-                archived_legacy_rows=archived,
             )
         except BaseException as e:
             _log.exception(

@@ -67,13 +67,14 @@ async def test_existing_rows_are_stamped_legacy_not_recomputed(db):
 async def test_the_legacy_rows_are_ARCHIVED_before_a_tracker_can_delete_them(db):
     """THE fix for the blocker. The marker alone does not survive DELETE+INSERT."""
     await _legacy_row(db, "vanar-chain-2", 8736.2)
-    await db._conn.execute(
-        "DELETE FROM paper_migrations WHERE name='chain_identity_semantics_v1'"
-    )
+    # initialize() already archived the (then empty) table, so drop and retake
+    # it now that the row exists.
     await db._conn.execute("DROP TABLE IF EXISTS gainers_comparisons_legacy_prefix_v1")
     await db._conn.commit()
 
-    await db._migrate_chain_identity_semantics_v1()
+    # The archive is an UNGATED startup step, not part of the migration -- see
+    # test_the_archive_is_taken_even_when_the_MIGRATION_MARKER_ALREADY_EXISTS.
+    await db.archive_legacy_prefix_comparisons()
 
     # Now simulate what the tracker actually does on every recompute.
     await db._conn.execute(
@@ -161,3 +162,73 @@ async def test_stamping_with_nothing_to_do_leaves_no_open_transaction(db):
     # Must not raise.
     await db._conn.execute("BEGIN EXCLUSIVE")
     await db._conn.execute("ROLLBACK")
+
+
+async def test_the_archive_is_taken_even_when_the_MIGRATION_MARKER_ALREADY_EXISTS(db):
+    """The blocker both reviewers found independently — and the same mistake twice.
+
+    The archive was retrofitted INSIDE the migration, whose first action is an
+    early-return on its `paper_migrations` marker. So on any database where the
+    EARLIER build of this branch had already run, the marker existed, the
+    migration returned at `..._skip_already_applied`, and the archive was never
+    taken — silently, under a log line that reads like success.
+
+    I had already fixed exactly that gating for the stamping step and left it in
+    place for archiving, which is the irreversible half.
+
+    This builds the state the reviewers reproduced: columns present, rows
+    stamped legacy, MARKER PRESENT, archives dropped. Every other archive test
+    in this file deletes the marker first, so all of them exercise the fresh
+    path only and none could see this.
+    """
+    await _legacy_row(db, "vanar-chain-2", 8736.2)
+    for t in ("gainers_comparisons", "losers_comparisons", "trending_comparisons"):
+        await db._conn.execute(f"DROP TABLE IF EXISTS {t}_legacy_prefix_v1")
+    await db._conn.commit()
+
+    cur = await db._conn.execute(
+        "SELECT 1 FROM paper_migrations WHERE name='chain_identity_semantics_v1'"
+    )
+    assert await cur.fetchone(), "fixture did not reproduce the marker-present state"
+
+    # The migration itself is now a no-op on this DB...
+    await db._migrate_chain_identity_semantics_v1()
+    cur = await db._conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='gainers_comparisons_legacy_prefix_v1'"
+    )
+    assert not await cur.fetchone(), "fixture invalid: the migration still archived"
+
+    # ...but the ungated step still protects the evidence.
+    created = await db.archive_legacy_prefix_comparisons()
+    assert "gainers_comparisons_legacy_prefix_v1" in created
+
+    # And it survives what the tracker actually does.
+    await db._conn.execute(
+        "DELETE FROM gainers_comparisons WHERE coin_id = ?", ("vanar-chain-2",)
+    )
+    await db._conn.commit()
+    cur = await db._conn.execute(
+        "SELECT chains_lead_minutes FROM gainers_comparisons_legacy_prefix_v1 "
+        "WHERE coin_id='vanar-chain-2'"
+    )
+    row = await cur.fetchone()
+    assert row is not None and row[0] == 8736.2
+
+
+async def test_archiving_is_idempotent_and_does_not_reset_an_existing_archive(db):
+    """Running every startup must not overwrite the snapshot with current state."""
+    await _legacy_row(db, "pepe", 1.0)
+    first = await db.archive_legacy_prefix_comparisons()
+    assert first == {}, "archives already existed from initialize(); nothing to do"
+
+    # A row added AFTER the snapshot must not appear in it, and the snapshot
+    # must not be retaken.
+    await _legacy_row(db, "post-snapshot", 2.0)
+    assert await db.archive_legacy_prefix_comparisons() == {}
+    cur = await db._conn.execute(
+        "SELECT COUNT(*) FROM gainers_comparisons_legacy_prefix_v1 "
+        "WHERE coin_id='post-snapshot'"
+    )
+    assert (await cur.fetchone())[
+        0
+    ] == 0, "the archive was retaken, so it is no longer the PRE-CUTOVER snapshot"

@@ -103,6 +103,9 @@ def cross_surface_conviction(row, settings) -> ConvictionResult:
         # code) are treated as legacy: unverified provenance must not earn
         # credit. Other surfaces are unaffected -- their leads never came from
         # this predicate.
+        # Counterpart to the note in scout/gainers/tracker.py::get_gainers_stats,
+        # which deliberately does NOT filter: that reports the historical record
+        # of what the system did, this computes a forward-looking score now.
         if surface == "chains":
             semantics = _row_get(row, "chains_identity_semantics")
             if semantics != CANONICAL_SEMANTICS:
