@@ -36,14 +36,36 @@ just in the other direction.
 Hence three outcomes, never two: **verified canonical**, **verified prefix-only**,
 and **indeterminate**.
 
-THE MONOTONIC SHORTCUT
-----------------------
-Missing older history can only make a true lead LARGER, never smaller. So an
-observed canonical lead >= the conviction gate is SAFE under left-censoring: the
-true lead is at least the observed one. The converse does not hold -- an
-observed lead below the gate cannot be called a negative, because earlier
-canonical history may simply be gone. That asymmetry is the only thing that lets
-any row be verified at all under incomplete coverage.
+THE MONOTONIC SHORTCUT, AND ITS LIMIT
+-------------------------------------
+Missing older history can only make a true lead LARGER **within a tier**. So an
+observed lead >= the conviction gate is safe under left-censoring, and the
+converse does not hold: a lead below the gate cannot be called a negative,
+because earlier history may simply be gone.
+
+**That argument does NOT hold ACROSS tiers, and an earlier version of this module
+claimed it did.** `identity.resolve` picks tier first, then earliest within tier.
+Censoring can hide the canonical-id token entirely, letting a lower-tier
+alias -- bare symbol equality, possibly a DIFFERENT ASSET -- win with an earlier
+first_seen. Restoring history reinstates the correct, LATER, canonical match and
+the lead COLLAPSES. Executed against the real resolver:
+
+    censored  [("luna", 08-15)]                    -> alias_unique,  lead 7200
+    restored  + ("terra-luna-2", 08-19T23:00)      -> canonical_id,  lead   60
+
+`terra-luna-2 <- luna` is not hypothetical: it is one of the eight named
+production identity errors this workstream exists to remove.
+
+So a verified positive requires a tier that censoring cannot mask:
+`contract` or `canonical_id`, where the winner IS the coin and no higher tier
+can appear later. An `alias_unique` win is recorded as indeterminate instead.
+
+That also disposes of a justification that does not transfer: symbol equality
+was admitted as tier 3 because the impact study measured it deciding ZERO
+winners -- but that study ran on the live, uncensored substrate. The recompute
+replays over deliberately censored history, where canonical ids are exactly what
+is missing and short symbol-tokens are what survive. This is the one context
+where symbol equality decides winners, which is precisely where it must not.
 """
 
 from __future__ import annotations
@@ -129,11 +151,27 @@ def classify(
     if resolution.tier == TIER_UNRESOLVED and resolution.alias_candidates:
         return STATUS_AMBIGUOUS
 
-    if resolution.tier in (TIER_CONTRACT, TIER_CANONICAL_ID, TIER_ALIAS_UNIQUE):
-        # Canonical identity established. The monotonic argument makes a lead at
-        # or above the gate safe even under left-censored history; below it, we
-        # cannot distinguish "genuinely late" from "earlier history pruned".
+    if resolution.tier in (TIER_CONTRACT, TIER_CANONICAL_ID):
+        # The winner IS the coin, so no higher tier can appear later to displace
+        # it and the monotonic argument holds: restoring history can only move
+        # this first_seen earlier. A lead at or above the gate is therefore safe
+        # under left-censoring; below it we cannot separate "genuinely late"
+        # from "earlier history pruned".
         if canonical_lead is not None and canonical_lead >= gate_minutes:
+            return STATUS_VERIFIED_CANONICAL
+        return STATUS_CANONICAL_SUB_GATE
+
+    if resolution.tier == TIER_ALIAS_UNIQUE:
+        # NEVER a verified positive under possibly-censored history. A hidden
+        # canonical-id token would outrank this on tier and could carry a LATER
+        # first_seen, collapsing the lead -- so an alias win can be an artefact
+        # of what is missing rather than evidence of what happened. Only safe
+        # once coverage establishes that no canonical-id token was hidden.
+        if (
+            anchor_covered
+            and canonical_lead is not None
+            and canonical_lead >= gate_minutes
+        ):
             return STATUS_VERIFIED_CANONICAL
         return STATUS_CANONICAL_SUB_GATE
 
@@ -159,6 +197,31 @@ _SURFACES = {
 }
 
 
+def _anchor_is_covered(anchor: str, intervals) -> bool:
+    """Is there history spanning the moment this anchor needs?
+
+    An earlier version used a single global floor -- `anchor > min(all history)`
+    -- which licenses PER-TOKEN evidence from a GLOBAL scalar and fails three
+    ways:
+
+      * the snapshot union has GAPS (2026-07-03..07-17, 2026-08-02..08-08).
+        An anchor inside a gap sits far above the global floor, so absence there
+        was read as proof;
+      * a token whose only events fell in a gap is in no source at all, yet its
+        coin's anchor was "covered" by a floor derived from a DIFFERENT token;
+      * worst, ONE ancient token dragged the floor back far enough to mark
+        essentially every anchor covered -- collapsing the three-outcome design
+        to two, so `indeterminate` would almost never fire and every unmatched
+        row became an asserted `verified_prefix_only`.
+
+    Intervals answer the question actually being asked. Outside them the answer
+    is "we cannot see", which is not the same as "it is not there".
+    """
+    if not anchor or not intervals:
+        return False
+    return any(start <= anchor <= end for start, end in intervals)
+
+
 async def substrate_floor(conn) -> str | None:
     """Earliest first-seen the substrate knows about, i.e. the coverage edge.
 
@@ -176,6 +239,7 @@ async def recompute_legacy_provenance(
     gate_minutes: float = 1440.0,
     semantics_column: str = "chains_identity_semantics",
     extra_history: dict[str, str] | None = None,
+    coverage_intervals: list[tuple[str, str]] | None = None,
 ) -> dict:
     """Resolve every archived legacy row's provenance into the versioned table.
 
@@ -199,13 +263,15 @@ async def recompute_legacy_provenance(
     from scout.identity import resolve
 
     floor = await substrate_floor(conn)
-    if extra_history:
-        extra_floor = min((v for v in extra_history.values() if v), default=None)
-        if extra_floor and (floor is None or extra_floor < floor):
-            # Coverage genuinely reaches further back now, so more anchors are
-            # decidable. Leaving the floor at the substrate's would keep calling
-            # rows indeterminate that the extra history can actually resolve.
-            floor = extra_floor
+    if coverage_intervals is None:
+        # UNDECLARED -> default to the substrate's own window. An EMPTY list is
+        # a different statement: it declares that nothing is covered, and must
+        # not silently widen to the default. `or []` conflated the two, which is
+        # the fail-open shape -- a caller asserting "no coverage" would have got
+        # full coverage.
+        intervals = [(floor, "9999-12-31T23:59:59+00:00")] if floor else []
+    else:
+        intervals = list(coverage_intervals)
     counts: dict[str, int] = {}
 
     # Normalise ONCE. Doing datetime()/julianday() per substrate row per legacy
@@ -264,17 +330,27 @@ async def recompute_legacy_provenance(
         for row_id, coin_id, symbol, anchor, legacy_detected, legacy_lead in rows:
             if not coin_id or not anchor:
                 continue
-            # Same +5min tolerance the consumers use, evaluated in SQL so the
-            # bound is identical to the one that produced the legacy value.
-            cur = await conn.execute(
-                "SELECT datetime(?, '+5 minutes'), julianday(?)", (anchor, anchor)
-            )
+            # PER-SURFACE bound. gainers/trending use the +5min tolerance with
+            # both sides normalised; losers uses a bare `first_seen_at < ?`.
+            # scout/identity.py documents that the two are NOT interchangeable,
+            # and an earlier version of this loop applied +5min uniformly while
+            # asserting in a comment that the bound was "identical to the one
+            # that produced the legacy value" -- so losers rows could be
+            # verified on candidates the canonical losers path would refuse.
+            if source_table == "losers_comparisons":
+                cur = await conn.execute("SELECT ?, julianday(?)", (anchor, anchor))
+            else:
+                cur = await conn.execute(
+                    "SELECT datetime(?, '+5 minutes'), julianday(?)", (anchor, anchor)
+                )
             cutoff, anchor_jd = await cur.fetchone()
 
+            raw_bound = source_table == "losers_comparisons"
             candidates = [
                 (token_id, first_seen)
                 for token_id, first_seen, nfs, _jd in substrate
-                if cutoff is not None and nfs < cutoff
+                if cutoff is not None
+                and ((first_seen < cutoff) if raw_bound else (nfs < cutoff))
             ]
             jd_by_value = {first_seen: jd for _t, first_seen, _n, jd in substrate}
 
@@ -286,7 +362,7 @@ async def recompute_legacy_provenance(
                 if seen_jd is not None:
                     canonical_lead = round(_lead_minutes(anchor_jd, seen_jd), 1)
 
-            anchor_covered = bool(floor) and anchor > floor
+            anchor_covered = _anchor_is_covered(anchor, intervals)
             status = classify(
                 resolution=res,
                 legacy_detected=bool(legacy_detected),

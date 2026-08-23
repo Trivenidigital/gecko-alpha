@@ -331,7 +331,18 @@ async def get_losers_comparisons(db: "Database", limit: int = 50) -> list[dict]:
                       AND cir.historical_anchor = losers_comparisons.appeared_on_losers_at
                     ORDER BY CASE cir.evidence_status
                              WHEN 'verified_canonical' THEN 1 ELSE 0 END
-                    LIMIT 1) AS chains_recompute_status
+                    LIMIT 1) AS chains_recompute_status,
+                  -- The VERIFIED lead, not the legacy prefix-derived one.
+                  -- Scoring chains_lead_minutes after verifying canonical_lead
+                  -- would decouple the claim from the value.
+                  (SELECT cir.canonical_lead
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'losers_comparisons'
+                      AND cir.coin_id = losers_comparisons.coin_id
+                      AND cir.historical_anchor = losers_comparisons.appeared_on_losers_at
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 1 ELSE 0 END
+                    LIMIT 1) AS chains_canonical_lead
            FROM losers_comparisons
            ORDER BY appeared_on_losers_at DESC
            LIMIT ?""",

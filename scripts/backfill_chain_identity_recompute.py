@@ -41,6 +41,38 @@ SNAPSHOT_SOURCES = (
 LIVE_DB = "/root/gecko-alpha/scout.db"
 
 
+def collect_intervals(sources, *, live_db: str) -> list[tuple[str, str]]:
+    """The windows each source actually spans, merged where they overlap.
+
+    Declared rather than inferred: a single global minimum would mark an anchor
+    inside a GAP as covered, and the union here has real gaps
+    (2026-07-03..07-17 and 2026-08-02..08-08 are in no source). Inside those,
+    absence of a canonical match is not evidence of absence.
+    """
+    spans: list[tuple[str, str]] = []
+    for path in [live_db, *sources]:
+        if not Path(path).exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+            row = conn.execute(
+                "SELECT MIN(created_at), MAX(created_at) FROM signal_events"
+            ).fetchone()
+            conn.close()
+            if row and row[0] and row[1]:
+                spans.append((row[0], row[1]))
+        except sqlite3.Error:
+            continue
+    spans.sort()
+    merged: list[tuple[str, str]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def collect_history(sources, *, live_db: str) -> dict[str, str]:
     """Earliest known event per token across every readable source.
 
@@ -100,8 +132,12 @@ async def main() -> int:
 
     print("Collecting history from every readable source (read-only):")
     history = collect_history(SNAPSHOT_SOURCES, live_db=args.db)
+    intervals = collect_intervals(SNAPSHOT_SOURCES, live_db=args.db)
     floor = min(history.values()) if history else None
     print(f"union: {len(history)} tokens, earliest = {floor}")
+    print("coverage intervals (anchors OUTSIDE these stay indeterminate):")
+    for start, end in intervals:
+        print(f"  {start}  ..  {end}")
 
     if not args.apply:
         print("\nDRY RUN — nothing written. Re-run with --apply.")
@@ -111,7 +147,10 @@ async def main() -> int:
     await db.initialize()
     try:
         counts = await recompute_legacy_provenance(
-            db._conn, gate_minutes=args.gate_minutes, extra_history=history
+            db._conn,
+            gate_minutes=args.gate_minutes,
+            extra_history=history,
+            coverage_intervals=intervals,
         )
     finally:
         await db.close()

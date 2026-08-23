@@ -138,6 +138,20 @@ def cross_surface_conviction(row, settings) -> ConvictionResult:
         if surface == "chains" and not _chains_evidence_is_trusted(row):
             continue
         lead = _row_get(row, lead_col)
+        if surface == "chains":
+            # Score the lead that was VERIFIED, not the legacy one.
+            #
+            # For a recovered legacy row the recompute establishes a canonical
+            # lead; `chains_lead_minutes` still holds the ORIGINAL,
+            # prefix-derived value. Using the latter decouples the claim from
+            # the number: a row verified at 7200 minutes but carrying a legacy
+            # 100 was refused by this gate despite being exactly the row the
+            # recomputation exists to recover. It also runs the other way -- a
+            # legacy lead inflated by a fuzzy match would be scored on evidence
+            # that was never verified.
+            recomputed = _row_get(row, "chains_canonical_lead")
+            if recomputed is not None:
+                lead = recomputed
         try:
             lead_val = float(lead)
         except (TypeError, ValueError):

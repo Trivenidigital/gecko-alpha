@@ -441,10 +441,36 @@ async def test_extra_history_extends_the_COVERAGE_floor_too(db):
         db._conn,
         gate_minutes=GATE,
         extra_history={"ancient": "2026-06-20T00:00:00+00:00"},
+        coverage_intervals=[("2026-06-19T00:00:00+00:00", "2026-08-02T20:21:10+00:00")],
     )
     assert (
         await _status(db, "ancient-coin") == STATUS_PREFIX_ONLY
-    ), "coverage floor was not extended, so resolvable evidence was ignored"
+    ), "declared coverage was ignored, so resolvable evidence went unused"
+
+
+async def test_an_anchor_inside_a_COVERAGE_GAP_is_indeterminate(db):
+    """The gap case a global floor cannot express.
+
+    2026-07-03..07-17 is covered by no source. An anchor there sits far above
+    any global floor, so the old predicate called it covered and read absence
+    as proof — manufacturing a false negative in the one window where we are
+    blindest.
+    """
+    await _substrate(db, [("ancient", EARLY)])
+    await _legacy(db, "ancient-coin", "XYZ", anchor="2026-07-10T00:00:00+00:00")
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=GATE,
+        extra_history={"ancient": "2026-06-20T00:00:00+00:00"},
+        coverage_intervals=[
+            ("2026-06-19T00:00:00+00:00", "2026-07-03T00:26:52+00:00"),
+            ("2026-07-17T19:32:46+00:00", "2026-08-02T20:21:10+00:00"),
+        ],
+    )
+    assert (
+        await _status(db, "ancient-coin") == STATUS_INDETERMINATE
+    ), "an anchor inside a known blind window was given a verdict"
 
 
 async def test_duplicate_coin_ids_cannot_FAN_OUT_the_reader(db):
@@ -522,3 +548,89 @@ async def test_the_overlay_matches_on_ANCHOR_not_just_coin_id(db):
     assert (
         row["chains_recompute_status"] is None
     ), "another anchor's verdict was applied to this row"
+
+
+async def test_END_TO_END_archive_to_recompute_to_reader_to_conviction(db):
+    """The cliff guard that can actually SEE the cliff.
+
+    Every other conviction assertion in this file hand-builds the row dict, so
+    none of them observes whether the overlay is produced by the SQL at all.
+    Review proved it: severing the join predicate in the reader left the entire
+    suite green — and that mutant IS the production cliff (overlay never joins
+    -> all legacy credit refused -> 826 rows, tier_high 341 -> 187).
+
+    This walks the real path: archive row -> recompute -> reader -> scorer.
+    """
+    from scout.gainers.tracker import get_gainers_comparisons
+
+    await _substrate(db, [("pepe", EARLY)])
+    await _legacy(db, "pepe", "PEPE", lead=100.0)  # legacy lead BELOW the gate
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics)
+           VALUES ('pepe','PEPE','Pepe',10.0,?,1,100.0,0,?)""",
+        (ANCHOR, LEGACY_SEMANTICS),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+
+    rows = await get_gainers_comparisons(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "pepe")
+
+    assert (
+        row["chains_recompute_status"] == STATUS_VERIFIED_CANONICAL
+    ), "the overlay never reached the reader — this is the cliff"
+    # D3: the VERIFIED lead must be what gets scored, not the legacy 100.
+    assert row["chains_canonical_lead"] == pytest.approx(7200.0, abs=1.0)
+
+    res = cross_surface_conviction(row, _settings())
+    assert (
+        "chains" in res.contributing
+    ), "a verified-canonical row was refused end to end"
+
+
+async def test_END_TO_END_a_prefix_only_row_is_refused(db):
+    """The other direction, through the same real path."""
+    from scout.gainers.tracker import get_gainers_comparisons
+
+    await _substrate(db, [("re", EARLY)])
+    await _legacy(db, "real-world-apparel", "JACKET")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics)
+           VALUES ('real-world-apparel','JACKET','RWA',10.0,?,1,8736.0,0,?)""",
+        (ANCHOR, LEGACY_SEMANTICS),
+    )
+    await db._conn.commit()
+
+    await recompute_legacy_provenance(db._conn, gate_minutes=GATE)
+    rows = await get_gainers_comparisons(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "real-world-apparel")
+
+    assert row["chains_recompute_status"] == STATUS_PREFIX_ONLY
+    assert "chains" not in cross_surface_conviction(row, _settings()).contributing
+
+
+async def test_an_alias_win_is_NOT_verified_under_censored_history(db):
+    """D1: the monotonic argument does not hold ACROSS tiers.
+
+    `luna` is a different asset from `terra-luna-2`. Under censoring it wins on
+    alias tier with an earlier first_seen; restoring history reinstates the
+    canonical token with a LATER one and the lead collapses. So an alias win
+    can be an artefact of what is missing.
+    """
+    await _substrate(db, [("luna", EARLY)])
+    await _legacy(db, "terra-luna-2", "LUNA", anchor=ANCHOR)
+
+    # No declared coverage -> the alias win must not be promoted to verified.
+    await recompute_legacy_provenance(
+        db._conn, gate_minutes=GATE, coverage_intervals=[]
+    )
+    assert (
+        await _status(db, "terra-luna-2") == STATUS_CANONICAL_SUB_GATE
+    ), "an alias-tier win was verified while a canonical token could be hidden"
