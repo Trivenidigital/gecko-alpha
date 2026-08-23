@@ -1,6 +1,6 @@
 # Acceptance report — versioned legacy-provenance recomputation
 
-**Candidate:** `4693c563` (`fix/canonical-identity-semantics`, PR #559)
+**Candidate:** `f2847774` (`fix/canonical-identity-semantics`, PR #559)
 **Method:** full replay of the entire archived population against a trimmed
 copy of production, taken in the pre-migration shape so `initialize()`
 exercises the real upgrade-with-data path.
@@ -68,6 +68,20 @@ the third.
 | losers | 1,080 | 591 | 54.7% |
 | trending | 543 | 388 | 71.5% |
 | **total** | **2,767** | **1,543** | **55.8%** |
+
+The collapse alarm's high-water ratchet, recorded on its first observation of
+this replay, reproduces these independently:
+
+```
+gainers   rate 0.4930   best_rate 0.4930
+losers    rate 0.5472   best_rate 0.5472
+trending  rate 0.7145   best_rate 0.7145
+```
+
+Those are the same numbers to four decimal places, arrived at by a different
+code path — the probe's per-surface correlation rather than the replay's status
+tally. A disagreement between them would have meant the alarm was measuring
+something other than what this table reports.
 
 ## 4. Row age — the axis that explains everything
 
@@ -162,13 +176,14 @@ first-seen *after* its anchor slipped through the time bounds.
 ## 7. Sensitivity
 
 The replay was run on seven successive revisions of the code (`c1a50e33`,
-`19dd27da`, `552ef6f6`, `599be775`, `47847f47`, `c8b5e009`, `4693c563`), across a change of live history source
+`19dd27da`, `552ef6f6`, `599be775`, `47847f47`, `c8b5e009`, `4693c563`,
+`f2847774`), across a change of live history source
 (`signal_events` → `signal_first_seen`), a rewrite of the coverage probe, and a
 change from one transaction to per-surface commits, the removal of
 `alias_unique` promotion, a semantics filter on the tracker overlay, and a
 gate re-check in the coverage probe.
 
-**Every status count was identical on all seven**, with one deliberate
+**Every status count was identical on all eight**, with one deliberate
 exception: the last revision split `alias_tier_not_verifiable` out of
 `canonical_below_gate_indeterminate` (252 → 249 + 3), because that label
 asserted a gate comparison never performed for the alias tier. The total,
@@ -201,5 +216,5 @@ late without re-opening the measurement.
 | Coverage is a global span, not per-token | Per-token coverage is a design change; the current predicate only ever produces conservative outcomes now that `alias_unique` cannot promote. |
 | `coverage_intervals=None` falls back to a global substrate floor | Latent: there is no runtime caller of `recompute_legacy_provenance` outside the ops script, which always passes explicit intervals. Removing the default would be a silent behaviour change for a caller that does not exist yet. |
 | Recovery falls to the substrate-only rate once the `/root` snapshots are deleted | Unavoidable. This is why the watchdog escalates on recovered credit rather than row count. |
-| The alarm cannot fire on *gradual* degradation | `not_recovering` is all-or-nothing per surface. Deleting the snapshots drops recovery to roughly a fifth — **not zero** — so tier_high could collapse ~80% under a green alarm. Right for deploy-without-activate, blind to attrition. Closing it needs a ratchet (persist last run's `credit_recovered` per surface, escalate on a drop beyond some fraction), which is a design decision rather than a bug fix. |
+| ~~The alarm cannot fire on gradual degradation~~ | **CLOSED.** A per-surface high-water rate ratchet now escalates on a fall below half the recorded rate, in both the probe and the watchdog. Recorded on first observation, raised on improvement, never lowered; reset by deleting the surface's row. See `docs/runbook_recompute_coverage.md`. |
 | Probe and readers now share one correlation *and* one gate predicate | More correct than two independent proxies, but a wrong shared predicate makes them wrong **together and in agreement**, which reads as healthy. The remaining failure mode is deliberate. |
