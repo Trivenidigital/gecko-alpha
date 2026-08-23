@@ -18,6 +18,31 @@ DB_PATH="${GECKO_DB_PATH:-$APP_DIR/scout.db}"
 ENV_FILE="${GECKO_ENV_FILE:-$APP_DIR/.env}"
 PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 
+# PREFLIGHT, before the `cd` and before anything invokes the interpreter.
+# Under `set -euo pipefail` a failed `cd` exits 1 --
+# the SAME code the alarm path uses after a successful Telegram send. A dead
+# watchdog and a firing watchdog were indistinguishable to anything
+# downstream. Reachable straight from the runbook's own install step: this
+# script is installed to /usr/local/bin while APP_DIR defaults to
+# /root/gecko-alpha, and that split has already caused a deploy that shipped
+# nothing on this box.
+#
+# EXIT CONTRACT (documented in docs/runbook_recompute_coverage.md):
+#   0  healthy            5  APP_DIR invalid
+#   1  ALARM, Telegram    6  interpreter missing, or the app cannot be
+#   2  check could not run (WARN, no Telegram)   imported to read the gate
+#   3  .env missing       4  Telegram credentials missing
+# Only 1 notifies. 2-6 are operator-visible failures of the watchdog itself.
+if [[ ! -d "$APP_DIR" ]]; then
+    echo "FATAL: APP_DIR does not exist: $APP_DIR" >&2
+    exit 5
+fi
+if [[ ! -x "$PYTHON" ]]; then
+    echo "FATAL: python interpreter not executable: $PYTHON" >&2
+    exit 6
+fi
+
+
 # The gate must match what the READERS use. `evidence_status` is a frozen
 # decision about the gate as it stood when the backfill ran; cross_surface
 # re-tests the lead against CONVICTION_EARLY_LEAD_MINUTES at scoring time.
@@ -65,29 +90,6 @@ if [[ -z "${GATE:-}" ]]; then
     # off an assumed threshold is the failure this whole file exists to
     # prevent.
     echo "FATAL: could not read CONVICTION_EARLY_LEAD_MINUTES from $APP_DIR" >&2
-    exit 6
-fi
-
-# Validate before `cd`. Under `set -euo pipefail` a failed `cd` exits 1 --
-# the SAME code the alarm path uses after a successful Telegram send. A dead
-# watchdog and a firing watchdog were indistinguishable to anything
-# downstream. Reachable straight from the runbook's own install step: this
-# script is installed to /usr/local/bin while APP_DIR defaults to
-# /root/gecko-alpha, and that split has already caused a deploy that shipped
-# nothing on this box.
-#
-# EXIT CONTRACT (documented in docs/runbook_recompute_coverage.md):
-#   0  healthy            5  APP_DIR invalid
-#   1  ALARM, Telegram    6  python interpreter missing
-#   2  check could not run (WARN, no Telegram)
-#   3  .env missing       4  Telegram credentials missing
-# Only 1 notifies. 2-6 are operator-visible failures of the watchdog itself.
-if [[ ! -d "$APP_DIR" ]]; then
-    echo "FATAL: APP_DIR does not exist: $APP_DIR" >&2
-    exit 5
-fi
-if [[ ! -x "$PYTHON" ]]; then
-    echo "FATAL: python interpreter not executable: $PYTHON" >&2
     exit 6
 fi
 
