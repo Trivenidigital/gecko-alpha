@@ -526,11 +526,15 @@ async def get_gainers_comparisons(db: "Database", limit: int = 50) -> list[dict]
                   -- re-inserts by coin_id on every recompute, so ids do not
                   -- survive. Only legacy rows consult it; canonical_v1 rows
                   -- carry their own tier.
-                  cir.evidence_status AS chains_recompute_status
+                  (SELECT cir.evidence_status
+                     FROM chain_identity_recompute_v1 cir
+                    WHERE cir.source_table = 'gainers_comparisons'
+                      AND cir.coin_id = gainers_comparisons.coin_id
+                      AND cir.historical_anchor = gainers_comparisons.appeared_on_gainers_at
+                    ORDER BY CASE cir.evidence_status
+                             WHEN 'verified_canonical' THEN 1 ELSE 0 END
+                    LIMIT 1) AS chains_recompute_status
            FROM gainers_comparisons
-           LEFT JOIN chain_identity_recompute_v1 cir
-                  ON cir.source_table = 'gainers_comparisons'
-                 AND cir.coin_id = gainers_comparisons.coin_id
            ORDER BY appeared_on_gainers_at DESC
            LIMIT ?""",
         (limit,),

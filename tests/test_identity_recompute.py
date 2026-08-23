@@ -445,3 +445,80 @@ async def test_extra_history_extends_the_COVERAGE_floor_too(db):
     assert (
         await _status(db, "ancient-coin") == STATUS_PREFIX_ONLY
     ), "coverage floor was not extended, so resolvable evidence was ignored"
+
+
+async def test_duplicate_coin_ids_cannot_FAN_OUT_the_reader(db):
+    """Caught on production data, not by reasoning: losers_comparisons has 2
+    duplicate coin_ids today.
+
+    The overlay was first wired as a LEFT JOIN on coin_id. With two archived
+    rows sharing a coin_id, the recompute table gets two rows for it and every
+    matching comparison row is returned TWICE — silently inflating every
+    dashboard count and any aggregate over these readers, with nothing
+    erroring.
+
+    A scalar subquery cannot fan out by construction, which is why it replaced
+    the join rather than the join being deduplicated.
+    """
+    from scout.losers.tracker import get_losers_comparisons
+
+    for anchor in (ANCHOR, "2026-08-21T00:00:00+00:00"):
+        await db._conn.execute(
+            """INSERT INTO losers_comparisons
+               (coin_id, symbol, name, price_change_24h, appeared_on_losers_at,
+                detected_by_chains, chains_lead_minutes, is_gap)
+               VALUES ('dupe', 'DUP', 'Dupe', -10.0, ?, 1, 5000.0, 0)""",
+            (anchor,),
+        )
+        await db._conn.execute(
+            """INSERT INTO chain_identity_recompute_v1
+               (source_table, source_row_id, coin_id, symbol, historical_anchor,
+                legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+                identity_tier, evidence_status, semantics_version, computed_at)
+               VALUES ('losers_comparisons', ?, 'dupe', 'DUP', ?, 1, 5000.0, 1, 5000.0,
+                       'canonical_id', ?, 'v1', '2026-08-23')""",
+            (1 if anchor == ANCHOR else 2, anchor, STATUS_VERIFIED_CANONICAL),
+        )
+    await db._conn.commit()
+
+    rows = await get_losers_comparisons(db, limit=50)
+    dupes = [r for r in rows if r["coin_id"] == "dupe"]
+    assert (
+        len(dupes) == 2
+    ), f"expected the 2 comparison rows, got {len(dupes)} — the overlay fanned out"
+    assert all(r["chains_recompute_status"] == STATUS_VERIFIED_CANONICAL for r in dupes)
+
+
+async def test_the_overlay_matches_on_ANCHOR_not_just_coin_id(db):
+    """Two historical observations of one coin are different rows of evidence.
+
+    Matching on coin_id alone would apply one anchor's verdict to the other's
+    row — and could hand credit to a row whose own provenance was never
+    established.
+    """
+    from scout.losers.tracker import get_losers_comparisons
+
+    await db._conn.execute(
+        """INSERT INTO losers_comparisons
+           (coin_id, symbol, name, price_change_24h, appeared_on_losers_at,
+            detected_by_chains, chains_lead_minutes, is_gap)
+           VALUES ('split', 'SPL', 'Split', -5.0, ?, 1, 5000.0, 0)""",
+        (ANCHOR,),
+    )
+    # A recompute row for a DIFFERENT anchor of the same coin.
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES ('losers_comparisons', 99, 'split', 'SPL', '2026-01-01T00:00:00+00:00',
+                   1, 5000.0, 1, 5000.0, 'canonical_id', ?, 'v1', '2026-08-23')""",
+        (STATUS_VERIFIED_CANONICAL,),
+    )
+    await db._conn.commit()
+
+    rows = await get_losers_comparisons(db, limit=50)
+    row = next(r for r in rows if r["coin_id"] == "split")
+    assert (
+        row["chains_recompute_status"] is None
+    ), "another anchor's verdict was applied to this row"
