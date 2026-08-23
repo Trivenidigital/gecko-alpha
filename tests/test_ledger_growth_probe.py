@@ -582,3 +582,67 @@ def test_these_are_refused_by_the_SHAPE_gate_not_by_the_parser(raw, why):
 
     with pytest.raises(ValueError, match="not an accepted timestamp shape"):
         _normalise_emitted_at(raw)
+
+
+def test_the_naive_path_never_calls_astimezone(monkeypatch):
+    """Pins the STRUCTURE, not its current side effects.
+
+    The naive branch returns early so that `astimezone()` is only ever reached
+    by tz-AWARE values, where its behaviour is TZ-independent. That is what
+    makes the dropped-stamp mutant killable at all: before the early return it
+    produced byte-identical output on a UTC host and no test could fail.
+
+    But nothing pinned the structure itself. Reverting to the fall-through form
+    passes every other test in this file — and the moment it is reverted the
+    mutant goes back to being unkillable here, leaving no trace: the tests that
+    catch the underlying bug only work BECAUSE of the structure, and they keep
+    passing once it is gone.
+
+    A source-text assertion would prove nothing about what actually runs, so
+    this spies the call instead.
+    """
+    from datetime import datetime as _real_datetime
+
+    from scout import outcome_ledger
+
+    calls: list = []
+
+    class _SpyDatetime(_real_datetime):
+        def astimezone(self, tz=None):  # noqa: D102
+            calls.append(self)
+            return super().astimezone(tz)
+
+    monkeypatch.setattr(outcome_ledger, "datetime", _SpyDatetime)
+
+    assert (
+        outcome_ledger._normalise_emitted_at("2026-08-23T12:00:00")
+        == "2026-08-23T12:00:00+00:00"
+    )
+    assert calls == [], (
+        "the naive path reached astimezone(), which reads naive values as LOCAL "
+        "time — the host-dependency the early return exists to remove"
+    )
+
+    # ...and the AWARE path still uses it, so the spy is not vacuous.
+    outcome_ledger._normalise_emitted_at("2026-08-23T12:00:00+05:30")
+    assert calls, "the spy never fired at all; it cannot detect anything"
+
+
+def test_the_two_refusal_messages_are_DISJOINT():
+    """Presence of each phrase is weaker than the two being distinguishable.
+
+    A shape message that grew to contain the parser message's phrase would pass
+    every 'is this phrase present' assertion while making the two reasons
+    indistinguishable — which is the one thing those tests are named for.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError) as shape:
+        _normalise_emitted_at("2026-08-23")
+    with pytest.raises(ValueError) as calendar:
+        _normalise_emitted_at("2026-02-30T00:00:00")
+
+    assert "not an accepted timestamp shape" in str(shape.value)
+    assert "not a real instant" not in str(shape.value)
+    assert "not a real instant" in str(calendar.value)
+    assert "not an accepted timestamp shape" not in str(calendar.value)

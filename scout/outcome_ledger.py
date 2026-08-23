@@ -314,6 +314,12 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
 
 #: The ONLY accepted shape for a caller-supplied `emitted_at`.
 #:
+#: ANCHORING LIVES AT THE CALL SITE. The pattern carries no `^`/`$`; the
+#: single consumer uses `fullmatch`, which anchors both ends and avoids the
+#: `$`-matches-before-a-trailing-newline quirk. A second consumer reaching
+#: for `.match` or `.search` would silently get prefix or substring
+#: semantics instead -- use `fullmatch`, or re-add the anchors.
+#:
 #: Declarative on purpose. The previous guard reasoned about the PARSE RESULT
 #: (`parsed.time() == midnight`) plus character-sniffing the raw string, which
 #: requires predicting `datetime.fromisoformat` -- and it is more permissive and
