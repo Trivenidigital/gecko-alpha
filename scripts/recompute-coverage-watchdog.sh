@@ -42,10 +42,30 @@ PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 # broken); the WRAPPER does the asking, and falls back to the literal only if
 # the interpreter cannot answer.
 cd "$APP_DIR"
-GATE="$("$PYTHON" -c 'from scout.config import get_settings; print(get_settings().CONVICTION_EARLY_LEAD_MINUTES)' 2>/dev/null || true)"
+# Two-step, so an incomplete .env degrades to the CODE default rather than to
+# a number written here. Building full Settings needs every required secret, so
+# on a box mid-configuration the first form fails -- and falling back to a
+# shell literal would silently reintroduce the fourth-literal problem this
+# block exists to remove. The second form reads the field default without
+# instantiating Settings, so it tracks scout/config.py even then.
+GATE="$("$PYTHON" - <<'PYGATE' 2>/dev/null || true
+from scout.config import Settings
+
+try:
+    from scout.config import get_settings
+
+    print(get_settings().CONVICTION_EARLY_LEAD_MINUTES)
+except Exception:
+    print(Settings.model_fields["CONVICTION_EARLY_LEAD_MINUTES"].default)
+PYGATE
+)"
 if [[ -z "${GATE:-}" ]]; then
-    echo "WARN: could not read CONVICTION_EARLY_LEAD_MINUTES from the app; using 1440" >&2
-    GATE=1440
+    # Neither form worked: the app is unimportable. Say so loudly and refuse
+    # rather than measuring against a guess -- a watchdog reporting healthy
+    # off an assumed threshold is the failure this whole file exists to
+    # prevent.
+    echo "FATAL: could not read CONVICTION_EARLY_LEAD_MINUTES from $APP_DIR" >&2
+    exit 6
 fi
 
 # Validate before `cd`. Under `set -euo pipefail` a failed `cd` exits 1 --

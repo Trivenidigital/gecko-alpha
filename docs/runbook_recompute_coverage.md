@@ -95,11 +95,19 @@ nothing else reports — so they are distinct codes rather than a shared one.
 | 3 | `.env` missing | no |
 | 4 | Telegram credentials missing — the alarm fired and could not be delivered | no |
 | 5 | `APP_DIR` invalid | no |
-| 6 | python interpreter missing | no |
+| 6 | interpreter missing, or the app cannot be imported to read the gate | no |
 
 Codes 5 and 6 exist because `cd "$APP_DIR"` under `set -euo pipefail` exits
 **1** — the same code the alarm path uses after a successful send. A dead
 watchdog and a firing watchdog were indistinguishable to anything downstream.
+
+The gate is read from the application, never parsed out of `.env`: first from
+`Settings` (so a `.env` override is honoured), then from the field default in
+`scout/config.py` if `Settings` cannot be built. There is deliberately **no**
+literal fallback in the shell — a threshold written here would drift from the
+one the readers use, which is the divergence the whole gate re-check exists to
+remove. If neither form answers, the watchdog exits 6 rather than measuring
+against a guess.
 
 The systemd unit sets `SuccessExitStatus=0 1`, so an alarm is not a service
 failure but 2–6 surface in `systemctl status`.

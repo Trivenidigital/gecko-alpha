@@ -287,3 +287,26 @@ def test_a_normal_page_still_points_at_the_backfill(tmp_path):
     assert "0 unarchivable" in r.stdout
     assert "--apply" in r.stdout
     assert "CANNOT HELP" not in r.stdout
+
+
+def test_the_wrapper_never_hardcodes_a_gate_value():
+    """Structural: the literal must not come back.
+
+    Lives here rather than in the wrapper's own test file because it needs no
+    bash -- that file skips on win32, which is where this would most likely be
+    reintroduced.
+
+    Behaviourally, a re-added `GATE=1440` fallback is indistinguishable from
+    the correct path on any box where the code default is also 1440 — which is
+    every box today.
+    """
+    wrapper = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "recompute-coverage-watchdog.sh"
+    )
+    text = wrapper.read_text(encoding="utf-8")
+    code = "\n".join(l for l in text.splitlines() if not l.strip().startswith("#"))
+    assert "GATE=1440" not in code.replace(
+        " ", ""
+    ), "a literal gate fallback reappeared in the wrapper"

@@ -137,3 +137,27 @@ def test_every_documented_exit_code_is_distinct():
     }
     assert len(codes) == len([c for c in codes]), "duplicate exit codes"
     assert {0, 1, 2, 3, 4, 5, 6} >= codes, f"undocumented exit code in {codes}"
+
+
+def test_it_refuses_rather_than_guessing_the_gate(tmp_path):
+    """No literal fallback. A guessed threshold is worse than no check.
+
+    The gate comes from the app — Settings first, then the field default in
+    `scout/config.py`. A number written in the shell would drift from the one
+    the readers use, which is the divergence the gate re-check exists to
+    remove. If neither form answers, refuse.
+    """
+    app = tmp_path / "app"
+    (app / "scripts").mkdir(parents=True, exist_ok=True)
+    (app / "scripts" / "check_recompute_coverage.py").write_text("", encoding="utf-8")
+    (app / ".env").write_text("TELEGRAM_BOT_TOKEN=\n", encoding="utf-8")
+
+    # An interpreter that runs, but cannot import the app.
+    py = tmp_path / "brokenpython"
+    py.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    py.chmod(0o755)
+
+    r = _run(tmp_path, app_dir=str(app), python=str(py))
+
+    assert r.returncode == 6, (r.returncode, r.stdout, r.stderr)
+    assert "could not read CONVICTION_EARLY_LEAD_MINUTES" in r.stderr
