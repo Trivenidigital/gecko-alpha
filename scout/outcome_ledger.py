@@ -384,7 +384,17 @@ def _normalise_emitted_at(emitted_at: str | None) -> str:
         ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat()
+    try:
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (OverflowError, OSError) as exc:
+        # `astimezone` raises OverflowError near datetime.min/max -- e.g.
+        # "0001-01-01T00:00:00+05:30" underflows shifting to UTC. Contained
+        # either way by the caller's `except Exception`, but this function's
+        # contract is ValueError and a caller catching only that would miss it.
+        raise ValueError(
+            f"emitted_at={emitted_at!r} cannot be converted to UTC without "
+            "overflowing the representable datetime range."
+        ) from exc
 
 
 async def record_emission_with_status(
@@ -444,13 +454,17 @@ async def record_emission_with_status(
         if conn is None or db._txn_lock is None:
             log.warning("ledger_record_skipped_db_closed", kind=kind, token_id=token_id)
             return None
-        # NORMALISE a caller-supplied emitted_at. `emitted_at` exists so a
-        # backfill can supply a historical timestamp, and backfills source them
-        # from other tables and journals -- the sibling
-        # scripts/backfill_minara_alert_emissions.py takes a journalctl-derived
-        # string. Stored verbatim, a space-separated or non-UTC-offset value
-        # breaks a LEXICOGRAPHIC comparison elsewhere, because ' ' (0x20) and
-        # the digits of a negative offset both sort below 'T' (0x54).
+        # NORMALISE a caller-supplied emitted_at.
+        #
+        # The parameter exists so a backfill can supply a historical
+        # timestamp, and backfills source them from other tables and
+        # journals. (The sibling scripts/backfill_minara_alert_emissions.py
+        # is the SHAPE of that risk rather than an instance of it -- it
+        # writes minara_alert_emissions, not this table.)
+        #
+        # Stored verbatim, a space-separated or non-UTC-offset value breaks
+        # a LEXICOGRAPHIC comparison elsewhere: ' ' (0x20) and the digits of
+        # a negative offset both sort below 'T' (0x54).
         #
         # Concretely: the ledger growth probe compares
         # `emitted_at >= strftime('%Y-%m-%dT%H:%M:%S', ...)` -- deliberately

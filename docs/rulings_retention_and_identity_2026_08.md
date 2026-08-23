@@ -121,12 +121,42 @@ escape hatch is the recomputation clause above; it has not been taken.
 Recorded because each was an INFERENCE until it was run, and an unrun scope
 assertion is exactly the failure this file's sibling runbook entry documents.
 
-| claim | check | result (2026-08-23) |
-|---|---|---|
-| `signal_outcome_ledger.emitted_at` is uniformly canonical, so the growth probe's lexicographic compare is chronological | `SELECT COUNT(*) ... WHERE emitted_at NOT LIKE '____-__-__T%+00:00'` | **0 of 511,810** — also 0 space-separated, 0 without UTC offset |
-| the identity-semantics migration has not yet run, so its archive will be taken | `paper_migrations` / `schema_version` / `sqlite_master` | 0 / 0 / 0 archives |
-| ruling B's readers are unaffected at 14d | vol7d-eligible contracts before vs after | 1668 → 1668 |
+| claim | result (2026-08-23) |
+|---|---|
+| `signal_outcome_ledger.emitted_at` is uniformly canonical, so the growth probe's lexicographic compare is chronological | **0 of 511,810** non-canonical; 0 space-separated; 0 without a UTC offset |
+| the identity-semantics migration has not yet run, so its archive will be taken | `paper_migrations` 0 / `schema_version` 0 / 0 archives |
+| ruling B's readers are unaffected at 14d | vol7d-eligible contracts 1668 → 1668 |
 
-The first is forward-enforced by `scout.outcome_ledger._normalise_emitted_at`
-for new writes; the check above is what establishes the existing 511,810 rows.
-Sole-writer analysis alone would have been inference.
+The first is re-runnable verbatim, read-only, against
+`/root/gecko-alpha/scout.db` on the VPS — all three sub-results, not just the
+headline:
+
+```sql
+SELECT COUNT(*)                                            AS total,
+       SUM(emitted_at NOT LIKE '____-__-__T%+00:00')       AS non_canonical,
+       SUM(emitted_at LIKE '____-__-__ %')                 AS space_separated,
+       SUM(emitted_at NOT LIKE '%+00:00')                  AS no_utc_offset
+  FROM signal_outcome_ledger;
+```
+
+Note this is a SHAPE test, not a validity test — `'9999-99-99Txx+00:00'` would
+pass it. Adequate for the claim being made, which is about ORDERING and not
+about the values being real instants.
+
+**What enforces it going forward, and what does not.**
+`scout.outcome_ledger._normalise_emitted_at` normalises every caller-supplied
+value, and it is the sole write path: the only `INSERT INTO
+signal_outcome_ledger` outside tests is in that module, and the two UPDATEs
+touch `label_status` / `labeled_at` only.
+
+But there is **no DB-level CHECK** on the column — the DDL is a bare
+`TEXT NOT NULL` — so a `sqlite3` shell write, or a second writer added later,
+bypasses the normalisation silently. The in-code note saying "if that
+normalisation is ever removed, this must go back to `datetime()`" is a comment,
+not a gate.
+
+**And the enforcement has a cost worth stating:** a refusal DROPS THE ROW. It
+returns `None` from `record_emission_with_status` and logs at warning level
+only. That is the right trade for a durable ordered column — a wrong instant
+stored silently is worse than a lost row logged loudly — but it is a real cost,
+not a free guarantee.

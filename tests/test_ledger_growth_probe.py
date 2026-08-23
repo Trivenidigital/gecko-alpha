@@ -484,3 +484,24 @@ def test_a_non_utc_offset_is_CONVERTED_not_stripped():
         _normalise_emitted_at("2026-08-23T00:00:00+05:30")
         == "2026-08-22T18:30:00+00:00"
     )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "0001-01-01T00:00:00+05:30",  # underflows shifting to UTC
+        "9999-12-31T23:59:59-05:00",  # overflows shifting to UTC
+    ],
+)
+def test_extreme_years_raise_ValueError_not_OverflowError(raw):
+    """`astimezone` raises OverflowError near datetime.min/max.
+
+    Contained either way by the caller's `except Exception`, but this
+    function's documented contract is ValueError, and a caller catching only
+    that would miss it. A contract that is right by accident of the handler
+    above it is not a contract.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError):
+        _normalise_emitted_at(raw)
