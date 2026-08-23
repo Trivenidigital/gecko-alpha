@@ -77,8 +77,14 @@ same numbers, different code path.
 
 | vector | last verdict | measured on |
 |---|---|---|
-| structural / concurrency | no blocking findings; 2 MEDIUM, both fixed | `33f9de54` |
-| recompute logic (final) | classification CLEAN, re-executed; one ratchet defect (R2), fixed | `f26c412f` |
+| structural / concurrency | **CLEAN, terminal** — regression re-run in full, 4/4 mutants | `97365248` |
+| silent failure / observability | **CLEAN, terminal** — 6/6 mutants, two verified as intended-assertion kills | `b90f66fa` |
+| ops safety / evidence integrity | CLEAN — lapsed, production code moved since | `1076f56d` |
+| recompute logic | classification CLEAN, re-executed — lapsed, production code moved since | `89b070ef` |
+
+Two clearances **hold at HEAD** (production code unchanged since, verified by
+`git diff --name-only <sha>..HEAD`). Two **lapsed** under the rule above and were
+re-requested rather than carried forward.
 | silent failure / observability | S1–S4, all fixed | `f2847774` |
 | ops safety / evidence integrity | N-1…N-6 + R1–R5, all fixed | `c8b5e009` |
 | recompute logic | nothing blocking; R1 implemented rather than deferred | `47847f47` |
@@ -100,6 +106,14 @@ each returns terminal.
 
 These are not observations about this PR. Each cost a blocking round, and
 each is a rule about how review itself is run.
+
+**A verdict without a revision attached is not a weaker verdict — it is not a
+verdict.** The cheap instance of this bit within an hour of being named: a
+crossed message, caught in one round, no cost. The expensive instance is the
+same mechanism at distance — someone reads "reviewed and clean" in this report
+in six months, against a branch that has moved eleven commits, and re-runs
+nothing. The SHA-tagged verdict lines in §4 are what prevent that, and they only
+work if the report carries the SHA every time it carries the word "clean".
 
 **A clearance is a property of a revision, not of a component.** Four reviewer
 clearances were invalidated by later changes that were themselves fixes for
