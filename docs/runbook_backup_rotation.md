@@ -189,30 +189,58 @@ Ad-hoc snapshots live OUTSIDE the rotation policy above (`scout.db.bak.*` inside
 `/root/gecko-alpha`). Nothing ages them out, so each deletion is an explicit,
 operator-authorized, irreversible act and is recorded here with its evidence.
 
-### 2026-08-23 — `/root/scout.db.bak-before-state-fix` DELETED
+### 2026-08-23T04:52:15Z — `/root/scout.db.bak-before-state-fix` DELETED
+
+Command: `rm -v /root/scout.db.bak-before-state-fix`, run over `ssh srilu-vps`
+by the agent session recorded in the commit trailer. Deletion time is the
+wall clock of the `rm`, not of this entry.
 
 **Authorization:** operator ruling 2026-08-23, scoped to this single file.
 Explicitly *not* authorized: `pre500.20260802202122`, `kraken_rehearsal`,
 `pre-deploy2-20260703`, `hermes-upgrade-backup-20260801T175814Z`.
 
-**Why it was safe to delete.** Its contents are wholly contained in
-`kraken_rehearsal/scout_copy.db` ∪ `scout.db.pre500.20260802202122`, verified
-across all six age-pruned tables — not just `signal_events`. For every table,
-kraken's left edge predates bak's and pre500's right edge postdates it, and the
-two overlap, so the union is contiguous with no gap inside bak's range:
+**Why it was safe to delete.** Its contents are contained in
+`kraken_rehearsal/scout_copy.db` ∪ `scout.db.pre500.20260802202122`.
 
-| table | bak | kraken ∪ pre500 |
-|---|---|---|
-| signal_events | 07-18 → 08-01 | 07-17 → 08-02 |
-| score_history | 07-11 → 08-01 | 07-10 → 08-02 |
-| volume_snapshots | 07-11 → 08-01 | 07-10 → 08-02 |
-| trending_snapshots | 07-02 → 08-01 | 07-01 → 08-02 |
-| volume_spikes | 06-18 → 08-01 | 06-17 → 08-02 |
-| trade_decision_events | 06-17 → 08-01 | 06-16 → 08-02 |
+The claim needs THREE facts per table, not one hull, and an earlier version of
+this entry printed only `min(mins)` / `max(maxes)` — from which none of the
+three is recoverable. The same two numbers would look identical in a world where
+kraken covered 07-17→07-20 and pre500 covered 07-25→08-02, leaving a hole
+squarely inside bak. All six numbers are therefore recorded:
 
-Limit of the claim: range containment over append-only tables, not a row-by-row
-diff. Rows would be unique to bak only if they fell in bak's range but in
-neither neighbour, which the enclosure rules out.
+| table | bak min → max | kraken min → max | pre500 min → max |
+|---|---|---|---|
+| signal_events | 07-18 16:24 → 08-01 16:27 | 07-17 19:32 → 07-31 19:33 | 07-19 20:10 → 08-02 20:21 |
+| score_history | 07-11 15:35 → 08-01 16:27 | 07-10 19:01 → 07-31 19:33 | 07-12 19:21 → 08-02 20:21 |
+| volume_snapshots | 07-11 15:35 → 08-01 16:27 | 07-10 19:01 → 07-31 19:32 | 07-12 19:21 → 08-02 20:21 |
+| trending_snapshots | 07-02 15:48 → 08-01 16:27 | 07-01 19:41 → 07-31 19:27 | 07-03 19:44 → 08-02 20:19 |
+| volume_spikes | 06-18 05:16 → 08-01 15:24 | 06-17 09:39 → 07-31 07:36 | 06-18 19:31 → 08-02 13:54 |
+| trade_decision_events | 06-17 15:32 → 08-01 16:27 | 06-16 18:59 → 07-31 19:32 | 06-18 19:21 → 08-02 20:20 |
+
+The three premises, verified for every row above:
+
+1. `kraken.min ≤ bak.min` — kraken opens before bak on all six;
+2. `pre500.max ≥ bak.max` — pre500 closes after bak on all six;
+3. `kraken.max ≥ pre500.min` — the two OVERLAP on all six, so their union is
+   contiguous and contains no hole for bak's range to fall into.
+
+**The failure mode this method actually has.** These are age-pruned tables, so
+retention advances the left edge continuously and a later snapshot has a later
+left edge. bak (08-01) sits between kraken and pre500 chronologically, so for
+`signal_events` at 14-day retention pre500 alone covers ~07-19→08-02 while bak
+opens 07-18 — the whole claim rests on kraken covering that ~1-day sliver.
+Premise 1 is what carries it, which is why kraken's own minimum is recorded
+above rather than folded into a hull.
+
+**Limit of the claim, stated precisely:** range containment over append-only
+tables, not a row-by-row diff. A row is unique to bak only if it falls inside
+bak's range but inside neither neighbour's, which premises 1–3 exclude for these
+six tables.
+
+**Why six tables and not more:** only age-pruned tables can hold rows that live
+no longer does. Tables without retention are strict supersets in live, so they
+cannot contain bak-only rows. The six were enumerated from the prune call sites
+in `_run_hourly_maintenance` (`scout/main.py`), not asserted.
 
 **Pre-deletion revalidation (all green):**
 
@@ -248,7 +276,15 @@ Other ad-hoc snapshots confirmed untouched at their original sizes.
 surviving source of pre-2026-08-08 history — live `signal_events` starts at the
 14-day retention boundary, so they are also the only material from which a
 truthful pre-08-08 `signal_first_seen` could ever be reconstructed. Union gaps
-that no snapshot covers: **07-03 → 07-17** and **08-02 → 08-08**.
+in **`signal_events` specifically**: **07-03 → 07-17** and **08-02 → 08-08**.
+
+That qualifier matters and an earlier version of this entry omitted it. Read
+unqualified, the 07-03 → 07-17 gap falls INSIDE bak's recorded range for five of
+the six tables above, which would contradict the containment claim. It does not,
+because the gap is between `pre-deploy2` and `kraken` on the `signal_events`
+timeline only — for the other five tables kraken opens earlier (see the table
+above) and no gap exists inside bak's range. Per-table gaps outside bak's range
+are irrelevant to whether bak was safe to delete.
 
 **Reading for the next operator:** the backup peak, not the steady state, is the
 number that governs headroom. Four backups plus the live DB coexist mid-run — on
