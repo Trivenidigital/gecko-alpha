@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import re
 import json
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -332,7 +332,8 @@ async def price_from_cache(db: Database, token_id: str) -> float | None:
 #: is now refused. No producer emits it, and a loud refusal on something
 #: unexpected beats a heuristic that mispredicts the parser.
 _EMITTED_AT_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[ Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:?\d{2})?$"
+    r"\d{4}-\d{2}-\d{2}[ Tt]\d{2}:\d{2}(:\d{2}(\.\d+)?)?([Zz]|[+-]\d{2}:?\d{2})?",
+    re.ASCII,
 )
 
 
@@ -366,7 +367,7 @@ def _normalise_emitted_at(emitted_at: str | None) -> str:
     if emitted_at is None:
         return datetime.now(timezone.utc).isoformat()
     raw = str(emitted_at).strip()
-    if not _EMITTED_AT_RE.match(raw):
+    if not _EMITTED_AT_RE.fullmatch(raw):
         raise ValueError(
             f"emitted_at={emitted_at!r} is not an accepted timestamp shape "
             f"(YYYY-MM-DD[T ]HH:MM[:SS[.ffffff]][offset]). "
@@ -377,10 +378,18 @@ def _normalise_emitted_at(emitted_at: str | None) -> str:
         )
     try:
         parsed = datetime.fromisoformat(raw.replace("t", "T").replace("z", "Z"))
-    except (TypeError, ValueError) as exc:  # pragma: no cover - shape already checked
+    except (TypeError, ValueError) as exc:
+        # REACHABLE, and not rare: the pattern checks SHAPE, and `\d{2}` cannot
+        # check a calendar. "2026-02-30T00:00:00", month 13, hour 25, an offset
+        # of +24:00 and year 0 all match the shape and fail here -- February 30
+        # being exactly what a bad backfill produces. An earlier version marked
+        # this `# pragma: no cover - shape already checked` and blamed a
+        # regex/parser divergence, which would send whoever reads it at 2am to
+        # audit the pattern instead of the input.
         raise ValueError(
-            f"emitted_at={emitted_at!r} matched the accepted shape but did not "
-            "parse; the shape pattern and the parser have diverged."
+            f"emitted_at={emitted_at!r} has the right shape but is not a real "
+            "instant (check the calendar date, the clock values and the UTC "
+            "offset range)."
         ) from exc
     if parsed.tzinfo is None:
         # Return HERE rather than falling through. `astimezone()` reads a NAIVE

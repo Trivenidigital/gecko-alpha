@@ -453,6 +453,18 @@ def test_empty_string_is_refused_not_silently_treated_as_now():
         ("2026-08-23T00:00", False, "HH:MM only"),
         ("2026-08-23T12:00:00.123456+00:00", False, "fractional seconds"),
         ("2026-08-23T00:00:00+05:30", False, "genuine midnight in a NON-UTC zone"),
+        # R1: the offset shape `strftime('%z')` emits. Permitted by `:?` in the
+        # pattern and previously pinned by NOTHING -- a mutant tightening it to
+        # `:` survived, and would have started REFUSING the format a Python
+        # producer is most likely to hand a backfill. A dropped row.
+        ("2026-08-23T12:00:00+0530", False, "colonless offset — what %z emits"),
+        ("2026-08-23T07:31:57+0000", False, "colonless UTC offset from %z"),
+        # R4: `fullmatch` is what makes this a whole-string check rather than a
+        # prefix one, which is the entire premise of validating shape first.
+        ("2026-08-23T12:00:00+00:00 extra", True, "trailing garbage"),
+        # R3: `\d` matches Unicode decimal digits unless the pattern is ASCII.
+        ("٢٠٢٦-٠٨-٢٣T١٢:٠٠:٠٠", True, "Arabic-Indic digits"),
+        ("２０２６-０８-２３T１２:００:００", True, "fullwidth digits"),
     ],
 )
 def test_emitted_at_shape_guard_in_both_directions(raw, expect_raise, why):
@@ -505,4 +517,68 @@ def test_extreme_years_raise_ValueError_not_OverflowError(raw):
     from scout.outcome_ledger import _normalise_emitted_at
 
     with pytest.raises(ValueError):
+        _normalise_emitted_at(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "2026-02-30T00:00:00",  # February 30 — what a bad backfill emits
+        "2026-13-45T00:00:00",  # month 13
+        "2026-08-23T25:61:61",  # impossible clock
+        "2026-08-23T12:00:00+24:00",  # offset >= 24h
+        "0000-01-01T00:00:00",  # year 0
+    ],
+)
+def test_shape_valid_but_calendar_invalid_raises_a_USEFUL_message(raw):
+    r"""This branch was marked `# pragma: no cover - shape already checked`.
+
+    It is reachable by nine mundane inputs, because the pattern checks SHAPE and
+    ``\d{2}`` cannot check a calendar. The old message blamed a "regex/parser
+    divergence", which would send whoever reads it at 2am to audit the pattern
+    instead of the input that actually said February 30th.
+
+    Classic `except:`-blocks-are-untested-code: a branch asserted unreachable,
+    marked no-cover, and trivially reachable.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError, match="not a real instant"):
+        _normalise_emitted_at(raw)
+
+
+def test_the_two_refusal_reasons_are_distinguishable():
+    """A caller reading the log must be able to tell WHICH gate refused."""
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError, match="not an accepted timestamp shape"):
+        _normalise_emitted_at("2026-08-23")
+    with pytest.raises(ValueError, match="not a real instant"):
+        _normalise_emitted_at("2026-02-30T00:00:00")
+
+
+@pytest.mark.parametrize(
+    "raw,why",
+    [
+        ("2026-08-23T12:00:00+00:00 extra", "fullmatch, not a prefix match"),
+        ("٢٠٢٦-٠٨-٢٣T١٢:٠٠:٠٠", "re.ASCII: Unicode digits are not digits here"),
+        ("２０２６-０８-２３T１２:００:００", "fullwidth digits"),
+    ],
+)
+def test_these_are_refused_by_the_SHAPE_gate_not_by_the_parser(raw, why):
+    """Asserting *that* it raises is not enough — both gates raise ValueError.
+
+    Dropping `re.ASCII` or swapping `fullmatch` for `match` lets these through
+    the shape gate to fail at the parser instead. Every existing test still
+    passed, because they only checked that SOMETHING raised. The mutants
+    survived on classification, not on outcome.
+
+    They matter beyond tidiness: `fullmatch` is what makes this a whole-string
+    check rather than a prefix one, which is the entire premise of validating
+    shape before parsing. And a Unicode-digit string reaching the parser would
+    be reported as a bad calendar value, sending a reader after the wrong thing.
+    """
+    from scout.outcome_ledger import _normalise_emitted_at
+
+    with pytest.raises(ValueError, match="not an accepted timestamp shape"):
         _normalise_emitted_at(raw)
