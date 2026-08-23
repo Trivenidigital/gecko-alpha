@@ -542,6 +542,20 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                     WHERE cir.source_table = 'trending_comparisons'
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(trending_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
                     -- canonical FIRST: this ORDER BY is ascending, so the
                     -- credit-bearing status must sort LOWEST. Written the
                     -- other way round it preferred the non-credit-bearing
@@ -559,6 +573,20 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                     WHERE cir.source_table = 'trending_comparisons'
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
+                      -- ONLY legacy rows consult the overlay. Without this
+                      -- the comment above was false: a `canonical_v1` row,
+                      -- resolved correctly at write time, had its own lead
+                      -- overwritten by an offline replay of a DIFFERENT
+                      -- (archived) row sharing its coin_id and anchor --
+                      -- and cross_surface applies chains_canonical_lead
+                      -- unconditionally, so that silently stripped its
+                      -- chains credit. The anchor is MIN(snapshot_at) over
+                      -- a trailing 24h, so a live canonical row and an
+                      -- archived legacy row share one for about a day
+                      -- after the backfill: exactly the window in which
+                      -- the tier_high question is being judged.
+                      AND COALESCE(trending_comparisons.chains_identity_semantics,
+                                   'legacy_prefix') != 'canonical_v1'
                     -- canonical FIRST: this ORDER BY is ascending, so the
                     -- credit-bearing status must sort LOWEST. Written the
                     -- other way round it preferred the non-credit-bearing

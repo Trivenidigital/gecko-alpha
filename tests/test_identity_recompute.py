@@ -16,6 +16,7 @@ from scout.conviction import cross_surface_conviction
 from scout.db import Database
 from scout.identity import CANONICAL_SEMANTICS, LEGACY_SEMANTICS
 from scout.identity_recompute import (
+    CREDIT_BEARING,
     STATUS_AMBIGUOUS,
     STATUS_CANONICAL_SUB_GATE,
     STATUS_INDETERMINATE,
@@ -24,6 +25,7 @@ from scout.identity_recompute import (
     STATUS_UNJOINABLE_ROW,
     STATUS_VERIFIED_CANONICAL,
     recompute_legacy_provenance,
+    reconciliation_report,
 )
 
 GATE = 1440.0
@@ -820,3 +822,83 @@ async def test_losers_uses_its_OWN_time_bound_not_the_gainers_tolerance(db):
     # uniform-bound mutant produces (canonical_below_gate_indeterminate, off a
     # candidate first seen two minutes after the anchor).
     assert status == STATUS_INDETERMINATE
+
+
+async def test_an_ALIAS_UNIQUE_win_is_never_a_verified_positive(db):
+    """The module's own worked example, and its own stated rule.
+
+    `terra-luna-2 <- luna` is one of the eight named production identity
+    errors this workstream exists to remove. Under censored history the symbol
+    token `luna` is the only survivor, so it wins on tier 3 with a long lead.
+    Restore the real history and `terra-luna-2` appears, outranks it on tier,
+    and carries a far later first_seen -- the lead collapses.
+
+    The branch used to promote on `anchor_covered`, but coverage intervals are
+    a GLOBAL span over all tokens' events: they establish that we were
+    recording, never that THIS coin's canonical-id token would have been seen.
+    A tier-3 win is exactly the case that censoring fabricates.
+    """
+    anchor = "2026-08-20T00:00:00+00:00"
+    # Censored substrate: only the short symbol token survives.
+    await _substrate(db, [("luna", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "terra-luna-2", "LUNA", anchor=anchor)
+
+    await recompute_legacy_provenance(
+        db._conn,
+        gate_minutes=1440.0,
+        coverage_intervals=[("2026-08-01T00:00:00+00:00", "2026-08-25T00:00:00+00:00")],
+    )
+
+    cur = await db._conn.execute(
+        "SELECT identity_tier, canonical_lead, evidence_status "
+        "FROM chain_identity_recompute_v1 WHERE coin_id='terra-luna-2'"
+    )
+    tier, lead, status = await cur.fetchone()
+
+    assert tier == "alias_unique", f"fixture did not produce a tier-3 win: {tier}"
+    # The lead is large and the anchor is covered -- every precondition the old
+    # branch promoted on. It must still not be a verified positive.
+    assert lead is not None and lead >= 1440.0
+    assert (
+        status == STATUS_CANONICAL_SUB_GATE
+    ), "an alias win was recorded as a VERIFIED positive on censored history"
+    assert status not in CREDIT_BEARING
+
+
+async def test_reconciliation_report_names_its_denominators(db):
+    """Three numbers can each be called "the population"; they disagree.
+
+    `sum(counts)` covers only the NON-canonical archived rows. `unjoinable_row`
+    is counted but never written. And `INSERT OR REPLACE` on
+    (source_table, source_row_id) collapses a duplicate pair silently, so rows
+    written and rows stored are different claims. An acceptance table that does
+    not say which denominator it used cannot be checked against the table it
+    describes.
+    """
+    await _substrate(db, [("has-history", "2026-08-15T00:00:00+00:00")])
+    await _legacy(db, "has-history", "HH")
+    await _legacy(db, "", "UNJOINABLE")
+    await db._conn.execute(
+        """INSERT INTO gainers_comparisons_legacy_prefix_v1
+           (id, coin_id, symbol, name, appeared_on_gainers_at,
+            detected_by_chains, chains_lead_minutes, is_gap,
+            chains_identity_semantics, created_at)
+           VALUES (9001, 'already-canonical', 'AC', 'AC', ?, 1, 5000.0, 0,
+                   'canonical_v1', ?)""",
+        (ANCHOR, ANCHOR),
+    )
+    await db._conn.commit()
+
+    counts = await recompute_legacy_provenance(db._conn, gate_minutes=1440.0)
+    rep = await reconciliation_report(db._conn)
+
+    assert rep["population"] == 3  # every archived row
+    assert rep["skipped_canonical"] == 1  # never prefix-derived, nothing to replay
+    assert rep["replayed"] == 2
+    assert (
+        sum(counts.values()) == rep["replayed"]
+    ), "the status breakdown does not cover the replayed population"
+    # One row was unjoinable: counted as a status, never written.
+    assert rep["stored"] == 1
+    assert counts.get(STATUS_UNJOINABLE_ROW) == 1
+    assert rep["stored"] + counts[STATUS_UNJOINABLE_ROW] == rep["replayed"]

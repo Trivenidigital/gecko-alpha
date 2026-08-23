@@ -71,3 +71,56 @@ async def test_canonical_wins_the_tiebreak(db, table, anchor_col, reader):
     # The lead must come from the same row as the status, or the claim and the
     # value describe different evidence.
     assert row["chains_canonical_lead"] == pytest.approx(9000.0)
+
+
+@pytest.mark.parametrize("table,anchor_col,reader", SURFACES)
+async def test_a_canonical_row_does_NOT_consult_the_overlay(
+    db, table, anchor_col, reader
+):
+    """A `canonical_v1` row carries its own tier. The overlay is for LEGACY rows.
+
+    The subqueries carried no semantics filter while the comment above them
+    said they did, and `cross_surface` applies `chains_canonical_lead`
+    unconditionally. So a row resolved correctly at write time had its lead
+    replaced by an offline replay of a DIFFERENT, archived row that merely
+    shared its coin_id and anchor -- silently stripping its chains credit.
+
+    Reachable on the deploy day: the anchor is MIN(snapshot_at) over a trailing
+    24h, so a live canonical row and an archived legacy row share one for about
+    a day after the backfill runs. That is the window in which the tier_high
+    question is being judged, so the corruption lands on the measurement.
+    """
+    await db._conn.execute(
+        f"""INSERT INTO {table}
+            (coin_id, symbol, name, {anchor_col}, detected_by_chains,
+             chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+            VALUES ('shared-coin', 'SC', 'SC', ?, 1, 5000.0, 0, ?, 'canonical_v1')""",
+        (ANCHOR, ANCHOR),
+    )
+    # A stale archived-legacy verdict at the SAME coin_id and anchor, whose
+    # reconstructed lead is far below the gate.
+    await _overlay(
+        db, table, "shared-coin", 1, "canonical_below_gate_indeterminate", 60.0
+    )
+    await db._conn.commit()
+
+    rows = await reader(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "shared-coin")
+
+    assert (
+        row["chains_recompute_status"] is None
+    ), "a canonical_v1 row consulted the legacy overlay"
+    assert row["chains_canonical_lead"] is None
+
+    # And the consequence, end to end: it keeps its own 5000-minute lead and
+    # therefore its chains credit.
+    from scout.config import Settings
+    from scout.conviction import cross_surface_conviction
+
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="x", TELEGRAM_CHAT_ID="x", ANTHROPIC_API_KEY="x"
+    )
+    result = cross_surface_conviction(row, settings)
+    assert (
+        "chains" in result.contributing
+    ), "the canonical row lost its chains credit to an archived row's replay"

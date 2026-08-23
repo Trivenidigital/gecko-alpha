@@ -168,14 +168,23 @@ def classify(
         # NEVER a verified positive under possibly-censored history. A hidden
         # canonical-id token would outrank this on tier and could carry a LATER
         # first_seen, collapsing the lead -- so an alias win can be an artefact
-        # of what is missing rather than evidence of what happened. Only safe
-        # once coverage establishes that no canonical-id token was hidden.
-        if (
-            anchor_covered
-            and canonical_lead is not None
-            and canonical_lead >= gate_minutes
-        ):
-            return STATUS_VERIFIED_CANONICAL
+        # of what is missing rather than evidence of what happened.
+        #
+        # This used to promote on `anchor_covered`, described as "safe once
+        # coverage establishes that no canonical-id token was hidden".
+        # `anchor_covered` cannot establish that. Coverage intervals are built
+        # from MIN/MAX over ALL tokens' events -- a GLOBAL span. They say "we
+        # were recording during this window", never "THIS coin's canonical-id
+        # token would have been seen". Review reproduced the failure on this
+        # module's own worked example: `terra-luna-2 <- luna` stamped
+        # verified_canonical at a 7,200-minute lead on censored history, which
+        # collapses to 60 once the real history is restored -- exactly the
+        # error the module docstring says the design forecloses.
+        #
+        # So honour the stated rule: an alias win is indeterminate. The
+        # asymmetry is the point -- this branch manufactured a false POSITIVE,
+        # granting unearned credit, where the same predicate's other uses
+        # produce negatives and fail safe.
         return STATUS_CANONICAL_SUB_GATE
 
     # No canonical identity found.
@@ -428,3 +437,52 @@ async def recompute_legacy_provenance(
         await conn.commit()
 
     return counts
+
+
+async def reconciliation_report(conn) -> dict[str, int]:
+    """Denominators for the acceptance table, queried rather than assumed.
+
+    `sum(counts)` from a replay cannot be checked against anything on its own.
+    It equals the NON-CANONICAL archived rows -- not every archived row -- and
+    rows classified `unjoinable_row` are counted but never written. Three
+    different numbers can all reasonably be called "the population", and an
+    acceptance table that does not say which one it used cannot be reconciled
+    against the table it describes.
+
+    Deliberately NOT folded into `recompute_legacy_provenance`'s return value:
+    callers sum that dict, so adding non-status keys would silently corrupt
+    every `sum(counts.values())`.
+
+    `stored` is read back from the overlay rather than tallied during the
+    write, because `INSERT OR REPLACE` on (source_table, source_row_id)
+    collapses a duplicate pair silently -- two archived rows in, one row out,
+    no error. "Rows we wrote" and "rows that exist" are separate claims.
+    """
+    out = {"population": 0, "skipped_canonical": 0, "stored": 0}
+    for source_table in _SURFACES:
+        archive = f"{source_table}_legacy_prefix_v1"
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (archive,)
+        )
+        if not await cur.fetchone():
+            continue
+        cur = await conn.execute(f"SELECT COUNT(*) FROM {archive}")
+        out["population"] += (await cur.fetchone())[0]
+
+        cur = await conn.execute(f"PRAGMA table_info({archive})")
+        if "chains_identity_semantics" in {r[1] for r in await cur.fetchall()}:
+            cur = await conn.execute(
+                f"SELECT COUNT(*) FROM {archive} WHERE "
+                "COALESCE(chains_identity_semantics, 'legacy_prefix') = 'canonical_v1'"
+            )
+            out["skipped_canonical"] += (await cur.fetchone())[0]
+
+    cur = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='chain_identity_recompute_v1'"
+    )
+    if await cur.fetchone():
+        cur = await conn.execute("SELECT COUNT(*) FROM chain_identity_recompute_v1")
+        out["stored"] = (await cur.fetchone())[0]
+    out["replayed"] = out["population"] - out["skipped_canonical"]
+    return out
