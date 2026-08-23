@@ -13,7 +13,16 @@ import aiosqlite
 import structlog
 
 from scout.identity import LEGACY_SEMANTICS
-from scout.identity_recompute import CREDIT_BEARING
+from scout.identity_recompute import CREDIT_BEARING, RECOMPUTE_SEMANTICS
+
+#: A surface must hold at least this many credit-bearing rows before its
+#: recovery rate is judged; below it, one row moves the rate enough to be
+#: noise.
+_COLLAPSE_MIN_POPULATION = 20
+#: Fraction of the high-water rate below which a surface is "collapsed".
+#: Deliberately generous -- this is a cliff detector, not a drift detector,
+#: and an alarm that fires on drift is one that gets muted.
+_COLLAPSE_FRACTION = 0.5
 
 _db_log = structlog.get_logger(__name__)
 
@@ -366,6 +375,20 @@ class Database:
             # forever once applied, and this is the IRREVERSIBLE half.
             await self._migrate_chain_identity_recompute_v1()
             await self._migrate_chain_identity_recompute_pk_v2()
+            # Ungated, like the archive step below and for the same reason: a
+            # migration early-returns forever once its marker exists, so
+            # putting this inside one meant every database that had already
+            # applied it never got the table. That is the gating mistake this
+            # tranche opened with, and I repeated it here.
+            await self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS recompute_coverage_baseline (
+                    source_table  TEXT PRIMARY KEY,
+                    best_rate     REAL NOT NULL,
+                    population    INTEGER NOT NULL,
+                    recorded_at   TEXT NOT NULL
+                )
+            """)
+            await self._conn.commit()
             await self.archive_legacy_prefix_comparisons()
             await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
@@ -7830,6 +7853,24 @@ class Database:
             return
 
         try:
+            # BEGIN EXCLUSIVE so the rebuild is actually atomic. DDL runs in
+            # AUTOCOMMIT under this connection mode -- the same property behind
+            # the archive-commit finding -- so without it the scratch CREATE is
+            # already durable and `rollback()` cannot undo it. Any failure
+            # (exception, OOM, SIGTERM, a deploy restart while it copies
+            # production's 2,891 rows) then left an orphan
+            # `..._pk2` table, and EVERY subsequent boot raised
+            # "table already exists" out of `initialize()`, which no caller
+            # catches, until someone dropped it by hand.
+            #
+            # That is the concurrent-startup crash this tranche opened with,
+            # reintroduced in its newest migration -- and only on the path that
+            # runs against databases carrying real data, since a fresh install
+            # takes the early return above.
+            await conn.execute("BEGIN EXCLUSIVE")
+            # And drop first, so a database already wedged by an earlier failed
+            # attempt recovers on the next boot instead of needing hands.
+            await conn.execute("DROP TABLE IF EXISTS chain_identity_recompute_v1_pk2")
             await conn.execute("""
                 CREATE TABLE chain_identity_recompute_v1_pk2 (
                     source_table        TEXT NOT NULL,
@@ -8167,9 +8208,14 @@ class Database:
                 "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
                 "!= 'canonical_v1'"
             )
+            # CURRENT version only. The version is in the primary key now, so
+            # the overlay holds every generation at once -- and an unfiltered
+            # read would let a superseded, more generous verdict keep counting
+            # as recovered after a version bump tightened the semantics.
             matched = (
                 "SELECT 1 FROM chain_identity_recompute_v1 AS r "
                 "  WHERE r.source_table = ? AND r.coin_id = c.coin_id "
+                "  AND r.semantics_version = ? "
                 f"  AND r.historical_anchor = c.{anchor}"
             )
             cur = await self._conn.execute(
@@ -8181,7 +8227,7 @@ class Database:
                 f"SELECT COUNT(*) FROM {table} AS c "
                 f"WHERE {untrusted} AND c.detected_by_chains = 1 "
                 f"AND NOT EXISTS ({matched})",
-                (table,),
+                (table, RECOMPUTE_SEMANTICS),
             )
             unc = (await cur.fetchone())[0]
             cur = await self._conn.execute(
@@ -8190,7 +8236,7 @@ class Database:
                 f"AND EXISTS ({matched} AND r.evidence_status IN "
                 f"({','.join('?' * len(CREDIT_BEARING))}) "
                 "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
-                (table, *sorted(CREDIT_BEARING), gate_minutes),
+                (table, RECOMPUTE_SEMANTICS, *sorted(CREDIT_BEARING), gate_minutes),
             )
             rec = (await cur.fetchone())[0]
 
@@ -8235,6 +8281,52 @@ class Database:
                 "unarchivable": unarchivable,
             }
 
+        # COLLAPSE detection, on top of the zero case.
+        #
+        # `dark` fires only at EXACTLY zero recovery, and that misses the
+        # degradation this probe's own docstring predicts: delete the /root
+        # snapshots, re-run the backfill, and roughly four rows in five land
+        # indeterminate. Four in five is 20% -- not zero -- so a fall from the
+        # measured 53% baseline to 5% is silent on every layer while 95% of
+        # readers go blind.
+        #
+        # History running out is GRADUAL; a snapshot-less or failed backfill is
+        # a CLIFF. Only the second should page, so this compares against a
+        # high-water RATE per surface rather than a fixed threshold: the mark
+        # self-calibrates on the first healthy observation and never lowers
+        # itself, so ordinary attrition rides underneath it and a collapse
+        # crosses it. Reset by deleting the surface's row.
+        collapsed: list[str] = []
+        for table, v in per_surface.items():
+            pop, rec = v["credit_bearing"], v["credit_recovered"]
+            if pop < _COLLAPSE_MIN_POPULATION:
+                continue  # too small to distinguish a collapse from noise
+            rate = rec / pop
+            cur = await self._conn.execute(
+                "SELECT best_rate FROM recompute_coverage_baseline WHERE source_table = ?",
+                (table,),
+            )
+            row = await cur.fetchone()
+            best = row[0] if row else None
+            v["rate"] = round(rate, 4)
+            # Report the mark IN FORCE AFTER this observation, not the one
+            # before it -- otherwise the first run reports None for a mark it
+            # just recorded, and the payload disagrees with the table.
+            v["best_rate"] = round(max(rate, best) if best is not None else rate, 4)
+            if best is None or rate > best:
+                await self._conn.execute(
+                    "INSERT INTO recompute_coverage_baseline "
+                    "(source_table, best_rate, population, recorded_at) "
+                    "VALUES (?, ?, ?, datetime('now')) "
+                    "ON CONFLICT(source_table) DO UPDATE SET "
+                    "best_rate=excluded.best_rate, population=excluded.population, "
+                    "recorded_at=excluded.recorded_at",
+                    (table, rate, pop),
+                )
+                await self._conn.commit()
+            elif rate < best * _COLLAPSE_FRACTION:
+                collapsed.append(table)
+
         # PER SURFACE, not global. The comment here used to claim a global
         # predicate covered "populated for one surface only"; it did not, and
         # per-surface commits made that reachable. A replay that fails partway
@@ -8254,7 +8346,7 @@ class Database:
             if v["credit_bearing"] > 0 and v["credit_recovered"] == 0
         )
         unarchivable_total = sum(v["unarchivable"] for v in per_surface.values())
-        not_recovering = bool(dark)
+        not_recovering = bool(dark) or bool(collapsed)
         return {
             "overlay_rows": overlay_rows,
             "credit_bearing_legacy_rows": credit_bearing,
@@ -8262,6 +8354,7 @@ class Database:
             "uncovered": uncovered,
             "not_recovering": not_recovering,
             "dark_surfaces": dark,
+            "collapsed_surfaces": sorted(collapsed),
             "unarchivable": unarchivable_total,
             "per_surface": per_surface,
         }

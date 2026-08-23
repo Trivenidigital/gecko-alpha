@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import aiohttp
 import structlog
 
+from scout.identity_recompute import RECOMPUTE_SEMANTICS
 from scout.identity import (
     CANONICAL_SEMANTICS,
     resolve_chain_first_seen,
@@ -540,6 +541,16 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                   (SELECT cir.evidence_status
                      FROM chain_identity_recompute_v1 cir
                     WHERE cir.source_table = 'trending_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
                       -- ONLY legacy rows consult the overlay. Without this
@@ -591,6 +602,16 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
                   (SELECT cir.canonical_lead
                      FROM chain_identity_recompute_v1 cir
                     WHERE cir.source_table = 'trending_comparisons'
+                      -- CURRENT version only. The version is in the
+                      -- primary key now, so the overlay holds every
+                      -- generation at once -- and with no filter the
+                      -- ORDER BY selected the MOST GENEROUS verdict ever
+                      -- recorded, across versions, rather than the
+                      -- current one. A version bump that TIGHTENS the
+                      -- semantics (the normal direction, and what this
+                      -- work has been doing for seven revisions) would
+                      -- have been silently ignored by every consumer.
+                      AND cir.semantics_version = ?
                       AND cir.coin_id = trending_comparisons.coin_id
                       AND cir.historical_anchor = trending_comparisons.appeared_on_trending_at
                       -- ONLY legacy rows consult the overlay. Without this
@@ -639,7 +660,7 @@ async def get_recent_comparisons(db: "Database", limit: int = 100) -> list[dict]
            FROM trending_comparisons
            ORDER BY COALESCE(social_detected_at, chains_detected_at, narrative_detected_at, pipeline_detected_at, appeared_on_trending_at) DESC
            LIMIT ?""",
-        (limit,),
+        (RECOMPUTE_SEMANTICS, RECOMPUTE_SEMANTICS, limit),
     )
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]

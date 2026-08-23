@@ -57,9 +57,36 @@ The probe alone is not enough: nothing on this box reads journald, so a
 `logger.error` there is operationally silence. The watchdog alone is not
 enough either: it samples on a timer and carries no per-surface detail.
 
-Both escalate on **recovered credit**, never on row count, and neither pages on
-partial coverage — history genuinely runs out for older anchors, and an alarm
-that fires on the steady state gets muted before the day it matters.
+Both escalate on **recovered credit**, never on row count, and on two distinct
+conditions:
+
+| condition | meaning |
+|---|---|
+| `dark_surfaces` | a surface with a population recovered **nothing** — a cliff: the backfill was never run, or ran with no history |
+| `collapsed_surfaces` | a surface fell below half its recorded high-water recovery **rate** — history was deleted underneath it |
+
+The second exists because the first only fires at exactly zero, and the
+degradation this system actually expects is not zero. Delete the `/root`
+snapshots, re-run the backfill, and roughly four rows in five land
+indeterminate — 20%, not 0% — so a fall from the measured ~53% baseline to 5%
+would page on neither. That is 95% of readers going blind under a green alarm.
+
+The high-water mark is a **ratchet**: recorded from the first observation of a
+surface, raised when recovery improves, never lowered. Ordinary attrition rides
+underneath it (archived rows draining to `canonical_v1` shrink population and
+recovered together, so the *rate* holds), and a collapse crosses it. Surfaces
+with fewer than 20 credit-bearing rows are not judged on rate at all — one row
+moves it too far to distinguish a cliff from noise.
+
+To reset after a deliberate change that lowers recovery:
+
+```sql
+DELETE FROM recompute_coverage_baseline WHERE source_table = '<surface>';
+```
+
+Neither condition pages on partial coverage per se — history genuinely runs out
+for older anchors, and an alarm that fires on the steady state gets muted before
+the day it matters.
 
 ### Install — and arm it
 

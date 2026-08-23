@@ -130,13 +130,22 @@ def test_a_missing_env_file_is_its_own_code(tmp_path):
 def test_every_documented_exit_code_is_distinct():
     """The contract is only useful if the codes do not collide."""
     text = WRAPPER.read_text(encoding="utf-8")
-    codes = {
+    # Collected into a LIST. The first version built a set and then compared
+    # its length against a list built from that same set -- equal by
+    # construction, so duplicates were deduplicated before the check that was
+    # supposed to find them. A guard that cannot fail.
+    codes = [
         int(line.split("exit ")[1].split()[0])
         for line in text.splitlines()
         if line.strip().startswith("exit ") and line.strip()[5:].strip().isdigit()
-    }
-    assert len(codes) == len([c for c in codes]), "duplicate exit codes"
-    assert {0, 1, 2, 3, 4, 5, 6} >= codes, f"undocumented exit code in {codes}"
+    ]
+    assert codes, "no exit codes found; the scanner is reading nothing"
+    # 1 is the alarm path and appears once; every other code should be unique.
+    # Duplicates are what make a dead watchdog indistinguishable from a firing
+    # one, which is the whole reason these codes exist.
+    dupes = sorted({c for c in codes if codes.count(c) > 1})
+    assert dupes == [], f"duplicate exit codes: {dupes}"
+    assert {0, 1, 2, 3, 4, 5, 6} >= set(codes), f"undocumented exit code in {codes}"
 
 
 def test_it_refuses_rather_than_guessing_the_gate(tmp_path):

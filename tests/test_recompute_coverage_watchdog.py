@@ -56,9 +56,13 @@ def _build(
             f"{col} TEXT, detected_by_chains INTEGER, chains_identity_semantics TEXT)"
         )
     conn.execute(
+        "CREATE TABLE recompute_coverage_baseline (source_table TEXT PRIMARY KEY, "
+        "best_rate REAL NOT NULL, population INTEGER NOT NULL, recorded_at TEXT NOT NULL)"
+    )
+    conn.execute(
         "CREATE TABLE chain_identity_recompute_v1 (source_table TEXT, "
         "source_row_id INTEGER, coin_id TEXT, historical_anchor TEXT, "
-        "evidence_status TEXT, canonical_lead REAL)"
+        "evidence_status TEXT, canonical_lead REAL, semantics_version TEXT)"
     )
     for i in range(population):
         conn.execute(
@@ -72,8 +76,15 @@ def _build(
             # the same fixture blindness that hid this defect in the probe.
             conn.execute(
                 "INSERT INTO chain_identity_recompute_v1 VALUES "
-                "('gainers_comparisons', ?, ?, ?, ?, ?)",
-                (i + 5000, f"coin-{i}", ANCHOR, overlay_status, canonical_lead),
+                "('gainers_comparisons', ?, ?, ?, ?, ?, ?)",
+                (
+                    i + 5000,
+                    f"coin-{i}",
+                    ANCHOR,
+                    overlay_status,
+                    canonical_lead,
+                    "chain_identity_recompute_v1",
+                ),
             )
     conn.commit()
     conn.close()
@@ -310,3 +321,45 @@ def test_the_wrapper_never_hardcodes_a_gate_value():
     assert "GATE=1440" not in code.replace(
         " ", ""
     ), "a literal gate fallback reappeared in the wrapper"
+
+
+def test_the_watchdog_pages_on_a_COLLAPSE_that_is_not_zero(tmp_path):
+    """The runbook's own scenario, on the layer that actually notifies.
+
+    Snapshots deleted, roughly four rows in five landing indeterminate — 20%,
+    not zero. `dark` only fires at exactly zero, so this was invisible to the
+    one component that sends Telegram.
+    """
+    db = _build(tmp_path, overlay_status="verified_canonical", population=40)
+    conn = sqlite3.connect(db)
+    # A recorded high-water rate of 1.0, against a population that now
+    # recovers only a fraction.
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 1.0, 40, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.execute("DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > 5004")
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 1, r.stdout
+    assert "COLLAPSED" in r.stdout
+    assert "0 of" not in r.stdout, "this is a collapse, not total loss"
+
+
+def test_a_healthy_rate_at_the_high_water_mark_does_not_page(tmp_path):
+    db = _build(tmp_path, overlay_status="verified_canonical", population=40)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO recompute_coverage_baseline VALUES "
+        "('gainers_comparisons', 1.0, 40, '2026-08-01T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    r = _run(db)
+
+    assert r.returncode == 0, r.stdout
+    assert "COLLAPSED" not in r.stdout

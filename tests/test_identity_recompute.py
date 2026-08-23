@@ -25,6 +25,7 @@ from scout.identity_recompute import (
     STATUS_PREFIX_ONLY,
     STATUS_UNJOINABLE_ROW,
     STATUS_VERIFIED_CANONICAL,
+    RECOMPUTE_SEMANTICS,
     recompute_legacy_provenance,
     reconciliation_report,
 )
@@ -506,8 +507,13 @@ async def test_duplicate_coin_ids_cannot_FAN_OUT_the_reader(db):
                 legacy_detected, legacy_lead, canonical_detected, canonical_lead,
                 identity_tier, evidence_status, semantics_version, computed_at)
                VALUES ('losers_comparisons', ?, 'dupe', 'DUP', ?, 1, 5000.0, 1, 5000.0,
-                       'canonical_id', ?, 'v1', '2026-08-23')""",
-            (1 if anchor == ANCHOR else 2, anchor, STATUS_VERIFIED_CANONICAL),
+                       'canonical_id', ?, ?, '2026-08-23')""",
+            (
+                1 if anchor == ANCHOR else 2,
+                anchor,
+                STATUS_VERIFIED_CANONICAL,
+                RECOMPUTE_SEMANTICS,
+            ),
         )
     await db._conn.commit()
 
@@ -542,8 +548,8 @@ async def test_the_overlay_matches_on_ANCHOR_not_just_coin_id(db):
             legacy_detected, legacy_lead, canonical_detected, canonical_lead,
             identity_tier, evidence_status, semantics_version, computed_at)
            VALUES ('losers_comparisons', 99, 'split', 'SPL', '2026-01-01T00:00:00+00:00',
-                   1, 5000.0, 1, 5000.0, 'canonical_id', ?, 'v1', '2026-08-23')""",
-        (STATUS_VERIFIED_CANONICAL,),
+                   1, 5000.0, 1, 5000.0, 'canonical_id', ?, ?, '2026-08-23')""",
+        (STATUS_VERIFIED_CANONICAL, RECOMPUTE_SEMANTICS),
     )
     await db._conn.commit()
 

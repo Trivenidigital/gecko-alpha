@@ -14,6 +14,7 @@ the wrong row: credit silently discarded, no error anywhere.
 import pytest
 
 from scout.db import Database
+from scout.identity_recompute import RECOMPUTE_SEMANTICS
 from scout.gainers.tracker import get_gainers_comparisons
 from scout.losers.tracker import get_losers_comparisons
 from scout.trending.tracker import get_recent_comparisons
@@ -41,8 +42,17 @@ async def _overlay(db, table, coin_id, row_id, status, lead):
            (source_table, source_row_id, coin_id, symbol, historical_anchor,
             legacy_detected, legacy_lead, canonical_detected, canonical_lead,
             identity_tier, evidence_status, semantics_version, computed_at)
-           VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, ?, 'canonical_id', ?, 'v1', ?)""",
-        (table, row_id, coin_id, ANCHOR, lead, status, ANCHOR),
+           VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, ?, 'canonical_id', ?, ?, ?)""",
+        (
+            table,
+            row_id,
+            coin_id,
+            ANCHOR,
+            lead,
+            status,
+            RECOMPUTE_SEMANTICS,
+            ANCHOR,
+        ),
     )
 
 
@@ -213,3 +223,51 @@ async def test_the_reader_picks_the_row_the_PROBE_counted(
         TELEGRAM_BOT_TOKEN="x", TELEGRAM_CHAT_ID="x", ANTHROPIC_API_KEY="x"
     )
     assert "chains" in cross_surface_conviction(row, settings).contributing
+
+
+@pytest.mark.parametrize("table,anchor_col,reader", SURFACES)
+async def test_a_SUPERSEDED_version_does_not_outvote_the_current_one(
+    db, table, anchor_col, reader
+):
+    """Storage was versioned; retrieval was not.
+
+    Putting `semantics_version` in the primary key means the overlay now holds
+    every generation at once — which is the point. But no reader filtered on
+    it, and the ordering is (verified first, lead DESC, row id), so across
+    versions it selected the **most generous verdict ever recorded** rather
+    than the current one. A version bump that TIGHTENS the semantics — the
+    normal direction, and what this work has been doing for seven revisions —
+    would have been silently ignored by every consumer.
+
+    The old row is deliberately the generous one, so an unfiltered reader
+    prefers it on both the status and the lead.
+    """
+    await db._conn.execute(
+        f"""INSERT INTO {table}
+            (coin_id, symbol, name, {anchor_col}, detected_by_chains,
+             chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+            VALUES ('two-gens', 'TG', 'TG', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+        (ANCHOR, ANCHOR),
+    )
+    # Superseded generation: generous.
+    await db._conn.execute(
+        """INSERT INTO chain_identity_recompute_v1
+           (source_table, source_row_id, coin_id, symbol, historical_anchor,
+            legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+            identity_tier, evidence_status, semantics_version, computed_at)
+           VALUES (?, 1, 'two-gens', 'TG', ?, 1, 8740.0, 1, 9000.0,
+                   'canonical_id', 'verified_canonical', 'superseded_v0', ?)""",
+        (table, ANCHOR, ANCHOR),
+    )
+    # Current generation: stricter.
+    await _overlay(db, table, "two-gens", 2, "verified_prefix_only", 60.0)
+    await db._conn.commit()
+
+    rows = await reader(db, limit=10)
+    row = next(r for r in rows if r["coin_id"] == "two-gens")
+
+    assert row["chains_recompute_status"] == "verified_prefix_only", (
+        "the reader took a superseded generation's verdict; a version bump "
+        "that tightened the semantics would be silently ignored"
+    )
+    assert row["chains_canonical_lead"] == pytest.approx(60.0)

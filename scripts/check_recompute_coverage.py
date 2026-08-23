@@ -41,6 +41,15 @@ SURFACES = (
     ("trending_comparisons", "appeared_on_trending_at"),
 )
 CREDIT_BEARING = ("verified_canonical",)
+#: Current semantics generation. Mirrors `identity_recompute.RECOMPUTE_SEMANTICS`
+#: (parity asserted by test). The version is part of the overlay's primary key,
+#: so the table holds every generation at once and an unfiltered read would let
+#: a superseded, more generous verdict keep counting as recovered.
+RECOMPUTE_SEMANTICS = "chain_identity_recompute_v1"
+#: Mirrors `Database._COLLAPSE_MIN_POPULATION` / `_COLLAPSE_FRACTION`
+#: (parity asserted by test).
+COLLAPSE_MIN_POPULATION = 20
+COLLAPSE_FRACTION = 0.5
 LIVE_DB = "/root/gecko-alpha/scout.db"
 #: Default gate. Overridable, because the readers compare `canonical_lead`
 #: against CONVICTION_EARLY_LEAD_MINUTES at scoring time -- a status alone is
@@ -123,6 +132,7 @@ def main() -> int:
         detail = []
         dark: list[str] = []
         unarchivable = 0
+        per_surface: dict[str, tuple[int, int]] = {}
         placeholders = ",".join("?" * len(CREDIT_BEARING))
         for table, anchor in SURFACES:
             untrusted = (
@@ -138,10 +148,11 @@ def main() -> int:
                 f"WHERE {untrusted} AND c.detected_by_chains = 1 "
                 "AND EXISTS (SELECT 1 FROM chain_identity_recompute_v1 AS r "
                 "  WHERE r.source_table = ? AND r.coin_id = c.coin_id "
+                "  AND r.semantics_version = ? "
                 f"  AND r.historical_anchor = c.{anchor} "
                 f"  AND r.evidence_status IN ({placeholders}) "
                 "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
-                (table, *CREDIT_BEARING, args.gate_minutes),
+                (table, RECOMPUTE_SEMANTICS, *CREDIT_BEARING, args.gate_minutes),
             ).fetchone()[0]
             # Rows with no archived twin: written after the archives were
             # taken, so the backfill can never reach them. Surfaced IN THE
@@ -168,6 +179,7 @@ def main() -> int:
             population += pop
             recovered += rec
             unarchivable += unarch
+            per_surface[table] = (pop, rec)
             detail.append(f"{table}={rec}/{pop}")
             # PER SURFACE. A global "recovered nothing" is satisfied by one
             # healthy surface while the others sit stripped -- reachable
@@ -176,6 +188,28 @@ def main() -> int:
             # `losers=0/5 trending=0/5` in its own alert text and exiting 0.
             if pop > 0 and rec == 0:
                 dark.append(table)
+
+        # Collapse detection against the high-water mark the probe maintains.
+        # Read-only: the probe owns the ratchet, this only compares. Must live
+        # INSIDE the connection's lifetime -- placed after `conn.close()` it
+        # raised ProgrammingError into a bare `except sqlite3.Error`, which
+        # silently produced "no collapse" forever. A silent failure inside the
+        # code added to fix silent failures.
+        collapsed = []
+        for table, _anchor in SURFACES:
+            try:
+                row = conn.execute(
+                    "SELECT best_rate FROM recompute_coverage_baseline "
+                    "WHERE source_table = ?",
+                    (table,),
+                ).fetchone()
+            except sqlite3.Error:
+                break  # baseline table absent (pre-deploy): nothing to compare
+            pop, rec = per_surface.get(table, (0, 0))
+            if not row or pop < COLLAPSE_MIN_POPULATION:
+                continue
+            if rec / pop < row[0] * COLLAPSE_FRACTION:
+                collapsed.append(table)
     except sqlite3.Error as exc:
         print(f"query failed: {exc}")
         return 2
@@ -186,6 +220,15 @@ def main() -> int:
     if population == 0:
         print(f"no pre-cutover chains credit to recover ({summary})")
         return 0
+    if collapsed and not dark:
+        print(
+            f"overlay recovery COLLAPSED on {', '.join(collapsed)}: "
+            f"{recovered} of {population} keep their credit, far below the "
+            f"recorded high-water rate ({summary}). History may have been "
+            "deleted; re-run the backfill and check the /root snapshots."
+        )
+        return 1
+
     if dark:
         remedy = (
             "Run scripts/backfill_chain_identity_recompute.py --apply"

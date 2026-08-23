@@ -16,6 +16,7 @@ Paging on the second trains the operator to ignore the first.
 import pytest
 
 from scout.db import Database
+from scout.identity_recompute import RECOMPUTE_SEMANTICS
 
 ANCHOR = "2026-08-01T00:00:00+00:00"
 
@@ -49,8 +50,8 @@ async def _overlay_row(db, row_id, coin_id, anchor):
             legacy_detected, legacy_lead, canonical_detected, canonical_lead,
             identity_tier, evidence_status, semantics_version, computed_at)
            VALUES ('gainers_comparisons', ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
-                   'canonical_id', 'verified_canonical', 'v1', ?)""",
-        (row_id, coin_id, anchor, ANCHOR),
+                   'canonical_id', 'verified_canonical', ?, ?)""",
+        (row_id, coin_id, anchor, RECOMPUTE_SEMANTICS, ANCHOR),
     )
     await db._conn.commit()
 
@@ -163,8 +164,8 @@ async def _overlay_row_with_status(
             legacy_detected, legacy_lead, canonical_detected, canonical_lead,
             identity_tier, evidence_status, semantics_version, computed_at)
            VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 0, NULL,
-                   'identity_unresolved', ?, 'v1', ?)""",
-        (table, row_id, coin_id, anchor, status, ANCHOR),
+                   'identity_unresolved', ?, ?, ?)""",
+        (table, row_id, coin_id, anchor, status, RECOMPUTE_SEMANTICS, ANCHOR),
     )
     await db._conn.commit()
 
@@ -463,8 +464,15 @@ async def test_a_fully_recovering_tree_names_no_dark_surfaces(db):
                 legacy_detected, legacy_lead, canonical_detected, canonical_lead,
                 identity_tier, evidence_status, semantics_version, computed_at)
                VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
-                       'canonical_id', 'verified_canonical', 'v1', ?)""",
-            (surface, cur.lastrowid, f"{surface}-ok", ANCHOR, ANCHOR),
+                       'canonical_id', 'verified_canonical', ?, ?)""",
+            (
+                surface,
+                cur.lastrowid,
+                f"{surface}-ok",
+                ANCHOR,
+                RECOMPUTE_SEMANTICS,
+                ANCHOR,
+            ),
         )
     await db._conn.commit()
 
@@ -539,8 +547,8 @@ async def test_a_lead_EXACTLY_at_the_gate_counts_as_recovered(db):
             identity_tier, evidence_status, semantics_version, computed_at)
            VALUES ('gainers_comparisons', ?, 'exactly-on-the-gate', 'X', ?,
                    1, 8740.0, 1, 1440.0, 'canonical_id', 'verified_canonical',
-                   'v1', ?)""",
-        (row_id, ANCHOR, ANCHOR),
+                   ?, ?)""",
+        (row_id, ANCHOR, RECOMPUTE_SEMANTICS, ANCHOR),
     )
     await db._conn.commit()
 
@@ -550,3 +558,96 @@ async def test_a_lead_EXACTLY_at_the_gate_counts_as_recovered(db):
         probe["credit_recovered"] == 1
     ), "a lead exactly on the gate was reported lost; cross_surface grants it"
     assert probe["not_recovering"] is False
+
+
+async def _bulk(db, n, recovered):
+    """n credit-bearing gainers rows, `recovered` of them with a verified overlay."""
+    for i in range(n):
+        row_id = await _credit_bearing_legacy_row(db, f"bulk-{i}")
+        if i < recovered:
+            await _overlay_row(db, row_id, f"bulk-{i}", ANCHOR)
+
+
+async def test_a_COLLAPSE_in_recovery_rate_pages_even_though_it_is_not_zero(db):
+    """The failure the probe's own docstring predicts, which zero-detection misses.
+
+    Delete the /root snapshots, re-run the backfill, and roughly four rows in
+    five land indeterminate. Four in five is 20% — not zero — so a fall from
+    the measured ~53% baseline to 5% left every alarm green while 95% of
+    readers went blind.
+    """
+    await _bulk(db, 100, 60)
+    healthy = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    assert healthy["not_recovering"] is False
+    assert healthy["per_surface"]["gainers_comparisons"]["best_rate"] == 0.6
+
+    # The snapshots are gone; a re-run recovers a fraction of what it did.
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 4 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+
+    collapsed = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert collapsed["credit_recovered"] > 0, "fixture must not be the zero case"
+    assert collapsed["dark_surfaces"] == [], "this is a collapse, not total loss"
+    assert collapsed["collapsed_surfaces"] == ["gainers_comparisons"]
+    assert collapsed["not_recovering"] is True
+
+
+async def test_ordinary_attrition_does_NOT_page(db):
+    """Archived rows drain to `canonical_v1` over time, shrinking both numbers.
+
+    A count-based high-water mark would page on that. Rates hold steady, so
+    this must stay quiet — an alarm that fires on drift is one that gets muted.
+    """
+    await _bulk(db, 100, 60)
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    # Half the population ages out; the surviving rows keep the same ratio.
+    await db._conn.execute(
+        "UPDATE gainers_comparisons SET chains_identity_semantics = 'canonical_v1' "
+        "WHERE id % 2 = 0"
+    )
+    await db._conn.commit()
+
+    after = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert after["credit_bearing_legacy_rows"] < 100, "fixture did not shrink"
+    assert after["collapsed_surfaces"] == []
+    assert after["not_recovering"] is False
+
+
+async def test_a_tiny_population_is_not_judged_on_its_rate(db):
+    """Below the floor one row swings the rate; that is noise, not a cliff."""
+    await _bulk(db, 4, 3)
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    await db._conn.execute("DELETE FROM chain_identity_recompute_v1")
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert probe["collapsed_surfaces"] == []
+    # It is still DARK -- zero recovery on a real population always pages --
+    # but not via the collapse path.
+    assert probe["dark_surfaces"] == ["gainers_comparisons"]
+
+
+async def test_the_high_water_mark_never_lowers_itself(db):
+    """A ratchet. Otherwise a degraded run silently becomes the new normal."""
+    await _bulk(db, 100, 60)
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    await db._conn.execute(
+        "DELETE FROM chain_identity_recompute_v1 WHERE source_row_id > "
+        "(SELECT MIN(source_row_id) + 29 FROM chain_identity_recompute_v1)"
+    )
+    await db._conn.commit()
+    await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    cur = await db._conn.execute(
+        "SELECT best_rate FROM recompute_coverage_baseline "
+        "WHERE source_table='gainers_comparisons'"
+    )
+    assert (await cur.fetchone())[0] == 0.6, "the mark followed the degradation down"
