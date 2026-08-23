@@ -164,3 +164,63 @@ async def test_boundary_row_is_not_deleted_while_a_reader_still_wants_it(db):
     await _snap(db, "0xd", 13.98, 42.0)
     await db.prune_volume_snapshots(keep_days=14)
     assert await db.get_volume_history("0xd", days=14) == [42.0]
+
+
+# ---------------------------------------------------------------------------
+# Batched deletion — bounded lock-hold time at cutover
+# ---------------------------------------------------------------------------
+
+
+async def test_batched_prune_deletes_everything_past_the_cutoff(db):
+    """Batching must not change WHAT gets deleted, only how it is chunked."""
+    for i in range(25):
+        await _snap(db, f"0x{i}", 20.0, 1.0)
+    for i in range(5):
+        await _snap(db, f"0x{i}", 1.0, 1.0)
+
+    deleted = await db.prune_volume_snapshots(keep_days=14, batch_size=4)
+    assert deleted == 25
+    cur = await db._conn.execute("SELECT COUNT(*) FROM volume_snapshots")
+    assert (await cur.fetchone())[0] == 5
+
+
+async def test_the_batch_loop_actually_iterates(db, monkeypatch):
+    """Pins that batching HAPPENS, not merely that the totals come out right.
+
+    A single unbatched DELETE returns the same count and passes the test above,
+    so that test cannot tell the two implementations apart. Counting the
+    executed DELETEs can.
+    """
+    for i in range(20):
+        await _snap(db, f"0x{i}", 20.0, 1.0)
+
+    deletes = 0
+    real_exec = type(db._conn).execute
+
+    async def counting_exec(self, sql, *a, **kw):
+        nonlocal deletes
+        if str(sql).lstrip().upper().startswith("DELETE FROM VOLUME_SNAPSHOTS"):
+            deletes += 1
+        return await real_exec(self, sql, *a, **kw)
+
+    monkeypatch.setattr(type(db._conn), "execute", counting_exec)
+    total = await db.prune_volume_snapshots(keep_days=14, batch_size=5)
+
+    assert total == 20
+    assert deletes >= 4, (
+        f"expected the 20 rows to be deleted in batches of 5, saw {deletes} "
+        "DELETE statements -- the loop is not batching"
+    )
+
+
+async def test_batch_size_must_be_positive(db):
+    """0 would make the LIMIT delete nothing and spin to the loop bound."""
+    with pytest.raises(ValueError, match="batch_size"):
+        await db.prune_volume_snapshots(keep_days=14, batch_size=0)
+
+
+async def test_prune_terminates_when_nothing_matches(db):
+    await _snap(db, "0xa", 1.0, 1.0)
+    assert await db.prune_volume_snapshots(keep_days=14, batch_size=5) == 0
+    cur = await db._conn.execute("SELECT COUNT(*) FROM volume_snapshots")
+    assert (await cur.fetchone())[0] == 1
