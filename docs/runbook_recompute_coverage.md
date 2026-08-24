@@ -345,6 +345,27 @@ shell half needs a re-`install` and silently does not deploy. That trap is
 already in this project's history with the backup scripts. Only the unit files
 are installed, and those change rarely.
 
+**"Rarely" is not "never", and this document is the exception to its own
+sentence.** THREE deploy mechanics live in this subsystem and collapsing them
+is how a change ships inert with everything green:
+
+| artefact | reaches production by | changed here? |
+|---|---|---|
+| `.sh` run by `ExecStart` | **`git pull`** — systemd runs the repo copy | yes (mode) |
+| `.py` (probe, checker, backfill) | **`git pull`** | yes |
+| **`.service` / `.timer`** | **`install` + `daemon-reload`** — systemd reads `/etc/systemd/system`, never the repo | **yes** |
+
+So **a unit-file change requires re-running the install block above.** Verified
+on the box: the installed copy of `recompute-coverage-watchdog.service` has no
+`ExecStartPre`, and after a plain `git pull` the repo copy would have one while
+the installed copy still would not. The preflight would be present in the diff,
+green in CI, and **inert in production** — and the operator's mental model would
+say it was live.
+
+That is the `/usr/local/bin` trap described in the paragraph above, one level
+over: a deploy path where `git pull` deploys nothing. It caught this PR, which
+changes two units.
+
 ### Exit contract
 
 Only exit 1 notifies. Everything else is a failure **of the watchdog**, which
