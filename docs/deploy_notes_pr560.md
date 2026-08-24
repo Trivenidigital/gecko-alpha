@@ -66,3 +66,39 @@ theirs:
 
 A sweep's result is a function of subject × consumers. Blob-identity on the
 subject alone is not sufficient to transfer it.
+
+---
+
+## Two distinct floor failures, and they need different remedies
+
+A bare `assert len(X) >= N` failed twice on this PR, 80 lines apart in one
+file, and they are **not** the same defect:
+
+**Heterogeneity** — the floor is blind to losing a *subgroup*. `INVOKED` was
+12 cron + 4 systemd against a floor of 4, so dropping the entire cron glob
+left it satisfied by the systemd half alone. *Remedy: per-source assertion
+with an anchor in each class.*
+
+**Contamination** — the floor is satisfied by members that **do not belong to
+the population at all**. `UNITS` matched on `.sh` suffix with no repo-path
+check, pulling in three `/usr/local/bin/gecko-backup-*.sh` units — installed
+copies, governed by `install -m 0755` rather than by the checkout. Real
+population 4, inflated set 7, floor 4. **The guard could not have failed.**
+*Remedy: the derived set must be validated for MEMBERSHIP before any assertion
+counts it.*
+
+Both present as "the floor is too weak", which is why fixing the first did not
+surface the second. Worth noting the `INVOKED` derivation got membership right
+by accident — the interpreter-first-token exclusion was doing that work — not
+because anyone checked it.
+
+## What no clearance on this PR can establish
+
+Every review slot here reads the **repository**. The repository is not what
+runs. The `ExecStartPre` finding is the proof: an artefact present in the diff,
+green in CI, and absent from `/etc/systemd/system` is indistinguishable from a
+working one by any repository-level check.
+
+So: **exact-head CI green is necessary and not sufficient**, and a full set of
+five clearances does not substitute for verifying the installed unit files on
+the box after deploy.
