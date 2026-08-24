@@ -694,3 +694,66 @@ async def test_a_TRANSIENT_read_error_on_ONE_surface_is_reported(db, tmp_path, m
         "the unreadable surface is reported as merely un-armed -- wrong "
         "remedy:\n" + out
     )
+
+
+async def test_BOTH_alarms_firing_names_both_reasons_and_the_remedy(db, tmp_path):
+    """The second alarm, and the next step. Both were unpinned.
+
+    A reviewer swept the checker's alert body against all three consuming test
+    files and found 8 survivors -- every one of them in the text the watchdog
+    forwards VERBATIM to Telegram. These are the two they said they would
+    actually fix, and both are the "decision pinned, words not" shape already
+    closed once on the arm script:
+
+    `ALSO COLLAPSED on` is the SECOND alarm. When dark and collapsed both fire
+    the collapse branch is skipped by `and not dark`, so without this clause an
+    operator paged about one surface never learns a second one also collapsed.
+    Delete it and the page still goes out, correct in every other respect.
+
+    The `History may have been deleted` sentence is the REMEDY. Delete it and
+    the operator gets numbers and no next step -- diagnosis without action, on
+    an alarm whose premise is that a page nobody can act on stops being read.
+    """
+    # gainers: armed high then collapsed. losers: recovering nothing -> dark.
+    await _populate_surface(db, "gainers_comparisons", 100, 90)
+    await _mark_surface(db, "gainers_comparisons", 0.9, 100)
+    await _populate_surface(db, "gainers_comparisons", 400, 0, prefix="collapse-")
+    await _populate_surface(db, "losers_comparisons", 60, 0)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+    await db.close()
+
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(tmp_path / "scout.db"),
+         "--gate-minutes", "1440"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout
+    assert "recovering NOTHING on losers_comparisons" in r.stdout, r.stdout
+    assert "ALSO COLLAPSED on gainers_comparisons" in r.stdout, (
+        "both alarms fired and only one reason reached the page -- the "
+        "operator never learns the second surface collapsed:\n" + r.stdout
+    )
+
+
+async def test_a_COLLAPSE_page_carries_its_remedy(db, tmp_path):
+    """Collapse alone: the numbers AND what to do about them."""
+    await _populate_surface(db, "gainers_comparisons", 100, 90)
+    await _mark_surface(db, "gainers_comparisons", 0.9, 100)
+    await _populate_surface(db, "gainers_comparisons", 400, 0, prefix="collapse-")
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+    await db.close()
+
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(tmp_path / "scout.db"),
+         "--gate-minutes", "1440"],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 1, r.stdout
+    assert "overlay recovery COLLAPSED on gainers_comparisons" in r.stdout, r.stdout
+    assert "far below the recorded high-water rate" in r.stdout, r.stdout
+    assert "History may have been deleted" in r.stdout, (
+        "the collapse page carries numbers but no remedy:\n" + r.stdout
+    )
+    assert "check the /root snapshots" in r.stdout, r.stdout
