@@ -328,8 +328,33 @@ def _master_declaration_text() -> str | None:
     An earlier version of this comment claimed the cwd-relative behaviour was a
     live silent mode. It was not: the code never creates that cwd. Same class as
     the two other comments corrected on this PR -- accurate about a mechanism
-    that is never reached. Kept anyway because it costs nothing and is real
-    defence if `cwd` or `REPO_ROOT` ever moves.
+    that is never reached. Kept anyway because it costs nothing -- but NOT
+    because it is defence against `REPO_ROOT` moving in general, which was the
+    next version of this comment and was also wrong. `REPO_ROOT` can move two
+    ways and the flag has OPPOSITE SIGNS in them. Measured:
+
+        A. REPO_ROOT descends BELOW the git root (cwd = <root>/tests)
+             plain       -> rc=0 out=''                 <- vacuous skip
+             --full-tree -> rc=0 out='.reviewers.toml'  <- flag HELPS
+
+        B. the git root ascends ABOVE REPO_ROOT (checkout vendored or
+           submoduled at <outer>/inner/)
+             plain       -> rc=0 out='.reviewers.toml'
+             --full-tree -> rc=0 out=''                 <- flag HURTS
+
+    In B the pathspec resolves against the OUTER root, misses
+    `inner/.reviewers.toml`, and returns exit 0 with empty output -- precisely
+    the vacuous skip the flag was added to prevent. So the flag defends
+    `REPO_ROOT` moving DOWN WITHIN this checkout, and inverts if this checkout
+    is ever nested inside another repository. If that day comes the fix is to
+    make the top level explicit (`-C` / `--git-dir`), not to pick a pathspec
+    convention -- both conventions are wrong in one of the two directions.
+
+    Recorded because the sentence this replaces asserted protective behaviour
+    in a hypothetical nobody had exercised -- an unreached-mechanism claim
+    three lines below the paragraph correcting an unreached-mechanism claim.
+    An unreachable state cannot ground a pin, and it cannot ground a safety
+    claim either.
 
     A MISSING REF is separated from a missing FILE by resolving the ref first;
     an unresolvable ref raises. Both calls carry an explicit timeout, and
