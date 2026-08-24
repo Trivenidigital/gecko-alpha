@@ -676,3 +676,21 @@ async def test_a_TRANSIENT_read_error_on_ONE_surface_is_reported(db, tmp_path, m
     )
     # The OTHER surfaces must still have been compared, not abandoned.
     assert "trending_comparisons" in out, out
+    # BIND surface to condition in ONE string. Asserting the surfaces and the
+    # wordings separately leaves the PAIRING unpinned: a reviewer swapped which
+    # list goes under which wording and this test stayed green, because every
+    # substring was still present -- both remedies simply pointed at the wrong
+    # surface. "baseline unreadable" sends the operator hunting a filesystem
+    # fault; "no baseline recorded yet" sends them to run the arm script. Same
+    # words, opposite half-hour.
+    #
+    # The mixed case is the ONLY state where the binding can be wrong, and it
+    # is the state the `break` -> `continue` change exists to support -- so it
+    # is exactly the one that has to pin it.
+    assert "losers_comparisons: baseline unreadable" in out, (
+        "the unreadable surface is not bound to the unreadable wording:\n" + out
+    )
+    assert "losers_comparisons: no baseline recorded yet" not in out, (
+        "the unreadable surface is reported as merely un-armed -- wrong "
+        "remedy:\n" + out
+    )
