@@ -71,6 +71,84 @@ mechanical enforcement originally asked for:
 - **There is no author-external review record.** Until verdicts land somewhere
   the author cannot write, the record is self-attested by construction.
 
+## The defect CI found after five rounds and five clearances
+
+**The gate and its own conformance test were mutually exclusive.** The gate
+FAILS a branch with a watched delta unless clearances are recorded in
+`.reviewers.toml`; `test_the_shipped_declaration_records_no_stale_clearances`
+read the **working tree** and asserted that file carried none. Clearances
+absent → gate red. Clearances present → that test red. **No single commit could
+satisfy both**, so the gate was unusable on exactly the branches it exists to
+police.
+
+**Why it survived five rounds and four independent vectors:** every CI run to
+that point was red for *lack* of clearances — an explicable red that masked the
+fact that fixing it turns a *different* job red. Each failure mode hid the
+other. "Of course it's red, there are no clearances yet" is a complete,
+satisfying, and wrong explanation, and the configuration that would have exposed
+the contradiction was never once constructed. Nothing asserted that the two
+mechanisms were **jointly** satisfiable — only that each was individually
+correct. Ticket 22.
+
+### Then the fix reproduced the defect it was fixing
+
+The repair added a helper that split "missing ref" from "missing file"
+correctly — and ended `return got.stdout if got.returncode == 0 else None`,
+routing every nonzero `git show` into the `None` the caller reads as "master
+carries no declaration". A corrupt object read as a clean master and **passed
+silently**. That is the `_tree` conflation this PR exists to close, split
+correctly at the ref layer and rebuilt one layer down at the file layer, inside
+the fix for it. Absence is now determined **positively** via `git ls-tree`.
+
+### And that fix shipped unpinned
+
+All three properties it established reverted **silently green** under mutation:
+`ls-tree`-failure→None, `show`-failure→None, and `skip`→bare-`return`. The third
+is the premise ticket 21's deferral rests on, so a one-line revert would have
+invalidated a recorded decision with nothing to report it. Now pinned by three
+tests, each killing exactly one mutant, each carrying an anti-vacuity counter.
+
+**The generator was constant across all fourteen rounds:** a fix correct about
+the branch it was aimed at, widening a channel just past it. Mutation found
+these; reading did not.
+
+One property of the pinning worth carrying past this PR: **each mutant kills
+exactly one test, and the correct one.** "All three died" and "one catch-all
+died three times" are the same observation until you look — and the difference
+is whether a future editor is told *what* broke or merely *that* something did.
+This generalises past mutation runs to any suite where a single summary line
+stands in for N properties.
+
+## What four reviewers cost, and what it bought
+
+Every finding above was found by a reviewer, not by the author. More useful than
+the findings is that **the reviewers' own failure modes were uncorrelated** —
+three vectors examined one line and produced three different epistemics:
+
+| vector | what it did | outcome |
+|---|---|---|
+| ops-safety | rated reachability without exercising the path | wrong — under-rated a blocking fail-open |
+| silent-failure | exercised it, harness failed on Windows read-only objects, read that as evidence about the code | wrong — reported unreachable |
+| logic | constructed the failing case | **decisive — blocked** |
+
+And the concurrency vector discarded two of its own broken probes before
+reporting: the first reported `FAIL-OPEN` for an injection that never fired, the
+second tested three labels against a four-call sequence. Reporting either would
+have handed the author a false blocking finding or a false clean.
+
+**These are not equally recoverable — which is not the same as one being
+harmless.** An un-exercised rating was wrong and nearly let a blocking fail-open
+through; it was *recoverable* only in that anyone who ran the path would have
+found it. A broken harness is worse in kind: it produces **evidence-shaped
+output**, so "I tried to reproduce it and couldn't" reads as a stronger
+clearance than "I didn't try". It manufactures confidence *and argues against
+the next attempt.* That asymmetry — not reviewer diligence — is the argument for
+overlapping vectors, and it is why the concurrency vector discarding two of its
+own probes before reporting was worth more than any single verdict.
+
+The distinguishing question was identical in all four cases, and in the author's
+two: **did my probe actually exercise the path I am making a claim about?**
+
 ## Enumerations here were verified. Attributions were not.
 
 Stated because a reader will otherwise assume one standard throughout. Every

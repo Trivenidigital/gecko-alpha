@@ -309,12 +309,27 @@ def _master_declaration_text() -> str | None:
     established, a failing `git show` is also fatal -- the file is known to be
     there, so a read failure is a broken environment, never an absence.
 
-    `--full-tree` is not decoration: `ls-tree` resolves its pathspec relative to
-    the CURRENT DIRECTORY, so without it this returns exit 0 and EMPTY output
-    from any subdirectory -- a vacuous skip, the exact silent shape the rest of
-    this helper exists to prevent. Demonstrated: from `tests/`, the plain form
-    returns `[]` and the `--full-tree` form returns `.reviewers.toml`. It is
-    correct today only because `cwd=REPO_ROOT` is the top level.
+    `--full-tree` is DEFENCE IN DEPTH, and is deliberately NOT pinned by a test.
+    `ls-tree` resolves its pathspec relative to the current directory, so from a
+    subdirectory the plain form returns exit 0 with empty output -- which this
+    helper would read as "master carries no declaration", a vacuous skip. But
+    **that state is not reachable here**: the call pins `cwd=REPO_ROOT`, and
+    `REPO_ROOT` is `parents[1]` of this file, i.e. the top level. Where pytest
+    happens to be invoked from is irrelevant, because `cwd` is set explicitly.
+
+    So removing the flag changes no observable behaviour, and a mutation that
+    drops it SURVIVES the suite. That survival is the EVIDENCE OF
+    UNREACHABILITY, not a missing test -- a property with no reachable effect
+    cannot be pinned, and a test that monkeypatched `REPO_ROOT` to a
+    subdirectory would be asserting against a configuration the code cannot
+    enter. Said plainly here so the absence of a pin reads as a decision rather
+    than an oversight.
+
+    An earlier version of this comment claimed the cwd-relative behaviour was a
+    live silent mode. It was not: the code never creates that cwd. Same class as
+    the two other comments corrected on this PR -- accurate about a mechanism
+    that is never reached. Kept anyway because it costs nothing and is real
+    defence if `cwd` or `REPO_ROOT` ever moves.
 
     A MISSING REF is separated from a missing FILE by resolving the ref first;
     an unresolvable ref raises. Both calls carry an explicit timeout, and
