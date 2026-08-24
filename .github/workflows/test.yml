@@ -112,4 +112,4 @@ jobs:
           # absent origin/master yields a wrong or unresolvable merge-base.
           # This must fail the job, not be swallowed.
           git fetch --quiet origin "${{ github.base_ref }}"
-          python scripts/check_reviewer_clearances.py             "${{ github.event.pull_request.head.sha }}"             "origin/${{ github.base_ref }}"
+          python scripts/check_reviewer_clearances.py             "${{ github.event.pull_request.head.sha }}"             "origin/${{ github.base_ref }}"             --pr "${{ github.event.pull_request.number }}"

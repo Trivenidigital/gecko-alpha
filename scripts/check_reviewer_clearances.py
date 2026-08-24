@@ -16,7 +16,7 @@ things would be required, and neither exists in this repository today:
    unmergeable -- `mergeStateStatus` reads `UNSTABLE` (checks red, merge
    permitted) rather than `BLOCKED`. Verified against this repo: PR #560 was
    mergeable while this very check was failing.
-2. **A review record outside the author's reach.** `.reviewers.toml` is
+2. **A review record outside the author's reach.** `.reviewers/<pr>.toml` is
    author-writable, so repointing every clearance at the head is a four-line
    edit that turns this green -- and it makes step 3 vacuous, because the
    clearance tree is then compared against itself. GitHub review approvals
@@ -91,23 +91,100 @@ import sys
 import tomllib
 from pathlib import Path
 
-#: Script-relative, not CWD-relative: run from a subdirectory, a CWD-relative
-#: path reports "declaration missing" instead of a usage error. `REVIEWERS_DECL`
-#: overrides it so the test-suite can drive the real script against a purpose-
-#: built repository rather than against this one.
-DECL = Path(
-    os.environ.get("REVIEWERS_DECL")
-    or Path(__file__).resolve().parents[1] / ".reviewers.toml"
+#: Root of the per-PR clearance records. Script-relative, not CWD-relative:
+#: run from a subdirectory, a CWD-relative path reports "declaration missing"
+#: instead of a usage error. `REVIEWERS_DIR` overrides it so the test-suite can
+#: drive the real script against a purpose-built repository rather than this one.
+DECL_DIR = Path(
+    os.environ.get("REVIEWERS_DIR")
+    or Path(__file__).resolve().parents[1] / ".reviewers"
 )
+
+
+class PRIdentityUnresolved(Exception):
+    """The candidate PR could not be identified. DELIBERATELY NOT a failure to
+    find a declaration.
+
+    These are different facts and collapsing them is a fail-open: "there is no
+    clearance for PR 42" is a verdict, while "I do not know which PR this is"
+    is the absence of one. If the second ever resolves to the first, a run with
+    no identity would report a specific, checkable-sounding reason and a future
+    reader would go looking for a file rather than for the missing context.
+
+    This is the same shape as `GitTimeout`, and it is here for the same reason:
+    the previous design had ONE declaration for the whole repository, so there
+    was no identity to get wrong. Introducing per-PR records introduces a new
+    way to be wrong about WHICH record applies.
+    """
+
+
+def _resolve_pr(argv: list[str]) -> str:
+    """The candidate PR number, from TRUSTED sources only.
+
+    Precedence, and every branch of it is deliberate:
+
+    1. `--pr N` on the command line -- the explicit local path.
+    2. `REVIEWERS_PR` in the environment -- set by CI from
+       `github.event.pull_request.number`, which is event metadata the workflow
+       receives rather than anything derivable from the tree.
+    3. Nothing. RAISE.
+
+    **The HEAD branch name is never consulted, and that is a security boundary
+    rather than a style preference.** A branch name is author-controlled and
+    travels with the tree, so `feat/pr-42` would let any branch claim any PR's
+    clearances by renaming itself -- which would defeat per-PR isolation
+    entirely while looking like it worked. Ownership must come from outside the
+    thing being evaluated.
+
+    Fail-closed locally is the point of (3): a developer running this by hand
+    with no `--pr` gets "I could not determine which PR this is", not a guess.
+    """
+    for i, a in enumerate(argv):
+        if a == "--pr":
+            if i + 1 >= len(argv):
+                raise PRIdentityUnresolved("`--pr` given with no value")
+            return argv[i + 1]
+        if a.startswith("--pr="):
+            return a.split("=", 1)[1]
+    env = os.environ.get("REVIEWERS_PR", "").strip()
+    if env:
+        return env
+    raise PRIdentityUnresolved(
+        "no PR identity: pass `--pr <number>`, or set REVIEWERS_PR from "
+        "trusted CI event metadata. The branch name is deliberately NOT "
+        "consulted -- it is author-controlled and would let any branch claim "
+        "any PR's clearances"
+    )
+
+
+_PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
+
+
+def _decl_path(pr: str) -> Path:
+    """`.reviewers/<pr>.toml`, with the PR number validated as a bare number.
+
+    Validated rather than trusted: the value reaches a filesystem path, so
+    `../../etc/passwd` or `42/../41` must not resolve to another PR's record or
+    to anything outside `DECL_DIR`. A malformed number is an identity failure,
+    not a missing declaration.
+    """
+    if not _PR_RE.match(pr):
+        raise PRIdentityUnresolved(
+            f"PR identity {pr!r} is not a bare positive number -- refusing to "
+            "resolve it to a path"
+        )
+    return DECL_DIR / f"{pr}.toml"
 
 #: Ruling D's four vectors, pinned in EXECUTABLE code rather than only in a
 #: test, because a declaration that can narrow `required` to one vector can
 #: equally narrow the test that checks it.
 MANDATORY_VECTORS = frozenset({"concurrency", "silent-failure", "ops-safety", "logic"})
 
-#: Paths whose movement must be covered by a clearance. `.reviewers.toml` can
-#: never appear here -- a file cannot police edits to itself -- and that is the
-#: clearest tell that a committed file is the wrong home for this record.
+#: Paths whose movement must be covered by a clearance. `.reviewers/` can
+#: never appear here -- a record cannot police edits to itself. Note this is a
+#: DIFFERENT reason from the one the old root declaration had: that file was
+#: excluded because a single shared table could not police its own rewriting;
+#: a per-PR record is excluded because it is the evidence being evaluated.
 #: `dashboard` is here because that is where the /health WAL-sidecar silent
 #: failure lived, and `.github` because a PR deleting this step from the
 #: workflow must not be able to lapse nothing.
@@ -243,13 +320,42 @@ def main(argv: list[str]) -> int:
     head = argv[1] if len(argv) > 1 else "HEAD"
     base = argv[2] if len(argv) > 2 else "origin/master"
 
+    pr = _resolve_pr(argv)
+    DECL = _decl_path(pr)
+
     if not DECL.exists():
-        print(f"FAIL: declaration is missing: {DECL}")
+        print(f"FAIL: no clearance recorded for PR {pr}: {DECL} does not exist")
+        print(
+            "  This is NOT a skip. A missing or renamed declaration for the "
+            "PR under evaluation is RED, because the alternative -- treating "
+            "absence as 'nothing to check' -- lets deleting the file turn the "
+            "gate green while disabling it."
+        )
         return 1
     try:
         decl = tomllib.loads(DECL.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
+        return 1
+
+    # The record must name its OWN PR, and it must match the identity resolved
+    # from trusted metadata. Filename alone is not ownership: a file copied
+    # from another PR keeps its contents, and a rename is a one-line edit. This
+    # is what makes "PR A's clearance can never satisfy PR B" a property of the
+    # DATA rather than of a naming convention.
+    declared = decl.get("pr")
+    if declared is None:
+        print(f"FAIL: {DECL} does not declare `pr`; ownership is unverifiable")
+        return 1
+    if str(declared) != str(pr):
+        print(
+            f"FAIL: clearance belongs to ANOTHER PR -- {DECL} declares "
+            f"pr = {declared!r}, evaluating PR {pr}"
+        )
+        print(
+            "  A record copied or renamed from another PR does not transfer. "
+            "Record clearances obtained for THIS PR."
+        )
         return 1
 
     # Coerce defensively. `clearances = "oops"` instead of a `[clearances]`
@@ -297,6 +403,7 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: cannot resolve {head} against {base}: {exc}")
         return 2
 
+    print(f"pr:    {pr}")
     print(f"decl:  {DECL}")
     print(f"base:  {merge_base[:8]} (merge-base with {base})")
     print(f"head:  {head_sha[:8]}")
@@ -325,13 +432,13 @@ def main(argv: list[str]) -> int:
         )
         if declared_only:
             print(
-                f"  {', '.join(declared_only)}: declared in .reviewers.toml only. "
+                f"  {', '.join(declared_only)}: declared in this PR's record only. "
                 "Almost certainly a typo -- fix the name there."
             )
         if pinned:
             print(
                 f"  {', '.join(pinned)}: pinned in MANDATORY_WATCH, so editing "
-                ".reviewers.toml CANNOT clear this. If the path was legitimately "
+                "the record CANNOT clear this. If the path was legitimately "
                 "retired, remove it from MANDATORY_WATCH in "
                 "scripts/check_reviewer_clearances.py -- a code change, which is "
                 "itself reviewed. Until then every PR fails here."
@@ -457,6 +564,17 @@ def _cli(argv: list[str]) -> int:
         print(
             "  git did not answer, so the comparison could not be made. This "
             "is NOT 'no delta' -- nothing was determined."
+        )
+        return 2
+    except PRIdentityUnresolved as exc:
+        print(f"FAIL: {exc}")
+        print(
+            "  Exit 2, NOT 1, and the distinction is the point: 1 means "
+            "'this PR's clearances do not hold', which is a verdict about a "
+            "known subject. Nothing was determined here -- there is no known "
+            "subject. Collapsing the two would report a specific, "
+            "checkable-sounding reason for a run that never identified what "
+            "it was checking."
         )
         return 2
 
