@@ -175,18 +175,51 @@ async def _arm() -> int:
             )
             return 1
 
-        unarmed = unarmed_surfaces(cov.get("per_surface", {}))
+        per_surface = cov.get("per_surface", {})
+        unarmed = unarmed_surfaces(per_surface)
         if unarmed:
             print("\nNOT fully armed:")
             for table in sorted(unarmed):
-                v = cov["per_surface"][table]
-                reason = v.get("comparison_skipped") or "rate could not be judged"
+                v = per_surface[table]
+                # "rate could not be judged" was the below-floor wording, and
+                # below-floor no longer reaches this path -- so it mislabelled
+                # the only case that does.
+                reason = v.get("comparison_skipped") or (
+                    "judged, but the mark write was lost (busy timeout)"
+                )
                 print(f"  {table}: {reason}")
             print(
                 "\nRe-run after the cause clears. A surface left here has no "
                 "usable mark, so collapse detection cannot fire for it."
             )
             return 1
+
+        # Below-floor surfaces are correctly EXCLUDED from `unarmed`: they are
+        # the documented steady state, not a fault, and flagging them would be a
+        # permanent exit 1 with no possible remedy. But excluding them SILENTLY
+        # makes "every surface is below the floor" print the same "armed" as
+        # "every surface is marked" -- nothing is wrong, no remedy exists, and
+        # the operator cannot tell the two apart. Same observable, different
+        # state, and production's trending surface is documented as draining
+        # toward that floor, so it is reachable rather than theoretical.
+        # Name them; neither hide them nor fail on them.
+        below_floor = sorted(
+            t for t, v in per_surface.items() if not v.get("rate_judged")
+        )
+        if below_floor:
+            print(
+                "\nbelow the judging floor, not armed and not expected to be: "
+                + ", ".join(below_floor)
+                + "\n  (too few credit-bearing rows to judge a rate; collapse "
+                "detection does not apply until the population grows)"
+            )
+        if below_floor and len(below_floor) == len(per_surface):
+            print(
+                "\nNO surface is judgeable yet -- nothing was armed, and "
+                "nothing can be until populations grow. Not an error, but not "
+                "'armed' either."
+            )
+            return 0
 
         print(f"\narmed at gate_minutes={gate} (from Settings, not hardcoded)")
         return 0

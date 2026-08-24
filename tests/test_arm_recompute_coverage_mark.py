@@ -331,3 +331,80 @@ async def test_arm_EXITS_1_when_a_surface_is_left_unarmed(tmp_path, monkeypatch)
         "_arm reported success while a surface was left unarmed -- the call "
         "site is not consulting unarmed_surfaces()"
     )
+
+
+async def test_arm_DISTINGUISHES_all_below_floor_from_armed(tmp_path, monkeypatch):
+    """"Nothing can be armed" must not print the same thing as "all armed".
+
+    Dropping `not rate_judged` from the predicate was correct per-surface --
+    below the floor is the documented steady state and flagging it would be a
+    permanent exit 1 with no possible remedy. But a reviewer pointed out the
+    consequence when EVERY surface is below the floor: `unarmed_surfaces()`
+    returns `[]`, so the script printed "armed" and exited 0 against a system
+    with no marks at all and none possible. Not the same defect as S1 -- nothing
+    is wrong and no remedy exists -- but the same OBSERVABLE, which is what the
+    operator has to act on.
+
+    Reachable rather than theoretical: production's trending surface is
+    documented as draining toward that floor.
+    """
+    from scout.db import Database
+    from scout.identity_recompute import RECOMPUTE_SEMANTICS
+
+    anchor = "2026-08-01T00:00:00+00:00"
+    db_path = tmp_path / "belowfloor.db"
+    db = Database(db_path)
+    await db.initialize()
+    # 5 rows per surface -- under _COLLAPSE_MIN_POPULATION on every one.
+    for table, col in (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        for i in range(5):
+            cur = await db._conn.execute(
+                f"""INSERT INTO {table}
+                   (coin_id, symbol, name, {col}, detected_by_chains,
+                    chains_lead_minutes, is_gap, created_at,
+                    chains_identity_semantics)
+                   VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+                (f"{table}-{i}", anchor, anchor),
+            )
+            # Some recovery on every surface, so this exercises BELOW-FLOOR and
+            # not `not_recovering`. Without it the dark guard fires first and
+            # the test passes/fails for the wrong reason.
+            if i < 3:
+                await db._conn.execute(
+                    """INSERT INTO chain_identity_recompute_v1
+                       (source_table, source_row_id, coin_id, symbol,
+                        historical_anchor, legacy_detected, legacy_lead,
+                        canonical_detected, canonical_lead, identity_tier,
+                        evidence_status, semantics_version, computed_at)
+                       VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
+                               'canonical_id', 'verified_canonical', ?, ?)""",
+                    (table, cur.lastrowid, f"{table}-{i}", anchor,
+                     RECOMPUTE_SEMANTICS, anchor),
+                )
+    await db._conn.commit()
+    await db.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    mod = _load()
+    with redirect_stdout(buf):
+        rc = await mod._arm()
+    out = buf.getvalue()
+
+    assert rc == 0, "below-floor is not a fault; it must not fail"
+    assert "below the judging floor" in out, out
+    assert "NO surface is judgeable yet" in out, out
+    assert "armed at gate_minutes" not in out, (
+        "printed plain 'armed' while no surface has a mark or can have one:\n" + out
+    )
