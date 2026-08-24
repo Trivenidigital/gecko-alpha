@@ -67,6 +67,26 @@ theirs:
 A sweep's result is a function of subject × consumers. Blob-identity on the
 subject alone is not sufficient to transfer it.
 
+**Refined, because the rule as written fires on every comment edit** — and a
+rule that fires on the common harmless case is the ritual failure mode: it gets
+skipped on the day it matters. The trigger is not *"the consumer moved"* but
+*"the consumer's **executable behaviour** moved"*, and the decision procedure is
+cheap:
+
+```python
+ast.dump(strip_docstrings(ast.parse(before))) == ast.dump(strip_docstrings(ast.parse(after)))
+```
+
+Subject blob-identical **×** consumer AST-identical ⟹ the sweep transfers with
+certainty. Demonstrated on this PR's final naming pass: a consumer moved
+`+13/−2` and a reviewer proved by AST equality that no executable delta existed,
+so the transfer was sound without a re-sweep.
+
+**And its limit, which is the asymmetry that matters:** AST equality *licenses*
+skipping a re-run. Blob-identity on the subject alone **never** does. The fifth
+enumeration drift on this PR was exactly that case — subject-identity claimed
+while consumers had moved — and it genuinely needed the sweep.
+
 ---
 
 ## Two distinct floor failures, and they need different remedies
