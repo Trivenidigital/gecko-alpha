@@ -1,42 +1,51 @@
-# Independent-review clearances (ruling D).
+# Reviewer clearances for PR #560 (ruling D).
 #
-# Checked by scripts/check_reviewer_clearances.py. READ THAT FILE'S DOCSTRING
-# BEFORE TRUSTING THIS ONE: it is a lapse DETECTOR, not an enforcement gate.
-# This file is author-writable and master has no branch protection, so a
-# motivated author bypasses it in four lines. It catches the accidental case --
-# a clearance recorded, production then moved, nobody noticed -- which is the
-# case with a track record here.
+# A clearance is a property of a REVISION, not of a branch. Each SHA below is
+# the revision at which that vector's reviewer named its verdict. The gate
+# (`scripts/check_reviewer_clearances.py`) recomputes, for every entry, that the
+# SHA is an ancestor of HEAD and that no path in `watch` has a different tree
+# hash between that SHA and HEAD. A textual delta in a watched path LAPSES the
+# clearance even when nothing executable moved -- see backlog ticket 20, and do
+# NOT "fix" that by teaching this gate to parse files.
 #
-# A clearance is a property of a REVISION. Record the full 40-hex SHA the
-# vector was actually measured on: not the branch head at the time, and not a
-# later SHA that happens to contain it. Branches and tags are rejected.
+# This file is deliberately NOT in `watch`. A file cannot police itself, and
+# recording a clearance must not invalidate the clearance being recorded.
 #
-# Clearances are only demanded when a PR actually moves a watched path. A
-# docs-only PR needs no entry here.
+# KNOWN LIMIT, stated here because it is the thing a reader will over-trust:
+# this file is author-writable, so repointing every entry at HEAD is a
+# four-line edit that turns the check green AND makes the tree comparison
+# vacuous. The gate is a lapse DETECTOR, not an enforcement mechanism. Real
+# enforcement needs branch protection with required checks (currently OFF --
+# `gh api .../branches/master/protection` returns 404, rulesets empty) and a
+# review record outside the author's reach (this project has never had one:
+# zero GitHub approvals on any recent PR). Both are operator actions and
+# neither is code. See backlog ticket 13 (d) and (e).
 
-required = ["concurrency", "silent-failure", "ops-safety", "logic"]
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
 
-# Tree hashes of these are compared between each clearance SHA and the head.
-# Names are not enough: a name-level diff misses a file restored to the wrong
-# baseline. A watch entry that resolves at NEITHER revision is a hard failure,
-# not a quiet pass.
-# cron/ops/systemd are the DEPLOY SUBSTRATE. They were added once "no delta in
-# watched paths" became a pass: before that an omission merely failed to lapse a
-# clearance, after it an omission is a silent full exemption. A 2-minute cron
-# entry once migrated the live DB into 74 `database is locked` errors, and
-# systemd units run scripts from /usr/local/bin copies so `git pull` deploys
-# nothing -- a unit edit is exactly the delta a reviewer must see.
-#
-# Root FILES are watched too. An earlier draft claimed they could not be --
-# "a path prefix cannot reach a root file" -- and shipped that as a known gap.
-# It was wrong: `git rev-parse <rev>:pyproject.toml` returns a blob hash, and
-# comparing blobs is the same operation as comparing trees. uv.lock and
-# pyproject.toml reach production via `uv sync` on the next restart.
-watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
-         "systemd", "pyproject.toml", "uv.lock", "Dockerfile",
-         "docker-compose.yml", "start.sh"]
+watch = [
+    "scout",
+    "scripts",
+    "tests",
+    ".github",
+    "dashboard",
+    "cron",
+    "ops",
+    "systemd",
+    "pyproject.toml",
+    "uv.lock",
+    "Dockerfile",
+    "docker-compose.yml",
+    "start.sh",
+]
 
 [clearances]
-# Deliberately EMPTY on master. Clearances are per-PR and are recorded on the
-# PR branch by the session that obtained them. Carrying a previous PR's SHAs
-# here would inherit a misleading verdict onto every new branch.
+# Mandatory vectors (ruling D's four -- not a per-PR choice).
+concurrency = "e1c7b8ca618791d56e57e1941d068f5d01e1a786"
+logic = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
+ops-safety = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
+silent-failure = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
+
+# Non-mandatory, recorded because it carries information: this vector refused
+# three times on surviving mutants before clearing, so its green discriminates.
+test-efficacy = "68cd3f0e618d5acd2de5f6e0402a7fea3ccefc42"
