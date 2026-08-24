@@ -65,18 +65,52 @@ def test_a_SKIPPED_comparison_counts_as_unarmed():
         "gainers_comparisons": {
             "rate_judged": True,
             "mark_written": False,
+            "best_rate": 0.8,
             "comparison_skipped": "incomparable_mark_not_cleared",
         },
-        "losers_comparisons": {"rate_judged": True, "mark_written": True},
-        "trending_comparisons": {"rate_judged": True, "mark_written": True},
+        "losers_comparisons": {"rate_judged": True, "mark_written": True, "best_rate": 0.5},
+        "trending_comparisons": {"rate_judged": True, "mark_written": True, "best_rate": 0.7},
     }
     assert _unarmed(per_surface) == ["gainers_comparisons"]
 
 
-def test_an_UNJUDGED_rate_still_counts_as_unarmed():
+def test_a_BELOW_FLOOR_surface_is_NOT_reported_unarmed():
+    """INVERTED from what this test used to assert, because it was wrong.
+
+    A surface under `_COLLAPSE_MIN_POPULATION` reports `rate_judged=False` and
+    `best_rate=None`. That is the DOCUMENTED steady state -- production's
+    trending surface drains through it -- not a fault. The old predicate keyed
+    on `not rate_judged`, so it flagged this permanently, giving exit 1 with a
+    remedy that can never work.
+
+    That is the cry-wolf property `unarmed_surfaces`' own docstring rejects
+    `mark_written` for, adopted one clause over. An alarm that fires on the
+    normal path gets ignored, which is the failure mode this whole component
+    is about.
+    """
     per_surface = {
         "gainers_comparisons": {"rate_judged": False, "best_rate": None},
-        "losers_comparisons": {"rate_judged": True, "mark_written": True},
+        "losers_comparisons": {"rate_judged": True, "best_rate": 0.5, "mark_written": True},
+    }
+    assert _unarmed(per_surface) == []
+
+
+def test_a_STARVED_rearm_write_counts_as_unarmed():
+    """The arm the old predicate could not see at all.
+
+    `rearm` whose `_record_coverage_baseline` gave up after the busy timeout:
+    `rate_judged` stays True (set before classification), `best_rate` is None,
+    `mark_written` False, and NO `comparison_skipped` is set. The script
+    printed "armed", exited 0, and left zero marks -- on the first arm after a
+    deploy, when every surface takes `rearm`.
+    """
+    per_surface = {
+        "gainers_comparisons": {
+            "rate_judged": True,
+            "mark_written": False,
+            "best_rate": None,
+        },
+        "losers_comparisons": {"rate_judged": True, "best_rate": 0.5, "mark_written": True},
     }
     assert _unarmed(per_surface) == ["gainers_comparisons"]
 
@@ -97,16 +131,16 @@ def test_the_healthy_COMPARE_arm_is_NOT_reported_unarmed():
             "comparison_skipped": None,
             "best_rate": 0.49,
         },
-        "losers_comparisons": {"rate_judged": True, "mark_written": False},
+        "losers_comparisons": {"rate_judged": True, "mark_written": False, "best_rate": 0.6},
     }
     assert _unarmed(per_surface) == []
 
 
 def test_a_fully_armed_probe_reports_nothing_unarmed():
     per_surface = {
-        "gainers_comparisons": {"rate_judged": True, "mark_written": True},
-        "losers_comparisons": {"rate_judged": True, "mark_written": True},
-        "trending_comparisons": {"rate_judged": True, "mark_written": True},
+        "gainers_comparisons": {"rate_judged": True, "mark_written": True, "best_rate": 0.49},
+        "losers_comparisons": {"rate_judged": True, "mark_written": True, "best_rate": 0.55},
+        "trending_comparisons": {"rate_judged": True, "mark_written": True, "best_rate": 0.71},
     }
     assert _unarmed(per_surface) == []
 

@@ -235,7 +235,7 @@ SURFACE_COLS = {
 }
 
 
-async def _populate_surface(db, table, population, recovered):
+async def _populate_surface(db, table, population, recovered, prefix=""):
     """Same shape as `_populate`, but for any surface.
 
     `_populate` and `_mark` hardcode `gainers_comparisons`, and so does
@@ -260,7 +260,7 @@ async def _populate_surface(db, table, population, recovered):
                (coin_id, symbol, name, {anchor_col}, detected_by_chains,
                 chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
                VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
-            (f"{table}-{i}", ANCHOR, ANCHOR),
+            (f"{table}-{prefix}{i}", ANCHOR, ANCHOR),
         )
         if i < recovered:
             await db._conn.execute(
@@ -270,7 +270,7 @@ async def _populate_surface(db, table, population, recovered):
                     identity_tier, evidence_status, semantics_version, computed_at)
                    VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
                            'canonical_id', 'verified_canonical', ?, ?)""",
-                (table, cur.lastrowid, f"{table}-{i}", ANCHOR, RECOMPUTE_SEMANTICS, ANCHOR),
+                (table, cur.lastrowid, f"{table}-{prefix}{i}", ANCHOR, RECOMPUTE_SEMANTICS, ANCHOR),
             )
     await db._conn.commit()
 
@@ -294,7 +294,13 @@ async def test_the_CHECKER_pages_a_collapse_on_every_surface(db, tmp_path, table
     await _populate_surface(db, table, 100, 90)
     await _mark_surface(db, table, 0.9, 100)
     # Collapse: many more credit-bearing rows, none of them recovered.
-    await _populate_surface(db, table, 400, 0)
+    # PREFIXED, because the overlay correlates on coin_id: without it the
+    # second batch reused ids 0-99 and 90 of them still matched the FIRST
+    # batch's overlay rows, so the rate landed at 180/500 = 0.36 rather than
+    # the intended 90/500 = 0.18. It still collapsed, but at a third of the
+    # intended margin below the 0.45 threshold -- a later threshold tweak would
+    # have silently stopped exercising a collapse at all.
+    await _populate_surface(db, table, 400, 0, prefix="collapse-")
     await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     await db.close()
 
@@ -318,4 +324,98 @@ async def test_the_CHECKER_stays_quiet_on_a_healthy_surface(db, tmp_path, table)
 
     assert not _checker_pages(tmp_path / "scout.db"), (
         f"the checker paged on {table} while recovery was healthy"
+    )
+
+
+async def test_the_NOT_ARMED_notice_names_each_unarmed_surface(db, tmp_path):
+    """One armed surface must not suppress the notice for the others.
+
+    `have_baseline` was a global OR: any surface with a row silenced the notice
+    for all of them. A reviewer reproduced the consequence -- alert text
+    printing `mark=none` twice with no notice, then a real collapse on an
+    unarmed surface exiting 0 in silence. That is the shape this file's own
+    comment says it already fixed twice, repeated one layer over in the notice.
+    """
+    for table in sorted(SURFACE_COLS):
+        await _populate_surface(db, table, 60, 30)
+    await _mark_surface(db, "gainers_comparisons", 0.5, 60)  # ONLY gainers armed
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(tmp_path / "scout.db"),
+         "--gate-minutes", "1440"],
+        capture_output=True, text=True,
+    )
+    assert "NOT ARMED" in r.stdout, (
+        "one armed surface suppressed the notice for two unarmed ones:\n" + r.stdout
+    )
+    assert "losers_comparisons" in r.stdout and "trending_comparisons" in r.stdout
+    assert "NOT ARMED on gainers_comparisons" not in r.stdout, (
+        "gainers IS armed and must not be named as unarmed"
+    )
+
+
+async def test_a_BELOW_FLOOR_surface_is_not_called_unarmed(db, tmp_path):
+    """The other direction: the notice must not cry wolf on the steady state.
+
+    A surface under COLLAPSE_MIN_POPULATION is not judged on rate by design --
+    production's trending surface drains through it. Naming it unarmed would
+    make the notice permanent, and a permanent notice is an ignored one.
+    """
+    await _populate_surface(db, "gainers_comparisons", 60, 30)
+    await _mark_surface(db, "gainers_comparisons", 0.5, 60)
+    await _populate_surface(db, "trending_comparisons", 5, 2)  # below the floor
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(tmp_path / "scout.db"),
+         "--gate-minutes", "1440"],
+        capture_output=True, text=True,
+    )
+    assert "trending_comparisons" not in r.stdout.split("NOT ARMED")[-1] or "NOT ARMED" not in r.stdout, (
+        "a below-floor surface was named unarmed; the notice would never clear:\n" + r.stdout
+    )
+
+
+@pytest.mark.parametrize("table", sorted(SURFACE_COLS))
+async def test_the_CHECKER_comparability_guard_holds_on_every_surface(db, tmp_path, table):
+    """The guard TWO LINES ABOVE the collapse condition, on the same axis.
+
+    The previous round parametrised the checker's collapse condition over
+    surfaces. The comparability guard immediately above it was left
+    surface-blind, and a reviewer showed a mutant appending
+    `and table == "gainers_comparisons"` to it survives all 176 tests.
+
+    Its consequence is a probe/checker DISAGREEMENT -- the exact failure class
+    this file exists to prevent. Measured under that mutant: gainers exit 0,
+    losers and trending exit 1 while the probe reports `collapsed_surfaces: []`
+    for all three. A false page on two surfaces, from the layer that pages.
+
+    It hid because both new checker tests arm at population=100, where the
+    guard never fires either way, and the one guard test in the tree is
+    gainers-only. Same file, same loop, same axis, two lines apart -- the
+    fourth instance on this PR of a fix closing one BRANCH and not the AXIS.
+
+    State: a mark of 0.90 recorded at population 25, today's population 60 at
+    rate 0.30. `recorded_pop < FLOOR*2 and pop > recorded_pop*2` holds, so the
+    mark is not comparable and the checker must stay quiet.
+    """
+    await _populate_surface(db, table, 60, 18)  # 0.30 today
+    # The mark is written LAST and the probe is NOT run. An earlier version of
+    # this test ran the probe first -- which is a WRITER: it saw the
+    # incomparable mark, cleared it, and re-armed at 0.30@60. The checker then
+    # read a comparable mark, the guard was never reached, and the mutant
+    # SURVIVED a test written to kill it. The fixture destroyed the state it
+    # existed to create.
+    await _mark_surface(db, table, 0.9, 25)  # 0.90 recorded against 25 rows
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    assert not _checker_pages(tmp_path / "scout.db"), (
+        f"the CHECKER paged on {table} against a mark recorded at population "
+        "25 while the probe did not -- the comparability guard is "
+        "surface-conditional on the paging layer, so probe and checker "
+        "disagree about the same surface"
     )

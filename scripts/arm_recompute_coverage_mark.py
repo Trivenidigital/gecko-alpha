@@ -89,7 +89,28 @@ def unarmed_surfaces(per_surface: dict) -> list[str]:
     return [
         table
         for table, v in per_surface.items()
-        if not v.get("rate_judged") or v.get("comparison_skipped")
+        # "Was judged, and yet has no mark" -- a CONJUNCTION, and both halves
+        # are load-bearing:
+        #
+        #   rate_judged=True + best_rate=None  -> `rearm` whose write STARVED.
+        #       The probe asked for a mark, `_record_coverage_baseline` gave up
+        #       after `_BASELINE_WRITE_TIMEOUT_MS`, swallowed the error and
+        #       returned None. No `comparison_skipped` is set, so the previous
+        #       predicate could not see it AT ALL: the script printed "armed",
+        #       exited 0, and left zero marks on every surface. Worst possible
+        #       timing -- this script exists for the first arm after a deploy,
+        #       when no mark exists so EVERY surface takes `rearm`, against a
+        #       live database the pipeline is writing.
+        #
+        #   rate_judged=False                  -> below `_COLLAPSE_MIN_POPULATION`.
+        #       Also `best_rate=None`, but this is the DOCUMENTED steady state,
+        #       not a fault -- production's trending surface drains through it.
+        #       Keying on `best_rate is None` alone (or on `not rate_judged`)
+        #       makes this a permanent exit 1 with a remedy that can never work,
+        #       which is the cry-wolf property this function's own docstring
+        #       rejects `mark_written` for. Excluded by the conjunction.
+        if (v.get("rate_judged") and v.get("best_rate") is None)
+        or v.get("comparison_skipped")
     ]
 
 
@@ -137,6 +158,22 @@ async def _arm() -> int:
         gate = float(settings.CONVICTION_EARLY_LEAD_MINUTES)
         cov = await db.chain_identity_recompute_coverage_probe(gate_minutes=gate)
         print(json.dumps(cov, indent=2, default=str))
+
+        # The payload-level verdict, which this script PRINTED and then ignored.
+        # Arming while nothing is recovering records a mark of 0.0 on every
+        # surface -- the frozen-at-zero mark that makes
+        # `rate < best * _COLLAPSE_FRACTION` unsatisfiable for every rate, which
+        # the runbook names as the hazard three paragraphs above the command
+        # that does it. Not invisible (dark fires, and the mark ratchets up on a
+        # later pass) but the operator must not be told "armed".
+        if cov.get("not_recovering"):
+            print(
+                "\nNOT ARMED -- recovery is zero on: "
+                + ", ".join(sorted(cov.get("dark_surfaces") or []))
+                + "\nA mark of 0.0 makes collapse detection unsatisfiable for "
+                "every rate. Run the backfill first, then arm."
+            )
+            return 1
 
         unarmed = unarmed_surfaces(cov.get("per_surface", {}))
         if unarmed:

@@ -213,12 +213,38 @@ cd /root/gecko-alpha
 .venv/bin/python scripts/arm_recompute_coverage_mark.py
 ```
 
-Then confirm from the read-only side — this is what the watchdog actually runs,
-stdlib-only and `mode=ro`:
+Then confirm from the read-only side. **Run the watchdog itself**, not the
+checker bare:
 
 ```bash
-.venv/bin/python scripts/check_recompute_coverage.py
+systemctl start recompute-coverage-watchdog.service
+journalctl -u recompute-coverage-watchdog.service -n 5 --no-pager
 ```
+
+An earlier version of this step said *"this is what the watchdog actually
+runs"* and gave `check_recompute_coverage.py` with no arguments. That was
+false, and false in the direction that reassures: without `--gate-minutes` the
+checker takes its own `DEFAULT_GATE_MINUTES = 1440.0`, while the watchdog
+passes the gate read from `Settings`. With `CONVICTION_EARLY_LEAD_MINUTES`
+overridden in `.env`, the two disagree completely — a reviewer measured the
+bare command printing `recovered 180 of 180` and **exit 0** on a database where
+the watchdog printed `recovering NOTHING ... THE BACKFILL CANNOT HELP` and
+**exit 1**.
+
+So the verify step hardcoded the gate by omission, two paragraphs after this
+runbook forbids hardcoding it. If you must run the checker directly, pass the
+gate explicitly:
+
+```bash
+GATE=$(.venv/bin/python -c "from scout.config import Settings; print(Settings().CONVICTION_EARLY_LEAD_MINUTES)")
+.venv/bin/python scripts/check_recompute_coverage.py --gate-minutes "$GATE"
+```
+
+**What to read in the output.** `[collapse detection NOT ARMED on <surfaces>]`
+names every surface that is large enough to be judged and has no mark. Its
+absence is the criterion for "armed" — but only since it became per-surface;
+it used to be a global OR, so one armed surface silenced the notice for the
+other two.
 
 `collapsed` becomes reachable only once that baseline row exists. That ordering
 is correct and worth confirming rather than assuming.
