@@ -116,9 +116,20 @@ sqlite3 scout.db "SELECT 1 FROM paper_migrations WHERE name='chain_identity_reco
 `schema_version` is therefore **not** a reliable indicator that the v2 shape is
 present. Tracked as BL-NEW-RECOMPUTE-PROBE-OBSERVABILITY-RESIDUALS.
 
+**The fresh-install path is also SILENT.** It returns before the completion
+log, so it emits neither a `schema_version` row nor a
+`pk_v2_migration_complete` journald line. An operator verifying a fresh deploy
+by grepping journald finds nothing and concludes the migration did not run --
+the identical false failure the missing stamp produces, one layer down. Verify
+the shape; the log line is a second stamp with the same failure mode.
+
 On a database that *does* rebuild, the first production run is also the first
 concurrent-startup exercise of the archive CTAS. Verified under injected
-failure is not the same as having run once in production. Watch that the
+failure is not the same as having run once in production -- and as of
+`cdbb8475` (2026-08-23) that is live status, not generic caution: **the rebuild
+branch has never executed in production.** Prod took the fresh-install path,
+confirmed on the box by the absence of `pk_v2_migration_complete` from journald
+entirely. Whoever triggers the rebuild will be the first to run it for real. Watch that the
 migration completes before any other process's `initialize()` reaches it, and
 that no `chain_identity_recompute_v1_pk2` orphan survives — `BEGIN EXCLUSIVE`
 makes the scratch `CREATE` part of the transaction so a rollback removes it,

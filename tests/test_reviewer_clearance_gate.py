@@ -202,8 +202,18 @@ def test_the_watch_list_cannot_be_NARROWED(repo):
     assert "watch list narrowed" in out
 
 
-def test_a_BRANCH_NAME_is_rejected_where_a_sha_belongs(repo):
-    """A moving ref silently re-points as it moves; it records nothing."""
+def test_a_BRANCH_NAME_is_rejected_by_the_SHAPE_CHECK(repo):
+    """A moving ref silently re-points as it moves; it records nothing.
+
+    Names the gate. There were briefly TWO gates rejecting this -- an early
+    shape pass and a per-vector branch -- raising the same exit code and
+    differing only in message. When the shape pass was added it made the loop
+    branch unreachable, and this assertion had been loosened to
+    `in out.lower()`, which let it keep passing against the new gate while its
+    name still described the old one. A reviewer proved the branch was dead by
+    replacing it with a sentinel and watching all 20 tests pass. The dead
+    branch is gone; this test now pins WHICH gate raises.
+    """
     _decl(repo, {v: "master" for v in MANDATORY_VECTORS})
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "decl")
@@ -211,9 +221,12 @@ def test_a_BRANCH_NAME_is_rejected_where_a_sha_belongs(repo):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert "not a full 40-hex sha" in out.lower()
+    assert "recorded clearances are malformed" in out, (
+        "expected the early shape check to raise, not the per-vector loop"
+    )
 
 
-def test_an_UNKNOWN_sha_names_the_right_reason(repo):
+def test_an_UNKNOWN_sha_is_rejected_by_the_SHAPE_CHECK(repo):
     """A bare `git rev-parse` echoes any 40-hex string back unverified.
 
     Before `--verify ...^{commit}` this fell through to the ancestry check and
@@ -227,6 +240,9 @@ def test_an_UNKNOWN_sha_names_the_right_reason(repo):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert "is not a commit" in out.lower()
+    assert "recorded clearances are malformed" in out, (
+        "expected the early shape check to raise, not the per-vector loop"
+    )
 
 
 def test_a_NON_ANCESTOR_clearance_FAILS(repo):

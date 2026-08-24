@@ -78,30 +78,59 @@ async def _arm() -> int:
             f"PRAGMA busy_timeout = {int(settings.SQLITE_BUSY_TIMEOUT_MS)}"
         )
 
-        cur = await db._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='chain_identity_recompute_v1'"
-        )
-        if not await cur.fetchone():
-            print(
-                "chain_identity_recompute_v1 does not exist -- deploy first, "
-                "then run the backfill, then arm."
+        # Both tables, not just the overlay. The probe reads the overlay AND
+        # reads/writes `recompute_coverage_baseline`; guarding only the first
+        # left an absent baseline table raising an uncaught OperationalError
+        # past the advertised "2 = schema not deployed". Low reachability --
+        # both arrive in the same `initialize()` -- but the guard was
+        # incomplete on the axis it claimed to cover.
+        for table in ("chain_identity_recompute_v1", "recompute_coverage_baseline"):
+            cur = await db._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
             )
-            return 2
+            if not await cur.fetchone():
+                print(
+                    f"{table} does not exist -- deploy first, then run the "
+                    "backfill, then arm."
+                )
+                return 2
 
         gate = float(settings.CONVICTION_EARLY_LEAD_MINUTES)
         cov = await db.chain_identity_recompute_coverage_probe(gate_minutes=gate)
         print(json.dumps(cov, indent=2, default=str))
 
-        unjudged = [
+        # `rate_judged` ALONE IS NOT ENOUGH, and getting this wrong reproduced
+        # the exact defect this script exists to close.
+        #
+        # `chain_identity_recompute_coverage_probe` sets `rate_judged = True`
+        # BEFORE it calls `_classify_coverage_mark` (scout/db.py:8524). The
+        # `incomparable_unresolved` arm then sets `mark_written = False` and
+        # `comparison_skipped = "incomparable_mark_not_cleared"` and continues,
+        # leaving `rate_judged` True. So the one arm that means "the mark was
+        # NOT written and nothing was judged" is invisible to a `rate_judged`
+        # filter: the script printed "armed", exited 0, and left a surface
+        # un-armed -- the precise "collapse unreachable" state it was written
+        # to prevent.
+        #
+        # `mark_written` is NOT the right predicate either: the legitimate
+        # `compare` arm (already armed, no write needed) also sets it False, so
+        # keying on it would fail every healthy re-run. The correct test is
+        # "unjudged OR explicitly skipped".
+        unarmed = [
             table
             for table, v in cov.get("per_surface", {}).items()
-            if not v.get("rate_judged")
+            if not v.get("rate_judged") or v.get("comparison_skipped")
         ]
-        if unjudged:
+        if unarmed:
+            print("\nNOT fully armed:")
+            for table in sorted(unarmed):
+                v = cov["per_surface"][table]
+                reason = v.get("comparison_skipped") or "rate could not be judged"
+                print(f"  {table}: {reason}")
             print(
-                "\nNOT fully armed -- these surfaces were not judged: "
-                + ", ".join(sorted(unjudged))
+                "\nRe-run after the cause clears. A surface left here has no "
+                "usable mark, so collapse detection cannot fire for it."
             )
             return 1
 

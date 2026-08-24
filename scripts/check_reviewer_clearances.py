@@ -152,9 +152,26 @@ MANDATORY_WATCH = frozenset(
 
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
+#: Every `subprocess.run` in `scripts/` must pass an explicit timeout -- there is
+#: a repo guard asserting it, and it caught this file. The reason applies here:
+#: `git` can block indefinitely on a lock held by a concurrent process, and a
+#: check that hangs is worse than one that fails, because a hung job reports
+#: nothing at all.
+_GIT_TIMEOUT_SEC = 60
+
 
 def _git(*args: str) -> str:
-    r = subprocess.run(["git", *args], capture_output=True, text=True)
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"git {' '.join(args)} timed out after {_GIT_TIMEOUT_SEC}s"
+        ) from None
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -194,9 +211,24 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
         return 1
 
-    required = list(decl.get("required") or [])
-    watch = list(decl.get("watch") or [])
-    clearances = dict(decl.get("clearances") or {})
+    # Coerce defensively. `clearances = "oops"` instead of a `[clearances]`
+    # table used to raise `ValueError: dictionary update sequence element #0
+    # has length 1` straight out of `main`. It failed closed, but by traceback
+    # -- and the docstring promises "everything that can be decided fails
+    # CLOSED as 1", so a crash presenting as exit 1 makes a decision and an
+    # accident indistinguishable. `required`/`watch` were safe only by luck:
+    # `list("scout")` yields characters, which the narrowing check happens to
+    # reject.
+    try:
+        required = list(decl.get("required") or [])
+        watch = list(decl.get("watch") or [])
+        clearances = dict(decl.get("clearances") or {})
+    except (TypeError, ValueError) as exc:
+        print(
+            f"FAIL: {DECL} is malformed -- `required` and `watch` must be "
+            f"arrays and `[clearances]` a table: {exc}"
+        )
+        return 1
 
     narrowed = MANDATORY_VECTORS - set(required)
     if narrowed:
@@ -264,8 +296,15 @@ def main(argv: list[str]) -> int:
     # unnoticed through every docs-only PR and then fails all four vectors at
     # once on the first PR that touches production, which is the least
     # convenient moment to discover a typo.
+    # Scoped to `required`, deliberately. Validating EVERY recorded key meant a
+    # stray `banana = "not-a-sha"` -- a vector nobody reads -- hard-failed a
+    # docs-only PR, defeating the one exemption this design protects on purpose.
+    # Given the docstring's own warning about training people to ignore a red
+    # signal, an unrelated typo should not be able to manufacture one.
     shape_errors: list[str] = []
-    for vector, sha in sorted(clearances.items()):
+    for vector, sha in sorted(
+        (v, s) for v, s in clearances.items() if v in set(required)
+    ):
         if not _SHA_RE.match(str(sha)):
             shape_errors.append(f"{vector:16s} {sha!r} is not a full 40-hex SHA")
             continue
@@ -293,27 +332,33 @@ def main(argv: list[str]) -> int:
         if not sha:
             failures.append(f"{vector:16s} NO CLEARANCE RECORDED")
             continue
-        if not _SHA_RE.match(str(sha)):
-            failures.append(
-                f"{vector:16s} {sha!r} IS NOT A FULL 40-HEX SHA -- a branch or "
-                "tag silently re-points as it moves, so it cannot record which "
-                "revision was reviewed"
-            )
-            continue
+        # No shape or existence check here. `_validate_clearance_shapes` above
+        # has already rejected every malformed or unresolvable value, so
+        # duplicating those branches made them UNREACHABLE -- and a reviewer
+        # proved it by replacing both with sentinels and watching all 20 tests
+        # pass. Worse, the two tests that had covered them were loosened to
+        # `in out.lower()` during that change, which is exactly what let them
+        # keep passing against the new block while their names and docstrings
+        # still described this loop. Two gates raising the same exit code and
+        # differing only in message, with an assertion that no longer
+        # discriminates between them.
+        #
+        # Deleted rather than re-guarded: the shape block subsumes them, and
+        # dead code with a green suite is a trap for whoever edits it next.
+        full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
         try:
-            # `_git` raises on a nonzero exit, and `--verify --quiet` never
-            # exits 0 with empty stdout, so no emptiness check is needed here.
-            full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
-        except RuntimeError:
+            anc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", full, head_sha],
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
             failures.append(
-                f"{vector:16s} {str(sha)[:8]} IS NOT A COMMIT IN THIS REPO"
+                f"{vector:16s} ancestry check timed out after "
+                f"{_GIT_TIMEOUT_SEC}s -- treated as NOT covered"
             )
             continue
-        anc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", full, head_sha],
-            capture_output=True,
-            text=True,
-        )
         if anc.returncode != 0:
             failures.append(
                 f"{vector:16s} {str(sha)[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
