@@ -109,9 +109,20 @@ looking for one reports a failure that has not happened. Verify the **shape**,
 not the stamp:
 
 ```bash
-sqlite3 scout.db "SELECT sql FROM sqlite_master WHERE name='chain_identity_recompute_v1';"   | grep -c 'PRIMARY KEY (source_table, source_row_id, semantics_version)'   # expect 1
-sqlite3 scout.db "SELECT 1 FROM paper_migrations WHERE name='chain_identity_recompute_pk_v2';"
+sqlite3 "file:scout.db?mode=ro" "SELECT sql FROM sqlite_master WHERE name='chain_identity_recompute_v1';"   | grep -c 'PRIMARY KEY (source_table, source_row_id, semantics_version)'   # expect 1
+sqlite3 "file:scout.db?mode=ro" "SELECT 1 FROM paper_migrations WHERE name='chain_identity_recompute_pk_v2';"
 ```
+
+**`mode=ro`, not bare and not `immutable=1`.** Bare opens read-write, and the
+operator most likely to run a verification command is the one diagnosing --
+which is exactly when a tool gets pointed at a copy. Against a BACKUP copy use
+`immutable=1` instead: sidecars written beside a backup are the 2026-08-15
+incident that destroyed every real backup.
+
+Do **not** use `immutable=1` against the live database here. It ignores the
+`-wal`, so it would hide everything committed-but-not-checkpointed and print
+the most reassuring possible output -- the stale all-clear that
+`scripts/check_recompute_coverage.py` exists to prevent.
 
 `schema_version` is therefore **not** a reliable indicator that the v2 shape is
 present. Tracked as BL-NEW-RECOMPUTE-PROBE-OBSERVABILITY-RESIDUALS.

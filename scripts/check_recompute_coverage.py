@@ -305,10 +305,18 @@ def main() -> int:
             if unarchivable < population
             else "THE BACKFILL CANNOT HELP: every row post-dates the archives"
         )
+        # When BOTH fire, the branch above is skipped by `and not dark` and the
+        # collapse surface names were dropped entirely -- the page still went
+        # out, but without the reason, on an alarm whose whole premise is that
+        # an operator who cannot act on a page stops reading them. `collapsed`
+        # is already computed; naming it costs one clause.
+        also = (
+            f" ALSO COLLAPSED on {', '.join(collapsed)}." if collapsed else ""
+        )
         print(
             f"overlay recovering NOTHING on {', '.join(dark)}: "
             f"{recovered} of {population} pre-cutover chains detections keep "
-            f"their credit, {unarchivable} unarchivable ({summary}). {remedy}"
+            f"their credit, {unarchivable} unarchivable ({summary}).{also} {remedy}"
         )
         return 1
     # Name the un-armed state. The collapse half of this alarm is gated on the

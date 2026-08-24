@@ -588,3 +588,76 @@ async def test_an_UNREADABLE_baseline_table_says_so(db, tmp_path):
         assert table in r.stdout.split("NOT ARMED")[-1], (
             f"{table} was not named as unreadable:\n" + r.stdout
         )
+
+
+async def test_a_TRANSIENT_read_error_on_ONE_surface_is_reported(db, tmp_path, monkeypatch):
+    """The `except sqlite3.Error: continue` path, driven in-process.
+
+    Two reviewers reached this and neither could execute it: the checker opens
+    `immutable=1` for non-live paths, so holding a lock produces no error, and
+    there is no deterministic way to make one surface's read raise from
+    outside. One reported it as inference and said so; the other found the
+    branch untested by grep. Both were right.
+
+    It is reachable in-process, so it is tested in-process: `sqlite3.connect`
+    is wrapped to raise on exactly one surface's baseline query. That is the
+    MIXED case -- one surface unreadable while another holds a mark -- which is
+    precisely what the `break` -> `continue` change was made to support, and
+    which the notice could not describe until it went per-surface.
+
+    The repo's own lesson applies: `except:` blocks are untested code, three
+    prior instances.
+    """
+    import importlib.util
+    import sqlite3 as _sqlite3
+
+    for table in sorted(SURFACE_COLS):
+        await _populate_surface(db, table, 60, 30)
+    await _mark_surface(db, "gainers_comparisons", 0.5, 60)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    spec = importlib.util.spec_from_file_location("chk_cov", CHECKER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    real_connect = _sqlite3.connect
+
+    class _Raising:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, params=()):
+            if "recompute_coverage_baseline" in sql and params and params[0] == (
+                "losers_comparisons"
+            ):
+                raise _sqlite3.OperationalError("database is locked")
+            return self._inner.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(
+        mod.sqlite3, "connect", lambda *a, **k: _Raising(real_connect(*a, **k))
+    )
+    monkeypatch.setattr(
+        mod.sys, "argv",
+        ["check", "--db", str(tmp_path / "scout.db"), "--gate-minutes", "1440"],
+    )
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = mod.main()
+    out = buf.getvalue()
+
+    assert rc in (0, 1), out
+    assert "losers_comparisons" in out, out
+    assert "unreadable" in out, (
+        "one surface's baseline read failed and the line does not say so -- "
+        "its collapse comparison was skipped silently:\n" + out
+    )
+    # The OTHER surfaces must still have been compared, not abandoned.
+    assert "trending_comparisons" in out, out

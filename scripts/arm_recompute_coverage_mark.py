@@ -166,13 +166,39 @@ async def _arm() -> int:
         # the runbook names as the hazard three paragraphs above the command
         # that does it. Not invisible (dark fires, and the mark ratchets up on a
         # later pass) but the operator must not be told "armed".
-        if cov.get("not_recovering"):
-            print(
-                "\nNOT ARMED -- recovery is zero on: "
-                + ", ".join(sorted(cov.get("dark_surfaces") or []))
-                + "\nA mark of 0.0 makes collapse detection unsatisfiable for "
-                "every rate. Run the backfill first, then arm."
-            )
+        # `not_recovering` is `bool(dark) or bool(collapsed)` (scout/db.py:8620),
+        # and an earlier version of this branch formatted ONLY `dark_surfaces`.
+        # When `collapsed` was the trigger it printed "recovery is zero on: "
+        # with nothing after the colon, offered the backfill as the remedy for a
+        # condition whose remedy is checking the /root snapshots, and blocked
+        # the runbook's own documented reset workflow -- DELETE one surface's
+        # mark and re-arm -- whenever any OTHER surface was collapsed.
+        #
+        # And "NOT ARMED" was false about durable state. The probe is the
+        # ratchet's only writer and it writes INSIDE the probe call, before this
+        # code sees the payload, so refusing here cannot prevent a write; it can
+        # only misdescribe one that already happened. The commit that added this
+        # gate is titled "the probe is a WRITER" and the gate was still written
+        # as though calling it were a read.
+        dark = sorted(cov.get("dark_surfaces") or [])
+        collapsed = sorted(cov.get("collapsed_surfaces") or [])
+        if dark or collapsed:
+            print("\nrefusing to report armed -- the probe already wrote its marks:")
+            if dark:
+                print(
+                    "  recovery is ZERO on: "
+                    + ", ".join(dark)
+                    + "\n    a mark of 0.0 makes collapse detection unsatisfiable "
+                    "for every rate. Run the backfill first, then arm."
+                )
+            if collapsed:
+                print(
+                    "  recovery COLLAPSED on: "
+                    + ", ".join(collapsed)
+                    + "\n    check the /root history snapshots still exist before "
+                    "re-running the backfill; a deliberate reset is a DELETE of "
+                    "that surface's row, per the runbook."
+                )
             return 1
 
         per_surface = cov.get("per_surface", {})

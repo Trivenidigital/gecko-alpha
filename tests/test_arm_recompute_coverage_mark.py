@@ -405,6 +405,9 @@ async def test_arm_DISTINGUISHES_all_below_floor_from_armed(tmp_path, monkeypatc
     assert rc == 0, "below-floor is not a fault; it must not fail"
     assert "below the judging floor" in out, out
     assert "NO surface is judgeable yet" in out, out
+    # Same shape: the list is pinned, the sentence saying why it is not an
+    # error was not.
+    assert "too few credit-bearing rows to judge a rate" in out, out
     assert "armed at gate_minutes" not in out, (
         "printed plain 'armed' while no surface has a mark or can have one:\n" + out
     )
@@ -487,8 +490,16 @@ async def test_the_ZERO_RECOVERY_message_is_asserted_not_just_written(
     _env(monkeypatch, db_path)
     rc, out = await _run_arm()
     assert rc == 1, out
-    assert "NOT ARMED -- recovery is zero" in out, out
+    assert "refusing to report armed" in out, out
+    assert "recovery is ZERO on:" in out, out
+    # Every dark surface named -- an empty list after the colon is the defect
+    # the collapse branch had.
+    for t in ("gainers_comparisons", "losers_comparisons", "trending_comparisons"):
+        assert t in out, out
     assert "Run the backfill first" in out, out
+    # And it must NOT claim the marks are untouched: the probe writes inside
+    # the probe call, before this code runs.
+    assert "the probe already wrote its marks" in out, out
     assert "armed at gate_minutes" not in out, out
 
 
@@ -533,6 +544,11 @@ async def test_the_LOST_WRITE_reason_is_asserted(tmp_path, monkeypatch):
     assert "mark write was lost" in out, (
         "the lost-write reason is not what the script printed:\n" + out
     )
+    # The REMEDY, not only the diagnosis. A sweep found every
+    # decision-bearing header pinned and the remediation sentence under
+    # each one unpinned: delete it and the suite stays green, leaving the
+    # operator with a diagnosis and no next step.
+    assert "Re-run after the cause clears" in out, out
 
 
 async def test_the_SUCCESS_message_is_asserted_positively(tmp_path, monkeypatch):
@@ -561,3 +577,63 @@ async def test_the_SUCCESS_message_is_asserted_positively(tmp_path, monkeypatch)
     assert "1440" in out, "the gate actually used must appear in the message"
     assert "NOT fully armed" not in out
     assert "below the judging floor" not in out
+
+
+async def test_a_COLLAPSE_is_reported_as_a_collapse_not_as_zero_recovery(
+    tmp_path, monkeypatch
+):
+    """`not_recovering` is `dark OR collapsed`, and the message formatted only dark.
+
+    Found by the silent-failure slot, introduced by my own S1c fix. When
+    `collapsed` was the trigger the script printed "recovery is zero on: " with
+    NOTHING after the colon, offered the backfill as the remedy for a condition
+    whose remedy is checking the /root snapshots, and -- worst -- blocked the
+    runbook's own documented reset workflow (DELETE one surface's mark, re-arm)
+    whenever any OTHER surface was collapsed.
+
+    It also claimed "NOT ARMED" about durable state that had already changed:
+    the probe writes its marks INSIDE the probe call, before this code sees the
+    payload. Refusing here cannot prevent a write, only misdescribe one. The
+    commit that added the gate is titled "the probe is a WRITER" and the gate
+    was still written as though calling it were a read.
+    """
+    from scout.db import Database
+
+    db_path = await _seed(tmp_path, "collapse.db", 60, 54)  # 0.90 today
+    db = Database(db_path)
+    await db.initialize()
+    # A high mark on gainers only -> gainers collapses, nothing is dark.
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO recompute_coverage_baseline "
+        "(source_table, best_rate, population, recorded_at) VALUES (?,?,?,?)",
+        ("gainers_comparisons", 0.99, 60, "2026-08-01T00:00:00+00:00"),
+    )
+    # Collapse it: many more credit-bearing rows, none recovered.
+    for i in range(400):
+        await db._conn.execute(
+            """INSERT INTO gainers_comparisons
+               (coin_id, symbol, name, appeared_on_gainers_at, detected_by_chains,
+                chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+               VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+            (f"collapse-{i}", "2026-08-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00"),
+        )
+    await db._conn.commit()
+    await db.close()
+
+    _env(monkeypatch, db_path)
+    rc, out = await _run_arm()
+
+    assert rc == 1, out
+    assert "COLLAPSED on: gainers_comparisons" in out, (
+        "a collapse was reported with an empty surface list or as zero "
+        "recovery:\n" + out
+    )
+    assert "recovery is zero on: \n" not in out, (
+        "empty surface list after the colon:\n" + out
+    )
+    assert "/root history snapshots" in out, (
+        "offered the backfill as the remedy for a collapse:\n" + out
+    )
+    assert "the probe already wrote its marks" in out, (
+        "still claims NOT ARMED about state the probe had already written:\n" + out
+    )
