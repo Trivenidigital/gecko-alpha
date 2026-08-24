@@ -30,29 +30,28 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "arm_recompute_coverage_mark.py"
 
 
-def _unarmed(per_surface: dict) -> list[str]:
-    """The script's own predicate, extracted from source so it cannot drift.
+def _load():
+    """Import the real script as a module.
 
-    Deliberately not a re-implementation: the list comprehension is read out of
-    the module the runbook tells operators to run, so a change there fails here
-    rather than leaving this test asserting a copy that no longer matches.
+    No `read_text`, no substring assertions, no copy of the predicate. The
+    first version of this file held a hand-written copy of the comprehension
+    and linked back to the script with two substring scans -- and a reviewer
+    showed BOTH survive reverting the predicate, because the scanned string
+    also occurs in the reporting line and in a comment. Every behavioural test
+    below was therefore structurally unable to see a change to the script it
+    claims to test.
+
+    Calling the real function is strictly simpler than hardening the scan, and
+    it is the only version that can actually fail.
     """
     spec = importlib.util.spec_from_file_location("arm_mod", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    # The predicate lives inline in `_arm`; assert on the source so a silent
-    # revert to `rate_judged`-only is caught.
-    src = SCRIPT.read_text(encoding="utf-8")
-    assert 'v.get("comparison_skipped")' in src, (
-        "the arming script no longer treats a skipped comparison as unarmed -- "
-        "it will report success on a surface that has no usable mark"
-    )
-    assert 'not v.get("rate_judged")' in src
-    return [
-        t
-        for t, v in per_surface.items()
-        if not v.get("rate_judged") or v.get("comparison_skipped")
-    ]
+    return mod
+
+
+def _unarmed(per_surface: dict) -> list[str]:
+    return _load().unarmed_surfaces(per_surface)
 
 
 def test_a_SKIPPED_comparison_counts_as_unarmed():
@@ -118,9 +117,20 @@ def test_the_script_guards_BOTH_tables_it_touches():
     Guarding only the overlay let an absent `recompute_coverage_baseline` raise
     an uncaught OperationalError past the advertised "2 = schema not deployed".
     """
-    src = SCRIPT.read_text(encoding="utf-8")
-    assert "chain_identity_recompute_v1" in src
-    assert "recompute_coverage_baseline" in src
+    import ast
+
+    # AST, not substring: both names appear in prose in this file's own
+    # docstrings, so a text scan would pass on comments alone. Assert they are
+    # real string CONSTANTS in the source, which a comment cannot supply.
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    constants = {
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    for table in ("chain_identity_recompute_v1", "recompute_coverage_baseline"):
+        assert table in constants, (
+            f"{table} is not guarded as a string constant -- the probe touches "
+            "it, so an absent table must return 2, not raise"
+        )
 
 
 def test_the_script_does_not_call_initialize():

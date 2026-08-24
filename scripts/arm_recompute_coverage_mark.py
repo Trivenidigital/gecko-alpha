@@ -55,6 +55,44 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def unarmed_surfaces(per_surface: dict) -> list[str]:
+    """Surfaces the probe did NOT arm. The single source of truth for success.
+
+    Extracted so the tests can call it instead of copying it. The first version
+    of the test file held a hand-written copy of this comprehension, with a
+    docstring claiming it was "deliberately not a re-implementation" -- it was
+    one, and every behavioural test was therefore structurally incapable of
+    seeing a change to this script. The only link back was two substring scans,
+    and a reviewer showed both SURVIVE reverting the predicate: the string
+    `v.get("comparison_skipped")` also appears in the reporting line below and
+    in a comment above, so an unrelated live call site satisfied the guard
+    while the decision it guarded was gone. A scan satisfiable by prose is
+    equally satisfiable by an unrelated use.
+
+    WHY THIS PREDICATE, in both directions:
+
+    `rate_judged` alone is NOT enough.
+    `chain_identity_recompute_coverage_probe` sets `rate_judged = True` BEFORE
+    calling `_classify_coverage_mark` (scout/db.py:8524). The
+    `incomparable_unresolved` arm then sets `mark_written = False`, sets
+    `comparison_skipped`, and continues -- leaving `rate_judged` True. So the
+    one arm meaning "nothing was armed" is invisible to a `rate_judged` filter,
+    and the script printed "armed", exited 0, and left a surface with no usable
+    mark: the exact collapse-unreachable state it exists to prevent.
+
+    `mark_written` is NOT the alternative. The healthy `compare` arm (already
+    armed, today does not improve it, no write needed) also sets it False, so
+    keying on that would report a correctly-armed system as broken on every
+    good re-run -- an alarm that cries wolf on the normal path, which is the
+    failure mode this whole component is about.
+    """
+    return [
+        table
+        for table, v in per_surface.items()
+        if not v.get("rate_judged") or v.get("comparison_skipped")
+    ]
+
+
 async def _arm() -> int:
     import aiosqlite
 
@@ -100,28 +138,7 @@ async def _arm() -> int:
         cov = await db.chain_identity_recompute_coverage_probe(gate_minutes=gate)
         print(json.dumps(cov, indent=2, default=str))
 
-        # `rate_judged` ALONE IS NOT ENOUGH, and getting this wrong reproduced
-        # the exact defect this script exists to close.
-        #
-        # `chain_identity_recompute_coverage_probe` sets `rate_judged = True`
-        # BEFORE it calls `_classify_coverage_mark` (scout/db.py:8524). The
-        # `incomparable_unresolved` arm then sets `mark_written = False` and
-        # `comparison_skipped = "incomparable_mark_not_cleared"` and continues,
-        # leaving `rate_judged` True. So the one arm that means "the mark was
-        # NOT written and nothing was judged" is invisible to a `rate_judged`
-        # filter: the script printed "armed", exited 0, and left a surface
-        # un-armed -- the precise "collapse unreachable" state it was written
-        # to prevent.
-        #
-        # `mark_written` is NOT the right predicate either: the legitimate
-        # `compare` arm (already armed, no write needed) also sets it False, so
-        # keying on it would fail every healthy re-run. The correct test is
-        # "unjudged OR explicitly skipped".
-        unarmed = [
-            table
-            for table, v in cov.get("per_surface", {}).items()
-            if not v.get("rate_judged") or v.get("comparison_skipped")
-        ]
+        unarmed = unarmed_surfaces(cov.get("per_surface", {}))
         if unarmed:
             print("\nNOT fully armed:")
             for table in sorted(unarmed):
