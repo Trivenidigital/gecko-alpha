@@ -433,6 +433,21 @@ async def test_the_NOT_ARMED_notice_names_each_unarmed_surface(db, tmp_path):
     assert "NOT ARMED on gainers_comparisons" not in r.stdout, (
         "gainers IS armed and must not be named as unarmed"
     )
+    # WHICH condition, not merely that a notice fired. The pair added to fix
+    # the unreadable-table residual is asymmetric: replacing
+    # ": baseline unreadable" dies, but rewording ": no baseline recorded yet"
+    # INTO the unreadable wording survived the whole suite. The two states have
+    # different remedies -- "run the arm script" vs "find out why the table
+    # cannot be read" -- so pinning the prefix and the surface names is not
+    # enough. One-branch-not-the-axis, inside the notice pair itself.
+    assert "no baseline recorded yet" in r.stdout, (
+        "the unarmed notice does not say WHICH condition it reports; it could "
+        "be reworded as an infrastructure fault and nothing would fail:\n"
+        + r.stdout
+    )
+    assert "unreadable" not in r.stdout, (
+        "reported an unreadable baseline when the table reads fine:\n" + r.stdout
+    )
 
 
 async def test_a_BELOW_FLOOR_surface_is_not_called_unarmed(db, tmp_path):
