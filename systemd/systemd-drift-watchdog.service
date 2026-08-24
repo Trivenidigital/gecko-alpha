@@ -9,6 +9,9 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/root/gecko-alpha
+# Preflight, matching the other repo-executed units. The mode bit prevents
+# a permission failure; this makes one LOUD if it happens anyway.
+ExecStartPre=/usr/bin/test -x /root/gecko-alpha/scripts/systemd-drift-watchdog.sh
 ExecStart=/root/gecko-alpha/scripts/systemd-drift-watchdog.sh
 # V51 SHOULD-FIX: exit 1 == drift detected + alert sent (NORMAL operation,
 # not a service failure). Without SuccessExitStatus, `systemctl status`

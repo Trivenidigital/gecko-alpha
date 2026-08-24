@@ -15,4 +15,12 @@ SuccessExitStatus=0 1
 # history with the backup scripts. Pointing systemd at the repo keeps both
 # halves on one deploy path.
 WorkingDirectory=/root/gecko-alpha
+# Preflight, matching chain-anchor-health and minara-emission-persistence.
+# The script ships 100755 so this should never fire -- but the two guarantees
+# are different: the mode bit PREVENTS a permission failure, this makes one
+# LOUD if it happens anyway (a bad deploy, a chmod, a filesystem restore). Two
+# of the four sibling units already had it and this one did not, which is the
+# gap that turns "the watchdog never ran" into a silent condition rather than a
+# unit failure -- the exact outcome this unit exists to report on.
+ExecStartPre=/usr/bin/test -x /root/gecko-alpha/scripts/recompute-coverage-watchdog.sh
 ExecStart=/root/gecko-alpha/scripts/recompute-coverage-watchdog.sh

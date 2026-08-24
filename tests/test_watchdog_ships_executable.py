@@ -47,10 +47,33 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _REPO_SH = re.compile(r"/root/gecko-alpha/(scripts/[A-Za-z0-9_.-]+\.sh)")
 
 
+#: EXECUTABLE artefacts only. The globs were `systemd/*` and `cron/*`,
+#: unfiltered -- so they ingested `README.md`, and a reviewer traced
+#: `scripts/cron-drift-watchdog.sh` into the covered set from a DOCUMENTATION
+#: EXAMPLE: it appears in no crontab and no unit. That is the
+#: "scan satisfiable by prose" category error, in the artefact-parsing
+#: direction rather than the assertion-scanning one -- the eighth instance on
+#: this PR, and it landed in the file written to close the seventh.
+_ARTEFACT_GLOBS = (
+    "scripts/*.service",
+    "scripts/*.timer",
+    "systemd/*.service",
+    "systemd/*.timer",
+    "cron/*.crontab",
+)
+
+#: Commands whose first token is an interpreter do NOT need the executable bit:
+#: `python scripts/foo.py` opens the file for reading and the kernel never
+#: execs it. Verified live in this repo -- `gecko-pilot-watchdog.service` uses
+#: `WorkingDirectory` + `uv run python scripts/...`, and three crontab lines use
+#: `cd ... && .venv/bin/python scripts/...`. Correctly out of scope, not missed.
+_INTERPRETERS = ("python", "python3", "uv", "bash", "sh", "/bin/sh", "/bin/bash")
+
+
 def _invoked_from_repo() -> dict[str, list[str]]:
     """{script path -> the artefacts that invoke it by repo path}."""
     found: dict[str, list[str]] = {}
-    globs = ("scripts/*.service", "scripts/*.timer", "systemd/*", "cron/*")
+    globs = _ARTEFACT_GLOBS
     for pattern in globs:
         for artefact in REPO_ROOT.glob(pattern):
             if artefact.is_dir():
@@ -77,18 +100,78 @@ def _index_mode(path: str) -> str:
 INVOKED = _invoked_from_repo()
 
 
-def test_the_derivation_finds_the_known_invocations():
-    """Guard the guard: an empty or shrunken derivation would pass everything.
+def test_no_repo_path_invocation_is_MISSED_by_the_derivation():
+    """Assert the INVERSE, because a floor only detects shrinkage.
 
-    A parser that silently matches nothing turns every assertion below into a
-    vacuous pass -- the failure mode this file was written to fix, one level up.
+    `assert len(INVOKED) >= 4` against a population of 17 was the first
+    version: the derivation could silently lose 13 and stay green, and the two
+    named anchors pinned 2. Worse, shrinkage is not the threatened failure --
+    a NEW unit written in a form the regex misses leaves the count unchanged,
+    both anchors present, everything green, and the new script uncovered. That
+    is the growth axis and nothing watched it.
+
+    So this asks "did we MISS any" rather than "did we find enough": every
+    `Exec*=` and crontab command whose first token resolves inside `scripts/`
+    must have been matched. It closes the growth axis AND makes the
+    absolute-prefix narrowing self-reporting -- the day someone writes a
+    relative-path unit, this names it instead of coverage silently shrinking.
     """
+    missed: list[str] = []
+    for pattern in _ARTEFACT_GLOBS:
+        for artefact in REPO_ROOT.glob(pattern):
+            if artefact.is_dir():
+                continue
+            for line in artefact.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("#") or not line:
+                    continue
+                body = line.split("=", 1)[1] if line.startswith("Exec") else line
+                tokens = body.replace("&&", " ").split()
+                for i, tok in enumerate(tokens):
+                    if not tok.endswith(".sh"):
+                        continue
+                    if "scripts/" not in tok:
+                        continue
+                    prev = tokens[i - 1] if i else ""
+                    if any(prev.endswith(x) for x in _INTERPRETERS):
+                        continue  # interpreter-invoked: no exec bit required
+                    norm = tok[tok.index("scripts/"):]
+                    if norm not in INVOKED:
+                        missed.append(f"{artefact.name}: {tok}")
+    assert not missed, (
+        "these repo-path .sh invocations were NOT matched by the derivation, "
+        "so they ship unguarded:\n  " + "\n  ".join(sorted(set(missed)))
+    )
+
+
+def test_the_derivation_still_matches_the_deployed_artefacts():
+    """Shrinkage detector, kept alongside the inverse -- they fail differently."""
     assert len(INVOKED) >= 4, (
         f"the derivation found only {len(INVOKED)} repo-path invocations; "
         "it has stopped matching the deployed artefacts"
     )
     assert "scripts/recompute-coverage-watchdog.sh" in INVOKED
     assert "scripts/systemd-drift-watchdog.sh" in INVOKED
+
+
+def test_no_script_is_covered_by_PROSE_alone():
+    """A documentation example must not be what puts a script in scope.
+
+    `cron-drift-watchdog.sh` entered the covered set from `cron/README.md`
+    while appearing in no crontab and no unit. Harmless in that instance --
+    the file genuinely should ship executable -- but the MECHANISM is the
+    category error this PR has now hit eight times: a scan satisfied by prose
+    cannot distinguish documentation from deployment.
+    """
+    prose_only = {
+        script: sources
+        for script, sources in INVOKED.items()
+        if all(name.endswith(".md") for name in sources)
+    }
+    assert not prose_only, (
+        "scripts pulled into scope by documentation alone: "
+        + ", ".join(f"{k} <- {sorted(set(v))}" for k, v in sorted(prose_only.items()))
+    )
 
 
 @pytest.mark.parametrize("script", sorted(INVOKED))
@@ -112,4 +195,48 @@ def test_the_runbook_does_not_reintroduce_a_chmod_step():
     assert "chmod +x scripts/recompute-coverage-watchdog.sh" not in activation, (
         "a chmod step is back on the activation path; the script ships 100755 "
         "so the step is both unnecessary and skippable"
+    )
+
+
+def _units_executing_repo_scripts() -> dict[str, str]:
+    """{unit filename -> the repo .sh it ExecStarts}, units only."""
+    units = {}
+    for pattern in ("scripts/*.service", "systemd/*.service"):
+        for unit in REPO_ROOT.glob(pattern):
+            for line in unit.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line.startswith("ExecStart=") and line.endswith(".sh"):
+                    units[unit.name] = line.split("=", 1)[1]
+    return units
+
+
+UNITS = _units_executing_repo_scripts()
+
+
+def test_the_unit_scan_finds_units():
+    """Guard the guard, again -- an empty scan makes the next test vacuous."""
+    assert len(UNITS) >= 4, f"only {len(UNITS)} repo-executing units found"
+
+
+@pytest.mark.parametrize("unit", sorted(UNITS))
+def test_a_unit_executing_a_repo_script_has_an_EXEC_PREFLIGHT(unit):
+    """`ExecStartPre=/usr/bin/test -x` on every unit that runs a repo script.
+
+    The mode bit and the preflight are DIFFERENT guarantees and this PR shipped
+    only the first. The bit PREVENTS a permission failure; the preflight makes
+    one LOUD if it happens anyway -- a bad deploy, a stray chmod, a filesystem
+    restore. Without it the unit fails in a way that reads as "the watchdog
+    didn't run", which is the silent condition these watchdogs exist to report.
+
+    Two of four sibling units had it and two did not, including the one this PR
+    added. Found by the concurrency slot as a residual on the mode fix, and it
+    is the axis to that fix's instance: I closed "ships non-executable" and left
+    "fails invisibly if it ever is" open on the same units.
+    """
+    body = (REPO_ROOT / ("scripts" if (REPO_ROOT / "scripts" / unit).exists() else "systemd") / unit).read_text(encoding="utf-8")
+    script = UNITS[unit]
+    assert f"ExecStartPre=/usr/bin/test -x {script}" in body, (
+        f"{unit} executes {script} from the repo with no `ExecStartPre=/usr/bin/"
+        f"test -x` preflight. A permission failure there is indistinguishable "
+        "from the watchdog simply not running."
     )
