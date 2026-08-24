@@ -309,6 +309,13 @@ def _master_declaration_text() -> str | None:
     established, a failing `git show` is also fatal -- the file is known to be
     there, so a read failure is a broken environment, never an absence.
 
+    `--full-tree` is not decoration: `ls-tree` resolves its pathspec relative to
+    the CURRENT DIRECTORY, so without it this returns exit 0 and EMPTY output
+    from any subdirectory -- a vacuous skip, the exact silent shape the rest of
+    this helper exists to prevent. Demonstrated: from `tests/`, the plain form
+    returns `[]` and the `--full-tree` form returns `.reviewers.toml`. It is
+    correct today only because `cwd=REPO_ROOT` is the top level.
+
     A MISSING REF is separated from a missing FILE by resolving the ref first;
     an unresolvable ref raises. Both calls carry an explicit timeout, and
     `TimeoutExpired` is deliberately NOT caught: "git did not answer" must not
@@ -321,7 +328,8 @@ def _master_declaration_text() -> str | None:
         ).returncode:
             continue
         listed = subprocess.run(
-            ["git", "ls-tree", "--name-only", ref, "--", ".reviewers.toml"],
+            ["git", "ls-tree", "--full-tree", "--name-only", ref,
+             "--", ".reviewers.toml"],
             capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
         )
         if listed.returncode != 0:
@@ -397,6 +405,85 @@ def test_the_shipped_declaration_records_no_stale_clearances():
         "reset master's [clearances] to empty -- its SHAs are no longer "
         "ancestors and would misreport on unrelated work."
     )
+
+
+# --------------------------------------------------------------------------
+# `_master_declaration_text` -- PINNING the hardening, because it arrived
+# unguarded. A reviewer mutated all three properties this helper exists to
+# establish and every one reverted SILENTLY GREEN: ls-tree-failure -> None,
+# show-failure -> None, and skip -> bare return. Guards added during review are
+# the least-attacked code in the tree, and these three are load-bearing --
+# M17 in particular is the premise ticket 21's deferral rests on, so a one-line
+# revert would invalidate a recorded decision with nothing to report it.
+# --------------------------------------------------------------------------
+
+def _patch_git(monkeypatch, *, ls_rc=0, ls_out="", show_rc=0, show_out=""):
+    """Drive `_master_declaration_text`'s three git calls, counting hits.
+
+    Returns the counter. Every test below asserts it moved -- a fake that is
+    never reached produces a pass indistinguishable from a real one, which is
+    the failure mode these tests exist to close one level down.
+    """
+    seen = {"n": 0}
+    real = subprocess.run
+
+    def fake(cmd, **kw):
+        if not (len(cmd) > 1 and cmd[0] == "git"):
+            return real(cmd, **kw)
+        if cmd[1] == "rev-parse":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[1] == "ls-tree":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, ls_rc, ls_out, "boom")
+        if cmd[1] == "show":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, show_rc, show_out, "boom")
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    return seen
+
+
+def test_a_git_FAILURE_is_not_reported_as_an_absent_declaration(monkeypatch):
+    """M16. `ls-tree` failing is "could not determine", never "carries none".
+
+    The blocking fail-open this helper was rewritten to close: any nonzero git
+    exit routed into the `None` the caller reads as "master has no
+    declaration", so a corrupt object read as a clean master and PASSED.
+    """
+    seen = _patch_git(monkeypatch, ls_rc=128)
+    with pytest.raises(AssertionError, match="NOT 'master carries none'"):
+        _master_declaration_text()
+    assert seen["n"] >= 2, "git was never called; test proves nothing"
+
+
+def test_an_UNREADABLE_blob_is_not_reported_as_an_absent_declaration(monkeypatch):
+    """M18. Listed in the tree but unreadable is a broken environment.
+
+    Distinct from M16 by LAYER: the tree resolves and names the path, then the
+    blob will not read. Both once collapsed into the same silent `None`.
+    """
+    seen = _patch_git(monkeypatch, ls_out=".reviewers.toml", show_rc=128)
+    with pytest.raises(AssertionError, match="listed in the tree but unreadable"):
+        _master_declaration_text()
+    assert seen["n"] >= 3, "git show was never reached; test proves nothing"
+
+
+def test_the_BOOTSTRAP_path_skips_rather_than_passing_silently(monkeypatch):
+    """M17. A vacuous pass and a real pass must not look the same.
+
+    THE PREMISE OF TICKET 21'S DEFERRAL. Deferring per-PR clearance files is
+    only safe while a forgotten `[clearances]` reset fails LOUDLY. A bare
+    `return` here reports PASSED while disabling both this test and the gate's
+    declaration -- converting a detected failure into a permanently undetected
+    one, and silently invalidating a recorded decision. `Skipped` is visible.
+    """
+    seen = _patch_git(monkeypatch, ls_out="")
+    assert _master_declaration_text() is None
+    with pytest.raises(pytest.skip.Exception):
+        test_the_shipped_declaration_records_no_stale_clearances()
+    assert seen["n"] >= 2, "git was never called; test proves nothing"
 
 
 # --------------------------------------------------------------------------
