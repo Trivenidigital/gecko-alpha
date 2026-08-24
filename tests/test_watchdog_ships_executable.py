@@ -144,14 +144,45 @@ def test_no_repo_path_invocation_is_MISSED_by_the_derivation():
     )
 
 
-def test_the_derivation_still_matches_the_deployed_artefacts():
-    """Shrinkage detector, kept alongside the inverse -- they fail differently."""
-    assert len(INVOKED) >= 4, (
-        f"the derivation found only {len(INVOKED)} repo-path invocations; "
-        "it has stopped matching the deployed artefacts"
+def test_the_derivation_matches_EVERY_source_of_artefacts():
+    """PER-SOURCE, because a floor plus two anchors could not see a lost glob.
+
+    The first version was `len(INVOKED) >= 4` plus two named scripts -- and
+    both names were systemd-invoked while the floor was exactly the
+    systemd-only count. A reviewer dropped the `cron/*.crontab` glob: the
+    derivation fell from 16 scripts to 4, this guard stayed GREEN, and a
+    cron-invoked script then lost its executable bit undetected. 75% of
+    coverage gone through a one-token edit to a tuple, past the guard added to
+    catch exactly that.
+
+    Its docstring said it caught "a parser that silently matches nothing". It
+    did. It could not catch "matches only the half both anchors live in" --
+    which was the smaller half, while the larger half went unwatched.
+
+    So: assert at least one invocation from EACH source class, and pin an
+    anchor in each. That cannot drift with the count, and losing any single
+    glob names the source that vanished.
+    """
+    by_source = {"unit": set(), "crontab": set()}
+    for script, artefacts in INVOKED.items():
+        for name in artefacts:
+            key = "crontab" if name.endswith(".crontab") else "unit"
+            by_source[key].add(script)
+
+    for source, scripts in by_source.items():
+        assert scripts, (
+            f"the derivation matched NOTHING from {source} artefacts -- a glob "
+            "was dropped or the parse broke, and every parametrised assertion "
+            "below silently stopped covering that source"
+        )
+
+    # An anchor in EACH source, so a lost glob is named rather than absorbed.
+    assert "scripts/recompute-coverage-watchdog.sh" in by_source["unit"]
+    assert "scripts/systemd-drift-watchdog.sh" in by_source["unit"]
+    assert "scripts/alert-channel-watchdog.sh" in by_source["crontab"], (
+        "the cron-invoked anchor is missing; both previous anchors were "
+        "systemd-invoked, which is how a dropped crontab glob went unseen"
     )
-    assert "scripts/recompute-coverage-watchdog.sh" in INVOKED
-    assert "scripts/systemd-drift-watchdog.sh" in INVOKED
 
 
 def test_no_script_is_covered_by_PROSE_alone():
