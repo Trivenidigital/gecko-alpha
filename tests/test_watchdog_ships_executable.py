@@ -247,8 +247,19 @@ def _units_executing_repo_scripts() -> dict[str, tuple[str, str]]:
     this name and docstring both saying "repo". It matched on
     `line.endswith(".sh")` alone, so three `/usr/local/bin/gecko-backup-*.sh`
     units -- installed copies, correctly out of scope -- padded the set to 7
-    when only 4 execute from the repo. The floor below was 4. So the padding
-    was exactly the slack that let a dropped glob pass.
+    when only 4 execute from the repo, against a floor of 4.
+
+    PRECISION, because the obvious reading of that is wrong: the padding was
+    the slack for the FLOOR, and the per-source assertion below replaced the
+    floor in the same commit. So this filter is NOT what closes the vacuity --
+    `test_the_unit_scan_covers_EVERY_unit_glob` is, and its per-glob mutants
+    are what prove it bites. Removing this filter today survives the suite,
+    because all three backup units happen to carry `ExecStartPre` already.
+
+    It stays as a SCOPING choice: do not assert repo-deploy properties about
+    installed copies, whose modes and preflights are governed by the `install`
+    command rather than by the checkout. A successor should not read it as
+    load-bearing for vacuity.
     """
     units: dict[str, tuple[str, str]] = {}
     for pattern in _UNIT_GLOBS:
