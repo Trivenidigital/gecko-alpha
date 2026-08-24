@@ -119,6 +119,23 @@ runs. The `ExecStartPre` finding is the proof: an artefact present in the diff,
 green in CI, and absent from `/etc/systemd/system` is indistinguishable from a
 working one by any repository-level check.
 
+A **runtime** check does exist, and it is worth naming here rather than leaving
+the sentence above to imply nothing anywhere can see this.
+`scripts/systemd-drift-watchdog.sh` diffs repo units against
+`/etc/systemd/system` on a timer and pages on drift -- it is precisely the right
+instrument. **It cannot see either unit this PR adds, in either direction:**
+Direction A (`:113`) enumerates `$REPO_DIR/systemd` only, and these two units
+are the only ones in the tree living under `scripts/` (17 units are in
+`systemd/`, 2 here); Direction B's `DIRB_PATTERNS` (`:51-57`) matches
+`gecko-*`, `minara-*`, `systemd-drift-watchdog.*` and so would not flag an
+installed-but-stale copy as untracked either.
+
+So the manual verification below is manual **because these units sit outside the
+standing instrument**, not because no standing instrument exists. Moving them to
+`systemd/` is what converts the instruction into a standing check; that is
+ticket 18, deliberately not taken in this PR. Note the fix is the move -- adding
+the names to `DIRB_PATTERNS` alone would page `UNTRACKED PROD UNIT` forever.
+
 So: **exact-head CI green is necessary and not sufficient**, and a full set of
 five clearances does not substitute for verifying the installed unit files on
 the box after deploy.
