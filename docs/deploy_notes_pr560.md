@@ -136,6 +136,25 @@ standing instrument**, not because no standing instrument exists. Moving them to
 ticket 18, deliberately not taken in this PR. Note the fix is the move -- adding
 the names to `DIRB_PATTERNS` alone would page `UNTRACKED PROD UNIT` forever.
 
+### Enumerations here were verified. Attributions were not.
+
+Stated plainly because a reader will otherwise assume one standard was applied
+throughout. Every file/count claim in this tranche was re-derived from `git
+diff` or `git ls-files` before being written down. **Attribution claims -- which
+slot found what -- had no such check**, and one was wrong: a message credited
+the logic slot with an `initialize()` finding belonging to another slot, and
+inverted which side of the "documentation nit" argument each of us had taken.
+
+It was caught only because the slot it named read it and objected. That is not a
+procedure; it is luck that the misattributed party was still listening. The
+asymmetry is the point: **an enumeration has a cheap decision procedure and an
+attribution does not.** `git diff` settles the first. The only check on the
+second is the person named going back and reading what they actually wrote.
+
+Note the direction of the correction -- it *removed* credit from the slot that
+raised it. That is the direction nobody is motivated to catch, which is why an
+inflated review record is more dangerous than an incomplete one.
+
 So: **exact-head CI green is necessary and not sufficient**, and a full set of
-five clearances does not substitute for verifying the installed unit files on
-the box after deploy.
+clearances does not substitute for verifying the installed unit files on the box
+after deploy.
