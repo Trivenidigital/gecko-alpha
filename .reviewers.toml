@@ -1,0 +1,54 @@
+# Reviewer clearances for PR #560 (ruling D).
+#
+# A clearance is a property of a REVISION, not of a branch. Each SHA below is
+# the revision at which that vector's reviewer named its verdict. The gate
+# (`scripts/check_reviewer_clearances.py`) recomputes, for every entry, that the
+# SHA is an ancestor of HEAD and that no path in `watch` has a different tree
+# hash between that SHA and HEAD. A textual delta in a watched path LAPSES the
+# clearance even when nothing executable moved -- see backlog ticket 20, and do
+# NOT "fix" that by teaching this gate to parse files.
+#
+# This file is deliberately NOT in `watch`. A file cannot police itself, and
+# recording a clearance must not invalidate the clearance being recorded.
+#
+# KNOWN LIMIT, stated here because it is the thing a reader will over-trust:
+# this file is author-writable, so repointing every entry at HEAD is a
+# four-line edit that turns the check green AND makes the tree comparison
+# vacuous. The gate is a lapse DETECTOR, not an enforcement mechanism. Real
+# enforcement needs branch protection with required checks (currently OFF --
+# `gh api .../branches/master/protection` returns 404, rulesets empty) and a
+# review record outside the author's reach (this project has never had one:
+# zero GitHub approvals on any recent PR). Both are operator actions and
+# neither is code. See backlog ticket 13 (d) and (e).
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    "scout",
+    "scripts",
+    "tests",
+    ".github",
+    "dashboard",
+    "cron",
+    "ops",
+    "systemd",
+    "pyproject.toml",
+    "uv.lock",
+    "Dockerfile",
+    "docker-compose.yml",
+    "start.sh",
+]
+
+[clearances]
+# Mandatory vectors (ruling D's four -- not a per-PR choice). Every SHA below
+# was named by its reviewer AT THAT REVISION and re-derived by them after each
+# head move; none was carried forward. Nine head-moves occurred during review
+# and each lapsed the table, which is the gate working rather than failing.
+concurrency = "85ae29a00c5e1a998e75cd5f01c03150cbbbe63c"
+logic = "dde828cf6f598d69fe108e0994d506e4297f2329"
+ops-safety = "d197bbea1c6449dea6928c1e346059041eed2abc"
+silent-failure = "d197bbea1c6449dea6928c1e346059041eed2abc"
+
+# Non-mandatory, recorded because it carries information: this vector refused
+# three times on surviving mutants before clearing, so its green discriminates.
+test-efficacy = "e02fcbe7b072524c6f8b0b6b1d604a486bc501db"

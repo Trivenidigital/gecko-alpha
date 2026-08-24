@@ -1,0 +1,703 @@
+"""The lapse detector must FAIL on the states it exists to catch.
+
+A check that only ever passes is the thing it was built to replace. Each test
+drives the script against a purpose-built repository in a state that must be
+rejected, and asserts the exit code AND the reason -- because a check that
+fails for the wrong reason is one that will pass for the wrong reason later.
+
+Several of these exist because an independent reviewer broke the first draft:
+a misspelled watch entry silently reported coverage, `required` could be
+narrowed to one vector, a branch name was accepted where a SHA belongs, and
+every PR was forced to edit the declaration to go green. The bypasses that
+remain -- no branch protection, and an author-writable record -- are documented
+in the script's docstring rather than papered over, because they cannot be
+closed from inside the repository.
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "scripts" / "check_reviewer_clearances.py"
+
+MANDATORY_VECTORS = ["concurrency", "silent-failure", "ops-safety", "logic"]
+MANDATORY_WATCH = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml",
+    "start.sh",
+]
+
+
+def _git(repo, *args):
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    assert r.returncode == 0, f"git {' '.join(args)}: {r.stderr}"
+    return r.stdout.strip()
+
+
+def _run(repo, head="HEAD", base="master"):
+    """Run the real script against `repo`, with the declaration inside it."""
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), head, base],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "REVIEWERS_DECL": str(repo / ".reviewers.toml")},
+    )
+    return r.returncode, r.stdout + r.stderr
+
+
+#: Watch entries that are FILES rather than directories. The fixture has to
+#: know the difference: an earlier version created a directory for every entry,
+#: so writing to `repo/Dockerfile` raised PermissionError against a directory.
+WATCHED_FILES = {
+    "pyproject.toml",
+    "uv.lock",
+    "Dockerfile",
+    "docker-compose.yml",
+    "start.sh",
+}
+WATCHED_DIRS = [w for w in MANDATORY_WATCH if w not in WATCHED_FILES]
+
+
+@pytest.fixture
+def repo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir(parents=True, exist_ok=True)
+    for d in WATCHED_DIRS:
+        (r / d).mkdir(parents=True, exist_ok=True)
+    assert subprocess.run(["git", "init", "-q", str(r)], capture_output=True).returncode == 0
+    _git(r, "config", "user.email", "t@t")
+    _git(r, "config", "user.name", "t")
+    for d in WATCHED_DIRS:
+        (r / d / "f.txt").write_text("base\n")
+    for f in WATCHED_FILES:
+        (r / f).write_text("base\n")
+    (r / "docs").mkdir(exist_ok=True)
+    (r / "docs" / "d.md").write_text("docs\n")
+    _git(r, "add", "-A")
+    _git(r, "commit", "-qm", "base")
+    _git(r, "branch", "-M", "master")
+    return r
+
+
+def _decl(repo, clearances, required=None, watch=None):
+    required = MANDATORY_VECTORS if required is None else required
+    watch = MANDATORY_WATCH if watch is None else watch
+    body = "required = [" + ", ".join(f'"{v}"' for v in required) + "]\n"
+    body += "watch = [" + ", ".join(f'"{w}"' for w in watch) + "]\n\n[clearances]\n"
+    for k, v in clearances.items():
+        body += f'{k} = "{v}"\n'
+    (repo / ".reviewers.toml").write_text(body)
+
+
+def _branch_with(repo, name, path, content):
+    _git(repo, "checkout", "-q", "-b", name)
+    (repo / path).write_text(content)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", f"change {path}")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+# --------------------------------------------------------------------------
+# The delta question: clearances are demanded only when production moved.
+# --------------------------------------------------------------------------
+
+def test_a_docs_only_branch_needs_NO_clearance(repo):
+    """Otherwise every PR is forced to edit the record, which is the bad habit."""
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 0, out
+    assert "no clearance required" in out
+
+
+def test_a_branch_that_moves_a_watched_path_DEMANDS_a_clearance(repo):
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "prod", "scout/f.txt", "production moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "NO CLEARANCE RECORDED" in out
+    assert "delta in watched paths" in out and "scout" in out
+
+
+def test_a_clearance_covering_the_delta_PASSES(repo):
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "production moved\n")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record clearances")
+    # The clearance predates a docs-only commit, so it still covers the tree.
+    (repo / "docs" / "d.md").write_text("docs after review\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "docs after review")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 0, out
+    assert out.count("HOLDS") == len(MANDATORY_VECTORS)
+
+
+def test_a_clearance_stops_covering_once_production_moves_again(repo):
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "first change\n")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record")
+    (repo / "scout" / "f.txt").write_text("SECOND change, unreviewed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "unreviewed change")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "LAPSED" in out and "scout" in out
+
+
+# --------------------------------------------------------------------------
+# Bypasses an independent reviewer found in the first draft.
+# --------------------------------------------------------------------------
+
+def test_a_watch_entry_that_resolves_NOWHERE_is_fatal_not_silent(repo):
+    """The only fail-OPEN path in the first draft.
+
+    `_tree` returns None for a missing path and `None != None` is False, so a
+    misspelled entry compared equal, held, and printed the typo in the banner
+    as though it were covered.
+    """
+    _decl(repo, {}, watch=MANDATORY_WATCH + ["dashbaord"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "prod", "scout/f.txt", "moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "dashbaord" in out
+    assert "monitors nothing" in out
+
+
+def test_required_vectors_cannot_be_NARROWED(repo):
+    _decl(repo, {}, required=["logic"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "required vectors narrowed" in out
+    for v in ("concurrency", "ops-safety", "silent-failure"):
+        assert v in out
+
+
+def test_the_watch_list_cannot_be_NARROWED(repo):
+    _decl(repo, {}, watch=["scout"])
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "watch list narrowed" in out
+
+
+def test_a_BRANCH_NAME_is_rejected_by_the_SHAPE_CHECK(repo):
+    """A moving ref silently re-points as it moves; it records nothing.
+
+    Names the gate. There were briefly TWO gates rejecting this -- an early
+    shape pass and a per-vector branch -- raising the same exit code and
+    differing only in message. When the shape pass was added it made the loop
+    branch unreachable, and this assertion had been loosened to
+    `in out.lower()`, which let it keep passing against the new gate while its
+    name still described the old one. A reviewer proved the branch was dead by
+    replacing it with a sentinel and watching all 20 tests pass. The dead
+    branch is gone; this test now pins WHICH gate raises.
+    """
+    _decl(repo, {v: "master" for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "prod", "scout/f.txt", "moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "not a full 40-hex sha" in out.lower()
+    assert "recorded clearances are malformed" in out, (
+        "expected the early shape check to raise, not the per-vector loop"
+    )
+
+
+def test_an_UNKNOWN_sha_is_rejected_by_the_SHAPE_CHECK(repo):
+    """A bare `git rev-parse` echoes any 40-hex string back unverified.
+
+    Before `--verify ...^{commit}` this fell through to the ancestry check and
+    was reported as "not an ancestor" -- true of a commit that is not in the
+    repository at all, and misleading to debug.
+    """
+    _decl(repo, {v: "0" * 40 for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "prod", "scout/f.txt", "moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "is not a commit" in out.lower()
+    assert "recorded clearances are malformed" in out, (
+        "expected the early shape check to raise, not the per-vector loop"
+    )
+
+
+def test_a_NON_ANCESTOR_clearance_FAILS(repo):
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    side = _branch_with(repo, "sidebranch", "scout/f.txt", "side\n")
+    _git(repo, "checkout", "-q", "master")
+    _branch_with(repo, "prod", "scout/f.txt", "prod\n")
+    _decl(repo, {v: side for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record side sha")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "IS NOT AN ANCESTOR" in out
+
+
+def test_a_MISSING_declaration_FAILS(repo):
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert ".reviewers.toml" in out
+
+
+# --------------------------------------------------------------------------
+# The declaration actually shipped here.
+# --------------------------------------------------------------------------
+
+def test_the_shipped_declaration_names_every_mandatory_vector_and_path():
+    import tomllib
+
+    decl = tomllib.loads((REPO_ROOT / ".reviewers.toml").read_text(encoding="utf-8"))
+    assert set(decl["required"]) >= set(MANDATORY_VECTORS)
+    assert set(decl["watch"]) >= set(MANDATORY_WATCH)
+
+
+def _master_declaration_text() -> str | None:
+    """`.reviewers.toml` AS COMMITTED ON MASTER, or None if master has none.
+
+    Deliberately not the working tree. Reading the working tree made this test
+    and the gate MUTUALLY EXCLUSIVE, and no single commit could satisfy both:
+    the gate FAILS a branch with a watched delta unless clearances are recorded,
+    and this test FAILED the instant they were. The gate was therefore unusable
+    on exactly the branches it exists to police -- discovered when the first
+    real declaration was committed and CI went red in the other direction.
+
+    ABSENCE IS DETERMINED POSITIVELY, and the first draft of this helper got it
+    wrong in a way worth recording, because it is the defect this whole PR
+    exists to close, reintroduced by the fix for it. That draft ended:
+
+        return got.stdout if got.returncode == 0 else None
+
+    which routes EVERY nonzero `git show` into the same `None` the caller reads
+    as "master has no declaration" -- so a corrupt object, a partially-fetched
+    tree, or any `fatal: bad object` became a silent PASS against a master that
+    genuinely carried stale clearances. That is `_tree` exactly. The conflation
+    was split correctly at the REF layer and reproduced one layer down at the
+    FILE layer, which is the more interesting half: fixing a fail-open teaches
+    you the shape and not the habit of looking for it again.
+
+    `git ls-tree` is the fix rather than a second `git show`: it exits 0 with
+    EMPTY output for a path that is genuinely not there, so absence is a real
+    answer instead of the default bucket for failure. A nonzero exit is then
+    unambiguously "git could not tell me", and raises. Once existence is
+    established, a failing `git show` is also fatal -- the file is known to be
+    there, so a read failure is a broken environment, never an absence.
+
+    `--full-tree` is DEFENCE IN DEPTH, and is deliberately NOT pinned by a test.
+    `ls-tree` resolves its pathspec relative to the current directory, so from a
+    subdirectory the plain form returns exit 0 with empty output -- which this
+    helper would read as "master carries no declaration", a vacuous skip. But
+    **that state is not reachable here**: the call pins `cwd=REPO_ROOT`, and
+    `REPO_ROOT` is `parents[1]` of this file, i.e. the top level. Where pytest
+    happens to be invoked from is irrelevant, because `cwd` is set explicitly.
+
+    So removing the flag changes no observable behaviour, and a mutation that
+    drops it SURVIVES the suite. That survival is the EVIDENCE OF
+    UNREACHABILITY, not a missing test -- a property with no reachable effect
+    cannot be pinned, and a test that monkeypatched `REPO_ROOT` to a
+    subdirectory would be asserting against a configuration the code cannot
+    enter. Said plainly here so the absence of a pin reads as a decision rather
+    than an oversight.
+
+    An earlier version of this comment claimed the cwd-relative behaviour was a
+    live silent mode. It was not: the code never creates that cwd. Same class as
+    the two other comments corrected on this PR -- accurate about a mechanism
+    that is never reached. Kept anyway because it costs nothing -- but NOT
+    because it is defence against `REPO_ROOT` moving in general, which was the
+    next version of this comment and was also wrong. `REPO_ROOT` can move two
+    ways and the flag has OPPOSITE SIGNS in them. Measured:
+
+        A. REPO_ROOT descends BELOW the git root (cwd = <root>/tests)
+             plain       -> rc=0 out=''                 <- vacuous skip
+             --full-tree -> rc=0 out='.reviewers.toml'  <- flag HELPS
+
+        B. the git root ascends ABOVE REPO_ROOT (checkout vendored or
+           submoduled at <outer>/inner/)
+             plain       -> rc=0 out='.reviewers.toml'
+             --full-tree -> rc=0 out=''                 <- flag HURTS
+
+    In B the pathspec resolves against the OUTER root, misses
+    `inner/.reviewers.toml`, and returns exit 0 with empty output -- precisely
+    the vacuous skip the flag was added to prevent. So the flag defends
+    `REPO_ROOT` moving DOWN WITHIN this checkout, and inverts if this checkout
+    is ever nested inside another repository. If that day comes the fix is to
+    make the top level explicit (`-C` / `--git-dir`), not to pick a pathspec
+    convention -- both conventions are wrong in one of the two directions.
+
+    Recorded because the sentence this replaces asserted protective behaviour
+    in a hypothetical nobody had exercised -- an unreached-mechanism claim
+    three lines below the paragraph correcting an unreached-mechanism claim.
+    An unreachable state cannot ground a pin, and it cannot ground a safety
+    claim either.
+
+    A MISSING REF is separated from a missing FILE by resolving the ref first;
+    an unresolvable ref raises. Both calls carry an explicit timeout, and
+    `TimeoutExpired` is deliberately NOT caught: "git did not answer" must not
+    become "there is nothing there".
+    """
+    for ref in ("origin/master", "master"):
+        if subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True, cwd=REPO_ROOT, timeout=60,
+        ).returncode:
+            continue
+        listed = subprocess.run(
+            ["git", "ls-tree", "--full-tree", "--name-only", ref,
+             "--", ".reviewers.toml"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+        if listed.returncode != 0:
+            raise AssertionError(
+                f"git ls-tree failed against {ref}: {listed.stderr.strip()} -- "
+                "this is 'could not determine', NOT 'master carries none'"
+            )
+        if not listed.stdout.strip():
+            return None
+        got = subprocess.run(
+            ["git", "show", f"{ref}:.reviewers.toml"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+        if got.returncode != 0:
+            raise AssertionError(
+                f"{ref}:.reviewers.toml is listed in the tree but unreadable: "
+                f"{got.stderr.strip()} -- a read failure on a file known to "
+                "exist is a broken environment, never an absence"
+            )
+        return got.stdout
+    raise AssertionError(
+        "neither origin/master nor master resolves -- cannot determine what "
+        "master carries, and a check that cannot see its subject has not "
+        "cleared it"
+    )
+
+
+def test_the_shipped_declaration_records_no_stale_clearances():
+    """Master carries none: they are per-PR and belong on the PR branch.
+
+    Carrying a previous PR's SHAs would inherit a misleading verdict onto every
+    new branch -- and because this repo squash-merges, those SHAs stop being
+    ancestors of master the moment the PR lands, so the verdict would be
+    'IS NOT AN ANCESTOR' on work that has nothing to do with them.
+
+    THE POST-MERGE STEP THIS IMPLIES IS REAL AND EASY TO FORGET: squash-merging
+    a cleared PR carries its clearances into master, so master must be reset to
+    an empty `[clearances]` after every cleared merge. This test is what catches
+    a forgotten reset. Backlog ticket 21 removes the step entirely by giving
+    each PR its own file.
+
+    VACUOUS UNTIL MASTER FIRST CARRIES A DECLARATION, which is the state today:
+    `.reviewers.toml` is new in this PR, so master has none and the assertion
+    below has never once executed. Do not read a pass here as evidence that
+    master is clean. It ARMS at the first cleared merge.
+
+    SKIP, NOT RETURN, and the distinction is load-bearing. A red on master has
+    two green-making fixes: empty `[clearances]` (correct), or DELETE
+    `.reviewers.toml` (wrong, and green). A bare `return` reports PASSED while
+    silently disabling both this test and the gate's declaration at once --
+    converting a detected failure into a permanently undetected one. SKIPPED is
+    visible in CI and cannot be mistaken for a verified pass. Ticket 21's
+    deferral is CONDITIONAL on this line: deferring is only safe while the
+    forgotten-reset failure stays loud.
+
+    SCOPE, stated precisely because the first version of this claim was wrong
+    and the second one overstated the gap. Scoping to master does NOT lose
+    nothing: the gate's ancestry check sits BEHIND its delta-empty shortcut
+    (`if not delta: return 0` precedes the per-vector loop), so a DOCS-ONLY
+    branch can carry a stale clearance without it ever being examined.
+
+    But the residual is NARROWER than "foreign SHAs pass on docs-only
+    branches". `_validate_clearance_shapes` runs BEFORE the delta shortcut, so
+    anything malformed or not a commit in this repo is rejected regardless of
+    delta. What slips through is only a SHA that is a REAL COMMIT here but not
+    an ancestor of the head -- a copy-paste from another branch, never an
+    invention. So the live case is accidental staleness, not fabrication, and
+    it surfaces one PR later once merged to master: the same detection lag
+    already documented for the reset step, not a new class.
+
+    THAT NARROWING RESTS ON A PREMISE THREE HUNDRED LINES AWAY, and collapses
+    without it. The shape loop iterates `clearances` filtered by
+    `if v in required_set`, so it only rejects fabrications for vectors that are
+    actually in `required`. That is safe today only because `required` comes
+    from the DECLARATION and `MANDATORY_VECTORS - required_set` must be empty or
+    the run exits 1 -- so all four vectors are always in the filter regardless
+    of delta. **Make `required` delta-derived** -- a plausible optimisation, since
+    on a docs-only PR no vector is strictly needed -- **and the filter empties,
+    fabricated SHAs stop being examined, and this residual silently widens back
+    from "a real commit that is not an ancestor" to "anything at all".** Recorded
+    here because whoever makes that change will be reading the gate, not this
+    test, and nothing on that side says a docs-only bound depends on it.
+    """
+    import tomllib
+
+    text = _master_declaration_text()
+    if text is None:
+        pytest.skip("bootstrap: master carries no declaration yet")
+
+    decl = tomllib.loads(text)
+    assert decl.get("clearances", {}) == {}, (
+        "master's declaration must not carry clearance SHAs; record them on the "
+        "PR branch that obtained them. If a cleared PR was just squash-merged, "
+        "reset master's [clearances] to empty -- its SHAs are no longer "
+        "ancestors and would misreport on unrelated work."
+    )
+
+
+# --------------------------------------------------------------------------
+# `_master_declaration_text` -- PINNING the hardening, because it arrived
+# unguarded. A reviewer mutated all three properties this helper exists to
+# establish and every one reverted SILENTLY GREEN: ls-tree-failure -> None,
+# show-failure -> None, and skip -> bare return. Guards added during review are
+# the least-attacked code in the tree, and these three are load-bearing --
+# M17 in particular is the premise ticket 21's deferral rests on, so a one-line
+# revert would invalidate a recorded decision with nothing to report it.
+# --------------------------------------------------------------------------
+
+def _patch_git(monkeypatch, *, ls_rc=0, ls_out="", show_rc=0, show_out=""):
+    """Drive `_master_declaration_text`'s three git calls, counting hits.
+
+    Returns the counter. Every test below asserts it moved -- a fake that is
+    never reached produces a pass indistinguishable from a real one, which is
+    the failure mode these tests exist to close one level down.
+    """
+    seen = {"n": 0}
+    real = subprocess.run
+
+    def fake(cmd, **kw):
+        if not (len(cmd) > 1 and cmd[0] == "git"):
+            return real(cmd, **kw)
+        if cmd[1] == "rev-parse":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[1] == "ls-tree":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, ls_rc, ls_out, "boom")
+        if cmd[1] == "show":
+            seen["n"] += 1
+            return subprocess.CompletedProcess(cmd, show_rc, show_out, "boom")
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    return seen
+
+
+def test_a_git_FAILURE_is_not_reported_as_an_absent_declaration(monkeypatch):
+    """M16. `ls-tree` failing is "could not determine", never "carries none".
+
+    The blocking fail-open this helper was rewritten to close: any nonzero git
+    exit routed into the `None` the caller reads as "master has no
+    declaration", so a corrupt object read as a clean master and PASSED.
+    """
+    seen = _patch_git(monkeypatch, ls_rc=128)
+    with pytest.raises(AssertionError, match="NOT 'master carries none'"):
+        _master_declaration_text()
+    assert seen["n"] >= 2, "git was never called; test proves nothing"
+
+
+def test_an_UNREADABLE_blob_is_not_reported_as_an_absent_declaration(monkeypatch):
+    """M18. Listed in the tree but unreadable is a broken environment.
+
+    Distinct from M16 by LAYER: the tree resolves and names the path, then the
+    blob will not read. Both once collapsed into the same silent `None`.
+    """
+    seen = _patch_git(monkeypatch, ls_out=".reviewers.toml", show_rc=128)
+    with pytest.raises(AssertionError, match="listed in the tree but unreadable"):
+        _master_declaration_text()
+    assert seen["n"] >= 3, "git show was never reached; test proves nothing"
+
+
+def test_the_BOOTSTRAP_path_skips_rather_than_passing_silently(monkeypatch):
+    """M17. A vacuous pass and a real pass must not look the same.
+
+    THE PREMISE OF TICKET 21'S DEFERRAL. Deferring per-PR clearance files is
+    only safe while a forgotten `[clearances]` reset fails LOUDLY. A bare
+    `return` here reports PASSED while disabling both this test and the gate's
+    declaration -- converting a detected failure into a permanently undetected
+    one, and silently invalidating a recorded decision. `Skipped` is visible.
+    """
+    seen = _patch_git(monkeypatch, ls_out="")
+    assert _master_declaration_text() is None
+    with pytest.raises(pytest.skip.Exception):
+        test_the_shipped_declaration_records_no_stale_clearances()
+    assert seen["n"] >= 2, "git was never called; test proves nothing"
+
+
+# --------------------------------------------------------------------------
+# The delta shortcut changed what an omission from `watch` MEANS.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["cron", "ops", "systemd"])
+def test_the_deploy_substrate_DEMANDS_a_clearance(repo, path):
+    """Regression for a hole a fix opened.
+
+    While a clearance was demanded unconditionally, a path missing from `watch`
+    only failed to LAPSE one. Once "no delta in watched paths" became a pass,
+    every omission became a silent full exemption -- reported as "no clearance
+    required". `cron`, `ops` and `systemd` are the deploy substrate: a
+    2-minute cron entry once migrated the live database into 74 `database is
+    locked` errors, and systemd units run scripts from `/usr/local/bin` copies
+    so `git pull` deploys nothing.
+    """
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, f"sub-{path}", f"{path}/f.txt", "deploy substrate moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert path in out
+    assert "NO CLEARANCE RECORDED" in out
+
+
+def test_a_malformed_clearance_is_caught_even_when_none_is_DEMANDED(repo):
+    """Otherwise a typo hides through every docs-only PR.
+
+    The per-vector loop never runs when there is no delta, so without this a
+    malformed SHA sits unvalidated and then fails all four vectors at once on
+    the first PR that touches production -- the least convenient moment to
+    discover it.
+    """
+    _decl(repo, {v: "not-a-sha" for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "docsonly", "docs/d.md", "docs change only\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "malformed" in out
+    assert "not a full 40-hex SHA" in out
+
+
+@pytest.mark.parametrize("path", ["pyproject.toml", "uv.lock", "Dockerfile"])
+def test_a_ROOT_FILE_change_demands_a_clearance(repo, path):
+    """A claim I shipped as a documented limitation, which was simply false.
+
+    An earlier draft asserted root files could not be watched "because a path
+    prefix cannot reach a root file", and a test pinned that gap in place.
+    `git rev-parse <rev>:pyproject.toml` returns a BLOB hash; comparing blobs
+    is the same operation as comparing trees. The limitation was an artifact of
+    never running the claim -- and the test asserting it would have kept a
+    dependency bump exempt from review indefinitely.
+    """
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    # git refuses a ref ending in ".lock", so sanitise the branch name.
+    safe = path.replace(".", "-")
+    _git(repo, "checkout", "-q", "-b", f"root-{safe}")
+    (repo / path).write_text("changed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", f"change {path}")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert path in out
+    assert "NO CLEARANCE RECORDED" in out
+
+
+# --------------------------------------------------------------------------
+# A timeout is not an answer. The fail-open a fix introduced.
+# --------------------------------------------------------------------------
+
+def _load_checker():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("chk_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_git_TIMEOUT_is_not_reported_as_an_absent_path(repo, monkeypatch):
+    """The fail-open introduced by the subprocess-timeout hardening.
+
+    `_git` originally converted `TimeoutExpired` into `RuntimeError` -- the same
+    type it raises for "no such object". `_tree` catches `RuntimeError` and
+    returns None, and None is `_moved`'s encoding for "path absent at that
+    revision". So a timeout became indistinguishable from an absent path, and a
+    reviewer showed the consequence: with two transient timeouts against a repo
+    where `scout/` had genuinely moved, `_moved` returned `([], [])` and the
+    check printed "no delta in watched paths; no clearance required", exit 0.
+
+    A production change reported as needing no review, reached without touching
+    the declaration. `GitTimeout` now has its own type and `_tree` does not
+    catch it.
+    """
+    import subprocess as sp
+
+    mod = _load_checker()
+    real = sp.run
+    seen = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if len(cmd) > 2 and cmd[1] == "rev-parse" and ":scout" in cmd[-1]:
+            seen["n"] += 1
+            raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    with pytest.raises(mod.GitTimeout):
+        mod._moved(["scout"], "HEAD", "HEAD")
+    assert seen["n"] >= 1, "the timeout was never triggered; test proves nothing"
+
+
+def test_the_cli_turns_a_timeout_into_exit_2_not_a_traceback(repo, monkeypatch):
+    """"git did not answer" is the "could not work out what to compare" case.
+
+    Emphatically not 0: a check that cannot see the tree has not cleared it.
+    """
+    import subprocess as sp
+
+    mod = _load_checker()
+    real = sp.run
+
+    def always_times_out(cmd, **kw):
+        if len(cmd) > 1 and cmd[1] in ("rev-parse", "merge-base"):
+            raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", always_times_out)
+    monkeypatch.setattr(mod, "DECL", repo / ".reviewers.toml")
+    _decl(repo, {})
+    rc = mod._cli(["check", "HEAD", "master"])
+    assert rc == 2, f"a timeout must not read as a pass or a clearance verdict (got {rc})"
+
+
+def test_a_malformed_required_that_is_not_a_list_of_strings_FAILS_cleanly(repo):
+    """The coercion guard stopped one statement short of the crash it closed.
+
+    `required = [["logic"]]` raised `TypeError: cannot use 'list' as a set
+    element` at the `set(required)` on the next line -- the same
+    "crash presenting as exit 1" class, one statement further on.
+    """
+    (repo / ".reviewers.toml").write_text(
+        'required = [["logic"]]\nwatch = ["scout"]\n\n[clearances]\n'
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "malformed" in out
+    assert "Traceback" not in out

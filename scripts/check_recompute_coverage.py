@@ -215,7 +215,15 @@ def main() -> int:
         # silently produced "no collapse" forever. A silent failure inside the
         # code added to fix silent failures.
         collapsed = []
-        have_baseline = False
+        # PER-SURFACE, not a global OR. `have_baseline = any(surface has a row)`
+        # meant one armed surface suppressed the NOT-ARMED notice for the other
+        # two -- the alert text printed `mark=none` twice and the notice stayed
+        # quiet, then a real collapse on an unarmed surface exited 0 in silence.
+        # That is character-for-character the shape this file's own comment says
+        # it fixed twice ("printing losers=0/5 trending=0/5 in its own alert
+        # text and exiting 0"), repeated in the notice.
+        unarmed_surfaces_seen = []
+        unreadable_surfaces = []
         for table, _anchor in SURFACES:
             try:
                 row = conn.execute(
@@ -224,11 +232,28 @@ def main() -> int:
                     (table,),
                 ).fetchone()
             except sqlite3.Error:
-                break  # baseline table absent (pre-deploy): nothing to compare
+                # `break` here abandoned the remaining surfaces AND left the
+                # global flag set, so a transient `database is locked` on
+                # surface 1 silently skipped 2 and 3 with a clean line -- most
+                # likely exactly when collapse detection matters most (backfill
+                # running, heavy write load). Record it and keep going; a
+                # genuinely absent table fails every surface and is reported.
+                # PER-SURFACE, for the same reason the notice below is. A
+                # global flag could not report the MIXED case -- one surface's
+                # read raising transiently while another holds a mark -- which
+                # is precisely the case the `break` -> `continue` change was
+                # made to support. The fix's own motivating scenario was the
+                # one its notice could not describe.
+                unreadable_surfaces.append(table)
+                continue
             if row:
-                have_baseline = True
                 marks[table] = row[0]
             pop, rec = per_surface.get(table, (0, 0))
+            if not row and pop >= COLLAPSE_MIN_POPULATION:
+                # Big enough to be judged, and no mark. THIS is unarmed; a
+                # below-floor surface is the documented steady state and must
+                # not be named, or the notice cries wolf on the normal path.
+                unarmed_surfaces_seen.append(table)
             if not row or pop < COLLAPSE_MIN_POPULATION:
                 continue
             # The SAME predicate the probe uses to decide a mark is not
@@ -280,10 +305,18 @@ def main() -> int:
             if unarchivable < population
             else "THE BACKFILL CANNOT HELP: every row post-dates the archives"
         )
+        # When BOTH fire, the branch above is skipped by `and not dark` and the
+        # collapse surface names were dropped entirely -- the page still went
+        # out, but without the reason, on an alarm whose whole premise is that
+        # an operator who cannot act on a page stops reading them. `collapsed`
+        # is already computed; naming it costs one clause.
+        also = (
+            f" ALSO COLLAPSED on {', '.join(collapsed)}." if collapsed else ""
+        )
         print(
             f"overlay recovering NOTHING on {', '.join(dark)}: "
             f"{recovered} of {population} pre-cutover chains detections keep "
-            f"their credit, {unarchivable} unarchivable ({summary}). {remedy}"
+            f"their credit, {unarchivable} unarchivable ({summary}).{also} {remedy}"
         )
         return 1
     # Name the un-armed state. The collapse half of this alarm is gated on the
@@ -291,11 +324,20 @@ def main() -> int:
     # design and cannot bootstrap one. Without saying so, "no baseline yet"
     # reads identically to "no collapse", which is the wrong reassurance for an
     # alarm built because the in-process log is operationally silence.
-    armed = (
-        ""
-        if have_baseline
-        else "  [collapse detection NOT ARMED: no baseline recorded yet]"
-    )
+    notices = []
+    if unreadable_surfaces:
+        notices.append(
+            "collapse detection NOT ARMED on "
+            + ", ".join(sorted(unreadable_surfaces))
+            + ": baseline unreadable"
+        )
+    if unarmed_surfaces_seen:
+        notices.append(
+            "collapse detection NOT ARMED on "
+            + ", ".join(sorted(unarmed_surfaces_seen))
+            + ": no baseline recorded yet"
+        )
+    armed = "  [" + "; ".join(notices) + "]" if notices else ""
     print(
         f"recovered {recovered} of {population}, "
         f"{unarchivable} unarchivable ({summary}){armed}"
