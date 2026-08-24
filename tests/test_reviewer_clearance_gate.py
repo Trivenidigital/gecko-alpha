@@ -385,12 +385,20 @@ def test_the_shipped_declaration_records_no_stale_clearances():
     deferral is CONDITIONAL on this line: deferring is only safe while the
     forgotten-reset failure stays loud.
 
-    SCOPE, stated precisely because the first version of this claim was wrong.
-    Scoping to master does NOT lose nothing. The gate's ancestry check sits
-    BEHIND its delta-empty shortcut, so a DOCS-ONLY branch carrying foreign
-    non-ancestor SHAs exits 0 and is not caught here either -- it surfaces one
-    PR later, once merged to master. That is the same detection lag already
-    documented for the reset step, not a new class.
+    SCOPE, stated precisely because the first version of this claim was wrong
+    and the second one overstated the gap. Scoping to master does NOT lose
+    nothing: the gate's ancestry check sits BEHIND its delta-empty shortcut
+    (`if not delta: return 0` precedes the per-vector loop), so a DOCS-ONLY
+    branch can carry a stale clearance without it ever being examined.
+
+    But the residual is NARROWER than "foreign SHAs pass on docs-only
+    branches". `_validate_clearance_shapes` runs BEFORE the delta shortcut, so
+    anything malformed or not a commit in this repo is rejected regardless of
+    delta. What slips through is only a SHA that is a REAL COMMIT here but not
+    an ancestor of the head -- a copy-paste from another branch, never an
+    invention. So the live case is accidental staleness, not fabrication, and
+    it surfaces one PR later once merged to master: the same detection lag
+    already documented for the reset step, not a new class.
     """
     import tomllib
 
