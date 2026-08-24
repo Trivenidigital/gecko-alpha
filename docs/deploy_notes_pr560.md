@@ -53,3 +53,16 @@ run a blob-identity check, seen only docs move, and never mutated the unit scan
 Every reviewer claim on this PR that was anchored to `cdbb8475..HEAD` or to the
 box was untouched by all four drifts. The one discipline that caught the
 material drift was a per-file blob-identity check — which is itself a diff.
+
+**Fifth drift, same class:** I told a reviewer `scripts/check_recompute_coverage.py`
+had moved in a commit where it had not — the delta was `backlog.md` plus two
+test files. Their conclusion (re-run rather than transfer) was right and my
+reason was wrong, and separating those matters because the correct rule is
+theirs:
+
+> Re-run a mutation sweep when the subject **or any consumer** moves.
+> Subject-identical plus consumer-changed is exactly the case where a
+> transferred survivor list over-reports.
+
+A sweep's result is a function of subject × consumers. Blob-identity on the
+subject alone is not sufficient to transfer it.
