@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the reviewer-clearance gate resolves SHAs that
+          # a shallow clone does not contain, and a missing commit there
+          # is indistinguishable from a revoked clearance.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -20,6 +25,15 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --all-extras
+
+      - name: Reviewer-clearance gate (ruling D)
+        # pull_request only: this repo squash-merges, so after a merge the
+        # clearance SHAs are no longer ancestors of master and the gate would
+        # fail every push. The revision under review is the PR head.
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --quiet origin "$GITHUB_BASE_REF" || true
+          uv run python scripts/check_reviewer_clearances.py "${{ github.event.pull_request.head.sha }}"
 
       - name: Dashboard contract firewalls
         timeout-minutes: 5

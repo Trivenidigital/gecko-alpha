@@ -44,6 +44,88 @@ history snapshots under `/root` still exist.
 Re-runnable. Keyed on `(source_table, source_row_id)`, so a second run
 overwrites its own rows and nothing else.
 
+## Deploy watchpoint 1 — the PK rebuild may not run at all
+
+`_migrate_chain_identity_recompute_pk_v2` rebuilds the overlay's PRIMARY KEY to
+include `semantics_version`. **It only rebuilds on a database that already
+carries the earlier shape.** A database with no `chain_identity_recompute_v1`
+takes the fresh-install path: `CREATE TABLE IF NOT EXISTS` already emits the v2
+shape, and the migration returns after stamping.
+
+The two paths stamp **differently**, and this has already misled once:
+
+| path | `paper_migrations` | `schema_version` 20260826 |
+|---|---|---|
+| rebuild (upgrade) | stamped | **stamped** |
+| fresh install | stamped | **absent** |
+
+So on a first deploy there is **no `schema_version = 20260826` row**, and
+looking for one reports a failure that has not happened. Verify the **shape**,
+not the stamp:
+
+```bash
+sqlite3 scout.db "SELECT sql FROM sqlite_master WHERE name='chain_identity_recompute_v1';"   | grep -c 'PRIMARY KEY (source_table, source_row_id, semantics_version)'   # expect 1
+sqlite3 scout.db "SELECT 1 FROM paper_migrations WHERE name='chain_identity_recompute_pk_v2';"
+```
+
+`schema_version` is therefore **not** a reliable indicator that the v2 shape is
+present. Tracked as BL-NEW-RECOMPUTE-PROBE-OBSERVABILITY-RESIDUALS.
+
+On a database that *does* rebuild, the first production run is also the first
+concurrent-startup exercise of the archive CTAS. Verified under injected
+failure is not the same as having run once in production. Watch that the
+migration completes before any other process's `initialize()` reaches it, and
+that no `chain_identity_recompute_v1_pk2` orphan survives — `BEGIN EXCLUSIVE`
+makes the scratch `CREATE` part of the transaction so a rollback removes it,
+and `DROP TABLE IF EXISTS` recovers a database already wedged by an older
+build. This is the same shape as the incident where a 2-minute cron migrated
+the live DB and produced 74 `database is locked` errors: readers must open
+read-only **before** `initialize()`.
+
+## Deploy watchpoint 2 — the migration→backfill zero-coverage interval
+
+**Between the migration and the completion of the backfill, coverage is `0.0`.
+That is a deployment phase, not normal runtime.**
+
+In that interval the mark is `0.0`, which makes `rate < best * _COLLAPSE_FRACTION`
+unsatisfiable for every rate — so **`collapsed` cannot fire, by construction.**
+`dark_surfaces` is the *only* observable, and it is load-bearing. Silencing it,
+or letting alert dedup/cooldown fold it into background noise, converts a
+temporary deployment state into an invisible permanent one.
+
+**The backfill is part of the deployment, not a later optional operation.** Do
+not leave the system sitting at `0.0`. Minimise the interval and timestamp it:
+
+```
+migration_complete → backfill_start → first_nonzero_coverage → backfill_complete
+```
+
+A worked interval, from the 2026-08-24 production deploy of `cdbb8475`:
+
+```
+migration_complete    2026-08-23T23:54:37.555Z
+backfill_start        2026-08-23T23:57:06.892Z
+backfill_complete     2026-08-23T23:57:31.699Z      (2m54s total)
+```
+
+**Note what that window does *not* prove.** The probe runs inside
+`_run_hourly_maintenance` — hourly. A window shorter than the probe period
+contains no probe tick, so `dark_surfaces` never gets an opportunity to fire.
+Its absence there is a consequence of minimising the window as instructed, and
+is **not** evidence the observable works. Do not record "dark_surfaces behaved
+correctly" on the strength of a window it never sampled.
+
+Because the probe is hourly, a freshly-backfilled deploy can otherwise sit
+un-armed for up to an hour. Arm it deliberately rather than waiting — the same
+call the scheduler makes:
+
+```python
+cov = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+```
+
+`collapsed` becomes reachable only once that baseline row exists. That ordering
+is correct and worth confirming rather than assuming.
+
 ## Monitoring (§12a)
 
 Two layers, because neither is sufficient alone:

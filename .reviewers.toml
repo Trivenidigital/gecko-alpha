@@ -1,0 +1,23 @@
+# Independent-review clearances for the current merge candidate (ruling D).
+#
+# Enforced mechanically by scripts/check_reviewer_clearances.py in CI, so an
+# absent or lapsed clearance makes the candidate unmergeable rather than
+# depending on the implementer noticing that one expired.
+#
+# A clearance is a property of a REVISION. Record the SHA the vector was
+# actually measured on -- not the branch head at the time, and not a later SHA
+# that happens to contain it.
+
+required = ["concurrency", "silent-failure", "ops-safety", "logic"]
+
+# Tree hashes of these paths are compared between each clearance SHA and the
+# head under review. Names are not enough: a name-level diff misses a file
+# restored to the wrong baseline.
+watch = ["scout", "scripts"]
+
+[clearances]
+# PR #559, all four terminal and verified holding at the merge head cdbb8475.
+concurrency    = "f7a200cf"
+silent-failure = "f7a200cf"
+ops-safety     = "014ce900"
+logic          = "1aa81f7e"
