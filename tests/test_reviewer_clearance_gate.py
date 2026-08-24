@@ -414,6 +414,19 @@ def test_the_shipped_declaration_records_no_stale_clearances():
     invention. So the live case is accidental staleness, not fabrication, and
     it surfaces one PR later once merged to master: the same detection lag
     already documented for the reset step, not a new class.
+
+    THAT NARROWING RESTS ON A PREMISE THREE HUNDRED LINES AWAY, and collapses
+    without it. The shape loop iterates `clearances` filtered by
+    `if v in required_set`, so it only rejects fabrications for vectors that are
+    actually in `required`. That is safe today only because `required` comes
+    from the DECLARATION and `MANDATORY_VECTORS - required_set` must be empty or
+    the run exits 1 -- so all four vectors are always in the filter regardless
+    of delta. **Make `required` delta-derived** -- a plausible optimisation, since
+    on a docs-only PR no vector is strictly needed -- **and the filter empties,
+    fabricated SHAs stop being examined, and this residual silently widens back
+    from "a real commit that is not an ancestor" to "anything at all".** Recorded
+    here because whoever makes that change will be reading the gate, not this
+    test, and nothing on that side says a docs-only bound depends on it.
     """
     import tomllib
 
