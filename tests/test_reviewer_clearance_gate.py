@@ -288,10 +288,31 @@ def _master_declaration_text() -> str | None:
     on exactly the branches it exists to police -- discovered when the first
     real declaration was committed and CI went red in the other direction.
 
-    `git show` failing means master has no declaration at all, which is the
-    bootstrap state and carries no clearances vacuously. That is a real answer,
-    not an "I could not tell": a MISSING ref is distinguished from a missing
-    FILE by resolving the ref first, and an unresolvable ref raises.
+    ABSENCE IS DETERMINED POSITIVELY, and the first draft of this helper got it
+    wrong in a way worth recording, because it is the defect this whole PR
+    exists to close, reintroduced by the fix for it. That draft ended:
+
+        return got.stdout if got.returncode == 0 else None
+
+    which routes EVERY nonzero `git show` into the same `None` the caller reads
+    as "master has no declaration" -- so a corrupt object, a partially-fetched
+    tree, or any `fatal: bad object` became a silent PASS against a master that
+    genuinely carried stale clearances. That is `_tree` exactly. The conflation
+    was split correctly at the REF layer and reproduced one layer down at the
+    FILE layer, which is the more interesting half: fixing a fail-open teaches
+    you the shape and not the habit of looking for it again.
+
+    `git ls-tree` is the fix rather than a second `git show`: it exits 0 with
+    EMPTY output for a path that is genuinely not there, so absence is a real
+    answer instead of the default bucket for failure. A nonzero exit is then
+    unambiguously "git could not tell me", and raises. Once existence is
+    established, a failing `git show` is also fatal -- the file is known to be
+    there, so a read failure is a broken environment, never an absence.
+
+    A MISSING REF is separated from a missing FILE by resolving the ref first;
+    an unresolvable ref raises. Both calls carry an explicit timeout, and
+    `TimeoutExpired` is deliberately NOT caught: "git did not answer" must not
+    become "there is nothing there".
     """
     for ref in ("origin/master", "master"):
         if subprocess.run(
@@ -299,11 +320,28 @@ def _master_declaration_text() -> str | None:
             capture_output=True, cwd=REPO_ROOT, timeout=60,
         ).returncode:
             continue
+        listed = subprocess.run(
+            ["git", "ls-tree", "--name-only", ref, "--", ".reviewers.toml"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+        if listed.returncode != 0:
+            raise AssertionError(
+                f"git ls-tree failed against {ref}: {listed.stderr.strip()} -- "
+                "this is 'could not determine', NOT 'master carries none'"
+            )
+        if not listed.stdout.strip():
+            return None
         got = subprocess.run(
             ["git", "show", f"{ref}:.reviewers.toml"],
             capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
         )
-        return got.stdout if got.returncode == 0 else None
+        if got.returncode != 0:
+            raise AssertionError(
+                f"{ref}:.reviewers.toml is listed in the tree but unreadable: "
+                f"{got.stderr.strip()} -- a read failure on a file known to "
+                "exist is a broken environment, never an absence"
+            )
+        return got.stdout
     raise AssertionError(
         "neither origin/master nor master resolves -- cannot determine what "
         "master carries, and a check that cannot see its subject has not "
@@ -321,15 +359,36 @@ def test_the_shipped_declaration_records_no_stale_clearances():
 
     THE POST-MERGE STEP THIS IMPLIES IS REAL AND EASY TO FORGET: squash-merging
     a cleared PR carries its clearances into master, so master must be reset to
-    an empty `[clearances]` after every such merge. This test is what catches a
-    forgotten reset -- on the NEXT PR, before its author inherits the confusion.
-    Backlog ticket 21 removes the step entirely by giving each PR its own file.
+    an empty `[clearances]` after every cleared merge. This test is what catches
+    a forgotten reset. Backlog ticket 21 removes the step entirely by giving
+    each PR its own file.
+
+    VACUOUS UNTIL MASTER FIRST CARRIES A DECLARATION, which is the state today:
+    `.reviewers.toml` is new in this PR, so master has none and the assertion
+    below has never once executed. Do not read a pass here as evidence that
+    master is clean. It ARMS at the first cleared merge.
+
+    SKIP, NOT RETURN, and the distinction is load-bearing. A red on master has
+    two green-making fixes: empty `[clearances]` (correct), or DELETE
+    `.reviewers.toml` (wrong, and green). A bare `return` reports PASSED while
+    silently disabling both this test and the gate's declaration at once --
+    converting a detected failure into a permanently undetected one. SKIPPED is
+    visible in CI and cannot be mistaken for a verified pass. Ticket 21's
+    deferral is CONDITIONAL on this line: deferring is only safe while the
+    forgotten-reset failure stays loud.
+
+    SCOPE, stated precisely because the first version of this claim was wrong.
+    Scoping to master does NOT lose nothing. The gate's ancestry check sits
+    BEHIND its delta-empty shortcut, so a DOCS-ONLY branch carrying foreign
+    non-ancestor SHAs exits 0 and is not caught here either -- it surfaces one
+    PR later, once merged to master. That is the same detection lag already
+    documented for the reset step, not a new class.
     """
     import tomllib
 
     text = _master_declaration_text()
     if text is None:
-        return  # master has no declaration yet; it carries no clearances
+        pytest.skip("bootstrap: master carries no declaration yet")
 
     decl = tomllib.loads(text)
     assert decl.get("clearances", {}) == {}, (

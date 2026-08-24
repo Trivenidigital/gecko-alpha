@@ -122,6 +122,15 @@ open. Endorsed independently by the logic and test-efficacy slots.
 
 ## Required after merge
 
-**`install` + `daemon-reload` on the box.** See `docs/deploy_notes_pr560.md`.
-Until it runs, the unit-file half of this PR is not deployed, and nothing in
-this repository or its CI can tell you so.
+**1. `install` + `daemon-reload` on the box.** See `docs/deploy_notes_pr560.md`.
+Until it runs, the unit-file half of this PR is not deployed, and **nothing in
+this repository or its CI can tell you so.**
+
+**2. Reset master's `[clearances]` to empty.** Squash-merge carries this PR's
+clearance SHAs onto master, where they stop being ancestors. Unlike step 1 this
+one is **loud** if forgotten — master's own push-CI goes red with an assertion
+naming the remedy. Empty the table; do not delete the file.
+
+The two are not equivalent and the difference is the whole point: step 1 is
+silent, step 2 is detected. Ticket 21 removes step 2 entirely by giving each PR
+its own file.

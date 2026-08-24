@@ -9,6 +9,21 @@ systemd reads `/etc/systemd/system`, not the repo:
     systemctl daemon-reload
     systemctl list-timers recompute-coverage-watchdog.timer   # verify still armed
 
+**Also post-merge, in the repo rather than on the box — reset master's
+clearances:**
+
+    # squash-merge carries this PR's clearance SHAs onto master, where they are
+    # no longer ancestors and would misreport on unrelated work.
+    # Empty the table; do NOT delete the file (deleting it turns the guard
+    # green while disabling it -- see the test's SKIP-NOT-RETURN note).
+    $EDITOR .reviewers.toml   # [clearances] -> empty
+
+These two steps are NOT equivalent and should not be treated as a pair. Skipping
+the `install` above has **no observable anywhere** and lands in production.
+Forgetting the reset goes red on master's own push-CI within one run, with an
+assertion naming the remedy. Detected-with-remedy is a different risk class from
+silent; pairing them invites mis-investment in both directions.
+
 Skip the install and the new `ExecStartPre=/usr/bin/test -x` preflights are
 present in the diff, green in CI, and absent from what systemd executes.
 
