@@ -222,3 +222,100 @@ async def test_the_agreement_harness_can_actually_fail(db, tmp_path):
 
     assert probe["not_recovering"] is True, "fixture no longer produces a collapse"
     assert _checker_pages(db._db_path) is True
+
+
+# --------------------------------------------------------------------------
+# SURFACE. The axis this bridge never varied.
+# --------------------------------------------------------------------------
+
+SURFACE_COLS = {
+    "gainers_comparisons": "appeared_on_gainers_at",
+    "losers_comparisons": "appeared_on_losers_at",
+    "trending_comparisons": "appeared_on_trending_at",
+}
+
+
+async def _populate_surface(db, table, population, recovered):
+    """Same shape as `_populate`, but for any surface.
+
+    `_populate` and `_mark` hardcode `gainers_comparisons`, and so does
+    `test_recompute_coverage_watchdog._build`. The only non-gainers rows
+    anywhere in the tree are 5 losers rows that sit below
+    `COLLAPSE_MIN_POPULATION` and describe a `dark` case -- so the CHECKER's
+    collapse branch had never once been reached with a non-gainers surface.
+
+    A reviewer proved the consequence: adding `and table ==
+    "gainers_comparisons"` to the checker's collapse condition survives all
+    7,135 tests. That is the F3 defect again, on the PAGING layer, where it is
+    strictly worse -- the probe's verdict goes to journald and, by the
+    checker's own docstring, nothing greps journald for it.
+
+    This file is the cross-layer bridge. It varies population, rate, version,
+    status and clear-outcome. It never varied surface.
+    """
+    anchor_col = SURFACE_COLS[table]
+    for i in range(population):
+        cur = await db._conn.execute(
+            f"""INSERT INTO {table}
+               (coin_id, symbol, name, {anchor_col}, detected_by_chains,
+                chains_lead_minutes, is_gap, created_at, chains_identity_semantics)
+               VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+            (f"{table}-{i}", ANCHOR, ANCHOR),
+        )
+        if i < recovered:
+            await db._conn.execute(
+                """INSERT INTO chain_identity_recompute_v1
+                   (source_table, source_row_id, coin_id, symbol, historical_anchor,
+                    legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+                    identity_tier, evidence_status, semantics_version, computed_at)
+                   VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
+                           'canonical_id', 'verified_canonical', ?, ?)""",
+                (table, cur.lastrowid, f"{table}-{i}", ANCHOR, RECOMPUTE_SEMANTICS, ANCHOR),
+            )
+    await db._conn.commit()
+
+
+async def _mark_surface(db, table, rate, population):
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO recompute_coverage_baseline VALUES (?, ?, ?, ?)",
+        (table, rate, population, ANCHOR),
+    )
+    await db._conn.commit()
+
+
+@pytest.mark.parametrize("table", sorted(SURFACE_COLS))
+async def test_the_CHECKER_pages_a_collapse_on_every_surface(db, tmp_path, table):
+    """The paging layer must see a collapse wherever it happens.
+
+    Armed high, then collapsed -- on each surface in turn. Under the
+    surface-conditional mutant this fails for losers and trending while gainers
+    still passes, which is exactly the shape that hid for 7,135 tests.
+    """
+    await _populate_surface(db, table, 100, 90)
+    await _mark_surface(db, table, 0.9, 100)
+    # Collapse: many more credit-bearing rows, none of them recovered.
+    await _populate_surface(db, table, 400, 0)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    assert _checker_pages(tmp_path / "scout.db"), (
+        f"the checker did not page a collapse on {table} -- collapse detection "
+        "is surface-conditional on the layer that actually alerts"
+    )
+
+
+@pytest.mark.parametrize("table", sorted(SURFACE_COLS))
+async def test_the_CHECKER_stays_quiet_on_a_healthy_surface(db, tmp_path, table):
+    """The other half: it must not page when nothing collapsed.
+
+    Without this the paging test above is satisfiable by a checker that always
+    exits 1.
+    """
+    await _populate_surface(db, table, 100, 90)
+    await _mark_surface(db, table, 0.9, 100)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.close()
+
+    assert not _checker_pages(tmp_path / "scout.db"), (
+        f"the checker paged on {table} while recovery was healthy"
+    )

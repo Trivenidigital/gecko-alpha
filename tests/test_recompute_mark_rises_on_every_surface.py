@@ -108,10 +108,17 @@ async def test_a_frozen_mark_on_this_surface_makes_COLLAPSE_unsatisfiable(
 ):
     """Why a per-surface freeze matters, stated as the consequence not the cause.
 
-    This is the assertion the surface-conditional mutant actually breaks. It is
-    kept separate from the rise test because they fail for different reasons:
-    the one above says the mark moved, this one says the alarm the mark exists
-    to arm can still fire afterwards.
+    CORRECTION, because the earlier version of this docstring was wrong and a
+    reviewer measured it: this is NOT the assertion the surface-conditional
+    mutant breaks. Under that mutant this test passes on all three surfaces --
+    its first probe finds no stored mark, takes the `rearm` arm, and never
+    reaches `if rate > best:`. Only the rise test above kills it.
+
+    What this one carries is a different axis: durability of stored state.
+    Neutralising `await conn.commit()` in `_record_coverage_baseline` is killed
+    here on all three surfaces and NOT by the rise test. Kept separate because
+    they fail for genuinely different reasons -- the one above says the mark
+    moved, this one says the alarm the mark exists to arm can still fire.
     """
     await _bulk(db, table, anchor_col, 100, 90, f"{table}-hi")
     armed = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
@@ -130,11 +137,75 @@ async def test_a_frozen_mark_on_this_surface_makes_COLLAPSE_unsatisfiable(
     )
 
 
-def test_every_production_surface_is_covered_by_this_file():
-    """The parametrisation must track the production tuple, not a copy of it.
+#: The surfaces known to exist when this file was written. A LITERAL, on
+#: purpose. The previous version of the test below asserted
+#: `SURFACES == list(Database._RECOMPUTE_SURFACES)` -- a value compared against
+#: its own definition three lines up, which passes no matter what the
+#: production tuple contains. A reviewer demonstrated it: adding a fourth
+#: surface left that assertion GREEN.
+_KNOWN_SURFACES = [
+    ("gainers_comparisons", "appeared_on_gainers_at"),
+    ("losers_comparisons", "appeared_on_losers_at"),
+    ("trending_comparisons", "appeared_on_trending_at"),
+]
 
-    Without this, adding a fourth surface to `_RECOMPUTE_SURFACES` silently
-    leaves it untested -- which is the same class of gap F3 was.
+
+def test_a_NEW_production_surface_forces_a_look_at_this_file():
+    """Trip deliberately when `_RECOMPUTE_SURFACES` grows.
+
+    The parametrisation above already covers a new surface automatically --
+    that part works, and a reviewer confirmed a fourth surface is picked up
+    immediately. What it cannot do is make anyone check whether the OTHER
+    surface-sensitive files were updated too: the checker-side coverage in
+    `test_probe_checker_agreement.py`, and the watchdog fixtures. Those are
+    hardcoded per-surface and are exactly where F3's twin hid.
+
+    So this fails on a new surface on purpose. Update the literal, and while
+    you are here, add the surface to the checker tests.
     """
-    assert SURFACES == list(Database._RECOMPUTE_SURFACES)
-    assert len(SURFACES) >= 3
+    assert list(Database._RECOMPUTE_SURFACES) == _KNOWN_SURFACES, (
+        "_RECOMPUTE_SURFACES changed. The parametrisation here follows it "
+        "automatically, but the CHECKER-side tests in "
+        "test_probe_checker_agreement.py do not -- add the surface there, "
+        "then update _KNOWN_SURFACES."
+    )
+
+
+@pytest.mark.parametrize("table,anchor_col", SURFACES)
+async def test_the_incomparability_guard_holds_on_this_surface(db, table, anchor_col):
+    """The OTHER branch of `_classify_coverage_mark`, three lines from the first.
+
+    F3 closed `if rate > best:` against the surface axis. The incomparability
+    test one branch up was left surface-blind, and a reviewer showed a mutant
+    appending `and source_table == "gainers_comparisons"` to it survives all
+    7,135 tests -- disabling the lock-race guard on losers and trending, which
+    is a FALSE PAGE there rather than a silent one.
+
+    That is the finding restated precisely: the earlier fix closed one BRANCH,
+    not the AXIS. Two branches of one function, three lines apart, and only one
+    was covered.
+
+    The guard's job: a mark recorded against a transiently tiny population is
+    not comparable to today's much larger one, so it must be re-established
+    rather than judged against. Judging against it pages on a rate that is
+    fine.
+    """
+    await _bulk(db, table, anchor_col, 60, 18, f"{table}-inc")  # 30% today
+    await db._conn.execute(
+        "INSERT OR REPLACE INTO recompute_coverage_baseline "
+        "(source_table, best_rate, population, recorded_at) VALUES (?, ?, ?, ?)",
+        (table, 0.9, 25, ANCHOR),  # 0.9 recorded against only 25 rows
+    )
+    await db._conn.commit()
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+
+    assert table not in probe["collapsed_surfaces"], (
+        f"{table} paged against a mark recorded at population 25 -- the "
+        "incomparability guard is surface-conditional, so this surface gets a "
+        "false page the others do not"
+    )
+    v = probe["per_surface"][table]
+    assert v["best_rate"] == pytest.approx(v["rate"], abs=1e-4), (
+        f"{table}: the incomparable mark was not re-established at today's rate"
+    )
