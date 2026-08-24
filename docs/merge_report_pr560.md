@@ -149,6 +149,30 @@ own probes before reporting was worth more than any single verdict.
 The distinguishing question was identical in all four cases, and in the author's
 two: **did my probe actually exercise the path I am making a claim about?**
 
+### Each vector's misses are recorded beside its catches, deliberately
+
+At the reviewers' own insistence, and because omitting them would be the
+inflated-review-record failure this PR spent a section on. Every slot that found
+something here also produced at least one claim another slot had to correct:
+
+- **ops-safety** — rated a fail-open's reachability without exercising it; then
+  demonstrated a severity-raise on the wrong subject; then cleared a paragraph
+  whose appended safety claim nobody had measured.
+- **silent-failure** — reported a defect unreachable when its harness had failed
+  for its own reasons; proposed a pin against a configuration the code cannot
+  enter.
+- **logic** — cleared a SHA without checking whether the fix was pinned at all;
+  approved wording broader than the single case its probe had built.
+- **concurrency** — generalised an *absence* of defect from one branch of a
+  two-branch path; discarded two of its own broken probes before reporting.
+- **author** — ten enumeration drifts, an invalid mutation proof, two
+  unreached-mechanism claims, and guards written without pins after recording
+  the rule that says to pin them.
+
+**That ratio is the case for four vectors, better than any individual finding
+is.** The failure modes were uncorrelated: every error above was caught by a
+vector that was not looking where its author was looking.
+
 ## Enumerations here were verified. Attributions were not.
 
 Stated because a reader will otherwise assume one standard throughout. Every
