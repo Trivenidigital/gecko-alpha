@@ -533,3 +533,31 @@ async def test_the_LOST_WRITE_reason_is_asserted(tmp_path, monkeypatch):
     assert "mark write was lost" in out, (
         "the lost-write reason is not what the script printed:\n" + out
     )
+
+
+async def test_the_SUCCESS_message_is_asserted_positively(tmp_path, monkeypatch):
+    """The one string every other test only asserts the ABSENCE of.
+
+    Found by mutation after a grep-based audit got this exact string wrong in
+    both directions. The grep reported `deploy first` unasserted (false
+    negative -- the test asserts a substring, so searching the test files for
+    the production phrase misses it) and `armed at gate_minutes` asserted
+    (false positive -- every mention is `not in out`). Mutating each message
+    and watching for a dead test gave the truth: 5 killed, this one survived.
+
+    A string asserted only by its absence is unpinned. Rename it and every
+    "must not say armed" test still passes, because it no longer says it
+    anywhere -- so the success path could stop reporting entirely and the suite
+    would stay green.
+    """
+    db_path = await _seed(tmp_path, "healthy.db", 60, 54)  # 0.90, well above floor
+    _env(monkeypatch, db_path)
+    rc, out = await _run_arm()
+
+    assert rc == 0, out
+    assert "armed at gate_minutes" in out, (
+        "the success path printed no confirmation at all:\n" + out
+    )
+    assert "1440" in out, "the gate actually used must appear in the message"
+    assert "NOT fully armed" not in out
+    assert "below the judging floor" not in out
