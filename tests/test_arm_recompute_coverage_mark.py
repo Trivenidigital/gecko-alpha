@@ -408,3 +408,128 @@ async def test_arm_DISTINGUISHES_all_below_floor_from_armed(tmp_path, monkeypatc
     assert "armed at gate_minutes" not in out, (
         "printed plain 'armed' while no surface has a mark or can have one:\n" + out
     )
+
+
+async def _seed(tmp_path, name, rows_per_surface, recovered_per_surface):
+    """Minimal populated DB. Returns its path, closed and ready for `_arm`."""
+    from scout.db import Database
+    from scout.identity_recompute import RECOMPUTE_SEMANTICS
+
+    anchor = "2026-08-01T00:00:00+00:00"
+    db_path = tmp_path / name
+    db = Database(db_path)
+    await db.initialize()
+    for table, col in (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    ):
+        for i in range(rows_per_surface):
+            cur = await db._conn.execute(
+                f"""INSERT INTO {table}
+                   (coin_id, symbol, name, {col}, detected_by_chains,
+                    chains_lead_minutes, is_gap, created_at,
+                    chains_identity_semantics)
+                   VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+                (f"{table}-{i}", anchor, anchor),
+            )
+            if i < recovered_per_surface:
+                await db._conn.execute(
+                    """INSERT INTO chain_identity_recompute_v1
+                       (source_table, source_row_id, coin_id, symbol,
+                        historical_anchor, legacy_detected, legacy_lead,
+                        canonical_detected, canonical_lead, identity_tier,
+                        evidence_status, semantics_version, computed_at)
+                       VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
+                               'canonical_id', 'verified_canonical', ?, ?)""",
+                    (table, cur.lastrowid, f"{table}-{i}", anchor,
+                     RECOMPUTE_SEMANTICS, anchor),
+                )
+    await db._conn.commit()
+    await db.close()
+    return db_path
+
+
+def _env(monkeypatch, db_path):
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+
+
+async def _run_arm():
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    mod = _load()
+    with redirect_stdout(buf):
+        rc = await mod._arm()
+    return rc, buf.getvalue()
+
+
+async def test_the_ZERO_RECOVERY_message_is_asserted_not_just_written(
+    tmp_path, monkeypatch
+):
+    """Every operator-facing REASON must be read by a test, not only printed.
+
+    A reviewer asked whether the new below-floor wording was asserted or merely
+    written, "since a message no test reads drifts the same way that one did" --
+    pointing at `"rate could not be judged"`, which described below-floor and
+    stayed behind when below-floor stopped reaching that branch.
+
+    Checked, and four reasons were unasserted: the lost-write wording, the
+    zero-recovery guard, the not-fully-armed header, and the schema guard. The
+    exit code was pinned; the sentence the operator acts on was not. These
+    close that.
+    """
+    db_path = await _seed(tmp_path, "dark.db", 60, 0)  # populated, nothing recovered
+    _env(monkeypatch, db_path)
+    rc, out = await _run_arm()
+    assert rc == 1, out
+    assert "NOT ARMED -- recovery is zero" in out, out
+    assert "Run the backfill first" in out, out
+    assert "armed at gate_minutes" not in out, out
+
+
+async def test_the_SCHEMA_GUARD_message_is_asserted(tmp_path, monkeypatch):
+    """An absent overlay must say which table and what to do, not just exit 2."""
+    from scout.db import Database
+
+    db_path = tmp_path / "noschema.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db._conn.execute("DROP TABLE chain_identity_recompute_v1")
+    await db._conn.commit()
+    await db.close()
+
+    _env(monkeypatch, db_path)
+    rc, out = await _run_arm()
+    assert rc == 2, out
+    assert "chain_identity_recompute_v1" in out
+    assert "deploy first" in out, out
+
+
+async def test_the_LOST_WRITE_reason_is_asserted(tmp_path, monkeypatch):
+    """The reason that replaced the stale below-floor wording.
+
+    `"rate could not be judged"` described below-floor and was left labelling
+    the starved-write case when below-floor stopped reaching it. Its
+    replacement must be read by a test or it drifts identically.
+    """
+    from scout.db import Database
+
+    db_path = await _seed(tmp_path, "starved.db", 60, 30)
+
+    async def _starved_write(self, source_table, rate, population):
+        return None  # the busy-timeout give-up, without needing a real lock
+
+    monkeypatch.setattr(Database, "_record_coverage_baseline", _starved_write)
+    _env(monkeypatch, db_path)
+    rc, out = await _run_arm()
+
+    assert rc == 1, out
+    assert "NOT fully armed" in out, out
+    assert "mark write was lost" in out, (
+        "the lost-write reason is not what the script printed:\n" + out
+    )
