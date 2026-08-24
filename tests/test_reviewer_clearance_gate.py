@@ -278,6 +278,39 @@ def test_the_shipped_declaration_names_every_mandatory_vector_and_path():
     assert set(decl["watch"]) >= set(MANDATORY_WATCH)
 
 
+def _master_declaration_text() -> str | None:
+    """`.reviewers.toml` AS COMMITTED ON MASTER, or None if master has none.
+
+    Deliberately not the working tree. Reading the working tree made this test
+    and the gate MUTUALLY EXCLUSIVE, and no single commit could satisfy both:
+    the gate FAILS a branch with a watched delta unless clearances are recorded,
+    and this test FAILED the instant they were. The gate was therefore unusable
+    on exactly the branches it exists to police -- discovered when the first
+    real declaration was committed and CI went red in the other direction.
+
+    `git show` failing means master has no declaration at all, which is the
+    bootstrap state and carries no clearances vacuously. That is a real answer,
+    not an "I could not tell": a MISSING ref is distinguished from a missing
+    FILE by resolving the ref first, and an unresolvable ref raises.
+    """
+    for ref in ("origin/master", "master"):
+        if subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True, cwd=REPO_ROOT, timeout=60,
+        ).returncode:
+            continue
+        got = subprocess.run(
+            ["git", "show", f"{ref}:.reviewers.toml"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=60,
+        )
+        return got.stdout if got.returncode == 0 else None
+    raise AssertionError(
+        "neither origin/master nor master resolves -- cannot determine what "
+        "master carries, and a check that cannot see its subject has not "
+        "cleared it"
+    )
+
+
 def test_the_shipped_declaration_records_no_stale_clearances():
     """Master carries none: they are per-PR and belong on the PR branch.
 
@@ -285,13 +318,25 @@ def test_the_shipped_declaration_records_no_stale_clearances():
     new branch -- and because this repo squash-merges, those SHAs stop being
     ancestors of master the moment the PR lands, so the verdict would be
     'IS NOT AN ANCESTOR' on work that has nothing to do with them.
+
+    THE POST-MERGE STEP THIS IMPLIES IS REAL AND EASY TO FORGET: squash-merging
+    a cleared PR carries its clearances into master, so master must be reset to
+    an empty `[clearances]` after every such merge. This test is what catches a
+    forgotten reset -- on the NEXT PR, before its author inherits the confusion.
+    Backlog ticket 21 removes the step entirely by giving each PR its own file.
     """
     import tomllib
 
-    decl = tomllib.loads((REPO_ROOT / ".reviewers.toml").read_text(encoding="utf-8"))
+    text = _master_declaration_text()
+    if text is None:
+        return  # master has no declaration yet; it carries no clearances
+
+    decl = tomllib.loads(text)
     assert decl.get("clearances", {}) == {}, (
         "master's declaration must not carry clearance SHAs; record them on the "
-        "PR branch that obtained them"
+        "PR branch that obtained them. If a cleared PR was just squash-merged, "
+        "reset master's [clearances] to empty -- its SHAs are no longer "
+        "ancestors and would misreport on unrelated work."
     )
 
 
