@@ -204,3 +204,96 @@ def test_the_gate_comes_from_settings_not_a_literal():
         assert "CONVICTION_EARLY_LEAD_MINUTES" in names, (
             f"gate_minutes is not read from Settings; found {names}"
         )
+
+
+# --------------------------------------------------------------------------
+# The CALL SITE, not just the predicate.
+# --------------------------------------------------------------------------
+
+async def test_arm_EXITS_1_when_a_surface_is_left_unarmed(tmp_path, monkeypatch):
+    """End-to-end, because every other test here stops at the predicate.
+
+    A reviewer's MUTANT 4 replaced `unarmed = unarmed_surfaces(...)` in `_arm`
+    with an inline buggy comprehension and all seven tests passed: they were
+    either unit tests of `unarmed_surfaces` or AST guards on source, so the
+    call site itself was unpinned. That is the mirror of the defect this file
+    was written to fix -- a copy in the test -- reflected back into the script.
+
+    This asserts the OBSERVABLE (the exit code an operator sees) rather than
+    the structure, which is why it is a better guard than an AST call-check:
+    it fails for the inline copy, for a reverted predicate, and for any future
+    refactor that stops consulting the predicate at all.
+
+    Fixture is the reviewer's: credit-bearing rows on every surface, a baseline
+    recorded at a small population so `recorded_pop < FLOOR*2 and pop >
+    recorded_pop*2` holds, and the clear forced to fail -- which is exactly the
+    `incomparable_unresolved` arm that leaves `rate_judged` True while writing
+    nothing.
+    """
+    from scout.db import Database
+    from scout.identity_recompute import RECOMPUTE_SEMANTICS
+
+    anchor = "2026-08-01T00:00:00+00:00"
+    db_path = tmp_path / "arm.db"
+
+    db = Database(db_path)
+    await db.initialize()
+    # ALL THREE surfaces populated. An earlier version seeded only gainers, so
+    # losers and trending fell below the population floor, reported
+    # rate_judged=False, and made `unarmed` non-empty no matter what the
+    # predicate did -- the test passed for a reason that was not the one it is
+    # named for, and the inline-copy mutant survived it.
+    surfaces = (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    )
+    for table, anchor_col in surfaces:
+        for i in range(60):
+            cur = await db._conn.execute(
+                f"""INSERT INTO {table}
+                   (coin_id, symbol, name, {anchor_col},
+                    detected_by_chains, chains_lead_minutes, is_gap, created_at,
+                    chains_identity_semantics)
+                   VALUES (?, 'X', 'X', ?, 1, 8740.0, 0, ?, 'legacy_prefix')""",
+                (f"{table}-{i}", anchor, anchor),
+            )
+            await db._conn.execute(
+                """INSERT INTO chain_identity_recompute_v1
+                   (source_table, source_row_id, coin_id, symbol, historical_anchor,
+                    legacy_detected, legacy_lead, canonical_detected, canonical_lead,
+                    identity_tier, evidence_status, semantics_version, computed_at)
+                   VALUES (?, ?, ?, 'X', ?, 1, 8740.0, 1, 8740.0,
+                           'canonical_id', 'verified_canonical', ?, ?)""",
+                (table, cur.lastrowid, f"{table}-{i}", anchor, RECOMPUTE_SEMANTICS, anchor),
+            )
+    # A mark recorded against a transiently tiny population -> incomparable.
+    await db._conn.execute(
+        "INSERT INTO recompute_coverage_baseline "
+        "(source_table, best_rate, population, recorded_at) VALUES (?,?,?,?)",
+        ("gainers_comparisons", 0.9, 25, anchor),
+    )
+    await db._conn.commit()
+    await db.close()
+
+    mod = _load()
+
+    # The clear loses its race, so the incomparable mark is still present:
+    # the probe declines to judge and writes nothing, while rate_judged stays
+    # True. This is the arm a `rate_judged`-only predicate cannot see.
+    async def clear_fails(self, source_table):
+        return False
+
+    monkeypatch.setattr(Database, "_clear_coverage_baseline", clear_fails)
+    # Settings has required fields the CI env supplies; provide the minimum so
+    # this test exercises the script rather than pydantic validation.
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+
+    rc = await mod._arm()
+    assert rc == 1, (
+        "_arm reported success while a surface was left unarmed -- the call "
+        "site is not consulting unarmed_surfaces()"
+    )

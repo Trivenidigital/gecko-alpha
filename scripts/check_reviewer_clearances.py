@@ -160,6 +160,29 @@ _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _GIT_TIMEOUT_SEC = 60
 
 
+class GitTimeout(Exception):
+    """`git` did not answer. DELIBERATELY NOT a `RuntimeError`.
+
+    This distinction is load-bearing and it was learned the hard way. When the
+    timeout hardening landed, `TimeoutExpired` was converted into `RuntimeError`
+    -- the same type `_git` raises for "that object does not exist". `_tree`
+    catches `RuntimeError` and returns `None`, and `None` is `_moved`'s encoding
+    for "this path is not present at that revision". So a timeout became
+    indistinguishable from an absent path, and a reviewer demonstrated the
+    consequence: with two transient timeouts against a repo where `scout/` had
+    genuinely moved, `_moved` returned `([], [])` and the check printed
+    "no delta in watched paths; no clearance required" and exited 0.
+
+    A production change reported as needing no review, without touching the
+    declaration -- the precise outcome this script exists to prevent, introduced
+    by a fix for something else.
+
+    One channel carrying two meanings. `_tree` was written when the only
+    realistic failure of `rev-parse <rev>:<path>` was "no such path"; widening
+    what `_git` raises without widening the handler is what did it.
+    """
+
+
 def _git(*args: str) -> str:
     try:
         r = subprocess.run(
@@ -169,7 +192,7 @@ def _git(*args: str) -> str:
             timeout=_GIT_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
+        raise GitTimeout(
             f"git {' '.join(args)} timed out after {_GIT_TIMEOUT_SEC}s"
         ) from None
     if r.returncode != 0:
@@ -178,6 +201,12 @@ def _git(*args: str) -> str:
 
 
 def _tree(rev: str, path: str) -> str | None:
+    """Tree/blob hash of `path` at `rev`, or None when it does not exist there.
+
+    `GitTimeout` is NOT caught: "git did not answer" is not "the path is
+    absent", and collapsing the two is a fail-open. It propagates to `main`,
+    which reports it and exits non-zero.
+    """
     try:
         return _git("rev-parse", f"{rev}:{path}")
     except RuntimeError:
@@ -190,11 +219,23 @@ def _moved(watch: list[str], a: str, b: str) -> tuple[list[str], list[str]]:
     The second list is why this returns a pair. `_tree` yields None for a path
     that does not exist, and `None != None` is False -- so a misspelled or
     renamed watch entry compared equal, was reported as covered, and printed the
-    typo in the banner as though it were being watched. That was the only way
-    this script could fail OPEN. It is now fatal rather than quiet.
+    typo in the banner as though it were being watched.
+
+    Two ways this could fail OPEN have now been found, and only one of them was
+    the one above. The other was a timeout being routed through the same
+    `RuntimeError` channel `_tree` uses to mean "absent" -- see `GitTimeout`.
+    Both are closed; the earlier version of this docstring claimed the first was
+    "the only way", which was true when written and false one commit later.
+
+    Each path is resolved ONCE per revision. The previous version called `_tree`
+    four times per path -- twice for `moved`, twice for `missing` -- so a
+    transient failure could answer differently across the two comprehensions and
+    produce a self-inconsistent verdict.
     """
-    moved = [p for p in watch if _tree(a, p) != _tree(b, p)]
-    missing = [p for p in watch if _tree(a, p) is None and _tree(b, p) is None]
+    at_a = {p: _tree(a, p) for p in watch}
+    at_b = {p: _tree(b, p) for p in watch}
+    moved = [p for p in watch if at_a[p] != at_b[p]]
+    missing = [p for p in watch if at_a[p] is None and at_b[p] is None]
     return moved, missing
 
 
@@ -223,14 +264,20 @@ def main(argv: list[str]) -> int:
         required = list(decl.get("required") or [])
         watch = list(decl.get("watch") or [])
         clearances = dict(decl.get("clearances") or {})
+        # INSIDE the guard, not after it. `required = [["logic"]]` gives
+        # `TypeError: cannot use 'list' as a set element` -- the same
+        # "crash presenting as exit 1" class this guard closed, one statement
+        # further on. The fix stopped exactly where the reported symptom did.
+        required_set = set(required)
+        watch_set = set(watch)
     except (TypeError, ValueError) as exc:
         print(
             f"FAIL: {DECL} is malformed -- `required` and `watch` must be "
-            f"arrays and `[clearances]` a table: {exc}"
+            f"arrays of strings and `[clearances]` a table: {exc}"
         )
         return 1
 
-    narrowed = MANDATORY_VECTORS - set(required)
+    narrowed = MANDATORY_VECTORS - required_set
     if narrowed:
         print(
             "FAIL: required vectors narrowed -- missing "
@@ -238,7 +285,7 @@ def main(argv: list[str]) -> int:
             "per-PR choice."
         )
         return 1
-    unwatched = MANDATORY_WATCH - set(watch)
+    unwatched = MANDATORY_WATCH - watch_set
     if unwatched:
         print(f"FAIL: watch list narrowed -- missing {', '.join(sorted(unwatched))}.")
         return 1
@@ -303,7 +350,7 @@ def main(argv: list[str]) -> int:
     # signal, an unrelated typo should not be able to manufacture one.
     shape_errors: list[str] = []
     for vector, sha in sorted(
-        (v, s) for v, s in clearances.items() if v in set(required)
+        (v, s) for v, s in clearances.items() if v in required_set
     ):
         if not _SHA_RE.match(str(sha)):
             shape_errors.append(f"{vector:16s} {sha!r} is not a full 40-hex SHA")
@@ -345,7 +392,15 @@ def main(argv: list[str]) -> int:
         #
         # Deleted rather than re-guarded: the shape block subsumes them, and
         # dead code with a green suite is a trap for whoever edits it next.
-        full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+        # Wrapped for the SAME reason the ancestry check below is: `_git` can
+        # raise `GitTimeout`, and an uncaught one escapes `main` and prints a
+        # traceback instead of a verdict. The ancestry call two lines down was
+        # given this treatment when the timeouts landed; this one was missed.
+        try:
+            full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+        except GitTimeout as exc:
+            failures.append(f"{vector:16s} {exc} -- treated as NOT covered")
+            continue
         try:
             anc = subprocess.run(
                 ["git", "merge-base", "--is-ancestor", full, head_sha],
@@ -386,5 +441,25 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def _cli(argv: list[str]) -> int:
+    """Turn a `GitTimeout` into a verdict rather than a traceback.
+
+    `GitTimeout` is deliberately not caught anywhere that could confuse it with
+    a real answer (see `_tree`), so it has to be caught HERE -- once, at the
+    boundary. Exit 2, because "git did not answer" is precisely the
+    "I could not work out what to compare" case the exit codes reserve 2 for.
+    Emphatically NOT 0: a check that cannot see the tree has not cleared it.
+    """
+    try:
+        return main(argv)
+    except GitTimeout as exc:
+        print(f"FAIL: {exc}")
+        print(
+            "  git did not answer, so the comparison could not be made. This "
+            "is NOT 'no delta' -- nothing was determined."
+        )
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(_cli(sys.argv))

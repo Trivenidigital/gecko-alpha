@@ -363,3 +363,89 @@ def test_a_ROOT_FILE_change_demands_a_clearance(repo, path):
     assert rc == 1, out
     assert path in out
     assert "NO CLEARANCE RECORDED" in out
+
+
+# --------------------------------------------------------------------------
+# A timeout is not an answer. The fail-open a fix introduced.
+# --------------------------------------------------------------------------
+
+def _load_checker():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("chk_mod", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_a_git_TIMEOUT_is_not_reported_as_an_absent_path(repo, monkeypatch):
+    """The fail-open introduced by the subprocess-timeout hardening.
+
+    `_git` originally converted `TimeoutExpired` into `RuntimeError` -- the same
+    type it raises for "no such object". `_tree` catches `RuntimeError` and
+    returns None, and None is `_moved`'s encoding for "path absent at that
+    revision". So a timeout became indistinguishable from an absent path, and a
+    reviewer showed the consequence: with two transient timeouts against a repo
+    where `scout/` had genuinely moved, `_moved` returned `([], [])` and the
+    check printed "no delta in watched paths; no clearance required", exit 0.
+
+    A production change reported as needing no review, reached without touching
+    the declaration. `GitTimeout` now has its own type and `_tree` does not
+    catch it.
+    """
+    import subprocess as sp
+
+    mod = _load_checker()
+    real = sp.run
+    seen = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if len(cmd) > 2 and cmd[1] == "rev-parse" and ":scout" in cmd[-1]:
+            seen["n"] += 1
+            raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    with pytest.raises(mod.GitTimeout):
+        mod._moved(["scout"], "HEAD", "HEAD")
+    assert seen["n"] >= 1, "the timeout was never triggered; test proves nothing"
+
+
+def test_the_cli_turns_a_timeout_into_exit_2_not_a_traceback(repo, monkeypatch):
+    """"git did not answer" is the "could not work out what to compare" case.
+
+    Emphatically not 0: a check that cannot see the tree has not cleared it.
+    """
+    import subprocess as sp
+
+    mod = _load_checker()
+    real = sp.run
+
+    def always_times_out(cmd, **kw):
+        if len(cmd) > 1 and cmd[1] in ("rev-parse", "merge-base"):
+            raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", always_times_out)
+    monkeypatch.setattr(mod, "DECL", repo / ".reviewers.toml")
+    _decl(repo, {})
+    rc = mod._cli(["check", "HEAD", "master"])
+    assert rc == 2, f"a timeout must not read as a pass or a clearance verdict (got {rc})"
+
+
+def test_a_malformed_required_that_is_not_a_list_of_strings_FAILS_cleanly(repo):
+    """The coercion guard stopped one statement short of the crash it closed.
+
+    `required = [["logic"]]` raised `TypeError: cannot use 'list' as a set
+    element` at the `set(required)` on the next line -- the same
+    "crash presenting as exit 1" class, one statement further on.
+    """
+    (repo / ".reviewers.toml").write_text(
+        'required = [["logic"]]\nwatch = ["scout"]\n\n[clearances]\n'
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "malformed" in out
+    assert "Traceback" not in out
