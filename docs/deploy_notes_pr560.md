@@ -78,9 +78,27 @@ ast.dump(strip_docstrings(ast.parse(before))) == ast.dump(strip_docstrings(ast.p
 ```
 
 Subject blob-identical **×** consumer AST-identical ⟹ the sweep transfers with
-certainty. Demonstrated on this PR's final naming pass: a consumer moved
-`+13/−2` and a reviewer proved by AST equality that no executable delta existed,
-so the transfer was sound without a re-sweep.
+certainty.
+
+**Worked example, with its anchors — because an earlier draft of this paragraph
+gave the figure without them and a reviewer resolved it to the wrong range,
+where the rule's own example inverted the rule it teaches:**
+
+| range | file | numstat | raw identical | AST identical |
+|---|---|---|---|---|
+| `54d94520..7a3f294c` | `tests/test_watchdog_ships_executable.py` | `+13/−2` | no | **yes** |
+| `eb72644d..dfab433f` | same file | `+66/−9` | no | **no** |
+
+The first row is the rule firing correctly: a docstring-only edit, so the sweep
+transfers without a re-run. The second is the rule *discriminating* — one test
+function renamed (`test_the_unit_scan_finds_units` →
+`test_the_unit_scan_covers_EVERY_unit_glob`) and the parametrised set narrowed
+19 → 16 scripts, so AST equality returns False and a re-run is genuinely
+required. **Both rows are needed.** A rule demonstrated only where it says "yes"
+has not been shown able to say "no".
+
+A `+13/−2` cited without naming the commits it spans is half a claim, and the
+half that was missing is the half that decides which row you are in.
 
 **And its limit, which is the asymmetry that matters:** AST equality *licenses*
 skipping a re-run. Blob-identity on the subject alone **never** does. The fifth
