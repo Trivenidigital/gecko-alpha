@@ -21,6 +21,7 @@ exercised either alone would have passed through all four findings above.
 """
 
 import sqlite3
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -97,7 +98,40 @@ def _checker_pages(db_path) -> bool:
         text=True,
     )
     assert r.returncode in (0, 1), f"checker errored: {r.returncode} {r.stdout}"
+    # The checker emits its own staleness warning when it sees a `-wal` that
+    # `immutable=1` cannot read. This helper used to read only the return code
+    # and discard stdout, so that warning was printed on every call in this file
+    # and never once observed -- the tool reported the exact defect and the
+    # harness threw the message away. Failing on it is self-maintaining: any
+    # future test that checkpoints in the wrong order trips here rather than
+    # silently measuring a stale view.
+    assert "cannot see" not in r.stdout, (
+        "the checker read a stale view -- checkpoint AFTER the last write:\n"
+        + r.stdout
+    )
     return r.returncode == 1
+
+
+def _checker_marks(db_path) -> dict:
+    """What mark the CHECKER sees per surface, parsed from its alert text.
+
+    Exists because `_checker_pages` returns only a boolean, and the boolean is
+    computed from `not_recovering` -- which does not depend on the ratchet mark
+    at all. So the `clear_succeeds` axis this file added could vary a
+    best-effort WRITE outcome and every assertion stayed identical: a reviewer
+    replaced BOTH baseline write functions with total no-ops and all 40 tests
+    still passed. The axis was inert in the assertion, not only in the view.
+    """
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(db_path), "--gate-minutes", "1440"],
+        capture_output=True,
+        text=True,
+    )
+    marks = {}
+    for token in re.findall(r"(\w+_comparisons)=\d+/\d+ mark=([^\s)]+)", r.stdout):
+        table, raw = token
+        marks[table] = None if raw == "none" else float(raw)
+    return marks
 
 
 #: (label, population, recovered, mark, overlay_version)
@@ -194,8 +228,40 @@ async def test_both_layers_reach_the_same_verdict(
         probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
     finally:
         _Db._clear_coverage_baseline = original
+    # CHECKPOINT AGAIN, AFTER the probe. The one above lands the data state; the
+    # probe then WRITES (`_record_coverage_baseline` / `_clear_coverage_baseline`,
+    # each on its own connection), and those writes go to a WAL created after
+    # that checkpoint. The checker opens `immutable=1`, which ignores the WAL by
+    # definition -- so it read the pre-probe view and the entire `clear_succeeds`
+    # axis was INERT: both arms produced identical checker output.
+    #
+    # Measured by a reviewer: replacing both baseline write functions with total
+    # no-ops left all 35 tests in this file passing. A harness that varies a
+    # write outcome the reader cannot observe is not covering that axis.
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+
     probe_pages = bool(probe["not_recovering"])
     checker_pages = _checker_pages(db._db_path)
+
+    # BOTH LAYERS MUST AGREE ABOUT THE MARK, not only about whether to page.
+    # This is what makes the `clear_succeeds` axis mean something: the probe's
+    # `best_rate` is the outcome of a best-effort write, and the checker reads
+    # that same row independently. Without this assertion the write could
+    # no-op entirely and nothing here would notice.
+    seen = _checker_marks(db._db_path)
+    for table, v in probe["per_surface"].items():
+        if table in seen:
+            pb, cb = v.get("best_rate"), seen[table]
+            if pb is None or cb is None:
+                assert pb == cb, (
+                    f"{table}: probe best_rate={pb} but checker sees mark={cb} "
+                    "-- the layers disagree about whether a mark exists"
+                )
+            else:
+                assert abs(pb - cb) < 1e-3, (
+                    f"{table}: probe best_rate={pb} but checker sees mark={cb}"
+                )
 
     assert probe_pages == checker_pages, (
         f"{label} [clear {'ok' if clear_succeeds else 'starved'}]: probe "
@@ -418,4 +484,63 @@ async def test_the_CHECKER_comparability_guard_holds_on_every_surface(db, tmp_pa
         "25 while the probe did not -- the comparability guard is "
         "surface-conditional on the paging layer, so probe and checker "
         "disagree about the same surface"
+    )
+
+
+async def test_a_RAISED_mark_reaches_the_checker(db, tmp_path):
+    """The write outcome must be observable, not just self-consistent.
+
+    Agreement alone cannot see a failed write. When `_record_coverage_baseline`
+    returns None the probe honestly falls back to reporting the table's
+    existing value -- so probe and checker still agree, and a reviewer showed
+    that replacing BOTH baseline write functions with total no-ops left every
+    test in this file passing, including the mark-agreement assertion added to
+    catch exactly that.
+
+    The discriminating fact is not "do the layers match" but "did the mark
+    MOVE". A genuine improvement must raise the stored mark AND that raise must
+    reach the checker, which reads the row independently.
+    """
+    await _populate(db, 100, 90)  # 0.90 today
+    await _mark(db, 0.20, 100)  # a much lower stored mark -> raise_mark
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+
+    v = probe["per_surface"]["gainers_comparisons"]
+    assert v["mark_written"] is True, (
+        "a genuine improvement did not write the mark -- the ratchet is not "
+        "ratcheting, and every agreement assertion here would still pass"
+    )
+    assert v["best_rate"] == pytest.approx(0.90, abs=1e-3)
+
+    seen = _checker_marks(tmp_path / "scout.db")
+    assert seen["gainers_comparisons"] == pytest.approx(0.90, abs=1e-3), (
+        f"the checker still sees the OLD mark {seen['gainers_comparisons']} "
+        "after the probe raised it to 0.90 -- the write never reached the "
+        "layer that pages"
+    )
+
+
+async def test_a_CLEARED_mark_reaches_the_checker(db, tmp_path):
+    """The clear-side twin, for the same reason."""
+    await _populate(db, 60, 18)  # 0.30 today
+    await _mark(db, 0.90, 25)  # incomparable -> clear, then re-arm at 0.30
+
+    probe = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+
+    v = probe["per_surface"]["gainers_comparisons"]
+    assert v.get("comparison_skipped") is None, (
+        "the clear failed, so this test is measuring the starved path rather "
+        "than the one it names"
+    )
+    assert v["best_rate"] == pytest.approx(0.30, abs=1e-3)
+
+    seen = _checker_marks(tmp_path / "scout.db")
+    assert seen["gainers_comparisons"] == pytest.approx(0.30, abs=1e-3), (
+        f"the checker still sees {seen['gainers_comparisons']} after the probe "
+        "discarded the incomparable mark and re-armed at 0.30"
     )
