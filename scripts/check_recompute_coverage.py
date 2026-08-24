@@ -223,7 +223,7 @@ def main() -> int:
         # it fixed twice ("printing losers=0/5 trending=0/5 in its own alert
         # text and exiting 0"), repeated in the notice.
         unarmed_surfaces_seen = []
-        baseline_table_missing = False
+        unreadable_surfaces = []
         for table, _anchor in SURFACES:
             try:
                 row = conn.execute(
@@ -238,7 +238,13 @@ def main() -> int:
                 # likely exactly when collapse detection matters most (backfill
                 # running, heavy write load). Record it and keep going; a
                 # genuinely absent table fails every surface and is reported.
-                baseline_table_missing = True
+                # PER-SURFACE, for the same reason the notice below is. A
+                # global flag could not report the MIXED case -- one surface's
+                # read raising transiently while another holds a mark -- which
+                # is precisely the case the `break` -> `continue` change was
+                # made to support. The fix's own motivating scenario was the
+                # one its notice could not describe.
+                unreadable_surfaces.append(table)
                 continue
             if row:
                 marks[table] = row[0]
@@ -310,16 +316,20 @@ def main() -> int:
     # design and cannot bootstrap one. Without saying so, "no baseline yet"
     # reads identically to "no collapse", which is the wrong reassurance for an
     # alarm built because the in-process log is operationally silence.
-    if baseline_table_missing and not marks:
-        armed = "  [collapse detection NOT ARMED: baseline table unreadable]"
-    elif unarmed_surfaces_seen:
-        armed = (
-            "  [collapse detection NOT ARMED on "
-            + ", ".join(sorted(unarmed_surfaces_seen))
-            + ": no baseline recorded yet]"
+    notices = []
+    if unreadable_surfaces:
+        notices.append(
+            "collapse detection NOT ARMED on "
+            + ", ".join(sorted(unreadable_surfaces))
+            + ": baseline unreadable"
         )
-    else:
-        armed = ""
+    if unarmed_surfaces_seen:
+        notices.append(
+            "collapse detection NOT ARMED on "
+            + ", ".join(sorted(unarmed_surfaces_seen))
+            + ": no baseline recorded yet"
+        )
+    armed = "  [" + "; ".join(notices) + "]" if notices else ""
     print(
         f"recovered {recovered} of {population}, "
         f"{unarchivable} unarchivable ({summary}){armed}"

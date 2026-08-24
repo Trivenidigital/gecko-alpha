@@ -18,6 +18,19 @@ one implementation.
 So the two implementations stay separate and this file is the bridge. It runs
 BOTH against one database and asserts they reach the same verdict. A test that
 exercised either alone would have passed through all four findings above.
+
+IN THIS COMPONENT, THE PROBE IS NOT AN OBSERVER -- IT IS A WRITER.
+`chain_identity_recompute_coverage_probe` records, clears and re-arms the
+ratchet mark. Running it before the checker therefore CHANGES the state the
+checker reads, and a fixture that does so can destroy the exact condition it
+was built to create. Two people hit this independently on this file: a
+reviewer got a false negative from it, and a later test written to kill a
+surface-conditional mutant SURVIVED because the probe cleared the incomparable
+mark and re-armed a comparable one before the checker ran.
+
+Write the state, checkpoint, then read with each layer. If a test needs the
+probe's own verdict as well, checkpoint again AFTER it -- the probe's writes go
+to a WAL the checker's `immutable=1` connection cannot see.
 """
 
 import sqlite3
@@ -544,3 +557,34 @@ async def test_a_CLEARED_mark_reaches_the_checker(db, tmp_path):
         f"the checker still sees {seen['gainers_comparisons']} after the probe "
         "discarded the incomparable mark and re-armed at 0.30"
     )
+
+
+async def test_an_UNREADABLE_baseline_table_says_so(db, tmp_path):
+    """Residual 1: the notice branch for an absent baseline table had no test.
+
+    A reviewer showed `if False and ...` on that branch survives the whole
+    suite: the notice vanishes and the line reads as a clean all-clear -- the
+    exact "no baseline yet reads identically to no collapse" wrong reassurance
+    the comment three lines above says the notice exists to prevent.
+    """
+    await _populate(db, 60, 30)
+    await db._conn.execute("DROP TABLE recompute_coverage_baseline")
+    await db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db._conn.commit()
+    await db.close()
+
+    r = subprocess.run(
+        [sys.executable, str(CHECKER), "--db", str(tmp_path / "scout.db"),
+         "--gate-minutes", "1440"],
+        capture_output=True, text=True,
+    )
+    assert "NOT ARMED" in r.stdout, (
+        "the baseline table is unreadable and the line reads as a clean "
+        "all-clear:\n" + r.stdout
+    )
+    assert "unreadable" in r.stdout, r.stdout
+    # Every surface must be named, not a single global mention.
+    for table in SURFACE_COLS:
+        assert table in r.stdout.split("NOT ARMED")[-1], (
+            f"{table} was not named as unreadable:\n" + r.stdout
+        )
