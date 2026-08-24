@@ -317,12 +317,26 @@ the failure class this whole subsystem exists to close. The timer ships in the
 repo for that reason.
 
 ```bash
-chmod +x scripts/recompute-coverage-watchdog.sh
 install -m 0644 scripts/recompute-coverage-watchdog.{timer,service} /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now recompute-coverage-watchdog.timer
 systemctl list-timers recompute-coverage-watchdog.timer   # VERIFY it is armed
 ```
+
+**No `chmod +x` step — the script ships mode 100755.** It used to ship `100644`
+with a `chmod` line here, and that was a defect in this very section's own
+terms. `ExecStart` runs the script *from the repo* (deliberately, see above), so
+the executable bit is mandatory: miss the `chmod` and the unit fails on
+permissions, the timer fires, and the watchdog never runs — the
+deploy-without-activate failure this section exists to close, reachable by
+skipping one line of it.
+
+It also left the production checkout **permanently dirty by design** —
+`git status` on the box showed ` M scripts/recompute-coverage-watchdog.sh`
+whose entire diff was `old mode 100644 / new mode 100755`. Benign alone, but it
+means the prod tree is never clean, so genuine unexpected drift is camouflaged
+among expected noise. Fixed with `git update-index --chmod=+x`, which removes
+the manual step rather than documenting it better.
 
 The unit runs the script **from the repo**, deliberately. Installing the `.sh`
 to `/usr/local/bin` while it invokes the `.py` from the repo splits the
