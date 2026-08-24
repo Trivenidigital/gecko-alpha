@@ -160,6 +160,41 @@ the slot it named read it and objected. That is luck, not a procedure.
 
 An enumeration has a cheap decision procedure. An attribution does not.
 
+**Ten drifts occurred. The tenth was a new kind and it explains why the first
+nine survived carefulness:** a *correct* value attached to the *wrong anchor*
+(`+21/−6` was real, but measured above a different SHA than the one named). It
+survives spot-checking, because the figures verify and only the label is false.
+
+The remedy adopted — **quote the invocation with its output, so the base and the
+figures come from the same text** — works for a reason worth stating, because it
+predicts where it will hold: *it deletes a transcription step rather than asking
+for an existing step to be performed better.* Nine drifts survived being
+careful. The test for any future fix of this shape is the same question: **does
+it remove a step, or does it ask someone to do an existing step more
+diligently?**
+
+And it does **not** generalise to attribution, which has no command that prints
+it. That gap stays open, with exactly one check — the person named reading what
+they actually wrote. Recorded explicitly so the numeric fix does not create the
+impression the whole class is closed.
+
+### Two kinds of unexercised-hypothetical claim, and only one is dangerous
+
+Four comments on this PR were corrected for asserting things about mechanisms
+nobody had exercised. The fourth differs from the first three in a way worth
+separating:
+
+- **Accurate about a mechanism the code never reaches** — *misleads* a reader.
+  Three instances, including two of the author's.
+- **Asserts protective behaviour that is actively harmful in one of the
+  movements it claims to cover** — *justifies a wrong decision.* One instance:
+  "real defence if `cwd` or `REPO_ROOT` ever moves", where under nesting
+  `--full-tree` **causes** the vacuous skip it was added to prevent.
+
+The second is the dangerous class, because a reader acting on it keeps a flag
+that makes things worse. Both were caught by reviewers running the case the
+sentence asserted about.
+
 Note the direction: the correction *removed* credit from the slot that raised
 it. That is the direction nobody is motivated to catch, which is why an inflated
 review record is more dangerous than an incomplete one.
