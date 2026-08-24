@@ -106,5 +106,10 @@ jobs:
 
       - name: Clearance lapse check (ruling D)
         run: |
+          # LOAD-BEARING, do not add `|| true`. The script no longer fetches
+          # (it had no base ref to fetch for, so the call was decorative); the
+          # base ref is now an argument to `git merge-base`, so a stale or
+          # absent origin/master yields a wrong or unresolvable merge-base.
+          # This must fail the job, not be swallowed.
           git fetch --quiet origin "${{ github.base_ref }}"
           python scripts/check_reviewer_clearances.py             "${{ github.event.pull_request.head.sha }}"             "origin/${{ github.base_ref }}"

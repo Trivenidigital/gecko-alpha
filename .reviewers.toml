@@ -20,7 +20,21 @@ required = ["concurrency", "silent-failure", "ops-safety", "logic"]
 # Names are not enough: a name-level diff misses a file restored to the wrong
 # baseline. A watch entry that resolves at NEITHER revision is a hard failure,
 # not a quiet pass.
-watch = ["scout", "scripts", "tests", ".github", "dashboard"]
+# cron/ops/systemd are the DEPLOY SUBSTRATE. They were added once "no delta in
+# watched paths" became a pass: before that an omission merely failed to lapse a
+# clearance, after it an omission is a silent full exemption. A 2-minute cron
+# entry once migrated the live DB into 74 `database is locked` errors, and
+# systemd units run scripts from /usr/local/bin copies so `git pull` deploys
+# nothing -- a unit edit is exactly the delta a reviewer must see.
+#
+# Root FILES are watched too. An earlier draft claimed they could not be --
+# "a path prefix cannot reach a root file" -- and shipped that as a known gap.
+# It was wrong: `git rev-parse <rev>:pyproject.toml` returns a blob hash, and
+# comparing blobs is the same operation as comparing trees. uv.lock and
+# pyproject.toml reach production via `uv sync` on the next restart.
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+         "systemd", "pyproject.toml", "uv.lock", "Dockerfile",
+         "docker-compose.yml", "start.sh"]
 
 [clearances]
 # Deliberately EMPTY on master. Clearances are per-PR and are recorded on the

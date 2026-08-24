@@ -25,7 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "check_reviewer_clearances.py"
 
 MANDATORY_VECTORS = ["concurrency", "silent-failure", "ops-safety", "logic"]
-MANDATORY_WATCH = ["scout", "scripts", "tests", ".github", "dashboard"]
+MANDATORY_WATCH = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml",
+    "start.sh",
+]
 
 
 def _git(repo, *args):
@@ -46,16 +50,32 @@ def _run(repo, head="HEAD", base="master"):
     return r.returncode, r.stdout + r.stderr
 
 
+#: Watch entries that are FILES rather than directories. The fixture has to
+#: know the difference: an earlier version created a directory for every entry,
+#: so writing to `repo/Dockerfile` raised PermissionError against a directory.
+WATCHED_FILES = {
+    "pyproject.toml",
+    "uv.lock",
+    "Dockerfile",
+    "docker-compose.yml",
+    "start.sh",
+}
+WATCHED_DIRS = [w for w in MANDATORY_WATCH if w not in WATCHED_FILES]
+
+
 @pytest.fixture
 def repo(tmp_path):
     r = tmp_path / "repo"
-    for d in MANDATORY_WATCH:
+    r.mkdir(parents=True, exist_ok=True)
+    for d in WATCHED_DIRS:
         (r / d).mkdir(parents=True, exist_ok=True)
     assert subprocess.run(["git", "init", "-q", str(r)], capture_output=True).returncode == 0
     _git(r, "config", "user.email", "t@t")
     _git(r, "config", "user.name", "t")
-    for d in MANDATORY_WATCH:
+    for d in WATCHED_DIRS:
         (r / d / "f.txt").write_text("base\n")
+    for f in WATCHED_FILES:
+        (r / f).write_text("base\n")
     (r / "docs").mkdir(exist_ok=True)
     (r / "docs" / "d.md").write_text("docs\n")
     _git(r, "add", "-A")
@@ -190,7 +210,7 @@ def test_a_BRANCH_NAME_is_rejected_where_a_sha_belongs(repo):
     _branch_with(repo, "prod", "scout/f.txt", "moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
-    assert "NOT A FULL 40-HEX SHA" in out
+    assert "not a full 40-hex sha" in out.lower()
 
 
 def test_an_UNKNOWN_sha_names_the_right_reason(repo):
@@ -206,7 +226,7 @@ def test_an_UNKNOWN_sha_names_the_right_reason(repo):
     _branch_with(repo, "prod", "scout/f.txt", "moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
-    assert "IS NOT A COMMIT" in out
+    assert "is not a commit" in out.lower()
 
 
 def test_a_NON_ANCESTOR_clearance_FAILS(repo):
@@ -257,3 +277,73 @@ def test_the_shipped_declaration_records_no_stale_clearances():
         "master's declaration must not carry clearance SHAs; record them on the "
         "PR branch that obtained them"
     )
+
+
+# --------------------------------------------------------------------------
+# The delta shortcut changed what an omission from `watch` MEANS.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["cron", "ops", "systemd"])
+def test_the_deploy_substrate_DEMANDS_a_clearance(repo, path):
+    """Regression for a hole a fix opened.
+
+    While a clearance was demanded unconditionally, a path missing from `watch`
+    only failed to LAPSE one. Once "no delta in watched paths" became a pass,
+    every omission became a silent full exemption -- reported as "no clearance
+    required". `cron`, `ops` and `systemd` are the deploy substrate: a
+    2-minute cron entry once migrated the live database into 74 `database is
+    locked` errors, and systemd units run scripts from `/usr/local/bin` copies
+    so `git pull` deploys nothing.
+    """
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, f"sub-{path}", f"{path}/f.txt", "deploy substrate moved\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert path in out
+    assert "NO CLEARANCE RECORDED" in out
+
+
+def test_a_malformed_clearance_is_caught_even_when_none_is_DEMANDED(repo):
+    """Otherwise a typo hides through every docs-only PR.
+
+    The per-vector loop never runs when there is no delta, so without this a
+    malformed SHA sits unvalidated and then fails all four vectors at once on
+    the first PR that touches production -- the least convenient moment to
+    discover it.
+    """
+    _decl(repo, {v: "not-a-sha" for v in MANDATORY_VECTORS})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    _branch_with(repo, "docsonly", "docs/d.md", "docs change only\n")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert "malformed" in out
+    assert "not a full 40-hex SHA" in out
+
+
+@pytest.mark.parametrize("path", ["pyproject.toml", "uv.lock", "Dockerfile"])
+def test_a_ROOT_FILE_change_demands_a_clearance(repo, path):
+    """A claim I shipped as a documented limitation, which was simply false.
+
+    An earlier draft asserted root files could not be watched "because a path
+    prefix cannot reach a root file", and a test pinned that gap in place.
+    `git rev-parse <rev>:pyproject.toml` returns a BLOB hash; comparing blobs
+    is the same operation as comparing trees. The limitation was an artifact of
+    never running the claim -- and the test asserting it would have kept a
+    dependency bump exempt from review indefinitely.
+    """
+    _decl(repo, {})
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "decl")
+    # git refuses a ref ending in ".lock", so sanitise the branch name.
+    safe = path.replace(".", "-")
+    _git(repo, "checkout", "-q", "-b", f"root-{safe}")
+    (repo / path).write_text("changed\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", f"change {path}")
+    rc, out = _run(repo, "HEAD", "master")
+    assert rc == 1, out
+    assert path in out
+    assert "NO CLEARANCE RECORDED" in out

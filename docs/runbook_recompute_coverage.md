@@ -41,8 +41,14 @@ Exit codes: `0` credit recovered · `2` schema not deployed (deploy first) ·
 `3` ran but recovered nothing — **do not treat as success**, check that the
 history snapshots under `/root` still exist.
 
-Re-runnable. Keyed on `(source_table, source_row_id)`, so a second run
-overwrites its own rows and nothing else.
+Re-runnable. Keyed on `(source_table, source_row_id, semantics_version)` --
+THREE columns, not two. Re-running the SAME semantics version replaces its
+own rows, so the backfill is idempotent; bumping `RECOMPUTE_SEMANTICS` and
+re-running ACCUMULATES a new generation beside the old one rather than
+overwriting it. That is the point of a versioned derived store, and it is
+why the primary key was rebuilt -- see Deploy watchpoint 1. (This line said
+two columns until 2026-08-23; it predated the rebuild and was contradicted
+by the watchpoint added directly above it.)
 
 ## Operator actions the reviewer-lapse check CANNOT do for you
 
@@ -139,13 +145,27 @@ not leave the system sitting at `0.0`. Minimise the interval and timestamp it:
 migration_complete → backfill_start → first_nonzero_coverage → backfill_complete
 ```
 
-A worked interval, from the 2026-08-24 production deploy of `cdbb8475`:
+A worked interval, from the production deploy of `cdbb8475` on
+**2026-08-23** (UTC — the session that ran it had already ticked over locally,
+and an earlier version of this line said 08-24):
 
-```
-migration_complete    2026-08-23T23:54:37.555Z
-backfill_start        2026-08-23T23:57:06.892Z
-backfill_complete     2026-08-23T23:57:31.699Z      (2m54s total)
-```
+| stamp | value | provenance |
+|---|---|---|
+| `migration_complete` | `2026-08-23T23:54:37.557033Z` | journald, `chain_identity_recompute_v1_migration_complete` |
+| `backfill_start` | `2026-08-23T23:57:06.892Z` | **operator transcript** — the backfill is a manual shell command and writes nothing to journald |
+| `backfill_complete` | `2026-08-23T23:57:31.699Z` | **operator transcript**, same caveat |
+| elapsed | **2m54.1s** | arithmetic on the above |
+
+**The provenance column is not decoration, and it exists because an earlier
+version of this block was wrong in a way that read as precise.** It quoted
+`migration_complete` as `…37.555Z` in a fenced code block, which looks like a
+verbatim log line. There is no event at `.555`. It was a millisecond rounding
+of `…37.554568` — the completion of `chain_identity_semantics_v1`, a
+*different* migration from the one Watchpoint 1 is about, whose real completion
+is `…37.557033`. Two of the other three values are not in journald at all.
+
+Millisecond precision inside a code fence is a claim about where a number came
+from. If some of the row is transcript-sourced, say so, or drop the precision.
 
 **Note what that window does *not* prove.** The probe runs inside
 `_run_hourly_maintenance` — hourly. A window shorter than the probe period
@@ -154,12 +174,39 @@ Its absence there is a consequence of minimising the window as instructed, and
 is **not** evidence the observable works. Do not record "dark_surfaces behaved
 correctly" on the strength of a window it never sampled.
 
-Because the probe is hourly, a freshly-backfilled deploy can otherwise sit
-un-armed for up to an hour. Arm it deliberately rather than waiting — the same
-call the scheduler makes:
+Because the probe is hourly, a freshly-backfilled deploy sits un-armed for a
+full hour **from boot** — `_run_hourly_maintenance` is gated on a 3600-second
+interval whose timer starts at startup, so a restart resets it and the window
+is not a partial remainder. Arm it deliberately rather than waiting.
 
-```python
-cov = await db.chain_identity_recompute_coverage_probe(gate_minutes=1440.0)
+**Two things this instruction previously got wrong, both dangerous enough to
+state before the command:**
+
+**Do not reach for `Database.initialize()`.** It applies ~40 migrations against
+a database the pipeline is concurrently writing. This runbook says two sections
+earlier that readers must open read-only *before* `initialize()`, and
+`scripts/backfill_chain_identity_recompute.py` carries the same warning — both
+because a 2-minute cron doing exactly this once produced 74 `database is
+locked` errors. An arming snippet that quietly requires `initialize()`
+contradicts its own runbook.
+
+**Read the gate from `Settings`; never hardcode it.** The scheduler uses
+`settings.CONVICTION_EARLY_LEAD_MINUTES` (default 1440), so a literal `1440.0`
+agrees with it today and diverges the moment a `.env` overrides it. Because the
+mark is a MAX ratchet, arming under a *looser* gate sets it too high and
+manufactures a false collapse page later — the drift this runbook's own
+watchdog section warns about.
+
+```bash
+cd /root/gecko-alpha
+.venv/bin/python scripts/arm_recompute_coverage_mark.py
+```
+
+Then confirm from the read-only side — this is what the watchdog actually runs,
+stdlib-only and `mode=ro`:
+
+```bash
+.venv/bin/python scripts/check_recompute_coverage.py
 ```
 
 `collapsed` becomes reachable only once that baseline row exists. That ordering
@@ -267,7 +314,7 @@ remove. If neither form answers, the watchdog exits 6 rather than measuring
 against a guess.
 
 The systemd unit sets `SuccessExitStatus=0 1`, so an alarm is not a service
-failure but 2–6 surface in `systemctl status`.
+failure but 2–7 surface in `systemctl status`.
 
 ## Reading the status breakdown
 

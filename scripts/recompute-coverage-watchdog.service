@@ -5,7 +5,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 # Exit 1 is the ALARM path and has already sent Telegram, so it is not a
-# service failure. 2-6 are failures OF THE WATCHDOG and must surface in
+# service failure. 2-7 are failures OF THE WATCHDOG and must surface in
 # systemctl status, because nothing else reports them.
 SuccessExitStatus=0 1
 # Runs the REPO copy, not an installed one. Installing the .sh to

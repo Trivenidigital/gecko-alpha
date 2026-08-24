@@ -33,7 +33,7 @@ PYTHON="${GECKO_PYTHON:-$APP_DIR/.venv/bin/python}"
 #   2  check could not run (WARN, no Telegram)
 #   7  the app could not be imported to read the gate
 #   3  .env missing       4  Telegram credentials missing
-# Only 1 notifies. 2-6 are operator-visible failures of the watchdog itself.
+# Only 1 notifies. 2-7 are operator-visible failures of the watchdog itself.
 if [[ ! -d "$APP_DIR" ]]; then
     echo "FATAL: APP_DIR does not exist: $APP_DIR" >&2
     exit 5

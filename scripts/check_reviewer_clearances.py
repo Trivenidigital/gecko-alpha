@@ -42,6 +42,13 @@ carry a clearance?"* -- not *"is some historical SHA still current?"*. So:
   the PR introduces no production delta and **no clearance is required**. A
   documentation-only PR passes without touching the declaration at all.
 
+  **This narrows the treadmill; it does not remove it.** `watch` includes
+  `tests` and `.github`, so essentially every substantive PR has a watched
+  delta and still lands red until someone writes SHAs into this file by hand --
+  and for exactly the PRs where review matters most. The rubber-stamp pressure
+  named above is unchanged for those. Only the docs-only case is genuinely
+  exempt.
+
   This matters more than it looks. An earlier draft demanded a clearance from
   every PR unconditionally. Because this repo squash-merges -- which discards
   branch commits, so recorded SHAs stop being ancestors of master the moment a
@@ -54,17 +61,25 @@ carry a clearance?"* -- not *"is some historical SHA still current?"*. So:
 THREE STEPS, IN ORDER
 =====================
 
-1. Resolve the base and the head. A stale base ref is silent to the ancestry
-   guard below, and it fails in the flattering direction: it *overstates* the
-   delta, so it reads as diligence rather than as an error. (A local `master`
-   pinned 60 commits back once inflated a branch from 36 files to 91.)
+1. **A CALLER OBLIGATION, not a step this script performs:** the base ref must
+   be current. This script issues no `git fetch` -- grep it, there is none --
+   because the fetch belongs where the network is, and it lives in
+   `.github/workflows/test.yml` un-swallowed so a failure there fails the job.
+   Off-CI a stale `origin/master` moves the merge-base earlier, which
+   *overstates* the delta and so fails CLOSED; that is the safe direction, but
+   it is luck, not a guarantee this script provides. (A local `master` pinned
+   60 commits back once inflated a branch from 36 files to 91 -- a failure that
+   flatters, because it reads as diligence rather than as an error.)
 2. `git merge-base --is-ancestor` -- the ancestry guard. It catches "wrong
    branch named" and is silent on "right branch, stale ref"; only step 1 closes
    that. A commit existing is not a commit being reachable.
 3. Compare **tree hashes** of the watched paths, never `--name-only`, which
    misses a file restored to the wrong baseline.
 
-Exit codes: 0 pass -- 1 missing/lapsed/invalid clearance -- 2 usage or git error.
+Exit codes: 0 pass -- 1 a declaration or clearance problem (missing, narrowed,
+lapsed, malformed, unresolvable watch entry) -- 2 base/head could not be
+resolved. Everything that can be decided fails CLOSED as 1; only "I could not
+work out what to compare" is 2.
 """
 
 from __future__ import annotations
@@ -96,7 +111,44 @@ MANDATORY_VECTORS = frozenset({"concurrency", "silent-failure", "ops-safety", "l
 #: `dashboard` is here because that is where the /health WAL-sidecar silent
 #: failure lived, and `.github` because a PR deleting this step from the
 #: workflow must not be able to lapse nothing.
-MANDATORY_WATCH = frozenset({"scout", "scripts", "tests", ".github", "dashboard"})
+MANDATORY_WATCH = frozenset(
+    {
+        "scout",
+        "scripts",
+        "tests",
+        ".github",
+        "dashboard",
+        # The DEPLOY SUBSTRATE, added after the delta shortcut below changed
+        # what this list means. While a clearance was demanded unconditionally,
+        # an omission here only failed to LAPSE a clearance. Once "no delta in
+        # watched paths" became a pass, every omission turned into a silent
+        # full exemption -- announced cheerfully as "no clearance required".
+        #
+        # These three are not academic for this project: a 2-minute `cron`
+        # entry once migrated the live database into 74 `database is locked`
+        # errors, and `systemd` units run scripts from `/usr/local/bin` copies,
+        # so `git pull` deploys nothing and a unit edit is exactly the delta a
+        # reviewer needs to see.
+        "cron",
+        "ops",
+        "systemd",
+        # Root FILES. An earlier draft of this list claimed they could not be
+        # covered "because a path prefix cannot reach a root file", and
+        # documented that as a known gap. That was simply wrong:
+        # `git rev-parse <rev>:pyproject.toml` returns a BLOB hash, and
+        # comparing blob hashes is the same operation as comparing tree hashes.
+        # The gap was an artifact of not testing the claim.
+        #
+        # `uv.lock` and `pyproject.toml` reach production through `uv sync` on
+        # the next restart -- a documented crash-loop surface here -- and the
+        # container/entrypoint files decide what actually runs.
+        "pyproject.toml",
+        "uv.lock",
+        "Dockerfile",
+        "docker-compose.yml",
+        "start.sh",
+    }
+)
 
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
@@ -134,12 +186,12 @@ def main(argv: list[str]) -> int:
     base = argv[2] if len(argv) > 2 else "origin/master"
 
     if not DECL.exists():
-        print(f"FAIL: {DECL.name} is missing.")
+        print(f"FAIL: declaration is missing: {DECL}")
         return 1
     try:
         decl = tomllib.loads(DECL.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        print(f"FAIL: {DECL.name} is not valid TOML: {exc}")
+        print(f"FAIL: {DECL} is not valid TOML: {exc}")
         return 1
 
     required = list(decl.get("required") or [])
@@ -166,17 +218,67 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: cannot resolve {head} against {base}: {exc}")
         return 2
 
+    print(f"decl:  {DECL}")
     print(f"base:  {merge_base[:8]} (merge-base with {base})")
     print(f"head:  {head_sha[:8]}")
     print(f"watch: {', '.join(watch)}")
 
     delta, absent_both = _moved(watch, merge_base, head_sha)
     if absent_both:
+        # Two different situations reach here, and telling the operator which
+        # one they are in is the whole value of the message. The check itself
+        # cannot distinguish them -- both look like "resolves nowhere" -- so it
+        # names the remedy for each instead of guessing.
+        #
+        # A path pinned in MANDATORY_WATCH cannot be cleared by editing the
+        # declaration: the floor above re-adds it. If such a path is
+        # legitimately retired, EVERY subsequent PR hard-fails until the code
+        # is changed -- which manufactures the permanently-red signal this
+        # design exists to avoid. That is deliberate rather than accidental
+        # (retiring a watched surface should be a reviewed code change), but a
+        # message that does not say so reads as an unfixable bug.
+        pinned = sorted(set(absent_both) & MANDATORY_WATCH)
+        declared_only = sorted(set(absent_both) - MANDATORY_WATCH)
         print(
             f"\nFAIL: watched path(s) {', '.join(absent_both)} exist at neither "
             f"{merge_base[:8]} nor {head_sha[:8]} -- a watch entry that resolves "
-            "nowhere monitors nothing while reporting coverage. Fix the name."
+            "nowhere monitors nothing while reporting coverage."
         )
+        if declared_only:
+            print(
+                f"  {', '.join(declared_only)}: declared in .reviewers.toml only. "
+                "Almost certainly a typo -- fix the name there."
+            )
+        if pinned:
+            print(
+                f"  {', '.join(pinned)}: pinned in MANDATORY_WATCH, so editing "
+                ".reviewers.toml CANNOT clear this. If the path was legitimately "
+                "retired, remove it from MANDATORY_WATCH in "
+                "scripts/check_reviewer_clearances.py -- a code change, which is "
+                "itself reviewed. Until then every PR fails here."
+            )
+        return 1
+
+    # Validate the SHAPE of anything recorded, even when nothing is demanded.
+    # Otherwise a malformed entry -- wrong length, or not a commit -- sits
+    # unnoticed through every docs-only PR and then fails all four vectors at
+    # once on the first PR that touches production, which is the least
+    # convenient moment to discover a typo.
+    shape_errors: list[str] = []
+    for vector, sha in sorted(clearances.items()):
+        if not _SHA_RE.match(str(sha)):
+            shape_errors.append(f"{vector:16s} {sha!r} is not a full 40-hex SHA")
+            continue
+        try:
+            _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+        except RuntimeError:
+            shape_errors.append(
+                f"{vector:16s} {str(sha)[:8]} is not a commit in this repo"
+            )
+    if shape_errors:
+        print("\nrecorded clearances are malformed:\n")
+        for e in shape_errors:
+            print(f"  {e}")
         return 1
 
     if not delta:
@@ -199,11 +301,13 @@ def main(argv: list[str]) -> int:
             )
             continue
         try:
+            # `_git` raises on a nonzero exit, and `--verify --quiet` never
+            # exits 0 with empty stdout, so no emptiness check is needed here.
             full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
-            if not full:
-                raise RuntimeError("no such commit")
         except RuntimeError:
-            failures.append(f"{vector:16s} {sha[:8]} IS NOT A COMMIT IN THIS REPO")
+            failures.append(
+                f"{vector:16s} {str(sha)[:8]} IS NOT A COMMIT IN THIS REPO"
+            )
             continue
         anc = subprocess.run(
             ["git", "merge-base", "--is-ancestor", full, head_sha],
@@ -212,13 +316,13 @@ def main(argv: list[str]) -> int:
         )
         if anc.returncode != 0:
             failures.append(
-                f"{vector:16s} {sha[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
+                f"{vector:16s} {str(sha)[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
             )
             continue
         moved, _ = _moved(watch, full, head_sha)
         if moved:
             failures.append(
-                f"{vector:16s} LAPSED -- {', '.join(moved)} moved since {sha[:8]}"
+                f"{vector:16s} LAPSED -- {', '.join(moved)} moved since {str(sha)[:8]}"
             )
         else:
             print(f"  {vector:16s} HOLDS at {sha[:8]}")
