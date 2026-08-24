@@ -19,11 +19,15 @@ Three things, all follow-ups to the #559 deploy:
 
 | vector | SHA | mandatory | verdict |
 |---|---|---|---|
-| concurrency | `e1c7b8ca` | yes | clean |
-| logic | `dfab433f` | yes | clean |
-| ops-safety | `dfab433f` | yes | clean |
-| silent-failure | `dfab433f` | yes | clean, one deferred finding |
-| test-efficacy | `68cd3f0e` | no | clean after three refusals |
+| concurrency | `85ae29a0` | yes | clean — 7 call sites fail-closed, ~90 runs no flake |
+| logic | `dde828cf` | yes | clean — after blocking twice |
+| ops-safety | `d197bbea` | yes | clean — after requiring the pins |
+| silent-failure | `d197bbea` | yes | clean — after two self-reversals |
+| test-efficacy | `e02fcbe7` | no | clean — after three refusals |
+
+Every SHA was named by its reviewer **at that revision** and re-derived after
+each head move; none was carried forward. Nine head-moves occurred during
+review, each lapsing the whole table — that is the gate working, not failing.
 
 Gate output at the declaration commit: **all four required vectors hold**,
 exit 0. Each SHA was verified as an ancestor of HEAD with no `watch` path

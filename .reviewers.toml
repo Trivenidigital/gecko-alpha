@@ -40,12 +40,15 @@ watch = [
 ]
 
 [clearances]
-# Mandatory vectors (ruling D's four -- not a per-PR choice).
-concurrency = "e1c7b8ca618791d56e57e1941d068f5d01e1a786"
-logic = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
-ops-safety = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
-silent-failure = "dfab433f1d4bf6323c4ef430651e41508ec54e0c"
+# Mandatory vectors (ruling D's four -- not a per-PR choice). Every SHA below
+# was named by its reviewer AT THAT REVISION and re-derived by them after each
+# head move; none was carried forward. Nine head-moves occurred during review
+# and each lapsed the table, which is the gate working rather than failing.
+concurrency = "85ae29a00c5e1a998e75cd5f01c03150cbbbe63c"
+logic = "dde828cf6f598d69fe108e0994d506e4297f2329"
+ops-safety = "d197bbea1c6449dea6928c1e346059041eed2abc"
+silent-failure = "d197bbea1c6449dea6928c1e346059041eed2abc"
 
 # Non-mandatory, recorded because it carries information: this vector refused
 # three times on surviving mutants before clearing, so its green discriminates.
-test-efficacy = "68cd3f0e618d5acd2de5f6e0402a7fea3ccefc42"
+test-efficacy = "e02fcbe7b072524c6f8b0b6b1d604a486bc501db"
