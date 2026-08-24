@@ -40,15 +40,18 @@ watch = [
 ]
 
 [clearances]
-# Mandatory vectors (ruling D's four -- not a per-PR choice). Every SHA below
-# was named by its reviewer AT THAT REVISION and re-derived by them after each
-# head move; none was carried forward. Nine head-moves occurred during review
-# and each lapsed the table, which is the gate working rather than failing.
-concurrency = "85ae29a00c5e1a998e75cd5f01c03150cbbbe63c"
-logic = "dde828cf6f598d69fe108e0994d506e4297f2329"
-ops-safety = "d197bbea1c6449dea6928c1e346059041eed2abc"
-silent-failure = "d197bbea1c6449dea6928c1e346059041eed2abc"
-
-# Non-mandatory, recorded because it carries information: this vector refused
-# three times on surviving mutants before clearing, so its green discriminates.
-test-efficacy = "e02fcbe7b072524c6f8b0b6b1d604a486bc501db"
+# EMPTY BY DESIGN, and this is a REQUIRED post-merge step, not an oversight.
+#
+# Clearances are per-PR and belong on the PR branch that obtained them. This
+# repo squash-merges, so a cleared PR's SHAs land on master and immediately
+# stop being ancestors of anything cut from it -- #560's four were verified
+# non-ancestors within minutes of its merge. Left in place they would report
+# "IS NOT AN ANCESTOR" on work that has nothing to do with them, training the
+# next author to ignore the gate.
+#
+# `test_the_shipped_declaration_records_no_stale_clearances` enforces this by
+# reading master AS COMMITTED. If you are here because that test went red after
+# a merge: EMPTY this table, do not delete the file -- deleting it turns the
+# test green while disabling both the test and this declaration at once.
+#
+# Backlog ticket 21 removes this step entirely by giving each PR its own file.
