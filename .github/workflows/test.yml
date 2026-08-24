@@ -26,15 +26,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras
 
-      - name: Reviewer-clearance gate (ruling D)
-        # pull_request only: this repo squash-merges, so after a merge the
-        # clearance SHAs are no longer ancestors of master and the gate would
-        # fail every push. The revision under review is the PR head.
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --quiet origin "$GITHUB_BASE_REF" || true
-          uv run python scripts/check_reviewer_clearances.py "${{ github.event.pull_request.head.sha }}"
-
       - name: Dashboard contract firewalls
         timeout-minutes: 5
         run: >
@@ -86,3 +77,34 @@ jobs:
           TELEGRAM_BOT_TOKEN: test
           TELEGRAM_CHAT_ID: test
           ANTHROPIC_API_KEY: test
+
+  reviewer-clearances:
+    # Its OWN job, deliberately. As a step inside `test` a stale declaration
+    # failed the job in 13 seconds and produced zero test signal -- a
+    # clearance problem masquerading as a broken build.
+    #
+    # pull_request only: this repo squash-merges, so recorded SHAs stop being
+    # ancestors of master the moment a PR lands. The revision under review is
+    # the PR head.
+    #
+    # NOTE: with no branch protection configured on master this job cannot
+    # block a merge. It reports. See the script docstring and the runbook.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the check resolves clearance SHAs that a shallow
+          # clone does not contain, and a missing commit there is
+          # indistinguishable from a revoked clearance.
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Clearance lapse check (ruling D)
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          python scripts/check_reviewer_clearances.py             "${{ github.event.pull_request.head.sha }}"             "origin/${{ github.base_ref }}"

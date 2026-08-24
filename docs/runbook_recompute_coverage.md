@@ -44,6 +44,45 @@ history snapshots under `/root` still exist.
 Re-runnable. Keyed on `(source_table, source_row_id)`, so a second run
 overwrites its own rows and nothing else.
 
+## Operator actions the reviewer-lapse check CANNOT do for you
+
+`scripts/check_reviewer_clearances.py` is a **lapse detector**, not an
+enforcement gate, and the difference is not a caveat — it is the whole security
+model. Two things are required to make an unreviewed merge actually impossible,
+and **neither can be done from inside the repository**:
+
+**1. Branch protection is OFF.** Verified:
+
+```bash
+gh api repos/Trivenidigital/gecko-alpha/branches/master/protection   # 404 Branch not protected
+gh api repos/Trivenidigital/gecko-alpha/rulesets                     # []
+```
+
+With no protection, `mergeStateStatus` reads `UNSTABLE` (checks red, merge
+permitted) rather than `BLOCKED` — so **no CI check in this repo can block
+anything.** PR #560 was mergeable while its own clearance check was failing.
+Until an operator enables protection with the checks marked required, every
+gate here is advisory text in a log.
+
+**2. The clearance record sits on the author's writable surface.**
+`.reviewers.toml` is committed, so repointing all four clearances at the head
+is a four-line edit that turns the check green — and it makes the tree
+comparison vacuous, because the clearance tree is then compared against itself.
+
+The usual fix is to read approvals from the GitHub API, where they are bound to
+a commit and cannot be written by the author. **That does not work here yet:**
+this project has *zero* GitHub review approvals on every recent PR (`gh api
+repos/.../pulls/N/reviews` → `0` for #555, #557, #558, #559). Its independent
+reviewers are agents whose verdicts live in session transcripts. Until review
+verdicts are recorded somewhere the author cannot write, the record is
+self-attested by construction.
+
+**What the check does buy**, and why it still ships: it catches the *accidental*
+lapse — a clearance recorded, production moved underneath it, nobody noticed.
+That is exactly what happened on #559, where two clearances were carried in a
+report as still holding after `scout/db.py` had moved. It does not defend
+against a motivated author, and it does not claim to.
+
 ## Deploy watchpoint 1 — the PK rebuild may not run at all
 
 `_migrate_chain_identity_recompute_pk_v2` rebuilds the overlay's PRIMARY KEY to

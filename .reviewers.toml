@@ -1,23 +1,28 @@
-# Independent-review clearances for the current merge candidate (ruling D).
+# Independent-review clearances (ruling D).
 #
-# Enforced mechanically by scripts/check_reviewer_clearances.py in CI, so an
-# absent or lapsed clearance makes the candidate unmergeable rather than
-# depending on the implementer noticing that one expired.
+# Checked by scripts/check_reviewer_clearances.py. READ THAT FILE'S DOCSTRING
+# BEFORE TRUSTING THIS ONE: it is a lapse DETECTOR, not an enforcement gate.
+# This file is author-writable and master has no branch protection, so a
+# motivated author bypasses it in four lines. It catches the accidental case --
+# a clearance recorded, production then moved, nobody noticed -- which is the
+# case with a track record here.
 #
-# A clearance is a property of a REVISION. Record the SHA the vector was
-# actually measured on -- not the branch head at the time, and not a later SHA
-# that happens to contain it.
+# A clearance is a property of a REVISION. Record the full 40-hex SHA the
+# vector was actually measured on: not the branch head at the time, and not a
+# later SHA that happens to contain it. Branches and tags are rejected.
+#
+# Clearances are only demanded when a PR actually moves a watched path. A
+# docs-only PR needs no entry here.
 
 required = ["concurrency", "silent-failure", "ops-safety", "logic"]
 
-# Tree hashes of these paths are compared between each clearance SHA and the
-# head under review. Names are not enough: a name-level diff misses a file
-# restored to the wrong baseline.
-watch = ["scout", "scripts"]
+# Tree hashes of these are compared between each clearance SHA and the head.
+# Names are not enough: a name-level diff misses a file restored to the wrong
+# baseline. A watch entry that resolves at NEITHER revision is a hard failure,
+# not a quiet pass.
+watch = ["scout", "scripts", "tests", ".github", "dashboard"]
 
 [clearances]
-# PR #559, all four terminal and verified holding at the merge head cdbb8475.
-concurrency    = "f7a200cf"
-silent-failure = "f7a200cf"
-ops-safety     = "014ce900"
-logic          = "1aa81f7e"
+# Deliberately EMPTY on master. Clearances are per-PR and are recorded on the
+# PR branch by the session that obtained them. Carrying a previous PR's SHAs
+# here would inherit a misleading verdict onto every new branch.

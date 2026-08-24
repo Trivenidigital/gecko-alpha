@@ -1,67 +1,104 @@
 #!/usr/bin/env python3
-"""Fail the build when a required independent-review clearance is missing or lapsed.
+"""Detect a reviewer clearance that has gone stale against the tree it covered.
 
-Ruling D says a merge candidate needs an independent clearance per required
-vector, and that a clearance is a property of a REVISION, not of a branch or a
-component. On PR #559 that rule worked -- two slots were sent back after
-`scout/db.py` moved, and both re-runs produced findings that did not exist at
-the clearances that would otherwise have been carried forward.
+WHAT THIS IS, AND WHAT IT IS NOT
+================================
 
-But the rule did not catch that. A person did, at the moment when accepting an
-already-held clearance was cheapest. That is discipline under observation with
-four reviewers watching, not a mechanism, and the merge report's own §7 argues
-against exactly that shape: prefer the version of a virtue that has a mechanism
-attached. This is the mechanism.
+This is a **lapse detector**. It catches the failure that actually happened on
+PR #559: a clearance was recorded, production then moved underneath it, and the
+merge report went on asserting the clearance still held. Recomputing rather
+than re-reading is the whole mechanism.
 
-The declaration lives in `.reviewers.toml` at the repo root:
+It is **NOT an independence mechanism, and cannot be made into one here.** Two
+things would be required, and neither exists in this repository today:
 
-    required = ["concurrency", "silent-failure", "ops-safety", "logic"]
-    watch    = ["scout", "scripts"]
+1. **Branch protection.** With none configured, no CI check can make anything
+   unmergeable -- `mergeStateStatus` reads `UNSTABLE` (checks red, merge
+   permitted) rather than `BLOCKED`. Verified against this repo: PR #560 was
+   mergeable while this very check was failing.
+2. **A review record outside the author's reach.** `.reviewers.toml` is
+   author-writable, so repointing every clearance at the head is a four-line
+   edit that turns this green -- and it makes step 3 vacuous, because the
+   clearance tree is then compared against itself. GitHub review approvals
+   would supply an unfakeable, commit-bound record, but this project has
+   **zero** of them on every recent PR: its independent reviewers are agents
+   whose verdicts live in session transcripts, not in the GitHub review API.
 
-    [clearances]
-    concurrency    = "f7a200cf"
-    silent-failure = "f7a200cf"
+So a motivated author bypasses this trivially. That is documented here rather
+than dressed up, because a check advertised as enforcement that is really a
+reminder is worse than an honest reminder. What it does buy is the accidental
+case, which is the one with a track record.
 
-Exit codes: 0 pass · 1 lapsed/missing/invalid clearance · 2 usage or git error.
+Both gaps are operator decisions and are recorded in
+`docs/runbook_recompute_coverage.md`.
 
-THREE STEPS, IN ORDER. The first was missing until it cost us:
+WHAT IT CHECKS
+==============
 
-1. `git fetch` -- the base ref itself may be stale. A local `master` pinned 60
-   commits back inflated a branch from 36 files to 91 and made it look like it
-   carried other PRs' work. That failure OVERSTATES footprint, so it reads as
-   diligence rather than as an error.
-2. `git merge-base --is-ancestor` -- the ancestry guard. Without it,
-   `origin/HEAD` resolving to `origin/master` produced a false LAPSED reporting
-   3,546 deletions. Step 2 catches "wrong branch named" and is SILENT on "right
-   branch, stale ref"; only step 1 closes that.
-3. Compare TREE HASHES of the watched paths, not `--name-only`. Name-level
-   diffing misses a file restored to the wrong baseline.
+The question is *"does the delta THIS pull request introduces in watched paths
+carry a clearance?"* -- not *"is some historical SHA still current?"*. So:
 
-And a commit existing is not a commit being reachable: ancestry is evaluated
-from the revision under review, never from whatever was last pushed.
+* If the watched trees are identical between the **merge base** and the head,
+  the PR introduces no production delta and **no clearance is required**. A
+  documentation-only PR passes without touching the declaration at all.
 
-RUNS ON `pull_request` ONLY, and that is not a preference. This repo
-squash-merges, which discards the branch commits -- so after the merge the
-clearance SHAs are no longer ancestors of anything on master, and the gate
-would fail every push. Found by running it against `cdbb8475` immediately after
-#559 landed:
+  This matters more than it looks. An earlier draft demanded a clearance from
+  every PR unconditionally. Because this repo squash-merges -- which discards
+  branch commits, so recorded SHAs stop being ancestors of master the moment a
+  PR lands -- every new branch inherited a red check and had to edit the record
+  to clear it. That manufactures exactly the rubber-stamp habit the check
+  exists to prevent, and trains everyone to ignore a permanently red signal.
+* Otherwise each required vector must have a clearance that is an ancestor of
+  the head and whose watched trees match the head's.
 
-    git merge-base --is-ancestor f7a200cf cdbb8475   -> NO   (squashed away)
-    git merge-base --is-ancestor f7a200cf e2e3440a   -> YES  (the PR head)
+THREE STEPS, IN ORDER
+=====================
 
-The revision under review is the PR head, which is exactly where the question
-"would this merge with an unreviewed delta?" is meaningful. Verify a
-squash-merge landed by CONTENT (tree equality), not by ancestry.
+1. Resolve the base and the head. A stale base ref is silent to the ancestry
+   guard below, and it fails in the flattering direction: it *overstates* the
+   delta, so it reads as diligence rather than as an error. (A local `master`
+   pinned 60 commits back once inflated a branch from 36 files to 91.)
+2. `git merge-base --is-ancestor` -- the ancestry guard. It catches "wrong
+   branch named" and is silent on "right branch, stale ref"; only step 1 closes
+   that. A commit existing is not a commit being reachable.
+3. Compare **tree hashes** of the watched paths, never `--name-only`, which
+   misses a file restored to the wrong baseline.
+
+Exit codes: 0 pass -- 1 missing/lapsed/invalid clearance -- 2 usage or git error.
 """
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
-DECL = Path(".reviewers.toml")
+#: Script-relative, not CWD-relative: run from a subdirectory, a CWD-relative
+#: path reports "declaration missing" instead of a usage error. `REVIEWERS_DECL`
+#: overrides it so the test-suite can drive the real script against a purpose-
+#: built repository rather than against this one.
+DECL = Path(
+    os.environ.get("REVIEWERS_DECL")
+    or Path(__file__).resolve().parents[1] / ".reviewers.toml"
+)
+
+#: Ruling D's four vectors, pinned in EXECUTABLE code rather than only in a
+#: test, because a declaration that can narrow `required` to one vector can
+#: equally narrow the test that checks it.
+MANDATORY_VECTORS = frozenset({"concurrency", "silent-failure", "ops-safety", "logic"})
+
+#: Paths whose movement must be covered by a clearance. `.reviewers.toml` can
+#: never appear here -- a file cannot police edits to itself -- and that is the
+#: clearest tell that a committed file is the wrong home for this record.
+#: `dashboard` is here because that is where the /health WAL-sidecar silent
+#: failure lived, and `.github` because a PR deleting this step from the
+#: workflow must not be able to lapse nothing.
+MANDATORY_WATCH = frozenset({"scout", "scripts", "tests", ".github", "dashboard"})
+
+_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 def _git(*args: str) -> str:
@@ -72,104 +109,127 @@ def _git(*args: str) -> str:
 
 
 def _tree(rev: str, path: str) -> str | None:
-    """Tree hash of `path` at `rev`, or None when the path does not exist there."""
     try:
         return _git("rev-parse", f"{rev}:{path}")
     except RuntimeError:
         return None
 
 
+def _moved(watch: list[str], a: str, b: str) -> tuple[list[str], list[str]]:
+    """Watched paths differing between `a` and `b`, and those absent at BOTH.
+
+    The second list is why this returns a pair. `_tree` yields None for a path
+    that does not exist, and `None != None` is False -- so a misspelled or
+    renamed watch entry compared equal, was reported as covered, and printed the
+    typo in the banner as though it were being watched. That was the only way
+    this script could fail OPEN. It is now fatal rather than quiet.
+    """
+    moved = [p for p in watch if _tree(a, p) != _tree(b, p)]
+    missing = [p for p in watch if _tree(a, p) is None and _tree(b, p) is None]
+    return moved, missing
+
+
 def main(argv: list[str]) -> int:
     head = argv[1] if len(argv) > 1 else "HEAD"
+    base = argv[2] if len(argv) > 2 else "origin/master"
 
     if not DECL.exists():
-        print(f"FAIL: {DECL} is missing -- every merge candidate must declare "
-              f"its required review vectors and the SHA each was cleared on.")
+        print(f"FAIL: {DECL.name} is missing.")
         return 1
-
     try:
         decl = tomllib.loads(DECL.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        print(f"FAIL: {DECL} is not valid TOML: {exc}")
-        return 2
-
-    required = decl.get("required") or []
-    watch = decl.get("watch") or ["scout", "scripts"]
-    clearances = decl.get("clearances") or {}
-
-    if not required:
-        print(f"FAIL: {DECL} declares no required vectors.")
+        print(f"FAIL: {DECL.name} is not valid TOML: {exc}")
         return 1
 
-    # Step 1. Without this the ancestry guard below is silent on a stale ref.
-    try:
-        subprocess.run(["git", "fetch", "--quiet", "origin"], check=False,
-                       capture_output=True, text=True, timeout=120)
-    except Exception:
-        pass  # offline runners still get steps 2 and 3
+    required = list(decl.get("required") or [])
+    watch = list(decl.get("watch") or [])
+    clearances = dict(decl.get("clearances") or {})
+
+    narrowed = MANDATORY_VECTORS - set(required)
+    if narrowed:
+        print(
+            "FAIL: required vectors narrowed -- missing "
+            f"{', '.join(sorted(narrowed))}. Ruling D's four vectors are not a "
+            "per-PR choice."
+        )
+        return 1
+    unwatched = MANDATORY_WATCH - set(watch)
+    if unwatched:
+        print(f"FAIL: watch list narrowed -- missing {', '.join(sorted(unwatched))}.")
+        return 1
 
     try:
-        head_sha = _git("rev-parse", head)
+        head_sha = _git("rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
+        merge_base = _git("merge-base", base, head_sha)
     except RuntimeError as exc:
-        print(f"FAIL: cannot resolve {head}: {exc}")
+        print(f"FAIL: cannot resolve {head} against {base}: {exc}")
         return 2
 
-    print(f"head under review: {head_sha[:8]}")
-    print(f"watched paths:     {', '.join(watch)}")
+    print(f"base:  {merge_base[:8]} (merge-base with {base})")
+    print(f"head:  {head_sha[:8]}")
+    print(f"watch: {', '.join(watch)}")
+
+    delta, absent_both = _moved(watch, merge_base, head_sha)
+    if absent_both:
+        print(
+            f"\nFAIL: watched path(s) {', '.join(absent_both)} exist at neither "
+            f"{merge_base[:8]} nor {head_sha[:8]} -- a watch entry that resolves "
+            "nowhere monitors nothing while reporting coverage. Fix the name."
+        )
+        return 1
+
+    if not delta:
+        print("\nno delta in watched paths; no clearance required.")
+        return 0
+
+    print(f"\ndelta in watched paths: {', '.join(delta)}")
 
     failures: list[str] = []
-    for vector in required:
+    for vector in sorted(required):
         sha = clearances.get(vector)
         if not sha:
             failures.append(f"{vector:16s} NO CLEARANCE RECORDED")
             continue
-
+        if not _SHA_RE.match(str(sha)):
+            failures.append(
+                f"{vector:16s} {sha!r} IS NOT A FULL 40-HEX SHA -- a branch or "
+                "tag silently re-points as it moves, so it cannot record which "
+                "revision was reviewed"
+            )
+            continue
         try:
-            # `--verify <sha>^{commit}` and not a bare `rev-parse`: a bare
-            # rev-parse happily echoes any 40-hex string back without checking
-            # the object exists, so an unknown SHA fell through to the ancestry
-            # check and was reported as "not an ancestor" -- a true statement
-            # about a commit that is not in the repository at all, and a
-            # misleading one to debug. Found by the test that asserts the
-            # REASON and not only the exit code.
             full = _git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
             if not full:
                 raise RuntimeError("no such commit")
         except RuntimeError:
-            failures.append(f"{vector:16s} {sha} IS NOT A COMMIT IN THIS REPO")
+            failures.append(f"{vector:16s} {sha[:8]} IS NOT A COMMIT IN THIS REPO")
             continue
-
-        # Step 2. A non-ancestor reports invalid rather than a spurious revert.
         anc = subprocess.run(
             ["git", "merge-base", "--is-ancestor", full, head_sha],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if anc.returncode != 0:
             failures.append(
-                f"{vector:16s} {sha[:8]} IS NOT AN ANCESTOR of {head_sha[:8]} "
-                f"-- the clearance was measured on a revision this head does "
-                f"not contain, so it says nothing about what would merge"
+                f"{vector:16s} {sha[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
             )
             continue
-
-        # Step 3. Tree hashes, not names.
-        moved = [p for p in watch if _tree(full, p) != _tree(head_sha, p)]
+        moved, _ = _moved(watch, full, head_sha)
         if moved:
             failures.append(
-                f"{vector:16s} LAPSED -- {', '.join(moved)} moved since "
-                f"{sha[:8]}; re-run this vector against {head_sha[:8]}"
+                f"{vector:16s} LAPSED -- {', '.join(moved)} moved since {sha[:8]}"
             )
         else:
             print(f"  {vector:16s} HOLDS at {sha[:8]}")
 
     if failures:
-        print("\nreviewer-clearance gate FAILED:\n")
+        print("\nreviewer-clearance check FAILED:\n")
         for f in failures:
             print(f"  {f}")
         print(
             "\nA clearance is a property of a revision, not of a branch. It is "
-            "not carried forward across a production delta, and the "
-            "implementer's own review never satisfies an independent slot."
+            "not carried forward across a production delta."
         )
         return 1
 
