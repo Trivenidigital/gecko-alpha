@@ -188,6 +188,13 @@ def test_the_derivation_matches_EVERY_source_of_artefacts():
 def test_no_script_is_covered_by_PROSE_alone():
     """A documentation example must not be what puts a script in scope.
 
+    TRIPWIRE, NOT A DETECTOR: `_ARTEFACT_GLOBS` contains no `.md`, so
+    `prose_only` is always empty and this cannot fire against the current
+    tree. Its job is to fail the day someone re-adds a prose glob -- the same
+    role `_KNOWN_SURFACES` plays. Do not read a pass here as evidence that
+    prose was checked and found absent; it is evidence that no `.md` is in
+    scope to check.
+
     `cron-drift-watchdog.sh` entered the covered set from `cron/README.md`
     while appearing in no crontab and no unit. Harmless in that instance --
     the file genuinely should ship executable -- but the MECHANISM is the
@@ -229,24 +236,63 @@ def test_the_runbook_does_not_reintroduce_a_chmod_step():
     )
 
 
-def _units_executing_repo_scripts() -> dict[str, str]:
-    """{unit filename -> the repo .sh it ExecStarts}, units only."""
-    units = {}
-    for pattern in ("scripts/*.service", "systemd/*.service"):
+#: Unit globs, kept separate from `_ARTEFACT_GLOBS` so a lost one is nameable.
+_UNIT_GLOBS = ("scripts/*.service", "systemd/*.service")
+
+
+def _units_executing_repo_scripts() -> dict[str, tuple[str, str]]:
+    """{unit filename -> (repo .sh it ExecStarts, which glob found it)}.
+
+    FILTERED to repo-path invocations, which the first version was not despite
+    this name and docstring both saying "repo". It matched on
+    `line.endswith(".sh")` alone, so three `/usr/local/bin/gecko-backup-*.sh`
+    units -- installed copies, correctly out of scope -- padded the set to 7
+    when only 4 execute from the repo. The floor below was 4. So the padding
+    was exactly the slack that let a dropped glob pass.
+    """
+    units: dict[str, tuple[str, str]] = {}
+    for pattern in _UNIT_GLOBS:
         for unit in REPO_ROOT.glob(pattern):
             for line in unit.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
                 if line.startswith("ExecStart=") and line.endswith(".sh"):
-                    units[unit.name] = line.split("=", 1)[1]
+                    target = line.split("=", 1)[1]
+                    if not target.startswith("/root/gecko-alpha/"):
+                        continue  # installed copy, not run from the checkout
+                    units[unit.name] = (target, pattern)
     return units
 
 
 UNITS = _units_executing_repo_scripts()
 
 
-def test_the_unit_scan_finds_units():
-    """Guard the guard, again -- an empty scan makes the next test vacuous."""
-    assert len(UNITS) >= 4, f"only {len(UNITS)} repo-executing units found"
+def test_the_unit_scan_covers_EVERY_unit_glob():
+    """PER-SOURCE, mirroring the derivation guard 80 lines up.
+
+    This was `len(UNITS) >= 4` -- a bare floor, no anchors, no per-source
+    assertion: precisely the form that guard was rewritten to replace, added in
+    the SAME commit, in the same file. A reviewer dropped `scripts/*.service`
+    from the unit scan: the set fell 7 -> 6, `recompute-coverage-watchdog.service`
+    -- the unit this PR is about -- stopped being scanned, 27 tests passed, and
+    its `ExecStartPre` could then be stripped undetected.
+
+    Ninth instance of a fix closing one branch and leaving its axis open, and
+    the first where both branches shipped in one commit.
+    """
+    by_glob: dict[str, set[str]] = {g: set() for g in _UNIT_GLOBS}
+    for unit, (_target, glob) in UNITS.items():
+        by_glob[glob].add(unit)
+
+    for glob, units in by_glob.items():
+        assert units, (
+            f"the unit scan matched NOTHING from {glob} -- that glob was "
+            "dropped or the parse broke, and every preflight assertion below "
+            "silently stopped covering it"
+        )
+
+    # An anchor in each glob, so a lost one is named rather than absorbed.
+    assert "recompute-coverage-watchdog.service" in by_glob["scripts/*.service"]
+    assert "systemd-drift-watchdog.service" in by_glob["systemd/*.service"]
 
 
 @pytest.mark.parametrize("unit", sorted(UNITS))
@@ -265,7 +311,7 @@ def test_a_unit_executing_a_repo_script_has_an_EXEC_PREFLIGHT(unit):
     "fails invisibly if it ever is" open on the same units.
     """
     body = (REPO_ROOT / ("scripts" if (REPO_ROOT / "scripts" / unit).exists() else "systemd") / unit).read_text(encoding="utf-8")
-    script = UNITS[unit]
+    script, _glob = UNITS[unit]
     assert f"ExecStartPre=/usr/bin/test -x {script}" in body, (
         f"{unit} executes {script} from the repo with no `ExecStartPre=/usr/bin/"
         f"test -x` preflight. A permission failure there is indistinguishable "
