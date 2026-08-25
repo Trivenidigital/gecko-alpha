@@ -56,7 +56,7 @@ def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
     argv = [sys.executable, str(SCRIPT), head, base]
     if pr is not None:
         argv += ["--pr", pr]
-    env = {**os.environ, "REVIEWERS_DIR": str(repo / ".reviewers")}
+    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
@@ -123,6 +123,15 @@ def _decl(repo, clearances, required=None, watch=None, pr=PR, declared_pr=None):
     d = repo / ".reviewers"
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{pr}.toml").write_text(body)
+    # COMMITTED, not merely written. The gate reads the record out of the
+    # REVISION under review rather than off disk, so an uncommitted record is
+    # not part of the candidate and must not clear it. This also models what
+    # really happens: the record is an evidence-only commit on the PR branch.
+    # `.reviewers/` is unwatched, so that commit cannot lapse the very
+    # clearances it records.
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", f"record clearances for PR {pr}")
+    return _git(repo, "rev-parse", "HEAD")
 
 
 def _branch_with(repo, name, path, content):
@@ -140,8 +149,6 @@ def _branch_with(repo, name, path, content):
 def test_a_docs_only_branch_needs_NO_clearance(repo):
     """Otherwise every PR is forced to edit the record, which is the bad habit."""
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "docsonly", "docs/d.md", "more docs\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 0, out
@@ -173,8 +180,6 @@ def test_a_docs_only_branch_STILL_needs_its_own_record(repo):
 
 def test_a_branch_that_moves_a_watched_path_DEMANDS_a_clearance(repo):
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "prod", "scout/f.txt", "production moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -184,12 +189,8 @@ def test_a_branch_that_moves_a_watched_path_DEMANDS_a_clearance(repo):
 
 def test_a_clearance_covering_the_delta_PASSES(repo):
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     sha = _branch_with(repo, "prod", "scout/f.txt", "production moved\n")
     _decl(repo, {v: sha for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "record clearances")
     # The clearance predates a docs-only commit, so it still covers the tree.
     (repo / "docs" / "d.md").write_text("docs after review\n")
     _git(repo, "add", "-A")
@@ -201,12 +202,8 @@ def test_a_clearance_covering_the_delta_PASSES(repo):
 
 def test_a_clearance_stops_covering_once_production_moves_again(repo):
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     sha = _branch_with(repo, "prod", "scout/f.txt", "first change\n")
     _decl(repo, {v: sha for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "record")
     (repo / "scout" / "f.txt").write_text("SECOND change, unreviewed\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "unreviewed change")
@@ -227,8 +224,6 @@ def test_a_watch_entry_that_resolves_NOWHERE_is_fatal_not_silent(repo):
     as though it were covered.
     """
     _decl(repo, {}, watch=MANDATORY_WATCH + ["dashbaord"])
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "prod", "scout/f.txt", "moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -238,8 +233,6 @@ def test_a_watch_entry_that_resolves_NOWHERE_is_fatal_not_silent(repo):
 
 def test_required_vectors_cannot_be_NARROWED(repo):
     _decl(repo, {}, required=["logic"])
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert "required vectors narrowed" in out
@@ -249,11 +242,21 @@ def test_required_vectors_cannot_be_NARROWED(repo):
 
 def test_the_watch_list_cannot_be_NARROWED(repo):
     _decl(repo, {}, watch=["scout"])
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert "watch list narrowed" in out
+
+    # PIN THE FLOOR ITSELF, not merely that narrowing raises. Dropping
+    # "cron","ops","systemd" from MANDATORY_WATCH left the ENTIRE suite green:
+    # this file keeps its own literal copy of the list and `_decl` defaults
+    # every record's `watch` to it, so the tests that name those paths prove
+    # "a DECLARED entry demands a clearance" and never "the floor forces the
+    # entry into every record". Assert-that-it-raised, not assert-what-it-pins
+    # -- on the axis where the consequence is a uv.lock-only dependabot PR or a
+    # systemd unit change passing unreviewed.
+    for w in MANDATORY_WATCH:
+        if w != "scout":
+            assert w in out, f"the floor no longer pins {w}: {out}"
 
 
 def test_a_BRANCH_NAME_is_rejected_by_the_SHAPE_CHECK(repo):
@@ -269,8 +272,6 @@ def test_a_BRANCH_NAME_is_rejected_by_the_SHAPE_CHECK(repo):
     branch is gone; this test now pins WHICH gate raises.
     """
     _decl(repo, {v: "master" for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "prod", "scout/f.txt", "moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -288,8 +289,6 @@ def test_an_UNKNOWN_sha_is_rejected_by_the_SHAPE_CHECK(repo):
     repository at all, and misleading to debug.
     """
     _decl(repo, {v: "0" * 40 for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "prod", "scout/f.txt", "moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -301,14 +300,10 @@ def test_an_UNKNOWN_sha_is_rejected_by_the_SHAPE_CHECK(repo):
 
 def test_a_NON_ANCESTOR_clearance_FAILS(repo):
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     side = _branch_with(repo, "sidebranch", "scout/f.txt", "side\n")
     _git(repo, "checkout", "-q", "master")
     _branch_with(repo, "prod", "scout/f.txt", "prod\n")
     _decl(repo, {v: side for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "record side sha")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert "IS NOT AN ANCESTOR" in out
@@ -484,7 +479,7 @@ def test_a_MALFORMED_stored_clearance_is_caught_at_rest(repo):
 
 def _run_argv(repo, extra, env_pr=None):
     """Drive the script with an EXACT argv tail, preserving order."""
-    env = {**os.environ, "REVIEWERS_DIR": str(repo / ".reviewers")}
+    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
@@ -513,10 +508,23 @@ def test_every_accepted_ARGUMENT_ORDER_resolves_the_same_run(repo, extra):
     were written around, not a contract.
     """
     sha = _branch_with(repo, "work", "scout/f.txt", "moved")
-    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
     rc, out = _run_argv(repo, extra)
     assert rc == 0, "argv " + repr(extra) + " did not resolve a clean run:" + chr(10) + out
     assert "pr:    " + PR in out, out
+    # ASSERT IT IS THE SAME RUN, not merely a clean one. The first version of
+    # this test checked only `rc == 0` and the pr banner -- and mutants that
+    # swapped the DEFAULT head/base refs SURVIVED all five parametrisations,
+    # because "nothing was compared" is also rc 0 with the right pr line. The
+    # docstring said "order must not change which PR, head or base is
+    # evaluated" while the assertions could not see head or base at all.
+    assert "head:  " + head[:8] in out, (
+        "argv " + repr(extra) + " resolved a DIFFERENT head:" + chr(10) + out
+    )
+    assert out.count("HOLDS") == len(MANDATORY_VECTORS), (
+        "argv " + repr(extra) + " did not verify all four vectors -- a run that "
+        "compared nothing also exits 0:" + chr(10) + out
+    )
 
 
 def test_ENVIRONMENT_ONLY_identity_resolves_without_any_flag(repo):
@@ -570,6 +578,176 @@ def test_AGREEING_duplicate_identities_are_accepted(repo):
     assert rc == 0, out
 
 
+# --------------------------------------------------------------------------
+# CROSS-PR WRITE CHANNEL. `.reviewers/` is exempt from `watch` because a record
+# cannot police edits to itself -- but that exemption was applied to the whole
+# PREFIX, so it exempted every OTHER PR's record too. The invariant
+# "nothing written for PR A can ever become active state for PR B" was
+# FALSIFIED end-to-end: a docs-only PR wrote another PR's record, printed
+# "no delta in watched paths", squash-merged, and the target PR's gate then
+# reported all four vectors HOLD -- target author uninvolved, no reviewer
+# involved, a third party choosing the SHA.
+# --------------------------------------------------------------------------
+
+def test_a_PR_cannot_WRITE_another_PRs_record(repo):
+    """The forgery half of the cross-PR channel."""
+    victim = _branch_with(repo, "victim", "scout/f.txt", "production change")
+    _git(repo, "checkout", "-q", "master")
+    _git(repo, "checkout", "-q", "-b", "attacker")
+    (repo / "docs" / "d.md").write_text("docs only\n")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (OTHER_PR + ".toml")).write_text(
+        "pr = " + OTHER_PR + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + victim + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _decl(repo, {}, pr=PR)  # the attacker's own record; commits both files
+
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, (
+        "a docs-only PR forged another PR's clearance record and passed:"
+        + nl + out
+    )
+    assert "ANOTHER PR" in out and OTHER_PR + ".toml" in out, out
+
+
+def test_a_PR_cannot_DELETE_another_PRs_archived_record(repo):
+    """The audit trail must not be silently erasable.
+
+    `.reviewers/README.md` promises old records are kept as evidence. Nothing
+    kept them: deletion is a change under an unwatched prefix, so it required
+    no clearance and was not even named in the output.
+    """
+    _decl(repo, {}, pr=OTHER_PR)          # an archived record, on master
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "docs" / "d.md").write_text("a docs change" + chr(10))
+    (repo / ".reviewers" / (OTHER_PR + ".toml")).unlink()
+    _decl(repo, {}, pr=PR)                # commits the docs edit AND the deletion
+
+    # PROVE THE FIXTURE MODELS THE CASE before trusting the verdict. An earlier
+    # version of this test silently built a tree where the archived record was
+    # never in the merge-base, so the guard had nothing to catch and the test
+    # reported the defect as unfixed.
+    base = _git(repo, "merge-base", "master", "HEAD")
+    assert OTHER_PR + ".toml" in _git(
+        repo, "ls-tree", "--name-only", base, "--", ".reviewers/"
+    ), "fixture broken: the archived record is not in the merge-base"
+    assert OTHER_PR + ".toml" not in _git(
+        repo, "ls-tree", "--name-only", "HEAD", "--", ".reviewers/"
+    ), "fixture broken: the deletion was never committed"
+
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, "another PR's record was deleted silently:" + chr(10) + out
+    assert "ANOTHER PR" in out, out
+
+
+def test_a_PR_MAY_touch_its_OWN_record(repo):
+    """The exemption that must survive: your own record is yours to write."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    rc, out = _run(repo, head, "master", pr=PR)
+    assert rc == 0, out
+
+
+# --------------------------------------------------------------------------
+# THE RECORD IS A PROPERTY OF THE REVISION, NOT OF THE WORKING TREE.
+# --------------------------------------------------------------------------
+
+def test_an_UNCOMMITTED_record_cannot_clear_a_revision(repo):
+    """A green must be reproducible from the SHA alone.
+
+    The gate judges `head_sha` but formerly read the record off disk -- two
+    different revisions with nothing asserting they matched. In GitHub Actions
+    they demonstrably differ: `actions/checkout@v4` with no `ref:` checks out
+    `refs/pull/N/merge` while the workflow passes `pull_request.head.sha`. So
+    the record came from the merge tree and the verdict described the head
+    tree.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    # deliberately NOT committed
+    rc, out = _run(repo, sha, "master", pr=PR)
+    assert rc == 1, (
+        "an uncommitted record cleared a revision that does not contain it:"
+        + nl + out
+    )
+    assert "not present in the revision under review" in out, out
+
+
+def test_a_record_on_the_BASE_ONLY_cannot_clear_the_head(repo):
+    """The CI-accurate case: the record exists, but not in what is judged."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _git(repo, "checkout", "-q", "master")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)   # lands on master
+    rc, out = _run(repo, sha, "master", pr=PR)
+    assert rc == 1, (
+        "a record present only on the base cleared the head:" + chr(10) + out
+    )
+    assert "not present in the revision under review" in out, out
+
+
+# --------------------------------------------------------------------------
+# SCHEMA VERSION -- enforced by the reader that DECIDES.
+# --------------------------------------------------------------------------
+
+def test_an_unsupported_record_version_is_refused_BY_THE_GATE(repo):
+    """Not merely by a hygiene test in a different CI job.
+
+    `record_version` formerly appeared nowhere in the gate: it exited 0 on
+    `record_version = 99`, and the only enforcement lived in the test-suite,
+    over a directory that globbed to zero files, in the `test` job rather than
+    the clearance job. A version marker whose purpose is "do not let a newer
+    schema be misread by an older reader" is worthless if the deciding reader
+    never reads it.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl + "record_version = 99" + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record with a future schema")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "record_version" in out, out
+
+
+def test_an_ABSENT_record_version_still_means_v1(repo):
+    """Permanent bootstrap compatibility -- absence is determinate, not a guess.
+
+    Requiring the field would retroactively invalidate every record written
+    before it existed, which is the retroactive-policy failure the historical
+    record rule exists to prevent. Strict on the open future, permissive on
+    the closed past.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    assert "record_version" not in (
+        repo / ".reviewers" / (PR + ".toml")
+    ).read_text()
+    rc, out = _run(repo, head, "master", pr=PR)
+    assert rc == 0, out
+
+
 def test_ANOTHER_PRs_clearance_cannot_satisfy_this_one(repo):
     """PR A's record must never clear PR B. The filename is not the owner.
 
@@ -613,13 +791,16 @@ def test_two_concurrent_PRs_at_different_heads_stay_INDEPENDENT(repo):
     _git(repo, "checkout", "-q", "master")
     b_sha = _branch_with(repo, "pr-b", "dashboard/f.txt", "b")
 
-    def both_records(a, b):
-        _decl(repo, {v: a for v in MANDATORY_VECTORS}, pr=PR)
-        _decl(repo, {v: b for v in MANDATORY_VECTORS}, pr=OTHER_PR)
+    # Each record is committed ON ITS OWN PR's branch: the gate reads the
+    # record out of the revision it judges, so a record living on the other
+    # branch is correctly invisible. That is the isolation being tested.
+    _git(repo, "checkout", "-q", "pr-a")
+    a_head = _decl(repo, {v: a_sha for v in MANDATORY_VECTORS}, pr=PR)
+    _git(repo, "checkout", "-q", "pr-b")
+    b_head = _decl(repo, {v: b_sha for v in MANDATORY_VECTORS}, pr=OTHER_PR)
 
-    both_records(a_sha, b_sha)
-    assert _run(repo, b_sha, "master", pr=OTHER_PR)[0] == 0
-    assert _run(repo, a_sha, "master", pr=PR)[0] == 0
+    assert _run(repo, b_head, "master", pr=OTHER_PR)[0] == 0
+    assert _run(repo, a_head, "master", pr=PR)[0] == 0
 
     # Move PR A only. Its own clearance must lapse; B's must not.
     _git(repo, "checkout", "-q", "pr-a")
@@ -628,11 +809,10 @@ def test_two_concurrent_PRs_at_different_heads_stay_INDEPENDENT(repo):
     _git(repo, "commit", "-qm", "a moves again")
     a2 = _git(repo, "rev-parse", "HEAD")
 
-    both_records(a_sha, b_sha)
     rc_a2, out_a2 = _run(repo, a2, "master", pr=PR)
     assert rc_a2 == 1 and "LAPSED" in out_a2, out_a2
 
-    rc_b2, out_b2 = _run(repo, b_sha, "master", pr=OTHER_PR)
+    rc_b2, out_b2 = _run(repo, b_head, "master", pr=OTHER_PR)
     assert rc_b2 == 0, "PR A's lapse bled into PR B:" + chr(10) + out_b2
 
 
@@ -646,7 +826,12 @@ def test_DELETING_the_active_record_is_RED_not_a_skip(repo):
     sha = _branch_with(repo, "work", "scout/f.txt", "moved")
     _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
     assert _run(repo, "HEAD", "master", pr=PR)[0] == 0
+    # COMMITTED deletion: the gate reads the record out of the revision, so a
+    # working-tree unlink is invisible to it. Committing is also the realistic
+    # attack -- "delete the file to go green" is a change someone pushes.
     (repo / ".reviewers" / (PR + ".toml")).unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "delete the record")
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 1, out
     assert "This is NOT a skip" in out, out
@@ -658,8 +843,15 @@ def test_RENAMING_the_active_record_cannot_launder_it(repo):
     _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
     d = repo / ".reviewers"
     (d / (PR + ".toml")).rename(d / (OTHER_PR + ".toml"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "rename the record")
     rc, out = _run(repo, "HEAD", "master", pr=OTHER_PR)
-    assert rc == 1 and "belongs to ANOTHER PR" in out, out
+    # Either refusal is correct and both are informative: the rename touches a
+    # record that is not this PR's (foreign-record guard), and the contents
+    # still declare the PR it came from (ownership guard). Renaming cannot
+    # launder a record under EITHER rule.
+    assert rc == 1, out
+    assert ("belongs to ANOTHER PR" in out) or ("ANOTHER PR's record" in out), out
 
 
 def test_a_BRANCH_NAME_can_never_confer_ownership(repo):
@@ -767,8 +959,6 @@ def test_the_deploy_substrate_DEMANDS_a_clearance(repo, path):
     so `git pull` deploys nothing.
     """
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, f"sub-{path}", f"{path}/f.txt", "deploy substrate moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -785,8 +975,6 @@ def test_a_malformed_clearance_is_caught_even_when_none_is_DEMANDED(repo):
     discover it.
     """
     _decl(repo, {v: "not-a-sha" for v in MANDATORY_VECTORS})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     _branch_with(repo, "docsonly", "docs/d.md", "docs change only\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
@@ -806,8 +994,6 @@ def test_a_ROOT_FILE_change_demands_a_clearance(repo, path):
     dependency bump exempt from review indefinitely.
     """
     _decl(repo, {})
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "decl")
     # git refuses a ref ending in ".lock", so sanitise the branch name.
     safe = path.replace(".", "-")
     _git(repo, "checkout", "-q", "-b", f"root-{safe}")
@@ -882,9 +1068,10 @@ def test_the_cli_turns_a_timeout_into_exit_2_not_a_traceback(repo, monkeypatch):
         return real(cmd, **kw)
 
     monkeypatch.setattr(mod.subprocess, "run", always_times_out)
-    # DECL_DIR, not DECL: the declaration is per-PR now and is resolved from
-    # the identity, so the directory is what the test can pin.
-    monkeypatch.setattr(mod, "DECL_DIR", repo / ".reviewers")
+    # DECL_PREFIX is a repo-relative prefix now, not a filesystem path: the
+    # record is read out of the revision under review, so there is no
+    # directory to point at.
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
     _decl(repo, {})
     rc = mod._cli(["check", "HEAD", "master", "--pr", PR])
     assert rc == 2, f"a timeout must not read as a pass or a clearance verdict (got {rc})"

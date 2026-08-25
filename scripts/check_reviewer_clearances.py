@@ -101,14 +101,40 @@ import sys
 import tomllib
 from pathlib import Path
 
-#: Root of the per-PR clearance records. Script-relative, not CWD-relative:
-#: run from a subdirectory, a CWD-relative path reports "declaration missing"
-#: instead of a usage error. `REVIEWERS_DIR` overrides it so the test-suite can
-#: drive the real script against a purpose-built repository rather than this one.
-DECL_DIR = Path(
-    os.environ.get("REVIEWERS_DIR")
-    or Path(__file__).resolve().parents[1] / ".reviewers"
-)
+#: Directory holding per-PR clearance records, as a path INSIDE the repository
+#: rather than a filesystem location. `REVIEWERS_PREFIX` overrides it so the
+#: test-suite can drive the real script against a purpose-built repository.
+#:
+#: It is a repo-relative prefix because records are now read out of the
+#: REVISION UNDER REVIEW, never off disk -- see `_read_record`.
+DECL_PREFIX = os.environ.get("REVIEWERS_PREFIX") or ".reviewers"
+
+
+#: Record schema versions this reader understands.
+#:
+#: ABSENT means version 1, permanently. Exactly one schema has ever existed, so
+#: absence is determinate rather than a guess -- and REQUIRING the field would
+#: retroactively invalidate every record written before it existed, which is
+#: the retroactive-policy failure the historical-record rule exists to prevent.
+#: Strict on the open future, permissive on the closed past.
+#:
+#: This lives in the GATE and not only in the test-suite, because a version
+#: marker whose purpose is "do not let a newer schema be misread by an older
+#: reader" is worthless if the reader that decides never reads it. It formerly
+#: sat in the tests alone: the gate exited 0 on `record_version = 99`, and the
+#: only enforcement ran in a different CI job over a directory that globbed to
+#: zero files.
+SUPPORTED_RECORD_VERSIONS = frozenset({1})
+
+
+class RecordUnreadable(Exception):
+    """The record could not be READ. Deliberately NOT "the record is absent".
+
+    Third member of the family with `GitTimeout` and `PRIdentityUnresolved`: a
+    channel meaning "I could not determine" must never share a representation
+    with one meaning "there is nothing there". Both earlier members were added
+    only after a fail-open had been demonstrated; this one is added before.
+    """
 
 
 class PRIdentityUnresolved(Exception):
@@ -190,20 +216,114 @@ def _parse_args(argv: list[str]) -> tuple[str, str, str]:
 _PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
 
 
-def _decl_path(pr: str) -> Path:
-    """`.reviewers/<pr>.toml`, with the PR number validated as a bare number.
+def _decl_path(pr: str) -> str:
+    """`<prefix>/<pr>.toml`, with the PR number validated as a bare number.
 
-    Validated rather than trusted: the value reaches a filesystem path, so
-    `../../etc/passwd` or `42/../41` must not resolve to another PR's record or
-    to anything outside `DECL_DIR`. A malformed number is an identity failure,
-    not a missing declaration.
+    Validated rather than trusted: the value reaches a path, so `../../etc` or
+    `42/../41` must not resolve to another PR's record. A malformed number is
+    an identity failure, not a missing declaration.
     """
     if not _PR_RE.match(pr):
         raise PRIdentityUnresolved(
             f"PR identity {pr!r} is not a bare positive number -- refusing to "
             "resolve it to a path"
         )
-    return DECL_DIR / f"{pr}.toml"
+    return f"{DECL_PREFIX}/{pr}.toml"
+
+
+def _read_record(head_sha: str, path: str) -> str | None:
+    """The record AS IT EXISTS IN THE REVISION UNDER REVIEW. None if absent.
+
+    NOT `Path.read_text()`, and the difference is a real attack rather than
+    tidiness. The gate judges `head_sha`, but the previous version read the
+    record off the working tree -- two different revisions, with nothing
+    asserting they matched. In GitHub Actions they demonstrably do not:
+    `actions/checkout@v4` with no `ref:` checks out `refs/pull/N/merge`, i.e.
+    merge(head, base), while the workflow passes
+    `github.event.pull_request.head.sha`. So the record came from the merge
+    tree and the verdict was about the head tree.
+
+    Exploited end-to-end before this fix: a docs-only PR wrote
+    `.reviewers/<other>.toml`, squash-merged, and the target PR's gate then
+    reported all four vectors HOLD -- with the target PR's author doing
+    nothing and no reviewer involved.
+
+    Absence is a POSITIVE determination via `ls-tree`, for the same reason the
+    predecessor needed it: `git show` exits non-zero for a missing path AND
+    for a corrupt object, and collapsing those makes "I could not read it"
+    indistinguishable from "it is not there".
+    """
+    listed = subprocess.run(
+        ["git", "ls-tree", "--full-tree", "--name-only", head_sha, "--", path],
+        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
+    )
+    if listed.returncode != 0:
+        raise RecordUnreadable(
+            f"git ls-tree failed for {path} at {head_sha[:8]}: "
+            f"{listed.stderr.strip()} -- this is 'could not determine', NOT "
+            "'the record is absent'"
+        )
+    if not listed.stdout.strip():
+        return None
+    got = subprocess.run(
+        ["git", "show", f"{head_sha}:{path}"],
+        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
+    )
+    if got.returncode != 0:
+        raise RecordUnreadable(
+            f"{path} is listed in the tree at {head_sha[:8]} but unreadable: "
+            f"{got.stderr.strip()} -- a read failure on a file known to exist "
+            "is a broken environment, never an absence"
+        )
+    return got.stdout
+
+
+def _foreign_record_edits(merge_base: str, head_sha: str, own: str) -> list[str]:
+    """Records belonging to OTHER PRs that this revision changes.
+
+    `.reviewers/` is deliberately absent from `MANDATORY_WATCH` -- a record
+    cannot police edits to itself. But that exemption is by PREFIX, so it
+    exempted every OTHER PR's record too, leaving an entirely unwatched
+    channel: a docs-only PR could author or delete any other PR's clearance
+    record and its own gate would print "no delta in watched paths".
+
+    Only `<prefix>/<own-pr>.toml` is exempt. Everything else under the prefix
+    is a production change to another PR's evidence and must be refused --
+    including DELETIONS, which is why this reads `--diff-filter` nothing and
+    takes every changed path.
+
+    Non-`.toml` files under the prefix (the README) are policy documentation,
+    not evidence, and are treated as ordinary unwatched docs. Without that
+    carve-out this rule reds the very PR that introduces the directory.
+
+    `--no-renames` IS LOAD-BEARING and was missing from the first version of
+    this guard. Git's rename detection collapses "delete `43.toml`" plus "add
+    `42.toml`" -- near-identical files -- into one rename, and `--name-only`
+    then reports only the DESTINATION. So deleting another PR's record while
+    adding your own was invisible here, and renaming their record onto your own
+    number was invisible too: precisely the laundering move this guard exists
+    to refuse. Caught by a regression test that asserted its own fixture, after
+    the guard was verified working on a standalone case whose files were too
+    dissimilar for rename detection to fire.
+    """
+    r = subprocess.run(
+        ["git", "diff", "--name-only", "--no-renames",
+         merge_base, head_sha, "--", DECL_PREFIX],
+        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
+    )
+    if r.returncode != 0:
+        raise RecordUnreadable(
+            f"git diff over {DECL_PREFIX} failed: {r.stderr.strip()} -- "
+            "cannot establish whether this PR touches another PR's record"
+        )
+    foreign = []
+    for line in r.stdout.splitlines():
+        p = line.strip()
+        if not p or not p.endswith(".toml"):
+            continue
+        if p != own:
+            foreign.append(p)
+    return sorted(foreign)
 
 #: Ruling D's four vectors, pinned in EXECUTABLE code rather than only in a
 #: test, because a declaration that can narrow `required` to one vector can
@@ -350,8 +470,22 @@ def main(argv: list[str]) -> int:
     head, base, pr = _parse_args(argv)
     DECL = _decl_path(pr)
 
-    if not DECL.exists():
-        print(f"FAIL: no clearance recorded for PR {pr}: {DECL} does not exist")
+    # The revision is resolved FIRST, because the record is read out of it
+    # rather than off disk. Ordering is load-bearing, not stylistic: reading
+    # the record before knowing which revision is under review is precisely
+    # how the working tree and the judged tree came apart.
+    try:
+        head_sha = _git("rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
+        merge_base = _git("merge-base", base, head_sha)
+    except RuntimeError as exc:
+        print(f"FAIL: cannot resolve {head} against {base}: {exc}")
+        return 2
+
+    if _read_record(head_sha, DECL) is None:
+        print(
+            f"FAIL: no clearance recorded for PR {pr}: {DECL} is not present "
+            f"in the revision under review ({head_sha[:8]})"
+        )
         print(
             "  This is NOT a skip. A missing or renamed declaration for the "
             "PR under evaluation is RED, because the alternative -- treating "
@@ -360,9 +494,15 @@ def main(argv: list[str]) -> int:
         )
         return 1
     try:
-        decl = tomllib.loads(DECL.read_text(encoding="utf-8"))
+        decl = tomllib.loads(_read_record(head_sha, DECL))
     except tomllib.TOMLDecodeError as exc:
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
+        return 1
+    except UnicodeDecodeError as exc:
+        # DISTINCT from "not valid TOML": one is a malformed document, the
+        # other is bytes that never became a document. Collapsing them sends a
+        # debugger looking for a syntax error that is not there.
+        print(f"FAIL: {DECL} is not valid UTF-8: {exc}")
         return 1
 
     # The record must name its OWN PR, and it must match the identity resolved
@@ -370,6 +510,18 @@ def main(argv: list[str]) -> int:
     # from another PR keeps its contents, and a rename is a one-line edit. This
     # is what makes "PR A's clearance can never satisfy PR B" a property of the
     # DATA rather than of a naming convention.
+    ver = decl.get("record_version", 1)
+    if ver not in SUPPORTED_RECORD_VERSIONS:
+        print(
+            f"FAIL: {DECL} declares record_version {ver!r}, which this reader "
+            "does not understand"
+        )
+        print(
+            "  Refusing to evaluate it with older semantics. A record written "
+            "to a newer schema may mean something different by the same keys."
+        )
+        return 1
+
     declared = decl.get("pr")
     if declared is None:
         print(f"FAIL: {DECL} does not declare `pr`; ownership is unverifiable")
@@ -423,18 +575,29 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: watch list narrowed -- missing {', '.join(sorted(unwatched))}.")
         return 1
 
-    try:
-        head_sha = _git("rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
-        merge_base = _git("merge-base", base, head_sha)
-    except RuntimeError as exc:
-        print(f"FAIL: cannot resolve {head} against {base}: {exc}")
-        return 2
-
     print(f"pr:    {pr}")
     print(f"decl:  {DECL}")
     print(f"base:  {merge_base[:8]} (merge-base with {base})")
     print(f"head:  {head_sha[:8]}")
     print(f"watch: {', '.join(watch)}")
+
+    # C1: `.reviewers/` is exempt from `watch` because a record cannot police
+    # edits to itself -- but that exemption is by PREFIX, so it also exempted
+    # every OTHER PR's record. That left an entirely unwatched channel, and it
+    # was exploited end-to-end: a docs-only PR wrote another PR's record,
+    # printed "no delta in watched paths", squash-merged, and the target PR's
+    # gate then reported all four vectors HOLD -- target author uninvolved, no
+    # reviewer involved, a third party choosing the SHA.
+    foreign = _foreign_record_edits(merge_base, head_sha, DECL)
+    if foreign:
+        print("")
+        print(f"FAIL: this PR changes ANOTHER PR's record(s): {', '.join(foreign)}")
+        print(
+            "  Only this PR's own record may be touched here. A record is "
+            "another PR's evidence; editing or deleting it is a production "
+            "change to their review, not a docs edit."
+        )
+        return 1
 
     delta, absent_both = _moved(watch, merge_base, head_sha)
     if absent_both:
@@ -591,6 +754,13 @@ def _cli(argv: list[str]) -> int:
         print(
             "  git did not answer, so the comparison could not be made. This "
             "is NOT 'no delta' -- nothing was determined."
+        )
+        return 2
+    except RecordUnreadable as exc:
+        print(f"FAIL: {exc}")
+        print(
+            "  Exit 2: the record could not be READ. That is not 'no clearance "
+            "recorded' -- nothing about this PR's clearances was determined."
         )
         return 2
     except PRIdentityUnresolved as exc:
