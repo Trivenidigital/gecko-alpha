@@ -54,6 +54,7 @@ MANDATORY_VECTORS = sorted(_GATE.MANDATORY_VECTORS)
 MANDATORY_WATCH = sorted(_GATE.MANDATORY_WATCH)
 SUPPORTED_RECORD_VERSIONS = _GATE.SUPPORTED_RECORD_VERSIONS
 DEFAULT_RECORD_VERSION = _GATE.DEFAULT_RECORD_VERSION
+DECL_PREFIX = _GATE.DECL_PREFIX
 
 
 def _git(repo, *args):
@@ -425,7 +426,15 @@ def test_every_shipped_record_is_STRUCTURALLY_valid():
     """
     import tomllib
 
-    d = REPO_ROOT / ".reviewers"
+    # DERIVED from the gate, not restated. This was the last place in the suite
+    # keeping its own copy of a gate constant, after that class was closed for
+    # the floors -- and here it was worse than drift: the sweep hardcoded
+    # `.reviewers` while the gate resolves records through `DECL_PREFIX`. If the
+    # prefix ever changed, the sweep would glob the OLD directory, find nothing,
+    # and report "no records committed yet" -- which is false, and
+    # observationally IDENTICAL to the true case. A broken glob and an empty
+    # corpus produced the same output, silently and permanently.
+    d = REPO_ROOT / _GATE.DECL_PREFIX
     if not d.is_dir():
         pytest.skip("no per-PR records shipped yet")
     records = sorted(d.glob("*.toml"))
@@ -1951,3 +1960,45 @@ def test_a_None_stdout_is_UNREADABLE_not_an_EMPTY_record(repo, monkeypatch):
     rc = mod._cli(["check", head, "master", "--pr", PR])
     assert fired["n"] >= 1, "git show was never reached; test proves nothing"
     assert rc == 2, f"a None stdout produced a verdict (rc={rc}), not 'undetermined'"
+
+
+def test_the_archive_sweep_READS_AND_PARSES_a_real_record(tmp_path):
+    """Exercise glob -> read_text -> tomllib on a real file, before the corpus exists.
+
+    `_record_schema_errors` is covered, but only through dict literals and a
+    `type("P", (), ...)()` stub -- the path from a file on disk to a parsed
+    record had never run. Without this, the sweep's first real execution would
+    also be that code's first execution ever, on the merge commit that adds its
+    only input.
+
+    With it, only the iteration over a real corpus is new, which is a genuinely
+    small delta to discover post-merge.
+    """
+    import tomllib
+
+    d = tmp_path / DECL_PREFIX
+    d.mkdir(parents=True)
+    nl = chr(10)
+    (d / "41.toml").write_text(
+        "pr = 41" + nl + "record_version = 1" + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl + MANDATORY_VECTORS[0] + ' = "' + "a" * 40 + '"' + nl,
+        encoding="utf-8",
+    )
+    records = sorted(d.glob("*.toml"))
+    assert records, "the glob found nothing on a directory that has a record"
+
+    errs = []
+    for f in records:
+        errs += _record_schema_errors(f, tomllib.loads(f.read_text(encoding="utf-8")))
+    assert not errs, errs
+
+    # And it must still REJECT a bad one read off disk, or the pass above is
+    # only evidence that the happy path parses.
+    (d / "42.toml").write_text("pr = 999" + nl, encoding="utf-8")
+    bad = _record_schema_errors(
+        d / "42.toml",
+        tomllib.loads((d / "42.toml").read_text(encoding="utf-8")),
+    )
+    assert any("filename and contents disagree" in e for e in bad), bad

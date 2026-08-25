@@ -314,29 +314,30 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
             # field as a string assumes something `subprocess` does not
             # promise.
             #
-            # DELIBERATELY UNPINNED. A mutant removing this branch survives,
-            # and that survival is EVIDENCE OF UNREACHABILITY rather than a
-            # missing test. Naming the configuration, per the rule this repo
-            # arrived at the hard way: for this to matter `run()` must return
-            # `stdout=None`, which needs the reader thread to die. `_readerthread`
-            # runs `buffer.append(fh.read())`, so ANY exception there does it --
-            # decoding is one cause, `MemoryError` on a very large blob and a
-            # pipe `OSError`/`ValueError` are others.
+            # PINNED by `test_a_None_stdout_is_UNREADABLE_not_an_EMPTY_record`,
+            # which reaches this branch through a `subprocess.run` double.
             #
-            # So what is proven is narrower than "the code cannot enter that
-            # state": it is "cannot enter it VIA DECODING", because
-            # `errors="surrogateescape"` above never raises. The earlier wording
-            # overstated it. That argues for KEEPING this branch, not removing
-            # it -- and the correction matters because the whole value of "name
-            # the configuration" is that the named configuration is exhaustive.
+            # This comment previously said the opposite -- "DELIBERATELY
+            # UNPINNED", "a mutant removing this branch survives", "the code
+            # cannot enter that state" -- and all three became false when that
+            # test landed six lines away. Left as it was, it instructed the
+            # next maintainer to DELETE a test that legitimately exists, by
+            # invoking the rule about not asserting against unreachable states.
+            # A comment that is merely stale misleads; one that issues a wrong
+            # instruction is worse.
             #
-            # It stays because what it guards is a false ABSENCE, and because
-            # the single edit that would make it reachable -- reverting to
-            # `errors="strict"` -- is itself held by
-            # `test_a_NON_UTF8_record_is_UNREADABLE_not_ABSENT`. Writing
-            # `or ""` here instead would launder a dead capture thread into
-            # exactly the "record is not present" verdict this whole family
-            # exists to prevent.
+            # The organic path is closed -- `errors="surrogateescape"` above
+            # cannot raise, so decoding cannot kill the capture thread. But
+            # `_readerthread` runs `buffer.append(fh.read())` and ANY exception
+            # there yields `stdout=None`: `MemoryError` on a very large blob, a
+            # pipe `OSError`. So the branch defends `subprocess`'s contract --
+            # `CompletedProcess.stdout` is not promised to be a string -- not
+            # just the decode case, and a double is the honest way to reach it.
+            #
+            # Writing `or ""` here instead would launder a dead capture thread
+            # into exactly the "record is not present" verdict this whole
+            # family exists to prevent. That is not hypothetical: it is what
+            # the first version of this fix did.
             raise RecordUnreadable(
                 f"{' '.join(argv)} produced no stdout -- the capture thread "
                 "died, which is NOT 'there is nothing there'"
