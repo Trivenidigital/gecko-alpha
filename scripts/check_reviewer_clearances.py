@@ -269,6 +269,16 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
        a cp1252 box and a traceback under `PYTHONUTF8=1`. The explicit encoding
        the old `Path.read_text(encoding="utf-8")` carried was silently dropped
        when the read moved into git.
+    SCOPE OF VALIDATION, stated because the absence of this note is how the
+    "one place to audit" claim below went stale once already: **this validates
+    `stdout` only.** `stderr` is interpolated into `_git`'s `RuntimeError` and
+    into three `RecordUnreadable` messages without a round-trip. No source of
+    invalid UTF-8 on stderr has been found -- the paths git echoes back come
+    from `watch`, which is valid Unicode by the time it is used -- but that is
+    the limit of one reviewer's attempt, not a proof. If one is ever found, the
+    fix is the same re-encode round-trip. Recorded so nobody infers from
+    "`_git_run` validates encoding" that everything reaching it is validated.
+
     3. **One place to audit.** The repo guard asserts every `subprocess.run` in
        `scripts/` passes `timeout=`. It cannot see whether anyone HANDLES the
        timeout, so it kept passing over all three defects. Routing git through
