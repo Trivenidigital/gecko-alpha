@@ -126,6 +126,25 @@ DECL_PREFIX = os.environ.get("REVIEWERS_PREFIX") or ".reviewers"
 #: zero files.
 SUPPORTED_RECORD_VERSIONS = frozenset({1})
 
+#: What an ABSENT `record_version` means. **Missing is 1, permanently and by
+#: decision** -- a reader years from now can rely on this: an absent field means
+#: the record predates versioning, never that the writer forgot.
+#:
+#: Named rather than left as a bare `.get(..., 1)` default because the danger
+#: was never the default, it was an UNDOCUMENTED one: a literal in a call is
+#: indistinguishable from an oversight, and the whole purpose of a version
+#: marker is to be readable years later by someone who cannot ask.
+#:
+#: Requiring the field instead was considered and declined 3-1. The deciding
+#: argument was that requiring it TODAY buys nothing: the stale-reader case (a
+#: v2 record read by a v1 gate) is prevented by the v2 WRITER declaring, which
+#: a v2 migration enforces at that time. Today's requirement would only let a
+#: reader distinguish "written before versioning" from "written after
+#: versioning, v1" -- and both mean 1, so the distinction is inert. Against
+#: that, a wrongly-required field produces a red whose cause is
+#: mis-attributable on the one PR whose red is already pre-explained.
+DEFAULT_RECORD_VERSION = 1
+
 
 class RecordUnreadable(Exception):
     """The record could not be READ. Deliberately NOT "the record is absent".
@@ -590,7 +609,7 @@ def main(argv: list[str]) -> int:
     # from another PR keeps its contents, and a rename is a one-line edit. This
     # is what makes "PR A's clearance can never satisfy PR B" a property of the
     # DATA rather than of a naming convention.
-    ver = decl.get("record_version", 1)
+    ver = decl.get("record_version", DEFAULT_RECORD_VERSION)
     if ver not in SUPPORTED_RECORD_VERSIONS:
         print(
             f"FAIL: {DECL} declares record_version {ver!r}, which this reader "

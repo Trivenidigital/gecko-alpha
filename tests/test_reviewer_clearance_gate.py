@@ -53,6 +53,7 @@ _GATE = _load_gate()
 MANDATORY_VECTORS = sorted(_GATE.MANDATORY_VECTORS)
 MANDATORY_WATCH = sorted(_GATE.MANDATORY_WATCH)
 SUPPORTED_RECORD_VERSIONS = _GATE.SUPPORTED_RECORD_VERSIONS
+DEFAULT_RECORD_VERSION = _GATE.DEFAULT_RECORD_VERSION
 
 
 def _git(repo, *args):
@@ -380,7 +381,9 @@ def _record_schema_errors(path, decl):
     the gate, against the policy in force now.
     """
     errs = []
-    ver = decl.get("record_version", 1)
+    # IMPORTED, not restated -- same class as the floors. A second copy of the
+    # default silently disagrees the day the gate's changes.
+    ver = decl.get("record_version", _GATE.DEFAULT_RECORD_VERSION)
     if ver not in SUPPORTED_RECORD_VERSIONS:
         errs.append(f"{path.name}: unsupported record_version {ver!r}")
     if "pr" not in decl:
@@ -425,8 +428,17 @@ def test_every_shipped_record_is_STRUCTURALLY_valid():
     d = REPO_ROOT / ".reviewers"
     if not d.is_dir():
         pytest.skip("no per-PR records shipped yet")
+    records = sorted(d.glob("*.toml"))
+    if not records:
+        # SKIP, NOT PASS. The directory exists (it holds README.md) while zero
+        # records have ever been committed on any ref, so this loop ran over an
+        # empty set and reported green having asserted nothing -- the same
+        # observable as the bootstrap `return` this project already replaced
+        # with a skip once. A visible SKIP cannot be mistaken in CI output for
+        # a verified sweep.
+        pytest.skip("no records committed yet; this sweep would assert nothing")
     errs = []
-    for f in sorted(d.glob("*.toml")):
+    for f in records:
         try:
             decl = tomllib.loads(f.read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as exc:
@@ -1610,3 +1622,49 @@ def test_a_DOCS_ONLY_pr_may_edit_the_reviewers_README(repo):
     _git(repo, "commit", "-qm", "edit the README")
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 0, "editing .reviewers/README.md was treated as evidence:" + chr(10) + out
+
+
+def test_a_record_version_of_1_is_PRESENT_and_SUPPORTED(repo):
+    """The branch every real record takes, and nothing exercised it.
+
+    Coverage was: unsupported (99) refused, absent-means-1 pinned, and
+    present-and-supported -- the case a record written under the "require the
+    field" proposal would always take -- tested nowhere. That gap is bought far
+    more cheaply with this test than with a policy on record contents, which is
+    part of why the requirement was declined.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl + "record_version = 1" + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record declaring version 1")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 0, "an explicit record_version = 1 was refused:" + nl + out
+
+
+def test_a_record_version_given_as_a_STRING_is_refused(repo):
+    """`"1"` is not `1`. Fail-closed, and pinned so it stays that way."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl + 'record_version = "1"' + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record with a string version")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "record_version" in out, out

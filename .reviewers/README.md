@@ -35,6 +35,50 @@ PR keeps its `pr` field and is rejected. **The HEAD branch name is never
 consulted** — it is author-controlled and travels with the tree, so inferring
 ownership from it would let any branch claim any PR's clearances.
 
+## Record schema
+
+```toml
+pr = 564                      # REQUIRED. Must match the PR being evaluated.
+record_version = 1            # optional; see below
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+[clearances]
+concurrency    = "<40-hex sha the concurrency reviewer named>"
+logic          = "<40-hex sha>"
+ops-safety     = "<40-hex sha>"
+silent-failure = "<40-hex sha>"
+```
+
+`required` and `watch` are **floors, not choices** — a record may add to them
+and may not narrow them. The gate prints what is missing if you do.
+
+**The record must be COMMITTED.** It is read out of the revision under review,
+not off disk, so an uncommitted record does not clear anything — a green has to
+be reproducible from the SHA alone.
+
+**A PR may only touch its own record.** Editing, renaming or deleting another
+PR's record is refused, including on an otherwise docs-only PR.
+
+### `record_version` may be omitted
+
+**Missing means 1, permanently and by decision.** A reader years from now can
+rely on this: an absent field means the record predates versioning, never that
+the writer forgot.
+
+Requiring it was considered and declined 3-1. Requiring it *today* would buy
+nothing — the case a version marker exists for (a v2 record read by a v1 gate)
+is prevented by the **v2 writer** declaring, which a v2 migration enforces at
+that time. Today's requirement would only distinguish "written before
+versioning" from "written after versioning, v1", and both mean 1.
+
+An *unsupported* version is a hard error: strict on the open future, permissive
+on the closed past.
+
 ## What this does NOT solve
 
 Per-PR files fix clearance **lifecycle and isolation**. They do not establish
