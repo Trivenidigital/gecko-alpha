@@ -1431,3 +1431,182 @@ def test_a_LAPSE_COMPARE_TIMEOUT_yields_a_WHOLE_verdict(repo, monkeypatch, capsy
     assert rc == 1, f"a lapse-compare timeout aborted instead of failing closed (rc={rc})"
     out = capsys.readouterr().out
     assert "NOT covered" in out, out
+
+
+# --------------------------------------------------------------------------
+# THE `RecordUnreadable` MACHINERY. Every line of it shipped with zero
+# coverage: two reviewers independently mutated both raise sites and the `_cli`
+# handler and left the whole suite green.
+#
+# The type's own docstring says "both earlier members were added only after a
+# fail-open had been demonstrated; this one is added BEFORE." Added-before is
+# exactly the guard that ships unpinned -- ticket 23, proving itself on the
+# commit that cites it.
+#
+# The shipped logic was correct at every site. Nothing held it there.
+# --------------------------------------------------------------------------
+
+def _corrupt_tree_of(repo, rev="HEAD"):
+    """Delete the loose tree object for `rev`, or skip if it is packed."""
+    tree = _git(repo, "rev-parse", rev + "^{tree}")
+    obj = repo / ".git" / "objects" / tree[:2] / tree[2:]
+    if not obj.exists():
+        pytest.skip("tree object is packed; this reproduction needs a loose object")
+    obj.chmod(0o600)
+    obj.unlink()
+
+
+def test_an_UNREADABLE_tree_is_NOT_reported_as_an_absent_record(repo):
+    """P1/P10. "could not determine" must not collapse into "absent".
+
+    Both are RED, so this is a coverage gap rather than a live fail-open -- and
+    the only reason it is harmless is that absence routes to a red branch. Soften
+    that branch and this becomes a genuine fail-open with no test resistance.
+    """
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    _corrupt_tree_of(repo)
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 2, out
+    assert "could not determine" in out, out
+    assert "is not present in the revision" not in out, (
+        "an unreadable tree was reported as an ABSENT record:" + chr(10) + out
+    )
+
+
+def test_an_UNREADABLE_BLOB_is_NOT_reported_as_an_absent_record(repo, monkeypatch):
+    """P2. Listed in the tree, but the blob will not read."""
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    import subprocess as sp
+    real = sp.run
+    fired = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if len(cmd) > 1 and cmd[1] == "show":
+            fired["n"] += 1
+            return sp.CompletedProcess(cmd, 128, "", "fatal: bad object")
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert fired["n"] >= 1, "git show was never reached; test proves nothing"
+    assert rc == 2, f"an unreadable blob produced a verdict (rc={rc})"
+
+
+def test_a_FOREIGN_DIFF_FAILURE_does_not_silently_disable_the_C1_guard(repo, monkeypatch):
+    """P3. The worst of the survivors: git error => "no foreign edits" => exit 0.
+
+    A failure to establish whether this PR touches another PR's record is not
+    evidence that it does not.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    import subprocess as sp
+    real = sp.run
+    fired = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if "diff" in cmd:
+            fired["n"] += 1
+            return sp.CompletedProcess(cmd, 128, "", "fatal: bad revision")
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert fired["n"] >= 1, "git diff was never reached; test proves nothing"
+    assert rc != 0, "the C1 guard switched itself off on a git error"
+    assert rc == 2, f"a guard failure produced a clearance verdict (rc={rc})"
+
+
+@pytest.mark.parametrize("site", ["ls-tree", "show", "diff"])
+def test_a_TIMEOUT_at_a_NEW_git_site_is_exit_2_not_a_verdict(repo, monkeypatch, site):
+    """T1/D1. Three sites added by a fix bypassed `_git` and dropped the timeout.
+
+    An uncaught exception exits 1 -- the code this module reserves for "this
+    PR's clearances do not hold" -- so a transient runner timeout was reported
+    as a clearance verdict, manufacturing the spurious red the docstring spends
+    three paragraphs warning trains people to ignore.
+
+    The repo's own timeout guard asserts the `timeout=` KWARG, not a handler,
+    so it structurally could not see this and kept passing over all three.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    import subprocess as sp
+    real = sp.run
+    fired = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if len(cmd) > 1 and site in cmd:
+            fired["n"] += 1
+            raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert fired["n"] >= 1, f"the {site} timeout never fired; test proves nothing"
+    assert rc == 2, f"a {site} timeout produced rc={rc}, not 'nothing determined'"
+
+
+def test_the_C1_guard_fires_from_a_SUBDIRECTORY(repo, monkeypatch):
+    """E1. A bare pathspec is CWD-RELATIVE, so the guard checked nothing.
+
+    From the repo root a tampering PR exited 1; from a subdirectory the same PR
+    exited 0 -- with no message saying the guard had examined nothing. Same
+    class as the unwatched channel C1 closes, reintroduced inside the guard
+    that closes it. Not reachable in the shipped CI job, which runs from
+    `github.workspace`; reachable for every off-CI invocation, which this
+    script is explicitly built for.
+    """
+    _decl(repo, {}, pr=OTHER_PR)                    # an archived record
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "docs" / "d.md").write_text("docs only" + chr(10))
+    (repo / ".reviewers" / (OTHER_PR + ".toml")).write_text(
+        "pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+        + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)
+    )
+    _decl(repo, {}, pr=PR)                          # commits the tamper too
+
+    root_rc, root_out = _run(repo, "HEAD", "master", pr=PR)
+    assert root_rc == 1 and "ANOTHER PR" in root_out, root_out
+
+    sub = repo / "scout"
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR],
+        cwd=str(sub), capture_output=True, text=True,
+        env={**os.environ, "REVIEWERS_PREFIX": ".reviewers"},
+    )
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, (
+        "the C1 guard did not fire from a subdirectory -- a bare pathspec is "
+        "cwd-relative and matched nothing:" + chr(10) + out
+    )
+    assert "ANOTHER PR" in out, out
+
+
+def test_a_DOCS_ONLY_pr_may_edit_the_reviewers_README(repo):
+    """P2 (conc). The carve-out that keeps this very PR from redding itself.
+
+    Without it, every PR touching `.reviewers/README.md` goes red -- including
+    the one that introduces the directory.
+    """
+    _decl(repo, {}, pr=PR)
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / ".reviewers" / "README.md").write_text("policy notes" + chr(10))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "edit the README")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 0, "editing .reviewers/README.md was treated as evidence:" + chr(10) + out

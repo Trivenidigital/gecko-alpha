@@ -231,31 +231,76 @@ def _decl_path(pr: str) -> str:
     return f"{DECL_PREFIX}/{pr}.toml"
 
 
+def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
+    """`subprocess.run` for git, with the three things that kept being missed.
+
+    Every one of these was a finding, and all three were missed on call sites
+    added *by the fix for the previous finding*:
+
+    1. **`TimeoutExpired` becomes `GitTimeout`.** Three sites added in the last
+       round called `subprocess.run` directly, so a timeout escaped `_cli`
+       entirely -- and an uncaught exception exits 1, the code this module
+       reserves for "this PR's clearances do not hold". A transient runner
+       timeout was reported as a clearance verdict. The whole `GitTimeout` /
+       `PRIdentityUnresolved` / `RecordUnreadable` family exists to keep
+       "could not determine" out of the verdict channel; the newest code put
+       it back.
+    2. **`encoding="utf-8", errors="strict"`.** `text=True` alone decodes with
+       the RUNNER'S LOCALE, so the same bytes produced mojibake-then-exit-0 on
+       a cp1252 box and a traceback under `PYTHONUTF8=1`. The explicit encoding
+       the old `Path.read_text(encoding="utf-8")` carried was silently dropped
+       when the read moved into git.
+    3. **One place to audit.** The repo guard asserts every `subprocess.run` in
+       `scripts/` passes `timeout=`. It cannot see whether anyone HANDLES the
+       timeout, so it kept passing over all three defects. Routing git through
+       one helper makes the handler auditable too.
+    """
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=_GIT_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        raise GitTimeout(
+            f"{' '.join(argv)} timed out after {_GIT_TIMEOUT_SEC}s"
+        ) from None
+    except UnicodeDecodeError as exc:
+        # Reached when git hands back bytes that are not UTF-8 -- a record
+        # hand-edited in latin-1, say. NOT "the record is absent" and NOT "not
+        # valid TOML": it never became a document at all.
+        raise RecordUnreadable(
+            f"{' '.join(argv)} returned bytes that are not valid UTF-8: {exc}"
+        ) from None
+
+
 def _read_record(head_sha: str, path: str) -> str | None:
     """The record AS IT EXISTS IN THE REVISION UNDER REVIEW. None if absent.
 
     NOT `Path.read_text()`, and the difference is a real attack rather than
-    tidiness. The gate judges `head_sha`, but the previous version read the
+    tidiness. The gate judges `head_sha`, but an earlier version read the
     record off the working tree -- two different revisions, with nothing
     asserting they matched. In GitHub Actions they demonstrably do not:
     `actions/checkout@v4` with no `ref:` checks out `refs/pull/N/merge`, i.e.
     merge(head, base), while the workflow passes
-    `github.event.pull_request.head.sha`. So the record came from the merge
-    tree and the verdict was about the head tree.
+    `github.event.pull_request.head.sha`.
 
-    Exploited end-to-end before this fix: a docs-only PR wrote
+    Exploited end-to-end before the fix: a docs-only PR wrote
     `.reviewers/<other>.toml`, squash-merged, and the target PR's gate then
-    reported all four vectors HOLD -- with the target PR's author doing
-    nothing and no reviewer involved.
+    reported all four vectors HOLD -- target author uninvolved, no reviewer
+    involved.
 
-    Absence is a POSITIVE determination via `ls-tree`, for the same reason the
-    predecessor needed it: `git show` exits non-zero for a missing path AND
-    for a corrupt object, and collapsing those makes "I could not read it"
-    indistinguishable from "it is not there".
+    Absence is a POSITIVE determination via `ls-tree`: `git show` exits
+    non-zero for a missing path AND for a corrupt object, and collapsing those
+    makes "I could not read it" indistinguishable from "it is not there".
+
+    `--full-tree` because a bare pathspec is CWD-RELATIVE. See
+    `_foreign_record_edits`, where the same trap was left open for one round.
     """
-    listed = subprocess.run(
-        ["git", "ls-tree", "--full-tree", "--name-only", head_sha, "--", path],
-        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
+    listed = _git_run(
+        ["git", "ls-tree", "--full-tree", "--name-only", head_sha, "--", path]
     )
     if listed.returncode != 0:
         raise RecordUnreadable(
@@ -265,10 +310,7 @@ def _read_record(head_sha: str, path: str) -> str | None:
         )
     if not listed.stdout.strip():
         return None
-    got = subprocess.run(
-        ["git", "show", f"{head_sha}:{path}"],
-        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
-    )
+    got = _git_run(["git", "show", f"{head_sha}:{path}"])
     if got.returncode != 0:
         raise RecordUnreadable(
             f"{path} is listed in the tree at {head_sha[:8]} but unreadable: "
@@ -282,43 +324,60 @@ def _foreign_record_edits(merge_base: str, head_sha: str, own: str) -> list[str]
     """Records belonging to OTHER PRs that this revision changes.
 
     `.reviewers/` is deliberately absent from `MANDATORY_WATCH` -- a record
-    cannot police edits to itself. But that exemption is by PREFIX, so it
-    exempted every OTHER PR's record too, leaving an entirely unwatched
-    channel: a docs-only PR could author or delete any other PR's clearance
-    record and its own gate would print "no delta in watched paths".
+    cannot police edits to itself. But that exemption is by PREFIX, so it also
+    exempted every OTHER PR's record, leaving an entirely unwatched channel: a
+    docs-only PR could author or delete any other PR's clearance record and its
+    own gate would print "no delta in watched paths".
 
-    Only `<prefix>/<own-pr>.toml` is exempt. Everything else under the prefix
-    is a production change to another PR's evidence and must be refused --
-    including DELETIONS, which is why this reads `--diff-filter` nothing and
-    takes every changed path.
+    Only `<prefix>/<own-pr>.toml` is exempt. Everything else under the prefix is
+    a production change to another PR's evidence and must be refused --
+    including DELETIONS.
 
     Non-`.toml` files under the prefix (the README) are policy documentation,
-    not evidence, and are treated as ordinary unwatched docs. Without that
-    carve-out this rule reds the very PR that introduces the directory.
+    not evidence. Without that carve-out this rule reds the very PR that
+    introduces the directory.
 
-    `--no-renames` IS LOAD-BEARING and was missing from the first version of
-    this guard. Git's rename detection collapses "delete `43.toml`" plus "add
-    `42.toml`" -- near-identical files -- into one rename, and `--name-only`
-    then reports only the DESTINATION. So deleting another PR's record while
-    adding your own was invisible here, and renaming their record onto your own
-    number was invisible too: precisely the laundering move this guard exists
-    to refuse. Caught by a regression test that asserted its own fixture, after
-    the guard was verified working on a standalone case whose files were too
-    dissimilar for rename detection to fire.
+    THREE GIT ARGUMENTS HERE ARE LOAD-BEARING, and each was missing once:
+
+    * `--no-renames`. Git collapses "delete `43.toml`" plus "add `42.toml`" --
+      near-identical files -- into one rename, and `--name-only` then reports
+      only the DESTINATION. Deleting another PR's record while adding your own
+      was invisible, and so was renaming theirs onto your own number: precisely
+      the laundering move this guard exists to refuse.
+
+    * `:(top)` and `-c diff.relative=false`. A bare pathspec is interpreted
+      RELATIVE TO CWD, so run from any subdirectory `.reviewers` resolved to
+      `<subdir>/.reviewers`, matched nothing, and the guard returned `[]`
+      **without saying it had checked nothing**. Demonstrated: from the repo
+      root a tampering PR exits 1; from `scout/` the same PR exits 0. Not
+      reachable in the shipped CI job, which runs from `github.workspace` -- but
+      reachable for every off-CI invocation, which this script is explicitly
+      built for, and the module docstring's claim that off-CI degradation
+      "fails CLOSED" is falsified by it. `diff.relative=true` in a user's config
+      suppresses the guard the same way, so both halves are needed.
+      `_read_record` was cwd-hardened with `--full-tree` in the same commit that
+      added this line unhardened.
+
+    * `-z`. `--name-only` QUOTES any path containing non-ASCII, `"`, `\\` or a
+      control character (`".reviewers/4\\303\\2513.toml"`), so an
+      `endswith(".toml")` test silently drops it. `core.quotepath=false` is NOT
+      sufficient -- quotes, backslashes and control characters are still
+      escaped. Today no *usable* record can trigger it, because `_decl_path`
+      constrains names to `[1-9][0-9]*\\.toml`; the guard is honest rather than
+      lucky.
     """
-    r = subprocess.run(
-        ["git", "diff", "--name-only", "--no-renames",
-         merge_base, head_sha, "--", DECL_PREFIX],
-        capture_output=True, text=True, timeout=_GIT_TIMEOUT_SEC,
-    )
+    r = _git_run([
+        "git", "-c", "diff.relative=false", "diff", "--name-only",
+        "--no-renames", "-z", merge_base, head_sha, "--", ":(top)" + DECL_PREFIX,
+    ])
     if r.returncode != 0:
         raise RecordUnreadable(
             f"git diff over {DECL_PREFIX} failed: {r.stderr.strip()} -- "
             "cannot establish whether this PR touches another PR's record"
         )
     foreign = []
-    for line in r.stdout.splitlines():
-        p = line.strip()
+    for p in r.stdout.split("\0"):
+        p = p.strip()
         if not p or not p.endswith(".toml"):
             continue
         if p != own:
@@ -489,7 +548,22 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: cannot resolve {head} against {base}: {exc}")
         return 2
 
-    if _read_record(head_sha, DECL) is None:
+    # READ ONCE. The previous version called `_read_record` twice per
+    # evaluation -- once to test for absence, once to parse -- which is the
+    # anti-pattern `_moved`'s own docstring records as fixed: two calls can
+    # answer differently under a transient failure and produce a
+    # self-inconsistent verdict. It also left `tomllib.loads(None)` reachable
+    # if they ever disagreed.
+    #
+    # And the read is INSIDE the try. The handlers below previously sat after
+    # an unguarded first call, thirteen lines earlier, so anything it raised
+    # escaped before they existed -- they were unreachable, and a mutant
+    # replacing both bodies with `return 0` left every test passing.
+    try:
+        raw = _read_record(head_sha, DECL)
+    except RecordUnreadable:
+        raise                      # exit 2 at the boundary: nothing determined
+    if raw is None:
         print(
             f"FAIL: no clearance FILE for PR {pr}: {DECL} is not present "
             f"in the revision under review ({head_sha[:8]})"
@@ -502,22 +576,13 @@ def main(argv: list[str]) -> int:
         )
         return 1
     try:
-        decl = tomllib.loads(_read_record(head_sha, DECL))
+        decl = tomllib.loads(raw)
     except tomllib.TOMLDecodeError as exc:
+        # Decoding failures no longer arrive here: `_git_run` reads with an
+        # explicit utf-8/strict codec and converts a bad byte into
+        # `RecordUnreadable`, because "these bytes never became a document" is
+        # a different fact from "this document is malformed".
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
-        return 1
-    except OSError as exc:
-        # DISTINCT from both "absent" and "not valid TOML": the path exists in
-        # the tree and something else went wrong reading it. The docstring
-        # promises everything decidable fails CLOSED as 1 and that a crash
-        # presenting as exit 1 must not be confusable with a decision.
-        print(f"FAIL: {DECL} could not be read: {exc}")
-        return 1
-    except UnicodeDecodeError as exc:
-        # DISTINCT from "not valid TOML": one is a malformed document, the
-        # other is bytes that never became a document. Collapsing them sends a
-        # debugger looking for a syntax error that is not there.
-        print(f"FAIL: {DECL} is not valid UTF-8: {exc}")
         return 1
 
     # The record must name its OWN PR, and it must match the identity resolved
