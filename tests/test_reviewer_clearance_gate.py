@@ -1778,6 +1778,18 @@ def test_a_NON_UTF8_record_is_UNREADABLE_not_ABSENT(repo):
     )
 
 
+#: Every way into a subprocess, not just `run`. `Popen` is the one that
+#: matters: it is not an alias but a SIBLING API someone might genuinely reach
+#: for, and it bypasses `timeout=` entirely -- which also defeats the repo-wide
+#: timeout guard, so nothing else would catch it.
+#:
+#: The alias forms (`import subprocess as _sp; _sp.run(...)`) are deliberately
+#: NOT covered. They need a rename to reach, the realistic reintroduction is
+#: the literal call, and widening a guard to cover deliberate evasion is how it
+#: turns into ritual. Same judgement the `initialize()` guard got.
+_SUBPROCESS_ENTRY_POINTS = {"run", "Popen", "call", "check_output", "check_call"}
+
+
 def test_EVERY_subprocess_run_in_the_gate_goes_through_git_run():
     """The "one place to audit" claim, made true and then pinned.
 
@@ -1802,12 +1814,12 @@ def test_EVERY_subprocess_run_in_the_gate_goes_through_git_run():
         for n in ast.walk(ast.parse(src))
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "run"
+        and n.func.attr in _SUBPROCESS_ENTRY_POINTS
         and isinstance(n.func.value, ast.Name)
         and n.func.value.id == "subprocess"
     ]
     assert len(sites) == 1, (
-        f"expected exactly one subprocess.run site (inside _git_run), found "
+        f"expected exactly one subprocess entry point (inside _git_run), found "
         f"{len(sites)} at lines {sites}. A second call site does not inherit "
         "the timeout conversion or the utf-8 validation, and the repo's own "
         "timeout guard checks only that `timeout=` is PASSED -- it cannot see "
@@ -1820,7 +1832,7 @@ def test_EVERY_subprocess_run_in_the_gate_goes_through_git_run():
         for n in ast.walk(f)
         if isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "run"
+        and n.func.attr in _SUBPROCESS_ENTRY_POINTS
     ]
     assert sites == inside, (
         f"the single subprocess.run site is not inside _git_run: {sites} vs {inside}"

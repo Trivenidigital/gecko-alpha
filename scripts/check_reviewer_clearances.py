@@ -888,6 +888,20 @@ def main(argv: list[str]) -> int:
                 f"{_GIT_TIMEOUT_SEC}s -- treated as NOT covered"
             )
             continue
+        # `merge-base --is-ancestor` returns 1 for "not an ancestor" and 128
+        # for a walk failure, so treating any non-zero as a verdict LOOKS like
+        # the could-not-determine collapse this module converts everywhere
+        # else. It is not reachable, and that was established by trying:
+        # deleting an intermediate commit object does produce 128 here, but
+        # `main`'s own `git merge-base base head_sha` runs FIRST, hits the same
+        # unreadable object, and exits 2 with an accurate message. By the time
+        # this line runs, head resolved, the merge-base was computed (so head's
+        # history is walkable), `_moved` succeeded, and `full` resolved. A 128
+        # needs corruption arriving between two adjacent git calls.
+        #
+        # Recorded rather than guarded, per the rule: an unexplained absence
+        # invites someone to add a test asserting against a state the code
+        # cannot enter.
         if anc.returncode != 0:
             failures.append(
                 f"{vector:16s} {str(sha)[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
