@@ -1668,3 +1668,58 @@ def test_a_record_version_given_as_a_STRING_is_refused(repo):
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 1, out
     assert "record_version" in out, out
+
+
+@pytest.mark.parametrize("literal,shown", [("true", "True"), ("1.0", "1.0")])
+def test_a_BOOL_or_FLOAT_record_version_is_REFUSED_not_read_as_v1(repo, literal, shown):
+    """`True in {1}` and `1.0 in {1}` are both True in Python.
+
+    Equal values, equal hashes -- so a membership test cannot tell them from a
+    real 1, and a typo'd `record_version = true` silently read as v1. Harmless
+    while 1 is the only version; a live misread the day 2 exists, which is
+    exactly when nobody is looking at this line.
+
+    `bool` IS an `int`. This project has been bitten by that before, in a
+    quantity guard where `True` passed `<= 0` and meant 1.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl + "record_version = " + literal + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record with a non-integer version")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, f"record_version = {literal} was accepted as v1:" + nl + out
+    assert "not an integer" in out, out
+
+
+def test_POLICY_EVOLUTION_does_not_invalidate_records_on_the_VERSION_axis():
+    """The sibling to the `required`-axis regression, on the axis that grew.
+
+    `_record_schema_errors` sweeps EVERY archived record, so it is where
+    retroactive invalidation would actually bite. The gate may tighten what it
+    demands of the ACTIVE record; the archive sweep must not inherit that.
+
+    Without this, the scoping is unpinned in exactly the way the `RecordUnreadable`
+    raise sites were -- a guard whose correctness nobody can break a test with.
+    """
+    older = {
+        "pr": 41,
+        "required": sorted(MANDATORY_VECTORS)[:1],
+        "watch": ["scout"],
+        "clearances": {sorted(MANDATORY_VECTORS)[0]: "a" * 40},
+    }
+    path = type("P", (), {"name": "41.toml", "stem": "41"})()
+    assert "record_version" not in older, "fixture must model a pre-versioning record"
+    assert _record_schema_errors(path, older) == [], (
+        "an archived record with no record_version was rejected by the at-rest "
+        "sweep -- requiring the field on ARCHIVES is the retroactive-policy "
+        "failure the sibling regression exists to prevent"
+    )

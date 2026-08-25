@@ -610,6 +610,21 @@ def main(argv: list[str]) -> int:
     # is what makes "PR A's clearance can never satisfy PR B" a property of the
     # DATA rather than of a naming convention.
     ver = decl.get("record_version", DEFAULT_RECORD_VERSION)
+    # TYPE-CHECK, do not merely membership-test. `True in {1}` and `1.0 in {1}`
+    # are both True in Python -- equal values, equal hashes -- so a typo'd
+    # `record_version = true` silently read as v1 instead of being rejected.
+    # `bool` IS an `int`, and this project has been bitten by that before.
+    # Harmless while 1 is the only version; a live misread the day 2 exists.
+    if isinstance(ver, bool) or not isinstance(ver, int):
+        print(
+            f"FAIL: {DECL} declares record_version {ver!r}, which is not an "
+            "integer"
+        )
+        print(
+            "  A version is a whole number. `true` and `1.0` compare equal to "
+            "1 in Python and would otherwise be read as v1."
+        )
+        return 1
     if ver not in SUPPORTED_RECORD_VERSIONS:
         print(
             f"FAIL: {DECL} declares record_version {ver!r}, which this reader "
