@@ -359,6 +359,14 @@ MANDATORY_WATCH = frozenset(
         "cron",
         "ops",
         "systemd",
+        # `.claude` for the same reason `.github` is here: it holds executable
+        # repo guards (`hooks/check-new-primitives.py`) and the hook/permission
+        # config. The argument already made for the workflow -- "a PR deleting
+        # this step must not be able to lapse nothing" -- applies unchanged to
+        # a PR editing the hook that enforces the plan-document contract.
+        # Under the pre-delta design an omission here merely failed to LAPSE a
+        # clearance; since "no delta ⇒ pass", an omission is a FULL EXEMPTION.
+        ".claude",
         # Root FILES. An earlier draft of this list claimed they could not be
         # covered "because a path prefix cannot reach a root file", and
         # documented that as a known gap. That was simply wrong:
@@ -483,7 +491,7 @@ def main(argv: list[str]) -> int:
 
     if _read_record(head_sha, DECL) is None:
         print(
-            f"FAIL: no clearance recorded for PR {pr}: {DECL} is not present "
+            f"FAIL: no clearance FILE for PR {pr}: {DECL} is not present "
             f"in the revision under review ({head_sha[:8]})"
         )
         print(
@@ -497,6 +505,13 @@ def main(argv: list[str]) -> int:
         decl = tomllib.loads(_read_record(head_sha, DECL))
     except tomllib.TOMLDecodeError as exc:
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
+        return 1
+    except OSError as exc:
+        # DISTINCT from both "absent" and "not valid TOML": the path exists in
+        # the tree and something else went wrong reading it. The docstring
+        # promises everything decidable fails CLOSED as 1 and that a crash
+        # presenting as exit 1 must not be confusable with a decision.
+        print(f"FAIL: {DECL} could not be read: {exc}")
         return 1
     except UnicodeDecodeError as exc:
         # DISTINCT from "not valid TOML": one is a malformed document, the
@@ -555,6 +570,12 @@ def main(argv: list[str]) -> int:
         # further on. The fix stopped exactly where the reported symptom did.
         required_set = set(required)
         watch_set = set(watch)
+        for _name, _val in (("required", required), ("watch", watch)):
+            bad = [x for x in _val if not isinstance(x, str)]
+            if bad:
+                raise TypeError(
+                    f"`{_name}` contains non-string entries: {bad!r}"
+                )
     except (TypeError, ValueError) as exc:
         print(
             f"FAIL: {DECL} is malformed -- `required` and `watch` must be "
@@ -674,7 +695,14 @@ def main(argv: list[str]) -> int:
     for vector in sorted(required):
         sha = clearances.get(vector)
         if not sha:
-            failures.append(f"{vector:16s} NO CLEARANCE RECORDED")
+            # LEXICALLY disjoint from the missing-FILE message above, not
+            # merely case-disjoint. These are two different facts -- the record
+            # is absent, versus the record exists with this vector empty -- and
+            # they previously collided under any case-insensitive substring
+            # match. This repo has already loosened assertions to
+            # `in out.lower()` once and lost the distinction between two gates
+            # that way, so the tokens must not be able to cross-match at all.
+            failures.append(f"{vector:16s} NO SHA RECORDED")
             continue
         # No shape or existence check here. `_validate_clearance_shapes` above
         # has already rejected every malformed or unresolvable value, so
@@ -716,7 +744,19 @@ def main(argv: list[str]) -> int:
                 f"{vector:16s} {str(sha)[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
             )
             continue
-        moved, _ = _moved(watch, full, head_sha)
+        try:
+            moved, _ = _moved(watch, full, head_sha)
+        except GitTimeout as exc:
+            # The THIRD git operation in this loop, and it alone used to abort
+            # the whole run. Its two siblings above degrade to "NOT covered",
+            # so a timeout here discarded every failure already accumulated for
+            # earlier vectors while leaving their `HOLDS` lines on stdout -- a
+            # log reading "concurrency HOLDS" followed by an abort. Those lines
+            # were true, so the result was INCOMPLETE rather than wrong, which
+            # is why it was easy to under-weight. All three now behave alike
+            # and the operator gets a whole verdict instead of a partial one.
+            failures.append(f"{vector:16s} {exc} -- treated as NOT covered")
+            continue
         if moved:
             failures.append(
                 f"{vector:16s} LAPSED -- {', '.join(moved)} moved since {str(sha)[:8]}"

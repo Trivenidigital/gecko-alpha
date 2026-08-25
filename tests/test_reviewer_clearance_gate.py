@@ -25,12 +25,34 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "check_reviewer_clearances.py"
 
-MANDATORY_VECTORS = ["concurrency", "silent-failure", "ops-safety", "logic"]
-MANDATORY_WATCH = [
-    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
-    "systemd", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml",
-    "start.sh",
-]
+def _load_gate():
+    """Import the real script as a module, once, for its floors and helpers."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_gate", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_GATE = _load_gate()
+
+#: IMPORTED, NOT RESTATED -- and this is the fix for a whole class of blind
+#: spot rather than a tidiness preference.
+#:
+#: These lists were previously literal copies here. `_decl` defaults every
+#: record's `watch` to the copy, so the tests exercised the DECLARED list and
+#: never the FLOOR the script enforces: mutants deleting `cron`/`ops`/`systemd`
+#: or the root files from `MANDATORY_WATCH` survived the ENTIRE suite, and a
+#: `cron`-only PR would have gone green. Two independent reviewers found the
+#: same hole, and the same shape would recur for every new minimum the script
+#: grows -- a floor asserted against a private copy of itself is not asserted.
+#:
+#: Importing makes the test-suite structurally unable to disagree with the
+#: script about what the minimum is.
+MANDATORY_VECTORS = sorted(_GATE.MANDATORY_VECTORS)
+MANDATORY_WATCH = sorted(_GATE.MANDATORY_WATCH)
+SUPPORTED_RECORD_VERSIONS = _GATE.SUPPORTED_RECORD_VERSIONS
 
 
 def _git(repo, *args):
@@ -168,7 +190,7 @@ def test_a_docs_only_branch_STILL_needs_its_own_record(repo):
     _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 1, out
-    assert "no clearance recorded for PR " + PR in out, out
+    assert "no clearance FILE for PR " + PR in out, out
 
     # With an owned record carrying NO clearance SHAs, the same branch passes.
     _decl(repo, {}, pr=PR)
@@ -183,7 +205,7 @@ def test_a_branch_that_moves_a_watched_path_DEMANDS_a_clearance(repo):
     _branch_with(repo, "prod", "scout/f.txt", "production moved\n")
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
-    assert "NO CLEARANCE RECORDED" in out
+    assert "NO SHA RECORDED" in out
     assert "delta in watched paths" in out and "scout" in out
 
 
@@ -313,7 +335,7 @@ def test_a_MISSING_declaration_FAILS(repo):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert PR + ".toml" in out, out
-    assert "no clearance recorded for PR " + PR in out, out
+    assert "no clearance FILE for PR " + PR in out, out
 
 
 # --------------------------------------------------------------------------
@@ -774,7 +796,7 @@ def test_a_record_for_a_DIFFERENT_pr_is_not_consulted_at_all(repo):
     _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=OTHER_PR)
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 1, out
-    assert "no clearance recorded for PR " + PR in out, out
+    assert "no clearance FILE for PR " + PR in out, out
 
 
 def test_two_concurrent_PRs_at_different_heads_stay_INDEPENDENT(repo):
@@ -874,6 +896,13 @@ def test_MISSING_pr_identity_is_exit_2_not_exit_1(repo):
     _branch_with(repo, "work", "scout/f.txt", "moved")
     rc, out = _run(repo, "HEAD", "master", pr=None)
     assert rc == 2, out
+    # WHICH exit 2, not merely exit 2. This script has three distinct
+    # non-zero outcomes -- a verdict (1), undetermined (2), and a
+    # traceback presenting as 1 -- and a GitTimeout anywhere also exits
+    # 2. An exit-code-only assertion cannot tell an identity failure
+    # from a git failure, which is how a mutant survives a test named
+    # for the thing it broke.
+    assert "no PR identity" in out, out
 
 
 @pytest.mark.parametrize("bad", ["../41", "41/../42", "0", "abc", "-1"])
@@ -882,6 +911,13 @@ def test_a_MALFORMED_pr_identity_is_refused_before_touching_the_filesystem(repo,
     _branch_with(repo, "work", "scout/f.txt", "moved")
     rc, out = _run(repo, "HEAD", "master", pr=bad)
     assert rc == 2, out
+    # WHICH exit 2, not merely exit 2. This script has three distinct
+    # non-zero outcomes -- a verdict (1), undetermined (2), and a
+    # traceback presenting as 1 -- and a GitTimeout anywhere also exits
+    # 2. An exit-code-only assertion cannot tell an identity failure
+    # from a git failure, which is how a mutant survives a test named
+    # for the thing it broke.
+    assert "not a bare positive number" in out, out
 
 
 def test_CI_and_LOCAL_identity_resolve_the_SAME_record(repo):
@@ -939,7 +975,7 @@ def test_reintroducing_a_MASTER_GLOBAL_table_breaks_isolation(repo):
         "a repo-global .reviewers.toml satisfied a per-PR evaluation -- the "
         "master-global table is back:\n" + out
     )
-    assert "no clearance recorded for PR " + PR in out, out
+    assert "no clearance FILE for PR " + PR in out, out
 
 
 # --------------------------------------------------------------------------
@@ -963,7 +999,7 @@ def test_the_deploy_substrate_DEMANDS_a_clearance(repo, path):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert path in out
-    assert "NO CLEARANCE RECORDED" in out
+    assert "NO SHA RECORDED" in out
 
 
 def test_a_malformed_clearance_is_caught_even_when_none_is_DEMANDED(repo):
@@ -1003,7 +1039,7 @@ def test_a_ROOT_FILE_change_demands_a_clearance(repo, path):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 1, out
     assert path in out
-    assert "NO CLEARANCE RECORDED" in out
+    assert "NO SHA RECORDED" in out
 
 
 # --------------------------------------------------------------------------
@@ -1099,3 +1135,299 @@ def test_a_malformed_required_that_is_not_a_list_of_strings_FAILS_cleanly(repo):
     assert rc == 1, out
     assert "malformed" in out
     assert "Traceback" not in out
+
+
+# --------------------------------------------------------------------------
+# FAIL-OPEN BRANCHES THAT SHIPPED UNPINNED.
+#
+# The silent-failure vector could not build a fail-open against the running
+# gate -- every state it constructed was handled correctly. The defect was in
+# the EVIDENCE: five mutants that turn this gate into an exit-0 fail-open
+# survived the entire suite, and subprocess-aware coverage showed the unreached
+# lines were exactly that survivor set.
+#
+# The worst of them, M8, makes an ancestry TIMEOUT print `HOLDS` and exit 0 --
+# which is the very defect class this script's docstring is about. The second,
+# M9, deletes a guard added in the same commit that shipped it, with no test.
+# "Evidence is not a test" is in this file's own docstring; the fix was
+# evidence.
+# --------------------------------------------------------------------------
+
+def _timeout_on(mod, monkeypatch, match, skip=0):
+    """Make git time out for calls satisfying `match`, after `skip` matches.
+
+    `skip` exists because two DIFFERENT call sites issue byte-identical argv:
+    the shape check resolves each clearance SHA, and the per-vector loop
+    resolves it again. Matching on argv alone times out the first one, which
+    has its own (correct) exit-2 behaviour -- so a test aimed at the second
+    measures the first and reports the wrong branch as broken.
+    """
+    import subprocess as sp
+
+    real = sp.run
+    seen = {"n": 0}
+
+    hits = {"n": 0}
+
+    def flaky(cmd, **kw):
+        if len(cmd) > 1 and cmd[0] == "git" and match(cmd):
+            hits["n"] += 1
+            if hits["n"] > skip:
+                seen["n"] += 1
+                raise sp.TimeoutExpired(cmd, 60)
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", flaky)
+    return seen
+
+
+def test_an_ANCESTRY_TIMEOUT_is_never_reported_as_HOLDS(repo, monkeypatch, capsys):
+    """M8. A timeout must not become a clearance.
+
+    This is the F3 class the module docstring is written about, on the one
+    branch nothing covered: with the guard removed, `merge-base --is-ancestor`
+    timing out prints `HOLDS` and exits 0 -- an unreviewed watched delta
+    reported as cleared, because git failed to answer.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    monkeypatch.chdir(repo)
+    seen = _timeout_on(mod, monkeypatch, lambda c: c[1] == "merge-base" and "--is-ancestor" in c)
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert seen["n"] >= 1, "the ancestry timeout never fired; test proves nothing"
+    # ASSERT WHICH VERDICT, not merely that one was non-zero. `rc != 0` is
+    # satisfied by the correct behaviour AND by the timeout escaping as exit 2,
+    # so it cannot tell a handled timeout from an unhandled one.
+    assert rc == 1, f"an ancestry TIMEOUT did not fail CLOSED as a verdict (rc={rc})"
+    out = capsys.readouterr().out
+    assert "NOT covered" in out, out
+
+
+def test_a_PER_VECTOR_REVPARSE_TIMEOUT_is_never_reported_as_HOLDS(repo, monkeypatch, capsys):
+    """M9. The guard added in the commit that shipped it, previously untested.
+
+    Its own comment records that the sibling call two lines down got this
+    treatment "when the timeouts landed; this one was missed" -- and then the
+    fix arrived with no test of its own.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    monkeypatch.chdir(repo)
+    # Target the PER-VECTOR rev-parse specifically. Both it and the head
+    # resolution are `rev-parse --verify --quiet <sha>^{commit}`, and the head
+    # one fires first -- matching on shape alone times out the wrong call and
+    # measures exit 2 from a different branch entirely. The clearance SHA is
+    # `sha`; the head is the later record commit, so they discriminate.
+    seen = _timeout_on(
+        mod, monkeypatch,
+        lambda c: c[1] == "rev-parse" and any(sha in a for a in c),
+        skip=len(MANDATORY_VECTORS),   # let the shape-check pass resolve first
+    )
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert seen["n"] >= 1, "the rev-parse timeout never fired; test proves nothing"
+    # Deleting this guard lets `GitTimeout` escape to `_cli` and exit 2, which
+    # `rc != 0` cannot distinguish from the handled case -- the mutant survived
+    # the first version of this test for exactly that reason.
+    assert rc == 1, f"the per-vector rev-parse timeout escaped as rc={rc}"
+    out = capsys.readouterr().out
+    assert "NOT covered" in out, out
+
+
+def test_an_UNPARSEABLE_record_is_RED_not_nothing_to_check(repo):
+    """M12. Invalid TOML must be a verdict, never an exemption."""
+    _branch_with(repo, "work", "scout/f.txt", "moved")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (PR + ".toml")).write_text("pr = = = 42" + chr(10))
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "unparseable record")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "not valid TOML" in out, out
+    assert "Traceback" not in out, out
+
+
+def test_a_record_with_NO_pr_FIELD_is_not_treated_as_owned(repo):
+    """M13. Ownership must be declared, never assumed from the filename.
+
+    Assuming ownership is the whole failure the `pr` field exists to prevent:
+    a record copied from another PR keeps its contents but takes the new
+    filename, so filename-as-owner accepts exactly the forgery.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    (d / (PR + ".toml")).write_text(
+        "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record without a pr field")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "does not declare `pr`" in out, out
+
+
+def test_an_UNRESOLVABLE_base_or_head_is_exit_2_not_a_PASS(repo):
+    """M14. "I could not work out what to compare" is never a clearance."""
+    _decl(repo, {}, pr=PR)
+    rc, out = _run(repo, "HEAD", "no-such-ref-anywhere", pr=PR)
+    assert rc == 2, out
+    assert "cannot resolve" in out, out
+
+
+@pytest.mark.parametrize("bad", ["required", "watch"])
+def test_a_NON_STRING_element_is_a_clean_verdict_not_a_TRACEBACK(repo, bad):
+    """S4. The residual the in-place fixture could not see.
+
+    `test_a_malformed_required_that_is_not_a_list_of_strings_FAILS_cleanly`
+    uses `[["logic"]]` -- the unhashable case the coercion guard already
+    catches. A fixture built to satisfy the guard in place cannot exercise the
+    branch beyond it: one character (`[["logic"]]` -> `42`) reaches
+    `sorted(required)` and `', '.join(watch)` and tracebacks out as exit 1,
+    which the docstring says must never be confusable with a decision.
+    """
+    _branch_with(repo, "work", "scout/f.txt", "moved")
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    nl = chr(10)
+    req = list(MANDATORY_VECTORS) + ([42] if bad == "required" else [])
+    wat = list(MANDATORY_WATCH) + ([7] if bad == "watch" else [])
+    fmt = lambda xs: "[" + ", ".join(
+        ('"' + x + '"') if isinstance(x, str) else str(x) for x in xs
+    ) + "]"
+    (d / (PR + ".toml")).write_text(
+        "pr = " + PR + nl + "required = " + fmt(req) + nl
+        + "watch = " + fmt(wat) + nl + nl + "[clearances]" + nl
+    )
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "non-string element")
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "Traceback" not in out, "a crash presenting as exit 1:" + nl + out
+    assert "malformed" in out or "non-string" in out, out
+
+def test_the_MISSING_FILE_and_EMPTY_VECTOR_messages_cannot_CROSS_MATCH(repo):
+    """Two different facts must not be confusable by any substring test.
+
+    "the record is absent" and "the record exists but this vector is empty" are
+    distinct states. They previously read `no clearance recorded for PR N` and
+    `NO CLEARANCE RECORDED` -- disjoint only by CASE, so any assertion
+    loosened to `in out.lower()` would match both. This repo has already lost
+    the distinction between two gates exactly that way.
+
+    Asserted in BOTH directions, because a one-way check passes if the two
+    messages ever converge on the token it happens to look for.
+    """
+    # State A: no record file at all.
+    _branch_with(repo, "work", "scout/f.txt", "moved")
+    rc_a, out_a = _run(repo, "HEAD", "master", pr=PR)
+    assert rc_a == 1, out_a
+
+    # State B: record present, every vector empty.
+    _decl(repo, {}, pr=PR)
+    rc_b, out_b = _run(repo, "HEAD", "master", pr=PR)
+    assert rc_b == 1, out_b
+
+    a, b = out_a.lower(), out_b.lower()
+    assert "no clearance file" in a and "no sha recorded" not in a, out_a
+    assert "no sha recorded" in b and "no clearance file" not in b, out_b
+
+
+# --------------------------------------------------------------------------
+# THE ONE PLACE MEMBERSHIP IS STATED LITERALLY.
+#
+# Everything else in this file DERIVES the floors from the gate, which is what
+# closed the "tests keep a private copy of the minimum" hole. But deriving
+# everywhere has a cost that must be paid exactly once: once the suite reads
+# the floor from the script, no test can see the floor SHRINK. Deleting
+# `.claude` from `MANDATORY_WATCH` left all 64 tests passing -- `_decl`
+# defaults each record's `watch` to the imported list, so declared and floor
+# stay equal and `unwatched` is empty.
+#
+# `test_the_watch_list_cannot_be_NARROWED` does not catch it either: it proves
+# only that SOME narrowing is rejected, using `watch=["scout"]`.
+#
+# So: derive everywhere for BEHAVIOUR, pin MEMBERSHIP literally here. A removal
+# is then a deliberate two-place edit rather than a silent one-place deletion.
+# --------------------------------------------------------------------------
+
+#: Deliberately a literal. Do not replace with an import -- that is the bug.
+EXPECTED_FLOOR = {
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+}
+
+EXPECTED_VECTORS = {"concurrency", "silent-failure", "ops-safety", "logic"}
+
+
+def test_the_watch_FLOOR_membership_is_pinned_LITERALLY():
+    """A path may only leave the floor by editing this list too."""
+    actual = set(_GATE.MANDATORY_WATCH)
+    assert actual == EXPECTED_FLOOR, (
+        "MANDATORY_WATCH changed. Removed: "
+        + repr(sorted(EXPECTED_FLOOR - actual))
+        + " | Added: " + repr(sorted(actual - EXPECTED_FLOOR))
+        + " -- if deliberate, edit EXPECTED_FLOOR in the same commit and say "
+        "why in the message. A path silently leaving the floor is a full "
+        "exemption for every PR that touches only it."
+    )
+
+
+def test_the_vector_FLOOR_membership_is_pinned_LITERALLY():
+    """Ruling D's four vectors are not a per-PR choice, nor a per-commit one."""
+    assert set(_GATE.MANDATORY_VECTORS) == EXPECTED_VECTORS
+
+
+def test_the_SUPPORTED_RECORD_VERSIONS_set_is_pinned_LITERALLY():
+    """Version 1 supported, 99 not -- asserted against the GATE, not an import.
+
+    An imported set agrees with itself by construction. This states the policy
+    independently so widening it is visible.
+    """
+    assert 1 in _GATE.SUPPORTED_RECORD_VERSIONS
+    assert 99 not in _GATE.SUPPORTED_RECORD_VERSIONS
+
+
+def test_a_LAPSE_COMPARE_TIMEOUT_yields_a_WHOLE_verdict(repo, monkeypatch, capsys):
+    """The third git operation in the per-vector loop, made consistent.
+
+    Its two siblings degrade to "treated as NOT covered"; this one alone
+    aborted the run, discarding every failure accumulated for earlier vectors
+    while leaving their `HOLDS` lines on stdout. Those lines were TRUE, so the
+    output was incomplete rather than wrong -- which is precisely why it read
+    as low severity and shipped unpinned.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    monkeypatch.chdir(repo)
+    # `_moved` resolves `<rev>:<path>` -- distinguishable from the `^{commit}`
+    # resolutions by the colon, so this targets the lapse compare and not the
+    # shape check or the ancestry guard.
+    # `_moved` runs TWICE per gate invocation: once for the delta computation
+    # before the loop, and once per vector inside it. The first correctly exits
+    # 2 (nothing was determined yet), so skip its calls -- 2 revisions x every
+    # watched path -- to land in the per-vector compare.
+    seen = _timeout_on(
+        mod, monkeypatch,
+        lambda c: c[1] == "rev-parse" and any(":" in a for a in c[2:]),
+        skip=2 * len(MANDATORY_WATCH),
+    )
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert seen["n"] >= 1, "the lapse-compare timeout never fired; proves nothing"
+    assert rc == 1, f"a lapse-compare timeout aborted instead of failing closed (rc={rc})"
+    out = capsys.readouterr().out
+    assert "NOT covered" in out, out
