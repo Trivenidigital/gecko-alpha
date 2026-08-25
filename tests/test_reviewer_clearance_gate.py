@@ -1595,6 +1595,11 @@ def test_the_C1_guard_fires_from_a_SUBDIRECTORY(repo, monkeypatch):
     root_rc, root_out = _run(repo, "HEAD", "master", pr=PR)
     assert root_rc == 1 and "ANOTHER PR" in root_out, root_out
 
+    # `diff.relative=true` in the repo's own config suppresses the guard from a
+    # subdirectory INDEPENDENTLY of the pathspec, so a fixture without it pins
+    # only half the fix: a mutant dropping `-c diff.relative=false` survived.
+    # Both halves are load-bearing and both are now held.
+    _git(repo, "config", "diff.relative", "true")
     sub = repo / "scout"
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR],
@@ -1820,3 +1825,77 @@ def test_EVERY_subprocess_run_in_the_gate_goes_through_git_run():
     assert sites == inside, (
         f"the single subprocess.run site is not inside _git_run: {sites} vs {inside}"
     )
+
+
+def test_the_foreign_guard_sees_a_NON_ASCII_record_path(repo):
+    """`-z`, pinned. `--name-only` C-QUOTES paths git considers unusual.
+
+    A path containing non-ASCII, a quote, a backslash or a control character
+    comes back as `".reviewers/4\303\2513.toml"` -- which ends with `"`, so an
+    `endswith(".toml")` filter silently drops it and the guard reports no
+    foreign edits. `core.quotepath=false` is NOT sufficient: quotes,
+    backslashes and control characters are still escaped. `-z` removes the
+    quoting layer entirely rather than patching one instance of it.
+
+    Bounded today -- `_decl_path` only ever builds `<digits>.toml`, so no
+    USABLE record can carry such a name, and the laundering move stays blocked
+    by the ASCII deletion half. This pins the guard as honest rather than
+    lucky: with an ASCII fixture, dropping `-z` changes nothing observable, so
+    the argument for it was load-bearing prose that no test would notice being
+    deleted.
+    """
+    _decl(repo, {}, pr=PR)
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "docs" / "d.md").write_text("docs only" + chr(10))
+    weird = repo / ".reviewers" / ("4" + chr(0xE9) + "3.toml")
+    weird.write_text("pr = 493" + chr(10) + "required = []" + chr(10)
+                     + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "add a non-ascii record path")
+
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, (
+        "a foreign record with a non-ASCII name was invisible to the guard -- "
+        "git quoted the path and the .toml filter dropped it:" + chr(10) + out
+    )
+    assert "ANOTHER PR" in out, out
+
+
+def test_the_README_TEMPLATE_matches_the_code_constants():
+    """The example record must stay correct as the floors move.
+
+    `.claude` was added to `MANDATORY_WATCH` one commit before this template
+    existed. The next such addition silently staleifies it, and the first
+    record copied from the template fails `watch list narrowed -- missing X`
+    on a PR that did nothing wrong. That is the pre-explained-red shape: the
+    author's red has a complete, satisfying, wrong explanation.
+
+    Parsed with `tomllib`, not regexed. The reviewer who found this gap first
+    tried a regex and it over-captured quoted strings out of prose, reporting
+    19 entries against 14 -- they discarded the result rather than report it.
+    A template is a document with a parser; use the parser.
+    """
+    import tomllib
+
+    readme = (REPO_ROOT / ".reviewers" / "README.md").read_text(encoding="utf-8")
+    fences = [
+        b for b in readme.split("```")[1::2]
+        if b.lstrip().startswith("toml")
+    ]
+    assert len(fences) == 1, (
+        f"expected exactly one ```toml example record, found {len(fences)}"
+    )
+    body = fences[0].split(chr(10), 1)[1]
+    decl = tomllib.loads(body)
+
+    assert set(decl["watch"]) == set(MANDATORY_WATCH), (
+        "README template `watch` disagrees with the code floor. Missing: "
+        + repr(sorted(set(MANDATORY_WATCH) - set(decl["watch"])))
+        + " | Extra: " + repr(sorted(set(decl["watch"]) - set(MANDATORY_WATCH)))
+        + " -- a stale template makes the FIRST record copied from it fail "
+        "`watch list narrowed`, on a PR that did nothing wrong."
+    )
+    assert set(decl["required"]) == set(MANDATORY_VECTORS), (
+        "README template `required` disagrees with the code floor"
+    )
+    assert "pr" in decl, "the template must show the required `pr` field"

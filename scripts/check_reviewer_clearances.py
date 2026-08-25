@@ -307,8 +307,34 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
         # round-trip then detects exactly the same bad bytes, in this thread,
         # on every platform. Keeping stdout a `str` also keeps the existing
         # test doubles valid -- decoding from bytes instead broke two of them.
+        if r.stdout is None:
+            # `run()` CAN return None fields. On Windows a decode failure in
+            # `_readerthread` kills that thread and `run()` returns NORMALLY
+            # with `stdout=None`, so every site treating a CompletedProcess
+            # field as a string assumes something `subprocess` does not
+            # promise.
+            #
+            # DELIBERATELY UNPINNED. A mutant removing this branch survives,
+            # and that survival is EVIDENCE OF UNREACHABILITY rather than a
+            # missing test. Naming the configuration, per the rule this repo
+            # arrived at the hard way: for this to matter `run()` must return
+            # `stdout=None`, which needs the reader thread to die, which needs
+            # decoding to raise -- and `errors="surrogateescape"` above never
+            # raises. The code cannot enter that state.
+            #
+            # It stays because what it guards is a false ABSENCE, and because
+            # the single edit that would make it reachable -- reverting to
+            # `errors="strict"` -- is itself held by
+            # `test_a_NON_UTF8_record_is_UNREADABLE_not_ABSENT`. Writing
+            # `or ""` here instead would launder a dead capture thread into
+            # exactly the "record is not present" verdict this whole family
+            # exists to prevent.
+            raise RecordUnreadable(
+                f"{' '.join(argv)} produced no stdout -- the capture thread "
+                "died, which is NOT 'there is nothing there'"
+            )
         try:
-            (r.stdout or "").encode("utf-8")
+            r.stdout.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise RecordUnreadable(
                 f"{' '.join(argv)} returned bytes that are not valid UTF-8: "
