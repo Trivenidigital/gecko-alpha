@@ -1911,3 +1911,43 @@ def test_the_README_TEMPLATE_matches_the_code_constants():
         "README template `required` disagrees with the code floor"
     )
     assert "pr" in decl, "the template must show the required `pr` field"
+
+
+def test_a_None_stdout_is_UNREADABLE_not_an_EMPTY_record(repo, monkeypatch):
+    """The correction to the F1 fix, which the F1 fix itself needed.
+
+    The first F1 patch validated `(r.stdout or "").encode("utf-8")`. `None` is
+    exactly what a dead capture thread returns -- the precise F1 mechanism --
+    and `or ""` encodes clean, so no `RecordUnreadable` is raised and
+    `_read_record` hands back an empty record. **The fix for the
+    could-not-determine / absent conflation carried a residual instance of that
+    same conflation, one line inside itself.**
+
+    WHY A TEST HERE AND ONLY A COMMENT AT THE ANCESTRY SITE, since both are
+    currently unreachable: there, no double could create the state without
+    faking the entire call, so a test would assert against something the code
+    cannot enter. Here the contract being defended is `subprocess`'s --
+    `CompletedProcess.stdout` is not promised to be a string -- doubles are
+    this suite's established idiom for exactly that, and this guard is the last
+    line for the specific failure F1 was.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    head = _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    import subprocess as sp
+    real = sp.run
+    fired = {"n": 0}
+
+    def dead_thread(cmd, **kw):
+        if len(cmd) > 1 and cmd[1] == "show":
+            fired["n"] += 1
+            return sp.CompletedProcess(cmd, 0, None, "")
+        return real(cmd, **kw)
+
+    monkeypatch.setattr(mod.subprocess, "run", dead_thread)
+    rc = mod._cli(["check", head, "master", "--pr", PR])
+    assert fired["n"] >= 1, "git show was never reached; test proves nothing"
+    assert rc == 2, f"a None stdout produced a verdict (rc={rc}), not 'undetermined'"
