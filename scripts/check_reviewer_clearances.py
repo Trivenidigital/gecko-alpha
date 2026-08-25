@@ -39,8 +39,17 @@ The question is *"does the delta THIS pull request introduces in watched paths
 carry a clearance?"* -- not *"is some historical SHA still current?"*. So:
 
 * If the watched trees are identical between the **merge base** and the head,
-  the PR introduces no production delta and **no clearance is required**. A
-  documentation-only PR passes without touching the declaration at all.
+  the PR introduces no production delta and **no clearance SHA is required**.
+
+  It still needs its own correctly-owned `.reviewers/<pr>.toml`, and that is
+  the executable rule -- the record is resolved and its ownership verified
+  BEFORE the watched delta is computed. An earlier version of this paragraph
+  said a docs-only PR "passes without touching the declaration at all", which
+  described a weaker gate than the one that shipped. The stronger rule is
+  deliberate: **known PR + missing active record = RED.** If absence were a
+  pass, deleting the record would be the cheapest way to turn the gate green
+  while switching it off -- and a docs-only PR is precisely where nobody would
+  look twice.
 
   **This narrows the treadmill; it does not remove it.** `watch` includes
   `tests` and `.github`, so essentially every substantive PR has a watched
@@ -84,6 +93,7 @@ work out what to compare" is 2.
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
@@ -118,43 +128,63 @@ class PRIdentityUnresolved(Exception):
     """
 
 
-def _resolve_pr(argv: list[str]) -> str:
-    """The candidate PR number, from TRUSTED sources only.
+def _parse_args(argv: list[str]) -> tuple[str, str, str]:
+    """`(head, base, pr)` from a REAL parser, not positional slicing.
 
-    Precedence, and every branch of it is deliberate:
+    The previous version read `argv[1]` as `head` and `argv[2]` as `base`
+    before looking for `--pr` anywhere in the list. `--pr 564` on its own
+    therefore resolved `head="--pr"` and `base="564"`, and failed with
+    `cannot resolve --pr against 564` -- an option silently reinterpreted as a
+    git ref. It was invisible in the test-suite because every call site passed
+    `head base --pr N` in that exact order, so the slice happened to land
+    correctly. A contract that only holds for one argument order is not a
+    contract; it is a coincidence the tests were written around.
 
-    1. `--pr N` on the command line -- the explicit local path.
-    2. `REVIEWERS_PR` in the environment -- set by CI from
-       `github.event.pull_request.number`, which is event metadata the workflow
-       receives rather than anything derivable from the tree.
-    3. Nothing. RAISE.
-
-    **The HEAD branch name is never consulted, and that is a security boundary
-    rather than a style preference.** A branch name is author-controlled and
-    travels with the tree, so `feat/pr-42` would let any branch claim any PR's
-    clearances by renaming itself -- which would defeat per-PR isolation
-    entirely while looking like it worked. Ownership must come from outside the
-    thing being evaluated.
-
-    Fail-closed locally is the point of (3): a developer running this by hand
-    with no `--pr` gets "I could not determine which PR this is", not a guess.
+    PR identity precedence, and conflicts are FATAL rather than
+    last-one-wins: silently preferring one of two disagreeing identities is
+    how a run ends up evaluating a different PR than the operator believes.
     """
-    for i, a in enumerate(argv):
-        if a == "--pr":
-            if i + 1 >= len(argv):
-                raise PRIdentityUnresolved("`--pr` given with no value")
-            return argv[i + 1]
-        if a.startswith("--pr="):
-            return a.split("=", 1)[1]
-    env = os.environ.get("REVIEWERS_PR", "").strip()
-    if env:
-        return env
-    raise PRIdentityUnresolved(
-        "no PR identity: pass `--pr <number>`, or set REVIEWERS_PR from "
-        "trusted CI event metadata. The branch name is deliberately NOT "
-        "consulted -- it is author-controlled and would let any branch claim "
-        "any PR's clearances"
+    ap = argparse.ArgumentParser(
+        prog="check_reviewer_clearances",
+        add_help=True,
+        description="Verify this PR's reviewer clearances against its tree.",
     )
+    ap.add_argument("head", nargs="?", default="HEAD")
+    ap.add_argument("base", nargs="?", default="origin/master")
+    ap.add_argument(
+        "--pr",
+        action="append",
+        default=None,
+        help="PR number. In CI supply it from github.event.pull_request.number.",
+    )
+
+    # `parse_args` exits 2 on a usage error, which is already the code this
+    # script reserves for "could not work out what to compare". Kept rather
+    # than intercepted: an unparseable command line is precisely that case.
+    ns = ap.parse_args(argv[1:])
+
+    given = list(ns.pr or [])
+    if len(set(given)) > 1:
+        raise PRIdentityUnresolved(
+            "conflicting --pr values: " + ", ".join(sorted(set(given)))
+            + " -- refusing to pick one"
+        )
+    env = os.environ.get("REVIEWERS_PR", "").strip()
+    if given and env and given[0] != env:
+        raise PRIdentityUnresolved(
+            f"--pr {given[0]} disagrees with REVIEWERS_PR {env} -- refusing to "
+            "pick one. One of them is describing a different PR than you think."
+        )
+
+    pr = given[0] if given else env
+    if not pr:
+        raise PRIdentityUnresolved(
+            "no PR identity: pass `--pr <number>`, or set REVIEWERS_PR from "
+            "trusted CI event metadata. The branch name is deliberately NOT "
+            "consulted -- it is author-controlled and would let any branch "
+            "claim any PR's clearances"
+        )
+    return ns.head, ns.base, pr
 
 
 _PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
@@ -317,10 +347,7 @@ def _moved(watch: list[str], a: str, b: str) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str]) -> int:
-    head = argv[1] if len(argv) > 1 else "HEAD"
-    base = argv[2] if len(argv) > 2 else "origin/master"
-
-    pr = _resolve_pr(argv)
+    head, base, pr = _parse_args(argv)
     DECL = _decl_path(pr)
 
     if not DECL.exists():

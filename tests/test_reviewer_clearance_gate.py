@@ -15,6 +15,7 @@ closed from inside the repository.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +95,11 @@ def repo(tmp_path):
     _git(r, "add", "-A")
     _git(r, "commit", "-qm", "base")
     _git(r, "branch", "-M", "master")
+    # A real `origin/master`, because the script's DEFAULT base is
+    # `origin/master` and a fixture without one cannot exercise any argument
+    # form that omits the base. Without this, `--pr N` alone fails on a
+    # missing ref and looks exactly like a parser bug.
+    _git(r, "update-ref", "refs/remotes/origin/master", "HEAD")
     return r
 
 
@@ -140,6 +146,29 @@ def test_a_docs_only_branch_needs_NO_clearance(repo):
     rc, out = _run(repo, "HEAD", "master")
     assert rc == 0, out
     assert "no clearance required" in out
+
+
+def test_a_docs_only_branch_STILL_needs_its_own_record(repo):
+    """Zero clearance SHAs required -- but the record itself is not optional.
+
+    The module prose once said a docs-only PR "passes without touching the
+    declaration at all". The executable flow resolves and ownership-checks the
+    record BEFORE computing the watched delta, so that was describing a weaker
+    gate than the one that shipped. This pins the stronger rule: if absence
+    were a pass, deleting the record would be the cheapest way to switch the
+    gate off, and a docs-only PR is where nobody would look twice.
+    """
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "no clearance recorded for PR " + PR in out, out
+
+    # With an owned record carrying NO clearance SHAs, the same branch passes.
+    _decl(repo, {}, pr=PR)
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 0, out2
+    assert "no clearance required" in out2, out2
+
 
 
 def test_a_branch_that_moves_a_watched_path_DEMANDS_a_clearance(repo):
@@ -310,30 +339,235 @@ def test_a_MISSING_declaration_FAILS(repo):
 # --------------------------------------------------------------------------
 
 
-def test_every_shipped_record_declares_the_pr_its_FILENAME_claims():
-    """Hygiene over the records at rest -- copy/rename mistakes caught early.
+#: Record schema versions this checker understands. A record declaring an
+#: unknown version is a hard error rather than a best-effort parse: the whole
+#: point of historical records is that they are readable years later, and
+#: guessing at an unrecognised shape is how a stale audit trail turns into a
+#: confident wrong answer.
+SUPPORTED_RECORD_VERSIONS = {1}
 
-    Deliberately NOT clearance evaluation: this reads every record, but the
-    GATE reads exactly one. Historical records stay inert as active state while
-    still being checked for the one defect that is always a bug -- a record
-    whose `pr` field disagrees with its filename, which is exactly what a
-    record copied from another PR looks like.
+
+def _record_schema_errors(path, decl):
+    """TIMELESS properties only -- never today's policy.
+
+    This is the line that keeps `.reviewers/` an audit directory instead of
+    master-global state by another name. A historical record was written under
+    the policy in force when its PR was reviewed; if adding a fifth mandatory
+    vector later made every archived record invalid, then every unrelated
+    future PR would be blocked until someone rewrote history -- which is
+    exactly the master-global coupling this design removed, reintroduced
+    through the back door of a hygiene check.
+
+    So: schema, ownership and structural validity are checked for all records.
+    `required` / `watch` sufficiency is checked ONLY for the active PR, inside
+    the gate, against the policy in force now.
+    """
+    errs = []
+    ver = decl.get("record_version", 1)
+    if ver not in SUPPORTED_RECORD_VERSIONS:
+        errs.append(f"{path.name}: unsupported record_version {ver!r}")
+    if "pr" not in decl:
+        errs.append(f"{path.name}: does not declare `pr`")
+    elif str(decl["pr"]) != path.stem:
+        errs.append(
+            f"{path.name}: declares pr={decl['pr']!r} -- filename and contents "
+            "disagree, which is what a record copied from another PR looks like"
+        )
+    for key in ("required", "watch"):
+        val = decl.get(key)
+        if val is not None and not (
+            isinstance(val, list) and all(isinstance(x, str) for x in val)
+        ):
+            errs.append(f"{path.name}: `{key}` must be an array of strings")
+    cl = decl.get("clearances")
+    if cl is not None:
+        if not isinstance(cl, dict):
+            errs.append(f"{path.name}: `[clearances]` must be a table")
+        else:
+            for vec, sha in cl.items():
+                if not isinstance(sha, str) or not _SHA40.match(sha):
+                    errs.append(
+                        f"{path.name}: clearance {vec} = {sha!r} is not a "
+                        "full 40-hex SHA"
+                    )
+    return errs
+
+
+_SHA40 = re.compile(r"\A[0-9a-f]{40}\Z")
+
+
+def test_every_shipped_record_is_STRUCTURALLY_valid():
+    """Hygiene over records at rest. Schema and ownership only.
+
+    Deliberately NOT clearance evaluation, and deliberately NOT today's
+    mandatory-vector policy: this reads every record, but the GATE reads
+    exactly one.
     """
     import tomllib
 
     d = REPO_ROOT / ".reviewers"
     if not d.is_dir():
         pytest.skip("no per-PR records shipped yet")
+    errs = []
     for f in sorted(d.glob("*.toml")):
-        decl = tomllib.loads(f.read_text(encoding="utf-8"))
-        assert "pr" in decl, f"{f.name} does not declare `pr`"
-        assert str(decl["pr"]) == f.stem, (
-            f"{f.name} declares pr={decl['pr']!r} -- filename and contents "
-            "disagree, which is what a copied record looks like"
-        )
-        assert set(decl.get("required", [])) >= set(MANDATORY_VECTORS), (
-            f"{f.name} narrows `required` below the mandatory four"
-        )
+        try:
+            decl = tomllib.loads(f.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            errs.append(f"{f.name}: not valid TOML: {exc}")
+            continue
+        errs += _record_schema_errors(f, decl)
+    assert not errs, chr(10).join(errs)
+
+
+def test_POLICY_EVOLUTION_does_not_invalidate_historical_records():
+    """Adding a mandatory vector must not make old records live policy.
+
+    THE REGRESSION FOR MAKING `.reviewers/` MASTER-GLOBAL BY ACCIDENT. An
+    earlier hygiene check asserted `set(record["required"]) >=
+    set(MANDATORY_VECTORS)` for EVERY record. Under that rule, adding a vector
+    tomorrow retroactively invalidates every archived record, and an unrelated
+    new PR goes red until someone rewrites files belonging to PRs that merged
+    months ago -- the exact cross-PR coupling this design removes,
+    reintroduced through a test.
+
+    THE FIXTURE MUST NOT SATISFY TODAY'S POLICY, and the first version of this
+    test did. It used a record carrying the current four vectors, so a check
+    against current policy passed anyway and the mutant survived: a fixture
+    built to satisfy the rule cannot exercise the clause that exempts records
+    written under a different one. This record declares FEWER vectors than
+    today's policy -- which is precisely what "recorded under an older policy"
+    looks like on disk.
+    """
+    older_policy = sorted(MANDATORY_VECTORS)[:1]
+    assert not set(older_policy) >= set(MANDATORY_VECTORS), (
+        "fixture must NOT satisfy today's policy or it cannot see the defect"
+    )
+    old = {
+        "pr": 41,
+        "required": older_policy,
+        "watch": ["scout"],
+        "clearances": {older_policy[0]: "a" * 40},
+    }
+    path = type("P", (), {"name": "41.toml", "stem": "41"})()
+
+    assert _record_schema_errors(path, old) == [], (
+        "a record written under an older mandatory-vector policy failed "
+        "hygiene -- the audit directory has become live policy again, and "
+        "every unrelated future PR is now blocked until history is rewritten"
+    )
+
+
+def test_an_UNSUPPORTED_record_version_is_an_error_not_a_guess():
+    """An unrecognised schema must fail loudly rather than be parsed hopefully."""
+    path = type("P", (), {"name": "41.toml", "stem": "41"})()
+    errs = _record_schema_errors(path, {"pr": 41, "record_version": 99})
+    assert any("unsupported record_version" in e for e in errs), errs
+
+
+def test_a_MALFORMED_stored_clearance_is_caught_at_rest(repo):
+    """Structural validity of stored data, independent of any policy."""
+    path = type("P", (), {"name": "41.toml", "stem": "41"})()
+    errs = _record_schema_errors(
+        path, {"pr": 41, "clearances": {"logic": "not-a-sha"}}
+    )
+    assert any("not a full 40-hex SHA" in e for e in errs), errs
+
+
+# --------------------------------------------------------------------------
+# CLI CONTRACT. Every accepted argument order is pinned, because the previous
+# parser was positional slicing that happened to work for exactly the order the
+# test-suite used: `head base --pr N`. `--pr 564` alone resolved head="--pr",
+# base="564". The bug was demonstrated in a shell and NOT pinned by a test --
+# so a mutant reverting the parser survived the whole suite. Evidence is not a
+# test.
+# --------------------------------------------------------------------------
+
+def _run_argv(repo, extra, env_pr=None):
+    """Drive the script with an EXACT argv tail, preserving order."""
+    env = {**os.environ, "REVIEWERS_DIR": str(repo / ".reviewers")}
+    env.pop("REVIEWERS_PR", None)
+    if env_pr is not None:
+        env["REVIEWERS_PR"] = env_pr
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), *extra],
+        cwd=str(repo), capture_output=True, text=True, env=env,
+    )
+    return r.returncode, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--pr", PR],
+        ["--pr=" + PR],
+        ["--pr", PR, "HEAD", "master"],
+        ["HEAD", "master", "--pr", PR],
+        ["HEAD", "--pr", PR],
+    ],
+    ids=["pr-only", "pr-equals", "pr-first", "pr-last", "head-then-pr"],
+)
+def test_every_accepted_ARGUMENT_ORDER_resolves_the_same_run(repo, extra):
+    """Order must not change which PR, head or base is evaluated.
+
+    A contract that holds for one argument order is a coincidence the tests
+    were written around, not a contract.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    rc, out = _run_argv(repo, extra)
+    assert rc == 0, "argv " + repr(extra) + " did not resolve a clean run:" + chr(10) + out
+    assert "pr:    " + PR in out, out
+
+
+def test_ENVIRONMENT_ONLY_identity_resolves_without_any_flag(repo):
+    """CI supplies identity through the environment, with no `--pr` at all."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    rc, out = _run_argv(repo, ["HEAD", "master"], env_pr=PR)
+    assert rc == 0, out
+    assert "pr:    " + PR in out, out
+
+
+def test_a_bare_option_is_never_reinterpreted_as_a_GIT_REF(repo):
+    """The precise old failure: `--pr` consumed as `head`.
+
+    Pinned by its symptom rather than only by its fix, so a future parser that
+    reintroduces positional slicing fails here with a recognisable message.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    rc, out = _run_argv(repo, ["--pr", PR])
+    assert rc == 0, out
+    assert "cannot resolve --pr" not in out, (
+        "an option was reinterpreted as a git ref -- positional slicing is back:"
+        + chr(10) + out
+    )
+
+
+def test_CONFLICTING_pr_identities_fail_deterministically(repo):
+    """Two disagreeing identities must not silently pick one.
+
+    Last-one-wins is how a run evaluates a different PR than the operator
+    believes it is evaluating -- and it would look completely normal in the log.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    rc_dup, out_dup = _run_argv(repo, ["HEAD", "master", "--pr", PR, "--pr", OTHER_PR])
+    assert rc_dup == 2, out_dup
+    assert "conflicting --pr values" in out_dup, out_dup
+
+    rc_env, out_env = _run_argv(repo, ["HEAD", "master", "--pr", PR], env_pr=OTHER_PR)
+    assert rc_env == 2, out_env
+    assert "disagrees with REVIEWERS_PR" in out_env, out_env
+
+
+def test_AGREEING_duplicate_identities_are_accepted(repo):
+    """Redundant but consistent input is not an error -- only disagreement is."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved")
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    rc, out = _run_argv(repo, ["HEAD", "master", "--pr", PR, "--pr", PR], env_pr=PR)
+    assert rc == 0, out
 
 
 def test_ANOTHER_PRs_clearance_cannot_satisfy_this_one(repo):
