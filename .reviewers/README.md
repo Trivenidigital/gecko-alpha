@@ -67,8 +67,12 @@ PR's record is refused, including on an otherwise docs-only PR.
 ### `record_version` may be omitted
 
 **Missing means 1, permanently and by decision.** A reader years from now can
-rely on this: an absent field means the record predates versioning, never that
-the writer forgot.
+rely on this: an absent field means version 1, whether the record predates
+versioning or the writer simply omitted an optional field. Both mean 1.
+
+(An earlier draft said "never that the writer forgot". That asserted provenance
+nothing enforces — once the field is optional, an author may omit it for any
+reason. The rule is unchanged; the unenforceable claim is gone.)
 
 Requiring it was considered and declined 3-1. Requiring it *today* would buy
 nothing — the case a version marker exists for (a v2 record read by a v1 gate)
