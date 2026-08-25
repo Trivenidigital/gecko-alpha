@@ -273,15 +273,48 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
        `scripts/` passes `timeout=`. It cannot see whether anyone HANDLES the
        timeout, so it kept passing over all three defects. Routing git through
        one helper makes the handler auditable too.
+
+       That claim was FALSE when first written: `_git` and the ancestry check
+       still called `subprocess.run` directly, each with its own inline timeout
+       handler. Safe in behaviour, and it meant the encoding fix landed on one
+       path and not the others. Both now route through here, and
+       `test_EVERY_subprocess_run_in_the_gate_goes_through_git_run` pins it by
+       AST -- not by grep, because a substring guard over a file whose own
+       prose contains `subprocess.run` would match its documentation and pass
+       while the code diverged.
     """
     try:
-        return subprocess.run(
+        r = subprocess.run(
             argv,
             capture_output=True,
             encoding="utf-8",
-            errors="strict",
+            errors="surrogateescape",
             timeout=_GIT_TIMEOUT_SEC,
         )
+        # VALIDATE IN THE CALLING THREAD. `errors="strict"` looks like it does
+        # this and does not: on Windows `capture_output` decodes inside
+        # `_readerthread`, so the `UnicodeDecodeError` is raised THERE, the
+        # handler below never sees it, the thread dies, and `stdout` comes back
+        # EMPTY -- which `_read_record` reads as `None` and `main` reports as
+        # "the record is not present in the revision under review".
+        #
+        # A committed record that `git ls-tree` returns, reported as absent.
+        # That is the could-not-determine / there-is-nothing-there conflation
+        # this whole exception family exists to prevent, re-entering through a
+        # platform detail, in the helper written to close it.
+        #
+        # `surrogateescape` never raises in the reader thread; the re-encode
+        # round-trip then detects exactly the same bad bytes, in this thread,
+        # on every platform. Keeping stdout a `str` also keeps the existing
+        # test doubles valid -- decoding from bytes instead broke two of them.
+        try:
+            (r.stdout or "").encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RecordUnreadable(
+                f"{' '.join(argv)} returned bytes that are not valid UTF-8: "
+                f"{exc}"
+            ) from None
+        return r
     except subprocess.TimeoutExpired:
         raise GitTimeout(
             f"{' '.join(argv)} timed out after {_GIT_TIMEOUT_SEC}s"
@@ -497,17 +530,13 @@ class GitTimeout(Exception):
 
 
 def _git(*args: str) -> str:
-    try:
-        r = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        raise GitTimeout(
-            f"git {' '.join(args)} timed out after {_GIT_TIMEOUT_SEC}s"
-        ) from None
+    # Through `_git_run`, not around it. This used to call `subprocess.run`
+    # directly with its own inline timeout handler -- safe, but it meant the
+    # helper's "one place to audit" claim was false and the locale-decoding
+    # defect stayed live here after being fixed there. Two paths with the same
+    # obligations is how the last round's three unhandled timeout sites got
+    # added at all.
+    r = _git_run(["git", *args])
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -826,13 +855,8 @@ def main(argv: list[str]) -> int:
             failures.append(f"{vector:16s} {exc} -- treated as NOT covered")
             continue
         try:
-            anc = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", full, head_sha],
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT_SEC,
-            )
-        except subprocess.TimeoutExpired:
+            anc = _git_run(["git", "merge-base", "--is-ancestor", full, head_sha])
+        except GitTimeout:
             failures.append(
                 f"{vector:16s} ancestry check timed out after "
                 f"{_GIT_TIMEOUT_SEC}s -- treated as NOT covered"

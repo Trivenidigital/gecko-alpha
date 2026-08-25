@@ -1723,3 +1723,100 @@ def test_POLICY_EVOLUTION_does_not_invalidate_records_on_the_VERSION_axis():
         "sweep -- requiring the field on ARCHIVES is the retroactive-policy "
         "failure the sibling regression exists to prevent"
     )
+
+
+def test_a_NON_UTF8_record_is_UNREADABLE_not_ABSENT(repo):
+    """A committed record with a bad byte must not be reported as missing.
+
+    `errors="strict"` LOOKS like it validates in the calling thread and does
+    not: on Windows `capture_output` decodes inside `_readerthread`, so the
+    `UnicodeDecodeError` is raised there, the handler never sees it, the thread
+    dies, and `stdout` returns EMPTY -- which reads as an absent record. `git
+    ls-tree` returns the file while the gate says it is not present.
+
+    That is the could-not-determine / there-is-nothing-there conflation this
+    exception family exists to prevent, re-entering through a platform detail,
+    inside the helper written to close it.
+
+    THIS TEST ALSO PINS THE ENCODING PAIR. Replacing it with `text=True`
+    survived the entire suite and, on a cp1252 box, decoded this record into
+    mojibake that parsed as valid TOML and was ACCEPTED -- a genuine fail-open
+    guarded only by a line no test defended. Reachable for this project
+    specifically: a record hand-edited on Windows saves cp1252 by default, so
+    one accented reviewer name does it.
+    """
+    sha = _branch_with(repo, "prod", "scout/f.txt", "moved" + chr(10))
+    nl = chr(10)
+    body = (
+        "pr = " + PR + nl
+        + "# reviewer: Jos" + chr(0xE9) + nl
+        + "required = [" + ", ".join('"' + v + '"' for v in MANDATORY_VECTORS) + "]" + nl
+        + "watch = [" + ", ".join('"' + w + '"' for w in MANDATORY_WATCH) + "]" + nl + nl
+        + "[clearances]" + nl
+        + "".join(v + ' = "' + sha + '"' + nl for v in MANDATORY_VECTORS)
+    )
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (PR + ".toml")).write_bytes(body.encode("latin-1"))
+    _git(repo, "add", "--", ".reviewers")
+    _git(repo, "commit", "-qm", "record with a non-utf8 byte")
+
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 2, out
+    assert "not valid UTF-8" in out, out
+    assert "is not present in the revision" not in out, (
+        "a committed record was reported as ABSENT because decoding failed:"
+        + nl + out
+    )
+    assert "all required vectors hold" not in out, (
+        "a record that could not be decoded was ACCEPTED:" + nl + out
+    )
+
+
+def test_EVERY_subprocess_run_in_the_gate_goes_through_git_run():
+    """The "one place to audit" claim, made true and then pinned.
+
+    It was false when written: `_git` and the ancestry check called
+    `subprocess.run` directly, each with its own inline timeout handler. Safe,
+    but it meant the encoding fix applied to one path and not the others -- and
+    two paths carrying the same obligations is exactly how last round's three
+    unhandled timeout sites got added.
+
+    AST, NOT GREP, and the distinction is load-bearing here: a substring guard
+    over a file that necessarily contains the words `subprocess.run` in its own
+    prose would match its own documentation and pass while the code diverged.
+    This project has shipped precisely that -- a text-scanning guard that
+    passed while six real derivations existed -- and the lesson recorded from
+    it was to scan the AST for the identifier.
+    """
+    import ast
+
+    src = SCRIPT.read_text(encoding="utf-8")
+    sites = [
+        n.lineno
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "run"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "subprocess"
+    ]
+    assert len(sites) == 1, (
+        f"expected exactly one subprocess.run site (inside _git_run), found "
+        f"{len(sites)} at lines {sites}. A second call site does not inherit "
+        "the timeout conversion or the utf-8 validation, and the repo's own "
+        "timeout guard checks only that `timeout=` is PASSED -- it cannot see "
+        "whether anyone HANDLES it."
+    )
+    inside = [
+        n.lineno
+        for f in ast.walk(ast.parse(src))
+        if isinstance(f, ast.FunctionDef) and f.name == "_git_run"
+        for n in ast.walk(f)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "run"
+    ]
+    assert sites == inside, (
+        f"the single subprocess.run site is not inside _git_run: {sites} vs {inside}"
+    )
