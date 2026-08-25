@@ -318,9 +318,17 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
             # and that survival is EVIDENCE OF UNREACHABILITY rather than a
             # missing test. Naming the configuration, per the rule this repo
             # arrived at the hard way: for this to matter `run()` must return
-            # `stdout=None`, which needs the reader thread to die, which needs
-            # decoding to raise -- and `errors="surrogateescape"` above never
-            # raises. The code cannot enter that state.
+            # `stdout=None`, which needs the reader thread to die. `_readerthread`
+            # runs `buffer.append(fh.read())`, so ANY exception there does it --
+            # decoding is one cause, `MemoryError` on a very large blob and a
+            # pipe `OSError`/`ValueError` are others.
+            #
+            # So what is proven is narrower than "the code cannot enter that
+            # state": it is "cannot enter it VIA DECODING", because
+            # `errors="surrogateescape"` above never raises. The earlier wording
+            # overstated it. That argues for KEEPING this branch, not removing
+            # it -- and the correction matters because the whole value of "name
+            # the configuration" is that the named configuration is exhaustive.
             #
             # It stays because what it guards is a false ABSENCE, and because
             # the single edit that would make it reachable -- reverting to
@@ -345,13 +353,15 @@ def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
         raise GitTimeout(
             f"{' '.join(argv)} timed out after {_GIT_TIMEOUT_SEC}s"
         ) from None
-    except UnicodeDecodeError as exc:
-        # Reached when git hands back bytes that are not UTF-8 -- a record
-        # hand-edited in latin-1, say. NOT "the record is absent" and NOT "not
-        # valid TOML": it never became a document at all.
-        raise RecordUnreadable(
-            f"{' '.join(argv)} returned bytes that are not valid UTF-8: {exc}"
-        ) from None
+    # NOTE: there is deliberately no `except UnicodeDecodeError` here.
+    # `errors="surrogateescape"` above cannot raise it, so such a handler
+    # would be dead -- and the version that used to sit here carried a comment
+    # asserting it WAS reached, which is worse than absence: a reader auditing
+    # this function saw two live decoding paths to `RecordUnreadable` and could
+    # not tell which one to test. The real case is caught by the re-encode
+    # round-trip above, in the calling thread. This file already argues the
+    # point elsewhere -- "dead code with a green suite is a trap for whoever
+    # edits it next" -- and deletes such branches rather than re-guarding them.
 
 
 def _read_record(head_sha: str, path: str) -> str | None:
