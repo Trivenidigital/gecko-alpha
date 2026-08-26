@@ -4,6 +4,13 @@
 **Base:** `master` at `cdbb8475` (the #559 merge)
 **Date:** 2026-08-24
 
+> **Historical record. Describes the state as of #560.** The root `.reviewers.toml`
+> this document refers to was replaced by per-PR `.reviewers/<PR>.toml` in #564;
+> there is no root file today and creating one has no effect. The references below are
+> left in place because they were true of #560 and this is a record of #560 -- they are
+> descriptive, not instructions. Noted here because the realistic access pattern for
+> this file is grep, so a reader lands mid-document with no date context.
+
 ## What this PR is
 
 Three things, all follow-ups to the #559 deploy:

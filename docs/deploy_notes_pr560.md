@@ -12,11 +12,18 @@ systemd reads `/etc/systemd/system`, not the repo:
 **Also post-merge, in the repo rather than on the box — reset master's
 clearances:**
 
-    # squash-merge carries this PR's clearance SHAs onto master, where they are
-    # no longer ancestors and would misreport on unrelated work.
-    # Empty the table; do NOT delete the file (deleting it turns the guard
-    # green while disabling it -- see the test's SKIP-NOT-RETURN note).
-    $EDITOR .reviewers.toml   # [clearances] -> empty
+    # SUPERSEDED BY PR #564 -- there is no reset step any more, and nothing
+    # to edit here. Clearance records are now per-PR (`.reviewers/<PR>.toml`),
+    # so master never carries live cross-PR clearance state: a merged PR's
+    # record is inert evidence rather than something a later branch inherits.
+    #
+    # DO NOT create a root `.reviewers.toml`. The gate does not read one --
+    # following this instruction as originally written produces a file that
+    # has no effect and reports no error.
+    #
+    # (Kept rather than deleted because this document records what #560
+    # required at the time, and a step that silently stopped being necessary
+    # is worth saying out loud.)
 
 These two steps are NOT equivalent and should not be treated as a pair. Skipping
 the `install` above has **no observable anywhere** and lands in production.

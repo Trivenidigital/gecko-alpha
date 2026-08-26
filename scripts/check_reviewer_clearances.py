@@ -16,7 +16,7 @@ things would be required, and neither exists in this repository today:
    unmergeable -- `mergeStateStatus` reads `UNSTABLE` (checks red, merge
    permitted) rather than `BLOCKED`. Verified against this repo: PR #560 was
    mergeable while this very check was failing.
-2. **A review record outside the author's reach.** `.reviewers.toml` is
+2. **A review record outside the author's reach.** `.reviewers/<pr>.toml` is
    author-writable, so repointing every clearance at the head is a four-line
    edit that turns this green -- and it makes step 3 vacuous, because the
    clearance tree is then compared against itself. GitHub review approvals
@@ -39,8 +39,17 @@ The question is *"does the delta THIS pull request introduces in watched paths
 carry a clearance?"* -- not *"is some historical SHA still current?"*. So:
 
 * If the watched trees are identical between the **merge base** and the head,
-  the PR introduces no production delta and **no clearance is required**. A
-  documentation-only PR passes without touching the declaration at all.
+  the PR introduces no production delta and **no clearance SHA is required**.
+
+  It still needs its own correctly-owned `.reviewers/<pr>.toml`, and that is
+  the executable rule -- the record is resolved and its ownership verified
+  BEFORE the watched delta is computed. An earlier version of this paragraph
+  said a docs-only PR "passes without touching the declaration at all", which
+  described a weaker gate than the one that shipped. The stronger rule is
+  deliberate: **known PR + missing active record = RED.** If absence were a
+  pass, deleting the record would be the cheapest way to turn the gate green
+  while switching it off -- and a docs-only PR is precisely where nobody would
+  look twice.
 
   **This narrows the treadmill; it does not remove it.** `watch` includes
   `tests` and `.github`, so essentially every substantive PR has a watched
@@ -84,6 +93,7 @@ work out what to compare" is 2.
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
@@ -91,23 +101,398 @@ import sys
 import tomllib
 from pathlib import Path
 
-#: Script-relative, not CWD-relative: run from a subdirectory, a CWD-relative
-#: path reports "declaration missing" instead of a usage error. `REVIEWERS_DECL`
-#: overrides it so the test-suite can drive the real script against a purpose-
-#: built repository rather than against this one.
-DECL = Path(
-    os.environ.get("REVIEWERS_DECL")
-    or Path(__file__).resolve().parents[1] / ".reviewers.toml"
-)
+#: Directory holding per-PR clearance records, as a path INSIDE the repository
+#: rather than a filesystem location. `REVIEWERS_PREFIX` overrides it so the
+#: test-suite can drive the real script against a purpose-built repository.
+#:
+#: It is a repo-relative prefix because records are now read out of the
+#: REVISION UNDER REVIEW, never off disk -- see `_read_record`.
+DECL_PREFIX = os.environ.get("REVIEWERS_PREFIX") or ".reviewers"
+
+
+#: Record schema versions this reader understands.
+#:
+#: ABSENT means version 1, permanently. Exactly one schema has ever existed, so
+#: absence is determinate rather than a guess -- and REQUIRING the field would
+#: retroactively invalidate every record written before it existed, which is
+#: the retroactive-policy failure the historical-record rule exists to prevent.
+#: Strict on the open future, permissive on the closed past.
+#:
+#: This lives in the GATE and not only in the test-suite, because a version
+#: marker whose purpose is "do not let a newer schema be misread by an older
+#: reader" is worthless if the reader that decides never reads it. It formerly
+#: sat in the tests alone: the gate exited 0 on `record_version = 99`, and the
+#: only enforcement ran in a different CI job over a directory that globbed to
+#: zero files.
+SUPPORTED_RECORD_VERSIONS = frozenset({1})
+
+#: What an ABSENT `record_version` means. **Missing is 1, permanently and by
+#: decision** -- a reader years from now can rely on this: an absent field means
+#: the record predates versioning, never that the writer forgot.
+#:
+#: Named rather than left as a bare `.get(..., 1)` default because the danger
+#: was never the default, it was an UNDOCUMENTED one: a literal in a call is
+#: indistinguishable from an oversight, and the whole purpose of a version
+#: marker is to be readable years later by someone who cannot ask.
+#:
+#: Requiring the field instead was considered and declined 3-1. The deciding
+#: argument was that requiring it TODAY buys nothing: the stale-reader case (a
+#: v2 record read by a v1 gate) is prevented by the v2 WRITER declaring, which
+#: a v2 migration enforces at that time. Today's requirement would only let a
+#: reader distinguish "written before versioning" from "written after
+#: versioning, v1" -- and both mean 1, so the distinction is inert. Against
+#: that, a wrongly-required field produces a red whose cause is
+#: mis-attributable on the one PR whose red is already pre-explained.
+DEFAULT_RECORD_VERSION = 1
+
+
+class RecordUnreadable(Exception):
+    """The record could not be READ. Deliberately NOT "the record is absent".
+
+    Third member of the family with `GitTimeout` and `PRIdentityUnresolved`: a
+    channel meaning "I could not determine" must never share a representation
+    with one meaning "there is nothing there". Both earlier members were added
+    only after a fail-open had been demonstrated; this one is added before.
+    """
+
+
+class PRIdentityUnresolved(Exception):
+    """The candidate PR could not be identified. DELIBERATELY NOT a failure to
+    find a declaration.
+
+    These are different facts and collapsing them is a fail-open: "there is no
+    clearance for PR 42" is a verdict, while "I do not know which PR this is"
+    is the absence of one. If the second ever resolves to the first, a run with
+    no identity would report a specific, checkable-sounding reason and a future
+    reader would go looking for a file rather than for the missing context.
+
+    This is the same shape as `GitTimeout`, and it is here for the same reason:
+    the previous design had ONE declaration for the whole repository, so there
+    was no identity to get wrong. Introducing per-PR records introduces a new
+    way to be wrong about WHICH record applies.
+    """
+
+
+def _parse_args(argv: list[str]) -> tuple[str, str, str]:
+    """`(head, base, pr)` from a REAL parser, not positional slicing.
+
+    The previous version read `argv[1]` as `head` and `argv[2]` as `base`
+    before looking for `--pr` anywhere in the list. `--pr 564` on its own
+    therefore resolved `head="--pr"` and `base="564"`, and failed with
+    `cannot resolve --pr against 564` -- an option silently reinterpreted as a
+    git ref. It was invisible in the test-suite because every call site passed
+    `head base --pr N` in that exact order, so the slice happened to land
+    correctly. A contract that only holds for one argument order is not a
+    contract; it is a coincidence the tests were written around.
+
+    PR identity precedence, and conflicts are FATAL rather than
+    last-one-wins: silently preferring one of two disagreeing identities is
+    how a run ends up evaluating a different PR than the operator believes.
+    """
+    ap = argparse.ArgumentParser(
+        prog="check_reviewer_clearances",
+        add_help=True,
+        description="Verify this PR's reviewer clearances against its tree.",
+    )
+    ap.add_argument("head", nargs="?", default="HEAD")
+    ap.add_argument("base", nargs="?", default="origin/master")
+    ap.add_argument(
+        "--pr",
+        action="append",
+        default=None,
+        help="PR number. In CI supply it from github.event.pull_request.number.",
+    )
+
+    # `parse_args` exits 2 on a usage error, which is already the code this
+    # script reserves for "could not work out what to compare". Kept rather
+    # than intercepted: an unparseable command line is precisely that case.
+    ns = ap.parse_args(argv[1:])
+
+    given = list(ns.pr or [])
+    if len(set(given)) > 1:
+        raise PRIdentityUnresolved(
+            "conflicting --pr values: " + ", ".join(sorted(set(given)))
+            + " -- refusing to pick one"
+        )
+    env = os.environ.get("REVIEWERS_PR", "").strip()
+    if given and env and given[0] != env:
+        raise PRIdentityUnresolved(
+            f"--pr {given[0]} disagrees with REVIEWERS_PR {env} -- refusing to "
+            "pick one. One of them is describing a different PR than you think."
+        )
+
+    pr = given[0] if given else env
+    if not pr:
+        raise PRIdentityUnresolved(
+            "no PR identity: pass `--pr <number>`, or set REVIEWERS_PR from "
+            "trusted CI event metadata. The branch name is deliberately NOT "
+            "consulted -- it is author-controlled and would let any branch "
+            "claim any PR's clearances"
+        )
+    return ns.head, ns.base, pr
+
+
+_PR_RE = re.compile(r"\A[1-9][0-9]{0,9}\Z")
+
+
+def _decl_path(pr: str) -> str:
+    """`<prefix>/<pr>.toml`, with the PR number validated as a bare number.
+
+    Validated rather than trusted: the value reaches a path, so `../../etc` or
+    `42/../41` must not resolve to another PR's record. A malformed number is
+    an identity failure, not a missing declaration.
+    """
+    if not _PR_RE.match(pr):
+        raise PRIdentityUnresolved(
+            f"PR identity {pr!r} is not a bare positive number -- refusing to "
+            "resolve it to a path"
+        )
+    return f"{DECL_PREFIX}/{pr}.toml"
+
+
+def _git_run(argv: list[str]) -> subprocess.CompletedProcess:
+    """`subprocess.run` for git, with the three things that kept being missed.
+
+    Every one of these was a finding, and all three were missed on call sites
+    added *by the fix for the previous finding*:
+
+    1. **`TimeoutExpired` becomes `GitTimeout`.** Three sites added in the last
+       round called `subprocess.run` directly, so a timeout escaped `_cli`
+       entirely -- and an uncaught exception exits 1, the code this module
+       reserves for "this PR's clearances do not hold". A transient runner
+       timeout was reported as a clearance verdict. The whole `GitTimeout` /
+       `PRIdentityUnresolved` / `RecordUnreadable` family exists to keep
+       "could not determine" out of the verdict channel; the newest code put
+       it back.
+    2. **`encoding="utf-8", errors="strict"`.** `text=True` alone decodes with
+       the RUNNER'S LOCALE, so the same bytes produced mojibake-then-exit-0 on
+       a cp1252 box and a traceback under `PYTHONUTF8=1`. The explicit encoding
+       the old `Path.read_text(encoding="utf-8")` carried was silently dropped
+       when the read moved into git.
+    SCOPE OF VALIDATION, stated because the absence of this note is how the
+    "one place to audit" claim below went stale once already: **this validates
+    `stdout` only.** `stderr` is interpolated into `_git`'s `RuntimeError` and
+    into three `RecordUnreadable` messages without a round-trip. No source of
+    invalid UTF-8 on stderr has been found -- the paths git echoes back come
+    from `watch`, which is valid Unicode by the time it is used -- but that is
+    the limit of one reviewer's attempt, not a proof. If one is ever found, the
+    fix is the same re-encode round-trip. Recorded so nobody infers from
+    "`_git_run` validates encoding" that everything reaching it is validated.
+
+    3. **One place to audit.** The repo guard asserts every `subprocess.run` in
+       `scripts/` passes `timeout=`. It cannot see whether anyone HANDLES the
+       timeout, so it kept passing over all three defects. Routing git through
+       one helper makes the handler auditable too.
+
+       That claim was FALSE when first written: `_git` and the ancestry check
+       still called `subprocess.run` directly, each with its own inline timeout
+       handler. Safe in behaviour, and it meant the encoding fix landed on one
+       path and not the others. Both now route through here, and
+       `test_EVERY_subprocess_run_in_the_gate_goes_through_git_run` pins it by
+       AST -- not by grep, because a substring guard over a file whose own
+       prose contains `subprocess.run` would match its documentation and pass
+       while the code diverged.
+    """
+    try:
+        r = subprocess.run(
+            argv,
+            capture_output=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            timeout=_GIT_TIMEOUT_SEC,
+        )
+        # VALIDATE IN THE CALLING THREAD. `errors="strict"` looks like it does
+        # this and does not: on Windows `capture_output` decodes inside
+        # `_readerthread`, so the `UnicodeDecodeError` is raised THERE, the
+        # handler below never sees it, the thread dies, and `stdout` comes back
+        # EMPTY -- which `_read_record` reads as `None` and `main` reports as
+        # "the record is not present in the revision under review".
+        #
+        # A committed record that `git ls-tree` returns, reported as absent.
+        # That is the could-not-determine / there-is-nothing-there conflation
+        # this whole exception family exists to prevent, re-entering through a
+        # platform detail, in the helper written to close it.
+        #
+        # `surrogateescape` never raises in the reader thread; the re-encode
+        # round-trip then detects exactly the same bad bytes, in this thread,
+        # on every platform. Keeping stdout a `str` also keeps the existing
+        # test doubles valid -- decoding from bytes instead broke two of them.
+        if r.stdout is None:
+            # `run()` CAN return None fields. On Windows a decode failure in
+            # `_readerthread` kills that thread and `run()` returns NORMALLY
+            # with `stdout=None`, so every site treating a CompletedProcess
+            # field as a string assumes something `subprocess` does not
+            # promise.
+            #
+            # PINNED by `test_a_None_stdout_is_UNREADABLE_not_an_EMPTY_record`,
+            # which reaches this branch through a `subprocess.run` double.
+            #
+            # This comment previously said the opposite -- "DELIBERATELY
+            # UNPINNED", "a mutant removing this branch survives", "the code
+            # cannot enter that state" -- and all three became false when that
+            # test landed six lines away. Left as it was, it instructed the
+            # next maintainer to DELETE a test that legitimately exists, by
+            # invoking the rule about not asserting against unreachable states.
+            # A comment that is merely stale misleads; one that issues a wrong
+            # instruction is worse.
+            #
+            # The organic path is closed -- `errors="surrogateescape"` above
+            # cannot raise, so decoding cannot kill the capture thread. But
+            # `_readerthread` runs `buffer.append(fh.read())` and ANY exception
+            # there yields `stdout=None`: `MemoryError` on a very large blob, a
+            # pipe `OSError`. So the branch defends `subprocess`'s contract --
+            # `CompletedProcess.stdout` is not promised to be a string -- not
+            # just the decode case, and a double is the honest way to reach it.
+            #
+            # Writing `or ""` here instead would launder a dead capture thread
+            # into exactly the "record is not present" verdict this whole
+            # family exists to prevent. That is not hypothetical: it is what
+            # the first version of this fix did.
+            raise RecordUnreadable(
+                f"{' '.join(argv)} produced no stdout -- the capture thread "
+                "died, which is NOT 'there is nothing there'"
+            )
+        try:
+            r.stdout.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RecordUnreadable(
+                f"{' '.join(argv)} returned bytes that are not valid UTF-8: "
+                f"{exc}"
+            ) from None
+        return r
+    except subprocess.TimeoutExpired:
+        raise GitTimeout(
+            f"{' '.join(argv)} timed out after {_GIT_TIMEOUT_SEC}s"
+        ) from None
+    # NOTE: there is deliberately no `except UnicodeDecodeError` here.
+    # `errors="surrogateescape"` above cannot raise it, so such a handler
+    # would be dead -- and the version that used to sit here carried a comment
+    # asserting it WAS reached, which is worse than absence: a reader auditing
+    # this function saw two live decoding paths to `RecordUnreadable` and could
+    # not tell which one to test. The real case is caught by the re-encode
+    # round-trip above, in the calling thread. This file already argues the
+    # point elsewhere -- "dead code with a green suite is a trap for whoever
+    # edits it next" -- and deletes such branches rather than re-guarding them.
+
+
+def _read_record(head_sha: str, path: str) -> str | None:
+    """The record AS IT EXISTS IN THE REVISION UNDER REVIEW. None if absent.
+
+    NOT `Path.read_text()`, and the difference is a real attack rather than
+    tidiness. The gate judges `head_sha`, but an earlier version read the
+    record off the working tree -- two different revisions, with nothing
+    asserting they matched. In GitHub Actions they demonstrably do not:
+    `actions/checkout@v4` with no `ref:` checks out `refs/pull/N/merge`, i.e.
+    merge(head, base), while the workflow passes
+    `github.event.pull_request.head.sha`.
+
+    Exploited end-to-end before the fix: a docs-only PR wrote
+    `.reviewers/<other>.toml`, squash-merged, and the target PR's gate then
+    reported all four vectors HOLD -- target author uninvolved, no reviewer
+    involved.
+
+    Absence is a POSITIVE determination via `ls-tree`: `git show` exits
+    non-zero for a missing path AND for a corrupt object, and collapsing those
+    makes "I could not read it" indistinguishable from "it is not there".
+
+    `--full-tree` because a bare pathspec is CWD-RELATIVE. See
+    `_foreign_record_edits`, where the same trap was left open for one round.
+    """
+    listed = _git_run(
+        ["git", "ls-tree", "--full-tree", "--name-only", head_sha, "--", path]
+    )
+    if listed.returncode != 0:
+        raise RecordUnreadable(
+            f"git ls-tree failed for {path} at {head_sha[:8]}: "
+            f"{listed.stderr.strip()} -- this is 'could not determine', NOT "
+            "'the record is absent'"
+        )
+    if not listed.stdout.strip():
+        return None
+    got = _git_run(["git", "show", f"{head_sha}:{path}"])
+    if got.returncode != 0:
+        raise RecordUnreadable(
+            f"{path} is listed in the tree at {head_sha[:8]} but unreadable: "
+            f"{got.stderr.strip()} -- a read failure on a file known to exist "
+            "is a broken environment, never an absence"
+        )
+    return got.stdout
+
+
+def _foreign_record_edits(merge_base: str, head_sha: str, own: str) -> list[str]:
+    """Records belonging to OTHER PRs that this revision changes.
+
+    `.reviewers/` is deliberately absent from `MANDATORY_WATCH` -- a record
+    cannot police edits to itself. But that exemption is by PREFIX, so it also
+    exempted every OTHER PR's record, leaving an entirely unwatched channel: a
+    docs-only PR could author or delete any other PR's clearance record and its
+    own gate would print "no delta in watched paths".
+
+    Only `<prefix>/<own-pr>.toml` is exempt. Everything else under the prefix is
+    a production change to another PR's evidence and must be refused --
+    including DELETIONS.
+
+    Non-`.toml` files under the prefix (the README) are policy documentation,
+    not evidence. Without that carve-out this rule reds the very PR that
+    introduces the directory.
+
+    THREE GIT ARGUMENTS HERE ARE LOAD-BEARING, and each was missing once:
+
+    * `--no-renames`. Git collapses "delete `43.toml`" plus "add `42.toml`" --
+      near-identical files -- into one rename, and `--name-only` then reports
+      only the DESTINATION. Deleting another PR's record while adding your own
+      was invisible, and so was renaming theirs onto your own number: precisely
+      the laundering move this guard exists to refuse.
+
+    * `:(top)` and `-c diff.relative=false`. A bare pathspec is interpreted
+      RELATIVE TO CWD, so run from any subdirectory `.reviewers` resolved to
+      `<subdir>/.reviewers`, matched nothing, and the guard returned `[]`
+      **without saying it had checked nothing**. Demonstrated: from the repo
+      root a tampering PR exits 1; from `scout/` the same PR exits 0. Not
+      reachable in the shipped CI job, which runs from `github.workspace` -- but
+      reachable for every off-CI invocation, which this script is explicitly
+      built for, and the module docstring's claim that off-CI degradation
+      "fails CLOSED" is falsified by it. `diff.relative=true` in a user's config
+      suppresses the guard the same way, so both halves are needed.
+      `_read_record` was cwd-hardened with `--full-tree` in the same commit that
+      added this line unhardened.
+
+    * `-z`. `--name-only` QUOTES any path containing non-ASCII, `"`, `\\` or a
+      control character (`".reviewers/4\\303\\2513.toml"`), so an
+      `endswith(".toml")` test silently drops it. `core.quotepath=false` is NOT
+      sufficient -- quotes, backslashes and control characters are still
+      escaped. Today no *usable* record can trigger it, because `_decl_path`
+      constrains names to `[1-9][0-9]*\\.toml`; the guard is honest rather than
+      lucky.
+    """
+    r = _git_run([
+        "git", "-c", "diff.relative=false", "diff", "--name-only",
+        "--no-renames", "-z", merge_base, head_sha, "--", ":(top)" + DECL_PREFIX,
+    ])
+    if r.returncode != 0:
+        raise RecordUnreadable(
+            f"git diff over {DECL_PREFIX} failed: {r.stderr.strip()} -- "
+            "cannot establish whether this PR touches another PR's record"
+        )
+    foreign = []
+    for p in r.stdout.split("\0"):
+        p = p.strip()
+        if not p or not p.endswith(".toml"):
+            continue
+        if p != own:
+            foreign.append(p)
+    return sorted(foreign)
 
 #: Ruling D's four vectors, pinned in EXECUTABLE code rather than only in a
 #: test, because a declaration that can narrow `required` to one vector can
 #: equally narrow the test that checks it.
 MANDATORY_VECTORS = frozenset({"concurrency", "silent-failure", "ops-safety", "logic"})
 
-#: Paths whose movement must be covered by a clearance. `.reviewers.toml` can
-#: never appear here -- a file cannot police edits to itself -- and that is the
-#: clearest tell that a committed file is the wrong home for this record.
+#: Paths whose movement must be covered by a clearance. `.reviewers/` can
+#: never appear here -- a record cannot police edits to itself. Note this is a
+#: DIFFERENT reason from the one the old root declaration had: that file was
+#: excluded because a single shared table could not police its own rewriting;
+#: a per-PR record is excluded because it is the evidence being evaluated.
 #: `dashboard` is here because that is where the /health WAL-sidecar silent
 #: failure lived, and `.github` because a PR deleting this step from the
 #: workflow must not be able to lapse nothing.
@@ -132,6 +517,14 @@ MANDATORY_WATCH = frozenset(
         "cron",
         "ops",
         "systemd",
+        # `.claude` for the same reason `.github` is here: it holds executable
+        # repo guards (`hooks/check-new-primitives.py`) and the hook/permission
+        # config. The argument already made for the workflow -- "a PR deleting
+        # this step must not be able to lapse nothing" -- applies unchanged to
+        # a PR editing the hook that enforces the plan-document contract.
+        # Under the pre-delta design an omission here merely failed to LAPSE a
+        # clearance; since "no delta ⇒ pass", an omission is a FULL EXEMPTION.
+        ".claude",
         # Root FILES. An earlier draft of this list claimed they could not be
         # covered "because a path prefix cannot reach a root file", and
         # documented that as a known gap. That was simply wrong:
@@ -184,17 +577,13 @@ class GitTimeout(Exception):
 
 
 def _git(*args: str) -> str:
-    try:
-        r = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        raise GitTimeout(
-            f"git {' '.join(args)} timed out after {_GIT_TIMEOUT_SEC}s"
-        ) from None
+    # Through `_git_run`, not around it. This used to call `subprocess.run`
+    # directly with its own inline timeout handler -- safe, but it meant the
+    # helper's "one place to audit" claim was false and the locale-decoding
+    # defect stayed live here after being fixed there. Two paths with the same
+    # obligations is how the last round's three unhandled timeout sites got
+    # added at all.
+    r = _git_run(["git", *args])
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -240,16 +629,102 @@ def _moved(watch: list[str], a: str, b: str) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str]) -> int:
-    head = argv[1] if len(argv) > 1 else "HEAD"
-    base = argv[2] if len(argv) > 2 else "origin/master"
+    head, base, pr = _parse_args(argv)
+    DECL = _decl_path(pr)
 
-    if not DECL.exists():
-        print(f"FAIL: declaration is missing: {DECL}")
+    # The revision is resolved FIRST, because the record is read out of it
+    # rather than off disk. Ordering is load-bearing, not stylistic: reading
+    # the record before knowing which revision is under review is precisely
+    # how the working tree and the judged tree came apart.
+    try:
+        head_sha = _git("rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
+        merge_base = _git("merge-base", base, head_sha)
+    except RuntimeError as exc:
+        print(f"FAIL: cannot resolve {head} against {base}: {exc}")
+        return 2
+
+    # READ ONCE. The previous version called `_read_record` twice per
+    # evaluation -- once to test for absence, once to parse -- which is the
+    # anti-pattern `_moved`'s own docstring records as fixed: two calls can
+    # answer differently under a transient failure and produce a
+    # self-inconsistent verdict. It also left `tomllib.loads(None)` reachable
+    # if they ever disagreed.
+    #
+    # And the read is INSIDE the try. The handlers below previously sat after
+    # an unguarded first call, thirteen lines earlier, so anything it raised
+    # escaped before they existed -- they were unreachable, and a mutant
+    # replacing both bodies with `return 0` left every test passing.
+    try:
+        raw = _read_record(head_sha, DECL)
+    except RecordUnreadable:
+        raise                      # exit 2 at the boundary: nothing determined
+    if raw is None:
+        print(
+            f"FAIL: no clearance FILE for PR {pr}: {DECL} is not present "
+            f"in the revision under review ({head_sha[:8]})"
+        )
+        print(
+            "  This is NOT a skip. A missing or renamed declaration for the "
+            "PR under evaluation is RED, because the alternative -- treating "
+            "absence as 'nothing to check' -- lets deleting the file turn the "
+            "gate green while disabling it."
+        )
         return 1
     try:
-        decl = tomllib.loads(DECL.read_text(encoding="utf-8"))
+        decl = tomllib.loads(raw)
     except tomllib.TOMLDecodeError as exc:
+        # Decoding failures no longer arrive here: `_git_run` reads with an
+        # explicit utf-8/strict codec and converts a bad byte into
+        # `RecordUnreadable`, because "these bytes never became a document" is
+        # a different fact from "this document is malformed".
         print(f"FAIL: {DECL} is not valid TOML: {exc}")
+        return 1
+
+    # The record must name its OWN PR, and it must match the identity resolved
+    # from trusted metadata. Filename alone is not ownership: a file copied
+    # from another PR keeps its contents, and a rename is a one-line edit. This
+    # is what makes "PR A's clearance can never satisfy PR B" a property of the
+    # DATA rather than of a naming convention.
+    ver = decl.get("record_version", DEFAULT_RECORD_VERSION)
+    # TYPE-CHECK, do not merely membership-test. `True in {1}` and `1.0 in {1}`
+    # are both True in Python -- equal values, equal hashes -- so a typo'd
+    # `record_version = true` silently read as v1 instead of being rejected.
+    # `bool` IS an `int`, and this project has been bitten by that before.
+    # Harmless while 1 is the only version; a live misread the day 2 exists.
+    if isinstance(ver, bool) or not isinstance(ver, int):
+        print(
+            f"FAIL: {DECL} declares record_version {ver!r}, which is not an "
+            "integer"
+        )
+        print(
+            "  A version is a whole number. `true` and `1.0` compare equal to "
+            "1 in Python and would otherwise be read as v1."
+        )
+        return 1
+    if ver not in SUPPORTED_RECORD_VERSIONS:
+        print(
+            f"FAIL: {DECL} declares record_version {ver!r}, which this reader "
+            "does not understand"
+        )
+        print(
+            "  Refusing to evaluate it with older semantics. A record written "
+            "to a newer schema may mean something different by the same keys."
+        )
+        return 1
+
+    declared = decl.get("pr")
+    if declared is None:
+        print(f"FAIL: {DECL} does not declare `pr`; ownership is unverifiable")
+        return 1
+    if str(declared) != str(pr):
+        print(
+            f"FAIL: clearance belongs to ANOTHER PR -- {DECL} declares "
+            f"pr = {declared!r}, evaluating PR {pr}"
+        )
+        print(
+            "  A record copied or renamed from another PR does not transfer. "
+            "Record clearances obtained for THIS PR."
+        )
         return 1
 
     # Coerce defensively. `clearances = "oops"` instead of a `[clearances]`
@@ -270,6 +745,12 @@ def main(argv: list[str]) -> int:
         # further on. The fix stopped exactly where the reported symptom did.
         required_set = set(required)
         watch_set = set(watch)
+        for _name, _val in (("required", required), ("watch", watch)):
+            bad = [x for x in _val if not isinstance(x, str)]
+            if bad:
+                raise TypeError(
+                    f"`{_name}` contains non-string entries: {bad!r}"
+                )
     except (TypeError, ValueError) as exc:
         print(
             f"FAIL: {DECL} is malformed -- `required` and `watch` must be "
@@ -290,17 +771,29 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: watch list narrowed -- missing {', '.join(sorted(unwatched))}.")
         return 1
 
-    try:
-        head_sha = _git("rev-parse", "--verify", "--quiet", f"{head}^{{commit}}")
-        merge_base = _git("merge-base", base, head_sha)
-    except RuntimeError as exc:
-        print(f"FAIL: cannot resolve {head} against {base}: {exc}")
-        return 2
-
+    print(f"pr:    {pr}")
     print(f"decl:  {DECL}")
     print(f"base:  {merge_base[:8]} (merge-base with {base})")
     print(f"head:  {head_sha[:8]}")
     print(f"watch: {', '.join(watch)}")
+
+    # C1: `.reviewers/` is exempt from `watch` because a record cannot police
+    # edits to itself -- but that exemption is by PREFIX, so it also exempted
+    # every OTHER PR's record. That left an entirely unwatched channel, and it
+    # was exploited end-to-end: a docs-only PR wrote another PR's record,
+    # printed "no delta in watched paths", squash-merged, and the target PR's
+    # gate then reported all four vectors HOLD -- target author uninvolved, no
+    # reviewer involved, a third party choosing the SHA.
+    foreign = _foreign_record_edits(merge_base, head_sha, DECL)
+    if foreign:
+        print("")
+        print(f"FAIL: this PR changes ANOTHER PR's record(s): {', '.join(foreign)}")
+        print(
+            "  Only this PR's own record may be touched here. A record is "
+            "another PR's evidence; editing or deleting it is a production "
+            "change to their review, not a docs edit."
+        )
+        return 1
 
     delta, absent_both = _moved(watch, merge_base, head_sha)
     if absent_both:
@@ -325,13 +818,13 @@ def main(argv: list[str]) -> int:
         )
         if declared_only:
             print(
-                f"  {', '.join(declared_only)}: declared in .reviewers.toml only. "
+                f"  {', '.join(declared_only)}: declared in this PR's record only. "
                 "Almost certainly a typo -- fix the name there."
             )
         if pinned:
             print(
                 f"  {', '.join(pinned)}: pinned in MANDATORY_WATCH, so editing "
-                ".reviewers.toml CANNOT clear this. If the path was legitimately "
+                "the record CANNOT clear this. If the path was legitimately "
                 "retired, remove it from MANDATORY_WATCH in "
                 "scripts/check_reviewer_clearances.py -- a code change, which is "
                 "itself reviewed. Until then every PR fails here."
@@ -377,7 +870,14 @@ def main(argv: list[str]) -> int:
     for vector in sorted(required):
         sha = clearances.get(vector)
         if not sha:
-            failures.append(f"{vector:16s} NO CLEARANCE RECORDED")
+            # LEXICALLY disjoint from the missing-FILE message above, not
+            # merely case-disjoint. These are two different facts -- the record
+            # is absent, versus the record exists with this vector empty -- and
+            # they previously collided under any case-insensitive substring
+            # match. This repo has already loosened assertions to
+            # `in out.lower()` once and lost the distinction between two gates
+            # that way, so the tokens must not be able to cross-match at all.
+            failures.append(f"{vector:16s} NO SHA RECORDED")
             continue
         # No shape or existence check here. `_validate_clearance_shapes` above
         # has already rejected every malformed or unresolvable value, so
@@ -402,24 +902,45 @@ def main(argv: list[str]) -> int:
             failures.append(f"{vector:16s} {exc} -- treated as NOT covered")
             continue
         try:
-            anc = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", full, head_sha],
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT_SEC,
-            )
-        except subprocess.TimeoutExpired:
+            anc = _git_run(["git", "merge-base", "--is-ancestor", full, head_sha])
+        except GitTimeout:
             failures.append(
                 f"{vector:16s} ancestry check timed out after "
                 f"{_GIT_TIMEOUT_SEC}s -- treated as NOT covered"
             )
             continue
+        # `merge-base --is-ancestor` returns 1 for "not an ancestor" and 128
+        # for a walk failure, so treating any non-zero as a verdict LOOKS like
+        # the could-not-determine collapse this module converts everywhere
+        # else. It is not reachable, and that was established by trying:
+        # deleting an intermediate commit object does produce 128 here, but
+        # `main`'s own `git merge-base base head_sha` runs FIRST, hits the same
+        # unreadable object, and exits 2 with an accurate message. By the time
+        # this line runs, head resolved, the merge-base was computed (so head's
+        # history is walkable), `_moved` succeeded, and `full` resolved. A 128
+        # needs corruption arriving between two adjacent git calls.
+        #
+        # Recorded rather than guarded, per the rule: an unexplained absence
+        # invites someone to add a test asserting against a state the code
+        # cannot enter.
         if anc.returncode != 0:
             failures.append(
                 f"{vector:16s} {str(sha)[:8]} IS NOT AN ANCESTOR of {head_sha[:8]}"
             )
             continue
-        moved, _ = _moved(watch, full, head_sha)
+        try:
+            moved, _ = _moved(watch, full, head_sha)
+        except GitTimeout as exc:
+            # The THIRD git operation in this loop, and it alone used to abort
+            # the whole run. Its two siblings above degrade to "NOT covered",
+            # so a timeout here discarded every failure already accumulated for
+            # earlier vectors while leaving their `HOLDS` lines on stdout -- a
+            # log reading "concurrency HOLDS" followed by an abort. Those lines
+            # were true, so the result was INCOMPLETE rather than wrong, which
+            # is why it was easy to under-weight. All three now behave alike
+            # and the operator gets a whole verdict instead of a partial one.
+            failures.append(f"{vector:16s} {exc} -- treated as NOT covered")
+            continue
         if moved:
             failures.append(
                 f"{vector:16s} LAPSED -- {', '.join(moved)} moved since {str(sha)[:8]}"
@@ -457,6 +978,24 @@ def _cli(argv: list[str]) -> int:
         print(
             "  git did not answer, so the comparison could not be made. This "
             "is NOT 'no delta' -- nothing was determined."
+        )
+        return 2
+    except RecordUnreadable as exc:
+        print(f"FAIL: {exc}")
+        print(
+            "  Exit 2: the record could not be READ. That is not 'no clearance "
+            "recorded' -- nothing about this PR's clearances was determined."
+        )
+        return 2
+    except PRIdentityUnresolved as exc:
+        print(f"FAIL: {exc}")
+        print(
+            "  Exit 2, NOT 1, and the distinction is the point: 1 means "
+            "'this PR's clearances do not hold', which is a verdict about a "
+            "known subject. Nothing was determined here -- there is no known "
+            "subject. Collapsing the two would report a specific, "
+            "checkable-sounding reason for a run that never identified what "
+            "it was checking."
         )
         return 2
 

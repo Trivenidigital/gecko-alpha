@@ -71,9 +71,14 @@ Until an operator enables protection with the checks marked required, every
 gate here is advisory text in a log.
 
 **2. The clearance record sits on the author's writable surface.**
-`.reviewers.toml` is committed, so repointing all four clearances at the head
-is a four-line edit that turns the check green — and it makes the tree
+`.reviewers/<PR>.toml` is committed, so repointing all four clearances at the
+head is a four-line edit that turns the check green — and it makes the tree
 comparison vacuous, because the clearance tree is then compared against itself.
+
+(Per-PR since #564. There is no root `.reviewers.toml`; creating one has no
+effect and reports no error, so do not follow any older instruction that says
+to edit it. Per-PR records fix clearance *lifecycle and isolation* only — they
+do not touch this gap, which remains an operator action.)
 
 The usual fix is to read approvals from the GitHub API, where they are bound to
 a commit and cannot be written by the author. **That does not work here yet:**
