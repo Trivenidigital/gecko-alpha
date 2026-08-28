@@ -16,7 +16,13 @@ That step was not merely tedious. The guard that detects a forgotten reset reads
 **master as committed**, so once master carried stale clearances *every* branch
 went red — including the branch that removed them. The remedy was unmergeable
 through the ordinary path, and breaking the deadlock took a one-time authorized
-direct push to master (`87604f44`). See backlog tickets 21 and 25.
+direct push to master (`87604f44`). See backlog tickets 21 and 30.
+
+(That pointer said "21 and 25" until 2026-08-28. Ticket 25 is the
+mutation-harness one; the deadlock ticket is 30. The reference was correct
+when written against an unmerged branch and became wrong when a different
+ticket 25 landed first -- a cross-reference is ambient text, and ambient
+text drifts.)
 
 Per-PR records remove the state that made that possible. There is nothing on
 master to go stale, so there is nothing to reset and nothing to block.
