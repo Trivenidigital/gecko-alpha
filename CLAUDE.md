@@ -106,22 +106,36 @@ autonomously until the barrier clears; do not check in for ordinary findings.
 | findings dispositioned | **no** — the gate cannot read findings |
 | "I checked it myself" ≠ review | **NO — and this is the live gap** |
 
-The last row is the one that matters. `.reviewers.toml` is committed and
+The last row is the one that matters. `.reviewers/<PR>.toml` is committed and
 **author-writable**, so repointing every vector at HEAD is a four-line edit that
 turns the check green *and* makes the tree comparison vacuous. The gate is a
-lapse **detector**, not enforcement. Closing it needs two operator actions,
-neither of which is code:
+lapse **detector**, not enforcement. Closing that needed two things:
 
-1. **Branch protection with required checks** — currently OFF (`gh api
-   .../branches/master/protection` → 404, rulesets `[]`), so `mergeStateStatus`
-   reads `UNSTABLE` rather than `BLOCKED` and **no CI check in this repo can
-   block a merge.**
-2. **A review record outside the author's reach** — there is none. Zero GitHub
-   approvals exist on any recent PR; this project's reviewers are agents whose
-   verdicts live in session transcripts.
+1. **Branch protection with required checks** — **DONE 2026-08-28.** `master` is
+   protected; `test` and `reviewer-clearances` are both required; `strict` is on
+   so a stale branch cannot merge on a verdict produced by a superseded check;
+   `enforce_admins` is on, so there is no direct-push path for anyone. A blocked
+   PR now reads `BLOCKED` rather than `UNSTABLE`.
 
-Until both land, the barrier is enforced by discipline with a mechanical
-detector behind it. See backlog tickets 13(d) and 13(e).
+   `required_approving_review_count` is **0, deliberately.** Every PR in this
+   repo has zero GitHub reviews, so requiring one would make every PR
+   permanently unmergeable — the same deadlock class the per-PR redesign
+   removed. Requiring the PR *path* is enforcement; requiring an *approval*
+   here would be a fake fix that wedges the repo. **Do not raise it to 1** until
+   item 2 exists to satisfy it.
+2. **A review record outside the author's reach** — **still absent, and this is
+   now the whole of the gap.** Zero GitHub approvals exist on any PR; this
+   project's reviewers are agents whose verdicts live in session transcripts, so
+   there is nothing commit-bound for the gate to read. Until a verdict is
+   written by an identity the implementing author cannot manufacture — a bot or
+   an attestation workflow, not another file in the PR — the record is
+   self-attested by construction.
+
+So: **the merge PATH is now mechanically enforced; the independence of the
+EVIDENCE is not.** A green `reviewer-clearances` proves a record exists naming
+SHAs that are ancestors with no watched delta since. It does not prove anyone
+other than the author put them there. See backlog tickets 13(d) (closed) and
+13(e) (open).
 
 ## Approvals Discipline (standing rule, 2026-07-02)
 
