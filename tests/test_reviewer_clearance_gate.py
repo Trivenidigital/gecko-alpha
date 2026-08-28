@@ -2002,3 +2002,197 @@ def test_the_archive_sweep_READS_AND_PARSES_a_real_record(tmp_path):
         tomllib.loads((d / "42.toml").read_text(encoding="utf-8")),
     )
     assert any("filename and contents disagree" in e for e in bad), bad
+
+
+# --------------------------------------------------------------------------
+# TICKET 28 -- the first red must carry its own remedy.
+#
+# What these pin is not a wrong verdict; the verdict was always right. It is
+# that the FIRST author to open a PR after the per-PR design shipped meets a
+# red they cannot act on, and the natural places to explain it -- README, PR
+# template -- are ambient text that drifts. FOUR such copies drifted on the PR
+# that introduced this gate: a runbook naming a file the gate no longer reads,
+# the archive sweep restating the prefix as a literal, a comment asserting a
+# branch was unpinned six lines from its test, and a README sentence claiming
+# an absent `record_version` meant the writer had not forgotten.
+#
+# So the contract is: the remedy is DERIVED from the live constants, printed
+# from inside the branch that detected the condition -- and the result stays
+# RED. A friendlier red is still a red.
+# --------------------------------------------------------------------------
+
+
+def _extract_skeleton(out):
+    """Pull the template back out of STDOUT, rather than re-calling `_skeleton`.
+
+    Deliberate: the contract is about what the READER receives, not what the
+    function returns. Those differ the moment the print path mangles, wraps or
+    drops a line, and re-calling the generator would agree with itself in
+    exactly that case -- a comparison that cannot fail is not a test.
+    """
+    lines = out.split(chr(10))
+    start = None
+    for i, line in enumerate(lines):
+        if "Skeleton, generated from" in line:
+            start = i + 1
+            break
+    assert start is not None, "no skeleton block in output:" + chr(10) + out
+    body = []
+    for line in lines[start:]:
+        if line.startswith("      "):
+            body.append(line[6:])
+        elif line.strip() == "":
+            body.append("")
+        else:
+            break
+    while body and body[0] == "":
+        body.pop(0)
+    while body and body[-1] == "":
+        body.pop()
+    assert body, "the skeleton block was empty:" + chr(10) + out
+    return chr(10).join(body)
+
+
+def _first_red(repo, pr=PR):
+    """A branch that moved production but carries no record."""
+    _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    return _run(repo, "HEAD", "master", pr=pr)
+
+
+def test_the_MISSING_RECORD_red_carries_a_skeleton(repo):
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    assert "no clearance FILE" in out, out
+    assert "[clearances]" in out, (
+        "the first red carried no record skeleton:" + chr(10) + out
+    )
+
+
+def test_the_skeleton_does_NOT_relax_the_verdict(repo):
+    """Ticket 28 is usability, not relaxation."""
+    rc, out = _first_red(repo)
+    # WHICH red, not merely nonzero. Exit 2 means "undetermined", and a mutant
+    # that escapes through the undetermined channel satisfies `rc != 0` while
+    # destroying the distinction this module is built on.
+    assert rc == 1, "printing a remedy changed the verdict to " + str(rc) + chr(10) + out
+    assert "no clearance FILE" in out, out
+
+
+def test_the_skeleton_is_VALID_TOML(repo):
+    """A template that does not parse costs a round trip to discover, and the
+    reader assumes their own edit broke it."""
+    import tomllib
+
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    doc = tomllib.loads(_extract_skeleton(out))
+    assert doc["pr"] == int(PR), doc
+    assert doc["record_version"] == _GATE.DEFAULT_RECORD_VERSION, doc
+
+
+def test_the_skeleton_names_the_EXACT_path_and_says_COMMIT(repo):
+    """The two facts the reader needs and cannot infer.
+
+    The path, because the number is theirs and the prefix is not. And COMMIT,
+    because the gate reads the revision rather than the working tree -- the
+    likeliest second mistake, and one that reproduces the SAME red with a
+    finished record sitting on disk.
+    """
+    rc, out = _first_red(repo)
+    assert ".reviewers/" + PR + ".toml" in out, out
+    assert "COMMIT" in out.upper(), (
+        "the remedy never told the reader to commit:" + chr(10) + out
+    )
+
+
+def test_the_skeleton_MATCHES_the_live_floors(repo):
+    import tomllib
+
+    rc, out = _first_red(repo)
+    doc = tomllib.loads(_extract_skeleton(out))
+    assert set(doc["required"]) == set(_GATE.MANDATORY_VECTORS), doc["required"]
+    assert set(doc["watch"]) == set(_GATE.MANDATORY_WATCH), doc["watch"]
+
+
+@pytest.mark.parametrize("floor", ["MANDATORY_WATCH", "MANDATORY_VECTORS"])
+def test_a_GROWN_floor_reaches_the_skeleton_with_NO_second_edit(
+    repo, monkeypatch, floor
+):
+    """THE regression this ticket exists to prevent, written as a mutation.
+
+    A hardcoded template passes every other test in this block and fails only
+    here -- which is why the assertion names the NEW member rather than merely
+    checking the template still parses. Same reason the floors are imported
+    from the gate and pinned literally in one place: derive for behaviour, pin
+    membership once.
+    """
+    import tomllib
+
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    new = "a-brand-new-floor-member"
+    monkeypatch.setattr(mod, floor, frozenset(getattr(mod, floor) | {new}))
+    body = mod._skeleton(PR)
+    key = "watch" if floor == "MANDATORY_WATCH" else "required"
+    assert new in tomllib.loads(body)[key], (
+        floor + " grew and the skeleton did not follow -- it is transcribed, "
+        "not derived:" + chr(10) + body
+    )
+
+
+def test_the_PLACEHOLDER_is_deliberately_not_a_well_formed_sha(repo):
+    """Forty hex zeros would satisfy the format check and fail two stages later
+    as "not an ancestor" -- which reads as a broken clearance rather than an
+    unfilled template, and sends the reader to the wrong problem."""
+    import tomllib
+
+    rc, out = _first_red(repo)
+    for vector, value in tomllib.loads(_extract_skeleton(out))["clearances"].items():
+        assert not _GATE._SHA_RE.match(value), (
+            "placeholder for " + vector + " is a well-formed SHA: " + value
+        )
+
+
+def test_the_skeleton_ROUND_TRIPS_to_a_GREEN(repo):
+    """GREEN-IS-REACHABLE for the template, and the strongest test in the block.
+
+    Every other test here proves the skeleton is well-FORMED. None proves it is
+    SUFFICIENT -- a template can parse, match both floors, and still describe a
+    record the gate rejects. That is not hypothetical in this repo: a gate and
+    its own conformance test once demanded mutually unsatisfiable things, every
+    component test passed, and no commit could go green.
+
+    So: take what was printed, substitute real reviewed SHAs, commit it, and
+    require exit 0.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+
+    body = _extract_skeleton(out).replace(_GATE.SKELETON_SHA, sha)
+    assert _GATE.SKELETON_SHA not in body, "placeholder substitution failed"
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (PR + ".toml")).write_bytes(body.encode("utf-8"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record built from the printed skeleton")
+
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 0, (
+        "the gate REFUSES the template it printed -- the remedy is wrong:"
+        + chr(10) + out2
+    )
+
+
+def test_the_skeleton_is_NOT_printed_on_OTHER_failures(repo):
+    """Scope. Emitting the template on every failure buries the specific
+    diagnosis under forty lines of boilerplate, and trains the reader to skip
+    the part that says what actually went wrong."""
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, declared_pr=OTHER_PR)
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc != 0, out
+    assert "[clearances]" not in out, (
+        "a skeleton was printed for a failure that is not a missing record:"
+        + chr(10) + out
+    )

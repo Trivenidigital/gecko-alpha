@@ -545,6 +545,50 @@ MANDATORY_WATCH = frozenset(
 
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
+#: The per-vector value in a generated skeleton. Deliberately NOT 40 hex zeros:
+#: a well-formed-but-wrong SHA passes the format check and fails two stages
+#: later as "not an ancestor", which reads like a broken clearance rather than
+#: an unfilled template. This fails immediately, and says what to do.
+SKELETON_SHA = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
+
+
+def _skeleton(pr: str) -> str:
+    """A copy-pasteable record for `pr`, GENERATED FROM THE LIVE CONSTANTS.
+
+    Derived, never transcribed, and that is the entire point rather than a
+    stylistic preference. This PR was bitten four separate times by text kept
+    NEAR a mechanism instead of derived FROM it: a runbook naming a file the
+    gate no longer reads, the archive sweep restating the prefix as a literal,
+    a comment asserting a branch was unpinned six lines from its test, and a
+    README sentence claiming an absent `record_version` meant the writer did
+    not forget. Every one drifted because a human maintained a second copy of
+    a fact the code already held.
+
+    A README could carry this template. It would be correct on the day it was
+    written and silently wrong the first time a vector or a watched path is
+    added -- and the reader has no way to tell which day they are on. This
+    function cannot be stale: it reads `MANDATORY_VECTORS`, `MANDATORY_WATCH`
+    and `DEFAULT_RECORD_VERSION` at the moment it prints.
+
+    Emitted only from the missing-record branch. That branch is the one place
+    where the reader is guaranteed to be someone who has no record yet, which
+    is the audience the template is for.
+    """
+    vectors = sorted(MANDATORY_VECTORS)
+    pad = max(len(v) for v in vectors)
+    lines = [
+        f"pr = {pr}",
+        f"record_version = {DEFAULT_RECORD_VERSION}",
+        "",
+        "required = [" + ", ".join(f'"{v}"' for v in vectors) + "]",
+        "",
+        "watch = [",
+    ]
+    lines += [f'    "{w}",' for w in sorted(MANDATORY_WATCH)]
+    lines += ["]", "", "[clearances]"]
+    lines += [f'{v.ljust(pad)} = "{SKELETON_SHA}"' for v in vectors]
+    return "\n".join(lines)
+
 #: Every `subprocess.run` in `scripts/` must pass an explicit timeout -- there is
 #: a repo guard asserting it, and it caught this file. The reason applies here:
 #: `git` can block indefinitely on a lock held by a concurrent process, and a
@@ -669,6 +713,39 @@ def main(argv: list[str]) -> int:
             "absence as 'nothing to check' -- lets deleting the file turn the "
             "gate green while disabling it."
         )
+        # THE REMEDY IS PRINTED FROM INSIDE THE BRANCH THAT DETECTED THE
+        # CONDITION, which is a guarantee rather than a convenience: this text
+        # cannot describe a state the code is not in. A README or a PR template
+        # is ambient -- it can drift out of step with the gate, and on this PR
+        # four such copies did.
+        #
+        # It stays RED. This is a usability fix, not a relaxation: the author
+        # still has to write and commit a record before anything goes green.
+        print(
+            "\n  On a NEW PR this red is the EXPECTED FIRST RESULT, not a "
+            "broken gate. Your record cannot exist until you write it, and "
+            "nothing can create it for you -- the file IS the evidence."
+        )
+        print(
+            f"  Create {DECL} and COMMIT it. The gate reads the revision "
+            "under review, NOT your working tree, so an uncommitted record "
+            "clears nothing and a green has to be reproducible from the SHA "
+            "alone."
+        )
+        print(
+            "  `required` and `watch` below are FLOORS: you may add to them, "
+            "never narrow them. Each SHA is the revision that vector actually "
+            "reviewed -- they need not all be equal, and a vector should name "
+            "what it measured rather than a later head."
+        )
+        print(
+            "\n  Skeleton, generated from this gate's live constants "
+            f"({len(MANDATORY_VECTORS)} vectors, "
+            f"{len(MANDATORY_WATCH)} watched paths):\n"
+        )
+        for line in _skeleton(pr).split("\n"):
+            print(f"      {line}" if line else "")
+        print()
         return 1
     try:
         decl = tomllib.loads(raw)
