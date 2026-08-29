@@ -2774,7 +2774,14 @@ def test_the_TEST_job_that_DELIVERS_these_guards_is_itself_pinned():
     )
     for st in pytest_steps:
         body = st["run"]
-        for op in ("||", "&&", ";", "|", "`", "$(", ">", "<"):
+        # `&` rather than `&&`: a BARE ampersand backgrounds the command, so
+        # the step exits 0 immediately while the suite is still running --
+        # `bash -e 'false &'` exits 0, `bash -e 'false'` exits 1. It is one
+        # character, it is not `&&` and not `|`, and it survived the first
+        # version of this list. Listing `&` SUBSUMES `&&`, so the enumeration
+        # gets shorter rather than longer, which is the only direction a list
+        # like this should ever move.
+        for op in ("&", ";", "|", "`", "$(", ">", "<"):
             assert op not in body, (
                 "the pytest step " + repr(st.get("name")) + " contains the "
                 "shell control operator " + repr(op) + ". A pytest invocation "
