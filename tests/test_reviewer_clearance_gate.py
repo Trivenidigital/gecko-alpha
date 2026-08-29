@@ -3533,6 +3533,29 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
     the 72 reaches a decision, which is the correct answer, and it would fail
     if any of them did.
 
+    WHICH ASSERTION ACTUALLY FIRES, because the docstring above describes a
+    different arm than the one that catches. Measured: for both a listed and an
+    unlisted steering name, the failure is the PRECONDITION, not `mini == amb`.
+    A prefix redirection makes the fixture's record lookup miss, so the ambient
+    run yields `(1, False)` and the comparison never runs.
+
+    That matters twice over. The precondition's message used to blame the
+    FIXTURE, so CI would have told a reader their test setup was wrong when the
+    cause was a steered gate shipped in the same PR -- "assert WHICH failure"
+    in the newest arm, one round after it was written into the docstring above.
+    And it means the whitelist blind spot is real but currently UNREACHABLE:
+    a name inside `_MINIMAL_ENV_KEYS` is present in both environments and can
+    never diverge, so the comparison alone would not catch it -- redirection
+    trips the precondition first. **Loosen that precondition to accept any exit
+    1 and the whitelisted-name channel opens with nothing left to catch it,
+    while this docstring still reads as though the comparison were doing the
+    work.**
+
+    That is also the argument for keeping `_MINIMAL_ENV_KEYS` as small as `git`
+    tolerates. `LC_ALL`, `LANG`, `TEMP`, `TMP`, `HOME` and `USERPROFILE` are all
+    settable from a workflow and are worth re-justifying individually rather
+    than carried as a block.
+
     Limits, stated: it covers the environment channel only, the whitelist needs
     maintaining, and a gate that SHELLED OUT and let a child read the real
     environment would escape it -- the child inherits `env=` from the parent
@@ -3564,8 +3587,13 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
 
     amb = _verdict(ambient)
     assert amb[0] == 1 and amb[1], (
-        "the fixture does not reach the foreign-record guard " + repr(amb)
-        + ", so this test cannot observe the property it claims to check"
+        "EITHER the fixture does not reach the foreign-record guard, OR the "
+        "gate under test is already steered by the ambient environment -- got "
+        + repr(amb) + ", expected (1, True). Both produce this exact result, "
+        "and the second is the security-relevant one: a prefix redirection "
+        "makes the record lookup miss, so the ambient run reports (1, False) "
+        "and never gets as far as the comparison below. If this fires in CI on "
+        "a PR that touched the gate, suspect the gate before the fixture."
     )
     assert set(minimal) < set(ambient), (
         "the minimal environment is not a proper subset of the ambient one, so "
