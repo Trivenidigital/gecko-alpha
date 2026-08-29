@@ -2567,13 +2567,56 @@ def test_the_clearance_job_INVOKES_the_gate_with_a_PINNED_script():
     assert len(hits) == 1, "reviewer-clearances is not uniquely defined"
     _, jid, job = hits[0]
 
-    # Located by NAME, not index -- inserting any step renumbers positions.
-    runners = [s for s in (job.get("steps") or []) if "run" in s]
+    # PIN THE WHOLE INVENTORY, not just the `run` steps.
+    #
+    # An earlier version counted only steps containing `run`, so "exactly one
+    # run step -- an added step is where a neuter hides" was true of `run`
+    # steps and false of `uses:` ones. Measured: inserting an
+    # `actions/github-script@v7` step that overwrites
+    # `scripts/check_reviewer_clearances.py` with `sys.exit(0)` left the pinned
+    # step byte-identical and the whole guard green. That is the variant to
+    # actually worry about -- `shell: cat {0}` looks strange in a diff, but an
+    # added `github-script` step reads as ordinary CI work.
+    steps = job.get("steps") or []
+    inventory = [
+        (s.get("uses") or "").split("@")[0] or ("run:" + str(s.get("name")))
+        for s in steps
+    ]
+    assert inventory == [
+        "actions/checkout",
+        "actions/setup-python",
+        "run:Clearance lapse check (ruling D)",
+    ], (
+        "the clearance job's STEP INVENTORY changed: " + repr(inventory)
+        + ". Adding a step is a neuter route that leaves every other pin "
+        "intact -- if the change is intentional, update this list in the same "
+        "commit so a reviewer sees it."
+    )
+    runners = [s for s in steps if "run" in s]
     assert len(runners) == 1, (
         "expected exactly one `run:` step in " + jid + ", found "
-        + str(len(runners)) + " -- an added step is where a neuter hides"
+        + str(len(runners))
     )
     step = runners[0]
+    # WHAT EXECUTES the script, not just what it says.
+    #
+    # Actions supports a custom shell template (`shell: <cmd> [args] {0}`), so
+    # `shell: cat {0}` PRINTS the script instead of running it -- one line, the
+    # `run:` pin still passes, and the job reports success. Proven locally:
+    # `bash -e s.sh` -> exit 1, `cat s.sh` -> exit 0, `/bin/true s.sh` -> 0.
+    # Absence is asserted rather than a value pinned because the default is
+    # correct and any override is worth a reviewer's eye. (`shell: bash` maps
+    # to `-eo pipefail`, i.e. STRICTER -- but "the safe ones are safe" is not a
+    # reason to leave the door open.)
+    assert "shell" not in step, (
+        "the clearance step overrides `shell:` (" + repr(step.get("shell"))
+        + ") -- a custom shell template can print the script instead of "
+        "executing it while `run:` stays byte-identical"
+    )
+    assert "defaults" not in job, (
+        "the clearance JOB sets `defaults:` -- `defaults.run.shell` reaches "
+        "the step without appearing in it"
+    )
     assert "if" not in step, (
         "the clearance step carries a STEP-LEVEL `if:` -- a skipped step runs "
         "nothing while the job still reports a non-failure, and the job-level "
@@ -2586,6 +2629,26 @@ def test_the_clearance_job_INVOKES_the_gate_with_a_PINNED_script():
         "update _EXPECTED_CLEARANCE_RUN in the same commit so a reviewer sees "
         "it in the diff." + chr(10) + "got:" + chr(10) + chr(10).join(lines)
     )
+
+
+def test_NO_workflow_LEVEL_defaults_reach_the_required_jobs():
+    """The evasion that lives ABOVE the job, where a job-scoped guard cannot look.
+
+    `defaults: run: shell: cat {0}` at the TOP level of the workflow applies to
+    every step of every job. `_jobs_by_context()` starts at `doc["jobs"]`, so
+    nothing else in this file can see it: the clearance step stays
+    byte-identical, has no `shell:` of its own, has no `defaults:` of its own,
+    and the script is printed rather than executed.
+
+    Asserted as ABSENCE for the same reason as the step-level check -- the
+    default is correct, and any override belongs in front of a reviewer.
+    """
+    for fname, doc in _load_workflows().items():
+        assert "defaults" not in doc, (
+            fname + " sets a workflow-level `defaults:` (" +
+            repr(doc.get("defaults")) + "). `defaults.run.shell` reaches every "
+            "step of every job without appearing in any of them."
+        )
 
 
 def test_the_clearance_job_CONDITION_is_pinned_exactly():
