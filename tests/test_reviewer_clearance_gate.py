@@ -3087,12 +3087,58 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
     # they all need: THE ENVIRONMENT MUST REACH THIS PROCESS EXACTLY ONCE, and
     # that once is the PR-identity fallback, which fails CLOSED.
     #
-    # HONEST LIMIT, stated because a guard that overclaims is the thing this
-    # file exists to stop: this pins the ENVIRONMENT as the steering channel
-    # only. A rebind sourced from a file or from argv would not trip it. The
-    # `ast.Constant` binding check and the `:(top)` pathspec check above are
-    # what cover those, and the three together are what hold. None of them is
-    # closure; `required_workflows` is.
+    # THE LIMIT THIS COMMENT USED TO CLAIM WAS FALSE, and the correction is the
+    # point. It read: "a rebind sourced from a file or from argv would not trip
+    # it -- the `ast.Constant` binding check and the `:(top)` pathspec check
+    # above are what cover those." **They do not.**
+    #
+    # Measured: the same `globals()["DECL_PREFIX"] = ...` form, sourced from a
+    # committed file instead of the environment, goes GREEN at exit 0 with the
+    # victim's record differing between head and master. W18 restored in full.
+    # It slips every arm -- no `os.environ` so the source pin still counts 1,
+    # no `global` statement, an Assign target that is a `Subscript` so
+    # `getattr(t, "id", None)` is None and `len(binds) == 1` still holds with a
+    # literal value, and a use site still reading the bare name.
+    #
+    # The diagnosis is sharper than the row: M3 closed the env-sourced rebind
+    # by deleting its SOURCE, not by fixing the BINDING blindness that let it
+    # through. The binding check is a Name-match, so it never covered the very
+    # rebind form that motivated M3. Change the source and the blindness
+    # reappears -- which is what happened.
+    #
+    # So pin the REBIND PRIMITIVE, the quadrant actually uncovered. This is
+    # still an enumeration and it is worth saying so, but of primitives with no
+    # legitimate use anywhere in this file -- a bounded space, unlike shell
+    # fragments or data sources. All three are absent today (measured: 0, 0, 0),
+    # so there is no cry-wolf risk.
+    for prim, hits in (
+        ("globals()/vars()", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in ("globals", "vars")
+        ]),
+        ("setattr()", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "setattr"
+        ]),
+        ("sys.modules", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and n.attr == "modules"
+        ]),
+    ):
+        assert not hits, (
+            "the gate uses " + prim + ", which can rebind DECL_PREFIX after "
+            "import from ANY source -- environment, file or argv -- and slips "
+            "every other assertion here: no `global` node, an Assign target "
+            "that is not a Name, and a use site still reading the bare name."
+        )
+
+    # WHAT IS STILL NOT COVERED, stated narrowly this time. The argv quadrant is
+    # UNTESTED rather than clean: the reviewer's argv mutant was rejected by
+    # argparse before it could take effect, so it measured their flag, not this
+    # gate. A rebind primitive beyond these three is also unenumerated. And none
+    # of this is closure -- `required_workflows` is.
     env_reads = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Attribute) and n.attr == "environ"
