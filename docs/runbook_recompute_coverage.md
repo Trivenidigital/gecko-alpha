@@ -83,10 +83,36 @@ item 2 either. **Do not "harden" it to 1.**
 Two live consequences an operator needs:
 
 * `strict: true` means a branch must be up to date before merging, and that
-  update can LAPSE clearances even when the PR's own diff is untouched — the
-  lapse is anchored to the clearance's tree, while the requirement is anchored
-  to the merge-base diff. Serialize merges while any PR has clearances
-  recorded. The constraint on any future relief valve: **never allow a merge on
+  update **does** lapse clearances even when the PR's own diff is untouched.
+  **Measured, not reasoned** — this paragraph asserted it from the mechanism
+  until 2026-08-29, which is the same unverified-claim shape this document was
+  just rewritten for. A PR that moves `scout/`, fully cleared at its own head;
+  then one unrelated commit lands on master also touching `scout/`; then the
+  branch does exactly what `strict: true` mandates before merging:
+
+  ```
+  STEP 1 - cleared at its own head, before master moves
+  exit=0
+    concurrency      HOLDS at 415f30c8
+    ... all required vectors hold at this head.
+
+  STEP 3 - after the branch update `strict: true` MANDATES
+           (the PR's own diff is unchanged throughout)
+  exit=1
+    concurrency      LAPSED -- scout moved since 415f30c8
+    logic            LAPSED -- scout moved since 415f30c8
+    ops-safety       LAPSED -- scout moved since 415f30c8
+    silent-failure   LAPSED -- scout moved since 415f30c8
+  ```
+
+  All four lapse on a delta the PR never introduced. The cause is an **anchor
+  mismatch**: the requirement is anchored to `diff(merge-base, head)` — this
+  script's own stated question is *"does the delta THIS pull request
+  introduces carry a clearance?"* — while the lapse is anchored to the
+  clearance's own tree. Defensible under the strict reading (the reviewer
+  cleared tree T, head is now T'), and it means the churn is not purely
+  `MANDATORY_WATCH` breadth. **Serialize merges while any PR has clearances
+  recorded.** The constraint on any future relief valve: **never allow a merge on
   a check computed by an older version of the gate** — which rules out override
   labels, admin bypasses, and reusing a prior green.
 * `enforce_admins: true` plus `allow_force_pushes: false` closes the escape
