@@ -3139,19 +3139,37 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
     # argparse before it could take effect, so it measured their flag, not this
     # gate. A rebind primitive beyond these three is also unenumerated. And none
     # of this is closure -- `required_workflows` is.
-    env_reads = [
-        n for n in ast.walk(tree)
-        if isinstance(n, ast.Attribute) and n.attr == "environ"
-        and isinstance(n.value, ast.Name) and n.value.id == "os"
-    ]
+    # FOUR SPELLINGS, not one. The first version pinned `os.environ` as an
+    # Attribute and the comment above it claimed "the environment must reach
+    # this process exactly once" -- an overclaim, and the same
+    # asserting-more-than-you-check shape this file keeps finding. `os.getenv`
+    # is the most idiomatic reach in Python and the first thing a maintainer
+    # would write; `from os import environ` renames it out of the pattern
+    # entirely. Both were measured reopening W18 when paired with a rebind.
+    #
+    # They are dead twice over at this revision -- the rebind-primitive pin and
+    # the binding-literal check each catch them independently -- so this arm is
+    # defence-in-depth. It is here because relaxing either of the other two
+    # would silently promote this to the load-bearing assertion, and it would
+    # have been narrower than its own comment.
+    _ENV_NAMES = {"environ", "environb", "getenv", "getenvb"}
+    env_reads = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and n.attr in _ENV_NAMES:
+            if isinstance(n.value, ast.Name) and n.value.id == "os":
+                env_reads.append("os." + n.attr)
+        elif isinstance(n, ast.ImportFrom) and n.module == "os":
+            for a in n.names:
+                if a.name in _ENV_NAMES:
+                    env_reads.append("from os import " + a.name)
     assert len(env_reads) == 1, (
-        "expected exactly one os.environ access in the gate, found "
-        + str(len(env_reads)) + ". Every additional one is a channel a "
-        "workflow `env:` line can steer, and the rebind mechanisms that "
-        "consume it cannot be enumerated."
+        "expected exactly one environment read in the gate, found "
+        + str(len(env_reads)) + " " + repr(env_reads) + ". Every additional "
+        "one is a channel a workflow `env:` line can steer."
     )
-    src_lines = SCRIPT.read_text(encoding="utf-8").split(chr(10))
-    env_line = src_lines[env_reads[0].lineno - 1]
+    src = SCRIPT.read_text(encoding="utf-8")
+    env_line = [l for l in src.split(chr(10)) if "os.environ" in l
+                and not l.lstrip().startswith("#")][0]
     assert "REVIEWERS_PR" in env_line and "REVIEWERS_PREFIX" not in env_line, (
         "the single os.environ access no longer reads REVIEWERS_PR: "
         + env_line.strip() + " -- the PR-identity fallback fails CLOSED "
