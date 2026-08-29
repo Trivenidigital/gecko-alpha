@@ -3260,12 +3260,48 @@ def test_the_ENVIRONMENT_cannot_change_a_VERDICT(repo):
         "cannot observe the property it claims to check:" + chr(10) + clean[1]
     )
 
+    # EVERY HOSTILE VALUE MUST BE CAPABLE OF STEERING, or the case passes for a
+    # reason unrelated to the property. Predicted by a reviewer before seeing
+    # the code and then measured against a deliberately steered gate:
+    #
+    #   REVIEWERS_PREFIX="docs"  -> steered gate yields "docs"        DIVERGES
+    #   REVIEWERS_PREFIX="/etc"  -> steered gate yields "/etc"        DIVERGES
+    #   REVIEWERS_PREFIX=""      -> steered gate yields ".reviewers"  TAUTOLOGY
+    #   REVIEWERS_DIR / GATE_PREFIX / PREFIX -> ".reviewers"          TAUTOLOGY
+    #
+    # The empty string is falsy, so `os.environ.get(...) or ".reviewers"` hands
+    # back the default and a FULLY STEERED gate produces output identical to a
+    # clean one. Decoy variable names are read by nothing, so the same. Both
+    # would have passed against the very exploit this test exists to catch --
+    # coverage-shaped and empty, the `if captured:` family.
+    #
+    # So the loop asserts the precondition on itself rather than trusting the
+    # author to keep picking good values: a hostile value must be non-empty and
+    # must differ from the prefix the gate already uses.
     for hostile in (
         {"REVIEWERS_PREFIX": "docs"},
         {"REVIEWERS_PREFIX": "/etc"},
-        {"REVIEWERS_PREFIX": ""},
-        {"REVIEWERS_DIR": "docs", "GATE_PREFIX": "docs", "PREFIX": "docs"},
+        {"REVIEWERS_PREFIX": "../../etc"},
+        {"REVIEWERS_PREFIX": "docs", "REVIEWERS_DIR": "docs"},
     ):
+        # THE NAME must be one a plausible reintroduction would read, not just
+        # the VALUE non-default. An earlier version checked only the value, so
+        # `{"REVIEWERS_DIR": "docs", "PREFIX": "docs"}` passed the precondition
+        # while being read by nothing -- steerable-looking and inert, which is
+        # the same tautology one level in. `REVIEWERS_PREFIX` is the name with
+        # an actual exploit history here: it is the one that was deleted, and
+        # the one any reintroduction would spell.
+        steerable = [
+            v for k, v in hostile.items()
+            if k == "REVIEWERS_PREFIX" and v and v != _GATE.DECL_PREFIX
+        ]
+        assert steerable, (
+            "hostile env " + repr(hostile) + " cannot steer anything: it sets "
+            "no REVIEWERS_PREFIX, or sets it empty or equal to the gate's own "
+            "prefix. A fully steered gate would then produce output identical "
+            "to a clean one and this case would pass while the lever was wide "
+            "open."
+        )
         rc, out = _run(repo, "HEAD", "master", pr=PR, extra_env=hostile)
         assert (rc, "ANOTHER PR" in out) == (clean[0], True), (
             "the environment changed the verdict. " + repr(hostile) + " gave "
