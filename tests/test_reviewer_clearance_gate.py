@@ -2404,3 +2404,86 @@ def test_an_EMPTY_clearance_table_still_REDS_a_PRODUCTION_pr(repo):
     )
     assert "NO SHA RECORDED" in out2, out2
 
+
+# --- Workflow integrity. DEFENCE IN DEPTH, EXPLICITLY NOT CLOSURE. -----------
+#
+# The clearance job is delivered by `.github/workflows/test.yml`, and for
+# `pull_request` events GitHub runs the workflow from the PR'S OWN MERGE REF.
+# So the PR being judged supplies the judge. Three edits make the job report a
+# non-failure while the gate's verdict is discarded:
+#
+#     skip the job (`if:`)      -> conclusion `skipped`
+#     `|| true` on the step     -> conclusion `success`
+#     `continue-on-error: true` -> conclusion `success`
+#
+# `.github` is on the watch floor, so the gate WOULD demand clearances for that
+# edit -- but the gate is exactly what has been neutered. Chicken-and-egg.
+#
+# Until today the only defence was a COMMENT in the workflow reading "do not
+# add `|| true`", which is prose, in the repository whose thesis is that prose
+# is not a control. These tests convert that sentence into a control.
+#
+# THEY ARE NOT CLOSURE AND MUST NOT BE REPORTED AS ONE. The same PR that edits
+# the workflow can edit this file, and `test` is delivered through the same
+# `run:` surface. This raises a one-line tamper to a two-line one and makes it
+# obvious in the diff. Real closure is a repository ruleset with
+# `required_workflows`, pinning the workflow at a ref the PR cannot rewrite --
+# an operator action, outside the repo, like 13(d) and 13(e).
+#
+# Variants that fail CLOSED and are deliberately NOT asserted, so this does not
+# over-scope: a bogus `runs-on` leaves the check pending (blocked), and a tiny
+# `timeout-minutes` yields `failure` (blocked). The fail-open family is three.
+
+_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
+
+
+def _clearance_job_text():
+    """The `reviewer-clearances` job block, read from disk."""
+    assert _WORKFLOW.exists(), "workflow missing: " + str(_WORKFLOW)
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    marker = chr(10) + "  reviewer-clearances:" + chr(10)
+    assert marker in text, (
+        "the reviewer-clearances job is GONE from the workflow. The job name is "
+        "the branch-protection CONTEXT: renaming or removing it silently drops "
+        "the requirement, because a context that never reports is absent."
+    )
+    block = text.split(marker, 1)[1]
+    # up to the next top-level job (two-space key) or EOF
+    out = []
+    for line in block.split(chr(10)):
+        if line and not line.startswith("    ") and line.strip().endswith(":"):
+            break
+        out.append(line)
+    return chr(10).join(out)
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    ["|| true", "continue-on-error", "|| exit 0", "|| :"],
+)
+def test_the_clearance_job_cannot_SWALLOW_its_own_verdict(forbidden):
+    """Each of these makes a failing gate report a passing check."""
+    job = _clearance_job_text()
+    body = chr(10).join(
+        l for l in job.split(chr(10)) if not l.strip().startswith("#")
+    )
+    assert forbidden not in body, (
+        "the clearance job swallows its verdict via " + repr(forbidden) + " -- "
+        "the gate would report FAIL and the check would report success"
+    )
+
+
+def test_the_clearance_job_runs_on_PULL_REQUEST_and_only_that():
+    """The `if:` is the skip lever, and a skipped job reports under the
+    required context name -- verified on this repo's master:
+    `reviewer-clearances: skipped`.
+
+    Pinned to the EXACT condition rather than "some condition present", because
+    `if: github.event_name == 'pull_request' && false` is also a condition.
+    """
+    job = _clearance_job_text()
+    assert "if: github.event_name == 'pull_request'" + chr(10) in job, (
+        "the clearance job's trigger condition changed. A job that skips "
+        "reports `skipped` under the required context name:" + chr(10) + job
+    )
+

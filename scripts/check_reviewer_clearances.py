@@ -636,7 +636,14 @@ def _skeleton(pr: str) -> str:
     # that fails to parse, because the reader debugs their own edit instead.
     # Quoted keys are legal TOML and make `"prod.state"` a flat key.
     keys = [_toml_str(v) for v in vectors]
-    pad = max(len(k) for k in keys)
+    # `default=0`, not a bare `max()`. An empty floor is unreachable today, but
+    # `max()` on it raises ValueError, `_cli` does not catch it, and an uncaught
+    # exception exits 1 -- the code this module reserves for "this PR's
+    # clearances do not hold". That is the accident-presenting-as-a-verdict
+    # shape the whole GitTimeout / RecordUnreadable / PRIdentityUnresolved
+    # family exists to prevent, and two reviewers independently said not to
+    # leave it in new code.
+    pad = max((len(k) for k in keys), default=0)
     lines = [
         f"pr = {pr}",
         f"record_version = {DEFAULT_RECORD_VERSION}",
