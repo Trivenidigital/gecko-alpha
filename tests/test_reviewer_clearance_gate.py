@@ -69,7 +69,7 @@ PR = "42"
 OTHER_PR = "43"
 
 
-def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
+def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None, extra_env=None):
     """Run the real script against `repo`, with its per-PR records inside it.
 
     `pr=None` omits `--pr` entirely -- that is how identity-unresolved is
@@ -84,6 +84,11 @@ def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
+    # `extra_env` exists for ONE test: proving the environment cannot change a
+    # verdict. It is deliberately un-filtered -- the point is to hand the gate
+    # a hostile environment and require the answer not to move.
+    if extra_env:
+        env.update(extra_env)
     r = subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env)
     return r.returncode, r.stdout + r.stderr
 
@@ -3207,3 +3212,63 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
         "touching the binding site."
     )
 
+
+def test_the_ENVIRONMENT_cannot_change_a_VERDICT(repo):
+    """The property every AST arm above only approximates.
+
+    Four rounds of mechanism-pinning ran binding site -> use site -> data
+    source -> rebind primitive -> env spelling, and each one was defeated by a
+    form outside the fixture that produced it. The last was an ALIASED import
+    (`import os as _o; _o.environ`), which slips a selector matching
+    `value.id == "os"` -- measured surviving.
+
+    That is the enumeration losing, not a specific list being short. The
+    property was never "which AST node reads the environment". It is
+    **the environment cannot change the verdict** -- so assert that, and stop
+    naming mechanisms.
+
+    Spelling-independent, mechanism-independent, and source-independent for the
+    environment channel: it does not care whether the read is `os.environ`,
+    `os.getenv`, an alias, a from-import, or a form nobody has thought of, nor
+    whether the rebind is `global`, `globals()[...]`, `setattr` or none at all.
+
+    THE FIXTURE MUST REACH THE FOREIGN-RECORD GUARD, which is what defeated
+    three separate reviewers' first attempts at this: without the PR's own
+    record present, both runs stop at the missing-record branch and agree for
+    a reason that has nothing to do with the property.
+
+    Residual, stated so it is not mistaken for closure: a rebind sourced from a
+    FILE or ARGV is not covered here -- the rebind-primitive pin above is what
+    reaches those. Nor is this closure of the workflow surface;
+    `required_workflows` is.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+
+    # a victim record on the branch, differing from master -> the foreign guard
+    # has something real to catch
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)   # own record, committed
+
+    clean = _run(repo, "HEAD", "master", pr=PR)
+    assert clean[0] == 1 and "ANOTHER PR" in clean[1], (
+        "the fixture does not reach the foreign-record guard, so this test "
+        "cannot observe the property it claims to check:" + chr(10) + clean[1]
+    )
+
+    for hostile in (
+        {"REVIEWERS_PREFIX": "docs"},
+        {"REVIEWERS_PREFIX": "/etc"},
+        {"REVIEWERS_PREFIX": ""},
+        {"REVIEWERS_DIR": "docs", "GATE_PREFIX": "docs", "PREFIX": "docs"},
+    ):
+        rc, out = _run(repo, "HEAD", "master", pr=PR, extra_env=hostile)
+        assert (rc, "ANOTHER PR" in out) == (clean[0], True), (
+            "the environment changed the verdict. " + repr(hostile) + " gave "
+            "exit " + str(rc) + " where a clean environment gives exit "
+            + str(clean[0]) + "." + chr(10) + out
+        )
