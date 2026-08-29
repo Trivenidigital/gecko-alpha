@@ -2369,7 +2369,7 @@ def test_the_INSTRUCTION_matches_what_the_round_trip_test_DOES(repo):
     """
     rc, out = _first_red(repo)
     assert rc == 1, out
-    assert "UNCOMMENT" in _extract_skeleton(out).upper(), (
+    assert "UNCOMMENT and replace" in _extract_skeleton(out), (
         "the template never tells the reader to uncomment, but the round-trip "
         "test does it anyway -- the test is proving its own edit, not the "
         "documented one:" + chr(10) + out
@@ -2499,5 +2499,48 @@ def test_the_clearance_job_runs_on_PULL_REQUEST_and_only_that():
     assert "if: github.event_name == 'pull_request'" + chr(10) in job, (
         "the clearance job's trigger condition changed. A job that skips "
         "reports `skipped` under the required context name:" + chr(10) + job
+    )
+
+
+# --- F6, from the logic vector. The BEHAVIOUR of the commented-template fix is
+# --- well pinned; the PROSE that makes it usable was not. Two mutants survived:
+# ---   M12  delete the in-file instruction comments  -> 25 passed
+# ---   M13  delete the stdout uncomment paragraph    -> 110 passed, full suite
+# --- M13 is the one that matters: that paragraph is the only stdout text
+# --- telling a delta-PR author what to do with a commented template, and it
+# --- carries the anti-fabrication instruction that MOTIVATED the redesign.
+# --- Round 2 pinned two other remedy sentences, so this was an inconsistency
+# --- inside the fix rather than a decision.
+
+
+def test_the_TEMPLATE_carries_its_own_instructions(repo):
+    """M12. The record is the only artifact that reaches the author of the
+    SECOND red -- `NO SHA RECORDED` never mentions uncommenting. So the
+    instruction has to travel inside the file they are already editing."""
+    rc, out = _first_red(repo)
+    body = _extract_skeleton(out)
+    assert "UNCOMMENT and replace" in body, body
+    assert "Leave them commented" in body, (
+        "the template does not tell a docs-only author to leave the lines "
+        "commented -- the one case where the default is already correct:"
+        + chr(10) + body
+    )
+    assert "must not invent" in body, (
+        "the ANTI-FABRICATION instruction is gone from the template. That "
+        "sentence is why the redesign happened: an author told four SHAs are "
+        "required, unable to obtain them, can invent four real commits and the "
+        "gate accepts them." + chr(10) + body
+    )
+
+
+def test_the_STDOUT_remedy_explains_the_commented_lines(repo):
+    """M13. Deleting this paragraph left the full suite green."""
+    rc, out = _first_red(repo)
+    assert "COMMENTED OUT on purpose" in out, out
+    assert "Uncomment one line per vector" in out, (
+        "stdout never tells a delta-PR author to uncomment:" + chr(10) + out
+    )
+    assert "Never invent one" in out, (
+        "stdout lost the anti-fabrication instruction:" + chr(10) + out
     )
 

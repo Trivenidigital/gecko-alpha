@@ -87,6 +87,12 @@ on the closed past.
 
 Per-PR files fix clearance **lifecycle and isolation**. They do not establish
 reviewer independence: these records are still author-writable, so the gate
-remains a lapse *detector*. Branch protection with required checks, and a
-reviewer record the PR author cannot manufacture, are separate controls that do
-not exist yet. See tickets 13(d) and 13(e).
+remains a lapse *detector*.
+
+Of the two controls that would change that, **one now exists.** Branch
+protection with `test` and `reviewer-clearances` required was enabled
+2026-08-28 (ticket 13(d), closed), so a failing check blocks a merge. **A
+reviewer record the PR author cannot manufacture still does not exist**
+(13(e), open) -- and that is now the whole of the gap. A green check proves a
+record exists naming ancestor SHAs with no watched delta since. It does not
+prove anyone other than the author put them there.

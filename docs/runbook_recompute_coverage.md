@@ -57,18 +57,42 @@ enforcement gate, and the difference is not a caveat — it is the whole securit
 model. Two things are required to make an unreviewed merge actually impossible,
 and **neither can be done from inside the repository**:
 
-**1. Branch protection is OFF.** Verified:
+**1. Branch protection — ENABLED 2026-08-28.** This section said "OFF" until
+then, and printed a `404 Branch not protected` as its proof. Re-run the same
+command today:
 
 ```bash
-gh api repos/Trivenidigital/gecko-alpha/branches/master/protection   # 404 Branch not protected
-gh api repos/Trivenidigital/gecko-alpha/rulesets                     # []
+gh api repos/Trivenidigital/gecko-alpha/branches/master/protection
+#   strict: true   contexts: ["test", "reviewer-clearances"]
+#   enforce_admins: true   required_approving_review_count: 0
+#   allow_force_pushes: false   allow_deletions: false
+gh api repos/Trivenidigital/gecko-alpha/rulesets                     # [] (still)
 ```
 
-With no protection, `mergeStateStatus` reads `UNSTABLE` (checks red, merge
-permitted) rather than `BLOCKED` — so **no CI check in this repo can block
-anything.** PR #560 was mergeable while its own clearance check was failing.
-Until an operator enables protection with the checks marked required, every
-gate here is advisory text in a log.
+**A document whose own stated verification returns the opposite of what the
+document records is worse than one with no evidence in it**, because the
+evidence is what makes it persuasive. That is why the command stays here: the
+next reader should run it rather than believe this paragraph.
+
+So a failing check now blocks. `required_approving_review_count` is **0 on
+purpose** — every PR in this repo has zero GitHub reviews, so requiring one
+would make every PR permanently unmergeable. Requiring the PR *path* is
+enforcement; requiring an *approval* would wedge the repo and would not create
+item 2 either. **Do not "harden" it to 1.**
+
+Two live consequences an operator needs:
+
+* `strict: true` means a branch must be up to date before merging, and that
+  update can LAPSE clearances even when the PR's own diff is untouched — the
+  lapse is anchored to the clearance's tree, while the requirement is anchored
+  to the merge-base diff. Serialize merges while any PR has clearances
+  recorded. The constraint on any future relief valve: **never allow a merge on
+  a check computed by an older version of the gate** — which rules out override
+  labels, admin bypasses, and reusing a prior green.
+* `enforce_admins: true` plus `allow_force_pushes: false` closes the escape
+  used once before (the authorized direct push `87604f44`). **Recovery from a
+  wedged state is now an out-of-band protection-disable by the repo owner.**
+  Worth knowing before it is needed.
 
 **2. The clearance record sits on the author's writable surface.**
 `.reviewers/<PR>.toml` is committed, so repointing all four clearances at the
