@@ -3527,6 +3527,23 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
     outside the whitelist the minimal run does not see it and the verdicts
     diverge. The test does not need to guess the name or plant it.
 
+    **BOUNDARY ON THAT ARGUMENT, and it is a real one.** It covers steering by
+    an ambient NAME. It does not reach `os.environ.get("NO_SUCH_NAME", "docs")`
+    -- where the DEFAULT does the steering and no name is in ambient at all.
+    Both runs are then steered identically, so the differential cannot see it
+    either. That case is caught, by the precondition and by the
+    rebind-primitive pin, so the composite holds -- but this paragraph should
+    not be read as covering it.
+
+    **THE PRECONDITION IS A DETECTOR, NOT ONLY A FIXTURE CHECK -- DO NOT RELAX
+    IT.** Three reviewers independently measured that every steering mutant
+    fires `assert amb[0] == 1 and amb[1]`, never `mini == amb`: a steered gate
+    makes the AMBIENT run miss the foreign-record guard, so the precondition
+    trips before the differential is evaluated. It is written in the shape of a
+    fixture health check, which is exactly the kind of assertion a maintainer
+    loosens when a fixture gets fiddly -- and loosening it exposes the
+    differential as the sole detector.
+
     On a clean box the two environments still genuinely differ -- measured, 81
     ambient keys against 9 minimal, 72 dropped -- so this is a real
     differential and not two identical runs. It passes there because none of
