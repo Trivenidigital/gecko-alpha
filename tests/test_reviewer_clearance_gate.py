@@ -3533,11 +3533,28 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
     the 72 reaches a decision, which is the correct answer, and it would fail
     if any of them did.
 
-    WHICH ASSERTION ACTUALLY FIRES, because the docstring above describes a
-    different arm than the one that catches. Measured: for both a listed and an
-    unlisted steering name, the failure is the PRECONDITION, not `mini == amb`.
-    A prefix redirection makes the fixture's record lookup miss, so the ambient
-    run yields `(1, False)` and the comparison never runs.
+    THE TWO ASSERTIONS CATCH DIFFERENT FAILURE MODES, and conflating them is
+    how the earlier draft of this paragraph got it wrong.
+
+      PRECONDITION  -- the AMBIENT environment steers the gate to a WRONG
+                       answer. A prefix redirection makes the record lookup
+                       miss, the ambient run yields `(1, False)`, and the
+                       comparison never runs. Both a listed and an unlisted
+                       steering name land here.
+
+      COMPARISON    -- the gate DEPENDS on an ambient name to reach the RIGHT
+                       answer. Demonstrated: a `_foreign_record_edits` that
+                       early-returns unless `APPDATA` is set passes the
+                       precondition (ambient has it) and fails the comparison
+                       with `(0, False) == (1, True)`. Silent dependence on
+                       ambient state, which nothing else here would notice.
+
+    Both are real and neither subsumes the other. A reviewer correctly flagged
+    that the comparison had never been shown able to fail -- "a detector never
+    shown able to produce a dirty result is unproven" -- and the mutant above
+    is that demonstration. The whitelist blind spot is unreachable through the
+    comparison for the same reason: a whitelisted name is in both environments,
+    so redirection through one trips the PRECONDITION instead.
 
     That matters twice over. The precondition's message used to blame the
     FIXTURE, so CI would have told a reader their test setup was wrong when the
