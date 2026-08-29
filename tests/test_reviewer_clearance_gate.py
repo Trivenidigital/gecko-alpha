@@ -2419,86 +2419,217 @@ def test_an_EMPTY_clearance_table_still_REDS_a_PRODUCTION_pr(repo):
     assert "NO SHA RECORDED" in out2, out2
 
 
-# --- Workflow integrity. DEFENCE IN DEPTH, EXPLICITLY NOT CLOSURE. -----------
+# --------------------------------------------------------------------------
+# WORKFLOW INTEGRITY. Structural, not a substring sweep.
 #
-# The clearance job is delivered by `.github/workflows/test.yml`, and for
-# `pull_request` events GitHub runs the workflow from the PR'S OWN MERGE REF.
-# So the PR being judged supplies the judge. Three edits make the job report a
-# non-failure while the gate's verdict is discarded:
+# The clearance job is delivered by `.github/workflows/*.yml`, and for
+# `pull_request` events GitHub runs the workflow FROM THE PR'S OWN MERGE REF --
+# so the PR being judged supplies the judge. Neutering it is a one-line edit,
+# and `.github` being on the watch floor does not help: the mechanism that
+# would demand clearances for that edit is the one being neutered.
 #
-#     skip the job (`if:`)      -> conclusion `skipped`
-#     `|| true` on the step     -> conclusion `success`
-#     `continue-on-error: true` -> conclusion `success`
+# THE FIRST VERSION OF THIS GUARD WAS A BLOCKLIST AND IT WAS MEASURED: it
+# caught 3 of 10 real tampers. Seven survived, six of them one-liners --
+# `||true` (one character off a caught literal), `|| echo x`, `|| /bin/true`,
+# `: python ...` (`:` ignores its arguments), replacing the whole `run:` with
+# `echo ok`, a STEP-level `if: false` (both old tests read the JOB's `if:`),
+# and `set +e` plus a trailing command. The claim written beside it -- "raises a
+# one-line tamper to a two-line one" -- was false, which is the exact class of
+# unmeasured claim this PR exists to stop shipping.
 #
-# `.github` is on the watch floor, so the gate WOULD demand clearances for that
-# edit -- but the gate is exactly what has been neutered. Chicken-and-egg.
+# So: PIN, do not blocklist. The bad-pattern space is unbounded; the legitimate
+# content is a fixed, small structure. Asserting equality against the expected
+# resolved values means every tamper trips the same assertion -- named or not,
+# hostile or accidental -- and any legitimate change must be made explicitly in
+# the diff, where a reviewer sees it.
 #
-# Until today the only defence was a COMMENT in the workflow reading "do not
-# add `|| true`", which is prose, in the repository whose thesis is that prose
-# is not a control. These tests convert that sentence into a control.
+# STILL NOT CLOSURE, and this must not be reported as one. The same PR that
+# edits the workflow can edit this file, and `test` ships through the same
+# `run:` surface. Real closure is a repository ruleset with `required_workflows`
+# pinning the workflow at a ref the PR cannot rewrite -- an operator action,
+# outside the repo, like 13(d) and 13(e).
 #
-# THEY ARE NOT CLOSURE AND MUST NOT BE REPORTED AS ONE. The same PR that edits
-# the workflow can edit this file, and `test` is delivered through the same
-# `run:` surface. This raises a one-line tamper to a two-line one and makes it
-# obvious in the diff. Real closure is a repository ruleset with
-# `required_workflows`, pinning the workflow at a ref the PR cannot rewrite --
-# an operator action, outside the repo, like 13(d) and 13(e).
-#
-# Variants that fail CLOSED and are deliberately NOT asserted, so this does not
-# over-scope: a bogus `runs-on` leaves the check pending (blocked), and a tiny
-# `timeout-minutes` yields `failure` (blocked). The fail-open family is three.
+# `pyyaml>=6.0,<7` is already a project dependency, so this adds none. That
+# matters: adding one would touch `pyproject.toml` and `uv.lock`, both watched,
+# and lapse every clearance for the sake of a test.
+# --------------------------------------------------------------------------
 
-_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "test.yml"
+_WF_DIR = REPO_ROOT / ".github" / "workflows"
 
-
-def _clearance_job_text():
-    """The `reviewer-clearances` job block, read from disk."""
-    assert _WORKFLOW.exists(), "workflow missing: " + str(_WORKFLOW)
-    text = _WORKFLOW.read_text(encoding="utf-8")
-    marker = chr(10) + "  reviewer-clearances:" + chr(10)
-    assert marker in text, (
-        "the reviewer-clearances job is GONE from the workflow. The job name is "
-        "the branch-protection CONTEXT: renaming or removing it silently drops "
-        "the requirement, because a context that never reports is absent."
-    )
-    block = text.split(marker, 1)[1]
-    # up to the next top-level job (two-space key) or EOF
-    out = []
-    for line in block.split(chr(10)):
-        if line and not line.startswith("    ") and line.strip().endswith(":"):
-            break
-        out.append(line)
-    return chr(10).join(out)
-
-
-@pytest.mark.parametrize(
-    "forbidden",
-    ["|| true", "continue-on-error", "|| exit 0", "|| :"],
+#: The clearance step's script, normalized (comments dropped, trailing
+#: whitespace stripped, blank lines dropped). Comments are deliberately NOT
+#: pinned -- the prose warning in the step is not the control and must stay
+#: freely editable. `||`, `;`, `&&` and redirections are deliberately NOT
+#: normalized away; doing so would rebuild the hole this replaces.
+_EXPECTED_CLEARANCE_RUN = (
+    'git fetch --quiet origin "${{ github.base_ref }}"' + chr(10)
+    + "python scripts/check_reviewer_clearances.py             "
+    + '"${{ github.event.pull_request.head.sha }}"             '
+    + '"origin/${{ github.base_ref }}"             '
+    + '--pr "${{ github.event.pull_request.number }}"'
 )
-def test_the_clearance_job_cannot_SWALLOW_its_own_verdict(forbidden):
-    """Each of these makes a failing gate report a passing check."""
-    job = _clearance_job_text()
-    body = chr(10).join(
-        l for l in job.split(chr(10)) if not l.strip().startswith("#")
-    )
-    assert forbidden not in body, (
-        "the clearance job swallows its verdict via " + repr(forbidden) + " -- "
-        "the gate would report FAIL and the check would report success"
-    )
+
+_EXPECTED_CLEARANCE_IF = "github.event_name == 'pull_request'"
 
 
-def test_the_clearance_job_runs_on_PULL_REQUEST_and_only_that():
-    """The `if:` is the skip lever, and a skipped job reports under the
-    required context name -- verified on this repo's master:
-    `reviewer-clearances: skipped`.
+def _load_workflows():
+    """Every workflow, parsed. MISSING OR UNPARSEABLE RAISES -- never skips.
 
-    Pinned to the EXACT condition rather than "some condition present", because
-    `if: github.event_name == 'pull_request' && false` is also a condition.
+    A sweep that skips reports green having asserted nothing, which is this
+    repository's most-repeated lesson and the reason the archive sweep needed
+    its own fix.
     """
-    job = _clearance_job_text()
-    assert "if: github.event_name == 'pull_request'" + chr(10) in job, (
-        "the clearance job's trigger condition changed. A job that skips "
-        "reports `skipped` under the required context name:" + chr(10) + job
+    import yaml                                   # already a project dependency
+
+    assert _WF_DIR.is_dir(), "workflow directory missing: " + str(_WF_DIR)
+    files = sorted(
+        [p for p in _WF_DIR.iterdir() if p.suffix in (".yml", ".yaml")]
+    )
+    assert files, "no workflow files found in " + str(_WF_DIR)
+    out = {}
+    for f in files:
+        # safe_load, never load.
+        doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), "unparseable workflow: " + f.name
+        out[f.name] = doc
+    return out
+
+
+def _jobs_by_context():
+    """Map GitHub's CHECK CONTEXT -> (file, job id, job), across all workflows.
+
+    The context is what branch protection matches on, and GitHub computes it as
+    `name` if present else the job id. A guard that checks only the job id
+    misses a `name:` override; one that checks only `name` misses an id rename.
+
+    Note `on:` is NOT consulted anywhere here: in YAML 1.1 the bare key `on`
+    parses as the BOOLEAN True, so `doc.get("on", {})` silently yields `{}` and
+    a guard built on it asserts nothing while reporting green. Measured on this
+    very file -- its top-level keys are `['name', True, 'jobs']`.
+    """
+    found = {}
+    for fname, doc in _load_workflows().items():
+        for jid, job in (doc.get("jobs") or {}).items():
+            ctx = job.get("name", jid) if isinstance(job, dict) else jid
+            found.setdefault(ctx, []).append((fname, jid, job))
+    return found
+
+
+@pytest.mark.parametrize("context", ["reviewer-clearances", "test"])
+def test_EXACTLY_ONE_job_claims_each_required_context(context):
+    """Two distinct holes, one assertion.
+
+    A RENAME removes the requirement outright -- protection matches on the
+    context name, and a context that never reports is simply absent. A SECOND
+    job anywhere claiming the same name lets a trivially-green job satisfy the
+    required context. Only one workflow file exists today, so this costs one
+    line now and would be unaddable later without someone noticing.
+    """
+    hits = _jobs_by_context().get(context, [])
+    assert len(hits) == 1, (
+        "expected exactly one job to resolve to the required context "
+        + repr(context) + ", found " + str(len(hits)) + ": "
+        + repr([(f, j) for f, j, _ in hits])
+    )
+
+
+@pytest.mark.parametrize("context", ["reviewer-clearances", "test"])
+def test_NEITHER_required_job_can_SWALLOW_a_failure(context):
+    """`continue-on-error` must be ABSENT, not merely not-True.
+
+    `continue-on-error: ${{ github.event_name == 'push' }}` parses as a STRING,
+    is not `True`, and is truthy at runtime -- so a `!= True` check waves it
+    through. It is also the variant most likely to survive human review,
+    because it reads as a deliberate CI setting rather than a shell hack.
+    """
+    hits = _jobs_by_context().get(context, [])
+    assert len(hits) == 1, "context " + repr(context) + " is not uniquely defined"
+    _, jid, job = hits[0]
+    assert "continue-on-error" not in job, (
+        "job " + jid + " sets continue-on-error at JOB level"
+    )
+    for i, step in enumerate(job.get("steps") or []):
+        assert "continue-on-error" not in step, (
+            "step " + str(i) + " (" + repr(step.get("name")) + ") of job " + jid
+            + " sets continue-on-error"
+        )
+
+
+def test_the_clearance_job_INVOKES_the_gate_with_a_PINNED_script():
+    """The assertion the blocklist never made: that the gate runs AT ALL.
+
+    Replacing the whole `run:` with `echo ok` defeated every earlier check,
+    because they searched for forbidden substrings and a benign line contains
+    none. Pinning the normalized script kills that and the entire `||` family
+    without naming a single member of it.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1, "reviewer-clearances is not uniquely defined"
+    _, jid, job = hits[0]
+
+    # Located by NAME, not index -- inserting any step renumbers positions.
+    runners = [s for s in (job.get("steps") or []) if "run" in s]
+    assert len(runners) == 1, (
+        "expected exactly one `run:` step in " + jid + ", found "
+        + str(len(runners)) + " -- an added step is where a neuter hides"
+    )
+    step = runners[0]
+    assert "if" not in step, (
+        "the clearance step carries a STEP-LEVEL `if:` -- a skipped step runs "
+        "nothing while the job still reports a non-failure, and the job-level "
+        "condition asserted elsewhere would not see it"
+    )
+    lines = [l.rstrip() for l in step["run"].split(chr(10))]
+    lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+    assert chr(10).join(lines) == _EXPECTED_CLEARANCE_RUN, (
+        "the clearance step's script changed. If the change is intentional, "
+        "update _EXPECTED_CLEARANCE_RUN in the same commit so a reviewer sees "
+        "it in the diff." + chr(10) + "got:" + chr(10) + chr(10).join(lines)
+    )
+
+
+def test_the_clearance_job_CONDITION_is_pinned_exactly():
+    """Pinned by equality, not by "is not false".
+
+    `if: github.event_name == 'pull_request' && false` is also a condition, and
+    a skipped job reports `skipped` under the required context name -- verified
+    on this repo's master.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1
+    _, jid, job = hits[0]
+    assert job.get("if") == _EXPECTED_CLEARANCE_IF, (
+        "the clearance job's condition is " + repr(job.get("if"))
+        + ", expected " + repr(_EXPECTED_CLEARANCE_IF)
+    )
+
+
+def test_the_clearance_checkout_keeps_FULL_history():
+    """`fetch-depth: 0` is pinned rather than reasoned about.
+
+    Removing it *probably* fails closed -- a clearance SHA absent from a
+    shallow clone becomes a shape error, or `merge-base` becomes unresolvable.
+    That is an inference, and the reviewer who made it said so and asked for a
+    pin instead. One assertion costs less than trusting the inference.
+
+    DELIBERATELY NOT ASSERTED, so a later maintainer does not add them as "more
+    coverage": `runs-on` (a bogus label leaves the check pending, and a pending
+    required check blocks the merge) and `timeout-minutes` (expiry yields
+    `failure`, which also blocks). Both fail CLOSED, so pinning them would
+    couple this guard to things that do not need it.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1
+    _, jid, job = hits[0]
+    checkout = [
+        s for s in (job.get("steps") or [])
+        if str(s.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert len(checkout) == 1, "expected exactly one checkout step in " + jid
+    assert checkout[0].get("with") == {"fetch-depth": 0}, (
+        "the clearance checkout's `with:` is " + repr(checkout[0].get("with"))
+        + ", expected {'fetch-depth': 0} -- a shallow clone cannot resolve the "
+        "clearance SHAs it is asked to compare"
     )
 
 
