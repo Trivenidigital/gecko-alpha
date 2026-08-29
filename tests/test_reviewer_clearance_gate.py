@@ -3139,6 +3139,13 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
             "that is not a Name, and a use site still reading the bare name."
         )
 
+    # `exec`/`eval` are DELIBERATELY ABSENT from this list. A module-level
+    # `exec("...")` hides the assignment, the environment read and the name
+    # inside a string literal, so no AST arm here can match it -- measured, and
+    # measured CAUGHT by the behavioural test instead. Adding the row would buy
+    # nothing and would re-teach the habit this file spent five rounds
+    # unlearning: the enumeration lost again, and the property held.
+    #
     # WHAT IS STILL NOT COVERED, stated narrowly this time. The argv quadrant is
     # UNTESTED rather than clean: the reviewer's argv mutant was rejected by
     # argparse before it could take effect, so it measured their flag, not this
@@ -3237,10 +3244,26 @@ def test_the_ENVIRONMENT_cannot_change_a_VERDICT(repo):
     record present, both runs stop at the missing-record branch and agree for
     a reason that has nothing to do with the property.
 
+    BOTH ASSERTIONS BELOW DISCRIMINATE ON THE MESSAGE, NOT THE EXIT CODE, and
+    that is load-bearing in a way that looks like verbosity. The precondition's
+    own failure reads `assert (1 == 1 and 'ANOTHER PR' in ...)` -- the
+    missing-record branch ALSO exits 1, so an exit-code-only precondition
+    passes vacuously and the hostile runs then compare two identical
+    "no clearance FILE" outputs and agree for a reason unrelated to the
+    property. The verdict comparison says it out loud in its own message:
+    "gave exit 1 where a clean environment gives exit 1". Simplify either to a
+    bare exit-code compare and the vacuous pass returns in both places. This is
+    "assert WHICH failure, not THAT one occurred" appearing twice in one test.
+
     Residual, stated so it is not mistaken for closure: a rebind sourced from a
-    FILE or ARGV is not covered here -- the rebind-primitive pin above is what
-    reaches those. Nor is this closure of the workflow surface;
-    `required_workflows` is.
+    FILE or ARGV is not covered by the environment variation here -- the
+    rebind-primitive pin above reaches those for the primitives it names, but
+    **not for `exec`/`eval`**, where the assignment, the read and the name all
+    live inside a string literal and no AST arm can see them. A file-sourced
+    `exec` rebind is therefore a KNOWN OPEN QUADRANT, untested rather than
+    covered: reaching it needs a readable file planted in the tree, itself a
+    watched-path change requiring clearances. Nor is any of this closure of the
+    workflow surface; `required_workflows` is.
     """
     sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
 
