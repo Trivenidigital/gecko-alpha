@@ -3054,7 +3054,15 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
     binds = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            if any(getattr(t, "id", None) == "DECL_PREFIX" for t in node.targets):
+            # TUPLE AND LIST TARGETS TOO. `getattr(t, "id", None)` is None for
+            # an `ast.Tuple`, so `DECL_PREFIX, _x = <env>, None` rebound the
+            # prefix while this scan counted only the literal below and still
+            # reported "exactly one binding, and it is a Constant". Measured as
+            # the gap that made a tuple-target rebind invisible here.
+            flat = []
+            for t in node.targets:
+                flat.extend(t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])
+            if any(getattr(t, "id", None) == "DECL_PREFIX" for t in flat):
                 binds.append(node)
         elif isinstance(node, ast.AnnAssign):
             if getattr(node.target, "id", None) == "DECL_PREFIX":
@@ -3331,3 +3339,200 @@ def test_the_ENVIRONMENT_cannot_change_a_VERDICT(repo):
             "exit " + str(rc) + " where a clean environment gives exit "
             + str(clean[0]) + "." + chr(10) + out
         )
+
+
+class _HostileEnv(dict):
+    """Real environment, except any name the gate has not already been given
+    comes back as a hostile prefix.
+
+    Subclassing `dict` and only overriding the MISS path is deliberate: `git`
+    is spawned as a child and inherits this mapping, so PATH, SystemRoot and
+    the rest must survive untouched or the failure is a broken subprocess
+    rather than a steered gate -- which would look identical from the outside.
+
+    `REVIEWERS_PR` is exempted, and that exemption is what makes this an
+    ALLOWLIST OF ONE rather than a blocklist of four. It is the single
+    environment channel this gate is shown to read, and it fails CLOSED: a
+    `--pr` disagreeing with it exits 2. Steering it would change the verdict
+    legitimately, which is a different fact from the one under test.
+    """
+
+    HOSTILE = "docs"
+    EXEMPT = frozenset({"REVIEWERS_PR"})
+
+    def get(self, key, default=None):
+        if key in self:
+            return dict.get(self, key)
+        return default if key in self.EXEMPT else self.HOSTILE
+
+    def __missing__(self, key):
+        if key in self.EXEMPT:
+            raise KeyError(key)
+        return self.HOSTILE
+
+
+def test_NO_environment_NAME_can_change_a_verdict(repo, monkeypatch, capsys):
+    """The residual the previous test left: it enumerated NAMES.
+
+    `test_the_ENVIRONMENT_cannot_change_a_VERDICT` is spelling-, mechanism- and
+    source-independent, and it says so -- but its hostile set is four variable
+    NAMES, so a rebind reading `os.environ.get("BUILD_PREFIX")` walked through
+    it. Canonical spelling, canonical mechanism, environment channel, exit 0.
+    Measured, not argued.
+
+    Adding `BUILD_PREFIX` to that list is the enumeration reflex the arm exists
+    to break, so instead: make EVERY unseen name hostile and exempt exactly
+    one. That turns a four-name blocklist into a ONE-NAME ALLOWLIST, and the
+    exempted name is the only channel already shown to fail closed.
+
+    Runs IN-PROCESS because the mapping has to be installed inside the gate,
+    not handed to a subprocess as a fixed set of keys -- a subprocess env is
+    itself a list of names, which is the thing being removed.
+
+    Known limits, stated rather than implied.
+
+    IMPORT-TIME REBINDS ARE OUT OF SCOPE HERE, and that is not a detail: the
+    module is loaded before the hostile mapping is installed, so a module-level
+    steer has already resolved against the real environment by the time this
+    test can see anything. Measured -- a tuple-target rebind at module level
+    passes this test and is caught by the sibling test above, whose behavioural
+    half re-imports with the variable set. The two are complementary rather
+    than redundant, and removing either leaves a live quadrant.
+
+    This covers reads that go through `os.environ` in this process; a gate that
+    shelled out and let a child read the real environment would not be
+    covered. And `exec`-hidden reads are
+    covered here only because the READ still happens through this mapping --
+    the AST arms cannot see them at all.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    # THE VERDICT IS (exit code, WHICH failure), never the code alone. The
+    # first version of this test compared exit codes only and was VACUOUS: a
+    # steered gate looks for `docs/42.toml`, does not find it, and exits 1 for
+    # "no clearance FILE" -- while a clean gate exits 1 for "changes ANOTHER
+    # PR's record". Both are 1. It passed against the very mutant it was
+    # written to catch, and against the capability control too.
+    #
+    # That is "assert WHICH failure, not THAT one occurred" -- violated here
+    # one commit after being written into the docstring above it.
+    def _verdict():
+        rc = mod._cli(["check", "HEAD", "master", "--pr", PR])
+        return rc, "ANOTHER PR" in capsys.readouterr().out
+
+    clean = _verdict()
+    assert clean == (1, True), (
+        "the fixture does not reach the foreign-record guard " + repr(clean)
+        + ", so this test cannot observe the property it claims to check"
+    )
+
+    hostile = _HostileEnv(os.environ)
+    hostile.pop("REVIEWERS_PR", None)
+    monkeypatch.setattr(mod.os, "environ", hostile)
+    # prove the shim is live and hostile before trusting the comparison
+    assert mod.os.environ.get("SOME-NAME-NOBODY-HAS-USED") == "docs", (
+        "the hostile mapping is not installed; the comparison below would "
+        "compare two identical clean runs"
+    )
+    assert mod.os.environ.get("REVIEWERS_PR") is None, "the exemption is broken"
+
+    steered = _verdict()
+    assert steered == clean, (
+        "an environment name changed the verdict: " + repr(steered)
+        + " under a hostile environment where a clean one gives " + repr(clean)
+        + ". No NAME should be able to steer this gate."
+    )
+
+
+#: The only environment names this gate legitimately needs. `PATH` and the
+#: Windows trio are for the `git` child; `REVIEWERS_PR` is the one channel the
+#: gate reads, and it fails CLOSED (a disagreeing `--pr` exits 2).
+#:
+#: A WHITELIST ON OUR SIDE, not a blocklist on the attacker's -- that asymmetry
+#: is the entire point and it is why this arm has no list of hostile names.
+_MINIMAL_ENV_KEYS = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "COMSPEC", "ComSpec",
+    "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL",
+    "PYTHONIOENCODING", "PYTHONUTF8", "REVIEWERS_PR",
+})
+
+
+def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
+    """The arm with NO attacker-side enumeration, and the reason it exists.
+
+    Every previous arm enumerated something the attacker chooses: node shapes,
+    then rebind mechanisms, then data sources, then env spellings, then
+    variable NAMES. Each fell to the next thing outside its list. The sibling
+    behavioural test says it is spelling-, mechanism- and source-independent --
+    all true, all about the READ -- while enumerating four hostile NAMES, so a
+    gate reading `XYZZY_PREFIX` walked straight through it. Measured, exit 0.
+
+    **You cannot check "the environment cannot change the verdict" by listing
+    the attacker's side.** The environment is unbounded in exactly the way the
+    mechanism list was.
+
+    So compare two runs: one under the AMBIENT environment, one under a MINIMAL
+    whitelist of names this gate legitimately needs. If any name outside that
+    whitelist reaches a decision, the verdicts diverge -- whatever the name is,
+    however it is spelled, whatever rebinds it. The whitelist is ours and
+    bounded; nothing here names anything of the attacker's.
+
+    In CI this fires on the PR that ships the tamper, because that PR's
+    workflow `env:` line is in the ambient environment when the suite runs. A
+    split attack is caught too: the gate-edit PR has nothing to diverge on and
+    passes, and the env-line PR diverges against the already-edited gate.
+
+    Limits, stated: it covers the environment channel only, the whitelist needs
+    maintaining, and it is NOT closure -- the PR that edits the workflow can
+    edit this test. `required_workflows` is.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    def _verdict(env):
+        argv = [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR]
+        r = subprocess.run(argv, cwd=str(repo), capture_output=True,
+                           text=True, env=env)
+        # (code, WHICH failure). Never the code alone: a steered gate exits 1
+        # for "no clearance FILE" while a clean one exits 1 for "changes
+        # ANOTHER PR's record", and an exit-code compare passes on both.
+        return r.returncode, "ANOTHER PR" in (r.stdout + r.stderr)
+
+    ambient = {**os.environ}
+    ambient.pop("REVIEWERS_PR", None)
+    minimal = {k: v for k, v in ambient.items() if k in _MINIMAL_ENV_KEYS}
+
+    amb = _verdict(ambient)
+    assert amb[0] == 1 and amb[1], (
+        "the fixture does not reach the foreign-record guard " + repr(amb)
+        + ", so this test cannot observe the property it claims to check"
+    )
+    assert set(minimal) < set(ambient), (
+        "the minimal environment is not a proper subset of the ambient one, so "
+        "the two runs are identical by construction and this test is vacuous"
+    )
+
+    mini = _verdict(minimal)
+    assert mini == amb, (
+        "a name in the ambient environment changed the verdict: minimal gives "
+        + repr(mini) + " where ambient gives " + repr(amb) + ". Some "
+        "environment name outside the whitelist reached a decision."
+    )
+
