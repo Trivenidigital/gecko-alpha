@@ -3063,6 +3063,48 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
         "whatever feeds it, and this constant aims the foreign-record guard."
     )
 
+    # PIN THE DATA SOURCE, because the REBIND FAMILY IS UNBOUNDED.
+    #
+    # The two binding-site checks above are mechanism-specific, and mechanisms
+    # can be enumerated forever -- which is the blocklist trap this file has
+    # already fallen into twice. Measured: `globals()["DECL_PREFIX"] = ...`
+    # inside a function called from main() evades BOTH by construction. The
+    # target is an `ast.Subscript`, so it is not counted as a binding, and
+    # there is no `ast.Global` node to trip the raise. The pathspec assertion
+    # still passes, because the use site reads a bare `DECL_PREFIX` -- which
+    # now holds the environment's value. W18 restored in full: exit 0 on a PR
+    # rewriting another PR's clearances.
+    #
+    # `setattr(sys.modules[__name__], ...)` is the same shape, and so is the
+    # next one nobody has thought of. So stop enumerating rebinds and pin what
+    # they all need: THE ENVIRONMENT MUST REACH THIS PROCESS EXACTLY ONCE, and
+    # that once is the PR-identity fallback, which fails CLOSED.
+    #
+    # HONEST LIMIT, stated because a guard that overclaims is the thing this
+    # file exists to stop: this pins the ENVIRONMENT as the steering channel
+    # only. A rebind sourced from a file or from argv would not trip it. The
+    # `ast.Constant` binding check and the `:(top)` pathspec check above are
+    # what cover those, and the three together are what hold. None of them is
+    # closure; `required_workflows` is.
+    env_reads = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and n.attr == "environ"
+        and isinstance(n.value, ast.Name) and n.value.id == "os"
+    ]
+    assert len(env_reads) == 1, (
+        "expected exactly one os.environ access in the gate, found "
+        + str(len(env_reads)) + ". Every additional one is a channel a "
+        "workflow `env:` line can steer, and the rebind mechanisms that "
+        "consume it cannot be enumerated."
+    )
+    src_lines = SCRIPT.read_text(encoding="utf-8").split(chr(10))
+    env_line = src_lines[env_reads[0].lineno - 1]
+    assert "REVIEWERS_PR" in env_line and "REVIEWERS_PREFIX" not in env_line, (
+        "the single os.environ access no longer reads REVIEWERS_PR: "
+        + env_line.strip() + " -- the PR-identity fallback fails CLOSED "
+        "(a disagreeing --pr exits 2); nothing else has been shown to."
+    )
+
     # PIN THE DATA PATH, not just its source. Deleting the env read at the
     # binding site does not stop someone reintroducing it AT THE USE SITE --
     # `":(top)" + (os.environ.get("REVIEWERS_PREFIX") or DECL_PREFIX)` inside
