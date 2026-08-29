@@ -3489,9 +3489,32 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
     bounded; nothing here names anything of the attacker's.
 
     In CI this fires on the PR that ships the tamper, because that PR's
-    workflow `env:` line is in the ambient environment when the suite runs. A
-    split attack is caught too: the gate-edit PR has nothing to diverge on and
-    passes, and the env-line PR diverges against the already-edited gate.
+    **workflow-level** `env:` is in the ambient environment when the suite
+    runs. A split attack is caught on the same basis: the gate-edit PR has
+    nothing to diverge on and passes, and the env-line PR diverges against the
+    already-edited gate.
+
+    **"WORKFLOW-LEVEL" IS LOAD-BEARING AND WAS MISSING FROM AN EARLIER DRAFT.**
+    `reviewer-clearances` is a separate job by design, so a JOB-SCOPED `env:`
+    on it is not in the `test` job's environment -- and this arm executes in
+    `test`. So this arm covers workflow-level `env:` and not job-scoped, and
+    the composite is what closes the gap: the structural workflow guard refuses
+    `env:` at workflow, job AND step scope, which is the arm that reaches the
+    job-scoped case. Neither alone is sufficient, and the earlier wording
+    implied this one was.
+
+    LOCALLY IT IS NEAR-INERT, for the same reason it is strong in CI: a
+    developer's shell contains their own names, so a gate reading a name they
+    have never set produces no steer to catch. That is the property below
+    working correctly -- no steer, nothing to detect -- but it means a green
+    here on a laptop says much less than a green in CI, and a maintainer
+    deciding whether the other arms are still needed should know that.
+
+    Free strength worth recording, which arrived from the shape rather than
+    from a list: `GITHUB_HEAD_REF` is attacker-controlled, ambient in every
+    job, and outside the whitelist -- so a gate that consulted the BRANCH NAME
+    would diverge and be caught here. That is precisely what the module
+    docstring says must never be consulted, and no rule here names it.
 
     WHERE THE HOSTILE VALUE COMES FROM, asked by a reviewer who suspected this
     cell was vacuous on a clean box. It is not, and the reason is a property
