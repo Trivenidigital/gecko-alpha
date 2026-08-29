@@ -2738,22 +2738,49 @@ def test_the_TEST_job_that_DELIVERS_these_guards_is_itself_pinned():
             "skipped step runs nothing while the job still reports success"
         )
 
+    # STRUCTURAL, not a blocklist. The first version of this check listed
+    # ("|| true", "||true", "|| :", "continue-on-error", "set +e") -- the one
+    # place in this guard that departed from PIN-DON'T-BLOCKLIST, and it
+    # behaved the way blocklists do: `|| exit 0`, `; true`, `|| /bin/true` and
+    # `|| echo x` all survived it. Four one-token edits to the step that
+    # executes every assertion in this file.
+    #
+    # The `run:` BODY is deliberately still not pinned -- flags and paths
+    # legitimately change whenever the invocation does, and a guard that cries
+    # wolf on ordinary edits gets deleted. What is asserted instead is that a
+    # pytest invocation contains no shell control operator at all, which is a
+    # property of the shape rather than of any named evasion. Measured clean
+    # today for both pytest steps, so there is no cry-wolf risk in adopting it.
+    #
+    # Scoped to steps that RUN PYTEST. The regression-count step legitimately
+    # uses `||`, `|`, `>` and `$(...)`, so a blanket ban across the job would
+    # be a false positive -- and a guard with a known false positive is one
+    # someone eventually deletes.
+    # Selected as "a bare pytest invocation": a single logical command whose
+    # body starts with `uv run pytest`. NOT "contains pytest" -- the
+    # regression-count step calls pytest inside a shell script and
+    # legitimately uses `||`, `|`, `>` and `$(...)`, so a contains-match would
+    # produce a guaranteed false positive, and a guard with a known false
+    # positive is one somebody eventually deletes.
     pytest_steps = [
         st for st in steps
-        if "run" in st and "pytest" in st["run"] and "--timeout" in st["run"]
+        if "run" in st and st["run"].strip().startswith("uv run pytest")
+        and len([l for l in st["run"].strip().split(chr(10)) if l.strip()]) == 1
     ]
-    assert len(pytest_steps) == 1, (
-        "expected exactly one full-suite pytest step in `test`, found "
-        + str(len(pytest_steps)) + " -- this is the step that executes every "
-        "guard in this file"
+    assert len(pytest_steps) == 2, (
+        "expected two bare pytest invocations in `test` (contract firewalls + "
+        "full suite), found " + str(len(pytest_steps)) + " -- these execute "
+        "every assertion in this file"
     )
-    body = pytest_steps[0]["run"]
-    for swallow in ("|| true", "||true", "|| :", "continue-on-error", "set +e"):
-        assert swallow not in body, (
-            "the full-suite pytest step swallows its own failure via "
-            + repr(swallow) + " -- every assertion in this file would still "
-            "report green"
-        )
+    for st in pytest_steps:
+        body = st["run"]
+        for op in ("||", "&&", ";", "|", "`", "$(", ">", "<"):
+            assert op not in body, (
+                "the pytest step " + repr(st.get("name")) + " contains the "
+                "shell control operator " + repr(op) + ". A pytest invocation "
+                "needs none, and every one of them can be used to swallow the "
+                "exit status of the step that runs every guard in this file."
+            )
 
 
 def test_the_clearance_job_CONDITION_is_pinned_exactly():
@@ -2888,6 +2915,25 @@ def test_the_README_TEMPLATE_actually_WORKS_when_copied(repo):
         + chr(10) + out
     )
     assert "no clearance required" in out, out
+
+    # SF-3. The fence can lose its `[clearances]` section ENTIRELY -- the
+    # UNCOMMENT instruction, "Leave them commented", and the anti-fabrication
+    # sentence -- and everything above still passes: the constants test checks
+    # `watch`/`required`/`pr`, and a clearance-less fence is still accepted on
+    # a docs-only PR. So acceptance is necessary and not sufficient.
+    #
+    # These three phrases are pinned in the GENERATED skeleton already. The
+    # README is the artifact that actually went stale once, and the one an
+    # author is looking at while editing the directory it describes, so it
+    # gets the same treatment rather than less.
+    for phrase in ("UNCOMMENT and replace", "Leave them commented",
+                   "must not invent"):
+        assert phrase in template, (
+            ".reviewers/README.md lost its guidance: " + repr(phrase)
+            + " is gone from the schema fence. A template that is ACCEPTED but "
+            "silent is how an author ends up inventing a SHA to fill a shape."
+            + chr(10) + template
+        )
 
 
 @pytest.mark.parametrize(
