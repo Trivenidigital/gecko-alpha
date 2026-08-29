@@ -2179,7 +2179,18 @@ def test_a_GROWN_floor_reaches_the_skeleton_with_NO_second_edit(
     )
 
 
-@pytest.mark.parametrize("member", ["prod.state", 'we"ird', "back\\slash", "a b"])
+# `ctl` and `del` are not decoration. The control-character branch of
+# `_toml_str` shipped UNPINNED: deleting `elif ord(ch) < 0x20 or ord(ch) ==
+# 0x7F` passed this entire file. Every member originally chosen here had a
+# branch of its OWN -- `"`, `\` and `\n` are each handled explicitly -- so
+# nothing ever reached the fallback. A fixture assembled from the cases you
+# thought of cannot exercise the clause that exists for the ones you did not.
+# Third time that shape has surfaced on this PR, and the second time INSIDE a
+# test written to catch it.
+@pytest.mark.parametrize(
+    "member",
+    ["prod.state", 'we"ird', "back\\slash", "a b", "ctl\x01x", "del\x7fx"],
+)
 def test_a_METACHARACTER_vector_survives_as_a_FLAT_key(monkeypatch, member):
     """The mutant the GROWN test cannot see, and the reason it cannot.
 
@@ -2211,7 +2222,10 @@ def test_a_METACHARACTER_vector_survives_as_a_FLAT_key(monkeypatch, member):
     )
 
 
-@pytest.mark.parametrize("member", ['pa"th', "back\\slash", "new\nline"])
+@pytest.mark.parametrize(
+    "member",
+    ['pa"th', "back\\slash", "new\nline", "ctl\x01x", "del\x7fx"],
+)
 def test_a_METACHARACTER_watch_entry_is_ESCAPED(monkeypatch, member):
     import tomllib
 
