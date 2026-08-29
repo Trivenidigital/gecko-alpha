@@ -8,10 +8,10 @@ fails for the wrong reason is one that will pass for the wrong reason later.
 Several of these exist because an independent reviewer broke the first draft:
 a misspelled watch entry silently reported coverage, `required` could be
 narrowed to one vector, a branch name was accepted where a SHA belongs, and
-every PR was forced to edit the declaration to go green. The bypasses that
-remain -- no branch protection, and an author-writable record -- are documented
-in the script's docstring rather than papered over, because they cannot be
-closed from inside the repository.
+every PR was forced to edit the declaration to go green. Of the two bypasses
+this file used to name, branch protection was closed on 2026-08-28; the
+author-writable record remains and is now the only one. Both are documented in
+the script's docstring rather than papered over.
 """
 
 import os
@@ -2005,20 +2005,28 @@ def test_the_archive_sweep_READS_AND_PARSES_a_real_record(tmp_path):
 
 
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
 # TICKET 28 -- the first red must carry its own remedy.
 #
-# What these pin is not a wrong verdict; the verdict was always right. It is
-# that the FIRST author to open a PR after the per-PR design shipped meets a
-# red they cannot act on, and the natural places to explain it -- README, PR
-# template -- are ambient text that drifts. FOUR such copies drifted on the PR
-# that introduced this gate: a runbook naming a file the gate no longer reads,
-# the archive sweep restating the prefix as a literal, a comment asserting a
-# branch was unpinned six lines from its test, and a README sentence claiming
-# an absent `record_version` meant the writer had not forgotten.
+# Rewritten after four review vectors. Three of them found the same S2 from
+# different directions, and the block below is shaped by what they broke:
 #
-# So the contract is: the remedy is DERIVED from the live constants, printed
-# from inside the branch that detected the condition -- and the result stays
-# RED. A friendlier red is still a red.
+#   * the clearance lines are emitted COMMENTED OUT, so the default paste is
+#     the SAFE one. Live placeholders made a docs-only PR red, ALSO failed the
+#     other required check via the structural sweep, and -- worst -- made
+#     inventing four SHAs the path of least resistance.
+#   * `assert "COMMIT" in out.upper()` used to pass on the word "unCOMMITted"
+#     inside the sentence under test. The test named `..._says_COMMIT` did not
+#     test that it says COMMIT.
+#   * `assert ".reviewers/42.toml" in out` used to pass on the PRE-EXISTING
+#     FAIL line, leaving the new sentence's path unpinned.
+#   * the placeholder loop iterated `doc["clearances"]`, which is now EMPTY by
+#     design -- a loop over nothing asserts nothing.
+#
+# Each of those is the same shape: an assertion satisfied by something other
+# than the thing it names.
 # --------------------------------------------------------------------------
 
 
@@ -2027,8 +2035,8 @@ def _extract_skeleton(out):
 
     Deliberate: the contract is about what the READER receives, not what the
     function returns. Those differ the moment the print path mangles, wraps or
-    drops a line, and re-calling the generator would agree with itself in
-    exactly that case -- a comparison that cannot fail is not a test.
+    drops a line -- and re-calling the generator would agree with itself in
+    exactly that case. A comparison that cannot fail is not a test.
     """
     lines = out.split(chr(10))
     start = None
@@ -2053,10 +2061,30 @@ def _extract_skeleton(out):
     return chr(10).join(body)
 
 
+def _uncomment(body):
+    """Uncomment the clearance lines, as an author with real SHAs would."""
+    out = []
+    for line in body.split(chr(10)):
+        s = line.lstrip()
+        if s.startswith("# ") and " = " in s and _GATE.SKELETON_SHA in s:
+            out.append(s[2:])
+        else:
+            out.append(line)
+    return chr(10).join(out)
+
+
 def _first_red(repo, pr=PR):
     """A branch that moved production but carries no record."""
     _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
     return _run(repo, "HEAD", "master", pr=pr)
+
+
+def _commit_record(repo, body, pr=PR):
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (pr + ".toml")).write_bytes(body.encode("utf-8"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record")
 
 
 def test_the_MISSING_RECORD_red_carries_a_skeleton(repo):
@@ -2071,16 +2099,14 @@ def test_the_MISSING_RECORD_red_carries_a_skeleton(repo):
 def test_the_skeleton_does_NOT_relax_the_verdict(repo):
     """Ticket 28 is usability, not relaxation."""
     rc, out = _first_red(repo)
-    # WHICH red, not merely nonzero. Exit 2 means "undetermined", and a mutant
-    # that escapes through the undetermined channel satisfies `rc != 0` while
-    # destroying the distinction this module is built on.
+    # WHICH red, not merely nonzero. Exit 2 means "undetermined"; a mutant that
+    # escapes through that channel satisfies `rc != 0` while destroying the
+    # distinction this module is built on.
     assert rc == 1, "printing a remedy changed the verdict to " + str(rc) + chr(10) + out
     assert "no clearance FILE" in out, out
 
 
-def test_the_skeleton_is_VALID_TOML(repo):
-    """A template that does not parse costs a round trip to discover, and the
-    reader assumes their own edit broke it."""
+def test_the_skeleton_is_VALID_TOML_with_an_EMPTY_clearance_table(repo):
     import tomllib
 
     rc, out = _first_red(repo)
@@ -2088,21 +2114,36 @@ def test_the_skeleton_is_VALID_TOML(repo):
     doc = tomllib.loads(_extract_skeleton(out))
     assert doc["pr"] == int(PR), doc
     assert doc["record_version"] == _GATE.DEFAULT_RECORD_VERSION, doc
+    # EMPTY BY DESIGN, and the reason is the whole finding: the shape sweep runs
+    # before the "no delta => pass" branch, so live placeholders red a docs-only
+    # PR, fail the structural sweep in the other required job, and make
+    # fabricating four SHAs the easiest way out.
+    assert doc["clearances"] == {}, (
+        "clearances are live in the template -- a verbatim paste is unsafe:"
+        + chr(10) + _extract_skeleton(out)
+    )
 
 
-def test_the_skeleton_names_the_EXACT_path_and_says_COMMIT(repo):
-    """The two facts the reader needs and cannot infer.
+def test_the_remedy_SENTENCE_names_the_path_and_the_imperative(repo):
+    """Pinned AS A UNIT, and neither half by itself.
 
-    The path, because the number is theirs and the prefix is not. And COMMIT,
-    because the gate reads the revision rather than the working tree -- the
-    likeliest second mistake, and one that reproduces the SAME red with a
-    finished record sitting on disk.
+    `".reviewers/42.toml" in out` passed on the PRE-EXISTING FAIL line, so the
+    new sentence could name any path at all. And `"COMMIT" in out.upper()`
+    passed on the word "unCOMMITted" inside this very sentence -- the tokens
+    cross-matched, which is the failure this file's own comments record.
     """
     rc, out = _first_red(repo)
-    assert ".reviewers/" + PR + ".toml" in out, out
-    assert "COMMIT" in out.upper(), (
-        "the remedy never told the reader to commit:" + chr(10) + out
+    assert rc == 1, out
+    assert "Create .reviewers/" + PR + ".toml and COMMIT it" in out, (
+        "the remedy sentence does not name the exact path AND the imperative:"
+        + chr(10) + out
     )
+
+
+def test_the_remedy_does_not_read_as_a_CLEAN_BILL(repo):
+    """"Expected" is about THIS check. Later checks have not run."""
+    rc, out = _first_red(repo)
+    assert "certifies nothing else" in out, out
 
 
 def test_the_skeleton_MATCHES_the_live_floors(repo):
@@ -2120,11 +2161,9 @@ def test_a_GROWN_floor_reaches_the_skeleton_with_NO_second_edit(
 ):
     """THE regression this ticket exists to prevent, written as a mutation.
 
-    A hardcoded template passes every other test in this block and fails only
-    here -- which is why the assertion names the NEW member rather than merely
-    checking the template still parses. Same reason the floors are imported
-    from the gate and pinned literally in one place: derive for behaviour, pin
-    membership once.
+    A hardcoded template passes almost everything else here and fails only on
+    this -- which is why the assertion names the NEW member rather than merely
+    checking the template still parses.
     """
     import tomllib
 
@@ -2140,42 +2179,128 @@ def test_a_GROWN_floor_reaches_the_skeleton_with_NO_second_edit(
     )
 
 
-def test_the_PLACEHOLDER_is_deliberately_not_a_well_formed_sha(repo):
-    """Forty hex zeros would satisfy the format check and fail two stages later
-    as "not an ancestor" -- which reads as a broken clearance rather than an
-    unfilled template, and sends the reader to the wrong problem."""
+@pytest.mark.parametrize("member", ["prod.state", 'we"ird', "back\\slash", "a b"])
+def test_a_METACHARACTER_vector_survives_as_a_FLAT_key(monkeypatch, member):
+    """The mutant the GROWN test cannot see, and the reason it cannot.
+
+    That test injects "a-brand-new-floor-member" -- hyphens only, a legal bare
+    key. A fixture built from convenient values cannot exercise the clause that
+    handles inconvenient ones.
+
+    `prod.state` is the dangerous case: as a BARE key it parses cleanly and
+    silently becomes `[clearances.prod] state = ...`, so the vector gets no SHA
+    and the author is told "NO SHA RECORDED" for a key they can see in their
+    own file. Wrong-but-plausible beats unparseable at wasting a day.
+    """
     import tomllib
 
+    mod = _load_checker()
+    monkeypatch.setattr(
+        mod, "MANDATORY_VECTORS", frozenset(mod.MANDATORY_VECTORS | {member})
+    )
+    body = mod._skeleton(PR)
+    doc = tomllib.loads(body)
+    assert member in doc["required"], body
+    # NOT a raw substring check on the emitted text -- `back\slash` is
+    # correctly written as `"back\\slash"`, so a literal search would fail
+    # against ESCAPING THAT IS WORKING. Parse it back instead: round-tripping
+    # through tomllib is the only assertion that means what it says here.
+    assert member in tomllib.loads(_uncomment(body))["clearances"], (
+        "vector " + repr(member) + " did not survive as a FLAT clearance key:"
+        + chr(10) + body
+    )
+
+
+@pytest.mark.parametrize("member", ['pa"th', "back\\slash", "new\nline"])
+def test_a_METACHARACTER_watch_entry_is_ESCAPED(monkeypatch, member):
+    import tomllib
+
+    mod = _load_checker()
+    monkeypatch.setattr(
+        mod, "MANDATORY_WATCH", frozenset(mod.MANDATORY_WATCH | {member})
+    )
+    body = mod._skeleton(PR)
+    assert member in tomllib.loads(body)["watch"], (
+        "watch member " + repr(member) + " did not round-trip:" + chr(10) + body
+    )
+
+
+def test_the_PLACEHOLDER_appears_ONCE_PER_VECTOR_and_is_not_a_valid_sha(repo):
+    """Existence AND count, not a loop over whatever happens to be there.
+
+    The earlier version iterated `doc["clearances"]` -- now empty by design --
+    so it asserted nothing at all. A template emitting one vector, or none,
+    passed it.
+    """
     rc, out = _first_red(repo)
-    for vector, value in tomllib.loads(_extract_skeleton(out))["clearances"].items():
-        assert not _GATE._SHA_RE.match(value), (
-            "placeholder for " + vector + " is a well-formed SHA: " + value
-        )
+    body = _extract_skeleton(out)
+    n = body.count(_GATE.SKELETON_SHA)
+    assert n == len(_GATE.MANDATORY_VECTORS), (
+        "expected one placeholder per vector ("
+        + str(len(_GATE.MANDATORY_VECTORS)) + "), found " + str(n) + chr(10) + body
+    )
+    assert not _GATE._SHA_RE.match(_GATE.SKELETON_SHA), (
+        "the placeholder is a well-formed SHA, so an unedited record would be "
+        "rejected for a MISSING COMMIT rather than an unfilled template"
+    )
+
+
+def test_a_DOCS_ONLY_pr_goes_GREEN_on_a_VERBATIM_paste(repo):
+    """The finding three vectors converged on, as an executable contract.
+
+    The author does the least possible: copies the block, commits it, changes
+    nothing. Because the clearance lines are commented, that is the CORRECT
+    record for a PR with no watched delta -- and it must pass.
+    """
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _extract_skeleton(out))
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 0, (
+        "a verbatim paste of the printed remedy does NOT go green on a "
+        "docs-only PR:" + chr(10) + out2
+    )
+    assert "no clearance required" in out2, out2
+
+
+def test_an_UNCOMMENTED_but_UNFILLED_placeholder_is_REFUSED(repo):
+    """The state a hurried author reaches, and the mutant that survived.
+
+    An adversarial pass inserted `if str(sha) == SKELETON_SHA: continue` into
+    the shape loop -- the plausible "friendly" future change -- and the whole
+    suite stayed green. Nothing pinned that a live placeholder is REJECTED.
+    """
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _uncomment(_extract_skeleton(out)))
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 1, (
+        "an unedited placeholder was ACCEPTED as a clearance:" + chr(10) + out2
+    )
+    assert _GATE.SKELETON_SHA in out2, (
+        "the refusal never names the placeholder, so the author is not told "
+        "what is wrong:" + chr(10) + out2
+    )
 
 
 def test_the_skeleton_ROUND_TRIPS_to_a_GREEN(repo):
     """GREEN-IS-REACHABLE for the template, and the strongest test in the block.
 
-    Every other test here proves the skeleton is well-FORMED. None proves it is
+    Everything else proves the skeleton is well-FORMED. None of it proves it is
     SUFFICIENT -- a template can parse, match both floors, and still describe a
-    record the gate rejects. That is not hypothetical in this repo: a gate and
-    its own conformance test once demanded mutually unsatisfiable things, every
+    record the gate rejects. Not hypothetical here: a gate and its own
+    conformance test once demanded mutually unsatisfiable things, every
     component test passed, and no commit could go green.
-
-    So: take what was printed, substitute real reviewed SHAs, commit it, and
-    require exit 0.
     """
     sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
     rc, out = _run(repo, "HEAD", "master", pr=PR)
     assert rc == 1, out
 
-    body = _extract_skeleton(out).replace(_GATE.SKELETON_SHA, sha)
+    body = _uncomment(_extract_skeleton(out)).replace(_GATE.SKELETON_SHA, sha)
     assert _GATE.SKELETON_SHA not in body, "placeholder substitution failed"
-    d = repo / ".reviewers"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / (PR + ".toml")).write_bytes(body.encode("utf-8"))
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "record built from the printed skeleton")
+    _commit_record(repo, body)
 
     rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
     assert rc2 == 0, (
@@ -2184,15 +2309,26 @@ def test_the_skeleton_ROUND_TRIPS_to_a_GREEN(repo):
     )
 
 
-def test_the_skeleton_is_NOT_printed_on_OTHER_failures(repo):
-    """Scope. Emitting the template on every failure buries the specific
-    diagnosis under forty lines of boilerplate, and trains the reader to skip
-    the part that says what actually went wrong."""
+@pytest.mark.parametrize("kind", ["wrong_pr", "bad_toml", "narrowed"])
+def test_the_skeleton_is_NOT_printed_on_OTHER_failures(repo, kind):
+    """Scope, across THREE red branches rather than one.
+
+    A single-branch test proved only that the covered branch is clean; a
+    skeleton print added to any other red branch survived it. Emitting the
+    template on every failure buries the specific diagnosis and trains the
+    reader to skip the part that says what went wrong.
+    """
     sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
-    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, declared_pr=OTHER_PR)
+    if kind == "wrong_pr":
+        _decl(repo, {v: sha for v in MANDATORY_VECTORS}, declared_pr=OTHER_PR)
+    elif kind == "bad_toml":
+        _commit_record(repo, "pr = " + PR + chr(10) + "required = [oops")
+    else:
+        _decl(repo, {v: sha for v in MANDATORY_VECTORS},
+              required=["logic"], watch=["scout"])
     rc, out = _run(repo, "HEAD", "master", pr=PR)
-    assert rc != 0, out
+    assert rc == 1, out
     assert "[clearances]" not in out, (
-        "a skeleton was printed for a failure that is not a missing record:"
-        + chr(10) + out
+        "a skeleton was printed for a failure that is not a missing record ("
+        + kind + "):" + chr(10) + out
     )

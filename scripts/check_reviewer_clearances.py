@@ -9,14 +9,25 @@ PR #559: a clearance was recorded, production then moved underneath it, and the
 merge report went on asserting the clearance still held. Recomputing rather
 than re-reading is the whole mechanism.
 
-It is **NOT an independence mechanism, and cannot be made into one here.** Two
-things would be required, and neither exists in this repository today:
+It is **NOT an independence mechanism.** Two things were required; ONE now
+exists:
 
-1. **Branch protection.** With none configured, no CI check can make anything
-   unmergeable -- `mergeStateStatus` reads `UNSTABLE` (checks red, merge
-   permitted) rather than `BLOCKED`. Verified against this repo: PR #560 was
-   mergeable while this very check was failing.
-2. **A review record outside the author's reach.** `.reviewers/<pr>.toml` is
+1. **Branch protection.** **CONFIGURED 2026-08-28**, and this paragraph said
+   the opposite until then -- it read "with none configured, no CI check can
+   make anything unmergeable", which was true when written and false the
+   moment protection landed. Recorded rather than quietly edited, because a
+   security claim that decays silently is the failure this file exists to
+   prevent, and it decayed four lines from the top of the file arguing against
+   exactly that. `master` now requires `test` and `reviewer-clearances`, is
+   `strict` (a stale branch cannot merge on a verdict from a superseded
+   version of the check), and sets `enforce_admins`, so there is no
+   direct-push path. A blocked PR reads `BLOCKED` rather than `UNSTABLE`.
+   Note `required_approving_review_count` is **0 deliberately**: every PR here
+   has zero GitHub reviews, so requiring one would make every PR permanently
+   unmergeable. Requiring the PR *path* is enforcement; requiring an
+   *approval* would wedge the repo, and would not create item 2 either.
+2. **A review record outside the author's reach. STILL ABSENT, and now the
+   WHOLE of the gap.** `.reviewers/<pr>.toml` is
    author-writable, so repointing every clearance at the head is a four-line
    edit that turns this green -- and it makes step 3 vacuous, because the
    clearance tree is then compared against itself. GitHub review approvals
@@ -545,11 +556,53 @@ MANDATORY_WATCH = frozenset(
 
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
-#: The per-vector value in a generated skeleton. Deliberately NOT 40 hex zeros:
-#: a well-formed-but-wrong SHA passes the format check and fails two stages
-#: later as "not an ancestor", which reads like a broken clearance rather than
-#: an unfilled template. This fails immediately, and says what to do.
+#: The per-vector value in a generated skeleton.
+#:
+#: Deliberately NOT 40 hex zeros, but the reason is NOT that zeros would reach a
+#: later check -- an earlier draft of this comment claimed they "fail two stages
+#: later as 'not an ancestor'", and that was measured false. Forty hex zeros
+#: satisfy `_SHA_RE` and then fail on the very NEXT line, at the `rev-parse`
+#: existence test, with `00000000 is not a commit in this repo`. The ancestry
+#: check is never reached.
+#:
+#: The real reason is the MESSAGE. Compare what the reader is told:
+#:      zeros:       `00000000 is not a commit in this repo`
+#:      this value:  `'REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED' is not a
+#:                    full 40-hex SHA`
+#: The first describes a broken clearance and sends the reader looking for a
+#: missing commit. The second echoes the instruction back and is unmistakably
+#: an unfilled template. Same stage, same exit code; only the diagnosis differs,
+#: and the diagnosis is the entire product here.
 SKELETON_SHA = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
+
+
+def _toml_str(value: str) -> str:
+    """`value` as a TOML basic string, ESCAPED.
+
+    Not cosmetic. `_skeleton` serialises floor members that are ordinary
+    identifiers today, so an f-string with bare quotes is correct today and
+    silently wrong the first time a member contains `"`, `\\` or a control
+    character -- which is exactly the "correct when written, stale when a floor
+    moves" failure this whole function exists to prevent, reintroduced one
+    layer down inside the fix for it.
+    """
+    out = []
+    for ch in value:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _skeleton(pr: str) -> str:
@@ -575,18 +628,51 @@ def _skeleton(pr: str) -> str:
     is the audience the template is for.
     """
     vectors = sorted(MANDATORY_VECTORS)
-    pad = max(len(v) for v in vectors)
+    # QUOTED keys, not bare. A bare TOML key containing a dot is a NESTED TABLE:
+    # a vector named `prod.state` would emit a skeleton that PARSES CLEANLY,
+    # silently produce `[clearances.prod] state = ...`, and the record built
+    # from it would then red with "NO SHA RECORDED" for a vector the reader can
+    # see in the file. A template that is wrong-but-plausible is worse than one
+    # that fails to parse, because the reader debugs their own edit instead.
+    # Quoted keys are legal TOML and make `"prod.state"` a flat key.
+    keys = [_toml_str(v) for v in vectors]
+    pad = max(len(k) for k in keys)
     lines = [
         f"pr = {pr}",
         f"record_version = {DEFAULT_RECORD_VERSION}",
         "",
-        "required = [" + ", ".join(f'"{v}"' for v in vectors) + "]",
+        "required = [" + ", ".join(_toml_str(v) for v in vectors) + "]",
         "",
         "watch = [",
     ]
-    lines += [f'    "{w}",' for w in sorted(MANDATORY_WATCH)]
+    lines += [f"    {_toml_str(w)}," for w in sorted(MANDATORY_WATCH)]
     lines += ["]", "", "[clearances]"]
-    lines += [f'{v.ljust(pad)} = "{SKELETON_SHA}"' for v in vectors]
+    # COMMENTED OUT, so the default paste is the SAFE one. Two vectors found
+    # this independently and it is the difference between a papercut and a
+    # correctness bug:
+    #
+    #   * The shape sweep runs BEFORE the "no delta => pass" branch, so live
+    #     placeholders make a docs-only PR RED -- re-manufacturing the
+    #     permanently-red signal the docs-only exemption exists to prevent.
+    #   * A committed placeholder also fails the OTHER required check: the
+    #     suite sweeps every `.reviewers/*.toml` and asserts 40-hex, so the
+    #     author gets a second, unrelated-looking diagnosis in the `test` job.
+    #   * Worst: told four SHAs are required and unable to obtain them, an
+    #     author may INVENT them, and the gate accepts any four real commits.
+    #     A remedy that makes fabricated evidence the path of least resistance
+    #     is worse than no remedy, in the one file whose job is to make
+    #     evidence mean something.
+    #
+    # Commented, every default is correct: a docs-only PR pastes this
+    # UNEDITED and goes green; a PR that moved a watched path gets
+    # "NO SHA RECORDED", which names exactly what is missing.
+    lines += [
+        "# One line per vector that reviewed this PR: UNCOMMENT and replace",
+        "# the placeholder with the 40-hex SHA that vector actually named.",
+        "# Touched no watched path? Leave them commented -- an empty table is",
+        "# the correct record, and you must not invent a SHA to fill it.",
+    ]
+    lines += [f"# {k.ljust(pad)} = {_toml_str(SKELETON_SHA)}" for k in keys]
     return "\n".join(lines)
 
 #: Every `subprocess.run` in `scripts/` must pass an explicit timeout -- there is
@@ -726,6 +812,17 @@ def main(argv: list[str]) -> int:
             "broken gate. Your record cannot exist until you write it, and "
             "nothing can create it for you -- the file IS the evidence."
         )
+        # "Expected" is a statement about THIS check, not about the PR. The
+        # foreign-record guard and the lapse comparison both run AFTER this
+        # return, so a branch that also tampered with another PR's record gets
+        # this reassuring text and no mention of the tamper until it writes a
+        # record. Still red, nothing merges green -- but this would otherwise
+        # be the only line in the file that reads as a clean bill of health.
+        print(
+            "  It certifies nothing else. The remaining checks have not run "
+            "yet, so fix this and re-read the output rather than assuming "
+            "this was the only finding."
+        )
         print(
             f"  Create {DECL} and COMMIT it. The gate reads the revision "
             "under review, NOT your working tree, so an uncommitted record "
@@ -737,6 +834,28 @@ def main(argv: list[str]) -> int:
             "never narrow them. Each SHA is the revision that vector actually "
             "reviewed -- they need not all be equal, and a vector should name "
             "what it measured rather than a later head."
+        )
+        # THE DOCS-ONLY ESCAPE HATCH, and it is not a nicety.
+        #
+        # The malformed-shape check runs BEFORE the "no delta => pass" branch,
+        # so a docs-only PR that commits this template UNEDITED is refused for
+        # malformed clearances -- while the correct record for it is this same
+        # template with `[clearances]` left EMPTY. Without this line the remedy
+        # walks a docs-only author into a wall and the only exit it names is
+        # "each SHA is the revision that vector actually reviewed", which reads
+        # as mandatory.
+        #
+        # The danger is not the wasted round trip. It is that an author who
+        # cannot obtain four SHAs, and has been told they are required, may
+        # INVENT them -- and the gate would accept any four real commits. A
+        # remedy that makes fabricated evidence the path of least resistance is
+        # worse than no remedy, in the one file whose purpose is to make
+        # evidence mean something.
+        print(
+            "  The clearance lines are COMMENTED OUT on purpose: pasted "
+            "unedited, this record is correct for a PR that touches no "
+            "watched path. Uncomment one line per vector only when a vector "
+            "has actually named a SHA. Never invent one to satisfy the shape."
         )
         print(
             "\n  Skeleton, generated from this gate's live constants "

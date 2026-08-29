@@ -87,8 +87,12 @@ jobs:
     # ancestors of master the moment a PR lands. The revision under review is
     # the PR head.
     #
-    # NOTE: with no branch protection configured on master this job cannot
-    # block a merge. It reports. See the script docstring and the runbook.
+    # This job is REQUIRED by branch protection as of 2026-08-28, so it can
+    # now block a merge. It previously only reported, and this comment said so.
+    # The job name is the protection CONTEXT -- renaming it silently removes
+    # the requirement, because protection matches on the name and a context
+    # that never reports is simply absent. Do not rename without updating
+    # `gh api repos/:owner/:repo/branches/master/protection`.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
