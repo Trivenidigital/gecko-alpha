@@ -3493,9 +3493,29 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
     split attack is caught too: the gate-edit PR has nothing to diverge on and
     passes, and the env-line PR diverges against the already-edited gate.
 
+    WHERE THE HOSTILE VALUE COMES FROM, asked by a reviewer who suspected this
+    cell was vacuous on a clean box. It is not, and the reason is a property
+    rather than an accident:
+
+    **A name that CAN steer the gate must be present in the ambient
+    environment.** If it is absent, `get()` returns None, the gate falls back
+    to its default and is not steered -- there is no exploit to catch. So any
+    name capable of steering is in ambient by construction, and if it is
+    outside the whitelist the minimal run does not see it and the verdicts
+    diverge. The test does not need to guess the name or plant it.
+
+    On a clean box the two environments still genuinely differ -- measured, 81
+    ambient keys against 9 minimal, 72 dropped -- so this is a real
+    differential and not two identical runs. It passes there because none of
+    the 72 reaches a decision, which is the correct answer, and it would fail
+    if any of them did.
+
     Limits, stated: it covers the environment channel only, the whitelist needs
-    maintaining, and it is NOT closure -- the PR that edits the workflow can
-    edit this test. `required_workflows` is.
+    maintaining, and a gate that SHELLED OUT and let a child read the real
+    environment would escape it -- the child inherits `env=` from the parent
+    here, so that gap is narrower than it sounds but it is not zero. It is NOT
+    closure: the PR that edits the workflow can edit this test.
+    `required_workflows` is.
     """
     sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
     d = repo / ".reviewers"
