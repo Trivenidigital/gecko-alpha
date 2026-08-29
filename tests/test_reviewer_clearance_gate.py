@@ -3560,11 +3560,21 @@ def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
                        steering name land here.
 
       COMPARISON    -- the gate DEPENDS on an ambient name to reach the RIGHT
-                       answer. Demonstrated: a `_foreign_record_edits` that
-                       early-returns unless `APPDATA` is set passes the
-                       precondition (ambient has it) and fails the comparison
-                       with `(0, False) == (1, True)`. Silent dependence on
-                       ambient state, which nothing else here would notice.
+                       answer. Demonstrated by a `_foreign_record_edits` that
+                       early-returns unless a marker name is set: ambient has
+                       it so the guard runs and the precondition passes;
+                       minimal drops it so the guard no-ops, and
+                       `(0, False) == (1, True)` fails the comparison. Silent
+                       dependence on ambient state, which nothing else notices.
+
+                       USE AN INJECTED MARKER NAME, not a real one. The first
+                       version of this used `APPDATA`, which is ambient on
+                       Windows and ABSENT on a Linux runner -- so the
+                       demonstration only reproduces on the platform it was
+                       written on, and on CI would trip the proper-subset
+                       guard or nothing at all. Every measurement in this
+                       review was Windows; a reader reproducing on CI needs
+                       the portable form.
 
     Both are real and neither subsumes the other. A reviewer correctly flagged
     that the comparison had never been shown able to fail -- "a detector never
