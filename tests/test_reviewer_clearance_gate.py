@@ -2675,3 +2675,49 @@ def test_the_STDOUT_remedy_explains_the_commented_lines(repo):
         "stdout lost the anti-fabrication instruction:" + chr(10) + out
     )
 
+
+def test_the_README_TEMPLATE_actually_WORKS_when_copied(repo):
+    """SF-1. The existing README test compares CONSTANTS; this one runs it.
+
+    `test_the_README_TEMPLATE_matches_the_code_constants` asserts `watch`,
+    `required` and `pr` against the floors -- so it is structurally blind to the
+    `[clearances]` presentation, and the two artifacts silently diverged the
+    moment the generated skeleton started emitting commented lines. Measured
+    A/B on the same docs-only PR, `scripts/` byte-identical:
+
+        record copied from the README    -> rc=1, "recorded clearances are
+                                            malformed" x4
+        record copied from the skeleton  -> rc=0, "no clearance required"
+
+    Two documented artifacts, opposite outcomes, and the README is the one
+    sitting in the directory the author is writing into.
+
+    So this pins BEHAVIOUR rather than text. A text comparison would have to
+    tolerate the README's explanatory inline comments and would break on
+    formatting; what actually matters is that copying it produces a record the
+    gate accepts.
+    """
+    import re
+
+    readme = (REPO_ROOT / ".reviewers" / "README.md").read_text(encoding="utf-8")
+    fences = re.findall(r"```toml" + chr(10) + r"(.*?)" + chr(10) + r"```",
+                        readme, re.DOTALL)
+    assert len(fences) == 1, (
+        "expected exactly one ```toml fence in .reviewers/README.md, found "
+        + str(len(fences)) + " -- this test cannot know which one is the schema"
+    )
+    template = fences[0]
+    # the fence documents PR 564; make it this fixture's PR without touching
+    # anything else about it.
+    template = re.sub(r"\Apr = \d+", "pr = " + PR, template)
+
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    _commit_record(repo, template)
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 0, (
+        "a record copied verbatim from .reviewers/README.md is REJECTED by the "
+        "gate. The documented template and the generated one have diverged:"
+        + chr(10) + out
+    )
+    assert "no clearance required" in out, out
+

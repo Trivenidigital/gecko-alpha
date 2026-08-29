@@ -54,11 +54,29 @@ watch = [
 ]
 
 [clearances]
-concurrency    = "<40-hex sha the concurrency reviewer named>"
-logic          = "<40-hex sha>"
-ops-safety     = "<40-hex sha>"
-silent-failure = "<40-hex sha>"
+# One line per vector that reviewed this PR: UNCOMMENT and replace the
+# placeholder with the 40-hex SHA that vector actually named.
+# Touched no watched path? Leave them commented -- an empty table is the
+# correct record, and you must not invent a SHA to fill it.
+# "concurrency"    = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
+# "logic"          = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
+# "ops-safety"     = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
+# "silent-failure" = "REPLACE-WITH-THE-40-HEX-SHA-THIS-VECTOR-NAMED"
 ```
+
+**Do not hand-copy the block above if you can avoid it.** Run the gate on your
+PR and it prints a skeleton generated from the live constants:
+
+```bash
+python scripts/check_reviewer_clearances.py HEAD origin/master --pr <your PR>
+```
+
+The printed one cannot go stale; this one is a transcription and already did
+once. Until 2026-08-29 the fence here showed **live, uncommented** clearance
+lines with `<40-hex sha>` placeholders -- so copying it produced
+`recorded clearances are malformed` while copying the printed skeleton went
+green. Two documented artifacts, opposite outcomes, and this was the one
+sitting in the directory the author is writing into.
 
 `required` and `watch` are **floors, not choices** — a record may add to them
 and may not narrow them. The gate prints what is missing if you do.
