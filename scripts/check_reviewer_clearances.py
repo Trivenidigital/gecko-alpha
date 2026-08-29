@@ -118,7 +118,36 @@ from pathlib import Path
 #:
 #: It is a repo-relative prefix because records are now read out of the
 #: REVISION UNDER REVIEW, never off disk -- see `_read_record`.
-DECL_PREFIX = os.environ.get("REVIEWERS_PREFIX") or ".reviewers"
+#: NOT settable from the environment, and that removal is a SECURITY FIX
+#: rather than tidying.
+#:
+#: This read `os.environ.get("REVIEWERS_PREFIX")` until 2026-08-29. Because
+#: `DECL_PREFIX` feeds BOTH the record lookup AND `_foreign_record_edits`'s
+#: pathspec (`:(top)" + DECL_PREFIX`), one environment variable moved the
+#: foreign-record guard off the directory it exists to guard. Measured
+#: end-to-end: with `env: REVIEWERS_PREFIX=docs` added to the workflow, a PR
+#: rewrote ANOTHER PR's clearances and the gate exited 0 --
+#:
+#:      default prefix          -> exit 1, "this PR changes ANOTHER PR's
+#:                                 record(s): .reviewers/999.toml"
+#:      REVIEWERS_PREFIX=docs   -> exit 0, "all required vectors hold"
+#:
+#: -- while the victim's record differed between head and master. That is
+#: "a PR may only touch its OWN record", one of this gate's named properties,
+#: broken with a green. `.reviewers/` is deliberately off the watch floor, so
+#: the delta path does not catch it either: the foreign-record guard was the
+#: only thing standing there.
+#:
+#: The docstring justified the variable as "so the test-suite can drive the
+#: real script against a purpose-built repository." **It never did.** All
+#: three call sites set it to `.reviewers` -- the default -- so the override
+#: was exercised by nothing and steered a security guard. A phantom lever:
+#: the capability was unused and the hole was real, so the fix is deletion,
+#: not a safer channel for a thing nobody needed.
+#:
+#: Tests that need a different prefix monkeypatch this module attribute
+#: IN-PROCESS, which no workflow edit can reach.
+DECL_PREFIX = ".reviewers"
 
 
 #: Record schema versions this reader understands.

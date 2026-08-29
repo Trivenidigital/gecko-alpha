@@ -80,7 +80,7 @@ def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
     argv = [sys.executable, str(SCRIPT), head, base]
     if pr is not None:
         argv += ["--pr", pr]
-    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
+    env = {**os.environ}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
@@ -522,7 +522,7 @@ def test_a_MALFORMED_stored_clearance_is_caught_at_rest(repo):
 
 def _run_argv(repo, extra, env_pr=None):
     """Drive the script with an EXACT argv tail, preserving order."""
-    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
+    env = {**os.environ}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
@@ -1613,7 +1613,7 @@ def test_the_C1_guard_fires_from_a_SUBDIRECTORY(repo, monkeypatch):
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR],
         cwd=str(sub), capture_output=True, text=True,
-        env={**os.environ, "REVIEWERS_PREFIX": ".reviewers"},
+        env={**os.environ},
     )
     out = r.stdout + r.stderr
     assert r.returncode == 1, (
@@ -2617,6 +2617,21 @@ def test_the_clearance_job_INVOKES_the_gate_with_a_PINNED_script():
         "the clearance JOB sets `defaults:` -- `defaults.run.shell` reaches "
         "the step without appearing in it"
     )
+    # `env:` too, and this one is not CI hygiene -- it was a live break of
+    # "a PR may only touch its OWN record". `DECL_PREFIX` fed both the record
+    # lookup and the foreign-record pathspec, so one `env:` line moved the
+    # guard off the directory it guards and a PR rewrote another PR's
+    # clearances with a green. The gate no longer reads the environment at
+    # all, so this is defence-in-depth rather than the barrier -- but a job
+    # that suddenly needs `env:` on the step that runs a security gate is
+    # worth a reviewer's eye regardless.
+    assert "env" not in step, (
+        "the clearance step sets `env:` (" + repr(step.get("env")) + ")"
+    )
+    assert "env" not in job, (
+        "the clearance JOB sets `env:` -- it reaches the step without "
+        "appearing in it"
+    )
     assert "if" not in step, (
         "the clearance step carries a STEP-LEVEL `if:` -- a skipped step runs "
         "nothing while the job still reports a non-failure, and the job-level "
@@ -2644,6 +2659,11 @@ def test_NO_workflow_LEVEL_defaults_reach_the_required_jobs():
     default is correct, and any override belongs in front of a reviewer.
     """
     for fname, doc in _load_workflows().items():
+        assert "env" not in doc, (
+            fname + " sets a workflow-level `env:` (" + repr(doc.get("env"))
+            + "). Workflow env reaches every step of every job without "
+            "appearing in any of them."
+        )
         assert "defaults" not in doc, (
             fname + " sets a workflow-level `defaults:` (" +
             repr(doc.get("defaults")) + "). `defaults.run.shell` reaches every "
@@ -2917,4 +2937,61 @@ def test_the_OPERATOR_DOCS_do_not_reassert_that_protection_is_OFF(doc_rel):
                     doc_rel + " reasserts a claim branch protection falsified: "
                     + repr(stale) + chr(10) + "  line: " + line.strip()
                 )
+
+
+def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch):
+    """W18. The lever that broke "a PR may only touch its OWN record".
+
+    `DECL_PREFIX` fed the record lookup AND `_foreign_record_edits`'s pathspec,
+    and it was read from `REVIEWERS_PREFIX` at import. So one `env:` line in
+    the workflow moved the foreign-record guard off the directory it guards --
+    measured end-to-end, a PR rewrote another PR's clearances and the gate
+    exited 0, while the victim's record differed between head and master.
+    `.reviewers/` is deliberately off the watch floor, so nothing else caught
+    it.
+
+    The override was also a PHANTOM: its documented purpose was "so the
+    test-suite can drive the real script against a purpose-built repo", and
+    all three call sites set it to the default. Unused capability, real hole
+    -- so it was deleted rather than moved to a safer channel.
+
+    This asserts the SOURCE, not a behaviour downstream of it: read the module
+    fresh with the variable set to something else and require the constant to
+    be unmoved. A behavioural assertion would pass the day someone reintroduces
+    the read with a different variable name.
+    """
+    import importlib.util
+
+    monkeypatch.setenv("REVIEWERS_PREFIX", "docs")
+    spec = importlib.util.spec_from_file_location("_w18", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.DECL_PREFIX == ".reviewers", (
+        "REVIEWERS_PREFIX steered DECL_PREFIX to " + repr(mod.DECL_PREFIX)
+        + " -- this re-points the foreign-record guard off the directory it "
+        "guards, and one workflow `env:` line is enough to set it"
+    )
+    # AST, not a substring sweep over the file. `os.environ` is still read
+    # legitimately for the `REVIEWERS_PR` identity fallback -- which fails
+    # CLOSED (`--pr 565` disagreeing with `REVIEWERS_PR 999` exits 2), so a
+    # blanket "no environ anywhere" ban would forbid a channel that is safe
+    # and forbid it for the wrong reason. The property is narrower: the
+    # DECLARATION PREFIX specifically must be a literal.
+    import ast
+
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    assigns = [
+        n for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", None) == "DECL_PREFIX" for t in n.targets)
+    ]
+    assert len(assigns) == 1, (
+        "expected exactly one module-level DECL_PREFIX assignment, found "
+        + str(len(assigns))
+    )
+    assert isinstance(assigns[0].value, ast.Constant), (
+        "DECL_PREFIX is computed (" + ast.dump(assigns[0].value)[:120]
+        + ") rather than a literal. Anything computed here can be steered by "
+        "whatever feeds it, and this constant aims the foreign-record guard."
+    )
 
