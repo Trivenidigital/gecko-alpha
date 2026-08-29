@@ -2332,3 +2332,75 @@ def test_the_skeleton_is_NOT_printed_on_OTHER_failures(repo, kind):
         "a skeleton was printed for a failure that is not a missing record ("
         + kind + "):" + chr(10) + out
     )
+
+
+# --- Round 3, from the silent-failure vector's pre-emptive notes on the
+# --- commented-clearances redesign. All three are about the INSTRUMENT: the
+# --- redesign moved work out of the gate and into the test's own edit.
+
+
+def test_the_INSTRUCTION_matches_what_the_round_trip_test_DOES(repo):
+    """SF note 1. `_uncomment()` is the test's OWN invention.
+
+    Before the redesign the round-trip was a pure substitution, so "what the
+    reader receives" and "what the test commits" were the same artifact. Now
+    the test must also strip comment markers -- and it could strip them in a
+    way no human would, and still report a successful round trip. The
+    green-is-reachable proof became conditional on un-commenting logic that
+    nothing pinned.
+
+    So pin the join: the printed text must actually TELL the reader to
+    uncomment. If the instruction stops saying it, this fails even though
+    `_uncomment` still works.
+    """
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    assert "UNCOMMENT" in _extract_skeleton(out).upper(), (
+        "the template never tells the reader to uncomment, but the round-trip "
+        "test does it anyway -- the test is proving its own edit, not the "
+        "documented one:" + chr(10) + out
+    )
+
+
+def test_the_PLACEHOLDERS_sit_UNDER_the_clearances_table(repo):
+    """SF note 2. `count(...) == len(vectors)` counts occurrences ANYWHERE.
+
+    That is what lets it see through comment markers, and it is why it kills
+    the emit-one-vector and emit-none mutants the old loop survived. But it
+    stopped proving LOCATION: four placeholders sitting in the prose would
+    satisfy it. Pair, rather than replace.
+    """
+    rc, out = _first_red(repo)
+    body = _extract_skeleton(out)
+    head, _, tail = body.partition("[clearances]")
+    assert _GATE.SKELETON_SHA not in head, (
+        "a placeholder appears BEFORE [clearances]:" + chr(10) + body
+    )
+    assert tail.count(_GATE.SKELETON_SHA) == len(_GATE.MANDATORY_VECTORS), (
+        "placeholders are not all under [clearances]:" + chr(10) + body
+    )
+
+
+def test_an_EMPTY_clearance_table_still_REDS_a_PRODUCTION_pr(repo):
+    """SF note 3, and the one that matters most after the redesign.
+
+    An empty `[clearances]` used to be a typo. It is now the DEFAULT PASTE, so
+    it stops being a rare state and becomes the common one. The docs-only green
+    is the intended exemption; the production red is the property that must not
+    have been traded away to get it.
+
+    `shape_errors` is scoped to `required_set` and iterates an empty dict, so
+    it raises nothing -- the red has to come from the per-vector loop instead.
+    Worth pinning explicitly rather than inferring from that reading.
+    """
+    _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _extract_skeleton(out))      # verbatim: clearances empty
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 1, (
+        "an EMPTY clearance table passed a PR that moved a watched path:"
+        + chr(10) + out2
+    )
+    assert "NO SHA RECORDED" in out2, out2
+
