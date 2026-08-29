@@ -3026,18 +3026,71 @@ def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch
     import ast
 
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-    assigns = [
-        n for n in tree.body
-        if isinstance(n, ast.Assign)
-        and any(getattr(t, "id", None) == "DECL_PREFIX" for t in n.targets)
-    ]
-    assert len(assigns) == 1, (
-        "expected exactly one module-level DECL_PREFIX assignment, found "
-        + str(len(assigns))
+
+    # ast.walk, NOT tree.body. The first version of this scanned module level
+    # only, so a `global DECL_PREFIX` rebind inside a function -- called from
+    # main(), after import -- was invisible to BOTH halves of this test: the
+    # AST half never looked inside functions, and the behavioural half above
+    # reads the value at IMPORT, before main() runs. Measured surviving, and it
+    # reopened W18 to exit 0.
+    #
+    # AnnAssign as well as Assign: `DECL_PREFIX: str = os.environ.get(...)` is
+    # not an ast.Assign, so an Assign-only scan found ZERO bindings and
+    # "failed" with a count message -- caught, but for the wrong reason, and it
+    # would equally have fired on a legitimate `DECL_PREFIX: str = ".reviewers"`.
+    # A guard that is right by accident is one that goes wrong on a valid edit.
+    binds = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if any(getattr(t, "id", None) == "DECL_PREFIX" for t in node.targets):
+                binds.append(node)
+        elif isinstance(node, ast.AnnAssign):
+            if getattr(node.target, "id", None) == "DECL_PREFIX":
+                binds.append(node)
+        elif isinstance(node, ast.Global) and "DECL_PREFIX" in node.names:
+            raise AssertionError(
+                "the gate declares `global DECL_PREFIX` -- a function can then "
+                "rebind the prefix after import, which re-aims the "
+                "foreign-record guard and is invisible to any import-time check"
+            )
+    assert len(binds) == 1, (
+        "expected exactly one DECL_PREFIX binding anywhere in the gate, found "
+        + str(len(binds)) + ". More than one means something rebinds it."
     )
-    assert isinstance(assigns[0].value, ast.Constant), (
-        "DECL_PREFIX is computed (" + ast.dump(assigns[0].value)[:120]
+    assert isinstance(binds[0].value, ast.Constant), (
+        "DECL_PREFIX is computed (" + ast.dump(binds[0].value)[:120]
         + ") rather than a literal. Anything computed here can be steered by "
         "whatever feeds it, and this constant aims the foreign-record guard."
+    )
+
+    # PIN THE DATA PATH, not just its source. Deleting the env read at the
+    # binding site does not stop someone reintroducing it AT THE USE SITE --
+    # `":(top)" + (os.environ.get("REVIEWERS_PREFIX") or DECL_PREFIX)` inside
+    # `_foreign_record_edits` restores the exploit while every assertion above
+    # still passes. Measured surviving.
+    #
+    # Same move as pinning the normalized `run:` rather than blocklisting shell
+    # fragments: assert the expression that AIMS the guard is exactly the two
+    # things it should be.
+    fn = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_foreign_record_edits"
+    ]
+    assert len(fn) == 1, "expected one _foreign_record_edits definition"
+    pathspecs = [
+        n for n in ast.walk(fn[0])
+        if isinstance(n, ast.BinOp)
+        and isinstance(n.left, ast.Constant)
+        and n.left.value == ":(top)"
+    ]
+    assert len(pathspecs) == 1, (
+        "expected exactly one ':(top)' pathspec expression in "
+        "_foreign_record_edits, found " + str(len(pathspecs))
+    )
+    assert isinstance(pathspecs[0].right, ast.Name)         and pathspecs[0].right.id == "DECL_PREFIX", (
+        "the foreign-record pathspec is aimed by "
+        + ast.dump(pathspecs[0].right)[:120] + " rather than by the bare "
+        "DECL_PREFIX constant. Anything else here can be steered without "
+        "touching the binding site."
     )
 
