@@ -2651,6 +2651,91 @@ def test_NO_workflow_LEVEL_defaults_reach_the_required_jobs():
         )
 
 
+def test_the_TEST_job_that_DELIVERS_these_guards_is_itself_pinned():
+    """F7. The guard was ASYMMETRIC, and the weaker side delivers the guard.
+
+    `test` is a required protection context, and **every assertion in this
+    file -- the structural workflow pin included -- is executed by pytest
+    inside it.** So a one-line edit to the `test` job disables the entire
+    test-based defence while both required contexts still report a
+    non-failure: `|| true` yields `success`, and `if: false` yields `skipped`,
+    which this repo has observed reporting under a required context name.
+
+    Measured before this test existed: `|| true` on the pytest step and
+    `if: false` on the job BOTH survived the whole guard, while the identical
+    `if:` tamper on `reviewer-clearances` was killed.
+
+    That matters for the honest framing of the residual. The file says the
+    remaining route is "the same PR that edits the workflow can edit this
+    file" -- a TWO-place edit. The `test`-job neuter needed neither. Leaving it
+    would have made that sentence the same kind of unmeasured claim as the
+    "one-line to two-line" one this guard already had to retract.
+
+    Deliberately narrower than the clearance job's pin: the individual `run:`
+    bodies are NOT pinned, because they legitimately change whenever the test
+    invocation does, and a guard that cries wolf on ordinary edits gets
+    deleted. What is pinned is the structure a neuter must alter -- the step
+    inventory, the absence of a job condition, and the absence of any shell
+    override.
+    """
+    hits = _jobs_by_context().get("test", [])
+    assert len(hits) == 1, "the `test` context is not uniquely defined"
+    _, jid, job = hits[0]
+
+    assert "if" not in job, (
+        "the `test` job carries a job-level `if:` (" + repr(job.get("if"))
+        + "). A skipped job reports `skipped` under the required context name "
+        "while running none of the guards it delivers."
+    )
+    assert "defaults" not in job, "the `test` job sets `defaults:`"
+
+    steps = job.get("steps") or []
+    inventory = [
+        (st.get("uses") or "").split("@")[0] or ("run:" + str(st.get("name")))
+        for st in steps
+    ]
+    assert inventory == [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "run:Set up Python 3.12",
+        "run:Install dependencies",
+        "run:Dashboard contract firewalls",
+        "run:Run tests",
+        "run:Regression protection — test count baseline (spec §11.9)",
+    ], (
+        "the `test` job's STEP INVENTORY changed: " + repr(inventory)
+        + ". Adding or removing a step here changes what enforces every other "
+        "assertion in this file -- if intentional, update this list in the "
+        "same commit so a reviewer sees it."
+    )
+    for i, st in enumerate(steps):
+        assert "shell" not in st, (
+            "step " + str(i) + " of `test` overrides `shell:` -- a custom shell "
+            "template can print a script instead of executing it"
+        )
+        assert "if" not in st, (
+            "step " + str(i) + " of `test` carries a step-level `if:`; a "
+            "skipped step runs nothing while the job still reports success"
+        )
+
+    pytest_steps = [
+        st for st in steps
+        if "run" in st and "pytest" in st["run"] and "--timeout" in st["run"]
+    ]
+    assert len(pytest_steps) == 1, (
+        "expected exactly one full-suite pytest step in `test`, found "
+        + str(len(pytest_steps)) + " -- this is the step that executes every "
+        "guard in this file"
+    )
+    body = pytest_steps[0]["run"]
+    for swallow in ("|| true", "||true", "|| :", "continue-on-error", "set +e"):
+        assert swallow not in body, (
+            "the full-suite pytest step swallows its own failure via "
+            + repr(swallow) + " -- every assertion in this file would still "
+            "report green"
+        )
+
+
 def test_the_clearance_job_CONDITION_is_pinned_exactly():
     """Pinned by equality, not by "is not false".
 
@@ -2783,4 +2868,53 @@ def test_the_README_TEMPLATE_actually_WORKS_when_copied(repo):
         + chr(10) + out
     )
     assert "no clearance required" in out, out
+
+
+@pytest.mark.parametrize(
+    "doc_rel",
+    ["docs/runbook_recompute_coverage.md", ".reviewers/README.md"],
+)
+def test_the_OPERATOR_DOCS_do_not_reassert_that_protection_is_OFF(doc_rel):
+    """F8. F5's own fix was unpinned, which reproduces the condition that
+    produced F5.
+
+    The runbook asserted "Branch protection is OFF" and printed
+    `404 Branch not protected` as its proof, on a repository where the command
+    returns 200. That is worse than no evidence, because the stale output is
+    what made it persuasive. It was corrected -- and nothing stopped it, or the
+    README, decaying back by exactly the route it decayed by the first time.
+
+    A NEGATIVE pin, deliberately, and it is the cheap half of the problem: it
+    cannot verify the protection config is what the docs say (that needs the
+    API, i.e. network and auth in CI, and remains genuinely unpinned -- the
+    runbook's "run this command yourself" framing is the honest mitigation).
+    What it CAN do is stop the specific false claims from coming back.
+
+    Phrases are matched OUTSIDE code fences and outside quoted history: both
+    documents deliberately quote what they used to say, and a naive substring
+    sweep would fire on the correction itself -- a guard that forbids
+    describing the bug it fixed.
+    """
+    import re
+
+    text = (REPO_ROOT / doc_rel).read_text(encoding="utf-8")
+    prose = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    prose = chr(10).join(
+        l for l in prose.split(chr(10)) if not l.lstrip().startswith((">", "#"))
+    )
+    for stale in (
+        "Branch protection is OFF",
+        "no CI check in this repo can block",
+        "controls that do not exist yet",
+    ):
+        # allow the phrase where the document is explicitly quoting its own
+        # former text -- those lines carry "until" or "said" nearby.
+        for line in prose.split(chr(10)):
+            if stale in line and not any(
+                m in line for m in ("until", "said", "used to", "asserted")
+            ):
+                raise AssertionError(
+                    doc_rel + " reasserts a claim branch protection falsified: "
+                    + repr(stale) + chr(10) + "  line: " + line.strip()
+                )
 

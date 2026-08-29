@@ -55,7 +55,10 @@ by the watchpoint added directly above it.)
 `scripts/check_reviewer_clearances.py` is a **lapse detector**, not an
 enforcement gate, and the difference is not a caveat — it is the whole security
 model. Two things are required to make an unreviewed merge actually impossible,
-and **neither can be done from inside the repository**:
+and **neither can be done from inside the repository. One of the two has since
+been done** — see item 1 — which is why this sentence no longer means what it
+did when it was written: "cannot be done from inside the repository" describes
+where the action lives, not whether it has happened.
 
 **1. Branch protection — ENABLED 2026-08-28.** This section said "OFF" until
 then, and printed a `404 Branch not protected` as its proof. Re-run the same
