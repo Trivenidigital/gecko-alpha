@@ -113,11 +113,11 @@ import tomllib
 from pathlib import Path
 
 #: Directory holding per-PR clearance records, as a path INSIDE the repository
-#: rather than a filesystem location. `REVIEWERS_PREFIX` overrides it so the
-#: test-suite can drive the real script against a purpose-built repository.
+#: rather than a filesystem location.
 #:
 #: It is a repo-relative prefix because records are now read out of the
 #: REVISION UNDER REVIEW, never off disk -- see `_read_record`.
+#:
 #: NOT settable from the environment, and that removal is a SECURITY FIX
 #: rather than tidying.
 #:
