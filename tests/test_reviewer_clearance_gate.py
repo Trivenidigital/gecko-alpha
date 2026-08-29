@@ -3360,15 +3360,32 @@ class _HostileEnv(dict):
     HOSTILE = "docs"
     EXEMPT = frozenset({"REVIEWERS_PR"})
 
+    #: STR KEYS ONLY. Synthesising a value for every missing key of any type
+    #: broke CI on Linux and passed on Windows:
+    #:
+    #:     ValueError: env cannot contain 'PATH' and b'PATH' keys
+    #:
+    #: POSIX `subprocess` probes the mapping with BYTES keys as well as str,
+    #: and a shim that answers both makes it look like the caller supplied a
+    #: conflicting environment. Windows never asks, so eleven rounds of local
+    #: measurement could not see it -- which is the Linux-parity caveat every
+    #: reviewer attached to every round, arriving as a real failure.
+    #:
+    #: The reviewer who proposed this shim also flagged it: "my shim makes
+    #: `__contains__` return True for all keys, which is aggressive; a
+    #: production version should be gentler." Recorded and not acted on.
+    def _synth(self, key):
+        return isinstance(key, str) and key not in self.EXEMPT
+
     def get(self, key, default=None):
         if key in self:
             return dict.get(self, key)
-        return default if key in self.EXEMPT else self.HOSTILE
+        return self.HOSTILE if self._synth(key) else default
 
     def __missing__(self, key):
-        if key in self.EXEMPT:
-            raise KeyError(key)
-        return self.HOSTILE
+        if self._synth(key):
+            return self.HOSTILE
+        raise KeyError(key)
 
 
 def test_NO_environment_NAME_can_change_a_verdict(repo, monkeypatch, capsys):
