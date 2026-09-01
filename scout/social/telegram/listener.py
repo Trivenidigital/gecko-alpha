@@ -731,6 +731,26 @@ async def _append_dlq(
         )
 
 
+def _message_age_minutes(posted_at: Any) -> float | None:
+    """Minutes between ``posted_at`` and now, or None if not computable.
+
+    Telethon supplies tz-aware UTC datetimes. A naive value (test stubs, or
+    a future Telethon change) is interpreted as UTC rather than raising,
+    because a TypeError here would propagate into the listener's per-message
+    handler and turn an age check into a dropped message.
+
+    A negative result (clock skew, or a message dated in the future) is
+    returned as-is; the caller compares with ``>`` so skew can only ever
+    make a message look NEWER, never older than it is.
+    """
+    if not isinstance(posted_at, datetime):
+        return None
+    ts = posted_at if posted_at.tzinfo is not None else posted_at.replace(
+        tzinfo=timezone.utc
+    )
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+
+
 async def handle_new_message(
     event: Any,
     *,
@@ -863,6 +883,31 @@ async def handle_new_message(
         cashtag_count=len(parsed.cashtags),
         contract_count=len(parsed.contracts),
     )
+
+    # Catchup-replay guard. `_catchup_channel` replays historical messages
+    # through THIS function, identically to live ones, and nothing downstream
+    # inspects message age — so without this bound a catchup pass resolves,
+    # alerts and (on trade_eligible channels) paper-trades months-old calls as
+    # if they had just fired. Deliberately placed AFTER the persist above: the
+    # row is kept and the watermark has already advanced, so a skipped replay
+    # still makes forward progress instead of being re-fetched every restart.
+    #
+    # Live messages arrive with age ~0, so this never gates the live path.
+    max_age_min = int(getattr(settings, "TG_SOCIAL_MAX_MESSAGE_AGE_MIN", 0) or 0)
+    if max_age_min > 0:
+        age_min = _message_age_minutes(posted_at)
+        # age_min is None only when the timestamp is unusable. Fail OPEN there:
+        # dropping a live message because its age could not be computed is a
+        # worse failure than replaying one stale message.
+        if age_min is not None and age_min > max_age_min:
+            log.info(
+                "tg_social_message_too_old",
+                channel_handle=channel_handle,
+                msg_id=msg_id,
+                age_min=int(age_min),
+                max_age_min=max_age_min,
+            )
+            return
 
     # Resolution — non-blocking transient retry. If the first attempt returns
     # TRANSIENT, we DO NOT block the listener for 60s here (devil's advocate

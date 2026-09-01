@@ -1424,6 +1424,17 @@ class Settings(BaseSettings):
     PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0
     PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5
     TG_SOCIAL_CATCHUP_LIMIT: int = 200
+    # Catchup replays historical messages through the SAME path as live ones
+    # (handle_new_message), and nothing else filters on message age — so a
+    # catchup pass would alert/trade on months-old calls as if they just
+    # fired. This bounds that: a message older than the threshold is still
+    # persisted (and still advances the watermark, so catchup makes forward
+    # progress) but is not resolved, alerted, or traded.
+    #
+    # Live messages arrive with age ~0, so any positive value is a no-op for
+    # live traffic; this gates REPLAY only. 0 disables the check entirely
+    # (process every message regardless of age) — the pre-guard behaviour.
+    TG_SOCIAL_MAX_MESSAGE_AGE_MIN: int = Field(default=60, ge=0)
     TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
     TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
     TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
