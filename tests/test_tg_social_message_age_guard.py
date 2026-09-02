@@ -74,9 +74,9 @@ def resolve_spy(monkeypatch):
 
     async def _spy(*args, **kwargs):
         calls.append((args, kwargs))
-        raise AssertionError(
-            "resolve_and_enrich reached — guard should have returned first"
-        )
+        # Raise so nothing downstream (alerting, dispatch) executes, and so a
+        # test that EXPECTS resolution can assert on it positively.
+        raise RuntimeError("resolve-reached")
 
     monkeypatch.setattr(listener_mod, "resolve_and_enrich", _spy)
     return calls
@@ -114,12 +114,19 @@ async def test_stale_message_is_persisted_but_not_resolved(
         await db.close()
 
 
-async def test_stale_message_still_advances_the_watermark(
+async def test_skipped_replay_still_persists_its_watermark_row(
     tmp_path, settings_factory, resolve_spy
 ):
-    """Forward progress. If a skipped replay left the watermark behind, every
-    restart would re-fetch and re-skip the same message forever, and catchup
-    could never reach the newer messages sitting behind it."""
+    """A skipped replay still writes its watermark row.
+
+    Deliberately NOT named "advances the watermark": that framing was
+    retracted. `_catchup_channel` iterates newest-first and the watermark
+    UPSERT is last-write-wins with no MAX(), so a multi-message batch ends
+    on its OLDEST id and IS re-fetched next restart. What this pins is the
+    narrower true property -- the guard runs after persist, so a skip leaves
+    a row behind rather than a hole -- which is what kills a
+    guard-before-persist mutant.
+    """
     settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
     db = await _mkdb(tmp_path)
     try:
@@ -284,7 +291,170 @@ async def test_skip_is_counted_in_the_pass_stats(
         old = datetime.now(timezone.utc) - timedelta(days=2)
         await _run(db, settings, _event(603, old), stats=stats)
         await _run(db, settings, _event(604, old), stats=stats)
+        # A FRESH replay sharing the same dict. Without this the test proves
+        # only that the counter increments per call, so hoisting the
+        # increment out of the skip branch -- counting every replayed
+        # message, stale or not -- would survive.
+        with pytest.raises(RuntimeError, match="resolve-reached"):
+            await _run(db, settings, _event(605, datetime.now(timezone.utc)), stats=stats)
         assert stats == {"skipped_stale": 2}
+    finally:
+        await db.close()
+
+
+# -- _catchup_channel wiring ---------------------------------------------
+#
+# Everything above calls handle_new_message DIRECTLY and supplies is_replay
+# itself, which pins the GUARD but not the WIRING. Four reviewers independently
+# found that deleting `is_replay=True` at the _catchup_channel call site
+# reverts this entire feature to a no-op with the whole suite green. These two
+# tests are the falsifier for that.
+
+
+class _FakeMsg:
+    def __init__(self, msg_id: int, posted_at):
+        self.id = msg_id
+        self.message = TEXT
+        self.text = TEXT
+        self.date = posted_at
+
+    async def get_chat(self):
+        return SimpleNamespace(username=CHANNEL.lstrip("@"), id=-100123)
+
+    async def get_sender(self):
+        return SimpleNamespace(username="curator", first_name="Curator")
+
+
+class _FakeClient:
+    """Yields messages instead of raising.
+
+    Every pre-existing _catchup_channel test drives iter_messages with a
+    RAISING fake, which is why no message has ever reached the handler
+    through this path.
+    """
+
+    def __init__(self, messages):
+        self._messages = messages
+
+    def iter_messages(self, channel, min_id=0, limit=None):
+        async def _gen():
+            for m in self._messages:
+                yield m
+
+        return _gen()
+
+
+async def test_catchup_applies_the_guard_and_reports_the_pass(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Drives a real _catchup_channel pass: 1 fresh + 2 stale, newest-first.
+
+    Kills three mutants that the rest of the suite cannot see:
+      * delete `is_replay=True`   -> replays ungated, feature is a no-op
+      * delete `stats=pass_stats` -> counter never increments
+      * delete the aggregate log  -> per-pass summary disappears
+
+    NOTE the spy RECORDS rather than raises. `_catchup_channel` funnels
+    per-message exceptions into the DLQ and keeps iterating, so a raising
+    spy is swallowed and the assertion passes against the mutant -- the
+    reviewer who wrote this falsifier first hit exactly that.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+    from scout.social.telegram.models import ResolutionResult, ResolutionState
+
+    resolved: list[int] = []
+
+    async def _resolve(*args, **kwargs):
+        resolved.append(1)
+        return ResolutionResult(state=ResolutionState.UNRESOLVED_TERMINAL)
+
+    async def _replay(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(listener_mod, "resolve_and_enrich", _resolve)
+    monkeypatch.setattr(listener_mod, "_replay_post_resolution", _replay)
+
+    now = datetime.now(timezone.utc)
+    client = _FakeClient(
+        [
+            _FakeMsg(903, now),                          # fresh  -> resolves
+            _FakeMsg(902, now - timedelta(days=3)),      # stale  -> skipped
+            _FakeMsg(901, now - timedelta(days=40)),     # stale  -> skipped
+        ]
+    )
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    try:
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=client,
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+                channel_handle=CHANNEL,
+            )
+
+        # Only the fresh message may reach the alert/trade path.
+        assert resolved == [1], f"expected exactly the fresh message, got {resolved}"
+
+        drops = [e for e in logs if e.get("event") == "tg_social_message_too_old"]
+        assert {d["msg_id"] for d in drops} == {902, 901}
+
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_skipped_stale"]
+        assert len(agg) == 1, f"expected one per-pass summary, got {agg}"
+        assert agg[0]["skipped_stale"] == 2
+        assert agg[0]["fetched"] == 3
+        assert agg[0]["max_age_min"] == 60
+        assert agg[0]["log_level"] == "warning"
+
+        # All three persisted regardless of age -- a skip is evidence, not a hole.
+        assert await _row_count(db, "tg_social_messages") == 3
+    finally:
+        await db.close()
+
+
+async def test_the_production_default_leaves_live_ungated(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Calls handle_new_message with is_replay OMITTED, as `_on_new` does.
+
+    The live lane is protected solely by the `is_replay: bool = False`
+    default. Every other test passes the flag explicitly, so flipping that
+    default to True survives them all. This is the only test that exercises
+    the production call shape.
+    """
+    reached: list[str] = []
+
+    async def _spy(*args, **kwargs):
+        reached.append("yes")
+        raise RuntimeError("stop-after-guard")
+
+    monkeypatch.setattr(listener_mod, "resolve_and_enrich", _spy)
+
+    settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
+    db = await _mkdb(tmp_path)
+    try:
+        ancient = datetime.now(timezone.utc) - timedelta(days=400)
+        with pytest.raises(RuntimeError, match="stop-after-guard"):
+            # No is_replay kwarg -- exactly how _on_new invokes it.
+            await handle_new_message(
+                _event(606, ancient),
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+            )
+        assert reached == ["yes"], "the default must leave the live path ungated"
     finally:
         await db.close()
 

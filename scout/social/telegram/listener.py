@@ -890,7 +890,16 @@ async def handle_new_message(
         await _append_dlq(db, channel_handle, msg_id or 0, text, e)
         return
     if message_pk is None:
-        return  # duplicate (UNIQUE conflict on catchup re-run) — not an error
+        # Duplicate (UNIQUE conflict on catchup re-run) — not an error.
+        # Counted so a catchup pass reconciles: fetched == resolved +
+        # skipped_stale + duplicates. Without this the second pass over the
+        # same batch reports NOTHING (these rows never reach the age guard,
+        # because this return pre-empts it), which reads as "the guard
+        # stopped dropping things" when in fact the same messages were
+        # discarded one check earlier.
+        if stats is not None:
+            stats["duplicates"] = stats.get("duplicates", 0) + 1
+        return
 
     log.info(
         "tg_social_message_persisted",
@@ -1156,19 +1165,30 @@ async def _catchup_channel(
             error=type(ake).__name__,
         )
         raise
-    skipped_stale = pass_stats.get("skipped_stale", 0)
-    if skipped_stale:
-        # One line per pass, so "the guard ate this catchup" is visible
-        # without reading every per-message WARNING. Emitted even when the
-        # pass was not truncated, because a fully-consumed pass that skipped
-        # everything is exactly the case worth noticing.
-        log.warning(
-            "tg_social_catchup_skipped_stale",
-            channel_handle=channel_handle,
-            skipped_stale=skipped_stale,
-            fetched=fetched,
-            max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
-        )
+    finally:
+        # In `finally`, not after the try: FloodWaitError and AuthKeyError
+        # re-raise, and a long historical catchup is simultaneously the pass
+        # most likely to skip many messages AND the pass most likely to trip
+        # FloodWait on GetHistoryRequest. Emitting after the try loses the
+        # summary in exactly the case it was added for.
+        #
+        # Emitted whenever the pass touched anything, not only when
+        # skipped_stale is non-zero: a pass that reports nothing is
+        # indistinguishable from a pass that did not run, and `duplicates`
+        # is what explains a SECOND pass over the same batch dropping
+        # everything silently (those rows return before the age guard, so
+        # they are never counted as stale).
+        _skipped = pass_stats.get("skipped_stale", 0)
+        _dupes = pass_stats.get("duplicates", 0)
+        if fetched or _skipped or _dupes:
+            log.warning(
+                "tg_social_catchup_skipped_stale",
+                channel_handle=channel_handle,
+                skipped_stale=_skipped,
+                duplicates=_dupes,
+                fetched=fetched,
+                max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
+            )
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",

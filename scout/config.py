@@ -1438,13 +1438,21 @@ class Settings(BaseSettings):
     # while every health surface still reported green. See the guard in
     # listener.py.
     #
-    # 720 = 12h. Sized to the hazard, not to signal freshness: the replay
+    # 1440 = 24h. Sized to the hazard, not to signal freshness: the replay
     # this exists to stop is months old, while a restart/outage gap is hours,
     # and messages recovered from such a gap are still worth acting on. A
-    # tighter bound (60) would discard same-day recovery to block nothing
-    # extra. 0 disables the check entirely — the pre-guard behaviour, and the
+    # tighter bound would discard same-day recovery to block nothing extra.
+    #
+    # 24h specifically, to match the dashboard's funnel window
+    # (`get_tg_social_funnel_24h` selects on `posted_at >= now-24h`). At any
+    # tighter value there is a band of ages that are BOTH dropped by this
+    # guard AND inside that window, which surfaces as a parsed-vs-signals gap
+    # with no reason code attached. Aligning the two bounds removes the band
+    # rather than instrumenting it.
+    #
+    # 0 disables the check entirely — the pre-guard behaviour, and the
     # documented escape hatch.
-    TG_SOCIAL_MAX_MESSAGE_AGE_MIN: int = Field(default=720, ge=0)
+    TG_SOCIAL_MAX_MESSAGE_AGE_MIN: int = Field(default=1440, ge=0)
     TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
     TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
     TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
