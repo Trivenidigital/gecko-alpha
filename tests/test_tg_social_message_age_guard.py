@@ -512,6 +512,206 @@ async def test_second_pass_counts_duplicates_and_no_signal(
         await db.close()
 
 
+async def test_partial_duplicate_pass_stays_at_info(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Routine restarts must not warn.
+
+    The watermark is non-monotonic (newest-first iteration, last-write-wins
+    UPSERT), so a pass ends on its OLDEST id and the next restart re-fetches
+    the tail. `duplicates > 0` is therefore the NORMAL case on any channel
+    that received more than one message -- promoting on it would warn on
+    every restart and train the operator to ignore the level that `dlq` and
+    `skipped_stale` need. Only a pass that made ZERO forward progress
+    (all-duplicate) escalates; that case is covered by
+    test_second_pass_counts_duplicates_and_no_signal.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+    from scout.social.telegram.models import ResolutionResult, ResolutionState
+
+    async def _resolve(*args, **kwargs):
+        return ResolutionResult(state=ResolutionState.UNRESOLVED_TERMINAL)
+
+    async def _replay(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(listener_mod, "resolve_and_enrich", _resolve)
+    monkeypatch.setattr(listener_mod, "_replay_post_resolution", _replay)
+
+    now = datetime.now(timezone.utc)
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    kw = dict(
+        db=db,
+        settings=settings,
+        engine=AsyncMock(),
+        http_session=AsyncMock(),
+        telegram_bot_token="tok",
+        telegram_chat_id="chat",
+        channel_handle=CHANNEL,
+    )
+    try:
+        await _catchup_channel(client=_FakeClient([_FakeMsg(901, now)]), **kw)
+        # Second pass: one already-seen message + one genuinely new one.
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=_FakeClient([_FakeMsg(902, now), _FakeMsg(901, now)]), **kw
+            )
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"][0]
+        assert agg["duplicates"] == 1 and agg["fetched"] == 2
+        assert agg["log_level"] == "info", (
+            "a pass that made forward progress must not warn merely because "
+            f"it re-read the tail: {agg}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_persist_failure_is_counted_as_dlq_and_warns(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Pins the whole `dlq` dimension.
+
+    Kills three mutants that survive otherwise, all sharing one cause --
+    no test anywhere makes a persist raise:
+      * the dlq leg of the three-way selection mislabelled as no_signal
+      * the signal-path `stats["dlq"]` counter deleted
+      * `_dlq` dropped from the WARNING trigger
+
+    A pass that is quietly DLQ-ing messages must not report INFO.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("persist exploded")
+
+    monkeypatch.setattr(listener_mod, "_persist_message_with_watermark", _boom)
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    try:
+        now = datetime.now(timezone.utc)
+        # BOTH shapes: a signal-bearing message exercises the counter on the
+        # signal path, and a chatter message exercises the dlq LEG of the
+        # three-way selection in the parsed.is_empty branch. With only the
+        # first, mislabelling that leg as no_signal survives.
+        chatter = _FakeMsg(911, now)
+        chatter.message = chatter.text = "gm no ticker"
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=_FakeClient([_FakeMsg(910, now), chatter]),
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+                channel_handle=CHANNEL,
+            )
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"][0]
+        assert agg["dlq"] == 2, f"both DLQ'd shapes must be tallied: {agg}"
+        assert agg["no_signal"] == 0, f"a DLQ'd chatter message is not no_signal: {agg}"
+        assert agg["fetched"] == 2
+        assert agg["log_level"] == "warning", "a DLQ-ing pass must not read as clean"
+        assert await _row_count(db, "tg_social_dlq") == 2
+    finally:
+        await db.close()
+
+
+async def test_exception_escaping_the_handler_is_counted_as_dlq(
+    tmp_path, settings_factory, monkeypatch
+):
+    """An exception that escapes `handle_new_message` into
+    `_catchup_channel`'s own per-message except writes a DLQ row and
+    increments `fetched`. Without a tally there it lands in the `resolved`
+    residual, so a pass that DLQ'd everything reported INFO and read as
+    fully resolved -- the reachable leak in the identity claim.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+
+    def _boom(_text):
+        raise RuntimeError("parse exploded")
+
+    # parse_message runs before handle_new_message's own try, so this
+    # propagates out to the loop rather than being handled internally.
+    monkeypatch.setattr(listener_mod, "parse_message", _boom)
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    try:
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=_FakeClient([_FakeMsg(920, datetime.now(timezone.utc))]),
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+                channel_handle=CHANNEL,
+            )
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"][0]
+        assert agg["dlq"] == 1, f"an escaped exception must be tallied: {agg}"
+        assert agg["fetched"] == 1
+        assert agg["log_level"] == "warning"
+        assert await _row_count(db, "tg_social_dlq") == 1
+    finally:
+        await db.close()
+
+
+async def test_malformed_event_is_counted_as_dlq(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A message whose chat metadata is unusable DLQs and must be tallied.
+
+    These early returns pre-date this PR, but the claim that the tallies
+    partition every yielded message is new -- so an uncounted exit here
+    inflates the `resolved` residual exactly like any other leak. Pins the
+    `_bump` helper, whose body is otherwise a no-op no test would notice.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+
+    class _NoChatMsg(_FakeMsg):
+        async def get_chat(self):
+            return None
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    try:
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=_FakeClient([_NoChatMsg(930, datetime.now(timezone.utc))]),
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+                channel_handle=CHANNEL,
+            )
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"][0]
+        assert agg["dlq"] == 1, f"a malformed event must be tallied: {agg}"
+        assert agg["log_level"] == "warning"
+    finally:
+        await db.close()
+
+
 async def test_summary_survives_an_aborted_pass(tmp_path, settings_factory, monkeypatch):
     """FloodWait mid-catchup: the summary must still emit AND the original
     exception must still propagate.

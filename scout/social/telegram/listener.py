@@ -731,6 +731,19 @@ async def _append_dlq(
         )
 
 
+def _bump(stats: dict[str, int] | None, key: str) -> None:
+    """Increment a per-pass tally, tolerating the live path's `stats=None`.
+
+    Exists so the DLQ-ing early returns can be counted without repeating the
+    None-check at each one. The tallies are only meaningful when they
+    PARTITION every message the catchup iterator yielded -- an uncounted
+    exit inflates the `resolved` residual, which is the number an operator
+    reads off the per-pass summary.
+    """
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + 1
+
+
 def _message_age_minutes(posted_at: Any) -> float | None:
     """Minutes between ``posted_at`` and now, or None if not computable.
 
@@ -800,6 +813,7 @@ async def handle_new_message(
             getattr(msg, "message", None) or getattr(msg, "text", None),
             ValueError("event has no chat metadata"),
         )
+        _bump(stats, "dlq")
         return
     if getattr(chat, "username", None):
         channel_handle = f"@{chat.username}"
@@ -826,6 +840,7 @@ async def handle_new_message(
                     f"events.NewMessage(chats=...) should have filtered this"
                 ),
             )
+            _bump(stats, "dlq")
             return
         channel_handle = str(chat_id)
     else:
@@ -837,6 +852,7 @@ async def handle_new_message(
             getattr(msg, "message", None) or getattr(msg, "text", None),
             ValueError("chat has no username and no id"),
         )
+        _bump(stats, "dlq")
         return
     msg_id = getattr(msg, "id", None)
     text = getattr(msg, "message", None) or getattr(msg, "text", None)
@@ -1139,6 +1155,7 @@ async def _catchup_channel(
                 # Any other failure during a single message gets DLQ'd; keep
                 # the catchup loop moving so one poison pill doesn't block.
                 await _append_dlq(db, channel_handle, getattr(msg, "id", 0), None, e)
+                pass_stats["dlq"] = pass_stats.get("dlq", 0) + 1
             fetched += 1
     except (
         ChannelPrivateError,
@@ -1219,7 +1236,19 @@ async def _catchup_channel(
                 # catchup, so a name/level asserting "stale" unconditionally
                 # would make routine operation match any alert grepping for
                 # it — inverting the summary's own purpose.
-                _emit = log.warning if (_skipped or _dupes or _dlq) else log.info
+                #
+                # `duplicates` deliberately does NOT promote on its own. The
+                # watermark is non-monotonic (newest-first iteration,
+                # last-write-wins UPSERT), so a pass ends on its OLDEST id
+                # and the next restart re-fetches the tail — meaning
+                # duplicates > 0 on essentially every restart of any channel
+                # that received more than one message. Promoting on that
+                # would warn routinely and train the operator to ignore the
+                # level, which is what `dlq` and `skipped_stale` need it for.
+                # An ALL-duplicate pass is different: it made zero forward
+                # progress, which is worth surfacing.
+                _stalled = bool(_dupes) and _dupes == fetched
+                _emit = log.warning if (_skipped or _dlq or _stalled) else log.info
                 _emit(
                     "tg_social_catchup_pass",
                     channel_handle=channel_handle,
@@ -1231,7 +1260,15 @@ async def _catchup_channel(
                     max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
                 )
         except Exception:  # pragma: no cover - defensive
-            log.exception("tg_social_catchup_pass_summary_failed")
+            # Nested, because the failure this wrap exists for is "the logger
+            # raises" (broken stdout / OSError on write) — in which case
+            # log.exception raises identically and would re-open the hole it
+            # was added to close. The summary is never worth replacing an
+            # in-flight FloodWaitError with.
+            try:
+                log.exception("tg_social_catchup_pass_summary_failed")
+            except Exception:
+                pass
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",
