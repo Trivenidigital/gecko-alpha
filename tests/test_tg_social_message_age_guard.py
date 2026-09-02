@@ -333,13 +333,27 @@ class _FakeClient:
     through this path.
     """
 
-    def __init__(self, messages):
+    def __init__(self, messages, raise_at_end=None):
         self._messages = messages
+        self._raise_at_end = raise_at_end
+        # Recorded so a test can pin that catchup passes the WATERMARK as
+        # min_id. A fake that ignores it lets a mutant replay the channel's
+        # entire history on every restart -- the exact hazard this guard
+        # exists to bound -- while the suite stays green.
+        self.seen_min_id = None
+        self.seen_limit = None
 
     def iter_messages(self, channel, min_id=0, limit=None):
+        self.seen_min_id = min_id
+        self.seen_limit = limit
+        messages = self._messages
+        raise_at_end = self._raise_at_end
+
         async def _gen():
-            for m in self._messages:
+            for m in messages:
                 yield m
+            if raise_at_end is not None:
+                raise raise_at_end
 
         return _gen()
 
@@ -408,7 +422,7 @@ async def test_catchup_applies_the_guard_and_reports_the_pass(
         drops = [e for e in logs if e.get("event") == "tg_social_message_too_old"]
         assert {d["msg_id"] for d in drops} == {902, 901}
 
-        agg = [e for e in logs if e.get("event") == "tg_social_catchup_skipped_stale"]
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"]
         assert len(agg) == 1, f"expected one per-pass summary, got {agg}"
         assert agg[0]["skipped_stale"] == 2
         assert agg[0]["fetched"] == 3
@@ -417,6 +431,151 @@ async def test_catchup_applies_the_guard_and_reports_the_pass(
 
         # All three persisted regardless of age -- a skip is evidence, not a hole.
         assert await _row_count(db, "tg_social_messages") == 3
+    finally:
+        await db.close()
+
+
+async def test_second_pass_counts_duplicates_and_no_signal(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Repeat-pass reconciliation. Kills four mutants at once:
+      * duplicates tally removed / double-counted
+      * `duplicates` dropped from the summary
+      * the emit condition narrowed back to `if _skipped:` -- a second pass
+        has skipped_stale == 0, so a narrowed condition goes SILENT exactly
+        when the operator needs to know the pass did nothing new
+
+    Also pins that a no-signal message that is already known counts as a
+    DUPLICATE, not a fresh no_signal: without capturing the persist return
+    in that branch, a repeat pass over a chatty channel reads almost
+    identically to a healthy pass processing new messages.
+    """
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+    from scout.social.telegram.models import ResolutionResult, ResolutionState
+
+    async def _resolve(*args, **kwargs):
+        return ResolutionResult(state=ResolutionState.UNRESOLVED_TERMINAL)
+
+    async def _replay(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(listener_mod, "resolve_and_enrich", _resolve)
+    monkeypatch.setattr(listener_mod, "_replay_post_resolution", _replay)
+
+    now = datetime.now(timezone.utc)
+    chatter = _FakeMsg(802, now)
+    chatter.message = chatter.text = "gm everyone no ticker here"
+
+    def _client():
+        return _FakeClient([_FakeMsg(803, now), chatter])
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    kw = dict(
+        db=db,
+        settings=settings,
+        engine=AsyncMock(),
+        http_session=AsyncMock(),
+        telegram_bot_token="tok",
+        telegram_chat_id="chat",
+        channel_handle=CHANNEL,
+    )
+    try:
+        with capture_logs() as first:
+            await _catchup_channel(client=_client(), **kw)
+        a1 = [e for e in first if e.get("event") == "tg_social_catchup_pass"][0]
+        assert (a1["duplicates"], a1["no_signal"], a1["fetched"]) == (0, 1, 2)
+        # Clean pass -> INFO, not WARNING.
+        assert a1["log_level"] == "info"
+
+        # Same batch again: both are now known.
+        second_client = _client()
+        with capture_logs() as second:
+            await _catchup_channel(client=second_client, **kw)
+        a2 = [e for e in second if e.get("event") == "tg_social_catchup_pass"][0]
+        assert a2["duplicates"] == 2, f"repeat pass must report duplicates: {a2}"
+        assert a2["no_signal"] == 0
+        assert a2["skipped_stale"] == 0
+        assert a2["fetched"] == 2
+        # Something WAS dropped, so this one escalates.
+        assert a2["log_level"] == "warning"
+
+        # Catchup must resume from the watermark, not from 0. A fake that
+        # ignored min_id would let a full-history-replay mutant survive.
+        assert second_client.seen_min_id == 802
+        assert await _row_count(db, "tg_social_messages") == 2
+    finally:
+        await db.close()
+
+
+async def test_summary_survives_an_aborted_pass(tmp_path, settings_factory, monkeypatch):
+    """FloodWait mid-catchup: the summary must still emit AND the original
+    exception must still propagate.
+
+    A long historical catchup is both the pass most likely to skip many
+    messages and the one most likely to trip FloodWait, so emitting the
+    summary after the `try` lost it in exactly the case it exists for.
+    """
+    from structlog.testing import capture_logs
+    from telethon.errors import FloodWaitError
+
+    from scout.social.telegram.listener import _catchup_channel
+
+    settings = settings_factory(
+        TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60, TG_SOCIAL_CATCHUP_LIMIT=200
+    )
+    db = await _mkdb(tmp_path)
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=9)
+        client = _FakeClient(
+            [_FakeMsg(701, old), _FakeMsg(702, old)],
+            raise_at_end=FloodWaitError(request=None, capture=7),
+        )
+        with capture_logs() as logs:
+            with pytest.raises(FloodWaitError):
+                await _catchup_channel(
+                    client=client,
+                    db=db,
+                    settings=settings,
+                    engine=AsyncMock(),
+                    http_session=AsyncMock(),
+                    telegram_bot_token="tok",
+                    telegram_chat_id="chat",
+                    channel_handle=CHANNEL,
+                )
+        agg = [e for e in logs if e.get("event") == "tg_social_catchup_pass"]
+        assert len(agg) == 1, f"aborted pass must still summarise: {agg}"
+        assert agg[0]["skipped_stale"] == 2
+    finally:
+        await db.close()
+
+
+async def test_empty_pass_emits_no_summary(tmp_path, settings_factory, monkeypatch):
+    """A pass that touched nothing stays silent -- otherwise every restart
+    at TG_SOCIAL_CATCHUP_LIMIT=0 would emit a summary per channel."""
+    from structlog.testing import capture_logs
+
+    from scout.social.telegram.listener import _catchup_channel
+
+    settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
+    db = await _mkdb(tmp_path)
+    try:
+        with capture_logs() as logs:
+            await _catchup_channel(
+                client=_FakeClient([]),
+                db=db,
+                settings=settings,
+                engine=AsyncMock(),
+                http_session=AsyncMock(),
+                telegram_bot_token="tok",
+                telegram_chat_id="chat",
+                channel_handle=CHANNEL,
+            )
+        assert [e for e in logs if e.get("event") == "tg_social_catchup_pass"] == []
     finally:
         await db.close()
 

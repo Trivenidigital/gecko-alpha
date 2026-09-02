@@ -857,8 +857,9 @@ async def handle_new_message(
     parsed = parse_message(text)
     if parsed.is_empty:
         # Persist anyway so watermark advances, but emit no_signal log
+        no_signal_dlq = False
         try:
-            await _persist_message_with_watermark(
+            no_signal_pk = await _persist_message_with_watermark(
                 db=db,
                 channel_handle=channel_handle,
                 msg_id=msg_id,
@@ -869,11 +870,30 @@ async def handle_new_message(
             )
         except Exception as e:
             await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+            no_signal_pk = None
+            no_signal_dlq = True
         log.info(
             "tg_social_no_signal_in_message",
             channel_handle=channel_handle,
             msg_id=msg_id,
         )
+        # Counted so the per-pass summary reconciles. On a real curator
+        # channel most messages carry no ticker, so this is the DOMINANT
+        # term -- leaving it out made `fetched` minus the other counters
+        # read as "resolved" when it was mostly this. A no-signal message
+        # that was already known is a duplicate, not a fresh no-signal:
+        # `_persist_message_with_watermark` returns None on the UNIQUE
+        # conflict, and without capturing that return a repeat pass over a
+        # mostly-chatter channel looked almost identical to a healthy pass
+        # processing new messages.
+        if stats is not None:
+            if no_signal_dlq:
+                key = "dlq"
+            elif no_signal_pk is None:
+                key = "duplicates"
+            else:
+                key = "no_signal"
+            stats[key] = stats.get(key, 0) + 1
         return
 
     try:
@@ -888,15 +908,15 @@ async def handle_new_message(
         )
     except Exception as e:
         await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+        if stats is not None:
+            stats["dlq"] = stats.get("dlq", 0) + 1
         return
     if message_pk is None:
         # Duplicate (UNIQUE conflict on catchup re-run) — not an error.
-        # Counted so a catchup pass reconciles: fetched == resolved +
-        # skipped_stale + duplicates. Without this the second pass over the
-        # same batch reports NOTHING (these rows never reach the age guard,
-        # because this return pre-empts it), which reads as "the guard
-        # stopped dropping things" when in fact the same messages were
-        # discarded one check earlier.
+        # Counted because this return PRE-EMPTS the age guard below, so
+        # without it a second pass over the same batch reports nothing at
+        # all — which reads as "the guard stopped dropping things" when the
+        # same messages were discarded one check earlier.
         if stats is not None:
             stats["duplicates"] = stats.get("duplicates", 0) + 1
         return
@@ -1173,22 +1193,45 @@ async def _catchup_channel(
         # summary in exactly the case it was added for.
         #
         # Emitted whenever the pass touched anything, not only when
-        # skipped_stale is non-zero: a pass that reports nothing is
-        # indistinguishable from a pass that did not run, and `duplicates`
-        # is what explains a SECOND pass over the same batch dropping
-        # everything silently (those rows return before the age guard, so
-        # they are never counted as stale).
-        _skipped = pass_stats.get("skipped_stale", 0)
-        _dupes = pass_stats.get("duplicates", 0)
-        if fetched or _skipped or _dupes:
-            log.warning(
-                "tg_social_catchup_skipped_stale",
-                channel_handle=channel_handle,
-                skipped_stale=_skipped,
-                duplicates=_dupes,
-                fetched=fetched,
-                max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
-            )
+        # something was skipped: a pass that reports nothing is
+        # indistinguishable from a pass that did not run.
+        #
+        # The tallies partition every message the iterator yielded:
+        #   fetched == resolved + skipped_stale + duplicates + no_signal + dlq
+        # `resolved` has no counter and is read as the residual, which is
+        # exactly why the other four must ALL be present. `no_signal` is
+        # the dominant term on a real curator channel (most messages carry
+        # no ticker); omitting it made the residual read as "resolved" when
+        # it was mostly chatter.
+        #
+        # Wrapped: a raising logger here would replace an in-flight
+        # FloodWaitError with its own exception, and `_run_listener_body`'s
+        # `except FloodWaitError` would never fire — turning a circuit-break
+        # into a crash. The summary is never worth losing the exception for.
+        try:
+            _skipped = pass_stats.get("skipped_stale", 0)
+            _dupes = pass_stats.get("duplicates", 0)
+            _nosig = pass_stats.get("no_signal", 0)
+            _dlq = pass_stats.get("dlq", 0)
+            if fetched or _skipped or _dupes or _nosig or _dlq:
+                # INFO on a clean pass, WARNING only when something was
+                # actually dropped. The event fires on every non-empty
+                # catchup, so a name/level asserting "stale" unconditionally
+                # would make routine operation match any alert grepping for
+                # it — inverting the summary's own purpose.
+                _emit = log.warning if (_skipped or _dupes or _dlq) else log.info
+                _emit(
+                    "tg_social_catchup_pass",
+                    channel_handle=channel_handle,
+                    skipped_stale=_skipped,
+                    duplicates=_dupes,
+                    no_signal=_nosig,
+                    dlq=_dlq,
+                    fetched=fetched,
+                    max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
+                )
+        except Exception:  # pragma: no cover - defensive
+            log.exception("tg_social_catchup_pass_summary_failed")
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",
