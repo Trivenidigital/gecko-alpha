@@ -739,9 +739,17 @@ def _message_age_minutes(posted_at: Any) -> float | None:
     because a TypeError here would propagate into the listener's per-message
     handler and turn an age check into a dropped message.
 
-    A negative result (clock skew, or a message dated in the future) is
-    returned as-is; the caller compares with ``>`` so skew can only ever
-    make a message look NEWER, never older than it is.
+    Skew is NOT symmetric, and an earlier version of this docstring claimed
+    it was. The age is a difference between two independent clocks — ours
+    (``datetime.now``) and Telegram's (``posted_at``) — so a LOCAL clock
+    running fast inflates every age and makes fresh messages look stale. In
+    other words the age check fails CLOSED against a fast local clock, and
+    the naive branch above fails the same way if a naive value were ever
+    local time east of UTC. Only a future-dated MESSAGE is safe, because a
+    negative result is returned as-is and the caller compares with ``>``.
+
+    That asymmetry is why the caller gates on ``is_replay``: a skewed clock
+    can then only suppress messages being re-read, never the live lane.
     """
     if not isinstance(posted_at, datetime):
         return None
@@ -760,8 +768,16 @@ async def handle_new_message(
     http_session: aiohttp.ClientSession,
     telegram_bot_token: str,
     telegram_chat_id: str,
+    is_replay: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> None:
     """Free-function entry point — testable without a TelegramClient mock.
+
+    `is_replay` marks a message that came from `_catchup_channel` re-reading
+    history rather than from the live update stream. Only replays are age-
+    gated; see the guard below for why scoping it that way is load-bearing
+    rather than cosmetic. Defaults False so the LIVE path — and any caller
+    that forgets — is never gated.
 
     `event` is a Telethon NewMessage event OR (in tests) a SimpleNamespace
     with the same attribute shape: event.message.id, event.message.message,
@@ -888,25 +904,47 @@ async def handle_new_message(
     # through THIS function, identically to live ones, and nothing downstream
     # inspects message age — so without this bound a catchup pass resolves,
     # alerts and (on trade_eligible channels) paper-trades months-old calls as
-    # if they had just fired. Deliberately placed AFTER the persist above: the
-    # row is kept and the watermark has already advanced, so a skipped replay
-    # still makes forward progress instead of being re-fetched every restart.
+    # if they had just fired.
     #
-    # Live messages arrive with age ~0, so this never gates the live path.
-    max_age_min = int(getattr(settings, "TG_SOCIAL_MAX_MESSAGE_AGE_MIN", 0) or 0)
-    if max_age_min > 0:
+    # Scoped to `is_replay` DELIBERATELY, and this is the whole safety
+    # argument. Age is derived from OUR clock (`datetime.now`) against
+    # TELEGRAM's `posted_at` — two independent clocks. A local clock running
+    # fast inflates every age, so an unscoped guard fails CLOSED on the LIVE
+    # lane: every live message looks stale, nothing resolves, and the
+    # subsystem still reports healthy because `_persist_message_with_watermark`
+    # stamps `tg_social_health.last_message_at` BEFORE this point. That is a
+    # total silent signal outage with every alarm green. Gating on replay
+    # means clock skew can only ever affect messages we were re-reading
+    # anyway, never the live path.
+    #
+    # It also preserves Telethon's in-process gap recovery: `getDifference`
+    # re-delivers genuinely-missed updates through the LIVE handler carrying
+    # their original `date`, and those are real calls we still want.
+    #
+    # Placed AFTER the persist so the row is kept: a skipped replay is
+    # evidence, not a hole. (It does NOT reliably advance the watermark —
+    # Telethon iterates newest-first and the watermark UPSERT is not
+    # monotonic, so a batch can end on its OLDEST id. That is pre-existing
+    # and ticketed; nothing here should be read as relying on it.)
+    max_age_min = settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN
+    if is_replay and max_age_min > 0:
         age_min = _message_age_minutes(posted_at)
         # age_min is None only when the timestamp is unusable. Fail OPEN there:
-        # dropping a live message because its age could not be computed is a
-        # worse failure than replaying one stale message.
+        # dropping a message because its age could not be computed is a worse
+        # failure than replaying one stale message.
         if age_min is not None and age_min > max_age_min:
-            log.info(
+            # WARNING, not info: this is the only per-message evidence that a
+            # call was discarded, and it is the signal that distinguishes
+            # "channels are quiet" from "the guard is eating everything".
+            log.warning(
                 "tg_social_message_too_old",
                 channel_handle=channel_handle,
                 msg_id=msg_id,
                 age_min=int(age_min),
                 max_age_min=max_age_min,
             )
+            if stats is not None:
+                stats["skipped_stale"] = stats.get("skipped_stale", 0) + 1
             return
 
     # Resolution — non-blocking transient retry. If the first attempt returns
@@ -1037,6 +1075,11 @@ async def _catchup_channel(
     last_seen = int(row[0]) if row else 0
 
     fetched = 0
+    # Per-pass tally of age-guard skips. A WARNING per dropped message is the
+    # per-message record; this is the aggregate an operator can actually see
+    # at a glance, and it is what distinguishes "this channel is quiet" from
+    # "the guard ate the whole pass".
+    pass_stats: dict[str, int] = {}
     try:
         async for msg in client.iter_messages(
             channel_handle, min_id=last_seen, limit=settings.TG_SOCIAL_CATCHUP_LIMIT
@@ -1055,6 +1098,8 @@ async def _catchup_channel(
                     http_session=http_session,
                     telegram_bot_token=telegram_bot_token,
                     telegram_chat_id=telegram_chat_id,
+                    is_replay=True,
+                    stats=pass_stats,
                 )
             except FloodWaitError:
                 # Re-raise so the caller can decide circuit-break vs. retry.
@@ -1111,6 +1156,19 @@ async def _catchup_channel(
             error=type(ake).__name__,
         )
         raise
+    skipped_stale = pass_stats.get("skipped_stale", 0)
+    if skipped_stale:
+        # One line per pass, so "the guard ate this catchup" is visible
+        # without reading every per-message WARNING. Emitted even when the
+        # pass was not truncated, because a fully-consumed pass that skipped
+        # everything is exactly the case worth noticing.
+        log.warning(
+            "tg_social_catchup_skipped_stale",
+            channel_handle=channel_handle,
+            skipped_stale=skipped_stale,
+            fetched=fetched,
+            max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
+        )
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",

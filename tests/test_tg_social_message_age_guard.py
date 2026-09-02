@@ -2,16 +2,20 @@
 
 `_catchup_channel` replays historical messages through `handle_new_message`,
 the same entry point live messages use, and nothing downstream inspects
-message age. Before TG_SOCIAL_MAX_MESSAGE_AGE_MIN existed, restoring
-TG_SOCIAL_CATCHUP_LIMIT to a non-zero value would therefore resolve, alert
-and (on trade_eligible channels) paper-trade months-old calls as if they had
-just fired.
+message age. Without a bound, a catchup pass resolves, alerts and (on
+trade_eligible channels) paper-trades months-old calls as if they had just
+fired -- a channel whose watermark is 0 would replay its entire history.
+TG_SOCIAL_CATCHUP_LIMIT defaults to 200 in code, so this is the default
+posture, not a hazard that only appears if an operator opts in.
 
 The contract under test:
-  * stale message  -> persisted, watermark advanced, NOT resolved
+  * stale REPLAY   -> persisted, NOT resolved, warned, counted
+  * live message   -> never gated, at any age (the load-bearing property:
+                      age spans two clocks, so gating live traffic would let
+                      local clock skew silently kill the whole signal lane)
   * fresh message  -> resolved as normal
-  * threshold 0    -> guard disabled entirely (pre-guard behaviour)
-  * bad timestamp  -> fail OPEN (never drop a live message on an age error)
+  * threshold 0    -> guard disabled entirely (documented escape hatch)
+  * bad timestamp  -> fail OPEN (never drop on an age-computation error)
 """
 
 from __future__ import annotations
@@ -41,7 +45,11 @@ def _event(msg_id: int, posted_at) -> SimpleNamespace:
     )
 
 
-async def _run(db, settings, event) -> None:
+async def _run(db, settings, event, *, is_replay: bool = True, stats=None) -> None:
+    """Defaults to is_replay=True: the guard only applies to catchup replay,
+    so a test that forgot the flag would silently exercise the ungated live
+    path and pass for the wrong reason. The live path is covered explicitly
+    by test_live_message_is_never_gated."""
     await handle_new_message(
         event,
         db=db,
@@ -50,6 +58,8 @@ async def _run(db, settings, event) -> None:
         http_session=AsyncMock(),
         telegram_bot_token="tok",
         telegram_chat_id="chat",
+        is_replay=is_replay,
+        stats=stats,
     )
 
 
@@ -195,6 +205,86 @@ async def test_uncomputable_age_fails_open(tmp_path, settings_factory, monkeypat
         with pytest.raises(RuntimeError, match="stop-after-guard"):
             await _run(db, settings, _event(504, ancient))
         assert reached == ["yes"], "uncomputable age must fail open"
+    finally:
+        await db.close()
+
+
+async def test_live_message_is_never_gated(tmp_path, settings_factory, monkeypatch):
+    """THE load-bearing property. Age is a difference between OUR clock and
+    Telegram's, so a fast local clock inflates it. If the guard applied to
+    live traffic, skew would silently suppress the entire signal lane while
+    tg_social_health.last_message_at kept refreshing (it is stamped during
+    persist, before the guard) and every alarm stayed green.
+
+    An ancient LIVE message must still be processed.
+    """
+    reached: list[str] = []
+
+    async def _spy(*args, **kwargs):
+        reached.append("yes")
+        raise RuntimeError("stop-after-guard")
+
+    monkeypatch.setattr(listener_mod, "resolve_and_enrich", _spy)
+
+    settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
+    db = await _mkdb(tmp_path)
+    try:
+        ancient = datetime.now(timezone.utc) - timedelta(days=400)
+        with pytest.raises(RuntimeError, match="stop-after-guard"):
+            await _run(db, settings, _event(601, ancient), is_replay=False)
+        assert reached == ["yes"], "live message must never be age-gated"
+    finally:
+        await db.close()
+
+
+async def test_skip_emits_a_warning_with_the_diagnostic_fields(
+    tmp_path, settings_factory, resolve_spy
+):
+    """Pins the guard's only per-message observable.
+
+    A prior revision of this suite let the entire log call be deleted with
+    every test still green (mutation M7). That log is the sole evidence a
+    call was discarded, so it is asserted here by event name AND by the
+    fields needed to diagnose -- an age_min in the low hundreds means live
+    traffic is being eaten, one in the thousands means a genuine historical
+    replay, and that distinction is unavailable without the values.
+    """
+    from structlog.testing import capture_logs
+
+    settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
+    db = await _mkdb(tmp_path)
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=3)
+        with capture_logs() as logs:
+            await _run(db, settings, _event(602, old))
+
+        drops = [e for e in logs if e.get("event") == "tg_social_message_too_old"]
+        assert len(drops) == 1, f"expected exactly one drop log, got {logs}"
+        entry = drops[0]
+        assert entry["log_level"] == "warning"
+        assert entry["channel_handle"] == CHANNEL
+        assert entry["msg_id"] == 602
+        assert entry["max_age_min"] == 60
+        # 3 days == 4320 min; assert the real value, not merely presence.
+        assert 4300 <= entry["age_min"] <= 4340
+    finally:
+        await db.close()
+
+
+async def test_skip_is_counted_in_the_pass_stats(
+    tmp_path, settings_factory, resolve_spy
+):
+    """The per-pass aggregate _catchup_channel logs. Without this, noticing
+    that a whole catchup pass was discarded means reading every message-level
+    warning individually."""
+    settings = settings_factory(TG_SOCIAL_MAX_MESSAGE_AGE_MIN=60)
+    db = await _mkdb(tmp_path)
+    try:
+        stats: dict[str, int] = {}
+        old = datetime.now(timezone.utc) - timedelta(days=2)
+        await _run(db, settings, _event(603, old), stats=stats)
+        await _run(db, settings, _event(604, old), stats=stats)
+        assert stats == {"skipped_stale": 2}
     finally:
         await db.close()
 
