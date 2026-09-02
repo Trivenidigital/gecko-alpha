@@ -37,6 +37,40 @@ class TestThresholdBounds:
             Settings()
 
 
+class TestTgSocialMessageAgeGuard:
+    """The age guard's PRODUCTION configuration.
+
+    `.env.example` ships TG_SOCIAL_MAX_MESSAGE_AGE_MIN commented out, so the
+    code default IS the value prod runs on -- and `0` is the field's own
+    documented "disable the guard entirely" sentinel. That combination means
+    a one-token edit to the default silently turns the whole feature into a
+    no-op. Every test in test_tg_social_message_age_guard.py overrides the
+    value via settings_factory, so none of them can see it.
+    """
+
+    def test_production_default_is_24h(self, _min_env):
+        # Not merely "> 0": the value is chosen to coincide with the
+        # dashboard's funnel window (get_tg_social_funnel_24h selects on
+        # posted_at >= now-24h). At any tighter value there is a band of
+        # ages both dropped by the guard and inside that window, which
+        # surfaces as a parsed-vs-signals gap with no reason code.
+        assert Settings().TG_SOCIAL_MAX_MESSAGE_AGE_MIN == 1440
+
+    def test_negative_age_rejected(self, _min_env, monkeypatch):
+        # `-1` is the plausible "disable it" typo. Without ge=0 it would not
+        # raise -- it would make `max_age_min > 0` False and disable the
+        # guard at startup, which is the same silent no-op as the default
+        # being edited, arriving through .env instead.
+        monkeypatch.setenv("TG_SOCIAL_MAX_MESSAGE_AGE_MIN", "-1")
+        with pytest.raises(ValidationError, match="TG_SOCIAL_MAX_MESSAGE_AGE_MIN"):
+            Settings()
+
+    def test_zero_is_accepted_as_the_escape_hatch(self, _min_env, monkeypatch):
+        # 0 must remain settable -- it is the documented rollback lever.
+        monkeypatch.setenv("TG_SOCIAL_MAX_MESSAGE_AGE_MIN", "0")
+        assert Settings().TG_SOCIAL_MAX_MESSAGE_AGE_MIN == 0
+
+
 class TestIntervalBounds:
     def test_narrative_poll_too_small_rejected(self, _min_env, monkeypatch):
         monkeypatch.setenv("NARRATIVE_POLL_INTERVAL", "0")
