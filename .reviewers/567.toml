@@ -1,0 +1,58 @@
+# PR #567 — tg_social catchup-replay age guard.
+#
+# All four vectors name the SAME revision, 1ea9cfd0, and that is not a
+# shorthand: every one of them re-derived at this SHA after the final
+# tests-only commit lapsed their earlier clearances. Two vectors verified
+# the delta by TREE HASH rather than by filename — `scout/` reads
+# 75f779ae88d50dca1b5bf39713aab4a6a74228f8 at both 3b33a42f and 1ea9cfd0 —
+# which is the check the gate itself performs.
+#
+# The review ran five rounds. The recurring defect had one shape, found
+# five times at five levels: the guard's MECHANISM was pinned by tests
+# while the thing that ACTIVATES it was not.
+#   1. `is_replay=True` at the _catchup_channel call site — deleting it
+#      reverted the entire feature with 49/49 tests green. Found
+#      independently by all four vectors; the blocking finding of round 2.
+#   2. the `is_replay: bool = False` default, which is the only thing
+#      keeping the live lane ungated.
+#   3. `stats=pass_stats` at the same call site.
+#   4. the per-pass summary's emit condition and its `finally` placement.
+#   5. `Field(default=1440)` — `.env.example` ships the key commented out,
+#      so the CODE default IS the production value and `0` is the field's
+#      own documented disable sentinel. One token, feature is a no-op,
+#      whole guard suite green. Found by a replacement reviewer after the
+#      original four had already cleared the surrounding code.
+#
+# Exact-head CI is green at this SHA. It also caught something no reviewer
+# did: the repo bans `except Exception: pass` in scout/ (PR #245), and a
+# nested handler two vectors had positively endorsed tripped it. Reverted
+# rather than reformulated — evading a text-based convention guard is worse
+# than the residual it protects against.
+
+pr = 567
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "1ea9cfd08a9b5a21e2b546e9c65cc80fcfc0da17"
+logic          = "1ea9cfd08a9b5a21e2b546e9c65cc80fcfc0da17"
+ops-safety     = "1ea9cfd08a9b5a21e2b546e9c65cc80fcfc0da17"
+silent-failure = "1ea9cfd08a9b5a21e2b546e9c65cc80fcfc0da17"
