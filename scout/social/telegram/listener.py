@@ -1260,15 +1260,15 @@ async def _catchup_channel(
                     max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
                 )
         except Exception:  # pragma: no cover - defensive
-            # Nested, because the failure this wrap exists for is "the logger
-            # raises" (broken stdout / OSError on write) — in which case
-            # log.exception raises identically and would re-open the hole it
-            # was added to close. The summary is never worth replacing an
-            # in-flight FloodWaitError with.
-            try:
-                log.exception("tg_social_catchup_pass_summary_failed")
-            except Exception:
-                pass
+            # Single-level on purpose. A nested `except Exception: pass` around
+            # this call would close one more case — the logger itself raising,
+            # in which case log.exception raises identically and the in-flight
+            # FloodWaitError is still replaced — but the repo forbids
+            # silent-swallow in scout/ (PR #245, enforced in CI), and that
+            # standing rule outranks the residual. The uncovered case needs
+            # structlog to be broken, which is not a state this handler could
+            # report on anyway.
+            log.exception("tg_social_catchup_pass_summary_failed")
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",
