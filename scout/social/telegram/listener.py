@@ -731,6 +731,47 @@ async def _append_dlq(
         )
 
 
+def _bump(stats: dict[str, int] | None, key: str) -> None:
+    """Increment a per-pass tally, tolerating the live path's `stats=None`.
+
+    Exists so the DLQ-ing early returns can be counted without repeating the
+    None-check at each one. The tallies are only meaningful when they
+    PARTITION every message the catchup iterator yielded -- an uncounted
+    exit inflates the `resolved` residual, which is the number an operator
+    reads off the per-pass summary.
+    """
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + 1
+
+
+def _message_age_minutes(posted_at: Any) -> float | None:
+    """Minutes between ``posted_at`` and now, or None if not computable.
+
+    Telethon supplies tz-aware UTC datetimes. A naive value (test stubs, or
+    a future Telethon change) is interpreted as UTC rather than raising,
+    because a TypeError here would propagate into the listener's per-message
+    handler and turn an age check into a dropped message.
+
+    Skew is NOT symmetric, and an earlier version of this docstring claimed
+    it was. The age is a difference between two independent clocks — ours
+    (``datetime.now``) and Telegram's (``posted_at``) — so a LOCAL clock
+    running fast inflates every age and makes fresh messages look stale. In
+    other words the age check fails CLOSED against a fast local clock, and
+    the naive branch above fails the same way if a naive value were ever
+    local time east of UTC. Only a future-dated MESSAGE is safe, because a
+    negative result is returned as-is and the caller compares with ``>``.
+
+    That asymmetry is why the caller gates on ``is_replay``: a skewed clock
+    can then only suppress messages being re-read, never the live lane.
+    """
+    if not isinstance(posted_at, datetime):
+        return None
+    ts = posted_at if posted_at.tzinfo is not None else posted_at.replace(
+        tzinfo=timezone.utc
+    )
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+
+
 async def handle_new_message(
     event: Any,
     *,
@@ -740,8 +781,16 @@ async def handle_new_message(
     http_session: aiohttp.ClientSession,
     telegram_bot_token: str,
     telegram_chat_id: str,
+    is_replay: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> None:
     """Free-function entry point — testable without a TelegramClient mock.
+
+    `is_replay` marks a message that came from `_catchup_channel` re-reading
+    history rather than from the live update stream. Only replays are age-
+    gated; see the guard below for why scoping it that way is load-bearing
+    rather than cosmetic. Defaults False so the LIVE path — and any caller
+    that forgets — is never gated.
 
     `event` is a Telethon NewMessage event OR (in tests) a SimpleNamespace
     with the same attribute shape: event.message.id, event.message.message,
@@ -764,6 +813,7 @@ async def handle_new_message(
             getattr(msg, "message", None) or getattr(msg, "text", None),
             ValueError("event has no chat metadata"),
         )
+        _bump(stats, "dlq")
         return
     if getattr(chat, "username", None):
         channel_handle = f"@{chat.username}"
@@ -790,6 +840,7 @@ async def handle_new_message(
                     f"events.NewMessage(chats=...) should have filtered this"
                 ),
             )
+            _bump(stats, "dlq")
             return
         channel_handle = str(chat_id)
     else:
@@ -801,6 +852,7 @@ async def handle_new_message(
             getattr(msg, "message", None) or getattr(msg, "text", None),
             ValueError("chat has no username and no id"),
         )
+        _bump(stats, "dlq")
         return
     msg_id = getattr(msg, "id", None)
     text = getattr(msg, "message", None) or getattr(msg, "text", None)
@@ -821,8 +873,9 @@ async def handle_new_message(
     parsed = parse_message(text)
     if parsed.is_empty:
         # Persist anyway so watermark advances, but emit no_signal log
+        no_signal_dlq = False
         try:
-            await _persist_message_with_watermark(
+            no_signal_pk = await _persist_message_with_watermark(
                 db=db,
                 channel_handle=channel_handle,
                 msg_id=msg_id,
@@ -833,11 +886,30 @@ async def handle_new_message(
             )
         except Exception as e:
             await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+            no_signal_pk = None
+            no_signal_dlq = True
         log.info(
             "tg_social_no_signal_in_message",
             channel_handle=channel_handle,
             msg_id=msg_id,
         )
+        # Counted so the per-pass summary reconciles. On a real curator
+        # channel most messages carry no ticker, so this is the DOMINANT
+        # term -- leaving it out made `fetched` minus the other counters
+        # read as "resolved" when it was mostly this. A no-signal message
+        # that was already known is a duplicate, not a fresh no-signal:
+        # `_persist_message_with_watermark` returns None on the UNIQUE
+        # conflict, and without capturing that return a repeat pass over a
+        # mostly-chatter channel looked almost identical to a healthy pass
+        # processing new messages.
+        if stats is not None:
+            if no_signal_dlq:
+                key = "dlq"
+            elif no_signal_pk is None:
+                key = "duplicates"
+            else:
+                key = "no_signal"
+            stats[key] = stats.get(key, 0) + 1
         return
 
     try:
@@ -852,9 +924,18 @@ async def handle_new_message(
         )
     except Exception as e:
         await _append_dlq(db, channel_handle, msg_id or 0, text, e)
+        if stats is not None:
+            stats["dlq"] = stats.get("dlq", 0) + 1
         return
     if message_pk is None:
-        return  # duplicate (UNIQUE conflict on catchup re-run) — not an error
+        # Duplicate (UNIQUE conflict on catchup re-run) — not an error.
+        # Counted because this return PRE-EMPTS the age guard below, so
+        # without it a second pass over the same batch reports nothing at
+        # all — which reads as "the guard stopped dropping things" when the
+        # same messages were discarded one check earlier.
+        if stats is not None:
+            stats["duplicates"] = stats.get("duplicates", 0) + 1
+        return
 
     log.info(
         "tg_social_message_persisted",
@@ -863,6 +944,53 @@ async def handle_new_message(
         cashtag_count=len(parsed.cashtags),
         contract_count=len(parsed.contracts),
     )
+
+    # Catchup-replay guard. `_catchup_channel` replays historical messages
+    # through THIS function, identically to live ones, and nothing downstream
+    # inspects message age — so without this bound a catchup pass resolves,
+    # alerts and (on trade_eligible channels) paper-trades months-old calls as
+    # if they had just fired.
+    #
+    # Scoped to `is_replay` DELIBERATELY, and this is the whole safety
+    # argument. Age is derived from OUR clock (`datetime.now`) against
+    # TELEGRAM's `posted_at` — two independent clocks. A local clock running
+    # fast inflates every age, so an unscoped guard fails CLOSED on the LIVE
+    # lane: every live message looks stale, nothing resolves, and the
+    # subsystem still reports healthy because `_persist_message_with_watermark`
+    # stamps `tg_social_health.last_message_at` BEFORE this point. That is a
+    # total silent signal outage with every alarm green. Gating on replay
+    # means clock skew can only ever affect messages we were re-reading
+    # anyway, never the live path.
+    #
+    # It also preserves Telethon's in-process gap recovery: `getDifference`
+    # re-delivers genuinely-missed updates through the LIVE handler carrying
+    # their original `date`, and those are real calls we still want.
+    #
+    # Placed AFTER the persist so the row is kept: a skipped replay is
+    # evidence, not a hole. (It does NOT reliably advance the watermark —
+    # Telethon iterates newest-first and the watermark UPSERT is not
+    # monotonic, so a batch can end on its OLDEST id. That is pre-existing
+    # and ticketed; nothing here should be read as relying on it.)
+    max_age_min = settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN
+    if is_replay and max_age_min > 0:
+        age_min = _message_age_minutes(posted_at)
+        # age_min is None only when the timestamp is unusable. Fail OPEN there:
+        # dropping a message because its age could not be computed is a worse
+        # failure than replaying one stale message.
+        if age_min is not None and age_min > max_age_min:
+            # WARNING, not info: this is the only per-message evidence that a
+            # call was discarded, and it is the signal that distinguishes
+            # "channels are quiet" from "the guard is eating everything".
+            log.warning(
+                "tg_social_message_too_old",
+                channel_handle=channel_handle,
+                msg_id=msg_id,
+                age_min=int(age_min),
+                max_age_min=max_age_min,
+            )
+            if stats is not None:
+                stats["skipped_stale"] = stats.get("skipped_stale", 0) + 1
+            return
 
     # Resolution — non-blocking transient retry. If the first attempt returns
     # TRANSIENT, we DO NOT block the listener for 60s here (devil's advocate
@@ -992,6 +1120,11 @@ async def _catchup_channel(
     last_seen = int(row[0]) if row else 0
 
     fetched = 0
+    # Per-pass tally of age-guard skips. A WARNING per dropped message is the
+    # per-message record; this is the aggregate an operator can actually see
+    # at a glance, and it is what distinguishes "this channel is quiet" from
+    # "the guard ate the whole pass".
+    pass_stats: dict[str, int] = {}
     try:
         async for msg in client.iter_messages(
             channel_handle, min_id=last_seen, limit=settings.TG_SOCIAL_CATCHUP_LIMIT
@@ -1010,6 +1143,8 @@ async def _catchup_channel(
                     http_session=http_session,
                     telegram_bot_token=telegram_bot_token,
                     telegram_chat_id=telegram_chat_id,
+                    is_replay=True,
+                    stats=pass_stats,
                 )
             except FloodWaitError:
                 # Re-raise so the caller can decide circuit-break vs. retry.
@@ -1020,6 +1155,7 @@ async def _catchup_channel(
                 # Any other failure during a single message gets DLQ'd; keep
                 # the catchup loop moving so one poison pill doesn't block.
                 await _append_dlq(db, channel_handle, getattr(msg, "id", 0), None, e)
+                pass_stats["dlq"] = pass_stats.get("dlq", 0) + 1
             fetched += 1
     except (
         ChannelPrivateError,
@@ -1066,6 +1202,73 @@ async def _catchup_channel(
             error=type(ake).__name__,
         )
         raise
+    finally:
+        # In `finally`, not after the try: FloodWaitError and AuthKeyError
+        # re-raise, and a long historical catchup is simultaneously the pass
+        # most likely to skip many messages AND the pass most likely to trip
+        # FloodWait on GetHistoryRequest. Emitting after the try loses the
+        # summary in exactly the case it was added for.
+        #
+        # Emitted whenever the pass touched anything, not only when
+        # something was skipped: a pass that reports nothing is
+        # indistinguishable from a pass that did not run.
+        #
+        # The tallies partition every message the iterator yielded:
+        #   fetched == resolved + skipped_stale + duplicates + no_signal + dlq
+        # `resolved` has no counter and is read as the residual, which is
+        # exactly why the other four must ALL be present. `no_signal` is
+        # the dominant term on a real curator channel (most messages carry
+        # no ticker); omitting it made the residual read as "resolved" when
+        # it was mostly chatter.
+        #
+        # Wrapped: a raising logger here would replace an in-flight
+        # FloodWaitError with its own exception, and `_run_listener_body`'s
+        # `except FloodWaitError` would never fire — turning a circuit-break
+        # into a crash. The summary is never worth losing the exception for.
+        try:
+            _skipped = pass_stats.get("skipped_stale", 0)
+            _dupes = pass_stats.get("duplicates", 0)
+            _nosig = pass_stats.get("no_signal", 0)
+            _dlq = pass_stats.get("dlq", 0)
+            if fetched or _skipped or _dupes or _nosig or _dlq:
+                # INFO on a clean pass, WARNING only when something was
+                # actually dropped. The event fires on every non-empty
+                # catchup, so a name/level asserting "stale" unconditionally
+                # would make routine operation match any alert grepping for
+                # it — inverting the summary's own purpose.
+                #
+                # `duplicates` deliberately does NOT promote on its own. The
+                # watermark is non-monotonic (newest-first iteration,
+                # last-write-wins UPSERT), so a pass ends on its OLDEST id
+                # and the next restart re-fetches the tail — meaning
+                # duplicates > 0 on essentially every restart of any channel
+                # that received more than one message. Promoting on that
+                # would warn routinely and train the operator to ignore the
+                # level, which is what `dlq` and `skipped_stale` need it for.
+                # An ALL-duplicate pass is different: it made zero forward
+                # progress, which is worth surfacing.
+                _stalled = bool(_dupes) and _dupes == fetched
+                _emit = log.warning if (_skipped or _dlq or _stalled) else log.info
+                _emit(
+                    "tg_social_catchup_pass",
+                    channel_handle=channel_handle,
+                    skipped_stale=_skipped,
+                    duplicates=_dupes,
+                    no_signal=_nosig,
+                    dlq=_dlq,
+                    fetched=fetched,
+                    max_age_min=settings.TG_SOCIAL_MAX_MESSAGE_AGE_MIN,
+                )
+        except Exception:  # pragma: no cover - defensive
+            # Single-level on purpose. A nested `except Exception: pass` around
+            # this call would close one more case — the logger itself raising,
+            # in which case log.exception raises identically and the in-flight
+            # FloodWaitError is still replaced — but the repo forbids
+            # silent-swallow in scout/ (PR #245, enforced in CI), and that
+            # standing rule outranks the residual. The uncovered case needs
+            # structlog to be broken, which is not a state this handler could
+            # report on anyway.
+            log.exception("tg_social_catchup_pass_summary_failed")
     if fetched == settings.TG_SOCIAL_CATCHUP_LIMIT:
         log.warning(
             "tg_social_catchup_truncated",

@@ -1424,6 +1424,35 @@ class Settings(BaseSettings):
     PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0
     PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5
     TG_SOCIAL_CATCHUP_LIMIT: int = 200
+    # Catchup replays historical messages through the SAME path as live ones
+    # (handle_new_message), and nothing else filters on message age — so a
+    # catchup pass would alert/trade on months-old calls as if they just
+    # fired. A channel whose watermark is 0 would replay its ENTIRE history.
+    # This bounds that: a replayed message older than the threshold is still
+    # persisted, but is not resolved, alerted, or traded.
+    #
+    # Applies to CATCHUP REPLAY ONLY (handle_new_message(is_replay=True)),
+    # never to live messages. The age is derived from our clock against
+    # Telegram's, so a fast local clock inflates it; gating live traffic on
+    # that would let clock skew silently suppress the entire signal lane
+    # while every health surface still reported green. See the guard in
+    # listener.py.
+    #
+    # 1440 = 24h. Sized to the hazard, not to signal freshness: the replay
+    # this exists to stop is months old, while a restart/outage gap is hours,
+    # and messages recovered from such a gap are still worth acting on. A
+    # tighter bound would discard same-day recovery to block nothing extra.
+    #
+    # 24h specifically, to match the dashboard's funnel window
+    # (`get_tg_social_funnel_24h` selects on `posted_at >= now-24h`). At any
+    # tighter value there is a band of ages that are BOTH dropped by this
+    # guard AND inside that window, which surfaces as a parsed-vs-signals gap
+    # with no reason code attached. Aligning the two bounds removes the band
+    # rather than instrumenting it.
+    #
+    # 0 disables the check entirely — the pre-guard behaviour, and the
+    # documented escape hatch.
+    TG_SOCIAL_MAX_MESSAGE_AGE_MIN: int = Field(default=1440, ge=0)
     TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
     TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
     TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
