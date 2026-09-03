@@ -752,7 +752,105 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                             detail="enough resolved outcomes but slots still "
                             "remain — inconsistent with a clean parole; holding",
                         )
+                    elif retest_state == "parole_stalled":
+                        # WITHOUT THIS ARM the state fell through to the `else`
+                        # and was logged as `parole_retest_waiting` — the exact
+                        # word this classification exists to stop using. The
+                        # page still fired (see `_process_retest_terminal_
+                        # incomplete`, which does branch on the state), so the
+                        # bug was invisible from the alert and visible only in
+                        # the logs, where it said the opposite of the truth.
+                        #
+                        # Prod 2026-09-03: five combos classified
+                        # `parole_stalled` when the real classifier was run
+                        # against the real DB, while every nightly run had
+                        # logged them as `waiting` and the string
+                        # "parole_stalled" appeared ZERO times in the whole
+                        # retained journal — which is why the stall was read as
+                        # "the alarm never fired".
+                        #
+                        # MIRRORS THE PAGER'S ADMISSION PREDICATE, which is a
+                        # DISJUNCTION, not a bare calendar grace. See the
+                        # `WHERE` in `_process_retest_terminal_incomplete`:
+                        #   (COALESCE(parole_trades_remaining, 1) <= 0
+                        #    OR parole_at <= stalled_grace_cutoff)
+                        # The 1-day cutoff binds only the SECOND disjunct — a
+                        # burned-budget stall pages with NO grace at all.
+                        #
+                        # An earlier revision of this arm graced everything and
+                        # its comment claimed to mirror the page. It did not: a
+                        # fresh burned-budget stall paged the operator at ERROR
+                        # while writing an INFO line saying it was not yet
+                        # interesting. That is this function's own defect class
+                        # — a log contradicting the truth — one corner over,
+                        # and it is reachable by the prod case that motivated
+                        # the state (chain_completed 2026-08-13, spent=5 with
+                        # cohort_total=0).
+                        #
+                        # KEEP IN SYNC with that WHERE clause. Duplicating a
+                        # SQL predicate in Python is the drift class
+                        # `parole_window_open`'s docstring warns about; the
+                        # alternative was letting the log disagree with the
+                        # page, which is worse. The disjunction is pinned by
+                        # `test_fresh_burned_budget_stall_warns_without_grace`.
+                        #
+                        # The calendar arm exists because, as the pager says,
+                        # "a parole window that opened minutes ago has
+                        # legitimately not been used yet, and paging on it
+                        # would fire a false alarm on every fresh generation".
+                        #
+                        # Without mirroring it here the LOG asserts "the retest
+                        # cannot start" for a generation the PAGE has correctly
+                        # judged too fresh to alarm on. `parole_at` is
+                        # `suppressed_at + 14d` at an arbitrary time of day and
+                        # this refresh is nightly, so roughly half of all fresh
+                        # generations would draw one spurious WARNING — which
+                        # is what teaches an operator to filter the string, and
+                        # is the same false-alarm class the pager avoids.
+                        #
+                        # Below the grace it is still logged, at INFO: the
+                        # classification is real and worth a trace, it is just
+                        # not yet evidence of a stuck system.
+                        days_open = _days_since(parole_at_existing)
+                        budget_burned = remaining is not None and remaining <= 0
+                        log_stalled = (
+                            log.warning
+                            if ((days_open or 0) >= 1 or budget_burned)
+                            else log.info
+                        )
+                        log_stalled(
+                            "parole_retest_stalled",
+                            combo_key=combo_key,
+                            cohort_total=acct["cohort_total"],
+                            slots_spent=acct["spent"],
+                            remaining=remaining,
+                            required=retest,
+                            # Elapsed time is the field that makes five stalled
+                            # combos rankable from one grep; without it a
+                            # one-night stall and a six-week one read alike.
+                            parole_at=parole_at_existing,
+                            days_open=days_open,
+                            detail="parole window is open and NOTHING has ever "
+                            "been admitted; the retest cannot start. Check "
+                            "signal_params.enabled and "
+                            "SIGNAL_DISPATCH_QUARANTINE for this signal",
+                        )
                     else:
+                        # The defect this PR fixes was a NEW classifier state
+                        # falling silently into this arm and being reported as
+                        # "waiting" — a confident lie. The arm below fixes the
+                        # instance; this guard fixes the SHAPE, so the next
+                        # state added to `_classify_retest` announces itself
+                        # instead of inheriting the same mislabel.
+                        if retest_state != "waiting":
+                            log.error(
+                                "parole_retest_unclassified",
+                                combo_key=combo_key,
+                                retest_state=retest_state,
+                                detail="classifier returned a state the emit "
+                                "chain has no arm for; it is being reported as "
+                                "'waiting', which may be wrong",
+                            )
                         log.info(
                             "parole_retest_waiting",
                             combo_key=combo_key,

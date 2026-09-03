@@ -1,0 +1,85 @@
+# PR #568 — log a stalled parole retest as stalled, not as "waiting".
+#
+# Four rounds. Every round found a real defect, and every one was the SAME
+# defect the PR exists to fix, reappearing one corner over after the previous
+# was closed:
+#
+#   1. `_classify_retest` returned `parole_stalled` correctly, but the emit
+#      chain had no arm for it, so it fell into the `else` and logged
+#      `parole_retest_waiting` — "be patient" for a structurally stuck system.
+#      The page was fine throughout; only the log lied. `parole_stalled`
+#      appeared ZERO times in the retained journal, which is why the stall was
+#      read as "the alarm never fired" when it had been firing since 08-16.
+#   2. The grace period I added to fix (1) had none of the pager's, so ~half of
+#      fresh parole generations would have drawn a spurious WARNING — the
+#      false-alarm class the pager's own comment says it exists to avoid.
+#   3. The grace I then added claimed "SAME 1-DAY GRACE AS THE PAGE" and was
+#      not: the pager admits on a DISJUNCTION, so a burned-budget stall pages
+#      with NO grace. A fresh burned-budget stall would have paged at ERROR
+#      while logging INFO — a log contradicting a page, reachable by the exact
+#      prod case that motivated the state (chain_completed 2026-08-13,
+#      spent=5 cohort_total=0).
+#   4. The NULL edge of that disjunct was unpinned; two different plausible
+#      simplifications both survived the suite and both invert it.
+#
+# The logic vector's generalisation, worth more than any single finding: the
+# recurrence is NOT "predicates gain values". It is that each fix added a
+# discriminating input, and the fixture set was only ever extended to cover the
+# value the PREVIOUS reviewer named. `remaining=5` collapsed three fields;
+# `remaining=0` split them but not NULL; NULL is now split. The general form is
+# to enumerate a changed predicate's input equivalence classes and check a
+# fixture exists per class — rather than adding the one case the last reviewer
+# pointed at. The `remaining` domain ({None, >0, <=0}) is now exhausted.
+#
+# ONE DECISION TAKEN AGAINST A REVIEWER'S RECOMMENDATION, recorded because its
+# acceptance is CONDITIONAL. ops-safety preferred softening the comment over
+# mirroring the pager's SQL predicate in Python, citing the drift class
+# `parole_window_open`'s docstring warns about. I mirrored it instead: a log
+# that knowingly contradicts a page is what this PR exists to remove, and
+# "quieter than the page" is not a safe direction when the operator reads the
+# log to judge whether the page mattered. They then withdrew the
+# recommendation. But their tripwire stands: if
+# `test_fresh_burned_budget_stall_warns_without_grace` is deleted, weakened, or
+# made to assert the level selector instead of the predicate, or if that WHERE
+# clause is edited without following the comment's sync note, the Python copy
+# becomes an unpinned second source of truth and their original position is
+# live again. Re-read this decision against that tripwire.
+#
+# Open, deferred, not a condition on this PR: the tests pin the log's
+# BEHAVIOUR, not its CORRESPONDENCE to the pager's WHERE. If that clause
+# changes, nothing goes red. The durable fix is one test driving both paths
+# from a shared fixture across the four quadrants, asserting
+# `(log_level == "warning") == (combo was paged)`.
+#
+# All four vectors re-derived at this SHA. The final commit is TEST-ONLY —
+# `scout` hashes to 68bc181bf5ad89b23799f38660d744e4204fe45a at both 33fe3090
+# and 3d3e7448 — and three vectors verified that by tree hash themselves
+# rather than inheriting the claim.
+
+pr = 568
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "3d3e7448ecb9711276f998cc4cb81885dbb0fea2"
+logic          = "3d3e7448ecb9711276f998cc4cb81885dbb0fea2"
+ops-safety     = "3d3e7448ecb9711276f998cc4cb81885dbb0fea2"
+silent-failure = "3d3e7448ecb9711276f998cc4cb81885dbb0fea2"
