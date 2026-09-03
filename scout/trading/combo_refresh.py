@@ -769,12 +769,34 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                         # retained journal — which is why the stall was read as
                         # "the alarm never fired".
                         #
-                        # SAME 1-DAY GRACE AS THE PAGE. `_classify_retest`'s
-                        # `window_open` is a bare `parole_at <= now`
-                        # (timeutil.py), with no grace — but the pager applies
-                        # one deliberately (`stalled_grace_cutoff` above) and
-                        # says why: "a parole window that opened minutes ago
-                        # has legitimately not been used yet, and paging on it
+                        # MIRRORS THE PAGER'S ADMISSION PREDICATE, which is a
+                        # DISJUNCTION, not a bare calendar grace. See the
+                        # `WHERE` in `_process_retest_terminal_incomplete`:
+                        #   (COALESCE(parole_trades_remaining, 1) <= 0
+                        #    OR parole_at <= stalled_grace_cutoff)
+                        # The 1-day cutoff binds only the SECOND disjunct — a
+                        # burned-budget stall pages with NO grace at all.
+                        #
+                        # An earlier revision of this arm graced everything and
+                        # its comment claimed to mirror the page. It did not: a
+                        # fresh burned-budget stall paged the operator at ERROR
+                        # while writing an INFO line saying it was not yet
+                        # interesting. That is this function's own defect class
+                        # — a log contradicting the truth — one corner over,
+                        # and it is reachable by the prod case that motivated
+                        # the state (chain_completed 2026-08-13, spent=5 with
+                        # cohort_total=0).
+                        #
+                        # KEEP IN SYNC with that WHERE clause. Duplicating a
+                        # SQL predicate in Python is the drift class
+                        # `parole_window_open`'s docstring warns about; the
+                        # alternative was letting the log disagree with the
+                        # page, which is worse. The disjunction is pinned by
+                        # `test_fresh_burned_budget_stall_warns_without_grace`.
+                        #
+                        # The calendar arm exists because, as the pager says,
+                        # "a parole window that opened minutes ago has
+                        # legitimately not been used yet, and paging on it
                         # would fire a false alarm on every fresh generation".
                         #
                         # Without mirroring it here the LOG asserts "the retest
@@ -790,8 +812,11 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                         # classification is real and worth a trace, it is just
                         # not yet evidence of a stuck system.
                         days_open = _days_since(parole_at_existing)
+                        budget_burned = remaining is not None and remaining <= 0
                         log_stalled = (
-                            log.warning if (days_open or 0) >= 1 else log.info
+                            log.warning
+                            if ((days_open or 0) >= 1 or budget_burned)
+                            else log.info
                         )
                         log_stalled(
                             "parole_retest_stalled",

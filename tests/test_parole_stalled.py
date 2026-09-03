@@ -979,3 +979,71 @@ async def test_an_unclassified_state_announces_itself(
         assert any(e.get("event") == "parole_retest_waiting" for e in logs)
     finally:
         await db.close()
+
+
+async def test_fresh_burned_budget_stall_warns_without_grace(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The pager's grace is a DISJUNCTION; the log must mirror it.
+
+    `_process_retest_terminal_incomplete`'s WHERE admits on
+        (COALESCE(parole_trades_remaining, 1) <= 0 OR parole_at <= cutoff)
+    so the 1-day cutoff binds only the SECOND disjunct: a burned-budget stall
+    pages with NO grace. An earlier revision graced everything, so a fresh
+    burned-budget stall paged the operator at ERROR while logging INFO --
+    a log contradicting a page, which is this module's own defect class.
+
+    Reachable by the prod case that motivated the state: chain_completed on
+    2026-08-13 was spent=5 with cohort_total=0, and five slots can be
+    reserved-then-leaked within hours of a window opening.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Window open FIVE HOURS -- far inside the calendar grace -- but the
+        # budget is gone. The pager fires on this; so must the log.
+        await _seed_livelocked(db, "chain_completed", days_open=5.0 / 24.0, remaining=0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "chain_completed", s)
+        e = [x for x in logs if x.get("event") == "parole_retest_stalled"][0]
+        assert e["days_open"] < 1.0, "fixture must be inside the calendar grace"
+        assert e["remaining"] == 0
+        assert e["log_level"] == "warning", (
+            "a burned-budget stall pages with no grace, so the log must not "
+            f"call it uninteresting: {e}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_grace_boundary_is_one_day(tmp_path, settings_factory, monkeypatch):
+    """Pins the threshold to ~1 day, not merely to some value in a wide band.
+
+    Without both sides, any threshold in (0.083, 6.0] passed -- the existing
+    fixtures only bracket it at 2 hours and 6 days.
+    """
+    from structlog.testing import capture_logs
+
+    async def _level_at(days_open, combo):
+        db = Database(tmp_path / f"{combo}.db")
+        await db.initialize()
+        try:
+            s = settings_factory()
+            _silence_senders(monkeypatch)
+            # remaining=5 so the budget disjunct cannot mask the calendar one.
+            await _seed_livelocked(db, combo, days_open=days_open, remaining=5)
+            with capture_logs() as logs:
+                await combo_refresh.refresh_combo(db, combo, s)
+            return [
+                x for x in logs if x.get("event") == "parole_retest_stalled"
+            ][0]["log_level"]
+        finally:
+            await db.close()
+
+    assert await _level_at(0.98, "slow_burn") == "info"
+    assert await _level_at(1.02, "volume_spike") == "warning"
