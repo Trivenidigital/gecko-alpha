@@ -1047,3 +1047,55 @@ async def test_grace_boundary_is_one_day(tmp_path, settings_factory, monkeypatch
 
     assert await _level_at(0.98, "slow_burn") == "info"
     assert await _level_at(1.02, "volume_spike") == "warning"
+
+
+async def test_null_budget_stall_is_not_treated_as_burned(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The NULL edge of the budget disjunct.
+
+    The pager's predicate is `COALESCE(parole_trades_remaining, 1) <= 0`, so
+    a NULL budget coalesces to 1 and is NOT burned -- the pager declines. The
+    Python mirror must agree, which is why it reads
+    `remaining is not None and remaining <= 0` rather than the obvious
+    simplification `(remaining or 0) <= 0`.
+
+    Both simplifications a future reader would reach for --
+    `(remaining or 0) <= 0` and `remaining is None or remaining <= 0` --
+    invert that edge and survived the suite before this test: they WARN on a
+    NULL budget while the pager stays silent, which is the log-contradicts-
+    page shape this PR exists to remove, one value further over.
+
+    NULL is a real anticipated state here, not a theoretical one: the pager
+    renders it specially ("unknown" rather than the number),
+    `_retest_accounting` special-cases it for `spent`, and `_classify_retest`
+    guards on it.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Inside the calendar grace, so only the budget disjunct can decide.
+        await _seed_livelocked(db, "slow_burn", days_open=2.0 / 24.0)
+        await db._conn.execute(
+            "UPDATE combo_performance SET parole_trades_remaining = NULL "
+            "WHERE combo_key = 'slow_burn' AND window = '30d'"
+        )
+        await db._conn.commit()
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+        stalled = [x for x in logs if x.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"a NULL-budget stall must still classify: {logs}"
+        e = stalled[0]
+        assert e["remaining"] is None, "fixture must actually exercise the NULL edge"
+        assert e["days_open"] < 1.0, "fixture must be inside the calendar grace"
+        assert e["log_level"] == "info", (
+            "NULL coalesces to 1 in the pager's predicate, so it is NOT burned "
+            f"and the pager declines -- the log must not WARN: {e}"
+        )
+    finally:
+        await db.close()
