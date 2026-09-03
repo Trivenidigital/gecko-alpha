@@ -752,6 +752,38 @@ async def _refresh_combo_locked(db: Database, combo_key: str, settings) -> bool:
                             detail="enough resolved outcomes but slots still "
                             "remain — inconsistent with a clean parole; holding",
                         )
+                    elif retest_state == "parole_stalled":
+                        # WITHOUT THIS ARM the state fell through to the `else`
+                        # and was logged as `parole_retest_waiting` — the exact
+                        # word this classification exists to stop using. The
+                        # page still fired (see `_process_retest_terminal_
+                        # incomplete`, which does branch on the state), so the
+                        # bug was invisible from the alert and visible only in
+                        # the logs, where it said the opposite of the truth.
+                        #
+                        # Prod 2026-09-03: five combos classified
+                        # `parole_stalled` when the real classifier was run
+                        # against the real DB, while every nightly run had
+                        # logged them as `waiting` and the string
+                        # "parole_stalled" appeared ZERO times in the whole
+                        # retained journal — which is why the stall was read as
+                        # "the alarm never fired".
+                        #
+                        # WARNING, not info: an open window with an empty cohort
+                        # is a stuck system, and info is the level the
+                        # mislabelled line already used.
+                        log.warning(
+                            "parole_retest_stalled",
+                            combo_key=combo_key,
+                            cohort_total=acct["cohort_total"],
+                            slots_spent=acct["spent"],
+                            remaining=remaining,
+                            required=retest,
+                            detail="parole window is open and NOTHING has ever "
+                            "been admitted; the retest cannot start. Check "
+                            "signal_params.enabled and "
+                            "SIGNAL_DISPATCH_QUARANTINE for this signal",
+                        )
                     else:
                         log.info(
                             "parole_retest_waiting",

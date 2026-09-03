@@ -690,3 +690,140 @@ async def test_reclassification_does_not_re_page_already_alerted_combos(
         assert "STALLED" in sender.messages[0]
     finally:
         await db.close()
+
+
+# --- the EMIT path -------------------------------------------------------
+#
+# Everything above tests `_classify_retest` in isolation, which is why the
+# defect below survived: the classifier returned "parole_stalled" correctly
+# in prod, and the per-combo log line still said "waiting". The if/elif chain
+# in `_refresh_combo_locked` had branches for complete / terminal_incomplete /
+# contaminated / accounting_inconsistent and an `else` — and no arm for the
+# state this module exists to introduce, so it fell through to the generic
+# "be patient" log. Same shape as the classifier being pinned while the thing
+# that CONSUMES it is not.
+#
+# Measured on prod 2026-09-03: five combos classified `parole_stalled` when
+# the real function was run against the real DB, while every nightly run had
+# logged `parole_retest_waiting` for them and the string "parole_stalled"
+# appeared ZERO times in the entire retained journal.
+
+
+def _silence_senders(monkeypatch):
+    """Silence every combo_refresh sender. Local to this module -- the
+    identically-named helper in test_alert_events_insertion_sites.py is not
+    importable from here."""
+    for name in (
+        "_send_permanent_suppression_alert",
+        "_send_suppression_reversal_alert",
+        "_send_retest_incomplete_alert",
+    ):
+        monkeypatch.setattr(combo_refresh, name, _StubSender())
+
+
+async def _stalled_states(db, settings, combo_key):
+    """Run one refresh and return the retest events it logged."""
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await combo_refresh.refresh_combo(db, combo_key, settings)
+    return [e for e in logs if str(e.get("event", "")).startswith("parole_retest")]
+
+
+async def test_stalled_combo_is_not_logged_as_waiting(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The whole point of the state: a stalled retest must not be reported
+    with the word that means 'be patient'.
+
+    Asserted as an ABSENCE plus a matching presence, not absence alone -- an
+    absence-only assertion would also pass if the refresh silently did
+    nothing at all.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "slow_burn")
+
+        events = await _stalled_states(db, s, "slow_burn")
+        names = [e["event"] for e in events]
+
+        assert "parole_retest_waiting" not in names, (
+            "a stalled combo was reported as 'waiting' -- the exact "
+            f"mislabel this state exists to remove: {names}"
+        )
+        assert "parole_retest_stalled" in names, (
+            f"no stall-specific event was emitted: {names}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_stalled_log_carries_the_diagnostic_fields(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The page tells the operator to check signal_params.enabled; the LOG has
+    to carry enough to confirm the diagnosis without re-deriving it. Asserts
+    real values, not mere presence."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "volume_spike", days_open=6.0, remaining=5)
+
+        events = await _stalled_states(db, s, "volume_spike")
+        stalled = [e for e in events if e["event"] == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"expected exactly one stall log: {events}"
+        e = stalled[0]
+        assert e["combo_key"] == "volume_spike"
+        assert e["cohort_total"] == 0
+        assert e["remaining"] == 5
+        # WARNING, not info: an empty cohort under an open window is a stuck
+        # system, and info is the level the mislabelled line already used.
+        assert e["log_level"] == "warning"
+    finally:
+        await db.close()
+
+
+async def test_waiting_is_still_used_when_the_cohort_is_genuinely_progressing(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The fix must not turn every non-terminal state into 'stalled'.
+
+    A combo with an OPEN trade has a non-empty cohort, so it is genuinely
+    waiting -- and must still say so. Without this, replacing the `else` arm
+    wholesale would pass the two tests above.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "chain_completed", remaining=3)
+        # One admitted, still-open trade inside the parole window.
+        cur = await db._conn.execute(
+            "SELECT parole_at FROM combo_performance WHERE combo_key='chain_completed'"
+        )
+        (parole_at,) = await cur.fetchone()
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_price, sl_price, status, "
+            " opened_at, created_at, signal_combo) "
+            "VALUES ('t1','T','T','solana','chain_completed','{}',1.0,100.0,100.0,"
+            "1.2,0.9,'open',?,?,'chain_completed')",
+            (parole_at, parole_at),
+        )
+        await db._conn.commit()
+
+        events = await _stalled_states(db, s, "chain_completed")
+        names = [e["event"] for e in events]
+        assert "parole_retest_waiting" in names, (
+            f"a progressing cohort must still read as waiting: {names}"
+        )
+        assert "parole_retest_stalled" not in names, names
+    finally:
+        await db.close()
