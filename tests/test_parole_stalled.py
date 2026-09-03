@@ -781,9 +781,120 @@ async def test_stalled_log_carries_the_diagnostic_fields(
         assert e["combo_key"] == "volume_spike"
         assert e["cohort_total"] == 0
         assert e["remaining"] == 5
-        # WARNING, not info: an empty cohort under an open window is a stuck
-        # system, and info is the level the mislabelled line already used.
+        assert e["required"] == 5
+        assert e["slots_spent"] == 0
+        # The remedy pointer is the one field that tells the operator what to
+        # DO. Mutation showed `slots_spent`, `required` and the entire
+        # `detail=` string could all be stripped with the suite still green.
+        assert "signal_params.enabled" in e["detail"]
+        assert "SIGNAL_DISPATCH_QUARANTINE" in e["detail"]
+        # WARNING, not info: an empty cohort under a window open for more than
+        # the grace period is a stuck system.
         assert e["log_level"] == "warning"
+    finally:
+        await db.close()
+
+
+async def test_budget_exhausted_stall_reports_spent_not_cohort(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A stall with the budget BURNED — slots reserved at the gate then
+    leaked, never admitting anything.
+
+    Every other fixture here uses remaining=5, which equals
+    FEEDBACK_PAROLE_RETEST_TRADES, so `spent` is 0 and `remaining` == `required`
+    in all of them. That makes three distinct fields indistinguishable and lets
+    two real mutants live: `cohort_total=acct["spent"]` and
+    `remaining=retest`. Under the first, a combo with an EMPTY cohort would be
+    logged `cohort_total=5` -- the exact misstatement this state exists to
+    remove, in the exact prod scenario (chain_completed, 2026-08-13, spent=5
+    cohort_total=0) the classifier was re-partitioned onto the cohort to catch.
+
+    This is also the only emit-path coverage of the budget-exhausted stall.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "chain_completed", days_open=9.0, remaining=0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "chain_completed", s)
+        stalled = [e for e in logs if e.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"expected a stall log: {logs}"
+        e = stalled[0]
+        # The discriminating trio: an empty cohort, a fully spent budget, and
+        # nothing remaining. All three differ here.
+        assert e["cohort_total"] == 0
+        assert e["slots_spent"] == 5
+        assert e["remaining"] == 0
+        assert e["required"] == 5
+    finally:
+        await db.close()
+
+
+async def test_fresh_window_is_not_yet_warned_about(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The 1-day grace, mirrored from the pager.
+
+    `_classify_retest`'s window_open is a bare `parole_at <= now`, but
+    `_process_retest_terminal_incomplete` applies a 1-day grace and says why:
+    a window that opened minutes ago has legitimately not been used yet.
+    Without mirroring it, the LOG asserts "the retest cannot start" for a
+    generation the PAGE correctly judges too fresh -- and since parole_at is
+    suppressed_at+14d at an arbitrary time of day against a nightly refresh,
+    roughly half of all fresh generations would draw a spurious WARNING.
+
+    Still logged, at INFO: the classification is real, it is just not yet
+    evidence of a stuck system.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Window opened 2 hours ago -- inside the grace.
+        await _seed_livelocked(db, "slow_burn", days_open=2.0 / 24.0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+        stalled = [e for e in logs if e.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"a fresh stall must still be traced: {logs}"
+        assert stalled[0]["log_level"] == "info", (
+            "a window open for 2 hours must not be WARNED about -- that is the "
+            f"false-alarm class the pager's grace exists to avoid: {stalled[0]}"
+        )
+        assert stalled[0]["days_open"] < 1.0
+    finally:
+        await db.close()
+
+
+async def test_aged_stall_carries_its_elapsed_time(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Elapsed time is what makes five stalled combos rankable from one grep.
+    Without it a one-night stall and a six-week one read identically."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "narrative_prediction", days_open=42.0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "narrative_prediction", s)
+        e = [x for x in logs if x.get("event") == "parole_retest_stalled"][0]
+        assert e["log_level"] == "warning"
+        assert 41.5 <= e["days_open"] <= 42.5, e
+        assert e["parole_at"] is not None
     finally:
         await db.close()
 
@@ -825,5 +936,46 @@ async def test_waiting_is_still_used_when_the_cohort_is_genuinely_progressing(
             f"a progressing cohort must still read as waiting: {names}"
         )
         assert "parole_retest_stalled" not in names, names
+    finally:
+        await db.close()
+
+
+async def test_an_unclassified_state_announces_itself(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The SHAPE guard, not the instance.
+
+    This PR exists because a new classifier state fell silently into the
+    `else` and was reported as "waiting" -- a confident lie. Adding the
+    missing arm fixes that instance; it does not stop the NEXT state added to
+    `_classify_retest` from inheriting the same mislabel. This pins the guard
+    that turns that recurrence from a silent lie into a loud one.
+
+    Driven by forcing the classifier to return a state the emit chain has no
+    arm for, because by construction every state it can currently return now
+    HAS an arm -- so there is no natural input that reaches the guard.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "slow_burn")
+        monkeypatch.setattr(
+            combo_refresh, "_classify_retest", lambda *a, **k: "some_future_state"
+        )
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+
+        unknown = [e for e in logs if e.get("event") == "parole_retest_unclassified"]
+        assert len(unknown) == 1, f"an unhandled state must announce itself: {logs}"
+        assert unknown[0]["retest_state"] == "some_future_state"
+        assert unknown[0]["log_level"] == "error"
+        # Still reported as waiting afterwards -- the guard adds a signal, it
+        # does not change the fallback behaviour.
+        assert any(e.get("event") == "parole_retest_waiting" for e in logs)
     finally:
         await db.close()
