@@ -8,10 +8,10 @@ fails for the wrong reason is one that will pass for the wrong reason later.
 Several of these exist because an independent reviewer broke the first draft:
 a misspelled watch entry silently reported coverage, `required` could be
 narrowed to one vector, a branch name was accepted where a SHA belongs, and
-every PR was forced to edit the declaration to go green. The bypasses that
-remain -- no branch protection, and an author-writable record -- are documented
-in the script's docstring rather than papered over, because they cannot be
-closed from inside the repository.
+every PR was forced to edit the declaration to go green. Of the two bypasses
+this file used to name, branch protection was closed on 2026-08-28; the
+author-writable record remains and is now the only one. Both are documented in
+the script's docstring rather than papered over.
 """
 
 import os
@@ -69,7 +69,7 @@ PR = "42"
 OTHER_PR = "43"
 
 
-def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
+def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None, extra_env=None):
     """Run the real script against `repo`, with its per-PR records inside it.
 
     `pr=None` omits `--pr` entirely -- that is how identity-unresolved is
@@ -80,10 +80,15 @@ def _run(repo, head="HEAD", base="master", pr=PR, env_pr=None):
     argv = [sys.executable, str(SCRIPT), head, base]
     if pr is not None:
         argv += ["--pr", pr]
-    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
+    env = {**os.environ}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
+    # `extra_env` exists for ONE test: proving the environment cannot change a
+    # verdict. It is deliberately un-filtered -- the point is to hand the gate
+    # a hostile environment and require the answer not to move.
+    if extra_env:
+        env.update(extra_env)
     r = subprocess.run(argv, cwd=str(repo), capture_output=True, text=True, env=env)
     return r.returncode, r.stdout + r.stderr
 
@@ -522,7 +527,7 @@ def test_a_MALFORMED_stored_clearance_is_caught_at_rest(repo):
 
 def _run_argv(repo, extra, env_pr=None):
     """Drive the script with an EXACT argv tail, preserving order."""
-    env = {**os.environ, "REVIEWERS_PREFIX": ".reviewers"}
+    env = {**os.environ}
     env.pop("REVIEWERS_PR", None)
     if env_pr is not None:
         env["REVIEWERS_PR"] = env_pr
@@ -1613,7 +1618,7 @@ def test_the_C1_guard_fires_from_a_SUBDIRECTORY(repo, monkeypatch):
     r = subprocess.run(
         [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR],
         cwd=str(sub), capture_output=True, text=True,
-        env={**os.environ, "REVIEWERS_PREFIX": ".reviewers"},
+        env={**os.environ},
     )
     out = r.stdout + r.stderr
     assert r.returncode == 1, (
@@ -2002,3 +2007,1664 @@ def test_the_archive_sweep_READS_AND_PARSES_a_real_record(tmp_path):
         tomllib.loads((d / "42.toml").read_text(encoding="utf-8")),
     )
     assert any("filename and contents disagree" in e for e in bad), bad
+
+
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# TICKET 28 -- the first red must carry its own remedy.
+#
+# Rewritten after four review vectors. Three of them found the same S2 from
+# different directions, and the block below is shaped by what they broke:
+#
+#   * the clearance lines are emitted COMMENTED OUT, so the default paste is
+#     the SAFE one. Live placeholders made a docs-only PR red, ALSO failed the
+#     other required check via the structural sweep, and -- worst -- made
+#     inventing four SHAs the path of least resistance.
+#   * `assert "COMMIT" in out.upper()` used to pass on the word "unCOMMITted"
+#     inside the sentence under test. The test named `..._says_COMMIT` did not
+#     test that it says COMMIT.
+#   * `assert ".reviewers/42.toml" in out` used to pass on the PRE-EXISTING
+#     FAIL line, leaving the new sentence's path unpinned.
+#   * the placeholder loop iterated `doc["clearances"]`, which is now EMPTY by
+#     design -- a loop over nothing asserts nothing.
+#
+# Each of those is the same shape: an assertion satisfied by something other
+# than the thing it names.
+# --------------------------------------------------------------------------
+
+
+def _extract_skeleton(out):
+    """Pull the template back out of STDOUT, rather than re-calling `_skeleton`.
+
+    Deliberate: the contract is about what the READER receives, not what the
+    function returns. Those differ the moment the print path mangles, wraps or
+    drops a line -- and re-calling the generator would agree with itself in
+    exactly that case. A comparison that cannot fail is not a test.
+    """
+    lines = out.split(chr(10))
+    start = None
+    for i, line in enumerate(lines):
+        if "Skeleton, generated from" in line:
+            start = i + 1
+            break
+    assert start is not None, "no skeleton block in output:" + chr(10) + out
+    body = []
+    for line in lines[start:]:
+        if line.startswith("      "):
+            body.append(line[6:])
+        elif line.strip() == "":
+            body.append("")
+        else:
+            break
+    while body and body[0] == "":
+        body.pop(0)
+    while body and body[-1] == "":
+        body.pop()
+    assert body, "the skeleton block was empty:" + chr(10) + out
+    return chr(10).join(body)
+
+
+def _uncomment(body):
+    """Uncomment the clearance lines, as an author with real SHAs would."""
+    out = []
+    for line in body.split(chr(10)):
+        s = line.lstrip()
+        if s.startswith("# ") and " = " in s and _GATE.SKELETON_SHA in s:
+            out.append(s[2:])
+        else:
+            out.append(line)
+    return chr(10).join(out)
+
+
+def _first_red(repo, pr=PR):
+    """A branch that moved production but carries no record."""
+    _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    return _run(repo, "HEAD", "master", pr=pr)
+
+
+def _commit_record(repo, body, pr=PR):
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (pr + ".toml")).write_bytes(body.encode("utf-8"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "record")
+
+
+def test_the_MISSING_RECORD_red_carries_a_skeleton(repo):
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    assert "no clearance FILE" in out, out
+    assert "[clearances]" in out, (
+        "the first red carried no record skeleton:" + chr(10) + out
+    )
+
+
+def test_the_skeleton_does_NOT_relax_the_verdict(repo):
+    """Ticket 28 is usability, not relaxation."""
+    rc, out = _first_red(repo)
+    # WHICH red, not merely nonzero. Exit 2 means "undetermined"; a mutant that
+    # escapes through that channel satisfies `rc != 0` while destroying the
+    # distinction this module is built on.
+    assert rc == 1, "printing a remedy changed the verdict to " + str(rc) + chr(10) + out
+    assert "no clearance FILE" in out, out
+
+
+def test_the_skeleton_is_VALID_TOML_with_an_EMPTY_clearance_table(repo):
+    import tomllib
+
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    doc = tomllib.loads(_extract_skeleton(out))
+    assert doc["pr"] == int(PR), doc
+    assert doc["record_version"] == _GATE.DEFAULT_RECORD_VERSION, doc
+    # EMPTY BY DESIGN, and the reason is the whole finding: the shape sweep runs
+    # before the "no delta => pass" branch, so live placeholders red a docs-only
+    # PR, fail the structural sweep in the other required job, and make
+    # fabricating four SHAs the easiest way out.
+    assert doc["clearances"] == {}, (
+        "clearances are live in the template -- a verbatim paste is unsafe:"
+        + chr(10) + _extract_skeleton(out)
+    )
+
+
+def test_the_remedy_SENTENCE_names_the_path_and_the_imperative(repo):
+    """Pinned AS A UNIT, and neither half by itself.
+
+    `".reviewers/42.toml" in out` passed on the PRE-EXISTING FAIL line, so the
+    new sentence could name any path at all. And `"COMMIT" in out.upper()`
+    passed on the word "unCOMMITted" inside this very sentence -- the tokens
+    cross-matched, which is the failure this file's own comments record.
+    """
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    assert "Create .reviewers/" + PR + ".toml and COMMIT it" in out, (
+        "the remedy sentence does not name the exact path AND the imperative:"
+        + chr(10) + out
+    )
+
+
+def test_the_remedy_does_not_read_as_a_CLEAN_BILL(repo):
+    """"Expected" is about THIS check. Later checks have not run."""
+    rc, out = _first_red(repo)
+    assert "certifies nothing else" in out, out
+
+
+def test_the_skeleton_MATCHES_the_live_floors(repo):
+    import tomllib
+
+    rc, out = _first_red(repo)
+    doc = tomllib.loads(_extract_skeleton(out))
+    assert set(doc["required"]) == set(_GATE.MANDATORY_VECTORS), doc["required"]
+    assert set(doc["watch"]) == set(_GATE.MANDATORY_WATCH), doc["watch"]
+
+
+@pytest.mark.parametrize("floor", ["MANDATORY_WATCH", "MANDATORY_VECTORS"])
+def test_a_GROWN_floor_reaches_the_skeleton_with_NO_second_edit(
+    repo, monkeypatch, floor
+):
+    """THE regression this ticket exists to prevent, written as a mutation.
+
+    A hardcoded template passes almost everything else here and fails only on
+    this -- which is why the assertion names the NEW member rather than merely
+    checking the template still parses.
+    """
+    import tomllib
+
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    new = "a-brand-new-floor-member"
+    monkeypatch.setattr(mod, floor, frozenset(getattr(mod, floor) | {new}))
+    body = mod._skeleton(PR)
+    key = "watch" if floor == "MANDATORY_WATCH" else "required"
+    assert new in tomllib.loads(body)[key], (
+        floor + " grew and the skeleton did not follow -- it is transcribed, "
+        "not derived:" + chr(10) + body
+    )
+
+
+# `ctl` and `del` are not decoration. The control-character branch of
+# `_toml_str` shipped UNPINNED: deleting `elif ord(ch) < 0x20 or ord(ch) ==
+# 0x7F` passed this entire file. Every member originally chosen here had a
+# branch of its OWN -- `"`, `\` and `\n` are each handled explicitly -- so
+# nothing ever reached the fallback. A fixture assembled from the cases you
+# thought of cannot exercise the clause that exists for the ones you did not.
+# Third time that shape has surfaced on this PR, and the second time INSIDE a
+# test written to catch it.
+@pytest.mark.parametrize(
+    "member",
+    ["prod.state", 'we"ird', "back\\slash", "a b", "ctl\x01x", "del\x7fx"],
+)
+def test_a_METACHARACTER_vector_survives_as_a_FLAT_key(monkeypatch, member):
+    """The mutant the GROWN test cannot see, and the reason it cannot.
+
+    That test injects "a-brand-new-floor-member" -- hyphens only, a legal bare
+    key. A fixture built from convenient values cannot exercise the clause that
+    handles inconvenient ones.
+
+    `prod.state` is the dangerous case: as a BARE key it parses cleanly and
+    silently becomes `[clearances.prod] state = ...`, so the vector gets no SHA
+    and the author is told "NO SHA RECORDED" for a key they can see in their
+    own file. Wrong-but-plausible beats unparseable at wasting a day.
+    """
+    import tomllib
+
+    mod = _load_checker()
+    monkeypatch.setattr(
+        mod, "MANDATORY_VECTORS", frozenset(mod.MANDATORY_VECTORS | {member})
+    )
+    body = mod._skeleton(PR)
+    doc = tomllib.loads(body)
+    assert member in doc["required"], body
+    # NOT a raw substring check on the emitted text -- `back\slash` is
+    # correctly written as `"back\\slash"`, so a literal search would fail
+    # against ESCAPING THAT IS WORKING. Parse it back instead: round-tripping
+    # through tomllib is the only assertion that means what it says here.
+    assert member in tomllib.loads(_uncomment(body))["clearances"], (
+        "vector " + repr(member) + " did not survive as a FLAT clearance key:"
+        + chr(10) + body
+    )
+
+
+@pytest.mark.parametrize(
+    "member",
+    ['pa"th', "back\\slash", "new\nline", "ctl\x01x", "del\x7fx"],
+)
+def test_a_METACHARACTER_watch_entry_is_ESCAPED(monkeypatch, member):
+    import tomllib
+
+    mod = _load_checker()
+    monkeypatch.setattr(
+        mod, "MANDATORY_WATCH", frozenset(mod.MANDATORY_WATCH | {member})
+    )
+    body = mod._skeleton(PR)
+    assert member in tomllib.loads(body)["watch"], (
+        "watch member " + repr(member) + " did not round-trip:" + chr(10) + body
+    )
+
+
+def test_the_PLACEHOLDER_appears_ONCE_PER_VECTOR_and_is_not_a_valid_sha(repo):
+    """Existence AND count, not a loop over whatever happens to be there.
+
+    The earlier version iterated `doc["clearances"]` -- now empty by design --
+    so it asserted nothing at all. A template emitting one vector, or none,
+    passed it.
+    """
+    rc, out = _first_red(repo)
+    body = _extract_skeleton(out)
+    n = body.count(_GATE.SKELETON_SHA)
+    assert n == len(_GATE.MANDATORY_VECTORS), (
+        "expected one placeholder per vector ("
+        + str(len(_GATE.MANDATORY_VECTORS)) + "), found " + str(n) + chr(10) + body
+    )
+    assert not _GATE._SHA_RE.match(_GATE.SKELETON_SHA), (
+        "the placeholder is a well-formed SHA, so an unedited record would be "
+        "rejected for a MISSING COMMIT rather than an unfilled template"
+    )
+
+
+def test_a_DOCS_ONLY_pr_goes_GREEN_on_a_VERBATIM_paste(repo):
+    """The finding three vectors converged on, as an executable contract.
+
+    The author does the least possible: copies the block, commits it, changes
+    nothing. Because the clearance lines are commented, that is the CORRECT
+    record for a PR with no watched delta -- and it must pass.
+    """
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _extract_skeleton(out))
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 0, (
+        "a verbatim paste of the printed remedy does NOT go green on a "
+        "docs-only PR:" + chr(10) + out2
+    )
+    assert "no clearance required" in out2, out2
+
+
+def test_an_UNCOMMENTED_but_UNFILLED_placeholder_is_REFUSED(repo):
+    """The state a hurried author reaches, and the mutant that survived.
+
+    An adversarial pass inserted `if str(sha) == SKELETON_SHA: continue` into
+    the shape loop -- the plausible "friendly" future change -- and the whole
+    suite stayed green. Nothing pinned that a live placeholder is REJECTED.
+    """
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _uncomment(_extract_skeleton(out)))
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 1, (
+        "an unedited placeholder was ACCEPTED as a clearance:" + chr(10) + out2
+    )
+    assert _GATE.SKELETON_SHA in out2, (
+        "the refusal never names the placeholder, so the author is not told "
+        "what is wrong:" + chr(10) + out2
+    )
+
+
+def test_the_skeleton_ROUND_TRIPS_to_a_GREEN(repo):
+    """GREEN-IS-REACHABLE for the template, and the strongest test in the block.
+
+    Everything else proves the skeleton is well-FORMED. None of it proves it is
+    SUFFICIENT -- a template can parse, match both floors, and still describe a
+    record the gate rejects. Not hypothetical here: a gate and its own
+    conformance test once demanded mutually unsatisfiable things, every
+    component test passed, and no commit could go green.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+
+    body = _uncomment(_extract_skeleton(out)).replace(_GATE.SKELETON_SHA, sha)
+    assert _GATE.SKELETON_SHA not in body, "placeholder substitution failed"
+    _commit_record(repo, body)
+
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 0, (
+        "the gate REFUSES the template it printed -- the remedy is wrong:"
+        + chr(10) + out2
+    )
+
+
+@pytest.mark.parametrize("kind", ["wrong_pr", "bad_toml", "narrowed"])
+def test_the_skeleton_is_NOT_printed_on_OTHER_failures(repo, kind):
+    """Scope, across THREE red branches rather than one.
+
+    A single-branch test proved only that the covered branch is clean; a
+    skeleton print added to any other red branch survived it. Emitting the
+    template on every failure buries the specific diagnosis and trains the
+    reader to skip the part that says what went wrong.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    if kind == "wrong_pr":
+        _decl(repo, {v: sha for v in MANDATORY_VECTORS}, declared_pr=OTHER_PR)
+    elif kind == "bad_toml":
+        _commit_record(repo, "pr = " + PR + chr(10) + "required = [oops")
+    else:
+        _decl(repo, {v: sha for v in MANDATORY_VECTORS},
+              required=["logic"], watch=["scout"])
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    assert "[clearances]" not in out, (
+        "a skeleton was printed for a failure that is not a missing record ("
+        + kind + "):" + chr(10) + out
+    )
+
+
+# --- Round 3, from the silent-failure vector's pre-emptive notes on the
+# --- commented-clearances redesign. All three are about the INSTRUMENT: the
+# --- redesign moved work out of the gate and into the test's own edit.
+
+
+def test_the_INSTRUCTION_matches_what_the_round_trip_test_DOES(repo):
+    """SF note 1. `_uncomment()` is the test's OWN invention.
+
+    Before the redesign the round-trip was a pure substitution, so "what the
+    reader receives" and "what the test commits" were the same artifact. Now
+    the test must also strip comment markers -- and it could strip them in a
+    way no human would, and still report a successful round trip. The
+    green-is-reachable proof became conditional on un-commenting logic that
+    nothing pinned.
+
+    So pin the join: the printed text must actually TELL the reader to
+    uncomment. If the instruction stops saying it, this fails even though
+    `_uncomment` still works.
+    """
+    rc, out = _first_red(repo)
+    assert rc == 1, out
+    assert "UNCOMMENT and replace" in _extract_skeleton(out), (
+        "the template never tells the reader to uncomment, but the round-trip "
+        "test does it anyway -- the test is proving its own edit, not the "
+        "documented one:" + chr(10) + out
+    )
+
+
+def test_the_PLACEHOLDERS_sit_UNDER_the_clearances_table(repo):
+    """SF note 2. `count(...) == len(vectors)` counts occurrences ANYWHERE.
+
+    That is what lets it see through comment markers, and it is why it kills
+    the emit-one-vector and emit-none mutants the old loop survived. But it
+    stopped proving LOCATION: four placeholders sitting in the prose would
+    satisfy it. Pair, rather than replace.
+    """
+    rc, out = _first_red(repo)
+    body = _extract_skeleton(out)
+    head, _, tail = body.partition("[clearances]")
+    assert _GATE.SKELETON_SHA not in head, (
+        "a placeholder appears BEFORE [clearances]:" + chr(10) + body
+    )
+    assert tail.count(_GATE.SKELETON_SHA) == len(_GATE.MANDATORY_VECTORS), (
+        "placeholders are not all under [clearances]:" + chr(10) + body
+    )
+
+
+def test_an_EMPTY_clearance_table_still_REDS_a_PRODUCTION_pr(repo):
+    """SF note 3, and the one that matters most after the redesign.
+
+    An empty `[clearances]` used to be a typo. It is now the DEFAULT PASTE, so
+    it stops being a rare state and becomes the common one. The docs-only green
+    is the intended exemption; the production red is the property that must not
+    have been traded away to get it.
+
+    `shape_errors` is scoped to `required_set` and iterates an empty dict, so
+    it raises nothing -- the red has to come from the per-vector loop instead.
+    Worth pinning explicitly rather than inferring from that reading.
+    """
+    _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 1, out
+    _commit_record(repo, _extract_skeleton(out))      # verbatim: clearances empty
+    rc2, out2 = _run(repo, "HEAD", "master", pr=PR)
+    assert rc2 == 1, (
+        "an EMPTY clearance table passed a PR that moved a watched path:"
+        + chr(10) + out2
+    )
+    assert "NO SHA RECORDED" in out2, out2
+
+
+# --------------------------------------------------------------------------
+# WORKFLOW INTEGRITY. Structural, not a substring sweep.
+#
+# The clearance job is delivered by `.github/workflows/*.yml`, and for
+# `pull_request` events GitHub runs the workflow FROM THE PR'S OWN MERGE REF --
+# so the PR being judged supplies the judge. Neutering it is a one-line edit,
+# and `.github` being on the watch floor does not help: the mechanism that
+# would demand clearances for that edit is the one being neutered.
+#
+# THE FIRST VERSION OF THIS GUARD WAS A BLOCKLIST AND IT WAS MEASURED: it
+# caught 3 of 10 real tampers. Seven survived, six of them one-liners --
+# `||true` (one character off a caught literal), `|| echo x`, `|| /bin/true`,
+# `: python ...` (`:` ignores its arguments), replacing the whole `run:` with
+# `echo ok`, a STEP-level `if: false` (both old tests read the JOB's `if:`),
+# and `set +e` plus a trailing command. The claim written beside it -- "raises a
+# one-line tamper to a two-line one" -- was false, which is the exact class of
+# unmeasured claim this PR exists to stop shipping.
+#
+# So: PIN, do not blocklist. The bad-pattern space is unbounded; the legitimate
+# content is a fixed, small structure. Asserting equality against the expected
+# resolved values means every tamper trips the same assertion -- named or not,
+# hostile or accidental -- and any legitimate change must be made explicitly in
+# the diff, where a reviewer sees it.
+#
+# STILL NOT CLOSURE, and this must not be reported as one. The same PR that
+# edits the workflow can edit this file, and `test` ships through the same
+# `run:` surface. Real closure is a repository ruleset with `required_workflows`
+# pinning the workflow at a ref the PR cannot rewrite -- an operator action,
+# outside the repo, like 13(d) and 13(e).
+#
+# `pyyaml>=6.0,<7` is already a project dependency, so this adds none. That
+# matters: adding one would touch `pyproject.toml` and `uv.lock`, both watched,
+# and lapse every clearance for the sake of a test.
+# --------------------------------------------------------------------------
+
+_WF_DIR = REPO_ROOT / ".github" / "workflows"
+
+#: The clearance step's script, normalized (comments dropped, trailing
+#: whitespace stripped, blank lines dropped). Comments are deliberately NOT
+#: pinned -- the prose warning in the step is not the control and must stay
+#: freely editable. `||`, `;`, `&&` and redirections are deliberately NOT
+#: normalized away; doing so would rebuild the hole this replaces.
+_EXPECTED_CLEARANCE_RUN = (
+    'git fetch --quiet origin "${{ github.base_ref }}"' + chr(10)
+    + "python scripts/check_reviewer_clearances.py             "
+    + '"${{ github.event.pull_request.head.sha }}"             '
+    + '"origin/${{ github.base_ref }}"             '
+    + '--pr "${{ github.event.pull_request.number }}"'
+)
+
+_EXPECTED_CLEARANCE_IF = "github.event_name == 'pull_request'"
+
+
+def _load_workflows():
+    """Every workflow, parsed. MISSING OR UNPARSEABLE RAISES -- never skips.
+
+    A sweep that skips reports green having asserted nothing, which is this
+    repository's most-repeated lesson and the reason the archive sweep needed
+    its own fix.
+    """
+    import yaml                                   # already a project dependency
+
+    assert _WF_DIR.is_dir(), "workflow directory missing: " + str(_WF_DIR)
+    files = sorted(
+        [p for p in _WF_DIR.iterdir() if p.suffix in (".yml", ".yaml")]
+    )
+    assert files, "no workflow files found in " + str(_WF_DIR)
+    out = {}
+    for f in files:
+        # safe_load, never load.
+        doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+        assert isinstance(doc, dict), "unparseable workflow: " + f.name
+        out[f.name] = doc
+    return out
+
+
+def _jobs_by_context():
+    """Map GitHub's CHECK CONTEXT -> (file, job id, job), across all workflows.
+
+    The context is what branch protection matches on, and GitHub computes it as
+    `name` if present else the job id. A guard that checks only the job id
+    misses a `name:` override; one that checks only `name` misses an id rename.
+
+    Note `on:` is NOT consulted anywhere here: in YAML 1.1 the bare key `on`
+    parses as the BOOLEAN True, so `doc.get("on", {})` silently yields `{}` and
+    a guard built on it asserts nothing while reporting green. Measured on this
+    very file -- its top-level keys are `['name', True, 'jobs']`.
+    """
+    found = {}
+    for fname, doc in _load_workflows().items():
+        for jid, job in (doc.get("jobs") or {}).items():
+            ctx = job.get("name", jid) if isinstance(job, dict) else jid
+            found.setdefault(ctx, []).append((fname, jid, job))
+    return found
+
+
+@pytest.mark.parametrize("context", ["reviewer-clearances", "test"])
+def test_EXACTLY_ONE_job_claims_each_required_context(context):
+    """Two distinct holes, one assertion.
+
+    A RENAME removes the requirement outright -- protection matches on the
+    context name, and a context that never reports is simply absent. A SECOND
+    job anywhere claiming the same name lets a trivially-green job satisfy the
+    required context. Only one workflow file exists today, so this costs one
+    line now and would be unaddable later without someone noticing.
+    """
+    hits = _jobs_by_context().get(context, [])
+    assert len(hits) == 1, (
+        "expected exactly one job to resolve to the required context "
+        + repr(context) + ", found " + str(len(hits)) + ": "
+        + repr([(f, j) for f, j, _ in hits])
+    )
+
+
+@pytest.mark.parametrize("context", ["reviewer-clearances", "test"])
+def test_NEITHER_required_job_can_SWALLOW_a_failure(context):
+    """`continue-on-error` must be ABSENT, not merely not-True.
+
+    `continue-on-error: ${{ github.event_name == 'push' }}` parses as a STRING,
+    is not `True`, and is truthy at runtime -- so a `!= True` check waves it
+    through. It is also the variant most likely to survive human review,
+    because it reads as a deliberate CI setting rather than a shell hack.
+    """
+    hits = _jobs_by_context().get(context, [])
+    assert len(hits) == 1, "context " + repr(context) + " is not uniquely defined"
+    _, jid, job = hits[0]
+    assert "continue-on-error" not in job, (
+        "job " + jid + " sets continue-on-error at JOB level"
+    )
+    for i, step in enumerate(job.get("steps") or []):
+        assert "continue-on-error" not in step, (
+            "step " + str(i) + " (" + repr(step.get("name")) + ") of job " + jid
+            + " sets continue-on-error"
+        )
+
+
+def test_the_clearance_job_INVOKES_the_gate_with_a_PINNED_script():
+    """The assertion the blocklist never made: that the gate runs AT ALL.
+
+    Replacing the whole `run:` with `echo ok` defeated every earlier check,
+    because they searched for forbidden substrings and a benign line contains
+    none. Pinning the normalized script kills that and the entire `||` family
+    without naming a single member of it.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1, "reviewer-clearances is not uniquely defined"
+    _, jid, job = hits[0]
+
+    # PIN THE WHOLE INVENTORY, not just the `run` steps.
+    #
+    # An earlier version counted only steps containing `run`, so "exactly one
+    # run step -- an added step is where a neuter hides" was true of `run`
+    # steps and false of `uses:` ones. Measured: inserting an
+    # `actions/github-script@v7` step that overwrites
+    # `scripts/check_reviewer_clearances.py` with `sys.exit(0)` left the pinned
+    # step byte-identical and the whole guard green. That is the variant to
+    # actually worry about -- `shell: cat {0}` looks strange in a diff, but an
+    # added `github-script` step reads as ordinary CI work.
+    steps = job.get("steps") or []
+    inventory = [
+        (s.get("uses") or "").split("@")[0] or ("run:" + str(s.get("name")))
+        for s in steps
+    ]
+    assert inventory == [
+        "actions/checkout",
+        "actions/setup-python",
+        "run:Clearance lapse check (ruling D)",
+    ], (
+        "the clearance job's STEP INVENTORY changed: " + repr(inventory)
+        + ". Adding a step is a neuter route that leaves every other pin "
+        "intact -- if the change is intentional, update this list in the same "
+        "commit so a reviewer sees it."
+    )
+    runners = [s for s in steps if "run" in s]
+    assert len(runners) == 1, (
+        "expected exactly one `run:` step in " + jid + ", found "
+        + str(len(runners))
+    )
+    step = runners[0]
+    # WHAT EXECUTES the script, not just what it says.
+    #
+    # Actions supports a custom shell template (`shell: <cmd> [args] {0}`), so
+    # `shell: cat {0}` PRINTS the script instead of running it -- one line, the
+    # `run:` pin still passes, and the job reports success. Proven locally:
+    # `bash -e s.sh` -> exit 1, `cat s.sh` -> exit 0, `/bin/true s.sh` -> 0.
+    # Absence is asserted rather than a value pinned because the default is
+    # correct and any override is worth a reviewer's eye. (`shell: bash` maps
+    # to `-eo pipefail`, i.e. STRICTER -- but "the safe ones are safe" is not a
+    # reason to leave the door open.)
+    assert "shell" not in step, (
+        "the clearance step overrides `shell:` (" + repr(step.get("shell"))
+        + ") -- a custom shell template can print the script instead of "
+        "executing it while `run:` stays byte-identical"
+    )
+    assert "defaults" not in job, (
+        "the clearance JOB sets `defaults:` -- `defaults.run.shell` reaches "
+        "the step without appearing in it"
+    )
+    # `env:` too, and this one is not CI hygiene -- it was a live break of
+    # "a PR may only touch its OWN record". `DECL_PREFIX` fed both the record
+    # lookup and the foreign-record pathspec, so one `env:` line moved the
+    # guard off the directory it guards and a PR rewrote another PR's
+    # clearances with a green. The gate no longer reads the environment at
+    # all, so this is defence-in-depth rather than the barrier -- but a job
+    # that suddenly needs `env:` on the step that runs a security gate is
+    # worth a reviewer's eye regardless.
+    assert "env" not in step, (
+        "the clearance step sets `env:` (" + repr(step.get("env")) + ")"
+    )
+    assert "env" not in job, (
+        "the clearance JOB sets `env:` -- it reaches the step without "
+        "appearing in it"
+    )
+    assert "if" not in step, (
+        "the clearance step carries a STEP-LEVEL `if:` -- a skipped step runs "
+        "nothing while the job still reports a non-failure, and the job-level "
+        "condition asserted elsewhere would not see it"
+    )
+    lines = [l.rstrip() for l in step["run"].split(chr(10))]
+    lines = [l for l in lines if l.strip() and not l.strip().startswith("#")]
+    assert chr(10).join(lines) == _EXPECTED_CLEARANCE_RUN, (
+        "the clearance step's script changed. If the change is intentional, "
+        "update _EXPECTED_CLEARANCE_RUN in the same commit so a reviewer sees "
+        "it in the diff." + chr(10) + "got:" + chr(10) + chr(10).join(lines)
+    )
+
+
+def test_NO_workflow_LEVEL_defaults_reach_the_required_jobs():
+    """The evasion that lives ABOVE the job, where a job-scoped guard cannot look.
+
+    `defaults: run: shell: cat {0}` at the TOP level of the workflow applies to
+    every step of every job. `_jobs_by_context()` starts at `doc["jobs"]`, so
+    nothing else in this file can see it: the clearance step stays
+    byte-identical, has no `shell:` of its own, has no `defaults:` of its own,
+    and the script is printed rather than executed.
+
+    Asserted as ABSENCE for the same reason as the step-level check -- the
+    default is correct, and any override belongs in front of a reviewer.
+    """
+    for fname, doc in _load_workflows().items():
+        assert "env" not in doc, (
+            fname + " sets a workflow-level `env:` (" + repr(doc.get("env"))
+            + "). Workflow env reaches every step of every job without "
+            "appearing in any of them."
+        )
+        assert "defaults" not in doc, (
+            fname + " sets a workflow-level `defaults:` (" +
+            repr(doc.get("defaults")) + "). `defaults.run.shell` reaches every "
+            "step of every job without appearing in any of them."
+        )
+
+
+def test_the_TEST_job_that_DELIVERS_these_guards_is_itself_pinned():
+    """F7. The guard was ASYMMETRIC, and the weaker side delivers the guard.
+
+    `test` is a required protection context, and **every assertion in this
+    file -- the structural workflow pin included -- is executed by pytest
+    inside it.** So a one-line edit to the `test` job disables the entire
+    test-based defence while both required contexts still report a
+    non-failure: `|| true` yields `success`, and `if: false` yields `skipped`,
+    which this repo has observed reporting under a required context name.
+
+    Measured before this test existed: `|| true` on the pytest step and
+    `if: false` on the job BOTH survived the whole guard, while the identical
+    `if:` tamper on `reviewer-clearances` was killed.
+
+    That matters for the honest framing of the residual. The file says the
+    remaining route is "the same PR that edits the workflow can edit this
+    file" -- a TWO-place edit. The `test`-job neuter needed neither. Leaving it
+    would have made that sentence the same kind of unmeasured claim as the
+    "one-line to two-line" one this guard already had to retract.
+
+    Deliberately narrower than the clearance job's pin: the individual `run:`
+    bodies are NOT pinned, because they legitimately change whenever the test
+    invocation does, and a guard that cries wolf on ordinary edits gets
+    deleted. What is pinned is the structure a neuter must alter -- the step
+    inventory, the absence of a job condition, and the absence of any shell
+    override.
+    """
+    hits = _jobs_by_context().get("test", [])
+    assert len(hits) == 1, "the `test` context is not uniquely defined"
+    _, jid, job = hits[0]
+
+    assert "if" not in job, (
+        "the `test` job carries a job-level `if:` (" + repr(job.get("if"))
+        + "). A skipped job reports `skipped` under the required context name "
+        "while running none of the guards it delivers."
+    )
+    assert "defaults" not in job, "the `test` job sets `defaults:`"
+
+    steps = job.get("steps") or []
+    inventory = [
+        (st.get("uses") or "").split("@")[0] or ("run:" + str(st.get("name")))
+        for st in steps
+    ]
+    assert inventory == [
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "run:Set up Python 3.12",
+        "run:Install dependencies",
+        "run:Dashboard contract firewalls",
+        "run:Run tests",
+        "run:Regression protection — test count baseline (spec §11.9)",
+    ], (
+        "the `test` job's STEP INVENTORY changed: " + repr(inventory)
+        + ". Adding or removing a step here changes what enforces every other "
+        "assertion in this file -- if intentional, update this list in the "
+        "same commit so a reviewer sees it."
+    )
+    for i, st in enumerate(steps):
+        assert "shell" not in st, (
+            "step " + str(i) + " of `test` overrides `shell:` -- a custom shell "
+            "template can print a script instead of executing it"
+        )
+        assert "if" not in st, (
+            "step " + str(i) + " of `test` carries a step-level `if:`; a "
+            "skipped step runs nothing while the job still reports success"
+        )
+
+    # STRUCTURAL, not a blocklist. The first version of this check listed
+    # ("|| true", "||true", "|| :", "continue-on-error", "set +e") -- the one
+    # place in this guard that departed from PIN-DON'T-BLOCKLIST, and it
+    # behaved the way blocklists do: `|| exit 0`, `; true`, `|| /bin/true` and
+    # `|| echo x` all survived it. Four one-token edits to the step that
+    # executes every assertion in this file.
+    #
+    # The `run:` BODY is deliberately still not pinned -- flags and paths
+    # legitimately change whenever the invocation does, and a guard that cries
+    # wolf on ordinary edits gets deleted. What is asserted instead is that a
+    # pytest invocation contains no shell control operator at all, which is a
+    # property of the shape rather than of any named evasion. Measured clean
+    # today for both pytest steps, so there is no cry-wolf risk in adopting it.
+    #
+    # Scoped to steps that RUN PYTEST. The regression-count step legitimately
+    # uses `||`, `|`, `>` and `$(...)`, so a blanket ban across the job would
+    # be a false positive -- and a guard with a known false positive is one
+    # someone eventually deletes.
+    # Selected as "a bare pytest invocation": a single logical command whose
+    # body starts with `uv run pytest`. NOT "contains pytest" -- the
+    # regression-count step calls pytest inside a shell script and
+    # legitimately uses `||`, `|`, `>` and `$(...)`, so a contains-match would
+    # produce a guaranteed false positive, and a guard with a known false
+    # positive is one somebody eventually deletes.
+    pytest_steps = [
+        st for st in steps
+        if "run" in st and st["run"].strip().startswith("uv run pytest")
+        and len([l for l in st["run"].strip().split(chr(10)) if l.strip()]) == 1
+    ]
+    assert len(pytest_steps) == 2, (
+        "expected two bare pytest invocations in `test` (contract firewalls + "
+        "full suite), found " + str(len(pytest_steps)) + " -- these execute "
+        "every assertion in this file"
+    )
+    for st in pytest_steps:
+        body = st["run"]
+        # `&` rather than `&&`: a BARE ampersand backgrounds the command, so
+        # the step exits 0 immediately while the suite is still running --
+        # `bash -e 'false &'` exits 0, `bash -e 'false'` exits 1. It is one
+        # character, it is not `&&` and not `|`, and it survived the first
+        # version of this list. Listing `&` SUBSUMES `&&`, so the enumeration
+        # gets shorter rather than longer, which is the only direction a list
+        # like this should ever move.
+        for op in ("&", ";", "|", "`", "$(", ">", "<"):
+            assert op not in body, (
+                "the pytest step " + repr(st.get("name")) + " contains the "
+                "shell control operator " + repr(op) + ". A pytest invocation "
+                "needs none, and every one of them can be used to swallow the "
+                "exit status of the step that runs every guard in this file."
+            )
+
+
+def test_the_clearance_job_CONDITION_is_pinned_exactly():
+    """Pinned by equality, not by "is not false".
+
+    `if: github.event_name == 'pull_request' && false` is also a condition, and
+    a skipped job reports `skipped` under the required context name -- verified
+    on this repo's master.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1
+    _, jid, job = hits[0]
+    assert job.get("if") == _EXPECTED_CLEARANCE_IF, (
+        "the clearance job's condition is " + repr(job.get("if"))
+        + ", expected " + repr(_EXPECTED_CLEARANCE_IF)
+    )
+
+
+def test_the_clearance_checkout_keeps_FULL_history():
+    """`fetch-depth: 0` is pinned rather than reasoned about.
+
+    Removing it *probably* fails closed -- a clearance SHA absent from a
+    shallow clone becomes a shape error, or `merge-base` becomes unresolvable.
+    That is an inference, and the reviewer who made it said so and asked for a
+    pin instead. One assertion costs less than trusting the inference.
+
+    DELIBERATELY NOT ASSERTED, so a later maintainer does not add them as "more
+    coverage": `runs-on` (a bogus label leaves the check pending, and a pending
+    required check blocks the merge) and `timeout-minutes` (expiry yields
+    `failure`, which also blocks). Both fail CLOSED, so pinning them would
+    couple this guard to things that do not need it.
+    """
+    hits = _jobs_by_context().get("reviewer-clearances", [])
+    assert len(hits) == 1
+    _, jid, job = hits[0]
+    checkout = [
+        s for s in (job.get("steps") or [])
+        if str(s.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert len(checkout) == 1, "expected exactly one checkout step in " + jid
+    assert checkout[0].get("with") == {"fetch-depth": 0}, (
+        "the clearance checkout's `with:` is " + repr(checkout[0].get("with"))
+        + ", expected {'fetch-depth': 0} -- a shallow clone cannot resolve the "
+        "clearance SHAs it is asked to compare"
+    )
+
+
+# --- F6, from the logic vector. The BEHAVIOUR of the commented-template fix is
+# --- well pinned; the PROSE that makes it usable was not. Two mutants survived:
+# ---   M12  delete the in-file instruction comments  -> 25 passed
+# ---   M13  delete the stdout uncomment paragraph    -> 110 passed, full suite
+# --- M13 is the one that matters: that paragraph is the only stdout text
+# --- telling a delta-PR author what to do with a commented template, and it
+# --- carries the anti-fabrication instruction that MOTIVATED the redesign.
+# --- Round 2 pinned two other remedy sentences, so this was an inconsistency
+# --- inside the fix rather than a decision.
+
+
+def test_the_TEMPLATE_carries_its_own_instructions(repo):
+    """M12. The record is the only artifact that reaches the author of the
+    SECOND red -- `NO SHA RECORDED` never mentions uncommenting. So the
+    instruction has to travel inside the file they are already editing."""
+    rc, out = _first_red(repo)
+    body = _extract_skeleton(out)
+    assert "UNCOMMENT and replace" in body, body
+    assert "Leave them commented" in body, (
+        "the template does not tell a docs-only author to leave the lines "
+        "commented -- the one case where the default is already correct:"
+        + chr(10) + body
+    )
+    assert "must not invent" in body, (
+        "the ANTI-FABRICATION instruction is gone from the template. That "
+        "sentence is why the redesign happened: an author told four SHAs are "
+        "required, unable to obtain them, can invent four real commits and the "
+        "gate accepts them." + chr(10) + body
+    )
+
+
+def test_the_STDOUT_remedy_explains_the_commented_lines(repo):
+    """M13. Deleting this paragraph left the full suite green."""
+    rc, out = _first_red(repo)
+    assert "COMMENTED OUT on purpose" in out, out
+    assert "Uncomment one line per vector" in out, (
+        "stdout never tells a delta-PR author to uncomment:" + chr(10) + out
+    )
+    assert "Never invent one" in out, (
+        "stdout lost the anti-fabrication instruction:" + chr(10) + out
+    )
+
+
+def test_the_README_TEMPLATE_actually_WORKS_when_copied(repo):
+    """SF-1. The existing README test compares CONSTANTS; this one runs it.
+
+    `test_the_README_TEMPLATE_matches_the_code_constants` asserts `watch`,
+    `required` and `pr` against the floors -- so it is structurally blind to the
+    `[clearances]` presentation, and the two artifacts silently diverged the
+    moment the generated skeleton started emitting commented lines. Measured
+    A/B on the same docs-only PR, `scripts/` byte-identical:
+
+        record copied from the README    -> rc=1, "recorded clearances are
+                                            malformed" x4
+        record copied from the skeleton  -> rc=0, "no clearance required"
+
+    Two documented artifacts, opposite outcomes, and the README is the one
+    sitting in the directory the author is writing into.
+
+    So this pins BEHAVIOUR rather than text. A text comparison would have to
+    tolerate the README's explanatory inline comments and would break on
+    formatting; what actually matters is that copying it produces a record the
+    gate accepts.
+    """
+    import re
+
+    readme = (REPO_ROOT / ".reviewers" / "README.md").read_text(encoding="utf-8")
+    fences = re.findall(r"```toml" + chr(10) + r"(.*?)" + chr(10) + r"```",
+                        readme, re.DOTALL)
+    assert len(fences) == 1, (
+        "expected exactly one ```toml fence in .reviewers/README.md, found "
+        + str(len(fences)) + " -- this test cannot know which one is the schema"
+    )
+    template = fences[0]
+    # the fence documents PR 564; make it this fixture's PR without touching
+    # anything else about it.
+    template = re.sub(r"\Apr = \d+", "pr = " + PR, template)
+
+    _branch_with(repo, "docsonly", "docs/d.md", "more docs" + chr(10))
+    _commit_record(repo, template)
+    rc, out = _run(repo, "HEAD", "master", pr=PR)
+    assert rc == 0, (
+        "a record copied verbatim from .reviewers/README.md is REJECTED by the "
+        "gate. The documented template and the generated one have diverged:"
+        + chr(10) + out
+    )
+    assert "no clearance required" in out, out
+
+    # SF-3. The fence can lose its `[clearances]` section ENTIRELY -- the
+    # UNCOMMENT instruction, "Leave them commented", and the anti-fabrication
+    # sentence -- and everything above still passes: the constants test checks
+    # `watch`/`required`/`pr`, and a clearance-less fence is still accepted on
+    # a docs-only PR. So acceptance is necessary and not sufficient.
+    #
+    # These three phrases are pinned in the GENERATED skeleton already. The
+    # README is the artifact that actually went stale once, and the one an
+    # author is looking at while editing the directory it describes, so it
+    # gets the same treatment rather than less.
+    for phrase in ("UNCOMMENT and replace", "Leave them commented",
+                   "must not invent"):
+        assert phrase in template, (
+            ".reviewers/README.md lost its guidance: " + repr(phrase)
+            + " is gone from the schema fence. A template that is ACCEPTED but "
+            "silent is how an author ends up inventing a SHA to fill a shape."
+            + chr(10) + template
+        )
+
+
+@pytest.mark.parametrize(
+    "doc_rel",
+    ["docs/runbook_recompute_coverage.md", ".reviewers/README.md"],
+)
+def test_the_OPERATOR_DOCS_do_not_reassert_that_protection_is_OFF(doc_rel):
+    """F8. F5's own fix was unpinned, which reproduces the condition that
+    produced F5.
+
+    The runbook asserted "Branch protection is OFF" and printed
+    `404 Branch not protected` as its proof, on a repository where the command
+    returns 200. That is worse than no evidence, because the stale output is
+    what made it persuasive. It was corrected -- and nothing stopped it, or the
+    README, decaying back by exactly the route it decayed by the first time.
+
+    A NEGATIVE pin, deliberately, and it is the cheap half of the problem: it
+    cannot verify the protection config is what the docs say (that needs the
+    API, i.e. network and auth in CI, and remains genuinely unpinned -- the
+    runbook's "run this command yourself" framing is the honest mitigation).
+    What it CAN do is stop the specific false claims from coming back.
+
+    Phrases are matched OUTSIDE code fences and outside quoted history: both
+    documents deliberately quote what they used to say, and a naive substring
+    sweep would fire on the correction itself -- a guard that forbids
+    describing the bug it fixed.
+    """
+    import re
+
+    text = (REPO_ROOT / doc_rel).read_text(encoding="utf-8")
+    prose = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    prose = chr(10).join(
+        l for l in prose.split(chr(10)) if not l.lstrip().startswith((">", "#"))
+    )
+    for stale in (
+        "Branch protection is OFF",
+        "no CI check in this repo can block",
+        "controls that do not exist yet",
+    ):
+        # allow the phrase where the document is explicitly quoting its own
+        # former text -- those lines carry "until" or "said" nearby.
+        for line in prose.split(chr(10)):
+            if stale in line and not any(
+                m in line for m in ("until", "said", "used to", "asserted")
+            ):
+                raise AssertionError(
+                    doc_rel + " reasserts a claim branch protection falsified: "
+                    + repr(stale) + chr(10) + "  line: " + line.strip()
+                )
+
+
+def test_the_ENVIRONMENT_cannot_repoint_the_declaration_prefix(repo, monkeypatch):
+    """W18. The lever that broke "a PR may only touch its OWN record".
+
+    `DECL_PREFIX` fed the record lookup AND `_foreign_record_edits`'s pathspec,
+    and it was read from `REVIEWERS_PREFIX` at import. So one `env:` line in
+    the workflow moved the foreign-record guard off the directory it guards --
+    measured end-to-end, a PR rewrote another PR's clearances and the gate
+    exited 0, while the victim's record differed between head and master.
+    `.reviewers/` is deliberately off the watch floor, so nothing else caught
+    it.
+
+    The override was also a PHANTOM: its documented purpose was "so the
+    test-suite can drive the real script against a purpose-built repo", and
+    all three call sites set it to the default. Unused capability, real hole
+    -- so it was deleted rather than moved to a safer channel.
+
+    This asserts the SOURCE, not a behaviour downstream of it: read the module
+    fresh with the variable set to something else and require the constant to
+    be unmoved. A behavioural assertion would pass the day someone reintroduces
+    the read with a different variable name.
+    """
+    import importlib.util
+
+    monkeypatch.setenv("REVIEWERS_PREFIX", "docs")
+    spec = importlib.util.spec_from_file_location("_w18", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.DECL_PREFIX == ".reviewers", (
+        "REVIEWERS_PREFIX steered DECL_PREFIX to " + repr(mod.DECL_PREFIX)
+        + " -- this re-points the foreign-record guard off the directory it "
+        "guards, and one workflow `env:` line is enough to set it"
+    )
+    # AST, not a substring sweep over the file. `os.environ` is still read
+    # legitimately for the `REVIEWERS_PR` identity fallback -- which fails
+    # CLOSED (`--pr 565` disagreeing with `REVIEWERS_PR 999` exits 2), so a
+    # blanket "no environ anywhere" ban would forbid a channel that is safe
+    # and forbid it for the wrong reason. The property is narrower: the
+    # DECLARATION PREFIX specifically must be a literal.
+    import ast
+
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+
+    # ast.walk, NOT tree.body. The first version of this scanned module level
+    # only, so a `global DECL_PREFIX` rebind inside a function -- called from
+    # main(), after import -- was invisible to BOTH halves of this test: the
+    # AST half never looked inside functions, and the behavioural half above
+    # reads the value at IMPORT, before main() runs. Measured surviving, and it
+    # reopened W18 to exit 0.
+    #
+    # AnnAssign as well as Assign: `DECL_PREFIX: str = os.environ.get(...)` is
+    # not an ast.Assign, so an Assign-only scan found ZERO bindings and
+    # "failed" with a count message -- caught, but for the wrong reason, and it
+    # would equally have fired on a legitimate `DECL_PREFIX: str = ".reviewers"`.
+    # A guard that is right by accident is one that goes wrong on a valid edit.
+    binds = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            # TUPLE AND LIST TARGETS TOO. `getattr(t, "id", None)` is None for
+            # an `ast.Tuple`, so `DECL_PREFIX, _x = <env>, None` rebound the
+            # prefix while this scan counted only the literal below and still
+            # reported "exactly one binding, and it is a Constant". Measured as
+            # the gap that made a tuple-target rebind invisible here.
+            flat = []
+            for t in node.targets:
+                flat.extend(t.elts if isinstance(t, (ast.Tuple, ast.List)) else [t])
+            if any(getattr(t, "id", None) == "DECL_PREFIX" for t in flat):
+                binds.append(node)
+        elif isinstance(node, ast.AnnAssign):
+            if getattr(node.target, "id", None) == "DECL_PREFIX":
+                binds.append(node)
+        elif isinstance(node, ast.Global) and "DECL_PREFIX" in node.names:
+            raise AssertionError(
+                "the gate declares `global DECL_PREFIX` -- a function can then "
+                "rebind the prefix after import, which re-aims the "
+                "foreign-record guard and is invisible to any import-time check"
+            )
+    assert len(binds) == 1, (
+        "expected exactly one DECL_PREFIX binding anywhere in the gate, found "
+        + str(len(binds)) + ". More than one means something rebinds it."
+    )
+    assert isinstance(binds[0].value, ast.Constant), (
+        "DECL_PREFIX is computed (" + ast.dump(binds[0].value)[:120]
+        + ") rather than a literal. Anything computed here can be steered by "
+        "whatever feeds it, and this constant aims the foreign-record guard."
+    )
+
+    # PIN THE DATA SOURCE, because the REBIND FAMILY IS UNBOUNDED.
+    #
+    # The two binding-site checks above are mechanism-specific, and mechanisms
+    # can be enumerated forever -- which is the blocklist trap this file has
+    # already fallen into twice. Measured: `globals()["DECL_PREFIX"] = ...`
+    # inside a function called from main() evades BOTH by construction. The
+    # target is an `ast.Subscript`, so it is not counted as a binding, and
+    # there is no `ast.Global` node to trip the raise. The pathspec assertion
+    # still passes, because the use site reads a bare `DECL_PREFIX` -- which
+    # now holds the environment's value. W18 restored in full: exit 0 on a PR
+    # rewriting another PR's clearances.
+    #
+    # `setattr(sys.modules[__name__], ...)` is the same shape, and so is the
+    # next one nobody has thought of. So stop enumerating rebinds and pin what
+    # they all need: THE ENVIRONMENT MUST REACH THIS PROCESS EXACTLY ONCE, and
+    # that once is the PR-identity fallback, which fails CLOSED.
+    #
+    # THE LIMIT THIS COMMENT USED TO CLAIM WAS FALSE, and the correction is the
+    # point. It read: "a rebind sourced from a file or from argv would not trip
+    # it -- the `ast.Constant` binding check and the `:(top)` pathspec check
+    # above are what cover those." **They do not.**
+    #
+    # Measured: the same `globals()["DECL_PREFIX"] = ...` form, sourced from a
+    # committed file instead of the environment, goes GREEN at exit 0 with the
+    # victim's record differing between head and master. W18 restored in full.
+    # It slips every arm -- no `os.environ` so the source pin still counts 1,
+    # no `global` statement, an Assign target that is a `Subscript` so
+    # `getattr(t, "id", None)` is None and `len(binds) == 1` still holds with a
+    # literal value, and a use site still reading the bare name.
+    #
+    # The diagnosis is sharper than the row: M3 closed the env-sourced rebind
+    # by deleting its SOURCE, not by fixing the BINDING blindness that let it
+    # through. The binding check is a Name-match, so it never covered the very
+    # rebind form that motivated M3. Change the source and the blindness
+    # reappears -- which is what happened.
+    #
+    # So pin the REBIND PRIMITIVE, the quadrant actually uncovered. This is
+    # still an enumeration and it is worth saying so, but of primitives with no
+    # legitimate use anywhere in this file -- a bounded space, unlike shell
+    # fragments or data sources. All three are absent today (measured: 0, 0, 0),
+    # so there is no cry-wolf risk.
+    for prim, hits in (
+        ("globals()/vars()", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in ("globals", "vars")
+        ]),
+        ("setattr()", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "setattr"
+        ]),
+        ("sys.modules", [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and n.attr == "modules"
+        ]),
+    ):
+        assert not hits, (
+            "the gate uses " + prim + ", which can rebind DECL_PREFIX after "
+            "import from ANY source -- environment, file or argv -- and slips "
+            "every other assertion here: no `global` node, an Assign target "
+            "that is not a Name, and a use site still reading the bare name."
+        )
+
+    # `exec`/`eval` are DELIBERATELY ABSENT from this list. A module-level
+    # `exec("...")` hides the assignment, the environment read and the name
+    # inside a string literal, so no AST arm here can match it -- measured, and
+    # measured CAUGHT by the behavioural test instead. Adding the row would buy
+    # nothing and would re-teach the habit this file spent five rounds
+    # unlearning: the enumeration lost again, and the property held.
+    #
+    # WHAT IS STILL NOT COVERED, stated narrowly this time. The argv quadrant is
+    # UNTESTED rather than clean: the reviewer's argv mutant was rejected by
+    # argparse before it could take effect, so it measured their flag, not this
+    # gate. A rebind primitive beyond these three is also unenumerated. And none
+    # of this is closure -- `required_workflows` is.
+    # FOUR SPELLINGS, not one. The first version pinned `os.environ` as an
+    # Attribute and the comment above it claimed "the environment must reach
+    # this process exactly once" -- an overclaim, and the same
+    # asserting-more-than-you-check shape this file keeps finding. `os.getenv`
+    # is the most idiomatic reach in Python and the first thing a maintainer
+    # would write; `from os import environ` renames it out of the pattern
+    # entirely. Both were measured reopening W18 when paired with a rebind.
+    #
+    # They are dead twice over at this revision -- the rebind-primitive pin and
+    # the binding-literal check each catch them independently -- so this arm is
+    # defence-in-depth. It is here because relaxing either of the other two
+    # would silently promote this to the load-bearing assertion, and it would
+    # have been narrower than its own comment.
+    _ENV_NAMES = {"environ", "environb", "getenv", "getenvb"}
+    env_reads = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and n.attr in _ENV_NAMES:
+            if isinstance(n.value, ast.Name) and n.value.id == "os":
+                env_reads.append("os." + n.attr)
+        elif isinstance(n, ast.ImportFrom) and n.module == "os":
+            for a in n.names:
+                if a.name in _ENV_NAMES:
+                    env_reads.append("from os import " + a.name)
+    assert len(env_reads) == 1, (
+        "expected exactly one environment read in the gate, found "
+        + str(len(env_reads)) + " " + repr(env_reads) + ". Every additional "
+        "one is a channel a workflow `env:` line can steer."
+    )
+    src = SCRIPT.read_text(encoding="utf-8")
+    env_line = [l for l in src.split(chr(10)) if "os.environ" in l
+                and not l.lstrip().startswith("#")][0]
+    assert "REVIEWERS_PR" in env_line and "REVIEWERS_PREFIX" not in env_line, (
+        "the single os.environ access no longer reads REVIEWERS_PR: "
+        + env_line.strip() + " -- the PR-identity fallback fails CLOSED "
+        "(a disagreeing --pr exits 2); nothing else has been shown to."
+    )
+
+    # PIN THE DATA PATH, not just its source. Deleting the env read at the
+    # binding site does not stop someone reintroducing it AT THE USE SITE --
+    # `":(top)" + (os.environ.get("REVIEWERS_PREFIX") or DECL_PREFIX)` inside
+    # `_foreign_record_edits` restores the exploit while every assertion above
+    # still passes. Measured surviving.
+    #
+    # Same move as pinning the normalized `run:` rather than blocklisting shell
+    # fragments: assert the expression that AIMS the guard is exactly the two
+    # things it should be.
+    fn = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_foreign_record_edits"
+    ]
+    assert len(fn) == 1, "expected one _foreign_record_edits definition"
+    pathspecs = [
+        n for n in ast.walk(fn[0])
+        if isinstance(n, ast.BinOp)
+        and isinstance(n.left, ast.Constant)
+        and n.left.value == ":(top)"
+    ]
+    assert len(pathspecs) == 1, (
+        "expected exactly one ':(top)' pathspec expression in "
+        "_foreign_record_edits, found " + str(len(pathspecs))
+    )
+    assert isinstance(pathspecs[0].right, ast.Name)         and pathspecs[0].right.id == "DECL_PREFIX", (
+        "the foreign-record pathspec is aimed by "
+        + ast.dump(pathspecs[0].right)[:120] + " rather than by the bare "
+        "DECL_PREFIX constant. Anything else here can be steered without "
+        "touching the binding site."
+    )
+
+
+def test_the_ENVIRONMENT_cannot_change_a_VERDICT(repo):
+    """The property every AST arm above only approximates.
+
+    Four rounds of mechanism-pinning ran binding site -> use site -> data
+    source -> rebind primitive -> env spelling, and each one was defeated by a
+    form outside the fixture that produced it. The last was an ALIASED import
+    (`import os as _o; _o.environ`), which slips a selector matching
+    `value.id == "os"` -- measured surviving.
+
+    That is the enumeration losing, not a specific list being short. The
+    property was never "which AST node reads the environment". It is
+    **the environment cannot change the verdict** -- so assert that, and stop
+    naming mechanisms.
+
+    Spelling-independent, mechanism-independent, and source-independent for the
+    environment channel: it does not care whether the read is `os.environ`,
+    `os.getenv`, an alias, a from-import, or a form nobody has thought of, nor
+    whether the rebind is `global`, `globals()[...]`, `setattr` or none at all.
+
+    THE FIXTURE MUST REACH THE FOREIGN-RECORD GUARD, which is what defeated
+    three separate reviewers' first attempts at this: without the PR's own
+    record present, both runs stop at the missing-record branch and agree for
+    a reason that has nothing to do with the property.
+
+    BOTH ASSERTIONS BELOW DISCRIMINATE ON THE MESSAGE, NOT THE EXIT CODE, and
+    that is load-bearing in a way that looks like verbosity. The precondition's
+    own failure reads `assert (1 == 1 and 'ANOTHER PR' in ...)` -- the
+    missing-record branch ALSO exits 1, so an exit-code-only precondition
+    passes vacuously and the hostile runs then compare two identical
+    "no clearance FILE" outputs and agree for a reason unrelated to the
+    property. The verdict comparison says it out loud in its own message:
+    "gave exit 1 where a clean environment gives exit 1". Simplify either to a
+    bare exit-code compare and the vacuous pass returns in both places. This is
+    "assert WHICH failure, not THAT one occurred" appearing twice in one test.
+
+    Residual, stated so it is not mistaken for closure: a rebind sourced from a
+    FILE or ARGV is not covered by the environment variation here -- the
+    rebind-primitive pin above reaches those for the primitives it names, but
+    **not for `exec`/`eval`**, where the assignment, the read and the name all
+    live inside a string literal and no AST arm can see them. A file-sourced
+    `exec` rebind is therefore a KNOWN OPEN QUADRANT, untested rather than
+    covered: reaching it needs a readable file planted in the tree, itself a
+    watched-path change requiring clearances. Nor is any of this closure of the
+    workflow surface; `required_workflows` is.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+
+    # a victim record on the branch, differing from master -> the foreign guard
+    # has something real to catch
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)   # own record, committed
+
+    clean = _run(repo, "HEAD", "master", pr=PR)
+    assert clean[0] == 1 and "ANOTHER PR" in clean[1], (
+        "the fixture does not reach the foreign-record guard, so this test "
+        "cannot observe the property it claims to check:" + chr(10) + clean[1]
+    )
+
+    # EVERY HOSTILE VALUE MUST BE CAPABLE OF STEERING, or the case passes for a
+    # reason unrelated to the property. Predicted by a reviewer before seeing
+    # the code and then measured against a deliberately steered gate:
+    #
+    #   REVIEWERS_PREFIX="docs"  -> steered gate yields "docs"        DIVERGES
+    #   REVIEWERS_PREFIX="/etc"  -> steered gate yields "/etc"        DIVERGES
+    #   REVIEWERS_PREFIX=""      -> steered gate yields ".reviewers"  TAUTOLOGY
+    #   REVIEWERS_DIR / GATE_PREFIX / PREFIX -> ".reviewers"          TAUTOLOGY
+    #
+    # The empty string is falsy, so `os.environ.get(...) or ".reviewers"` hands
+    # back the default and a FULLY STEERED gate produces output identical to a
+    # clean one. Decoy variable names are read by nothing, so the same. Both
+    # would have passed against the very exploit this test exists to catch --
+    # coverage-shaped and empty, the `if captured:` family.
+    #
+    # So the loop asserts the precondition on itself rather than trusting the
+    # author to keep picking good values: a hostile value must be non-empty and
+    # must differ from the prefix the gate already uses.
+    for hostile in (
+        {"REVIEWERS_PREFIX": "docs"},
+        {"REVIEWERS_PREFIX": "/etc"},
+        {"REVIEWERS_PREFIX": "../../etc"},
+        {"REVIEWERS_PREFIX": "docs", "REVIEWERS_DIR": "docs"},
+    ):
+        # THE NAME must be one a plausible reintroduction would read, not just
+        # the VALUE non-default. An earlier version checked only the value, so
+        # `{"REVIEWERS_DIR": "docs", "PREFIX": "docs"}` passed the precondition
+        # while being read by nothing -- steerable-looking and inert, which is
+        # the same tautology one level in. `REVIEWERS_PREFIX` is the name with
+        # an actual exploit history here: it is the one that was deleted, and
+        # the one any reintroduction would spell.
+        steerable = [
+            v for k, v in hostile.items()
+            if k == "REVIEWERS_PREFIX" and v and v != _GATE.DECL_PREFIX
+        ]
+        assert steerable, (
+            "hostile env " + repr(hostile) + " cannot steer anything: it sets "
+            "no REVIEWERS_PREFIX, or sets it empty or equal to the gate's own "
+            "prefix. A fully steered gate would then produce output identical "
+            "to a clean one and this case would pass while the lever was wide "
+            "open."
+        )
+        rc, out = _run(repo, "HEAD", "master", pr=PR, extra_env=hostile)
+        assert (rc, "ANOTHER PR" in out) == (clean[0], True), (
+            "the environment changed the verdict. " + repr(hostile) + " gave "
+            "exit " + str(rc) + " where a clean environment gives exit "
+            + str(clean[0]) + "." + chr(10) + out
+        )
+
+
+class _HostileEnv(dict):
+    """Real environment, except any name the gate has not already been given
+    comes back as a hostile prefix.
+
+    Subclassing `dict` and only overriding the MISS path is deliberate: `git`
+    is spawned as a child and inherits this mapping, so PATH, SystemRoot and
+    the rest must survive untouched or the failure is a broken subprocess
+    rather than a steered gate -- which would look identical from the outside.
+
+    `REVIEWERS_PR` is exempted, and that exemption is what makes this an
+    ALLOWLIST OF ONE rather than a blocklist of four. It is the single
+    environment channel this gate is shown to read, and it fails CLOSED: a
+    `--pr` disagreeing with it exits 2. Steering it would change the verdict
+    legitimately, which is a different fact from the one under test.
+    """
+
+    HOSTILE = "docs"
+    EXEMPT = frozenset({"REVIEWERS_PR"})
+
+    #: STR KEYS ONLY. Synthesising a value for every missing key of any type
+    #: broke CI on Linux and passed on Windows:
+    #:
+    #:     ValueError: env cannot contain 'PATH' and b'PATH' keys
+    #:
+    #: POSIX `subprocess` probes the mapping with BYTES keys as well as str,
+    #: and a shim that answers both makes it look like the caller supplied a
+    #: conflicting environment. Windows never asks, so eleven rounds of local
+    #: measurement could not see it -- which is the Linux-parity caveat every
+    #: reviewer attached to every round, arriving as a real failure.
+    #:
+    #: The reviewer who proposed this shim also flagged it: "my shim makes
+    #: `__contains__` return True for all keys, which is aggressive; a
+    #: production version should be gentler." Recorded and not acted on.
+    def _synth(self, key):
+        return isinstance(key, str) and key not in self.EXEMPT
+
+    def get(self, key, default=None):
+        if key in self:
+            return dict.get(self, key)
+        return self.HOSTILE if self._synth(key) else default
+
+    def __missing__(self, key):
+        if self._synth(key):
+            return self.HOSTILE
+        raise KeyError(key)
+
+
+def test_NO_environment_NAME_can_change_a_verdict(repo, monkeypatch, capsys):
+    """The residual the previous test left: it enumerated NAMES.
+
+    `test_the_ENVIRONMENT_cannot_change_a_VERDICT` is spelling-, mechanism- and
+    source-independent, and it says so -- but its hostile set is four variable
+    NAMES, so a rebind reading `os.environ.get("BUILD_PREFIX")` walked through
+    it. Canonical spelling, canonical mechanism, environment channel, exit 0.
+    Measured, not argued.
+
+    Adding `BUILD_PREFIX` to that list is the enumeration reflex the arm exists
+    to break, so instead: make EVERY unseen name hostile and exempt exactly
+    one. That turns a four-name blocklist into a ONE-NAME ALLOWLIST, and the
+    exempted name is the only channel already shown to fail closed.
+
+    Runs IN-PROCESS because the mapping has to be installed inside the gate,
+    not handed to a subprocess as a fixed set of keys -- a subprocess env is
+    itself a list of names, which is the thing being removed.
+
+    Known limits, stated rather than implied.
+
+    IMPORT-TIME REBINDS ARE OUT OF SCOPE HERE, and that is not a detail: the
+    module is loaded before the hostile mapping is installed, so a module-level
+    steer has already resolved against the real environment by the time this
+    test can see anything. Measured -- a tuple-target rebind at module level
+    passes this test and is caught by the sibling test above, whose behavioural
+    half re-imports with the variable set. The two are complementary rather
+    than redundant, and removing either leaves a live quadrant.
+
+    This covers reads that go through `os.environ` in this process; a gate that
+    shelled out and let a child read the real environment would not be
+    covered. And `exec`-hidden reads are
+    covered here only because the READ still happens through this mapping --
+    the AST arms cannot see them at all.
+    """
+    mod = _load_checker()
+    monkeypatch.setattr(mod, "DECL_PREFIX", ".reviewers")
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+    monkeypatch.chdir(repo)
+
+    # THE VERDICT IS (exit code, WHICH failure), never the code alone. The
+    # first version of this test compared exit codes only and was VACUOUS: a
+    # steered gate looks for `docs/42.toml`, does not find it, and exits 1 for
+    # "no clearance FILE" -- while a clean gate exits 1 for "changes ANOTHER
+    # PR's record". Both are 1. It passed against the very mutant it was
+    # written to catch, and against the capability control too.
+    #
+    # That is "assert WHICH failure, not THAT one occurred" -- violated here
+    # one commit after being written into the docstring above it.
+    def _verdict():
+        rc = mod._cli(["check", "HEAD", "master", "--pr", PR])
+        return rc, "ANOTHER PR" in capsys.readouterr().out
+
+    clean = _verdict()
+    assert clean == (1, True), (
+        "the fixture does not reach the foreign-record guard " + repr(clean)
+        + ", so this test cannot observe the property it claims to check"
+    )
+
+    hostile = _HostileEnv(os.environ)
+    hostile.pop("REVIEWERS_PR", None)
+    monkeypatch.setattr(mod.os, "environ", hostile)
+    # prove the shim is live and hostile before trusting the comparison
+    assert mod.os.environ.get("SOME-NAME-NOBODY-HAS-USED") == "docs", (
+        "the hostile mapping is not installed; the comparison below would "
+        "compare two identical clean runs"
+    )
+    assert mod.os.environ.get("REVIEWERS_PR") is None, "the exemption is broken"
+
+    steered = _verdict()
+    assert steered == clean, (
+        "an environment name changed the verdict: " + repr(steered)
+        + " under a hostile environment where a clean one gives " + repr(clean)
+        + ". No NAME should be able to steer this gate."
+    )
+
+
+#: The only environment names this gate legitimately needs. `PATH` and the
+#: Windows trio are for the `git` child; `REVIEWERS_PR` is the one channel the
+#: gate reads, and it fails CLOSED (a disagreeing `--pr` exits 2).
+#:
+#: A WHITELIST ON OUR SIDE, not a blocklist on the attacker's -- that asymmetry
+#: is the entire point and it is why this arm has no list of hostile names.
+_MINIMAL_ENV_KEYS = frozenset({
+    "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "COMSPEC", "ComSpec",
+    "TEMP", "TMP", "HOME", "USERPROFILE", "LANG", "LC_ALL",
+    "PYTHONIOENCODING", "PYTHONUTF8", "REVIEWERS_PR",
+})
+
+
+def test_the_AMBIENT_environment_cannot_change_a_verdict(repo):
+    """The arm with NO attacker-side enumeration, and the reason it exists.
+
+    Every previous arm enumerated something the attacker chooses: node shapes,
+    then rebind mechanisms, then data sources, then env spellings, then
+    variable NAMES. Each fell to the next thing outside its list. The sibling
+    behavioural test says it is spelling-, mechanism- and source-independent --
+    all true, all about the READ -- while enumerating four hostile NAMES, so a
+    gate reading `XYZZY_PREFIX` walked straight through it. Measured, exit 0.
+
+    **You cannot check "the environment cannot change the verdict" by listing
+    the attacker's side.** The environment is unbounded in exactly the way the
+    mechanism list was.
+
+    So compare two runs: one under the AMBIENT environment, one under a MINIMAL
+    whitelist of names this gate legitimately needs. If any name outside that
+    whitelist reaches a decision, the verdicts diverge -- whatever the name is,
+    however it is spelled, whatever rebinds it. The whitelist is ours and
+    bounded; nothing here names anything of the attacker's.
+
+    In CI this fires on the PR that ships the tamper, because that PR's
+    **workflow-level** `env:` is in the ambient environment when the suite
+    runs. A split attack is caught on the same basis: the gate-edit PR has
+    nothing to diverge on and passes, and the env-line PR diverges against the
+    already-edited gate.
+
+    **"WORKFLOW-LEVEL" IS LOAD-BEARING AND WAS MISSING FROM AN EARLIER DRAFT.**
+    `reviewer-clearances` is a separate job by design, so a JOB-SCOPED `env:`
+    on it is not in the `test` job's environment -- and this arm executes in
+    `test`. So this arm covers workflow-level `env:` and not job-scoped, and
+    the composite is what closes the gap: the structural workflow guard refuses
+    `env:` at workflow, job AND step scope, which is the arm that reaches the
+    job-scoped case. Neither alone is sufficient, and the earlier wording
+    implied this one was.
+
+    LOCALLY IT IS NEAR-INERT, for the same reason it is strong in CI: a
+    developer's shell contains their own names, so a gate reading a name they
+    have never set produces no steer to catch. That is the property below
+    working correctly -- no steer, nothing to detect -- but it means a green
+    here on a laptop says much less than a green in CI, and a maintainer
+    deciding whether the other arms are still needed should know that.
+
+    Free strength worth recording, which arrived from the shape rather than
+    from a list: `GITHUB_HEAD_REF` is attacker-controlled, ambient in every
+    job, and outside the whitelist -- so a gate that consulted the BRANCH NAME
+    would diverge and be caught here. That is precisely what the module
+    docstring says must never be consulted, and no rule here names it.
+
+    WHERE THE HOSTILE VALUE COMES FROM, asked by a reviewer who suspected this
+    cell was vacuous on a clean box. It is not, and the reason is a property
+    rather than an accident:
+
+    **A name that CAN steer the gate must be present in the ambient
+    environment.** If it is absent, `get()` returns None, the gate falls back
+    to its default and is not steered -- there is no exploit to catch. So any
+    name capable of steering is in ambient by construction, and if it is
+    outside the whitelist the minimal run does not see it and the verdicts
+    diverge. The test does not need to guess the name or plant it.
+
+    **BOUNDARY ON THAT ARGUMENT, and it is a real one.** It covers steering by
+    an ambient NAME. It does not reach `os.environ.get("NO_SUCH_NAME", "docs")`
+    -- where the DEFAULT does the steering and no name is in ambient at all.
+    Both runs are then steered identically, so the differential cannot see it
+    either. That case is caught, by the precondition and by the
+    rebind-primitive pin, so the composite holds -- but this paragraph should
+    not be read as covering it.
+
+    **THE PRECONDITION IS A DETECTOR, NOT ONLY A FIXTURE CHECK -- DO NOT RELAX
+    IT.** Three reviewers independently measured that every steering mutant
+    fires `assert amb[0] == 1 and amb[1]`, never `mini == amb`: a steered gate
+    makes the AMBIENT run miss the foreign-record guard, so the precondition
+    trips before the differential is evaluated. It is written in the shape of a
+    fixture health check, which is exactly the kind of assertion a maintainer
+    loosens when a fixture gets fiddly -- and loosening it exposes the
+    differential as the sole detector.
+
+    On a clean box the two environments still genuinely differ -- measured, 81
+    ambient keys against 9 minimal, 72 dropped -- so this is a real
+    differential and not two identical runs. It passes there because none of
+    the 72 reaches a decision, which is the correct answer, and it would fail
+    if any of them did.
+
+    THE TWO ASSERTIONS CATCH DIFFERENT FAILURE MODES, and conflating them is
+    how the earlier draft of this paragraph got it wrong.
+
+      PRECONDITION  -- the AMBIENT environment steers the gate to a WRONG
+                       answer. A prefix redirection makes the record lookup
+                       miss, the ambient run yields `(1, False)`, and the
+                       comparison never runs. Both a listed and an unlisted
+                       steering name land here.
+
+      COMPARISON    -- the gate DEPENDS on an ambient name to reach the RIGHT
+                       answer. Demonstrated by a `_foreign_record_edits` that
+                       early-returns unless a marker name is set: ambient has
+                       it so the guard runs and the precondition passes;
+                       minimal drops it so the guard no-ops, and
+                       `(0, False) == (1, True)` fails the comparison. Silent
+                       dependence on ambient state, which nothing else notices.
+
+                       USE AN INJECTED MARKER NAME, not a real one. The first
+                       version of this used `APPDATA`, which is ambient on
+                       Windows and ABSENT on a Linux runner -- so the
+                       demonstration only reproduces on the platform it was
+                       written on, and on CI would trip the proper-subset
+                       guard or nothing at all. Every measurement in this
+                       review was Windows; a reader reproducing on CI needs
+                       the portable form.
+
+    Both are real and neither subsumes the other. A reviewer correctly flagged
+    that the comparison had never been shown able to fail -- "a detector never
+    shown able to produce a dirty result is unproven" -- and the mutant above
+    is that demonstration. The whitelist blind spot is unreachable through the
+    comparison for the same reason: a whitelisted name is in both environments,
+    so redirection through one trips the PRECONDITION instead.
+
+    That matters twice over. The precondition's message used to blame the
+    FIXTURE, so CI would have told a reader their test setup was wrong when the
+    cause was a steered gate shipped in the same PR -- "assert WHICH failure"
+    in the newest arm, one round after it was written into the docstring above.
+    And it means the whitelist blind spot is real but currently UNREACHABLE:
+    a name inside `_MINIMAL_ENV_KEYS` is present in both environments and can
+    never diverge, so the comparison alone would not catch it -- redirection
+    trips the precondition first. **Loosen that precondition to accept any exit
+    1 and the whitelisted-name channel opens with nothing left to catch it,
+    while this docstring still reads as though the comparison were doing the
+    work.**
+
+    That is also the argument for keeping `_MINIMAL_ENV_KEYS` as small as `git`
+    tolerates. `LC_ALL`, `LANG`, `TEMP`, `TMP`, `HOME` and `USERPROFILE` are all
+    settable from a workflow and are worth re-justifying individually rather
+    than carried as a block.
+
+    Limits, stated: it covers the environment channel only, the whitelist needs
+    maintaining, and a gate that SHELLED OUT and let a child read the real
+    environment would escape it -- the child inherits `env=` from the parent
+    here, so that gap is narrower than it sounds but it is not zero. It is NOT
+    closure: the PR that edits the workflow can edit this test.
+    `required_workflows` is.
+    """
+    sha = _branch_with(repo, "work", "scout/f.txt", "moved" + chr(10))
+    d = repo / ".reviewers"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / (OTHER_PR + ".toml")).write_bytes(
+        ("pr = " + OTHER_PR + chr(10) + "required = []" + chr(10)
+         + "watch = []" + chr(10) + chr(10) + "[clearances]" + chr(10)).encode()
+    )
+    _decl(repo, {v: sha for v in MANDATORY_VECTORS}, pr=PR)
+
+    def _verdict(env):
+        argv = [sys.executable, str(SCRIPT), "HEAD", "master", "--pr", PR]
+        r = subprocess.run(argv, cwd=str(repo), capture_output=True,
+                           text=True, env=env)
+        # (code, WHICH failure). Never the code alone: a steered gate exits 1
+        # for "no clearance FILE" while a clean one exits 1 for "changes
+        # ANOTHER PR's record", and an exit-code compare passes on both.
+        return r.returncode, "ANOTHER PR" in (r.stdout + r.stderr)
+
+    ambient = {**os.environ}
+    ambient.pop("REVIEWERS_PR", None)
+    minimal = {k: v for k, v in ambient.items() if k in _MINIMAL_ENV_KEYS}
+
+    amb = _verdict(ambient)
+    assert amb[0] == 1 and amb[1], (
+        "EITHER the fixture does not reach the foreign-record guard, OR the "
+        "gate under test is already steered by the ambient environment -- got "
+        + repr(amb) + ", expected (1, True). Both produce this exact result, "
+        "and the second is the security-relevant one: a prefix redirection "
+        "makes the record lookup miss, so the ambient run reports (1, False) "
+        "and never gets as far as the comparison below. If this fires in CI on "
+        "a PR that touched the gate, suspect the gate before the fixture."
+    )
+    assert set(minimal) < set(ambient), (
+        "the minimal environment is not a proper subset of the ambient one, so "
+        "the two runs are identical by construction and this test is vacuous"
+    )
+
+    mini = _verdict(minimal)
+    assert mini == amb, (
+        "a name in the ambient environment changed the verdict: minimal gives "
+        + repr(mini) + " where ambient gives " + repr(amb) + ". Some "
+        "environment name outside the whitelist reached a decision."
+    )
+

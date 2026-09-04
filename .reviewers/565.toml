@@ -1,0 +1,57 @@
+# PR #565 — ticket 28: the first red carries its own remedy.
+#
+# All four vectors converged on ONE revision this time, unlike #564 where they
+# deliberately did not. That is not a stronger result — it means the tree
+# stopped moving, and each vector re-derived at the frozen head rather than
+# carrying an earlier SHA forward. Every one of them named the revision they
+# measured and refused to name one they had not.
+#
+# Eleven review rounds. Three findings were live breaks of a named security
+# property, all closed and independently re-verified here:
+#
+#   W18  REVIEWERS_PREFIX steered the foreign-record guard's pathspec, so one
+#        workflow `env:` line let a PR rewrite ANOTHER PR's clearances, exit 0.
+#   R4   a file-sourced `globals()` rebind reached the same lever through the
+#        binding scan's blindness to non-Name targets.
+#   M_F  the name axis — the behavioural pin enumerated four hostile variable
+#        names, so a gate reading a fifth walked through it.
+#
+# Last EXECUTABLE change to the gate: `fda1d3ee` (W18).
+# Last change of any kind:            `1c4a9b6f` (comment-only).
+# `scripts/` is blob-identical to `1c4a9b6f` at this revision.
+#
+# THIS COMMIT CONTAINS THIS FILE AND NOTHING ELSE, deliberately. `.reviewers/`
+# is off the watch floor so a record cannot police itself — which is what makes
+# recording clearances possible without lapsing them. That is a property of the
+# prefix, NOT of the commit being small: a single docstring line under any of
+# the 14 watched paths would lapse all four on the commit that records them.
+# Measured during this review: a docstring-only edit to `tests/` moves the tree
+# hash and lapses, because the gate compares tree hashes and not semantics.
+
+pr = 565
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "6e8d8814c38b16b9f600d54c537206b6b1c4339c"
+logic          = "6e8d8814c38b16b9f600d54c537206b6b1c4339c"
+ops-safety     = "6e8d8814c38b16b9f600d54c537206b6b1c4339c"
+silent-failure = "6e8d8814c38b16b9f600d54c537206b6b1c4339c"
