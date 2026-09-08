@@ -16,7 +16,15 @@ DETERMINISM CONTRACT
     difference happened to straddle the "excludes zero" boundary that a
     headline rested on.
   * rows ordered by `id` so the resample input is a fixed sequence.
-  * percentile bootstrap, 10,000 resamples, 2.5/97.5.
+  * percentile bootstrap, 10,000 resamples. Bounds are taken at indices
+    int(0.025*N) and 9750, i.e. the 2.51/97.51 points rather than exactly
+    2.5/97.5 -- a re-derivation via numpy.percentile will differ in the second
+    decimal. Immaterial to every conclusion drawn, precisely because none of
+    them rests on a boundary-hugging bound; noted so a future re-deriver does
+    not read a small numeric difference as a discrepancy.
+  * CPython guarantees cross-version reproducibility for random() but NOT for
+    randrange()/_randbelow(), so this contract holds for a fixed interpreter.
+    Generated under CPython 3.12 on the prod host.
 
 Usage:  uv run python scripts/analyze_signal_reenable_evidence.py [db_path]
 """
@@ -78,9 +86,15 @@ def main(db_path="scout.db"):
     print("## (NOT a common calendar window; the three cover different periods)")
     print(f"{'signal':17} {'n':>4} {'mean%':>7} {'95% CI':>20}  window")
     for sig in SIGNALS:
+        # CLOSED applied here too: the anchor must come from the SAME
+        # population as the sample. Without it, one open trade with a newer
+        # opened_at slides the 60-day window forward and silently drops closed
+        # trades off the left edge, changing n and the mean with no indication.
+        # Harmless today (zero open trades) -- but this script exists to be
+        # re-run later, and later is exactly when open trades exist.
         b = con.execute(
-            "SELECT date(MAX(opened_at),'-60 day'), date(MAX(opened_at)) "
-            "FROM paper_trades WHERE signal_type=?", (sig,)).fetchone()
+            f"SELECT date(MAX(opened_at),'-60 day'), date(MAX(opened_at)) "
+            f"FROM paper_trades WHERE signal_type=? AND {CLOSED}", (sig,)).fetchone()
         r = _rows(con, sig, "AND opened_at >= ?", (b[0],))
         if len(r) < 5:
             print(f"{sig:17} {len(r):4d}  INSUFFICIENT_DATA")
@@ -114,9 +128,10 @@ def main(db_path="scout.db"):
         r = _rows(con, sig)
         sd = st.stdev(r)
         n_need = math.ceil((1.96 * sd / 2.0) ** 2)
-        span = con.execute(
-            "SELECT julianday(MAX(opened_at))-julianday(MIN(opened_at)) "
-            "FROM paper_trades WHERE signal_type=?", (sig,)).fetchone()[0] or 1
+        span = con.execute(  # CLOSED for the same reason as the anchor above
+            f"SELECT julianday(MAX(opened_at))-julianday(MIN(opened_at)) "
+            f"FROM paper_trades WHERE signal_type=? AND {CLOSED}",
+            (sig,)).fetchone()[0] or 1
         rate = len(r) / max(span, 1)
         print(f"  {sig:17} n={n_need:5d}  at {rate:.2f}/day -> {n_need/rate:.0f} days")
 

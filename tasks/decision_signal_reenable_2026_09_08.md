@@ -25,14 +25,43 @@ than treated as timeless constants.
 
 **KEEP ALL THREE DISABLED.** And separately, and more importantly:
 
-> **Do not re-enable any suppressed signal through the parole retest as it is
-> currently configured.** A 5-trade retest cannot distinguish any of these
-> signals from zero, and 2 wins out of 5 is enough to CLEAR a suppression that
-> was earned on 20–185 trades. Re-enabling under that mechanism does not test
-> the signal; it launders a coin-flip into a "recovered" verdict.
+> **The 5-trade parole retest cannot certify recovery, and must not be relied
+> on to.** Two winners out of five is 40%, which passes a 30% gate — so a tiny
+> noisy cohort can clear a combo suppression built from a much larger history.
 
-That second point holds regardless of what you decide about these three, and it
-is the finding I would act on first.
+**CORRECTION — an earlier revision of this document pointed at the wrong
+lever.** It said "do not re-enable any suppressed signal through the parole
+retest," implying the retest is the way back in for these three. It is not.
+Three reviewers caught this independently; the code states it plainly
+(`combo_refresh.py:2024-2036`):
+
+* **combo suppression** (`combo_performance.suppressed`) clears ONLY via a
+  passing parole retest. Operator action does not clear it directly.
+* **signal suspension** (`signal_params.enabled=0`) clears ONLY via
+  `db.revive_signal_with_baseline(signal_type=...)`.
+
+All three signals here are held by the **signal** axis. While `enabled=0`, no
+trade is admitted, so the retest accumulates nothing and can never reach
+`complete`. **The clear-on-noise path is not armed today.**
+
+What arms it is the revive helper itself: on a **base combo** it *also*
+re-opens the parole window and refills the retest allowance. So one operator
+call both re-enables the signal and arms the 5-trade clearance. The two are
+inseparable on a base combo — which is the accurate statement of the hazard.
+
+Per-signal, verified against prod:
+
+| signal | base combo row | combo suppressed | signal enabled | held by |
+|---|---|---|---|---|
+| chain_completed | yes | 1 | 0 | **both axes** |
+| volume_spike | yes | 1 | 0 | **both axes** |
+| first_signal | **none** | — | 0 | **signal axis only** — its dominant combo `first_signal+momentum_ratio` (231/277 trades) is NOT suppressed |
+
+The "earned on 185 trades" framing in the earlier revision also mixed axes: 185
+is `chain_completed`'s **signal-level** trade count, while the 2-of-5 asymmetry
+is a **combo-axis** defect. Both are real; they are not the same fact. The
+asymmetry is being worked separately on its own combo-axis evidence
+(`tasks/findings_parole_clearance_asymmetry_2026_09_08.md`).
 
 ## Why each was disabled — this was not a policy choice
 
@@ -62,8 +91,14 @@ for what the gate saw.
 
 ## Evidence
 
-Regenerate everything below with
-`uv run python scripts/analyze_signal_reenable_evidence.py` (committed).
+`uv run python scripts/analyze_signal_reenable_evidence.py` (committed)
+regenerates the **Lifetime**, **Recent window**, **censoring**, **n=5 width**
+and **sample-needed** tables. It does NOT produce the per-month table, the
+`chain='coingecko'` per-chain claim, the "net −$186" April figure, the kill
+table (hand-derived from `signal_params_audit`), the revival-window table, or
+the 3-day detection counts (journald, unreproducible after ~2026-09-25). A
+future re-deriver gets roughly five of nine artifacts from the script and must
+re-derive the rest by hand.
 Percentile bootstrap, 10,000 resamples, stdlib `random.Random` seeded **per
 call**, rows ordered by `id`. Population: `status LIKE 'closed%' AND pnl_pct
 IS NOT NULL`. Data provenance: `max(closed_at) = 2026-08-11T02:38:00Z`.
@@ -152,7 +187,7 @@ the specific figure ±31.1% rather than ±44.0%.
 | volume_spike | 22.6% | ±19.8% | **±28.0%** | −2.25% | cannot separate from 0 |
 
 The qualitative fact carrying the decision is that the interval half-width
-exceeds the effect by roughly 3–25×, under either method. No refinement of the
+exceeds the effect by roughly **6–26×** (normal 5.7/18.0/8.8; t 8.1/25.5/12.5), under either method. No refinement of the
 interval arithmetic changes that.
 
 To resolve ±2 percentage points (same caveat — an estimate from observed
@@ -186,7 +221,10 @@ so a later reader does not reduce this to "the average was negative":
 | **sample size** | n = 185 / 277 / 130. `volume_spike`'s straddling CI is partly a power statement, not an innocence statement. |
 | **prior revival cohort** | volume_spike's 35 post-revival trades and first_signal's 21 are a *selected* cohort — trades taken after an operator judged the signal worth reviving. They are the most decision-relevant subset and the worst-performing one. |
 | **event throughput** | 3-day detection: 1,821 / 919 / 47. Identical per-trade economics imply very different bleed rates. |
-| **outcome maturity / censoring** | Checked against an **unfiltered** denominator (`COUNT(*)` with no status clause): 185/185, 277/277, 130/130, zero open, zero other. So the closed-trade filter removed nothing — the check is not the tautology it would be if the denominator had been filtered too. **But it bounds POST-OPEN censoring only.** It cannot see candidates filtered before a trade was ever opened, so it does not rule out selection at admission. Narrower claim than the first revision made. |
+| **outcome maturity / right-censoring** | Unfiltered denominator (`COUNT(*)`, no status clause): 185/185, 277/277, 130/130, zero open. So there is **no right-censoring within the trades table** — but that is all it shows, and the first revision wrongly called the whole axis clean. |
+| **selection INTO the cohort** | Not ruled out. Detection ran at 1,821/3d for `chain_completed` against ~5.6 trades/day historically — roughly 1% of detections became trades, filtered by conviction, safety and slot contention. "100% of survivors survived" is definitionally true and says nothing about that filter. |
+| **OPTIONAL STOPPING (the strongest bias here, and it cuts against this document)** | Every cohort was terminated by `hard_loss`, which fires *because* cumulative realised loss crossed a threshold. That is stopping on the outcome variable: each sample ends precisely when the signal was losing, biasing the observed mean **downward** relative to the true per-trade mean. The bootstrap CIs assume exchangeable draws from a fixed population and so understate coverage at the sample boundary. **This is the one identified bias whose direction favours the signals**, and the decision is made in spite of it, not in ignorance of it. |
+| **execution-regime staleness** | All cohorts closed 2026-06-06 .. 07-18. This document is dated 09-08, ~2 months and many merged changes later across the exit / stop / sizing / parole surface. Every figure estimates these signals **under the June–July execution policy**. If the loss was execution-layer rather than signal-layer, the estimate is stale. This is the axis with the largest leverage on the conclusion and the one most likely to expire. |
 
 ## The retest can also CLEAR on noise
 
@@ -210,7 +248,10 @@ recommendation above is unconditional.
    not exist: `shadow_trades` requires a `paper_trade_id`, so it shadows real
    paper trades against venue depth and cannot stand in for a disabled signal.
    That would be new work and I am not proposing it now — the expected value is
-   low given every month of every signal is negative.
+   low. (Precisely: no month of any signal is meaningfully positive; the
+   largest single cell, `first_signal` April at n=254, is flat at +0.04% and
+   negative in dollars at −$186. An earlier revision said "every month of every
+   signal is negative", which is false against this document's own table.)
 
 ## FROZEN research design — NOT a green light
 
