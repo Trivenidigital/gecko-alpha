@@ -45,6 +45,14 @@ Two had already been revived once by an operator and failed again.
 | first_signal | 2026-06-29 | −$597, dd −$597 | 19 | killed 05-02 (dd −$593, n=253); revived 05-31; **re-failed in 4 wks** |
 | chain_completed | 2026-06-06 | **−$1,714, dd −$2,856** | 144 | never revived |
 
+The kill-row figures are the gate's own numbers **at the moment it fired**
+(`signal_params_audit.reason`), over the window it evaluated. They are not the
+same quantity as the lifetime totals in the Evidence section — `chain_completed`
+shows −$1,714 over n=144 at its kill and −$3,018 over n=185 lifetime, because
+41 further trades closed after the gate tripped. Both are correct; they answer
+different questions. Cite the lifetime figure for economics and the kill figure
+for what the gate saw.
+
 **Both prior revivals performed WORSE than the signal's own lifetime baseline:**
 
 | signal | lifetime avg/trade | revival-window avg | revival n |
@@ -54,18 +62,51 @@ Two had already been revived once by an operator and failed again.
 
 ## Evidence
 
-Lifetime, closed trades, bootstrap 10,000 resamples (seed 20260908):
+Regenerate everything below with
+`uv run python scripts/analyze_signal_reenable_evidence.py` (committed).
+Percentile bootstrap, 10,000 resamples, stdlib `random.Random` seeded **per
+call**, rows ordered by `id`. Population: `status LIKE 'closed%' AND pnl_pct
+IS NOT NULL`. Data provenance: `max(closed_at) = 2026-08-11T02:38:00Z`.
 
-| signal | n | mean | 95% CI | recent-60d mean | recent CI |
+### Lifetime
+
+| signal | n | mean | 95% CI | net | WR |
 |---|---|---|---|---|---|
-| chain_completed | 185 | −5.44% | **[−10.01, −0.00]** excludes 0 | −5.44% | [−9.90, +0.24] |
-| first_signal | 277 | −0.64% | [−2.16, +0.95] straddles | **−8.58%** | **[−15.55, −1.75]** excludes 0 |
-| volume_spike | 130 | −2.25% | [−5.72, +2.13] straddles | −4.75% | [−8.81, +0.68] |
+| chain_completed | 185 | −5.44% | [−10.01, **−0.00**] | −$3,018 | 50.3% |
+| first_signal | 277 | −0.64% | [−2.13, +0.95] straddles 0 | −$750 | 40.1% |
+| volume_spike | 130 | −2.25% | [−5.85, +1.98] straddles 0 | −$877 | 37.7% |
 
-**`first_signal`'s lifetime number is misleading.** −0.64% with a CI straddling
-zero reads as harmless; its recent window is −8.58% with a CI that excludes
-zero. The lifetime average is dominated by 254 near-flat April trades and hides
-a deterioration. Judge it on the recent window.
+**`chain_completed`'s CI does not meaningfully exclude zero.** Its upper bound
+is −0.00 — sitting *on* the boundary, not clear of it. An earlier revision of
+this document claimed "excludes 0" as a headline; that claim was an artifact of
+a bootstrap bug (one seeded RNG reused across two loops, so the same sample
+produced two different intervals). Corrected. **The case against
+`chain_completed` rests on economics — −$3,018 net, −5.44%/trade, negative in
+every month, highest throughput — not on interval significance.**
+
+### Recent window — the last 60 days of EACH SIGNAL'S OWN LIFE
+
+Not a common calendar window. The three cover different periods and different
+fractions of each signal's span, and are **not comparable to one another**:
+
+| signal | n | mean | 95% CI | window covered |
+|---|---|---|---|---|
+| chain_completed | 185 | −5.44% | [−10.01, −0.00] | 2026-04-05 .. 06-04 (**its entire 33-day life**) |
+| first_signal | 25 | **−8.58%** | **[−15.40, −1.72]** excludes 0 | 2026-04-29 .. 06-28 |
+| volume_spike | 90 | −4.75% | [−8.84, +0.70] straddles 0 | 2026-05-15 .. 07-14 |
+
+`chain_completed`'s "recent" row is the same 185 trades as its lifetime row —
+its span is shorter than the window. It is listed for completeness, not as a
+second observation.
+
+**`first_signal`'s lifetime number is misleading, and this is the one place a
+window choice carries a conclusion.** −0.64% lifetime (CI straddling zero)
+reads as harmless; the last 60 days of its life are −8.58% on n=25 with a CI
+that excludes zero. The lifetime mean is dominated by 254 near-flat April
+trades. This is the only signal where lifetime and recent give opposite
+verdicts, and the recent window is the decision-relevant one because it
+contains the post-revival cohort — but n=25 is small and the reader should
+weigh it as such.
 
 **No profitable slice exists.** Per-chain isolation is vacuous — every trade in
 all three signals is `chain='coingecko'`, a single corpus. Per-month:
@@ -80,9 +121,17 @@ Every signal is negative in every month with usable n. The only non-negative
 cells are `first_signal` April (+0.04%, net −$186 — flat, not profitable) and
 `first_signal` May (n=2, meaningless).
 
-**Detection is not the constraint.** Over 3 days: chain_completed 1,821 events,
-first_signal 919, volume_spike 47. Re-enabling `chain_completed` would not be a
-slow soak — it would trade immediately and often.
+**Detection is not the constraint.** journald, `gecko-pipeline`, the 3 days to
+2026-09-08: chain_completed 1,821 events, first_signal 919, volume_spike 47.
+
+Three caveats that the figure does not carry on its face. These are **detections
+on signals that are DISABLED** — detection continues regardless of the trading
+gate, so they are an upper bound on what re-enabling would admit, not a trade
+rate. journald retention on this box is ~17 days, so this figure becomes
+**unverifiable after ~2026-09-25** and cannot be re-derived later. And the
+conversion rate from detection to admitted trade is not measured here. The
+supported inference is only the weak one: nothing about detection volume would
+make a re-enabled `chain_completed` a slow soak.
 
 ## The structural finding: the retest cannot answer the question
 
@@ -137,7 +186,7 @@ so a later reader does not reduce this to "the average was negative":
 | **sample size** | n = 185 / 277 / 130. `volume_spike`'s straddling CI is partly a power statement, not an innocence statement. |
 | **prior revival cohort** | volume_spike's 35 post-revival trades and first_signal's 21 are a *selected* cohort — trades taken after an operator judged the signal worth reviving. They are the most decision-relevant subset and the worst-performing one. |
 | **event throughput** | 3-day detection: 1,821 / 919 / 47. Identical per-trade economics imply very different bleed rates. |
-| **outcome maturity / censoring** | Checked, and clean: 185/185, 277/277, 130/130 closed with realised P&L; **zero open or excluded trades**. No survivorship or maturity bias in these figures. This is the one axis that turned out not to bite. |
+| **outcome maturity / censoring** | Checked against an **unfiltered** denominator (`COUNT(*)` with no status clause): 185/185, 277/277, 130/130, zero open, zero other. So the closed-trade filter removed nothing — the check is not the tautology it would be if the denominator had been filtered too. **But it bounds POST-OPEN censoring only.** It cannot see candidates filtered before a trade was ever opened, so it does not rule out selection at admission. Narrower claim than the first revision made. |
 
 ## The retest can also CLEAR on noise
 
@@ -200,7 +249,7 @@ The design below is the shape such an experiment would take.
   prior kill threshold) regardless of n.
 - **`chain_completed` is not a candidate for such a run** from the present
   evidence. Highest detection rate (1,821/3d),
-  largest realised loss (−$3,018), CI excludes zero, negative in every month,
+  largest realised loss (−$3,018 lifetime), −5.44%/trade, negative in every month,
   and 218 days to resolve. It is the worst risk/return of the three by every
   axis measured.
 
