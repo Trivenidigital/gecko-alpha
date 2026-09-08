@@ -16,6 +16,13 @@ The supported conclusion, stated in the form the operator ruled on:
 
 Explicitly NOT claimed: that these signals can never work.
 
+**Re-review trigger.** This ruling has no expiry by default, which would make
+it permanent by inattention. It should be revisited if any of: (a) the
+execution layer changes materially (exits, stops, sizing) — the staleness axis
+below; (b) a counterfactual lane exists that can accumulate evidence without
+trading; (c) the parole clearance rule is replaced with an evidence-based one;
+or (d) 2027-03-08, whichever comes first.
+
 The `first_signal` design below is preserved as a **pre-registered future
 experimental design only**. It is not authorised, and its sample-size and
 duration figures must be re-derived immediately before any future run rather
@@ -199,8 +206,24 @@ variance, not a constant):
 | first_signal | 167 | **~41** |
 | volume_spike | 489 | ~301 |
 
-**`first_signal` is the only one where a decisive answer is reachable in a
-reasonable window** — and its evidence already points negative.
+**CORRECTION — the "reachable in ~41 days" claim does not survive.** The
+sample-size table above is computed on **lifetime** variance, while this
+document instructs judging `first_signal` on the **recent** window. Those are
+different frames and the recent one is worse: recent SD is **17.70%**, not
+13.16%. Re-derived on the decision-relevant frame:
+
+* n for ±2pp ≈ **301**, not 167;
+* calendar ≈ **74 days** at the historical rate (4.07/day) but ≈ **722 days**
+  at the recent rate (0.42/day).
+
+That spread is itself the argument for re-deriving at activation rather than
+quoting this table. `first_signal` remains the *least impractical* of the
+three, but "a decisive answer in ~41 days" was wrong and is withdrawn.
+
+Note also that ±2pp is a poor target for `first_signal` specifically: its
+lifetime effect is −0.64%, so ±2pp is 3× the effect and would return
+INSUFFICIENT_DATA under this document's own gate. The target only makes sense
+against the recent effect (−8.58%).
 
 **167 and ~41 days are NOT constants.** 167 derives from variance observed in a
 cohort that ended 2026-06-28; ~41 days derives from that signal's historical
@@ -219,7 +242,7 @@ so a later reader does not reduce this to "the average was negative":
 | **lifetime vs recent** | `first_signal` is −0.64% lifetime (CI straddles 0) and −8.58% recent (CI excludes 0). Opposite conclusions from the same signal. |
 | **signal age** | Active spans differ 2.4×: chain_completed 33d, first_signal 68d, volume_spike 80d. Per-signal "lifetime" covers unequal calendar exposure. |
 | **sample size** | n = 185 / 277 / 130. `volume_spike`'s straddling CI is partly a power statement, not an innocence statement. |
-| **prior revival cohort** | volume_spike's 35 post-revival trades and first_signal's 21 are a *selected* cohort — trades taken after an operator judged the signal worth reviving. They are the most decision-relevant subset and the worst-performing one. |
+| **prior revival cohort** | volume_spike's 35 post-revival trades and first_signal's 21 are a *selected* cohort — trades taken after an operator judged the signal worth reviving. Most decision-relevant, worst-performing. **NOT independent of the row above:** for these two the recent window and the revival cohort are substantially the SAME trades, so "recent is worse" and "the revival was worse" are one observation, not two. The earlier revision presented them as separate axes. |
 | **event throughput** | 3-day detection: 1,821 / 919 / 47. Identical per-trade economics imply very different bleed rates. |
 | **outcome maturity / right-censoring** | Unfiltered denominator (`COUNT(*)`, no status clause): 185/185, 277/277, 130/130, zero open. So there is **no right-censoring within the trades table** — but that is all it shows, and the first revision wrongly called the whole axis clean. |
 | **selection INTO the cohort** | Not ruled out. Detection ran at 1,821/3d for `chain_completed` against ~5.6 trades/day historically — roughly 1% of detections became trades, filtered by conviction, safety and slot contention. "100% of survivors survived" is definitionally true and says nothing about that filter. |
@@ -279,20 +302,55 @@ The design below is the shape such an experiment would take.
 - **Candidate:** `first_signal` only. It is the sole signal where a decisive
   answer is reachable (~167 trades / ~41 days) and its per-trade SD (13.2%) is
   less than half the others'.
-- **Do NOT rely on the parole retest to judge it.** Flip
-  `signal_params.enabled=1` and evaluate on the n below, independently of
-  whether `combo_refresh` clears or re-suppresses the combo.
-- **Gate:** n ≥ 167 closed trades, judged on a bootstrap CI of mean pnl_pct.
+- **Use `db.revive_signal_with_baseline(signal_type=...)`, not a raw
+  `UPDATE`.** The raw flip skips the baseline reset that `auto_suspend`
+  depends on (`drawdown_baseline_at` / `last_calibration_at` bound the gate's
+  window), so a hand-flipped signal is measured against a stale drawdown
+  baseline and can re-trip immediately. Requires a recorded operator approval.
+- **The "judge it independently of the combo axis" claim holds for
+  `first_signal` and NOT in general.** `first_signal` has no base combo row,
+  and its dominant combo (`first_signal+momentum_ratio`, 231/277 trades) is
+  unsuppressed, so nothing on the combo axis gates it. For `chain_completed`
+  and `volume_spike` the independence does **not** exist: the revive helper
+  refills the retest, `combo_refresh` decides clear-vs-re-suppress at 5 valid
+  closes, and a re-suppress re-latches the combo axis and blocks further opens
+  — so an n≥301 experiment would stall at n≈5 and die silently. Any future run
+  on those two needs an explicit step holding the combo axis open.
+- **Gate:** n ≥ **301** closed trades (recent-variance frame; re-derive at
+  activation), judged on a bootstrap CI of mean pnl_pct.
+- **Percent and dollars must both be checked.** Every CI here is on mean
+  `pnl_pct`, but the kill condition and the live `hard_loss` gate are in
+  DOLLARS, and this document contains a case where they disagree —
+  `first_signal` April is +0.04% mean-pct and −$186 net, from unequal position
+  sizing. A run could satisfy a pct-based PROMOTE gate and still lose money.
+  Preregister both.
   - **PROMOTE** only if the 95% CI lower bound is > 0.
   - **KILL** if the CI upper bound is < 0, or on any `hard_loss` trip.
   - **INSUFFICIENT_DATA** otherwise — hold disabled, do not read as pass.
-- **Hard stop:** abort immediately if cumulative net reaches −$600 (its own
-  prior kill threshold) regardless of n.
+- **Hard stop:** abort immediately if cumulative net reaches −$600 regardless
+  of n. NB this is a rounded *observation* of its prior kill (−$597), not a
+  system constant — the real threshold is a config value and must be read at
+  activation, not inherited from this line.
 - **`chain_completed` is not a candidate for such a run** from the present
   evidence. Highest detection rate (1,821/3d),
   largest realised loss (−$3,018 lifetime), −5.44%/trade, negative in every month,
   and 218 days to resolve. It is the worst risk/return of the three by every
   axis measured.
+
+## Supersedes an earlier finding — stated, not silent
+
+`tasks/findings_signal_suspensions_are_exit_mechanics_2026_08_03.md` is titled
+*"Why every signal is suspended — it is the exit path, not the signals"* and
+concludes the exit path loses money uniformly, so each signal crosses the P&L
+threshold regardless of detection quality. `audit_suspended_signal_provenance_2026_08_05.md`
+carries that verdict forward.
+
+**This document supersedes that headline on one point only.** Exit-reason mix
+is outcome-conditioned — a trade's exit reason is determined by how the trade
+went — so comparing exit reasons across signals is selection, not treatment,
+and cannot support "the exits are the problem" as a causal claim. The 08-03
+document's other content stands; its one-line verdict does not, and a reader
+should not treat the two as consistent.
 
 ## What this does not claim
 
