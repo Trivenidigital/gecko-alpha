@@ -4,6 +4,23 @@
 
 **Date:** 2026-09-08 · **Prepared against:** prod `6c56186e` · **Decision owner:** operator
 
+## RULING (operator, 2026-09-08) — BINDING
+
+**`chain_completed`, `first_signal` and `volume_spike` remain DISABLED.**
+**Do not use the current 5-trade parole retest to revive them.**
+
+The supported conclusion, stated in the form the operator ruled on:
+
+> **CURRENT EVIDENCE DOES NOT SUPPORT RE-ENABLEMENT, AND THE CURRENT PAROLE
+> MECHANISM CANNOT GENERATE RELIABLE EVIDENCE OF RECOVERY.**
+
+Explicitly NOT claimed: that these signals can never work.
+
+The `first_signal` design below is preserved as a **pre-registered future
+experimental design only**. It is not authorised, and its sample-size and
+duration figures must be re-derived immediately before any future run rather
+than treated as timeless constants.
+
 ## Recommendation
 
 **KEEP ALL THREE DISABLED.** And separately, and more importantly:
@@ -69,16 +86,28 @@ slow soak — it would trade immediately and often.
 
 ## The structural finding: the retest cannot answer the question
 
-Per-trade return SD is large relative to the effect. A 5-trade parole retest
-yields:
+Per-trade return SD is large relative to the effect.
 
-| signal | per-trade SD | 5-trade 95% CI | effect being measured | verdict |
-|---|---|---|---|---|
-| chain_completed | 35.4% | **±31.1%** | −5.44% | cannot separate from 0 |
-| first_signal | 13.2% | **±11.5%** | −0.64% | cannot separate from 0 |
-| volume_spike | 22.6% | **±19.8%** | −2.25% | cannot separate from 0 |
+**Read the numbers below as order-of-magnitude, not as measurements.** They are
+normal-approximation intervals. At five observations that approximation is the
+*optimistic* end: a small-sample t interval is ~1.42× wider, exact widths are
+highly unstable, and a five-observation bootstrap is not something that can
+certify recovery at all. The conclusion "five trades cannot discriminate" is
+therefore **sound and probably understated** — but no decision should rest on
+the specific figure ±31.1% rather than ±44.0%.
 
-To resolve ±2 percentage points:
+| signal | per-trade SD | 5-trade ± (normal) | 5-trade ± (t, df=4) | effect | verdict |
+|---|---|---|---|---|---|
+| chain_completed | 35.4% | ±31.1% | **±44.0%** | −5.44% | cannot separate from 0 |
+| first_signal | 13.2% | ±11.5% | **±16.3%** | −0.64% | cannot separate from 0 |
+| volume_spike | 22.6% | ±19.8% | **±28.0%** | −2.25% | cannot separate from 0 |
+
+The qualitative fact carrying the decision is that the interval half-width
+exceeds the effect by roughly 3–25×, under either method. No refinement of the
+interval arithmetic changes that.
+
+To resolve ±2 percentage points (same caveat — an estimate from observed
+variance, not a constant):
 
 | signal | trades needed | days at its own historical rate |
 |---|---|---|
@@ -89,7 +118,28 @@ To resolve ±2 percentage points:
 **`first_signal` is the only one where a decisive answer is reachable in a
 reasonable window** — and its evidence already points negative.
 
-### And the retest can clear on noise
+**167 and ~41 days are NOT constants.** 167 derives from variance observed in a
+cohort that ended 2026-06-28; ~41 days derives from that signal's historical
+arrival rate while it was enabled. Both must be re-derived at the moment any
+prospective experiment is actually considered, not carried forward from this
+document. Treat them as an existence proof that a discriminating sample is
+reachable in principle, nothing more.
+
+## Selection axes — do not collapse these into one lifetime mean
+
+Every headline here has an axis along which it was selected. Stated explicitly
+so a later reader does not reduce this to "the average was negative":
+
+| axis | what it changes |
+|---|---|
+| **lifetime vs recent** | `first_signal` is −0.64% lifetime (CI straddles 0) and −8.58% recent (CI excludes 0). Opposite conclusions from the same signal. |
+| **signal age** | Active spans differ 2.4×: chain_completed 33d, first_signal 68d, volume_spike 80d. Per-signal "lifetime" covers unequal calendar exposure. |
+| **sample size** | n = 185 / 277 / 130. `volume_spike`'s straddling CI is partly a power statement, not an innocence statement. |
+| **prior revival cohort** | volume_spike's 35 post-revival trades and first_signal's 21 are a *selected* cohort — trades taken after an operator judged the signal worth reviving. They are the most decision-relevant subset and the worst-performing one. |
+| **event throughput** | 3-day detection: 1,821 / 919 / 47. Identical per-trade economics imply very different bleed rates. |
+| **outcome maturity / censoring** | Checked, and clean: 185/185, 277/277, 130/130 closed with realised P&L; **zero open or excluded trades**. No survivorship or maturity bias in these figures. This is the one axis that turned out not to bite. |
+
+## The retest can also CLEAR on noise
 
 `combo_refresh.py`: **suppress** requires `trades >= 20` AND `WR < 30%`.
 **Clear** requires 5 valid retest trades AND `WR >= 30%` over the 30-day
@@ -113,9 +163,28 @@ recommendation above is unconditional.
    That would be new work and I am not proposing it now — the expected value is
    low given every month of every signal is negative.
 
-## If you decide to re-enable anyway — pre-registered criteria
+## FROZEN research design — NOT a green light
 
-Register these BEFORE flipping anything, or the result is unfalsifiable.
+**Operator ruling 2026-09-08: do not execute this now.** It is preserved
+because `first_signal` is the only signal the present analysis says could reach
+a discriminating sample in a practical period — not because it is approved.
+Activation requires a separate, explicit decision.
+
+Before any future activation, ALL of the following must be redone rather than
+inherited from this document:
+
+- re-estimate the sample requirement from **current** variance (167 is stale the
+  moment the distribution moves);
+- re-derive expected calendar duration from the **then-current** arrival rate
+  (~41 days assumes a rate last observed in June);
+- preregister the exact outcome metric and CI method;
+- preregister censoring / maturity handling;
+- freeze cohort identity before the first trade;
+- freeze the hard stop;
+- no threshold changes after outcomes are observed;
+- a separate activation decision, recorded.
+
+The design below is the shape such an experiment would take.
 
 - **Candidate:** `first_signal` only. It is the sole signal where a decisive
   answer is reachable (~167 trades / ~41 days) and its per-trade SD (13.2%) is
@@ -129,7 +198,8 @@ Register these BEFORE flipping anything, or the result is unfalsifiable.
   - **INSUFFICIENT_DATA** otherwise — hold disabled, do not read as pass.
 - **Hard stop:** abort immediately if cumulative net reaches −$600 (its own
   prior kill threshold) regardless of n.
-- **Do not re-enable `chain_completed`.** Highest detection rate (1,821/3d),
+- **`chain_completed` is not a candidate for such a run** from the present
+  evidence. Highest detection rate (1,821/3d),
   largest realised loss (−$3,018), CI excludes zero, negative in every month,
   and 218 days to resolve. It is the worst risk/return of the three by every
   axis measured.
