@@ -42,17 +42,15 @@ imports from scout.db, writes, joins, migrations or feature-flag dependency.
 Read transaction ends with connection close. A bounded page plus one COUNT over
 existing tiny history is sufficient; no new indexes or cached counters.
 
-Row shape: {id:string,token_id:string,detected_at:string,run_pct:number|null,
+Row shape: {id:string,token_id:string|null,detected_at:string|null,run_pct:number|null,field_unavailable_reasons:object,
 most_frequent_recorded_block_reason:string|null}. run_pct accepts finite int/float
 only, excluding bool; text/blob/nonfinite values become null. No recalculation or
 joins to current prices. Return ids exactly with str(row['id']). Nullable reason
 passes through; no reason is not a claim no blockage occurred. Text columns are
-read as text and length-bounded in SELECT (token_id256, detected_at128, reason512)
-to prevent an anomalous row from creating an unbounded response; normal values
-are unchanged. This is display truncation, not a data mutation.
+read through bounded SQL CASE expressions: only typeof(value)=text with length within token_id256, detected_at128, reason512 is returned; anomalous values return null plus a per-field unavailable reason (non_text or too_long). The same CASE and reason apply to latest_detected_at metadata. Never silently substring identity, reason, or timestamp. Normal values remain unchanged.
 
 Envelope: {meta:{ok:true,read_only:true,historical_only:true,generated_at:string,
-total_records:int,latest_detected_at:string|null,sort_policy:'id_desc',limit:int},
+total_records:int,latest_detected_at:string|null,latest_detected_at_unavailable_reason:string|null,sort_policy:'id_desc',limit:int},
 rows:[...],has_more:boolean,next_before_id:string|null}. latest_detected_at comes
 from ORDER BY id DESC LIMIT1, never lexical MAX. Empty table returns200,total0,
 latestnull,rows[],has_morefalse,cursornull. Page past end has total_records intact.
@@ -85,7 +83,7 @@ Columns: Token; Captured at; Price change from paper entry; Most frequent record
 pre-detection block reason. Price help text: Recorded change from the selected
 most-recent open paper trade entry price to cached price at capture; not a24-hour
 change or realized return. Null number displays Unavailable; null reason displays
-No recorded reason. Valid negative/zero values remain visible. Capture strings
+No recorded reason only when the stored value is SQL NULL. A field unavailable reason renders Unavailable (too long/non-text), including anomalous token/capture/reason fields and latest capture metadata. Valid negative/zero values remain visible. Capture strings
 render as stored timestamps; React escapes all text. Metadata: total stored
 records and Capture time of newest recorded row, not a pipeline-health badge.
 
@@ -111,7 +109,7 @@ failure sanitized and logged; Cache-Control on success/error;
 -null/nonfinite/text run_pct normalize to null; negative/zero finite retained;
 -DB content/schema preserved after request; direct _ro_db UPDATE attempt fails;
 -limit1/100 boundaries, invalid0/101, invalidcursor0/negative/above64-bit bound;
--text containing markup appears as text, bounded abnormal strings.
+-text containing markup appears as text; overlong/non-text token, reason, row timestamp and newest metadata timestamp return null plus correct unavailable reasons, never silent truncation. Malformed text decoding failures return sanitized query_failed503.
 
 Frontend tests: add focused Python-driven Node tests using existing repo pattern,
 extract only request/paging helper if required for executable async race tests;
@@ -135,4 +133,5 @@ remain open; list visibility cannot close those residuals.
 
 ## Design review
 
-Awaiting two independent reviews. No implementation files changed.
+Structural design review approved. Operations requested explicit anomalous-field handling rather than silent truncation; folded above and awaiting reapproval. Tests must reject stale success, error, and finally updates. No implementation files changed.
+
