@@ -51,6 +51,10 @@ Production HEAD d2f0d61e, tracked clean; actual pipeline/dashboard/Hermes units 
 
 ## Contract and boundaries
 
+UI/API explicitly label historical PAPER / EXPERIMENTAL, not for pruning,
+sizing or dispatch decisions. Stored exits already include modeled paper
+slippage; this display cannot attribute venue execution or fees.
+Every unavailable row carries a specific exclusion reason.
 Metric is recorded entry-stop shortfall in percentage points, not execution
 slippage, terminal-stop overshoot or realized portfolio PnL. Formula:
 max(0, -100*(exit_price/entry_price-1)-sl_pct_at_entry).
