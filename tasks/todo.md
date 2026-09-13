@@ -2,7 +2,7 @@
 
 - [x] Current-base drift and production read-only schema/state preflight.
 - [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
-- [ ] Exact-head CI and allowed merge; deployment remains separately owned.
+- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Deployment held separately for active capture/migration owner.
 - Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
 
 ## Findings closeout: 2026-09-13 — autonomous product readiness
@@ -2421,9 +2421,10 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 ## Historical postmortem viewer: 2026-09-13
 
 - [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
-- [ ] Two plan reviews and folds; two design reviews and folds.
-- [ ] Bounded read-only historical list API and Performance tab; focused tests/build.
+- [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
+- [x] Bounded read-only historical list API and Performance tab; 60 focused/API/navigation tests and frontend build passed. Independent visual QA in progress.
 - [ ] PR, two independent reviews, folds, exact-head CI; parent-coordinated merge.
 
 Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
 See tasks/plan_postmortem_history_2026_09_13.md.
+

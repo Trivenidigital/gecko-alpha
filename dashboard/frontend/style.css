@@ -2031,3 +2031,18 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* Historical captures: descriptive values, no eligibility styling. */
+.postmortem-history { padding: 20px; }
+.postmortem-history-heading, .postmortem-history-paging { display: flex; align-items: center; gap: 16px; }
+.postmortem-history-heading { justify-content: space-between; }
+.postmortem-history p { line-height: 1.6; max-width: 1000px; }
+.postmortem-history-help, .postmortem-history-meta { color: var(--color-text-secondary); font-size: 13px; }
+.postmortem-history-scroll { overflow-x: auto; }
+.postmortem-history table { width: 100%; border-collapse: collapse; }
+.postmortem-history th, .postmortem-history td { text-align: left; padding: 12px; border-bottom: 1px solid var(--color-border); overflow-wrap: anywhere; }
+.postmortem-history th { font-size: 12px; color: var(--color-text-secondary); }
+.postmortem-history button { padding: 8px 14px; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-text-primary); background: var(--color-bg-secondary); cursor: pointer; }
+.postmortem-history button:disabled { opacity: .45; cursor: default; }
+.postmortem-history-paging { margin-top: 20px; }
+

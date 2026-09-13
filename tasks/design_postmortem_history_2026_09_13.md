@@ -47,7 +47,7 @@ most_frequent_recorded_block_reason:string|null}. run_pct accepts finite int/flo
 only, excluding bool; text/blob/nonfinite values become null. No recalculation or
 joins to current prices. Return ids exactly with str(row['id']). Nullable reason
 passes through; no reason is not a claim no blockage occurred. Text columns are
-read through bounded SQL CASE expressions: only typeof(value)=text with length within token_id256, detected_at128, reason512 is returned; anomalous values return null plus a per-field unavailable reason (non_text or too_long). The same CASE and reason apply to latest_detected_at metadata. Never silently substring identity, reason, or timestamp. Normal values remain unchanged.
+read through bounded SQL CASE expressions: only typeof(value)=text with length within token_id256, detected_at128, reason512 is returned; anomalous values return null plus a per-field unavailable reason (non_text or too_long). A four-bytes-per-character byte bound also prevents embedded NUL from bypassing SQLite character length limits. The same CASE and reason apply to latest_detected_at metadata. Never silently substring identity, reason, or timestamp. Normal values remain unchanged.
 
 Envelope: {meta:{ok:true,read_only:true,historical_only:true,generated_at:string,
 total_records:int,latest_detected_at:string|null,latest_detected_at_unavailable_reason:string|null,sort_policy:'id_desc',limit:int},
@@ -133,5 +133,6 @@ remain open; list visibility cannot close those residuals.
 
 ## Design review
 
-Structural design review approved. Operations requested explicit anomalous-field handling rather than silent truncation; folded above and awaiting reapproval. Tests must reject stale success, error, and finally updates. No implementation files changed.
+Structural design review approved. Operations requested explicit anomalous-field handling rather than silent truncation; folded above and operations reapproval received; build authorized by parent. Tests must reject stale success, error, and finally updates. No implementation files changed.
+
 
