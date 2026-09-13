@@ -1,0 +1,20 @@
+# Independent Claude Max sessions, read-only, terminal at the named candidate.
+# Concurrency/logic: 8e7c72c2-ff0c-4f98-9bbb-af4961f100b6.
+# Ops-safety/silent-failure: f07f3b59-04b6-401c-898a-e16c82ea1441.
+# Re-reviewed after implementation fixes and final cooldown write-order change.
+# Native verification and mutation results recorded in the capture report.
+# Capacity and activation are not part of this clearance.
+pr = 576
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    ".claude", ".github", "Dockerfile", "cron", "dashboard",
+    "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts",
+    "start.sh", "systemd", "tests", "uv.lock", "investigation",
+]
+
+[clearances]
+concurrency = "5ca39f9c731aed521068755595bc76d22eb2508e"
+logic = "5ca39f9c731aed521068755595bc76d22eb2508e"
+ops-safety = "5ca39f9c731aed521068755595bc76d22eb2508e"
+silent-failure = "5ca39f9c731aed521068755595bc76d22eb2508e"

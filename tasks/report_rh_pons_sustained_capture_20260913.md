@@ -294,3 +294,13 @@ independent reviewers; Codex ran native tests, fault checks and integration.
 | Production activation, live trading, provider purchase | Not performed; remains outside this increment |
 
 Final independent clearance and exact-head CI records will accompany the PR.
+
+PR: https://github.com/Trivenidigital/gecko-alpha/pull/576
+
+All four independent vectors are terminal and cleared at
+`5ca39f9c731aed521068755595bc76d22eb2508e`. The final write-order fix passed
+six native watchdog-ops tests, including injected failure between state writes.
+The two Claude reviewer session IDs and watched paths are in `.reviewers/576.toml`.
+Integration and merge of this verified increment use the user authorization
+recorded above; production activation remains excluded. Exact-head Linux CI is
+pending and must pass before merge.
