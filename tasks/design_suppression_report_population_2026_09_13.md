@@ -68,8 +68,10 @@ Runtime: invoke old and new `analyze` with the same fixed timestamp and identica
 parameters on production read-only data, compare entire `cost` object. Import
 new source via stdin, no remote file writes, no --send. Publish population
 diagnostics and exact limits. Re-review all affected vectors on new PR SHA;
-record only actual terminal verdicts; exact-head CI before merge. No deploy;
-rollback is revert via normal PR/CI, with no data restore.
+record only actual terminal verdicts; exact-head CI before merge. Initial probes
+do not deploy. After merge, the closeout report's script-refresh preflight and
+no-send smoke apply under current production-push authorization; rollback is
+revert via normal PR/CI, with no data restore or service restart.
 
 Design review fold: fixed timestamps alone do not freeze mutable labels.
 Runtime comparison used a shared SQLite read transaction for old/new analysis;

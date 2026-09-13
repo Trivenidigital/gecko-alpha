@@ -28,14 +28,14 @@ successor tracker missing from this checkout. Do not rebuild those parents.
   prior automation memory; independently audit drift and Hermes ecosystem.
 - [x] Two parallel plan reviews (evidence/logic and authority/safety), fold findings.
 - [x] Write design; two parallel design reviews and fold findings.
-- [ ] Update reporter text only: always distinguish candidate files from actual
+- [x] Update reporter text only: always distinguish candidate files from actual
   scheduler/run evidence, and qualify historical backlog anchors with the
   precedence of reconciliation/forward-tracker instructions. No new parser.
-- [ ] Update status runbook and role map; file dated missing-tracker and runtime
+- [x] Update status runbook and role map; file dated missing-tracker and runtime
   evidence report. Preserve historical backlog entries; add a dated pointer.
-- [ ] Regression test both candidate/no-candidate output to prevent claims of
+- [x] Regression test both candidate/no-candidate output to prevent claims of
   execution from file presence/absence. Verify reporter tests and node syntax.
-- [ ] Commit, open PR; two parallel PR reviews covering logic/concurrency and
+- [x] Commit, open PR; two parallel PR reviews covering logic/concurrency and
   ops-safety/silent-failure; fold all findings and record exact reviewed SHA.
 - [ ] Merge only after focused tests, independent terminal reviews and exact-head
   CI pass. Docs/script change requires no production service deployment.

@@ -6,7 +6,7 @@ Both reporting corrections implemented and independently reviewed in
 [PR #571](https://github.com/Trivenidigital/gecko-alpha/pull/571); exact-head CI
 is the next merge gate. This report does **not** claim all Gecko backlog work is exhausted.
 No trading, dispatch, source suppression, paid access, DB or production config
-was changed. Production remains at `6c56186e31db24ebf6fe769a798cc9cd65e73015`.
+was changed. Production baseline is `6c56186e31db24ebf6fe769a798cc9cd65e73015`.
 
 The six-hour budget is a ceiling for this block, not evidence that a six-hour
 soak occurred. Measurements below are timestamped snapshots.
@@ -185,9 +185,9 @@ No signal was revived or threshold changed to manufacture a cohort.
   `.reviewers/571.toml` records those actual verdicts. Required CI must pass
   after this documentation/clearance commit before merge.
 - Implementation commits: `24680ff5` (autonomous evidence boundary) and
-  `218a295e` (suppression population correction). No production deploy needed
-  for repository-local reporting; updated suppression code was verified through
-  read-only stdin execution only, and production's scheduled script is unchanged.
+  `218a295e` (suppression population correction). Updated suppression code was
+  verified through read-only stdin execution. Production script refresh is
+  planned after merge so the existing scheduled report benefits from the fix.
 
 Second slice plan/design each received two parallel independent approvals.
 Folds: per-signal ratio checks but aggregate rows/day floor; explicit no-activity,
@@ -205,10 +205,28 @@ had escaped the earlier diff check); removed and verified against origin/master.
 | Read-only repo/runtime probes | inspection | Current task requires runtime verification | Sept 13 19:16–19:25Z |
 | Reporter/docs/tests implementation; branch/commit/PR | reversible build | Current production-push prompt: may create branches, commits, PRs, feature pushes | Sept 13, this branch |
 | Merge | conditional | Same prompt: permitted low-risk classes after CI, focused verification and two-vector reviews | Not yet executed |
-| Production deployment or state change | not needed | None exercised | None |
+| Scripts/docs refresh after merge | conditional deployment | Current prompt permits docs/scripts/tests deployment after smoke and rollback notes | Pending CI/merge and preflight below |
 
 Rollback: revert this PR through normal review/CI. No production restart or
 data restore is needed for this local script/docs correction.
+
+### Production script refresh preflight and smoke
+
+After exact-head CI and merge, verify production tracked files remain clean,
+HEAD still equals the recorded baseline, origin/master is exactly this PR's
+merge SHA, and the incoming diff contains only the reviewed files. Abort on
+unrelated changes or untracked-file collision; preserve existing operational
+artifacts. Fast-forward `/root/gecko-alpha` to that exact SHA. No service restart,
+build, schema or configuration change.
+
+Run the installed suppression report **without `--send`**, Python compile to
+memory, and service-state check. Expect named population mismatch, unchanged
+n-gate/counterfactual semantics and active services. Repository reporter smoke
+uses Node only if already installed; no runtime installation. If smoke fails,
+restore the two report scripts from baseline `6c56186e` (exact tracked paths
+only) and open a revert PR to reconcile deployment; never reset unrelated files.
+Final execution timestamp/SHA/result belongs in automation memory and final
+task response; this committed checkpoint intentionally leaves future gates open.
 
 ## Permanent prompt adjustment and next operator action
 

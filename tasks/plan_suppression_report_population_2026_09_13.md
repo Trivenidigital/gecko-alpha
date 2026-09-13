@@ -34,17 +34,17 @@ Add explicit experimental/not-for-pruning scope to output; no paid calls.
 
 ## Checkable execution
 
-- [ ] Two parallel plan reviews: statistical/logic and operational safety.
-- [ ] Write exact design and get two parallel design reviews; fold findings.
-- [ ] Add regressions for ledger-only lane masking another lane's missing or
+- [x] Two parallel plan reviews: statistical/logic and operational safety.
+- [x] Write exact design and get two parallel design reviews; fold findings.
+- [x] Add regressions for ledger-only lane masking another lane's missing or
   low sampling, counts above denominator, zero-event/zero-ledger, balanced lanes,
   and no calendar/deployment assertion. Prove red before implementation.
-- [ ] Implement grouping + uncertainty output in existing script; cost math
+- [x] Implement grouping + uncertainty output in existing script; cost math
   remains untouched. Open DB with read-only URI to enforce analysis boundary.
-- [ ] Focused report suites, syntax, read-only DB mutation check and diff check.
+- [x] Focused report suites, syntax, read-only DB mutation check and diff check.
 - [ ] Update existing PR #571; independently re-review new candidate for all
   affected vectors, record actual reviewed SHA, wait for CI before merge.
-- [ ] Run updated script against prod DB read-only via stdin import (no remote
+- [x] Run updated script against prod DB read-only via stdin import (no remote
   file changes), compare cost fields against old at a fixed timestamp.
 - [ ] Record findings, folds, runtime evidence and final disposition.
 
