@@ -37,7 +37,7 @@ fixture/server files are not included in PR.
 
 ## Release boundary
 
-Awaiting two final PR reviews and exact-head CI. No deployment while separately
+Both final PR577 reviews approved exact 4131d358c17922be8247e6981c2fc9d27788a245: stop_gap_audit logic/concurrency (16 independently rerun tests), stale_pr_audit ops-safety/silent-failure plus attribution/UI truth (141 independently rerun tests). No required code fixes. Clearances recorded in .reviewers/577.toml. Awaiting exact final-head CI. No deployment while separately
 owned capture/migration work is active. Later rollback is revert viewer commit
 and rebuild prior frontend; no DB restore required. Historical list visibility
 is complete; comprehensive missed-token capture, causal attribution, guaranteed

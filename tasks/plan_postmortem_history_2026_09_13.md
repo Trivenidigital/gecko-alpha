@@ -75,12 +75,13 @@ actions offering execution, dispatch, enable/disable, pruning or reclassificatio
 - [x] Clean isolated worktree/branch; source drift and current Hermes check.
 - [x] Two independent plan reviews coordinated by parent; structural approval and operations reapproval at527ce25c.
 - [x] Write tasks/design_postmortem_history_2026_09_13.md; two independent design reviews and folds before build (final e7b5cc28).
-- [ ] Add failing tests in tests/test_postmortem_history_endpoint.py: populated/empty/missing DB/table; exact fields/no evidence; pagination with id gaps and intervening inserts; invalid limit/cursor; strict finite JSON; read-only database preservation.
-- [ ] Implement get_postmortem_history in dashboard/db.py and GET route in dashboard/api.py; typed response models in dashboard/models.py if consistent with reviewed design.
-- [ ] Add dashboard/frontend/components/PostmortemHistoryTab.jsx; wire App.jsx and minimal style.css reuse. Extend navigation guard; cover async error/stale response/page state through repo-supported frontend tests.
-- [ ] Run focused endpoint/navigation tests, existing API regression tests, frontend build, git diff --check. Use shared installed Python; document exact commands/results.
-- [ ] Commit meaningful verified changes; reconcile latest merged origin/master after PR575, rerun affected checks, push feature branch and create PR.
-- [ ] Two independent PR reviews (structural/read-only bounds and semantic/UI truth), fold all material findings, CI green on exact final head before parent considers merge. Add codex and codex-automation labels when available.
+- [x] Add failing tests in tests/test_postmortem_history_endpoint.py: populated/empty/missing DB/table; exact fields/no evidence; pagination with id gaps and intervening inserts; invalid limit/cursor; strict finite JSON; read-only database preservation.
+- [x] Implement get_postmortem_history in dashboard/db.py and GET route in dashboard/api.py; typed response models in dashboard/models.py if consistent with reviewed design.
+- [x] Add dashboard/frontend/components/PostmortemHistoryTab.jsx; wire App.jsx and minimal style.css reuse. Extend navigation guard; cover async error/stale response/page state through repo-supported frontend tests.
+- [x] Run focused endpoint/navigation tests, existing API regression tests, frontend build, git diff --check. Use shared installed Python; document exact commands/results.
+- [x] Commit meaningful verified changes; reconcile latest merged origin/master after PR575, rerun affected checks, push feature branch and create PR.
+- [x] Two independent PR reviews approved exact 4131d358 (structural/read-only bounds and semantic/UI truth); no required fixes. PR577 has codex and codex-automation labels.
+- [ ] Exact final-head CI green before parent considers merge; deployment remains held.
 
 ## Files and release boundary
 
@@ -93,6 +94,6 @@ the viewer commit and rebuilding prior UI; no data restore/migration needed.
 
 ## Review
 
-Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, operations reapproval received. Design/build have not started. Current source
+Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, operations reapproval received. Design and build complete; 141 focused tests and independent visual QA passed. Current source
 and row inventory support a display; broader capture coverage, causal analysis,
 T-minus reconstruction and writer watchdog remain explicitly separate residuals.

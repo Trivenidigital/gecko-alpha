@@ -1,0 +1,19 @@
+pr = 577
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Independent terminal approvals on the exact code head below:
+# stop_gap_audit: logic/concurrency; independently reran 16 focused tests.
+# stale_pr_audit: ops-safety/silent-failure and attribution/UI truth;
+# independently reran all 141 focused tests. No required fixes.
+# Later changes are review/task metadata only; no code drift.
+[clearances]
+concurrency = "4131d358c17922be8247e6981c2fc9d27788a245"
+logic = "4131d358c17922be8247e6981c2fc9d27788a245"
+ops-safety = "4131d358c17922be8247e6981c2fc9d27788a245"
+silent-failure = "4131d358c17922be8247e6981c2fc9d27788a245"
