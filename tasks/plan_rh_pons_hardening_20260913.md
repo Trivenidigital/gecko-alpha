@@ -37,9 +37,9 @@ Claude/Codex collaboration on 2026-09-13. Retain default-off and ineligible stam
   stale and failure cases; document deployment wiring and measurable SLO.
 - [x] Codex: first-party network and onchain verification attempts; record
   raw public facts and unresolved deployment/ABI boundaries without fabrication.
-- [ ] Integrate changes, review along structural and durable-evidence axes,
+- [x] Integrate changes, review along structural and durable-evidence axes,
   run focused plus relevant regression tests, fix attributable failures.
-- [ ] Commit finished code and report precise acceptance status and residual
+- [x] Commit finished code and report precise acceptance status and residual
   external blockers. No claim of live effectiveness from synthetic fixtures.
 
 Runtime assumptions before activation: chain ID matches verified network;

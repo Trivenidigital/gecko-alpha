@@ -83,6 +83,28 @@ complementary ops-safety paths (45 tests). The latter authored the head-lag
 extension, which was independently covered by the durable reviewer instead.
 Clearances authorize the default-off merge scope only, not live activation.
 
+## Final integration status
+
+Linux CI at `4da32b77` passed: **7,720 tests passed, 12 skipped**, plus
+118 dashboard contract checks and the required clearance check. PR #572 is
+ready for review. Master subsequently moved to `d2f0d61e` through reporting
+PR #571. Merge `2b397d18` preserves both task entries; RH code is unchanged.
+All four reviewers renewed their bounded clearances at that merge SHA.
+The incoming reporting PR also passed its own CI. The merged branch's
+additional focused verification and fresh CI are reported on PR #572.
+
+A separate real-RPC run with the **2,000-block default window timed out
+inside header reads at the 30-second deadline**. The successful live probe
+used 200 blocks. Default activation is therefore not accepted. Provider
+capacity, scan sizing and sustainable cadence must be resolved first.
+The watchdog and deadline contain failure; they do not make stalled capture
+useful. This is an explicit next-stage blocker, not a hidden soak assumption.
+
+Supplemental cancellation validation also passed: cancel after a real event
+commit, before discovery creation; close/reopen DB and replay twice. Exactly
+one event and one correctly projected, execution-ineligible discovery remain.
+This tests interrupted persistence/replay, not every full-poll cancellation point.
+
 Production read-only inspection found `gecko-pipeline` active at `6c56186e`,
 the RH collector disabled, and no configured RH RPC URL. The host can reach
 the official public RPC. Native Windows Python DNS could not, although public
