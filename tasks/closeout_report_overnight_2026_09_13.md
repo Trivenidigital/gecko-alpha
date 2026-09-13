@@ -2,8 +2,9 @@
 
 ## State and scope
 
-Both reporting corrections implemented; independent PR review and CI are the next
-merge gates. This report does **not** claim all Gecko backlog work is exhausted.
+Both reporting corrections implemented and independently reviewed in
+[PR #571](https://github.com/Trivenidigital/gecko-alpha/pull/571); exact-head CI
+is the next merge gate. This report does **not** claim all Gecko backlog work is exhausted.
 No trading, dispatch, source suppression, paid access, DB or production config
 was changed. Production remains at `6c56186e31db24ebf6fe769a798cc9cd65e73015`.
 
@@ -177,7 +178,16 @@ No signal was revived or threshold changed to manufacture a cohort.
   authority/safety. Design: same two orthogonal reviews approved. Folds:
   static warning is not reconciliation parsing; external config is not run
   completion; all registered reviewers must terminate; sanitized evidence only.
-- PR review/CI/merge evidence will be appended after those gates finish.
+- Independent final PR verdicts: `scope_audit` APPROVE logic/concurrency and
+  `loop_audit` APPROVE ops-safety/silent-failure, both naming exact candidate
+  `218a295e7c944d5ef65f7a12b4c06ff12406c4c9`. Both independently ran 21 focused
+  tests. All dispatched reviewers reached terminal states; no unresolved folds.
+  `.reviewers/571.toml` records those actual verdicts. Required CI must pass
+  after this documentation/clearance commit before merge.
+- Implementation commits: `24680ff5` (autonomous evidence boundary) and
+  `218a295e` (suppression population correction). No production deploy needed
+  for repository-local reporting; updated suppression code was verified through
+  read-only stdin execution only, and production's scheduled script is unchanged.
 
 Second slice plan/design each received two parallel independent approvals.
 Folds: per-signal ratio checks but aggregate rows/day floor; explicit no-activity,

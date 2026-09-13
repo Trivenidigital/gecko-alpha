@@ -13,7 +13,9 @@
 - [x] Suppression report population mismatch corrected after two parallel plan
   and two parallel design reviews; 21 focused tests pass, cost identical in
   shared production read-only snapshot. No deployment or sends.
-- [ ] Focused verification, PR, two-vector independent PR reviews, exact-head CI.
+- [x] Focused verification and PR #571; both independent PR reviewers approved
+  candidate `218a295e` across all four clearance vectors, no remaining folds.
+- [ ] Exact-head CI and conditional merge.
 - [ ] Conditional merge and final report/memory.
 
 Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and

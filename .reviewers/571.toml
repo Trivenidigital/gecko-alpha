@@ -1,0 +1,18 @@
+pr = 571
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Independent terminal verdicts in the 2026-09-13 overnight task:
+# scope_audit reviewed logic + concurrency; loop_audit reviewed ops-safety +
+# silent-failure. Both explicitly approved this SHA after 21 focused tests.
+# Prior 24680ff5 whitespace finding folded before this reviewed candidate.
+[clearances]
+concurrency = "218a295e7c944d5ef65f7a12b4c06ff12406c4c9"
+logic = "218a295e7c944d5ef65f7a12b4c06ff12406c4c9"
+ops-safety = "218a295e7c944d5ef65f7a12b4c06ff12406c4c9"
+silent-failure = "218a295e7c944d5ef65f7a12b4c06ff12406c4c9"
