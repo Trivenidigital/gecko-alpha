@@ -70,9 +70,13 @@ completed turn and deployed code remain distinct evidence categories.
 - DASH-09 aggregate remains open; a page mean would be misleading.
 - Postmortem UI, suppression dashboard integration and centralized routing
   remain engineering residuals, not operator-only blockers.
-- PR570 retains three unique historical docs despite analyzer supersession;
-  read-only audit recommends preserving it, not closing as a duplicate. Its
-  existing approval evidence/ownership needs separate verification before merge.
+- PR570 retained three unique historical docs despite analyzer supersession.
+  Its latest permanent-loop owner was independently confirmed completed;
+  fresh two-vector reviews APPROVED 7e953e4f64c48ac9e73e2b14ddad244777c7203f,
+  exact-head CI34786461305 was green, and this closeout merged it normally
+  at 2026-09-13T22:46:35Z as c3a91972f4363ecc63608ff2ecb202fdbe519fa4.
+  Docs-only; no deployment needed. PR575 then incorporated that new base,
+  retaining both task-log sections; source/test trees unchanged.
 - Successor tracker remains untracked in main checkout; reconciliation into a
   shared queue remains due. Automation cadence remains hourly with six-hour
   mission; prompt should consult reconciliation/current queue, actual prior
