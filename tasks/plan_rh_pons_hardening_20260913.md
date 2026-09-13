@@ -1,4 +1,4 @@
-**New primitives introduced:** durable RH scan checkpoint (within existing DB layer), RH liveness watchdog using existing watchdog infrastructure; no new trading or ranking mechanism.
+**New primitives introduced:** durable RH scan checkpoint and canonical-restoration evidence (within existing DB layer), RH liveness watchdog using existing watchdog infrastructure, read-only RPC capability preflight CLI; no new trading or ranking mechanism.
 
 ## Hermes-first analysis
 

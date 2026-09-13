@@ -270,7 +270,8 @@ async def main(
             False,
         )
     else:
-        async with aiohttp.ClientSession() as session:
+        # Honor the host's standard proxy configuration for the operator CLI.
+        async with aiohttp.ClientSession(trust_env=True) as session:
             report = await run_checks(
                 session, rpc_url, log_window=min(max(1, args.log_window), 100)
             )

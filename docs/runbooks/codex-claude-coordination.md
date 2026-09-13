@@ -39,3 +39,20 @@ reviewing the result before integration. Do not give two agents the same branch.
 Retain raw session JSON locally; commit only the relevant reviewed findings.
 Do not send secrets, wallet material, environment files, or unrelated project
 context in review prompts. No periodic automation is installed by this workflow.
+
+## Writer lifecycle and handoff
+
+An installed episodic-memory helper spawned a resumed SDK process after its
+parent coding session was interrupted during this task. It continued writing
+the old task's files. Stopping only the visible Claude PID was insufficient.
+Before transferring file ownership, inspect `claude agents --json` and the
+parent/child process tree for the task-specific worktree. Terminate the entire
+owned CLI process tree when canceling its work; never stop unrelated interactive
+sessions. Verify the worktree stops changing, preserve competing changes, and
+integrate only explicitly reviewed commits. Do not assume a helper is read-only
+because its name includes memory or summarization.
+
+Concurrent writers also share Git's index within a worktree. Prefer separate
+worktrees, and use `git commit --only <owned paths>` when committing disjoint
+work in a shared integration checkout. This prevents one worker's staged files
+from accidentally entering another worker's commit.
