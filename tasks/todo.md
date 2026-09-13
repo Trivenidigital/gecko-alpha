@@ -1,8 +1,8 @@
 ## Active Work: 2026-09-13 — autonomous product-readiness findings
 
-**Status:** AUDIT-IN-PROGRESS. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
+**Status:** FINDINGS-READY — DASH-11 denominator population mismatch (135.67%). Report: tasks/findings_autonomous_product_readiness_2026_09_13.md. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
 - [x] Refresh current master; inspect backlog drift and read-only runtime.
-- [ ] Plan/design: two parallel reviews each, with folds.
+- [x] Plan/design: two parallel reviews each approved, evidence-precision folds applied.
 - [ ] Findings PR: source + runtime evidence, next product gate, two PR reviews.
 # Backlog — gecko-alpha
 
