@@ -16,6 +16,11 @@ can yield zero new event/discovery rows, so row age is diagnostic rather than
 an outage verdict. Measure actual poll p50/p95 duration and launch rows/hour
 after activation; do not infer them from retrospective event counts.
 
+`RH_PONS_POLL_TIMEOUT_SEC` defaults to 30 seconds (valid range 1–300).
+The main pipeline cancels a stalled RH pass at that deadline and continues
+ordinary candidate processing. Incomplete coverage is retried from its durable
+checkpoint; a timeout is not a successful heartbeat.
+
 The existing watchdog supports `--source rh_pons`; it reads the DB read-only,
 uses the RH heartbeat and discovery table, and reports missing/stale/invalid
 heartbeats. Preview on Windows or Linux with:

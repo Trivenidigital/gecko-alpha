@@ -44,6 +44,21 @@ execution-eligible. Raw evidence is in
 The scans took 23.469 and 71.010 seconds, exposing sequential-header overhead;
 this sample must not be presented as sustained capacity acceptance.
 
+After batching header requests in groups of eight, a second real probe captured
+19 launches and 363 events in scans taking 18.907 and 23.177 seconds. Both
+completed inside the new 30-second pipeline deadline; injected failure again
+preserved the heartbeat. Completion-time head measurement reported 164 and
+205 blocks of lag. The samples differ, so these timings are operational
+observations, not a controlled speedup estimate. Evidence:
+`investigation/rh_pons_live_probe_final_20260913.json`.
+
+Final structural/cancellation review at `c23ad743` found no concrete blockers
+and passed 58 collector/DB/deadline regressions. A broader run exposed an
+overbroad test assertion against unrelated CoinGecko heartbeat writes;
+`7f0e6ff1` scopes it to RH and passed the combined main/deadline tests.
+Production Python has no pytest installed; no packages were added to that
+environment. Linux-wide regression verification is delegated to PR CI.
+
 Production read-only inspection found `gecko-pipeline` active at `6c56186e`,
 the RH collector disabled, and no configured RH RPC URL. The host can reach
 the official public RPC. Native Windows Python DNS could not, although public
