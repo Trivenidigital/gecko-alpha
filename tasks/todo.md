@@ -2387,3 +2387,20 @@ dormant), BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO (MED, operator vendor 
 BL-NEW-CG-DEMO-API-KEY (MED, operator action, runbook ready), BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE
 (LOW-MED), plus the low-priority tail enumerated in backlog.md. See backlog.md for full
 evidence and the SUPERSEDED→new-ID mapping.
+
+## Closeout follow-through: 2026-09-13 21:14 UTC
+
+Docs-only scope; detailed findings and verification in
+`tasks/closeout_followthrough_2026_09_13_2114.md`.
+
+- [x] Refresh clean isolated branch to origin/master 6dd4327b; read prior run
+  memory, current reconciliation, local AGENTS.md and lessons.
+- [x] Verify earlier automation turns completed; identify current PR572/capture
+  owner before any shared PR or production action.
+- [x] Trace alert destinations through send helpers and correct three registry
+  rows; document overlap preflight without claiming an implemented lock.
+- [x] Focused registry coverage: 2 passed; diff whitespace check passed.
+- [ ] Two independent PR reviews, folds, exact-head CI and conditional merge.
+
+Review: no code/runtime changes; centralized routing, stop history and postmortem
+UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.

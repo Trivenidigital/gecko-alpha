@@ -43,8 +43,8 @@ not yet a runtime field.
 |------|-----------|---------|---------|-----------|----------|------|
 | Combo suppression reversal (§12b) | `combo_refresh_suppression_reversal` | Nightly refresh newly-suppresses or parole-exhausts a combo | trading | None | warning | Y |
 | Early-detection candidate alert | `detection_alert` | Fresh CG candidate, early vs CG trending (lane flag-gated) | trading | None | info | Y |
-| Detection-receipt disk pressure | `detection_receipt_disk_pressure` | Free disk below floor → receipt accrual suspended for the cycle (send path unchanged); guard flag-gated. Immediate on first breach + critical escalation; else cooldown-paced | health | None | warning | Y |
-| Detection-receipt disk recovery | `detection_receipt_disk_recovery` | Free disk recovered above floor → receipt accrual resumed (distinct one-shot recovery page) | health | None | info | Y |
+| Detection-receipt disk pressure | `detection_receipt_disk_pressure` | Free disk below floor → receipt accrual suspended for the cycle (send path unchanged); guard flag-gated. Immediate on first breach + critical escalation; else cooldown-paced | trading | None | warning | Y |
+| Detection-receipt disk recovery | `detection_receipt_disk_recovery` | Free disk recovered above floor → receipt accrual resumed (distinct one-shot recovery page) | trading | None | info | Y |
 | Alert-channel-death watchdog (script) | `alert_channel_watchdog` | No trading-chat alert delivered within the watchdog window | trading | None | warning | Y |
 | Pilot threshold watchdog (script) | `pilot_threshold_watchdog` | A pre-registered pilot gate was reached: instrumentation validated, K2–K6 kill condition, admission close (§7.5 rollback due), tail resolved, or the gainers instrumentation gate. Operational state only — never a verdict, `D(X)`, or P&L | trading | None | warning | Y |
 | TG shadow lag watchdog (script) | `tg_shadow_lag_watchdog` | TG shadow evidence stopped accumulating: eligible RESOLVED signals in the current generation are past the lag threshold and unshadowed, either after a completed scan (`writer_failing`) or with no scan inside the cadence budget (`writer_dead`). Silent while `TG_SHADOW_ENABLED=false` or no generation row exists | trading | None | warning | Y |
@@ -77,7 +77,7 @@ not yet a runtime field.
 | WAL checkpoint-busy watchdog | `sqlite_wal_checkpoint_busy` | WAL checkpoint repeatedly busy | trading | None | warning | Y |
 | Suppression event | `suppression` | Suppression event alert | trading | None | warning | N |
 | Suppression-cost rollup (script) | `suppression_cost_rollup` | Weekly suppression-cost rollup digest | trading | None | info | Y |
-| CoinGecko budget pace | `cg_budget_pace` | Projected month-end CoinGecko credit consumption exceeds the plan allowance — discovery halts at its own envelope while the critical reserve is preserved | health | None | warning | Y |
+| CoinGecko budget pace | `cg_budget_pace` | Projected month-end CoinGecko credit consumption exceeds the plan allowance — discovery halts at its own envelope while the critical reserve is preserved | trading | None | warning | Y |
 | Primary trader alert | `tg_alert_dispatch` | Paper-trade opportunity alert (the core trader alert) | trading | None | info | Y |
 | TG allowlist announcement | `tg_allowlist_announce` | One-time TG allowlist announcement sentinel | trading | None | info | N |
 | Trade-expiry anomaly | `trade_expiry_anomaly` | Trade-expiry anomaly detected | trading | None | warning | Y |
@@ -112,7 +112,10 @@ Known instances: `scripts/acceleration-heartbeat-watchdog.sh`,
    (`ingest_watchdog`, `sqlite_stale_reader_watchdog`, `sqlite_wal_checkpoint_busy`,
    `conviction_watchlist_watchdog`, `price_refresh_streak`, `auto_suspend`,
    `kill_switch`, `solana_execution_watchdog`, plus the `scripts/` watchdogs)
-   posts to the **trading** chat,
+   posts to the **trading** chat. The detection-receipt disk-pressure/recovery
+   helper (`scout/trading/detection_alert.py`, `_send_disk_page`) and CoinGecko
+   budget-pace sender (`scout/main.py`, `_send_cg_budget_pace_alert`) also omit the
+   `chat_id=` override and therefore use that default,
    interleaving operator-health noise with trade opportunities. This is the
    mis-routing ALR-06 was opened to surface.
 
