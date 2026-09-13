@@ -1743,8 +1743,13 @@ async def _open_collector_db(db: "Database", settings: "Settings") -> "Database"
     except BaseException:
         try:
             await owned.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Type only: the original open failure is re-raised below.
+            logger.warning(
+                "rh_pons_collector_db_close_failed",
+                stage="open_cleanup",
+                error_type=type(exc).__name__,
+            )
         raise
     return owned
 
