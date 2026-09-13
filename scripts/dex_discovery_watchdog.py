@@ -437,7 +437,11 @@ async def _send_via_alerter(text: str) -> None:
 
 
 def _cooldown_active(
-    state_dir: str, now: datetime, cooldown_hours: float, clock_skew_seconds: float
+    state_dir: str,
+    now: datetime,
+    cooldown_hours: float,
+    clock_skew_seconds: float,
+    reason: str | None = None,
 ) -> bool:
     """Whether the send-cooldown window is active.
 
@@ -445,7 +449,18 @@ def _cooldown_active(
     cooldown timestamp in the future WITHIN the allowance still counts as
     active; beyond it the state is corrupted — logged and ignored so it can
     never suppress a current breach. Malformed state is eligible-to-send.
+
+    With ``reason`` (RH/Pons), the window only suppresses a breach whose
+    reason matches the one last paged: a transient lag page must not silence
+    a later outage. Missing/unreadable reason state is eligible-to-send.
     """
+    if reason is not None:
+        rf = Path(state_dir) / f"last_alert_{_CHECK_KEY}_reason"
+        try:
+            if rf.read_text().strip() != reason:
+                return False
+        except OSError:
+            return False
     sf = Path(state_dir) / f"last_alert_{_CHECK_KEY}"
     if not sf.exists():
         return False
@@ -481,10 +496,14 @@ def _recently_active(check: dict, now: datetime, clock_skew_seconds: float) -> b
     return False
 
 
-def _write_cooldown_state(state_dir: str, now: datetime) -> None:
+def _write_cooldown_state(
+    state_dir: str, now: datetime, reason: str | None = None
+) -> None:
     d = Path(state_dir)
     d.mkdir(parents=True, exist_ok=True)
     (d / f"last_alert_{_CHECK_KEY}").write_text(now.isoformat())
+    if reason is not None:
+        (d / f"last_alert_{_CHECK_KEY}_reason").write_text(reason)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -602,9 +621,16 @@ def main(argv: list[str] | None = None) -> int:
         lock_fh.close()
         return 0
 
+    # RH/Pons has several breach reasons under a minutes-scale SLO, so its
+    # cooldown is reason-aware; DEX keeps one cooldown for every reason.
+    cooldown_reason = check["reason"] if args.source == "rh_pons" else None
     try:
         if _cooldown_active(
-            args.state_dir, now, args.cooldown_hours, args.clock_skew_seconds
+            args.state_dir,
+            now,
+            args.cooldown_hours,
+            args.clock_skew_seconds,
+            cooldown_reason,
         ):
             _log.info(
                 f"{event_prefix}_alert_suppressed_by_cooldown",
@@ -622,7 +648,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "error", "error": "alert_dispatch_failed"}))
             return 1
         _log.info(f"{event_prefix}_alert_delivered")
-        _write_cooldown_state(args.state_dir, now)
+        _write_cooldown_state(args.state_dir, now, cooldown_reason)
         print(json.dumps({"status": "breach_paged", "check": check}))
         return 5
     finally:

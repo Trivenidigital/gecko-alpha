@@ -60,5 +60,8 @@ No new dependencies.
 - [x] Round 2 runner: catch-up head cutoff, invalid/negative clock counting, `--db-output` isolated backup, pacing args
 - [x] Codex native REQUEST 4(a): 254 passed (31-mutant run pending in review worktree at 59dfc74c)
 - [x] Round 3 review fixes: owned collector connection + interleave/cancel-replay tests; batch transient vs refusal, 413 shrink; F1 throttle memory; F2 throttle classification + HTTP-date Retry-After; F3/F4 truthful isolated probe; F5/F6 attempt streak, minute SLO, gate mismatch, missing-URL log; F7 chain id per session; F8 timeout context; F9 docs
-- [ ] Codex native REQUEST 5 and re-review of the new head
-- [ ] Next live isolated probe only after the reviews clear (not activation)
+- [x] Codex native REQUEST 5 (284/54: None-validation regression) → fixed in 49f119e7; focused native rerun 52 passed, 9 = pre-existing Windows baseline (same at PR572 integration)
+- [x] Mutation round 3: 28 kills, 1 expected-equivalent lock mutant, no timeout/skip/survivor
+- [x] Ops re-review round 2: R1 reason-aware RH cooldown (test-first), R3 wrapper argument contract + preview command, R2/R4 runbook; R5 lighter owned DB open deferred as residual
+- [ ] Codex native check of the round-4 tests, final review and Linux CI
+- [ ] Next live isolated probe only after review and CI (not activation)

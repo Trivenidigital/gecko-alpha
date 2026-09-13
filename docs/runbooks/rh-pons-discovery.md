@@ -50,7 +50,8 @@ Loop control (all in memory; a restart re-derives it):
   head, or when the provider head is behind the checkpoint.
 - Timeouts, failures and HTTP 429 halve the window toward its floor and back
   off exponentially up to `RH_PONS_FAILURE_BACKOFF_MAX_SEC` (default 60),
-  honouring a numeric Retry-After within that ceiling. Refusals (no URL, no
+  honouring Retry-After (delta-seconds or HTTP-date) within that ceiling.
+  Refusals (no URL, no
   verified deployment, chain mismatch) back off without shrinking.
 - With no checkpoint, the first coverage start is pinned for the process, so
   a failed or shrunken cold-start retry never skips launches. A restart before
@@ -63,9 +64,11 @@ Transports:
   (default 50, at most two POSTs in flight). Duplicate, bool or unknown ids,
   per-item errors, wrong heights and invalid hash/timestamp fail the pass;
   they never downgrade the transport. Only an explicit refusal (HTTP
-  400/404/405/413/415/501 or a top-level JSON-RPC error object other than
-  throttling) falls back to single requests, eight in flight, for the rest of
-  the process. Reorg anchor, per-log hash and final-block checks are unchanged.
+  400/404/405/415/501, or a top-level JSON-RPC error -32600/-32601) falls back
+  to single requests, eight in flight, for the rest of the process. HTTP 413
+  halves the batch size and keeps batching; any other top-level JSON-RPC error
+  is transient (the pass fails, batching stays on); throttle errors count as
+  rate limiting. Reorg anchor, per-log hash and final-block checks are unchanged.
 - `RH_PONS_TOPIC_ONLY_TRADE_QUERY=true` (default) fetches CurveBuy/CurveSell by
   topic in one query per pass and checks each emitter against known curves
   (indexed lookup for returned emitters, curves launched in the pass, and
@@ -83,8 +86,9 @@ Pacing and header budget (loop only; `poll_once` is unpaced):
   (`RH_PONS_RPC_CALLS_PER_SEC`, default 8; `RH_PONS_RPC_BURST_CALLS`, default
   100); a header batch of N costs N. These are provisional, not a known
   provider quota. A 429 empties the bucket, halves the rate (not below
-  `RH_PONS_RPC_MIN_CALLS_PER_SEC`, default 1) and holds calls for a numeric
-  Retry-After capped at `RH_PONS_FAILURE_BACKOFF_MAX_SEC`; each completed pass
+  `RH_PONS_RPC_MIN_CALLS_PER_SEC`, default 1) and holds calls for a
+  Retry-After (delta-seconds or HTTP-date) capped at
+  `RH_PONS_FAILURE_BACKOFF_MAX_SEC`; each completed pass
   restores a tenth of the configured rate.
 - Header reads per pass are capped by `RH_PONS_MAX_HEADERS_PER_PASS` (default
   80) and by what the pacer can supply in half the remaining pass deadline
@@ -106,8 +110,11 @@ uses the RH heartbeat and discovery table, and reports missing/stale/invalid
 heartbeats. Preview on Windows or Linux with:
 
 ```text
-python scripts/dex_discovery_watchdog.py --source rh_pons --db scout.db --enabled true --discovery-enabled true --staleness-hours 1 --dry-run
+python scripts/dex_discovery_watchdog.py --source rh_pons --db scout.db --enabled true --discovery-enabled true --staleness-minutes 10 --max-consecutive-failed-passes 10 --dry-run
 ```
+
+Omitting `--max-consecutive-failed-passes` disables the failure-streak check,
+so previews should pass the same limits as the wrapper.
 
 For Linux deployment, install `scripts/rh-pons-watchdog.sh` alongside the
 collector and invoke every five minutes through the existing scheduler.
@@ -119,6 +126,21 @@ gate reads false while the DB shows a heartbeat or attempt within the SLO, the
 watchdog breaches with `enabled_gate_mismatch` instead of silently disarming.
 The wrapper captures the watchdog gate before loading `.env`, so a stray
 `.env` line cannot arm it. Default watchdog gate is off.
+
+To disable the lane deliberately, disarm the watchdog first
+(`RH_PONS_WATCHDOG_ENABLED=false` in the scheduler environment), then set
+`RH_PONS_COLLECTOR_ENABLED=false` in `.env` and restart the pipeline. If the
+lane is disabled first, the last heartbeat or attempt stays recent for up to
+one SLO window and the next watchdog run correctly pages
+`enabled_gate_mismatch`. Re-enable in the reverse order: lane first, then the
+watchdog once a completed scan exists.
+
+RH breach alerts use the existing send cooldown
+(`RH_PONS_WATCHDOG_COOLDOWN_HOURS`), keyed by breach reason: the same reason
+is suppressed inside the window, but a different reason (for example
+`head_lag_exceeded` followed by `stale`) pages immediately. State written by
+older versions has no reason and pages once. DEX discovery keeps a single
+cooldown for all reasons.
 
 Watchdog knobs are Settings fields, so `.env` lines are valid:
 `RH_PONS_POLL_STALENESS_ALERT_MINUTES` (default 10; the collector passes

@@ -191,11 +191,12 @@ Verification this round:
   - The new guard test passes natively.
   - The collector suites were unchanged by this fix and were not repeated;
     REQUEST 6(a) passed 35.
-- **Not established:**
-  - A full native green run of every listed suite at this head.
-  - Linux confirmation of the 9 baseline failures, which is left to CI.
-  - Mutation round 3 has not run. It is on hold until Codex accepts this
-    baseline, so an unrelated failure cannot count as a kill.
+- **Baseline accepted by Codex:** the unchanged PR572 integration worktree
+  shows the same 9 DEX watchdog failures (28 passed), so no new watchdog
+  failure remains locally. Linux CI is still required for those 9.
+- **Mutation round 3 (Codex, author worktree): complete.** 28 assertion kills,
+  1 expected equivalent (the pacer lock), no timeouts, skips or survivors;
+  source restored.
 
 Mutation round 2 (Codex, review worktree `59dfc74c`): 31 mutants gave 28
 assertion kills, 2 hangs and 1 survivor. The hangs are not counted as kills.
@@ -222,20 +223,40 @@ assertion kills, 2 hangs and 1 survivor. The hangs are not counted as kills.
   - covers the two formerly hanging mutants, the equivalent lock mutant
     (reported as expected), round-1/2 guards whose code changed, and 23 new
     round-3 guards across the collector, DB and watchdog.
-  - Results are pending.
+  - Results: see mutation round 3 above.
+
+## Round 4 — ops re-review (`claude-review-ops-silent-round2.json`)
+
+The re-review found no merge blockers for capture-only and confirmed F1–F9
+closed or dispositioned.
+
+| Item | Disposition |
+|---|---|
+| **R1** one 24 h cooldown silences every later RH breach reason | **Fixed**, using the existing cooldown mechanism. RH alerts also record the paged reason, so a different reason pages inside the window and the same reason stays suppressed. Legacy state with no recorded reason pages once. DEX behaviour is unchanged. Tests were written first: the A-then-B test failed before the fix. |
+| **R2** deliberately disabling the lane pages `enabled_gate_mismatch` | **Documented** disable order (watchdog first, then lane) and re-enable order; the page itself is correct when the order is reversed. |
+| **R3** unset streak limit fails open; no wrapper argument contract | **Fixed.** A wrapper test with an argument-echo interpreter stub asserts `--staleness-minutes` and `--max-consecutive-failed-passes` reach Python (defaults and `.env` values). The runbook preview command passes both, with a note that omitting the streak flag disables that check. |
+| **R4** runbook contradicted batch-fallback code | **Fixed.** 413 shrinks; only 400/404/405/415/501 or -32600/-32601 disable batching; other top-level errors are transient; Retry-After accepts HTTP-date. |
+| Verification (local, Git Bash `--noconftest`) | New `tests/test_rh_pons_watchdog_ops.py`: 2 failed / 3 passed before the fix, 5 passed after. With the DEX script and wrapper suites: 33 passed, 9 failed, the same known Windows baseline set. Cooldown-guard mutants (reason not compared, reason not written) both KILLED; source restored. Native check requested as REQUEST 8. |
+| **R5** owned connection runs full `Database.initialize()` | **Deferred, residual.** It is idempotent after pipeline startup but adds write-lock attempts at worker start and reopen, and a migration failure there surfaces only through the minutes-scale staleness page (no attempt row without a DB). A lighter owned open is a follow-up, not part of this increment. |
 
 ## Not established
 
-- Sustained capacity, real-time latency and provider quota. The capacity
-  probe (`investigation/rh_pons_sustained_capacity_probe_20260913.py`) has not
-  been run; see the runbook's capacity acceptance section. Earlier transport
-  samples show capability only.
+- Sustained capacity, real-time latency and provider quota. The isolated
+  capacity smoke DID run once against the public RPC and FAILED:
+  `investigation/rh_capacity_smoke_throttled_20260913.json` shows the
+  3000-block backlog did not drain and three of seven passes were throttled.
+  That run was on the pre-pacing code. The paced collector has not been
+  probed live since, and no passing capacity run exists.
 - Wall-clock performance is not asserted in tests; bounded query and RPC
   scope is pinned instead (5000 unrelated evidence rows, 500 unrelated curves).
 - A process restart before the first completed pass re-derives cold-start
   coverage from the then-current head (logged, not persisted).
-- Cancelling a pass mid-write on the shared connection relies on existing
-  append-only replay; no new fault injection beyond the scoped replay test.
+- Mid-write cancellation IS tested on the collector-owned connection: a real
+  loop pass whose commit is cancelled by the deadline leaves nothing durable,
+  and replay matches an uninterrupted run. Not tested: cancellation inside
+  aiosqlite's worker thread at every statement boundary, or process kill.
+- Linux CI confirmation of the 9 Windows-only DEX watchdog failures and of the
+  wrapper tests on the real cron path.
 - Useful alerts, quote approval, safety and execution remain out of scope.
 
 ## Approvals log
