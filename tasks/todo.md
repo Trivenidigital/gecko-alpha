@@ -1,3 +1,9 @@
+## Active Work: 2026-09-13 22:15 - Historical entry-stop display
+
+- [x] Current-base drift and production read-only schema/state preflight.
+- [ ] Plan/design two-agent reviews, build, test, PR reviews and allowed merge.
+- Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
+
 # Backlog — gecko-alpha
 
 ## RH/Pons implementation follow-through — 2026-09-13
