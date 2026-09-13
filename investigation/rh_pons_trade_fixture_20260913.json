@@ -1,0 +1,151 @@
+{
+  "provenance": "onchain_read_replay",
+  "observed_at_utc": "2026-09-13T19:03:12.544183+00:00",
+  "notes": [
+    "Five public read requests; original explorer null topic padding retained below.",
+    "Canonical header hashes/timestamps acquired independently from official RPC.",
+    "Associated launch below was captured in original 10k-block public factory response during this investigation; copied verbatim from observed response. No live collection or early-detection claim."
+  ],
+  "calls": [
+    {
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBlockByNumber",
+        "params": [
+          "0x3b4acdc",
+          false
+        ]
+      },
+      "header": {
+        "number": "0x3b4acdc",
+        "hash": "0x883d6eb1ad67e62d1d4492c80dbd6f81f7f7bb9f5c0b3ed77e5afabee6726137",
+        "parentHash": "0x1d7e7f30fcc25ba6a82d50eabbce7d55491f006163f630d8baf773449d6c7604",
+        "timestamp": "0x6aa6ec6b"
+      }
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62173187&toBlock=62174186&address=0x9ba24b3a293f78c39da9a41ef04b69e6ef70f6e1",
+      "status": "1",
+      "log_count": 309,
+      "topic0_counts": {
+        "0x908408e307fc569b417f6cbec5d5a06f44a0a505ac0479b47d421a4b2fd6a1e6": 1,
+        "0xe4b7e48fbd47c2f602bacadee76ad33b16542ddb4997cfc0de04c311adcfa8c7": 3,
+        "0x3bc39a5562b28f5fe8f36cecabfbaa12bb969acf05717994709225fc412a9934": 15,
+        "0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455": 180,
+        "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df": 104,
+        "0x9f4cd7c4ed99d08a797804560c9c5d71d2cf7e101f2e3b5e7d1ca8a24c370e4f": 4,
+        "0xa69e8258ccc7b9bbb70ab953fc2d1062b4ee28b8ca827534097e1732e87b0262": 1,
+        "0xf8d37a90738ae063b8b8058b66f5880cf3cf7ab0c5d4fa78219696591dfbfb67": 1
+      }
+    },
+    {
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "method": "eth_getBlockByNumber",
+        "id": 2,
+        "params": [
+          "0x3b4b003",
+          false
+        ],
+        "jsonrpc": "2.0"
+      },
+      "header": {
+        "number": "0x3b4b003",
+        "hash": "0xa07c6ba26b65b984abd7d4069d0e3cd88a1c7c981bf4103aa64415c12430eafe",
+        "parentHash": "0xdd763c7eabbf410186c1b302a7c54e2c0cd3aaf24ba07a8a1b4f953a32640312",
+        "timestamp": "0x6aa6ecbe"
+      }
+    },
+    {
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "method": "eth_getBlockByNumber",
+        "id": 2,
+        "params": [
+          "0x3b4b00b",
+          false
+        ],
+        "jsonrpc": "2.0"
+      },
+      "header": {
+        "number": "0x3b4b00b",
+        "hash": "0x36d50f996e8d13b391d9dc67790da9dbd524a26a23b9d0955ad34861069d3e1d",
+        "parentHash": "0x146d3cac3a2e3e7dfa871f83275c4dc64f376e7c086befa9bb82a22595b878c5",
+        "timestamp": "0x6aa6ecbf"
+      }
+    },
+    {
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "method": "eth_getBlockByNumber",
+        "id": 2,
+        "params": [
+          "0x3b4b019",
+          false
+        ],
+        "jsonrpc": "2.0"
+      },
+      "header": {
+        "number": "0x3b4b019",
+        "hash": "0x0b9350a503c00f243c0db130d84b0488168a7e114fa432f0f3ad79777034c086",
+        "parentHash": "0xb1e34bdf7c89b9562cc626f03382b05c100e20b15217be1135486a18daff2985",
+        "timestamp": "0x6aa6ecc0"
+      }
+    }
+  ],
+  "raw_logs": {
+    "buy": {
+      "address": "0x9ba24b3a293f78c39da9a41ef04b69e6ef70f6e1",
+      "blockNumber": "0x3b4b00b",
+      "data": "0x0000000000000000000000000000000000000000000000000254db1c224400000000000000000000000000000000000000000000004641f1b71d5daa075888eb000000000000000000000000000000000000000000000000002adab05b2380000000000000000000000000000000000000000000000000000000000000000000",
+      "gasPrice": "0x531a6a0",
+      "gasUsed": "0x361d6",
+      "logIndex": "0x13",
+      "timeStamp": "0x6aa6ecbf",
+      "topics": [
+        "0xec36bf571f136799e8dc0b0b8bea4b04d8bd3d43de838aab0d5fc21d4cbfc455",
+        "0x0000000000000000000000000a94698cc0cc61115926072d5cb0da03c291fffd",
+        "0x00000000000000000000000097eec358d08dadfbf470c4c35e863c91db893ada",
+        null
+      ],
+      "transactionHash": "0x32dff1656234c94e302369f99c67cffce6e2c9fe37792fe6c8f4112c71f09f6a",
+      "transactionIndex": "0x2"
+    },
+    "sell": {
+      "address": "0x9ba24b3a293f78c39da9a41ef04b69e6ef70f6e1",
+      "blockNumber": "0x3b4b019",
+      "data": "0x000000000000000000000000000000000000000000030e45ec2e546d31eb84ba0000000000000000000000000000000000000000000000000032293c056feab5000000000000000000000000000000000000000000000000000081b59dcad3d30000000000000000000000000000000000000000000000000000000000000000",
+      "gasPrice": "0x5125700",
+      "gasUsed": "0x13a9f",
+      "logIndex": "0x25",
+      "timeStamp": "0x6aa6ecc0",
+      "topics": [
+        "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df",
+        "0x000000000000000000000000fefe306eb0e5eaf0d6821a1d2935ffc5cfa8cc1b",
+        "0x000000000000000000000000fefe306eb0e5eaf0d6821a1d2935ffc5cfa8cc1b",
+        null
+      ],
+      "transactionHash": "0x9b2b7ac9702a03480a0787c893d3ee32c4962c682ec7d206ca24a34f230cbb3d",
+      "transactionIndex": "0xb"
+    },
+    "launch": {
+      "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+      "blockNumber": "0x3b4b003",
+      "data": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003a4965bf58a40000",
+      "gasPrice": "0x51014e0",
+      "gasUsed": "0x3b0fa6",
+      "logIndex": "0x6a",
+      "timeStamp": "0x6aa6ecbe",
+      "topics": [
+        "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607",
+        "0x000000000000000000000000a89c296c92518e8cee489d8e7365f229247ee200",
+        "0x0000000000000000000000009ba24b3a293f78c39da9a41ef04b69e6ef70f6e1",
+        "0x000000000000000000000000e78b7655a09b59762e25eb9a77c9064654613cf7"
+      ],
+      "transactionHash": "0xec243c26a5807a8251a6b23e8a5e250de94d605fb271ec86421e06b75b5629c8",
+      "transactionIndex": "0xe"
+    }
+  }
+}
