@@ -21,6 +21,25 @@ import TradeDetailDrawer from './TradeDetailDrawer.jsx'
 
 const CLOSED_PER_PAGE = 20  // closed-trades pagination size
 
+function StopShortfallCell({ value }) {
+  if (value?.state === 'available'
+      && [value.shortfall_pp, value.entry_stop_pct, value.recorded_exit_return_pct]
+        .every(n => typeof n === 'number' && Number.isFinite(n))) {
+    return <td style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
+      <strong>{value.shortfall_pp.toFixed(2)} pp</strong>
+      <div style={{ fontSize: 10, color: 'var(--color-text-secondary)' }}>
+        Entry stop {value.entry_stop_pct.toFixed(2)}% · Exit return {value.recorded_exit_return_pct.toFixed(2)}%
+      </div>
+    </td>
+  }
+  const label = value?.state === 'modeled' ? 'Modeled'
+    : value?.state === 'not_applicable' ? 'Not applicable' : 'Unavailable'
+  const reason = (value?.exclusion_reason || 'evidence unavailable').replaceAll('_', ' ')
+  return <td style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
+    {label}<div style={{ fontSize: 10 }}>{reason}</div>
+  </td>
+}
+
 function _readStoredPage() {
   try {
     const v = sessionStorage.getItem('gecko.closedPage')
@@ -1698,6 +1717,11 @@ export default function TradingTab({ deepLinkTradeId = null }) {
             Show only live-eligible
           </label>
         </div>
+        <p style={{ fontSize: 11, color: 'var(--color-text-secondary)', margin: '6px 0 10px' }}>
+          Historical paper / EXPERIMENTAL. Stored exits include modeled paper slippage.
+          Entry-stop comparison is not execution slippage or a terminal-stop comparison;
+          not for pruning, sizing or dispatch decisions.
+        </p>
         {history.length === 0 ? (
           <div className="empty-state">No closed trades yet.</div>
         ) : filteredHistory.length === 0 ? (
@@ -1724,6 +1748,7 @@ export default function TradingTab({ deepLinkTradeId = null }) {
                   <SharedSortHeader col="amount_usd" label="Amount" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="_pnl" label="PnL $" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <SharedSortHeader col="_pnl_pct" label="PnL %" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
+                  <th title="Recorded exit-price shortfall beyond the frozen entry stop, in percentage points. Only strictly eligible historical paper stop exits have a value.">Entry-stop shortfall</th>
                   <SharedSortHeader col="exit_reason" label="Reason" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
                   <th title="Outcome integrity: priced = market-derived exit; stale-priced = stale market price; force-closed-unpriced = fabricated close at entry price (no price source). Derived live from exit_reason / exit_provenance.">Integrity</th>
                   <SharedSortHeader col="closed_at" label="Duration" sortCol={closedSort.sortCol} sortDir={closedSort.sortDir} onSort={closedSort.handleSort} />
@@ -1784,6 +1809,7 @@ export default function TradingTab({ deepLinkTradeId = null }) {
                       <td style={{ fontWeight: 600, color: pnlColor(pnlPct), whiteSpace: 'nowrap' }}>
                         {pnlPct != null ? (pnlPct > 0 ? '+' : '') + Number(pnlPct).toFixed(2) + '%' : '-'}
                       </td>
+                      <StopShortfallCell value={h.stop_shortfall} />
                       <td>{reasonBadge(h.exit_reason || h.close_reason || h.reason)}</td>
                       <td><IntegrityChip trade={h} /></td>
                       <td style={{ fontSize: 12, color: 'var(--color-text-secondary)', whiteSpace: 'nowrap' }}>

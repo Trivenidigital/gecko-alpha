@@ -11,6 +11,7 @@ import structlog
 
 from scout.timeutil import sql_utc_cutoff
 from scout.token_ids import is_cg_coin_id
+from dashboard.stop_shortfall import enrich_stop_shortfalls
 
 # Must equal `scout.social.telegram.shadow.SHADOW_ACTIVE_GENERATION_COMPONENT`
 # and `.ACTIVE_GENERATION_DETAIL_PREFIX`. Kept as local literals rather than
@@ -3209,6 +3210,8 @@ async def get_trading_history(
     """
     async with _ro_db(db_path) as db:
         try:
+            # Base rows and eligibility evidence must describe one snapshot.
+            await db.execute("BEGIN")
             filter_sql, filter_params = _actionability_filter_sql(actionability)
             # exit_provenance is added by a parallel branch; query defensively
             # so this endpoint works on both schemas (do NOT add the column
@@ -3255,6 +3258,7 @@ async def get_trading_history(
                     d.get("exit_reason"), d.get("exit_provenance")
                 )
                 out.append(d)
+            await enrich_stop_shortfalls(db, out)
             return out
         except Exception:
             return []  # table doesn't exist yet
