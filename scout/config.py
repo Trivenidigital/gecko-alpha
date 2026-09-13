@@ -564,6 +564,18 @@ class Settings(BaseSettings):
     DEX_DISCOVERY_POLL_STALENESS_ALERT_HOURS: int = Field(default=2, ge=1, le=168)
     DEX_DISCOVERY_WATCHDOG_CLOCK_SKEW_SECONDS: int = Field(default=300, ge=0, le=3600)
 
+    # RH/Pons curve-launch collector (observe-only; inert by default — see
+    # tasks/design_rh_pons_discovery_delta_2026_09_13.md). Enabling the flag
+    # alone does NOT collect: poll_once additionally requires a configured RPC
+    # URL and an 'onchain_verified' deployment registry entry.
+    RH_PONS_COLLECTOR_ENABLED: bool = False
+    # No default endpoint on purpose: the public RH RPC is documented as
+    # rate-limited/non-production, and endpoint choice is an operator call.
+    RH_PONS_RPC_URL: str = ""
+    RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=3, ge=1, le=60)
+    # eth_getLogs span per pass; bounds backfill after downtime.
+    RH_PONS_BACKFILL_BLOCK_SPAN: int = Field(default=2000, ge=1, le=100_000)
+
     # Database
     DB_PATH: Path = Path("scout.db")
     # GA-22: connection-level PRAGMA busy_timeout applied at
