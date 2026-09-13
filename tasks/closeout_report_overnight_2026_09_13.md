@@ -2,7 +2,7 @@
 
 ## State and scope
 
-Reporting correction implemented; independent PR review and CI are the next
+Both reporting corrections implemented; independent PR review and CI are the next
 merge gates. This report does **not** claim all Gecko backlog work is exhausted.
 No trading, dispatch, source suppression, paid access, DB or production config
 was changed. Production remains at `6c56186e31db24ebf6fe769a798cc9cd65e73015`.
@@ -111,8 +111,24 @@ suppression branches call `_record_suppressed_ledger_emission` without a
 matching decision-event call; other branches record both. Decision-event
 retention spans July 30 through Sept 13 (1,150,452 rows), so this result does
 not support claiming the excess is seven-day retention loss or duplication.
-**Residual:** make report denominator coverage explicit before interpreting its
-fraction as sampling health. Do not add ranking/UI atop that misleading ratio.
+**Correction implemented in this PR:** per-signal count diagnostics expose
+ledger-only/excess populations; aggregate fraction becomes null/UNKNOWN when
+incomparable. A missing or low-sample event-bearing lane can no longer be hidden
+by another signal's volume. Absolute rows/day floor remains aggregate; no
+thresholds, cost math or pipeline writers changed. CLI exit 5 now also catches
+partial lane death; the existing cron command only redirects output, no retry
+or status-dependent branch. No cron was changed or run with `--send`.
+
+Analysis now opens a SQLite `mode=ro` URI. Removed stale claims that #421 has
+not deployed and that July31 determines maturity; output marks experimental,
+not-for-pruning. Verified old and new `analyze` in the **same read-only SQLite
+transaction**, sharing a fixed lookback clock: entire `cost` object equal.
+That later snapshot has 18,363 samples / 13,534 events, chain=4,495/0,
+first=334/0, losers=13,534/13,534; output correctly says UNKNOWN + POPULATION
+MISMATCH. The existing clock argument controls lower bounds, not an upper
+cutoff; this is cost-regression evidence, not an exact replay of the earlier
+bounded attribution query. New source executed via stdin; no production file
+replacement, install, restart, message or database write.
 
 ### DASH-09: stop-gap finding, no fresh calibration cohort
 
@@ -139,8 +155,8 @@ No signal was revived or threshold changed to manufacture a cohort.
   does not authorize a paid sample in this run.
 - **Parked:** negative historical GT probe; downgraded DASH-08 absent new
   reachable-row evidence. Do not resurrect old parent proposals.
-- **Remaining engineering:** suppression denominator qualification; historical
-  closed-stop gap visibility; postmortem UI beyond the shipped recorder;
+- **Remaining engineering:** historical closed-stop gap visibility; postmortem
+  UI beyond the shipped recorder;
   centralized alert severity routing beyond existing registry docs. These are
   not represented as completed or all operator-blocked. Alert routing needs
   runtime destination and intended-delivery verification before any build.
@@ -162,6 +178,15 @@ No signal was revived or threshold changed to manufacture a cohort.
   static warning is not reconciliation parsing; external config is not run
   completion; all registered reviewers must terminate; sanitized evidence only.
 - PR review/CI/merge evidence will be appended after those gates finish.
+
+Second slice plan/design each received two parallel independent approvals.
+Folds: per-signal ratio checks but aggregate rows/day floor; explicit no-activity,
+missing and mismatch states; partial-outage exit-5 behavior; readonly URI;
+snapshot-aware cost comparison. Expanded tests before implementation:
+10 failed/5 passed. After implementation, both focused suites: **21 passed**.
+Python compile, node syntax and full base-to-working-tree diff checks passed.
+First PR review found an extra generated-report EOF blank (untracked artifact
+had escaped the earlier diff check); removed and verified against origin/master.
 
 ## Approvals log
 

@@ -9,6 +9,10 @@
 - [x] Two parallel plan reviews, then two parallel design reviews approved;
   folds recorded in `tasks/design_overnight_closeout_2026_09_13.md`.
 - [x] Reporter regression reproduced before bounded wording/doc correction.
+- [x] Recovered successor tracker; runtime findings advanced DASH-09/11.
+- [x] Suppression report population mismatch corrected after two parallel plan
+  and two parallel design reviews; 21 focused tests pass, cost identical in
+  shared production read-only snapshot. No deployment or sends.
 - [ ] Focused verification, PR, two-vector independent PR reviews, exact-head CI.
 - [ ] Conditional merge and final report/memory.
 

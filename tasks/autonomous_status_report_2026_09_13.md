@@ -45,4 +45,3 @@
 ## Operator-only gates (reminder)
 
 - Paid APIs/vendor calls, live execution/sizing, pruning/suppression/auto-disable, destructive DB writes/migrations, secrets/external account state require explicit operator approval.
-
