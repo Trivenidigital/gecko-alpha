@@ -227,3 +227,27 @@ async def test_earliest_absolute_instant_and_negative_advantage(
     assert row["event_to_dex_lane_seconds"] == 1.5
     assert row["rh_advantage_vs_dex_lane_seconds"] == -28.5
     assert report["paired_advantage_summary"]["rh_vs_dex_lane"]["rh_later_n"] == 1
+
+
+async def test_mixed_invalid_and_valid_observations_censor_earliest(
+    tmp_path, token_factory
+):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            (
+                "INSERT INTO dex_pool_discoveries (network,pool_address,base_token_address,first_seen_at) VALUES (?,?,?,?)",
+                ("robinhood", "unknown-clock-pool", TOKEN_A, "broken"),
+            ),
+        ],
+    )
+    row = report["launches"][0]
+    assert "invalid_dex_lane_clock" in row["censored"]
+    assert row["dex_lane_first_seen_at"] is None
+    assert row["event_to_dex_lane_seconds"] is None
+    assert row["rh_advantage_vs_dex_lane_seconds"] is None
+    assert report["latency_summary"]["event_to_dex_lane"]["n"] == 0
+    assert report["paired_advantage_summary"]["rh_vs_dex_lane"]["n"] == 0
+    assert report["paired_advantage_summary"]["rh_vs_dex_lane"]["censored_n"] == 2
+    assert report["latency_summary"]["event_to_cg_ds_gt"]["n"] == 1

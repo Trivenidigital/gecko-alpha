@@ -92,10 +92,17 @@ def _earliest_observation(conn, table, address_column, chain_column, token, netw
     valid = [
         (parsed, raw) for raw in matching if (parsed := _parse_ts(raw)) is not None
     ]
+    invalid_count = len(matching) - len(valid)
+    # A malformed clock may belong to an earlier observation. Selecting the
+    # earliest parseable row would overstate latency and manufacture RH lift.
     return (
-        min(valid, key=lambda item: item[0])[1] if valid else None,
+        (
+            min(valid, key=lambda item: item[0])[1]
+            if valid and not invalid_count
+            else None
+        ),
         len(matching),
-        sum(_parse_ts(raw) is None for raw in matching),
+        invalid_count,
     )
 
 
