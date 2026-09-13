@@ -38,7 +38,7 @@ behavior and does not deliver DASH-08 or DASH-11.
 | Cockpit parent | `backlog.md:2888`, archived parent | Child work only |
 | DASH-01 funnel | `dashboard/api.py:370`, `dashboard/db.py:976`, `dashboard/frontend/components/DispatchFunnelPanel.jsx:50`, `dashboard/frontend/App.jsx:277`; PR #443 | Already implemented; do not rebuild |
 | DASH-08 live status | reusable `dashboard/db.py:3615` and `SignalTrustTab.jsx:13`; Inbox surfaces at `dashboard/db.py:1834`, Focus projection at `:2530` omits live status | Trust-tab primitive exists; Focus/Inbox integration is absent |
-| DASH-11 cost visibility | `scripts/suppression_cost_rollup.py:117`; dashboard lacks suppression-cost endpoint/component | Genuine residual, selected for readiness audit |
+| DASH-11 cost visibility | `scripts/suppression_cost_rollup.py:118`; dashboard lacks suppression-cost endpoint/component | Genuine residual, selected for readiness audit |
 | Historical-pool probe | `backlog.md:108` and `:447` | Closed with negative result; no repeat vendor calls |
 
 The 2026-07-10 local Fable DASH-08 and DASH-11 entries are at lines 131 and 134.
@@ -113,8 +113,8 @@ Independent read-only SQL with cutoff `2026-09-06T19:22:14.574381+00:00`:
 The 4,824-row excess is exactly the two surfaces absent from the denominator.
 Both queries used one SQLite read-only connection; the table counts were obtained
 sequentially, not under a pinned transaction. Source inspection supports the
-structural explanation: first_signal suppression at `scout/trading/signals.py:852`
-and chain_completed at `:1408` record a ledger emission then continue without
+structural explanation: first_signal suppression at `scout/trading/signals.py:861`
+and chain_completed at `:1418` record a ledger emission then continue without
 emitting a trade decision. losers_contrarian at `:718` emits the decision and at
 `:722` records the ledger emission. The analyzed numerator spans all dispatcher
 surfaces (`scripts/suppression_cost_rollup.py:165`), while its denominator is
@@ -165,7 +165,7 @@ Two parallel source-drift audits completed. Two parallel plan reviews approved;
 folds: exact timestamps/SHA, considered vs returned counts, separate sampling and
 maturity windows. Two parallel design reviews approved; folds: absent Focus/Inbox
 integration stated precisely, explicit read-only analyzer connection, and no
-readiness claim from n or checkout SHA. PR reviews occur after opening this PR;
+readiness claim from n or checkout SHA. Two parallel PR reviews approved the evidence and source attribution;
 the final session report records their results.
 
 Existing analyzer tests: `python -m pytest -q

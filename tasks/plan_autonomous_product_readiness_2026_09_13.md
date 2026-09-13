@@ -28,7 +28,7 @@ slice, not delivery of DASH-08 or DASH-11. Preserve all runtime behavior.
 - [x] Write findings with reproducible read-only methods, timestamps, source lines,
       limitations, and concrete next gate; add a short todo entry.
 - [x] Documentation checks and existing analyzer tests passed; opened PR #570 with both labels.
-- [ ] Two parallel PR reviews and folds. Report CI accurately; no merge without full gates.
+- [x] Two parallel PR reviews approved; checklist/citation polish folded. Final-head confirmation and CI are recorded in the session report; no merge without full gates.
 
 ## Acceptance
 Separate confirmed source gaps from runtime usefulness. No whole-token suspension

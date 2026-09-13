@@ -3,7 +3,7 @@
 **Status:** FINDINGS-READY — DASH-11 denominator population mismatch (135.67%). Report: tasks/findings_autonomous_product_readiness_2026_09_13.md. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
 - [x] Refresh current master; inspect backlog drift and read-only runtime.
 - [x] Plan/design: two parallel reviews each approved, evidence-precision folds applied.
-- [ ] Findings PR: source + runtime evidence, next product gate, two PR reviews.
+- [x] Findings PR #570 opened: source + runtime evidence, next product gate, two PR reviews approved with citation/checklist folds. CI/final-head confirmation tracked in session report.
 # Backlog — gecko-alpha
 
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
