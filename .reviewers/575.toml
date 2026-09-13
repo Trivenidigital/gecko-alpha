@@ -11,7 +11,7 @@ watch = [
 # stop_gap_audit: logic/concurrency; stale_pr_audit: ops-safety/silent-failure.
 # Each independently ran all 81 targeted tests. No outstanding PR folds.
 [clearances]
-concurrency = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
-logic = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
-ops-safety = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
-silent-failure = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
+concurrency = "44aee2c7897dcc9d20aae9f80de7e2dc3871404a"
+logic = "44aee2c7897dcc9d20aae9f80de7e2dc3871404a"
+ops-safety = "44aee2c7897dcc9d20aae9f80de7e2dc3871404a"
+silent-failure = "44aee2c7897dcc9d20aae9f80de7e2dc3871404a"

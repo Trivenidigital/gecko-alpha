@@ -20,6 +20,9 @@ Final PR reviews both APPROVE fce7c7c98a6fb60ea388b76e43d30f3640d4ec67:
 stop_gap_audit logic/concurrency and stale_pr_audit ops-safety/silent-failure.
 Each independently ran 81 targeted tests. No final PR folds remain.
 Clearances recorded in .reviewers/575.toml; exact-head CI remains required.
+Both reviewers subsequently approved 44aee2c7897dcc9d20aae9f80de7e2dc3871404a
+after public type annotations/import housekeeping; 81 targeted tests rerun pass.
+No logic or query changes in that follow-up; clearance records use the newer SHA.
 
 ## Verification
 
@@ -40,6 +43,11 @@ Clearances recorded in .reviewers/575.toml; exact-head CI remains required.
   This mean is validation evidence, not a new UI aggregate or ranking.
 - An initial in-memory smoke harness shadowed datetime and failed; corrected
   harness imports without namespace collision. No product defect was inferred.
+- Full candidate/base history parity at 2026-09-13T22:34:40.508101Z: same
+  production read transaction per comparison; pages (20, offset0), (20,
+  offset20), (500, offset0) retained identical pre-existing fields. Candidate
+  times approximately 6.5ms, 3.3ms, 21.6ms; available counts 0, 3, 23.
+  Single probe timings are not a performance SLO. No production deployment.
 
 ## Runtime and ownership
 
@@ -51,6 +59,10 @@ No new DB tables, mutations, external sends, paid calls or configuration changes
 Prepare for improvements (task 01a09bfb-c05b-7de3-9ebf-0efa353bdf2e) is active
 and owns capture reliability work. This task does not take over its files,
 PRs or deployment. Verify ownership again before any production action.
+Latest previous automation task 01a09ca0-2612-77e1-ae31-e31c68db1912 was
+independently confirmed completed via wait_threads; app database pending-review
+means inbox review, not still executing. Scheduler configuration, observed run,
+completed turn and deployed code remain distinct evidence categories.
 
 ## Remaining and no-action items
 
