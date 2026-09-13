@@ -42,12 +42,19 @@ Add explicit experimental/not-for-pruning scope to output; no paid calls.
 - [x] Implement grouping + uncertainty output in existing script; cost math
   remains untouched. Open DB with read-only URI to enforce analysis boundary.
 - [x] Focused report suites, syntax, read-only DB mutation check and diff check.
-- [ ] Update existing PR #571; independently re-review new candidate for all
+- [x] Update existing PR #571; independently re-review new candidate for all
   affected vectors, record actual reviewed SHA, wait for CI before merge.
 - [x] Run updated script against prod DB read-only via stdin import (no remote
   file changes), compare cost fields against old at a fixed timestamp.
-- [ ] Record findings, folds, runtime evidence and final disposition.
+- [x] Record findings, folds, runtime evidence and final disposition.
 
 Authorization: current production-push prompt allows observability/scripts;
 no pipeline, policy, threshold, config, DB, secrets or sending change exercised.
 Rollback: revert PR via normal checks; no DB restore needed.
+
+## Final implementation status
+
+PR #571 merged as d2f0d61e on 2026-09-13 after 21 focused tests, independent
+reviews and full CI (7,625 passed, 12 skipped). Scripts/docs fast-forwarded
+to production at 19:55Z; no-send smokes passed, no restart or policy changes.
+See tasks/closeout_report_overnight_2026_09_13.md for exact conditions/evidence.
