@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -70,17 +71,21 @@ def redact_endpoint(url: str) -> str:
 
 
 def _is_hex_quantity(value: Any) -> bool:
-    if not isinstance(value, str) or not value.startswith("0x") or len(value) < 3:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return True
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)", value) is not None
+    )
+
+
+def _is_hex_data(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"0x(?:[0-9a-fA-F]{2})*", value) is not None
+    )
 
 
 def _is_hash(value: Any) -> bool:
-    return _is_hex_quantity(value) and len(value) == 66
+    return _is_hex_data(value) and len(value) == 66
 
 
 async def _call(
@@ -148,7 +153,7 @@ async def run_checks(
 
     async def get_code() -> dict:
         r = await _call(session, rpc_url, "eth_getCode", [factory, "latest"], 3)
-        if not isinstance(r, str) or not r.startswith("0x"):
+        if not _is_hex_data(r):
             raise CheckFailed("shape_error", detail="code not a hex string")
         if len(r) <= 2:
             raise CheckFailed("shape_error", detail="empty bytecode at factory")
@@ -163,6 +168,7 @@ async def run_checks(
             and _is_hash(r.get("hash"))
             and _is_hash(r.get("parentHash"))
             and _is_hex_quantity(r.get("timestamp"))
+            and ("latest" not in state or int(r["number"], 16) == state["latest"])
         ):
             raise CheckFailed("shape_error", detail="invalid block header")
         return {"block": int(r["number"], 16), "timestamp": int(r["timestamp"], 16)}
@@ -180,6 +186,21 @@ async def run_checks(
         r = await _call(session, rpc_url, "eth_getLogs", [flt], 5)
         if not isinstance(r, list):
             raise CheckFailed("shape_error", detail="logs not a list")
+        for log in r:
+            if not (
+                isinstance(log, dict)
+                and str(log.get("address", "")).lower() == factory.lower()
+                and _is_hex_quantity(log.get("blockNumber"))
+                and from_block <= int(log["blockNumber"], 16) <= to_block
+                and _is_hash(log.get("blockHash"))
+                and _is_hash(log.get("transactionHash"))
+                and _is_hex_quantity(log.get("logIndex"))
+                and isinstance(log.get("topics"), list)
+                and all(_is_hash(topic) for topic in log["topics"])
+                and _is_hex_data(log.get("data"))
+                and log.get("removed", False) is False
+            ):
+                raise CheckFailed("shape_error", detail="invalid or out-of-range log")
         return {"from_block": from_block, "to_block": to_block, "log_count": len(r)}
 
     steps: list[tuple[str, Callable]] = [

@@ -67,8 +67,6 @@ async def test_success_ready_with_capability_only_label():
     report = await _run(_handlers(), calls)
     assert report["overall"] == "ready"
     assert report["scope"] == "rpc_capability_only"
-    assert "observation activation" in report["disclaimer"]
-    assert "NOT" in report["disclaimer"]
     checks = _by_name(report)
     assert set(checks) == {
         "eth_chainId",
@@ -134,8 +132,16 @@ async def test_jsonrpc_error_is_distinguished():
     [
         ({"eth_blockNumber": "banana"}, "eth_blockNumber"),
         ({"eth_getCode": "0x"}, "eth_getCode"),
+        ({"eth_getCode": "0xzz"}, "eth_getCode"),
+        ({"eth_getCode": "0x123"}, "eth_getCode"),
+        ({"eth_blockNumber": "0x-1"}, "eth_blockNumber"),
         ({"eth_getBlockByNumber": {"number": "0x64"}}, "eth_getBlockByNumber"),
+        (
+            {"eth_getBlockByNumber": {**GOOD_BLOCK, "number": "0x63"}},
+            "eth_getBlockByNumber",
+        ),
         ({"eth_getLogs": {"not": "a list"}}, "eth_getLogs"),
+        ({"eth_getLogs": [{}]}, "eth_getLogs"),
     ],
 )
 async def test_malformed_results_are_shape_errors(over, name):

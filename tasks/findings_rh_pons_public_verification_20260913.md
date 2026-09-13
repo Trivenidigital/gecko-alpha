@@ -45,3 +45,9 @@ The alternative factory has `TokenLaunched(address,address,address,address,addre
 4. The high local launch rate supports a short data-bound observation gate, conditional on provider capacity, complete cursor traversal and watchdog health. The original early-signal goal still requires live observation timestamps and a comparison against baseline discovery; historical event timestamps must not be used as historical first-observation times.
 
 Only public investigation artifacts changed. No transactions, activation or deployment occurred.
+
+## Follow-up: actual curve trades and canonical block hashes
+
+The bounded follow-up made exactly five ordinary public requests: one 1,000-block explorer curve-log query and four official RPC block-header reads. The query for curve `0x9ba24b3a293f78c39da9a41ef04b69e6ef70f6e1` returned 309 events including **180 CurveBuy and 104 CurveSell**. Real raw buy/sell examples are now retained, along with the corresponding factory launch previously observed in the first investigation, in `investigation/rh_pons_trade_fixture_20260913.json`.
+
+Canonical block hashes and timestamps came from `eth_getBlockByNumber`, not invented fixture fields. The explorer's null topic padding remains intact in saved raw examples and is explicitly removed by the offline adapter in `tests/test_rh_pons_public_fixtures.py`. Two characterization tests verify actual token/curve identity, integer amount decoding, replay ordering, trade-to-token resolution, provenance, and execution ineligibility. Both passed. This closes the missing real trade-fixture boundary; it does not demonstrate live polling reliability or early discovery latency.
