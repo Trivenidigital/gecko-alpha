@@ -61,6 +61,30 @@ Transports:
   full rebuild remains available as `reconcile_curve_launch_projection`
   without `identities` for diagnostics.
 
+Pacing and header budget (loop only; `poll_once` is unpaced):
+
+- Every logical JSON-RPC call is charged to an in-memory token bucket
+  (`RH_PONS_RPC_CALLS_PER_SEC`, default 8; `RH_PONS_RPC_BURST_CALLS`, default
+  100); a header batch of N costs N. These are provisional, not a known
+  provider quota. A 429 empties the bucket, halves the rate (not below
+  `RH_PONS_RPC_MIN_CALLS_PER_SEC`, default 1) and holds calls for a numeric
+  Retry-After capped at `RH_PONS_FAILURE_BACKOFF_MAX_SEC`; each completed pass
+  restores a tenth of the configured rate.
+- Header reads per pass are capped by `RH_PONS_MAX_HEADERS_PER_PASS` (default
+  80) and by what the pacer can supply in half the remaining pass deadline
+  (minus the two tail calls). If a window needs more, the pass covers the
+  largest block prefix whose headers fit and checkpoints only that prefix;
+  logs above it are re-fetched next pass. The next window is sized to about
+  twice the verified progress.
+- Per-pass logs report `truncated`, `header_budget`, `rpc_s` (time in HTTP
+  exchanges), `pacing_wait_s` and the current `rpc_rate`.
+
+Why: the 2026-09-13 public-RPC smoke
+(`investigation/rh_capacity_smoke_throttled_20260913.json`) needed ~0.5
+header reads per scanned block. Doubling the window produced a second
+~100-call header burst seconds after the first and three passes failed with
+429. Checkpoint integrity held, but the 3000-block backlog did not drain.
+
 The existing watchdog supports `--source rh_pons`; it reads the DB read-only,
 uses the RH heartbeat and discovery table, and reports missing/stale/invalid
 heartbeats. Preview on Windows or Linux with:

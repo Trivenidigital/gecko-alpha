@@ -594,6 +594,18 @@ class Settings(BaseSettings):
     # Trade logs by event topic with indexed emitter membership. False keeps the
     # address-batched query, whose RPC count grows with every known curve.
     RH_PONS_TOPIC_ONLY_TRADE_QUERY: bool = True
+    # Loop-only pacing over LOGICAL JSON-RPC calls (a batch of N costs N).
+    # Provider quota is unknown: these are provisional, not measured limits. A
+    # 429 empties the bucket and halves the rate (not below MIN); completed
+    # passes restore it. A 2026-09-13 public-RPC smoke accepted ~100-call header
+    # bursts and throttled a second 100-call burst seconds later.
+    RH_PONS_RPC_CALLS_PER_SEC: float = Field(default=8.0, ge=0.5, le=1000)
+    RH_PONS_RPC_MIN_CALLS_PER_SEC: float = Field(default=1.0, ge=0.1, le=1000)
+    RH_PONS_RPC_BURST_CALLS: int = Field(default=100, ge=1, le=10_000)
+    # Header reads per loop pass (also capped by what the pacer can supply in
+    # half the remaining pass deadline). A pass that would exceed it covers the
+    # largest block prefix that fits instead of failing on a throttled burst.
+    RH_PONS_MAX_HEADERS_PER_PASS: int = Field(default=80, ge=1, le=10_000)
 
     # Database
     DB_PATH: Path = Path("scout.db")

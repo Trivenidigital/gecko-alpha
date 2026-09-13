@@ -4,6 +4,9 @@ Synthetic, provenance-tagged fixtures only; nothing here is a live check.
 """
 
 import asyncio
+import json
+import random
+import time
 
 import aiohttp
 import pytest
@@ -193,6 +196,15 @@ def _mutate_first(fn):
 
 MALFORMED = {
     "duplicate_id": _mutate_first(lambda items: items[1].update(id=items[0]["id"])),
+    # Right length, every item individually valid, but id 1 never answered:
+    # only the duplicate-id guard can refuse this (height checks all pass).
+    "duplicate_id_valid_result": _mutate_first(
+        lambda items: items.__setitem__(1, json.loads(json.dumps(items[0])))
+    ),
+    # A valid header result must not launder a per-item error.
+    "result_and_error": _mutate_first(
+        lambda items: items[0].update(error={"code": -32000})
+    ),
     "bool_id": _mutate_first(lambda items: items[1].update(id=True)),
     "string_id": _mutate_first(lambda items: items[0].update(id="0")),
     "unknown_id": _mutate_first(lambda items: items[0].update(id=99)),

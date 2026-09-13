@@ -664,16 +664,102 @@ async def advance_lifecycle(
 class _RpcStats:
     """Per-pass transport counters, shared with gathered child requests."""
 
-    __slots__ = ("calls", "rate_limited", "retry_after")
+    __slots__ = ("calls", "rate_limited", "retry_after", "rpc_seconds")
 
     def __init__(self) -> None:
         self.calls = 0
         self.rate_limited = False
         self.retry_after: float | None = None
+        self.rpc_seconds = 0.0
 
 
 #: Gathered child tasks copy the context, so they mutate this same object.
 _RPC_STATS: ContextVar[_RpcStats | None] = ContextVar("rh_pons_rpc_stats", default=None)
+
+
+class _RpcPacer:
+    """Token bucket over LOGICAL JSON-RPC calls; loop-owned and in memory.
+
+    A batch of N header reads costs N. Provider quota is unknown, so the rate
+    and burst are provisional settings, not measured limits. A 429 empties the
+    bucket, halves the rate (never below ``min_rate``) and holds new calls
+    until a Retry-After capped at ``max_hold`` has passed; each completed pass
+    restores a tenth of the configured rate. A call larger than the burst
+    waits for a full bucket and then borrows, so it cannot deadlock. Waits are
+    serialized, so concurrent batch POSTs cannot overdraw together.
+    """
+
+    _RECOVERY_FRACTION = 0.1
+
+    def __init__(
+        self,
+        *,
+        rate: float,
+        burst: int,
+        min_rate: float,
+        max_hold: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Any] = asyncio.sleep,
+    ) -> None:
+        self.max_rate = rate
+        self.rate = rate
+        self.min_rate = min(min_rate, rate)
+        self.burst = float(burst)
+        self.max_hold = max_hold
+        self.tokens = float(burst)
+        self.not_before = float("-inf")
+        self.waited_s = 0.0
+        self._clock = clock
+        self._sleep = sleep
+        self._updated = clock()
+        self._lock = asyncio.Lock()
+
+    def _refill(self) -> float:
+        now = self._clock()
+        self.tokens = min(self.burst, self.tokens + (now - self._updated) * self.rate)
+        self._updated = now
+        return now
+
+    async def acquire(self, cost: int) -> None:
+        async with self._lock:
+            need = min(float(cost), self.burst)
+            while True:
+                now = self._refill()
+                wait = max(self.not_before - now, (need - self.tokens) / self.rate)
+                if wait <= 1e-9:
+                    break
+                self.waited_s += wait
+                await self._sleep(wait)
+            self.tokens -= cost
+
+    def throttled(self, retry_after: float | None) -> None:
+        now = self._refill()
+        self.tokens = min(self.tokens, 0.0)
+        self.rate = max(self.min_rate, self.rate / 2)
+        if retry_after is not None:
+            hold = min(retry_after, self.max_hold)
+            self.not_before = max(self.not_before, now + hold)
+
+    def recovered(self) -> None:
+        self._refill()
+        self.rate = min(
+            self.max_rate, self.rate + self.max_rate * self._RECOVERY_FRACTION
+        )
+
+    def call_allowance(self, seconds: float) -> int:
+        """Logical calls obtainable within ``seconds`` without overdrawing."""
+        now = self._refill()
+        usable = max(0.0, seconds - max(0.0, self.not_before - now))
+        return int(self.tokens + self.rate * usable)
+
+
+_RPC_PACER: ContextVar[_RpcPacer | None] = ContextVar("rh_pons_rpc_pacer", default=None)
+
+
+async def _acquire_rpc_budget(cost: int) -> None:
+    pacer = _RPC_PACER.get()
+    if pacer is not None:
+        await pacer.acquire(cost)
 
 
 def _count_rpc_calls(count: int) -> None:
@@ -682,28 +768,43 @@ def _count_rpc_calls(count: int) -> None:
         stats.calls += count
 
 
+def _add_rpc_seconds(seconds: float) -> None:
+    stats = _RPC_STATS.get()
+    if stats is not None:
+        stats.rpc_seconds += seconds
+
+
 def _note_rate_limit(status: int, headers: Any) -> None:
-    """Record a 429 (and a numeric Retry-After) for the loop's backoff.
+    """Record a 429 (and a numeric Retry-After) for pacing and loop backoff.
 
     Quota is unknown: this reacts to provider refusals, it does not probe them.
     """
-    stats = _RPC_STATS.get()
-    if stats is None or status != 429:
+    if status != 429:
         return
-    stats.rate_limited = True
+    retry_after = None
     try:
-        retry_after = float(headers.get("Retry-After"))
+        value = float(headers.get("Retry-After"))
+        if value >= 0:
+            retry_after = value
     except (AttributeError, TypeError, ValueError):
-        return
-    if retry_after >= 0:
-        stats.retry_after = max(stats.retry_after or 0.0, retry_after)
+        pass
+    stats = _RPC_STATS.get()
+    if stats is not None:
+        stats.rate_limited = True
+        if retry_after is not None:
+            stats.retry_after = max(stats.retry_after or 0.0, retry_after)
+    pacer = _RPC_PACER.get()
+    if pacer is not None:
+        pacer.throttled(retry_after)
 
 
 async def _rpc(
     session: aiohttp.ClientSession, rpc_url: str, method: str, params: list
 ) -> Any:
     """Return JSON-RPC result; failures never include provider text or URL secrets."""
+    await _acquire_rpc_budget(1)
     _count_rpc_calls(1)
+    started = time.monotonic()
     try:
         async with session.post(
             rpc_url,
@@ -730,6 +831,8 @@ async def _rpc(
             "rh_pons_rpc_transport_error", method=method, error_type=type(exc).__name__
         )
         return None
+    finally:
+        _add_rpc_seconds(time.monotonic() - started)
 
 
 async def _rpc_get_logs(
@@ -837,8 +940,10 @@ async def _post_header_batch(
         }
         for index, height in enumerate(heights)
     ]
+    await _acquire_rpc_budget(len(heights))
     _count_rpc_calls(len(heights))
     method = "eth_getBlockByNumber_batch"
+    started = time.monotonic()
     try:
         async with session.post(
             url, json=payload, timeout=aiohttp.ClientTimeout(total=15)
@@ -857,6 +962,8 @@ async def _post_header_batch(
             "rh_pons_rpc_transport_error", method=method, error_type=type(exc).__name__
         )
         return None
+    finally:
+        _add_rpc_seconds(time.monotonic() - started)
     if isinstance(body, dict) and "error" in body and "result" not in body:
         error = body["error"]
         code = error.get("code") if isinstance(error, dict) else None
@@ -947,6 +1054,10 @@ class _ScanState:
     #: the first completed pass derives (and logs) it again.
     cold_start_block: int | None = None
     failures: int = 0
+    #: Header reads allowed per pass; None (poll_once) means unbounded.
+    max_headers: int | None = None
+    #: Monotonic deadline of the running pass, set by the loop.
+    pass_deadline: float | None = None
 
     @classmethod
     def for_loop(cls, settings: "Settings") -> "_ScanState":
@@ -959,6 +1070,7 @@ class _ScanState:
             batch_headers=True,
             topic_only=settings.RH_PONS_TOPIC_ONLY_TRADE_QUERY,
             header_batch_size=settings.RH_PONS_HEADER_BATCH_SIZE,
+            max_headers=settings.RH_PONS_MAX_HEADERS_PER_PASS,
         )
 
     @classmethod
@@ -999,6 +1111,12 @@ class _PassResult:
     retry_after: float | None = None
     duration_s: float = 0.0
     completed_monotonic: float | None = None
+    #: Coverage stopped at a verifiable prefix to stay within the header budget.
+    truncated: bool = False
+    header_budget: int | None = None
+    #: Time inside HTTP exchanges, and time waiting on the pacer.
+    rpc_s: float = 0.0
+    pacing_wait_s: float = 0.0
 
     @property
     def caught_up(self) -> bool:
@@ -1008,6 +1126,60 @@ class _PassResult:
             and self.to_block is not None
             and self.to_block >= self.start_head
         )
+
+
+#: Logical calls a pass still makes after its header batch (final header,
+#: completion head); reserved when sizing the header budget.
+_PASS_TAIL_CALLS = 2
+
+
+def _header_cutoff(
+    *,
+    fixed: Iterable[int],
+    events: Iterable[int],
+    low: int,
+    high: int,
+    overlap: int,
+    floor_block: int,
+    budget: int,
+) -> int:
+    """Largest block ``c`` in [low, high] whose header set fits ``budget``.
+
+    The header set for coverage through ``c`` is: retained checkpoint heights
+    (``fixed``), every event height <= c, and the overlap window
+    [max(floor_block, c - overlap), c]. Returns ``low`` when nothing fits, so
+    a pass always makes minimal progress. One sweep, O(high - low + events).
+    """
+    fixed_set = set(fixed)
+    event_set = set(events)
+    if high < low:
+        return high
+    known = fixed_set | {e for e in event_set if e < low}
+    base = len(known)
+    upcoming = sorted(e for e in event_set if e >= low and e not in fixed_set)
+
+    def plain(height: int) -> bool:
+        return height not in fixed_set and height not in event_set
+
+    window_lo = max(floor_block, low - overlap)
+    plain_count = sum(1 for h in range(window_lo, low + 1) if plain(h))
+    best = low
+    index = 0
+    for c in range(low, high + 1):
+        if c > low:
+            if plain(c):
+                plain_count += 1
+            new_lo = max(floor_block, c - overlap)
+            for h in range(window_lo, new_lo):
+                if plain(h):
+                    plain_count -= 1
+            window_lo = max(window_lo, new_lo)
+        while index < len(upcoming) and upcoming[index] <= c:
+            base += 1
+            index += 1
+        if base + plain_count <= budget:
+            best = c
+    return best
 
 
 async def _scan_headers(
@@ -1218,6 +1390,38 @@ async def _scan_pass(
         elif emitter != deployment.factory.lower():
             return failed("unexpected_factory_emitter")
         identities.append((log, ident))
+    if state.max_headers is not None:
+        # Header reads scale with active blocks (~0.5/block observed), so a
+        # wide window becomes a throttled burst. Size this pass's header set to
+        # the configured cap and to what the pacer can supply in half the
+        # remaining deadline, and cover the largest verifiable prefix.
+        budget = state.max_headers
+        pacer = _RPC_PACER.get()
+        if pacer is not None and state.pass_deadline is not None:
+            remaining = max(0.0, state.pass_deadline - time.monotonic())
+            budget = min(budget, pacer.call_allowance(remaining / 2) - _PASS_TAIL_CALLS)
+        cutoff = _header_cutoff(
+            fixed=map(int, old_hashes),
+            events=[ident[2] for _, ident in identities]
+            + [event["block_number"] for event in prior_events],
+            low=min(next_block, to_block),
+            high=to_block,
+            overlap=overlap,
+            floor_block=deployment.deploy_block,
+            budget=budget,
+        )
+        context["header_budget"] = budget
+        if cutoff < to_block:
+            # Logs above the cutoff are re-fetched next pass; nothing above it
+            # is written or checkpointed. A genuine curve cannot trade before
+            # its launch block, so dropping later launches orphans no trade.
+            to_block = cutoff
+            identities = [
+                (log, ident) for log, ident in identities if ident[2] <= to_block
+            ]
+            raw_logs = [log for log, _ in identities]
+            prior_events = [e for e in prior_events if e["block_number"] <= to_block]
+            context.update(to_block=to_block, truncated=True)
     # One bounded batch covers event clocks, old evidence canonicality and
     # retained overlap headers, including empty blocks. No per-log await.
     needed = set(map(int, old_hashes))
@@ -1356,7 +1560,13 @@ def _after_pass(state: _ScanState, result: _PassResult, settings: "Settings") ->
         state.failures = 0
         if result.caught_up:
             return idle
-        if result.duration_s < settings.RH_PONS_POLL_TIMEOUT_SEC / 2:
+        if result.truncated:
+            # The header budget, not the window, bound this pass: fetch logs
+            # for about twice what it could verify rather than growing further.
+            state.span = max(
+                state.min_span, min(state.max_span, 2 * max(1, result.new_blocks))
+            )
+        elif result.duration_s < settings.RH_PONS_POLL_TIMEOUT_SEC / 2:
             state.span = min(state.max_span, state.span * 2)
         return 0.0
     if result.status == "head_behind":
@@ -1388,64 +1598,100 @@ async def run_rh_pons_loop(
         logger.info("rh_pons_loop_disabled")
         return
     state = _ScanState.for_loop(settings)
+    pacer = _RpcPacer(
+        rate=settings.RH_PONS_RPC_CALLS_PER_SEC,
+        burst=settings.RH_PONS_RPC_BURST_CALLS,
+        min_rate=settings.RH_PONS_RPC_MIN_CALLS_PER_SEC,
+        max_hold=settings.RH_PONS_FAILURE_BACKOFF_MAX_SEC,
+    )
     logger.info(
         "rh_pons_loop_started",
         min_span=state.min_span,
         max_span=state.max_span,
         topic_only=state.topic_only,
         header_batch_size=state.header_batch_size,
+        max_headers_per_pass=state.max_headers,
+        rpc_calls_per_sec=pacer.max_rate,
+        rpc_burst_calls=int(pacer.burst),
     )
-    while True:
-        stats = _RpcStats()
-        token = _RPC_STATS.set(stats)
-        started = time.monotonic()
+    pacer_token = _RPC_PACER.set(pacer)
+    try:
+        while True:
+            await _run_loop_pass(session, db, settings, state, pacer, on_pass)
+    finally:
+        _RPC_PACER.reset(pacer_token)
+
+
+async def _run_loop_pass(
+    session: aiohttp.ClientSession,
+    db: "Database",
+    settings: "Settings",
+    state: _ScanState,
+    pacer: _RpcPacer,
+    on_pass: Callable[[_PassResult], None] | None,
+) -> None:
+    stats = _RpcStats()
+    token = _RPC_STATS.set(stats)
+    started = time.monotonic()
+    waited_before = pacer.waited_s
+    state.pass_deadline = started + settings.RH_PONS_POLL_TIMEOUT_SEC
+    try:
+        async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
+            result = await _scan_pass(session, db, settings, state)
+    except TimeoutError:
+        result = _PassResult("timeout", reason="pass_deadline")
+    except Exception as exc:  # CancelledError is BaseException: propagates.
+        # Type only: exception text can embed the RPC URL.
+        logger.error("rh_pons_loop_pass_error", error_type=type(exc).__name__)
+        result = _PassResult("error", reason=type(exc).__name__)
+    finally:
+        _RPC_STATS.reset(token)
+        state.pass_deadline = None
+    result.duration_s = round(time.monotonic() - started, 3)
+    result.rpc_calls = stats.calls
+    result.rate_limited = stats.rate_limited
+    result.retry_after = stats.retry_after
+    result.rpc_s = round(stats.rpc_seconds, 3)
+    result.pacing_wait_s = round(pacer.waited_s - waited_before, 3)
+    if result.status == "completed":
+        pacer.recovered()
+    delay = _after_pass(state, result, settings)
+    logger.info(
+        "rh_pons_loop_pass",
+        status=result.status,
+        reason=result.reason,
+        from_block=result.from_block,
+        to_block=result.to_block,
+        new_blocks=result.new_blocks,
+        start_head=result.start_head,
+        completion_head=result.completion_head,
+        lag_blocks=(
+            None
+            if result.completion_head is None or result.to_block is None
+            else max(0, result.completion_head - result.to_block)
+        ),
+        recorded_events=result.recorded_events,
+        header_heights=result.header_heights,
+        header_budget=result.header_budget,
+        truncated=result.truncated,
+        trade_logs=result.trade_logs,
+        excluded_foreign_logs=result.excluded_foreign_logs,
+        active_curves=result.active_curves,
+        rpc_calls=result.rpc_calls,
+        rate_limited=result.rate_limited,
+        duration_s=result.duration_s,
+        rpc_s=result.rpc_s,
+        pacing_wait_s=result.pacing_wait_s,
+        rpc_rate=round(pacer.rate, 3),
+        next_span=state.span,
+        consecutive_failures=state.failures,
+        batch_headers=state.batch_headers and state.batch_supported,
+        sleep_s=delay,
+    )
+    if on_pass is not None:
         try:
-            async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
-                result = await _scan_pass(session, db, settings, state)
-        except TimeoutError:
-            result = _PassResult("timeout", reason="pass_deadline")
-        except Exception as exc:  # CancelledError is BaseException: propagates.
-            # Type only: exception text can embed the RPC URL.
-            logger.error("rh_pons_loop_pass_error", error_type=type(exc).__name__)
-            result = _PassResult("error", reason=type(exc).__name__)
-        finally:
-            _RPC_STATS.reset(token)
-        result.duration_s = round(time.monotonic() - started, 3)
-        result.rpc_calls = stats.calls
-        result.rate_limited = stats.rate_limited
-        result.retry_after = stats.retry_after
-        delay = _after_pass(state, result, settings)
-        logger.info(
-            "rh_pons_loop_pass",
-            status=result.status,
-            reason=result.reason,
-            from_block=result.from_block,
-            to_block=result.to_block,
-            new_blocks=result.new_blocks,
-            start_head=result.start_head,
-            completion_head=result.completion_head,
-            lag_blocks=(
-                None
-                if result.completion_head is None or result.to_block is None
-                else max(0, result.completion_head - result.to_block)
-            ),
-            recorded_events=result.recorded_events,
-            header_heights=result.header_heights,
-            trade_logs=result.trade_logs,
-            excluded_foreign_logs=result.excluded_foreign_logs,
-            active_curves=result.active_curves,
-            rpc_calls=result.rpc_calls,
-            rate_limited=result.rate_limited,
-            duration_s=result.duration_s,
-            next_span=state.span,
-            consecutive_failures=state.failures,
-            batch_headers=state.batch_headers and state.batch_supported,
-            sleep_s=delay,
-        )
-        if on_pass is not None:
-            try:
-                on_pass(result)
-            except Exception:
-                logger.exception("rh_pons_loop_observer_error")
-        if delay > 0:
-            await _sleep(delay)
+            on_pass(result)
+        except Exception:
+            logger.exception("rh_pons_loop_observer_error")
+    if delay > 0:
+        await _sleep(delay)

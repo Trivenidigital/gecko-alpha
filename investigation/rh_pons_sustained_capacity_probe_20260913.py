@@ -77,26 +77,42 @@ def build_settings(args: argparse.Namespace) -> Settings:
         RH_PONS_IDLE_SLEEP_SEC=args.idle_sleep,
         RH_PONS_POLL_TIMEOUT_SEC=args.pass_timeout,
         RH_PONS_TOPIC_ONLY_TRADE_QUERY=True,
+        RH_PONS_RPC_CALLS_PER_SEC=args.rpc_calls_per_sec,
+        RH_PONS_RPC_MIN_CALLS_PER_SEC=args.rpc_min_calls_per_sec,
+        RH_PONS_RPC_BURST_CALLS=args.rpc_burst,
+        RH_PONS_MAX_HEADERS_PER_PASS=args.max_headers_per_pass,
     )
 
 
-async def event_delays(db: Database, after_block: int | None) -> dict[str, Any]:
-    if after_block is None:
+def real_time_cutoff(catchup: dict | None) -> int | None:
+    """Events at or below the head observed at catch-up may be residual
+    backlog, so only blocks strictly after that HEAD count as real time."""
+    return None if catchup is None else catchup["head"]
+
+
+async def event_delays(db: Database, after_head: int | None) -> dict[str, Any]:
+    if after_head is None:
         return {"samples": 0, "note": "no catch-up; no real-time samples"}
     names = ",".join(f"'{name}'" for name in REAL_TIME_EVENTS)
     cur = await db._conn.execute(
         f"""SELECT event_name,
             (julianday(observed_at) - julianday(event_time)) * 86400.0
         FROM curve_launch_events
-        WHERE block_number > ? AND event_time IS NOT NULL
-        AND event_name IN ({names})""",
-        (after_block,),
+        WHERE block_number > ? AND event_name IN ({names})""",
+        (after_head,),
     )
     rows = await cur.fetchall()
-    delays = [r[1] for r in rows if r[1] is not None]
+    # Missing/unparseable clocks and negative delays are counted, never
+    # silently dropped into a better-looking percentile.
+    invalid = sum(1 for r in rows if r[1] is None)
+    negative = sum(1 for r in rows if r[1] is not None and r[1] < 0)
+    delays = [r[1] for r in rows if r[1] is not None and r[1] >= 0]
     launches = [r[1] for r in rows if r[0] == "token_launched" and r[1] is not None]
+    launches = [d for d in launches if d >= 0]
     return {
         "samples": len(delays),
+        "invalid_clock": invalid,
+        "negative_delay": negative,
         "p50_s": percentile(delays, 50),
         "p95_s": percentile(delays, 95),
         "max_s": round(max(delays), 3) if delays else None,
@@ -105,6 +121,30 @@ async def event_delays(db: Database, after_block: int | None) -> dict[str, Any]:
         "launch_p95_s": percentile(launches, 95),
         "clock_note": "block timestamps have 1 s resolution",
     }
+
+
+def backup_isolated_db(source: Path, target: Path) -> dict[str, Any]:
+    """Copy the closed isolated evidence DB via SQLite's online backup API.
+
+    Refuses to overwrite anything, so it cannot clobber an existing (for
+    example production) database. The copy is integrity-checked.
+    """
+    import sqlite3
+    from contextlib import closing
+
+    target = target.resolve()
+    if target.exists():
+        raise FileExistsError(f"refusing to overwrite {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        closing(sqlite3.connect(source)) as src,
+        closing(sqlite3.connect(target)) as dst,
+    ):
+        src.backup(dst)
+    with closing(sqlite3.connect(target)) as check:
+        integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+        events = check.execute("SELECT COUNT(*) FROM curve_launch_events").fetchone()[0]
+    return {"path": str(target), "integrity": integrity, "events": events}
 
 
 def summarize(results: list[dict], started: float, catchup: dict | None) -> dict:
@@ -125,6 +165,12 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
         "checkpoint_regressions": regressions,
         "rate_limited_passes": sum(1 for r in results if r["rate_limited"]),
         "rpc_calls": sum(r["rpc_calls"] for r in results),
+        "truncated_passes": sum(1 for r in results if r.get("truncated")),
+        "rpc_s_total": round(sum(r.get("rpc_s", 0.0) for r in results), 3),
+        "pacing_wait_s_total": round(
+            sum(r.get("pacing_wait_s", 0.0) for r in results), 3
+        ),
+        "duration_s_total": round(sum(r["duration_s"] for r in results), 3),
     }
     first = completed[0] if completed else None
     if first is None:
@@ -207,16 +253,25 @@ def evaluate(summary: dict, delays: dict, min_steady: int) -> dict:
         verdict["lag_p50_le_50"] = steady["lag_blocks_p50"] <= 50
         verdict["lag_p95_le_150"] = steady["lag_blocks_p95"] <= 150
         verdict["timeouts_le_1pct"] = steady["timeouts"] <= 0.01 * steady["passes"]
-    if delays.get("samples", 0) == 0:
+    bad_clocks = delays.get("invalid_clock", 0) + delays.get("negative_delay", 0)
+    if delays.get("samples", 0) == 0 and bad_clocks == 0:
         verdict["event_delay"] = "not_evaluated_no_real_time_samples"
     else:
-        verdict["event_delay_p50_le_10s"] = delays["p50_s"] <= 10
-        verdict["event_delay_p95_le_30s"] = delays["p95_s"] <= 30
+        verdict["event_clocks_valid"] = bad_clocks == 0
+        verdict["event_delay_p50_le_10s"] = (
+            delays.get("p50_s") is not None and delays["p50_s"] <= 10
+        )
+        verdict["event_delay_p95_le_30s"] = (
+            delays.get("p95_s") is not None and delays["p95_s"] <= 30
+        )
     verdict["zero_checkpoint_regressions"] = summary["checkpoint_regressions"] == 0
     return verdict
 
 
 async def run(args: argparse.Namespace) -> dict:
+    if args.db_output is not None and args.db_output.exists():
+        # Fail before any network call; never overwrite an existing database.
+        raise FileExistsError(f"refusing to overwrite {args.db_output}")
     settings = build_settings(args)
     results: list[dict] = []
     catchup: dict | None = None
@@ -241,6 +296,10 @@ async def run(args: argparse.Namespace) -> dict:
             "rate_limited": result.rate_limited,
             "duration_s": result.duration_s,
             "completed_monotonic": result.completed_monotonic,
+            "truncated": result.truncated,
+            "header_budget": result.header_budget,
+            "rpc_s": result.rpc_s,
+            "pacing_wait_s": result.pacing_wait_s,
         }
         results.append(row)
         if (
@@ -282,9 +341,7 @@ async def run(args: argparse.Namespace) -> dict:
                 except asyncio.CancelledError:
                     pass
             summary = summarize(results, started, catchup)
-            delays = await event_delays(
-                db, None if catchup is None else catchup["block"]
-            )
+            delays = await event_delays(db, real_time_cutoff(catchup))
             cur = await db._conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(execution_eligible), 0) "
                 "FROM curve_launch_discoveries"
@@ -294,6 +351,12 @@ async def run(args: argparse.Namespace) -> dict:
             (events,) = await cur.fetchone()
         finally:
             await db.close()
+        # The worker is cancelled and the connection closed before copying.
+        backup = (
+            None
+            if args.db_output is None
+            else backup_isolated_db(Path(folder) / "isolated.db", args.db_output)
+        )
     return {
         "scope": "isolated_public_rpc_sustained_capacity",
         "production_mutated": False,
@@ -308,8 +371,14 @@ async def run(args: argparse.Namespace) -> dict:
             "idle_sleep_s": args.idle_sleep,
             "pass_timeout_s": args.pass_timeout,
             "catchup_lag_blocks": args.catchup_lag,
+            "rpc_calls_per_sec": args.rpc_calls_per_sec,
+            "rpc_min_calls_per_sec": args.rpc_min_calls_per_sec,
+            "rpc_burst_calls": args.rpc_burst,
+            "max_headers_per_pass": args.max_headers_per_pass,
         },
         "catchup": catchup,
+        "real_time_cutoff_head": real_time_cutoff(catchup),
+        "isolated_db_backup": backup,
         "summary": summary,
         "real_time_event_delay": delays,
         "db": {
@@ -337,8 +406,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--idle-sleep", type=float, default=2.0)
     p.add_argument("--pass-timeout", type=float, default=30)
     p.add_argument("--stop-after-rate-limits", type=int, default=3)
+    p.add_argument("--rpc-calls-per-sec", type=float, default=8.0)
+    p.add_argument("--rpc-min-calls-per-sec", type=float, default=1.0)
+    p.add_argument("--rpc-burst", type=int, default=100)
+    p.add_argument("--max-headers-per-pass", type=int, default=80)
     p.add_argument("--include-passes", action="store_true")
     p.add_argument("--output", type=Path)
+    p.add_argument(
+        "--db-output",
+        type=Path,
+        help="Copy the isolated evidence DB here after the run (must not exist)",
+    )
     return p.parse_args(argv)
 
 

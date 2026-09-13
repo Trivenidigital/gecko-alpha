@@ -54,5 +54,9 @@ No new dependencies.
 - [x] Main: remove in-cycle polling; spawn loop behind flag; real `main()` wiring + shutdown-cancel test
 - [x] Capacity runner (temporary DB, public RPC, bounded, drain-then-steady metrics)
 - [x] Runbook + report update; commit owned paths only
-- [ ] Codex native REQUEST 3: formatted-HEAD rerun + collector guard mutations
-- [ ] Live isolated capacity probe on host (Codex-run; not activation)
+- [x] Codex native REQUEST 3: 227 passed; mutations 16/18 killed (duplicate-id and item-error guards survived)
+- [x] Live isolated smoke (Codex-run): backlog not drained, 3 of 7 passes throttled by 429 on header bursts
+- [x] Round 2: discriminating batch tests for both survivors; loop token-bucket pacer (logical-call cost, 429 halving, capped hold, recovery); per-pass header budget with exact prefix cutoff; timing instrumentation
+- [x] Round 2 runner: catch-up head cutoff, invalid/negative clock counting, `--db-output` isolated backup, pacing args
+- [ ] Codex native REQUEST 4: suites + 31-mutant run
+- [ ] Next live isolated probe only after review of the pacing change (not activation)
