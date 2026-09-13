@@ -1,5 +1,22 @@
 # Backlog — gecko-alpha
 
+## Active Work: 2026-09-13 - Autonomous closeout evidence boundaries
+
+- [x] Fresh origin/master drift audit in isolated branch; templates, role map,
+  cockpit and Signal Trust V1 already exist.
+- [x] Read-only production service/revision and endpoint checks; external Codex
+  configuration found; no matching closeout job in inspected Hermes job store.
+- [x] Two parallel plan reviews, then two parallel design reviews approved;
+  folds recorded in `tasks/design_overnight_closeout_2026_09_13.md`.
+- [x] Reporter regression reproduced before bounded wording/doc correction.
+- [ ] Focused verification, PR, two-vector independent PR reviews, exact-head CI.
+- [ ] Conditional merge and final report/memory.
+
+Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and
+`tasks/closeout_report_overnight_2026_09_13.md`. No policy, runtime configuration,
+DB, vendor, or execution mutation. Successor tracker recovered from the main
+checkout as untracked dated evidence; historical parents are not rebuilt.
+
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
 **Status:** SHIPPED 2026-06-22 - PR #377 squash `dc8f70ae`. Goal: run the Gecko overnight autonomous closeout in
