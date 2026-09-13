@@ -1,0 +1,20 @@
+# Durable-evidence: independent Codex reviewer checked recovery, checkpoint,
+# monitoring and cancellation at this SHA; see readiness report.
+# Runtime: primary Codex reviewer executed the isolated real-RPC probes and
+# 176 focused/regression tests. This is author-attested runtime evidence,
+# not an independent human approval or authorization to activate trading.
+# Claude session 3c9deda4-5c60-4ecb-9007-96c7ebfbce0b separately cleared
+# header batching/completion head/deadline at c23ad743. The only subsequent
+# watched delta scopes the deadline assertion to RH heartbeat writes.
+pr = 572
+record_version = 1
+required = ["durable-evidence", "runtime"]
+watch = [
+    ".claude", ".github", "Dockerfile", "cron", "dashboard",
+    "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts",
+    "start.sh", "systemd", "tests", "uv.lock",
+]
+
+[clearances]
+durable-evidence = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
+runtime = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"

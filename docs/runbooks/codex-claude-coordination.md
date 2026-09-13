@@ -52,6 +52,12 @@ sessions. Verify the worktree stops changing, preserve competing changes, and
 integrate only explicitly reviewed commits. Do not assume a helper is read-only
 because its name includes memory or summarization.
 
+This helper restarted again during a later read-only review. The primary
+review remained read-only, but the plugin's separate sync process resumed
+the old coding worktree. Inspect background process ownership after each CLI
+start, not just after cancellation. An unattended writer handoff is not yet
+safe with that helper enabled. No global plugin setting was changed here.
+
 Concurrent writers also share Git's index within a worktree. Prefer separate
 worktrees, and use `git commit --only <owned paths>` when committing disjoint
 work in a shared integration checkout. This prevents one worker's staged files

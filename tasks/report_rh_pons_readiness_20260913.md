@@ -59,6 +59,19 @@ overbroad test assertion against unrelated CoinGecko heartbeat writes;
 Production Python has no pytest installed; no packages were added to that
 environment. Linux-wide regression verification is delegated to PR CI.
 
+Final combined local regression run: **176 passed**, with six existing
+marker/mock warnings. The final independent durable-evidence reviewer cleared
+`1e8ded72` after inspecting the assertion-only delta. Claude Code session
+`3c9deda4-5c60-4ecb-9007-96c7ebfbce0b` returned a bounded correctness clearance
+for header batching, completion head and deadline handling at `c23ad743`.
+It did not run tests. PR: https://github.com/Trivenidigital/gecko-alpha/pull/572.
+
+Claude's residual observations are retained: a fixed scan span can repeatedly
+time out on a slow provider; a temporarily regressed provider head can cause
+redundant rescanning; final hash casing can falsely refuse a pass; and real
+mid-write cancellation deserves additional fault injection before activation.
+These are activation/capacity limits, not evidence of successful live readiness.
+
 Production read-only inspection found `gecko-pipeline` active at `6c56186e`,
 the RH collector disabled, and no configured RH RPC URL. The host can reach
 the official public RPC. Native Windows Python DNS could not, although public
