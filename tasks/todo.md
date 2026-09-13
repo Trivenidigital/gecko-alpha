@@ -1,5 +1,23 @@
 # Backlog — gecko-alpha
 
+## Codex / Claude coordination review — 2026-09-13
+
+- [x] Read operator handoff; fetch exact reviewed tip b8843487.
+- [x] Isolate review on feat/claude-review-20260913; preserve main checkout changes.
+- [x] Discover authenticated Claude Code CLI and request a read-only second review.
+- [x] Reproduce focused test results and investigate uncovered collection/evidence defects.
+- [x] Reconcile Claude feedback and independent durable-evidence review.
+- [x] Record findings, verification limits, and reusable direct-coordination procedure.
+
+Scope: review and coordination only. No deployment, live activation, or funding.
+No new product primitives are proposed by this review; Hermes ecosystem analysis
+does not apply to inspecting existing code and using the installed CLI.
+
+Review result: 24 focused tests pass; five concrete findings recorded in
+`tasks/review_claude_rh_pons_2026_09_13.md`. Direct CLI request and same-session
+follow-up both succeeded. Product fixes and live readiness remain outstanding.
+
+
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
 **Status:** SHIPPED 2026-06-22 - PR #377 squash `dc8f70ae`. Goal: run the Gecko overnight autonomous closeout in
