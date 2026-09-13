@@ -62,7 +62,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import math
 import sqlite3
@@ -80,6 +79,10 @@ _log = structlog.get_logger()
 
 _CHECK_KEY = "poll_liveness"
 _HEARTBEAT_SOURCE = "dex_discovery"
+_DISCOVERY_TABLES = {
+    "dex_discovery": "dex_pool_discoveries",
+    "rh_pons": "curve_launch_discoveries",
+}
 
 
 def _configure_logging() -> None:
@@ -142,18 +145,23 @@ def _validate_config(args: argparse.Namespace) -> str | None:
 
 
 async def _read_state(
-    db_path: str, now: datetime, staleness_hours: float, clock_skew_seconds: float
+    db_path: str,
+    now: datetime,
+    staleness_hours: float,
+    clock_skew_seconds: float,
+    source: str = _HEARTBEAT_SOURCE,
 ) -> dict:
     """Run the liveness check + gather diagnostic context.
 
     Opens the DB read-only (sqlite mode=ro URI) so this path structurally
     cannot mutate pipeline state.
     """
+    table = _DISCOVERY_TABLES[source]  # closed mapping, never caller-supplied SQL
     async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         try:
             cur = await conn.execute(
                 "SELECT updated_at FROM ingest_watchdog_state WHERE source = ?",
-                (_HEARTBEAT_SOURCE,),
+                (source,),
             )
             row = await cur.fetchone()
         except sqlite3.OperationalError as exc:
@@ -163,9 +171,7 @@ async def _read_state(
                 raise
         last_new_discovery_at: str | None = None
         try:
-            cur = await conn.execute(
-                "SELECT MAX(first_seen_at) FROM dex_pool_discoveries"
-            )
+            cur = await conn.execute(f"SELECT MAX(first_seen_at) FROM {table}")
             drow = await cur.fetchone()
             last_new_discovery_at = drow[0] if drow else None
         except sqlite3.OperationalError as exc:
@@ -186,6 +192,7 @@ async def _read_state(
             discovery_age_hours = None
 
     result = {
+        "source": source,
         "check": _CHECK_KEY,
         "last_successful_poll_at": row[0] if row else None,
         "last_new_discovery_at": last_new_discovery_at,
@@ -221,23 +228,25 @@ async def _read_state(
 
 
 def _compose_message(check: dict) -> str:
-    lines = ["gecko-alpha DEX-discovery watchdog: poll-liveness breach"]
+    source = check.get("source", _HEARTBEAT_SOURCE)
+    label = "DEX-discovery" if source == "dex_discovery" else "RH/Pons"
+    lines = [f"gecko-alpha {label} watchdog: poll-liveness breach"]
     reason = check["reason"]
     if reason == "heartbeat_absent":
         lines.append(
-            "- dex_discovery heartbeat: NO successful-poll record exists in "
+            f"- {source} heartbeat: NO successful-poll record exists in "
             "ingest_watchdog_state — the discovery lane has never completed a "
             f"valid poll (SLO {check['staleness_hours']}h)"
         )
     elif reason == "heartbeat_invalid":
         lines.append(
-            "- dex_discovery heartbeat: last_successful_poll_at "
+            f"- {source} heartbeat: last_successful_poll_at "
             f"{check['last_successful_poll_at']!r} is UNPARSEABLE — corrupted "
             "heartbeat state; liveness cannot be trusted"
         )
     elif reason == "future_invalid":
         lines.append(
-            "- dex_discovery heartbeat: last_successful_poll_at "
+            f"- {source} heartbeat: last_successful_poll_at "
             f"{check['last_successful_poll_at']} is in the FUTURE "
             f"(signed age {check['poll_age_seconds_signed']}s, allowance "
             f"{check['clock_skew_seconds']}s) — clock skew or corrupted state; "
@@ -245,10 +254,10 @@ def _compose_message(check: dict) -> str:
         )
     else:
         lines.append(
-            "- dex_discovery heartbeat: last successful poll at "
+            f"- {source} heartbeat: last successful poll at "
             f"{check['last_successful_poll_at']} ({check['poll_age_hours']}h ago) "
-            f"exceeds SLO {check['staleness_hours']}h — the GT new-pools poller "
-            "has stalled (pipeline down, GT unreachable, or schema drift "
+            f"exceeds SLO {check['staleness_hours']}h — the {label} poller "
+            "has stalled (pipeline down, provider unreachable, or schema drift "
             "failing every pass)"
         )
     lines.append(
@@ -320,53 +329,60 @@ def _write_cooldown_state(state_dir: str, now: datetime) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--source", choices=tuple(_DISCOVERY_TABLES), default=_HEARTBEAT_SOURCE
+    )
     ap.add_argument("--db", required=True)
     ap.add_argument("--enabled", default="false")
     ap.add_argument("--discovery-enabled", default="false")
     ap.add_argument("--staleness-hours", type=float, default=2.0)
     ap.add_argument("--clock-skew-seconds", type=float, default=300.0)
     ap.add_argument("--cooldown-hours", type=float, default=24.0)
-    ap.add_argument(
-        "--state-dir", default="/var/lib/gecko-alpha/dex-discovery-watchdog"
-    )
+    ap.add_argument("--state-dir", default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+    if args.state_dir is None:
+        lane_dir = "dex-discovery" if args.source == "dex_discovery" else "rh-pons"
+        args.state_dir = f"/var/lib/gecko-alpha/{lane_dir}-watchdog"
+    event_prefix = f"{args.source}_watchdog"
 
     # Boundary validation BEFORE any gate/DB/state access: argparse accepts
     # any float (including nan/inf/negatives), so range-check here.
     config_error = _validate_config(args)
     if config_error is not None:
-        _log.error("dex_discovery_watchdog_invalid_configuration", error=config_error)
+        _log.error(f"{event_prefix}_invalid_configuration", error=config_error)
         print(json.dumps({"status": "invalid_configuration", "error": config_error}))
         return 1
 
     if not _is_enabled(args.enabled):
-        _log.info("dex_discovery_watchdog_disabled_noop")
+        _log.info(f"{event_prefix}_disabled_noop")
         print(json.dumps({"status": "disabled_noop"}))
         return 0
     if not _is_enabled(args.discovery_enabled):
         # The lane is intentionally OFF: a liveness page here would represent
         # disablement as failure. Clean exit, no page, explicit status.
-        _log.info("dex_discovery_watchdog_not_armed_discovery_disabled")
+        _log.info(f"{event_prefix}_not_armed_discovery_disabled")
         print(json.dumps({"status": "not_armed_discovery_disabled"}))
         return 0
     if not Path(args.db).exists():
-        _log.error("dex_discovery_watchdog_db_missing", db=args.db)
+        _log.error(f"{event_prefix}_db_missing", db=args.db)
         print(json.dumps({"status": "error", "error": "db_missing"}))
         return 1
 
     now = datetime.now(timezone.utc)
     try:
         check = asyncio.run(
-            _read_state(args.db, now, args.staleness_hours, args.clock_skew_seconds)
+            _read_state(
+                args.db, now, args.staleness_hours, args.clock_skew_seconds, args.source
+            )
         )
     except Exception as exc:  # runtime error → exit 1, never a silent 0
-        _log.error("dex_discovery_watchdog_runtime_error", error=str(exc))
+        _log.error(f"{event_prefix}_runtime_error", error=str(exc))
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 1
 
     _log.info(
-        "dex_discovery_watchdog_check",
+        f"{event_prefix}_check",
         **{k: v for k, v in check.items() if k != "check"},
     )
 
@@ -382,13 +398,16 @@ def main(argv: list[str] | None = None) -> int:
         return 5
 
     # Non-blocking lock so concurrent invocations cannot double-send.
+    # Sending is deployed on Linux; read-only checks also run on Windows.
+    import fcntl
+
     lock_dir = Path(args.state_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_fh = open(lock_dir / "lock", "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        _log.info("dex_discovery_watchdog_lock_held_skipping")
+        _log.info(f"{event_prefix}_lock_held_skipping")
         print(json.dumps({"status": "lock_held_skipped"}))
         lock_fh.close()
         return 0
@@ -398,21 +417,21 @@ def main(argv: list[str] | None = None) -> int:
             args.state_dir, now, args.cooldown_hours, args.clock_skew_seconds
         ):
             _log.info(
-                "dex_discovery_watchdog_alert_suppressed_by_cooldown",
+                f"{event_prefix}_alert_suppressed_by_cooldown",
                 check=_CHECK_KEY,
             )
             print(json.dumps({"status": "breach_cooldown_suppressed", "check": check}))
             return 5
-        _log.info("dex_discovery_watchdog_alert_dispatched", chars=len(message))
+        _log.info(f"{event_prefix}_alert_dispatched", chars=len(message))
         try:
             asyncio.run(_send_via_alerter(message))
         except Exception as exc:
             # Send failure: log + exit 1; cooldown state NOT written, so the
             # next run re-alerts instead of going quiet for a full window.
-            _log.error("dex_discovery_watchdog_alert_failed", error=str(exc))
+            _log.error(f"{event_prefix}_alert_failed", error=str(exc))
             print(json.dumps({"status": "error", "error": "alert_dispatch_failed"}))
             return 1
-        _log.info("dex_discovery_watchdog_alert_delivered")
+        _log.info(f"{event_prefix}_alert_delivered")
         _write_cooldown_state(args.state_dir, now)
         print(json.dumps({"status": "breach_paged", "check": check}))
         return 5
