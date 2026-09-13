@@ -17,9 +17,49 @@ an outage verdict. Measure actual poll p50/p95 duration and launch rows/hour
 after activation; do not infer them from retrospective event counts.
 
 `RH_PONS_POLL_TIMEOUT_SEC` defaults to 30 seconds (valid range 1–300).
-The main pipeline cancels a stalled RH pass at that deadline and continues
-ordinary candidate processing. Incomplete coverage is retried from its durable
-checkpoint; a timeout is not a successful heartbeat.
+Capture runs as a dedicated worker (`run_rh_pons_loop`), spawned by the
+pipeline only when `RH_PONS_COLLECTOR_ENABLED=true`; the detection cycle makes
+no RH calls. Each pass is cancelled at the deadline. Incomplete coverage is
+retried from its durable checkpoint; a timeout is not a successful heartbeat.
+The worker never exits while enabled and is cancelled with the other workers
+at shutdown.
+
+Loop control (all in memory; a restart re-derives it):
+
+- The window starts at `RH_PONS_MIN_SCAN_SPAN_BLOCKS` (default 100, capped at
+  `RH_PONS_BACKFILL_BLOCK_SPAN`) and doubles after a pass that stayed behind
+  the head in under half its deadline, up to `RH_PONS_BACKFILL_BLOCK_SPAN`.
+- A pass that did not reach its starting head is followed immediately. The
+  loop sleeps `RH_PONS_IDLE_SLEEP_SEC` (default 2) only after reaching that
+  head, or when the provider head is behind the checkpoint.
+- Timeouts, failures and HTTP 429 halve the window toward its floor and back
+  off exponentially up to `RH_PONS_FAILURE_BACKOFF_MAX_SEC` (default 60),
+  honouring a numeric Retry-After within that ceiling. Refusals (no URL, no
+  verified deployment, chain mismatch) back off without shrinking.
+- With no checkpoint, the first coverage start is pinned for the process, so
+  a failed or shrunken cold-start retry never skips launches. A restart before
+  the first completed pass derives it again from the then-current head.
+- A provider head below the checkpoint never moves coverage backwards.
+
+Transports:
+
+- Headers are read in strict JSON-RPC batches of `RH_PONS_HEADER_BATCH_SIZE`
+  (default 50, at most two POSTs in flight). Duplicate, bool or unknown ids,
+  per-item errors, wrong heights and invalid hash/timestamp fail the pass;
+  they never downgrade the transport. Only an explicit refusal (HTTP
+  400/404/405/413/415/501 or a top-level JSON-RPC error object other than
+  throttling) falls back to single requests, eight in flight, for the rest of
+  the process. Reorg anchor, per-log hash and final-block checks are unchanged.
+- `RH_PONS_TOPIC_ONLY_TRADE_QUERY=true` (default) fetches CurveBuy/CurveSell by
+  topic in one query per pass and checks each emitter against known curves
+  (indexed lookup for returned emitters, curves launched in the pass, and
+  curves referenced by overlap evidence) before decoding. Other emitters are
+  counted as `excluded_foreign_logs` and never recorded. Setting it false
+  restores address-batched queries, whose RPC count grows with every known
+  curve.
+- Projection repair is scoped to the log identities a pass processed; the
+  full rebuild remains available as `reconcile_curve_launch_projection`
+  without `identities` for diagnostics.
 
 The existing watchdog supports `--source rh_pons`; it reads the DB read-only,
 uses the RH heartbeat and discovery table, and reports missing/stale/invalid
@@ -70,11 +110,33 @@ subsequent restarts resume the durable checkpoint. Historical backfill should
 use a separate evidence DB and cannot qualify as real-time capture. The
 watchdog deliberately reports its lag until it catches up.
 
-Capacity limits still matter: active ungraduated curves accumulate, and
-projection reconciliation reads retained evidence. Measure sustained scans
-and latency as the dataset grows before enabling a production observation
-lane. A tiny successful sample proves transport and decoding, not capacity
-or signal quality.
+Capacity limits still matter. Topic-only trade queries and identity-scoped
+projection repair keep per-pass work tied to the blocks and events scanned,
+not to accumulated curves or history, but that has only been pinned by
+fixture tests. A tiny successful sample proves transport and decoding, not
+capacity or signal quality.
+
+## Capacity acceptance (before observation activation)
+
+Run `investigation/rh_pons_sustained_capacity_probe_20260913.py` on the target
+host with its temporary database. It uses in-code settings, never `.env`, and
+reports quota as unknown (it does not load-test to 429). Judge two phases
+separately, over the same monotonic windows:
+
+- **Backlog drain** (finite cold-start backlog): unique coverage, excluding
+  the reorg overlap, must reach at least 1.2x the chain rate measured over the
+  same window, until completion-time lag is within the catch-up threshold.
+- **Steady state** (passes after catch-up): new blocks cannot be covered faster
+  than they arrive, so do not apply the 1.2x ratio. Require completion-time lag
+  p50 <= 50 and p95 <= 150 blocks, timeouts <= 1% of passes and zero checkpoint
+  regressions over a pre-registered pass count (default 300).
+- **Real-time event delay**: `observed_at - event_time` p50 <= 10 s and
+  p95 <= 30 s, counting only events in blocks after the catch-up head.
+  Backfilled events never count. Block timestamps have 1 s resolution.
+
+Record the JSON report with the endpoint class, pass count and RPC calls per
+minute. A throttled probe (repeated 429s) is a provider-capacity finding, not
+a collector pass.
 
 Run `scripts/compare_discovery_latency.py --db <captured-db>` over observations
 captured by the running lanes. Use the paired sample count and RH advantage on

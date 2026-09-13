@@ -139,9 +139,7 @@ async def test_scoped_repair_graduation_removed_by_null_marker(db):
     # Only the marker's identity is passed: it carries no token of its own.
     await marker(db, "reorg_removed", "old", tx="grad", block_number=11)
     await assert_scoped_matches_full(db, [("grad", 0)], {"token"})
-    assert (await db.get_curve_launch(CHAIN, "token"))[
-        "lifecycle_status"
-    ] == "on_curve"
+    assert (await db.get_curve_launch(CHAIN, "token"))["lifecycle_status"] == "on_curve"
 
 
 async def test_scoped_repair_includes_old_and_new_token_on_replacement(db):
@@ -158,7 +156,9 @@ async def test_scoped_repair_includes_old_and_new_token_on_replacement(db):
     )
     await event(db, block_hash="new", token_address="token_b", curve_address="curve_b")
     await assert_scoped_matches_full(db, [("tx", 0)], {"token_a", "token_b"})
-    assert (await db.get_curve_launch(CHAIN, "token_a"))["lifecycle_status"] == "unknown"
+    assert (await db.get_curve_launch(CHAIN, "token_a"))[
+        "lifecycle_status"
+    ] == "unknown"
     assert (await db.get_curve_launch(CHAIN, "token_b"))["curve_address"] == "curve_b"
 
 

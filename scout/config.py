@@ -582,6 +582,18 @@ class Settings(BaseSettings):
     # No checkpoint: recent capture defaults to one span; archival start is explicit.
     RH_PONS_INITIAL_LOOKBACK_BLOCKS: int | None = Field(default=None, ge=1, le=100_000)
     RH_PONS_START_BLOCK: int | None = Field(default=None, ge=0)
+    # Dedicated collector loop (plan_rh_pons_sustained_capture_20260913). The
+    # adaptive window moves between MIN and RH_PONS_BACKFILL_BLOCK_SPAN (MIN is
+    # capped at that maximum); the loop sleeps only once a pass reaches the head
+    # it started from, or on failure.
+    RH_PONS_MIN_SCAN_SPAN_BLOCKS: int = Field(default=100, ge=1, le=100_000)
+    RH_PONS_IDLE_SLEEP_SEC: float = Field(default=2.0, ge=0.1, le=300)
+    RH_PONS_FAILURE_BACKOFF_MAX_SEC: float = Field(default=60.0, ge=1, le=3600)
+    # JSON-RPC calls per batched header POST (at most two POSTs in flight).
+    RH_PONS_HEADER_BATCH_SIZE: int = Field(default=50, ge=1, le=100)
+    # Trade logs by event topic with indexed emitter membership. False keeps the
+    # address-batched query, whose RPC count grows with every known curve.
+    RH_PONS_TOPIC_ONLY_TRADE_QUERY: bool = True
 
     # Database
     DB_PATH: Path = Path("scout.db")
