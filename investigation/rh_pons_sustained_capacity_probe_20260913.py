@@ -1,21 +1,24 @@
 """Isolated sustained-capacity probe for the RH/Pons capture loop.
 
 Runs the real ``run_rh_pons_loop`` against a public RPC with a TEMPORARY
-database and in-code settings. It never reads ``.env``, production config or
-the production DB, never writes outside its temp directory, sends no alerts
-and places no trades. Read-only JSON-RPC methods only (the collector's own).
+database. Settings come ONLY from in-code values (no ``.env`` and no process
+environment variables), never the production DB; no alerts, no trades.
+Read-only JSON-RPC methods only (the collector's own).
 
 Phases, measured separately:
 1. Drain: a finite cold-start backlog (``--backlog-blocks``) is scanned until
    completion-time lag is <= ``--catchup-lag``. Only here must unique coverage
-   exceed the chain rate (>= 1.2x over the same monotonic window).
+   exceed the chain rate (>= 1.2x), with chain growth measured from the first
+   head the probe observed.
 2. Steady state: passes after catch-up. Coverage cannot outpace block
-   arrival here, so lag p50/p95 and event delay are the measures. Only events
-   in blocks after the catch-up head count toward real-time delay; backfilled
-   samples never do.
+   arrival here, so lag p50/p95, failed/throttled passes and event delay are
+   the measures. Only events in blocks after the catch-up HEAD count toward
+   real-time delay; backfilled samples never do.
 
-Quota is unknown and NOT probed. The loop backs off on 429; the probe stops
-after ``--stop-after-rate-limits`` throttled passes and reports it.
+Every report carries an overall ``verdict`` (pass | fail | inconclusive) and an
+explicit ``stop_reason``. A run that never catches up, or stops on repeated
+429s, is a FAIL. Quota is unknown and NOT probed: the probe stops after
+``--stop-after-rate-limits`` throttled passes or ``--max-rpc-calls``.
 
 Run on the host (native shell), from the repo root:
     python investigation/rh_pons_sustained_capacity_probe_20260913.py \
@@ -28,9 +31,11 @@ import argparse
 import asyncio
 import json
 import math
+import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +49,24 @@ from scout.ingestion import rh_pons  # noqa: E402
 
 PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com"
 REAL_TIME_EVENTS = ("token_launched", "curve_buy", "curve_sell", "pool_graduated")
+FAILED_STATUSES = ("failed", "timeout", "error", "refused")
+
+
+class IsolatedSettings(Settings):
+    """Settings from init values only: no .env and no process environment,
+    so an operator shell export (for example RH_PONS_START_BLOCK) cannot
+    redirect the probe."""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        return (init_settings,)
 
 
 def redact(url: str) -> str:
@@ -62,8 +85,7 @@ def percentile(values: list[float], pct: float) -> float | None:
 
 
 def build_settings(args: argparse.Namespace) -> Settings:
-    return Settings(
-        _env_file=None,
+    return IsolatedSettings(
         TELEGRAM_BOT_TOKEN="unused",
         TELEGRAM_CHAT_ID="unused",
         ANTHROPIC_API_KEY="unused",
@@ -71,6 +93,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         RH_PONS_COLLECTOR_ENABLED=True,
         RH_PONS_RPC_URL=args.rpc_url,
         RH_PONS_INITIAL_LOOKBACK_BLOCKS=args.backlog_blocks,
+        RH_PONS_START_BLOCK=None,
         RH_PONS_BACKFILL_BLOCK_SPAN=args.max_span,
         RH_PONS_MIN_SCAN_SPAN_BLOCKS=args.min_span,
         RH_PONS_HEADER_BATCH_SIZE=args.header_batch_size,
@@ -82,6 +105,38 @@ def build_settings(args: argparse.Namespace) -> Settings:
         RH_PONS_RPC_BURST_CALLS=args.rpc_burst,
         RH_PONS_MAX_HEADERS_PER_PASS=args.max_headers_per_pass,
     )
+
+
+def effective_settings(settings: Settings) -> dict[str, Any]:
+    """Every RH setting the run actually used (URL redacted)."""
+    values = {
+        key: value
+        for key, value in settings.model_dump().items()
+        if key.startswith("RH_PONS_")
+    }
+    values["RH_PONS_RPC_URL"] = redact(settings.RH_PONS_RPC_URL)
+    values["SQLITE_BUSY_TIMEOUT_MS"] = settings.SQLITE_BUSY_TIMEOUT_MS
+    return values
+
+
+def read_durable_checkpoint(db_path: Path) -> dict[str, Any] | None:
+    """The primary deployment's committed checkpoint, read independently."""
+    deployment = rh_pons.active_deployment()
+    if deployment is None or not Path(db_path).exists():
+        return None
+    try:
+        uri = f"file:{Path(db_path).as_posix()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            row = conn.execute(
+                "SELECT next_block, head_block, updated_at FROM curve_scan_checkpoints "
+                "WHERE chain_id=? AND protocol=? AND factory=?",
+                (deployment.chain_id, deployment.version, deployment.factory.lower()),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return {"next_block": row[0], "head_block": row[1], "updated_at": row[2]}
 
 
 def real_time_cutoff(catchup: dict | None) -> int | None:
@@ -129,9 +184,6 @@ def backup_isolated_db(source: Path, target: Path) -> dict[str, Any]:
     Refuses to overwrite anything, so it cannot clobber an existing (for
     example production) database. The copy is integrity-checked.
     """
-    import sqlite3
-    from contextlib import closing
-
     target = target.resolve()
     if target.exists():
         raise FileExistsError(f"refusing to overwrite {target}")
@@ -147,23 +199,41 @@ def backup_isolated_db(source: Path, target: Path) -> dict[str, Any]:
     return {"path": str(target), "integrity": integrity, "events": events}
 
 
+def stop_reason_for(
+    results: list[dict], catchup: dict | None, args: argparse.Namespace, timed_out: bool
+) -> str:
+    """The limit that actually ended the run, most severe first."""
+    if sum(1 for r in results if r["rate_limited"]) >= args.stop_after_rate_limits:
+        return "rate_limited"
+    max_calls = getattr(args, "max_rpc_calls", None)
+    if max_calls is not None and sum(r["rpc_calls"] for r in results) >= max_calls:
+        return "max_rpc_calls"
+    steady = 0 if catchup is None else len(results) - catchup["index"] - 1
+    if steady >= args.steady_passes:
+        return "steady_target"
+    if len(results) >= args.max_passes:
+        return "max_passes"
+    return "max_seconds" if timed_out else "not_stopped"
+
+
 def summarize(results: list[dict], started: float, catchup: dict | None) -> dict:
     completed = [r for r in results if r["status"] == "completed"]
     statuses: dict[str, int] = {}
     for r in results:
         statuses[r["status"]] = statuses.get(r["status"], 0) + 1
-    regressions = sum(
-        1
-        for prev, cur in zip(completed, completed[1:])
-        if cur["to_block"] is not None
-        and prev["to_block"] is not None
-        and cur["to_block"] < prev["to_block"]
-    )
+    durable = [
+        r["durable_next_block"]
+        for r in results
+        if r.get("durable_next_block") is not None
+    ]
+    regressions = sum(1 for prev, cur in zip(durable, durable[1:]) if cur < prev)
     out: dict[str, Any] = {
         "passes": len(results),
         "statuses": statuses,
+        "durable_checkpoint_samples": len(durable),
         "checkpoint_regressions": regressions,
         "rate_limited_passes": sum(1 for r in results if r["rate_limited"]),
+        "failed_passes": sum(1 for r in results if r["status"] in FAILED_STATUSES),
         "rpc_calls": sum(r["rpc_calls"] for r in results),
         "truncated_passes": sum(1 for r in results if r.get("truncated")),
         "rpc_s_total": round(sum(r.get("rpc_s", 0.0) for r in results), 3),
@@ -175,11 +245,13 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
     first = completed[0] if completed else None
     if first is None:
         return out
-    initial_backlog = first["start_head"] - first["from_block"] + 1
-    out["initial_backlog_blocks"] = initial_backlog
+    out["initial_backlog_blocks"] = first["start_head"] - first["from_block"] + 1
+    # Chain growth from the FIRST head observed by any pass: early failures
+    # must not shrink the chain side of the drain ratio.
+    first_head = next(r["start_head"] for r in results if r["start_head"] is not None)
     if catchup is not None:
         window = catchup["t"] - started
-        chain = catchup["head"] - first["start_head"]
+        chain = catchup["head"] - first_head
         covered = sum(r["new_blocks"] for r in results[: catchup["index"] + 1])
         out["drain"] = {
             "seconds": round(window, 3),
@@ -190,10 +262,8 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
                 round(covered / chain, 3) if chain > 0 else None
             ),
         }
-        steady = [
-            r for r in results[catchup["index"] + 1 :] if r["status"] == "completed"
-        ]
         steady_all = results[catchup["index"] + 1 :]
+        steady = [r for r in steady_all if r["status"] == "completed"]
         if steady:
             last = steady[-1]
             span_s = last["completed_monotonic"] - catchup["t"]
@@ -201,6 +271,11 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
             out["steady"] = {
                 "completed_passes": len(steady),
                 "passes": len(steady_all),
+                "failed_passes": sum(
+                    1 for r in steady_all if r["status"] in FAILED_STATUSES
+                ),
+                "rate_limited_passes": sum(1 for r in steady_all if r["rate_limited"]),
+                "timeouts": sum(1 for r in steady_all if r["status"] == "timeout"),
                 "seconds": round(span_s, 3),
                 "chain_blocks_per_s": (
                     round((last["completion_head"] - catchup["head"]) / span_s, 3)
@@ -221,7 +296,6 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
                 "pass_duration_p95_s": percentile(
                     [r["duration_s"] for r in steady], 95
                 ),
-                "timeouts": sum(1 for r in steady_all if r["status"] == "timeout"),
                 "rpc_calls_per_min": (
                     round(sum(r["rpc_calls"] for r in steady_all) / span_s * 60, 1)
                     if span_s > 0
@@ -238,24 +312,50 @@ def summarize(results: list[dict], started: float, catchup: dict | None) -> dict
     return out
 
 
-def evaluate(summary: dict, delays: dict, min_steady: int) -> dict:
+def evaluate(
+    summary: dict,
+    delays: dict,
+    min_steady: int,
+    stop_reason: str | None = None,
+    max_rpc_calls_per_min: float | None = None,
+) -> dict:
+    """Criteria plus one overall verdict; missing evidence is never a pass."""
     verdict: dict[str, Any] = {}
+    failures: list[str] = []
+    inconclusive: list[str] = []
+    if stop_reason == "rate_limited":
+        failures.append("stopped_on_rate_limits")
     drain = summary.get("drain")
-    verdict["drain_ratio_ge_1_2"] = (
-        None
-        if not drain or drain["coverage_to_chain_ratio"] is None
-        else drain["coverage_to_chain_ratio"] >= 1.2
-    )
+    if not drain or drain.get("coverage_to_chain_ratio") is None:
+        verdict["drain_ratio_ge_1_2"] = False
+        failures.append("backlog_not_drained")
+    else:
+        verdict["drain_ratio_ge_1_2"] = drain["coverage_to_chain_ratio"] >= 1.2
+        if not verdict["drain_ratio_ge_1_2"]:
+            failures.append("drain_ratio_below_1_2")
     steady = summary.get("steady")
     if not steady or steady["completed_passes"] < min_steady:
         verdict["steady_state"] = "not_evaluated_insufficient_passes"
+        inconclusive.append("insufficient_steady_passes")
     else:
-        verdict["lag_p50_le_50"] = steady["lag_blocks_p50"] <= 50
-        verdict["lag_p95_le_150"] = steady["lag_blocks_p95"] <= 150
-        verdict["timeouts_le_1pct"] = steady["timeouts"] <= 0.01 * steady["passes"]
+        checks = {
+            "lag_p50_le_50": steady["lag_blocks_p50"] <= 50,
+            "lag_p95_le_150": steady["lag_blocks_p95"] <= 150,
+            "failed_passes_le_1pct": steady.get("failed_passes", 0)
+            <= 0.01 * steady["passes"],
+            "no_rate_limited_passes": steady.get("rate_limited_passes", 0) == 0,
+        }
+        if max_rpc_calls_per_min is not None:
+            checks["rpc_calls_per_min_within_budget"] = (
+                steady.get("rpc_calls_per_min") is not None
+                and steady["rpc_calls_per_min"] <= max_rpc_calls_per_min
+            )
+        verdict.update(checks)
+        failures.extend(name for name, ok in checks.items() if not ok)
     bad_clocks = delays.get("invalid_clock", 0) + delays.get("negative_delay", 0)
     if delays.get("samples", 0) == 0 and bad_clocks == 0:
         verdict["event_delay"] = "not_evaluated_no_real_time_samples"
+        inconclusive.append("no_real_time_samples")
     else:
         verdict["event_clocks_valid"] = bad_clocks == 0
         verdict["event_delay_p50_le_10s"] = (
@@ -264,7 +364,25 @@ def evaluate(summary: dict, delays: dict, min_steady: int) -> dict:
         verdict["event_delay_p95_le_30s"] = (
             delays.get("p95_s") is not None and delays["p95_s"] <= 30
         )
-    verdict["zero_checkpoint_regressions"] = summary["checkpoint_regressions"] == 0
+        failures.extend(
+            name
+            for name in (
+                "event_clocks_valid",
+                "event_delay_p50_le_10s",
+                "event_delay_p95_le_30s",
+            )
+            if not verdict[name]
+        )
+    verdict["zero_checkpoint_regressions"] = (
+        summary.get("checkpoint_regressions", 0) == 0
+    )
+    if not verdict["zero_checkpoint_regressions"]:
+        failures.append("checkpoint_regressed")
+    verdict["failures"] = failures
+    verdict["inconclusive"] = inconclusive
+    verdict["verdict"] = (
+        "fail" if failures else ("inconclusive" if inconclusive else "pass")
+    )
     return verdict
 
 
@@ -278,69 +396,75 @@ async def run(args: argparse.Namespace) -> dict:
     done = asyncio.Event()
     started = time.monotonic()
 
-    def observe(result: rh_pons._PassResult) -> None:
-        nonlocal catchup
-        row = {
-            "status": result.status,
-            "reason": result.reason,
-            "from_block": result.from_block,
-            "to_block": result.to_block,
-            "new_blocks": result.new_blocks,
-            "start_head": result.start_head,
-            "completion_head": result.completion_head,
-            "recorded_events": result.recorded_events,
-            "header_heights": result.header_heights,
-            "trade_logs": result.trade_logs,
-            "excluded_foreign_logs": result.excluded_foreign_logs,
-            "rpc_calls": result.rpc_calls,
-            "rate_limited": result.rate_limited,
-            "duration_s": result.duration_s,
-            "completed_monotonic": result.completed_monotonic,
-            "truncated": result.truncated,
-            "header_budget": result.header_budget,
-            "rpc_s": result.rpc_s,
-            "pacing_wait_s": result.pacing_wait_s,
-        }
-        results.append(row)
-        if (
-            catchup is None
-            and result.status == "completed"
-            and result.completion_head - result.to_block <= args.catchup_lag
-        ):
-            catchup = {
-                "index": len(results) - 1,
-                "t": result.completed_monotonic,
-                "head": result.completion_head,
-                "block": result.to_block,
-            }
-        steady = 0 if catchup is None else len(results) - catchup["index"] - 1
-        if (
-            steady >= args.steady_passes
-            or len(results) >= args.max_passes
-            or sum(1 for r in results if r["rate_limited"])
-            >= args.stop_after_rate_limits
-        ):
-            done.set()
-
     with tempfile.TemporaryDirectory(prefix="rh-pons-capacity-") as folder:
-        db = Database(Path(folder) / "isolated.db")
+        db_path = Path(folder) / "isolated.db"
+
+        def observe(result: rh_pons._PassResult) -> None:
+            nonlocal catchup
+            durable = read_durable_checkpoint(db_path)
+            results.append(
+                {
+                    "status": result.status,
+                    "reason": result.reason,
+                    "stage": result.stage,
+                    "from_block": result.from_block,
+                    "to_block": result.to_block,
+                    "new_blocks": result.new_blocks,
+                    "start_head": result.start_head,
+                    "completion_head": result.completion_head,
+                    "durable_next_block": durable["next_block"] if durable else None,
+                    "recorded_events": result.recorded_events,
+                    "header_heights": result.header_heights,
+                    "trade_logs": result.trade_logs,
+                    "excluded_foreign_logs": result.excluded_foreign_logs,
+                    "rpc_calls": result.rpc_calls,
+                    "rpc_responses": result.rpc_responses,
+                    "rate_limited": result.rate_limited,
+                    "duration_s": result.duration_s,
+                    "completed_monotonic": result.completed_monotonic,
+                    "truncated": result.truncated,
+                    "header_budget": result.header_budget,
+                    "rpc_s": result.rpc_s,
+                    "pacing_wait_s": result.pacing_wait_s,
+                }
+            )
+            if (
+                catchup is None
+                and result.status == "completed"
+                and result.completion_head - result.to_block <= args.catchup_lag
+            ):
+                catchup = {
+                    "index": len(results) - 1,
+                    "t": result.completed_monotonic,
+                    "head": result.completion_head,
+                    "block": result.to_block,
+                }
+            if (
+                stop_reason_for(results, catchup, args, timed_out=False)
+                != "not_stopped"
+            ):
+                done.set()
+
+        db = Database(db_path)
         await db.initialize()
         try:
             async with aiohttp.ClientSession(trust_env=True) as session:
                 task = asyncio.create_task(
                     rh_pons.run_rh_pons_loop(session, db, settings, on_pass=observe)
                 )
+                timed_out = False
                 try:
                     await asyncio.wait_for(done.wait(), args.max_seconds)
-                    stop_reason = "target_reached_or_limit"
                 except TimeoutError:
-                    stop_reason = "max_seconds"
+                    timed_out = True
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+            stop_reason = stop_reason_for(results, catchup, args, timed_out)
             summary = summarize(results, started, catchup)
+            final_checkpoint = read_durable_checkpoint(db_path)
             delays = await event_delays(db, real_time_cutoff(catchup))
             cur = await db._conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(execution_eligible), 0) "
@@ -351,33 +475,26 @@ async def run(args: argparse.Namespace) -> dict:
             (events,) = await cur.fetchone()
         finally:
             await db.close()
-        # The worker is cancelled and the connection closed before copying.
+        # The worker is cancelled and every connection closed before copying.
         backup = (
             None
             if args.db_output is None
-            else backup_isolated_db(Path(folder) / "isolated.db", args.db_output)
+            else backup_isolated_db(db_path, args.db_output)
         )
     return {
         "scope": "isolated_public_rpc_sustained_capacity",
-        "production_mutated": False,
+        "isolation": {
+            "database": "temporary_directory",
+            "settings_sources": "in_code_init_only",
+            "reads_dotenv_or_environment": False,
+        },
         "endpoint": redact(args.rpc_url),
         "quota": "unknown_not_probed",
         "stop_reason": stop_reason,
-        "config": {
-            "backlog_blocks": args.backlog_blocks,
-            "min_span": args.min_span,
-            "max_span": args.max_span,
-            "header_batch_size": args.header_batch_size,
-            "idle_sleep_s": args.idle_sleep,
-            "pass_timeout_s": args.pass_timeout,
-            "catchup_lag_blocks": args.catchup_lag,
-            "rpc_calls_per_sec": args.rpc_calls_per_sec,
-            "rpc_min_calls_per_sec": args.rpc_min_calls_per_sec,
-            "rpc_burst_calls": args.rpc_burst,
-            "max_headers_per_pass": args.max_headers_per_pass,
-        },
+        "effective_settings": effective_settings(settings),
         "catchup": catchup,
         "real_time_cutoff_head": real_time_cutoff(catchup),
+        "final_durable_checkpoint": final_checkpoint,
         "isolated_db_backup": backup,
         "summary": summary,
         "real_time_event_delay": delays,
@@ -386,7 +503,13 @@ async def run(args: argparse.Namespace) -> dict:
             "launches": launches,
             "execution_eligible": eligible,
         },
-        "acceptance": evaluate(summary, delays, args.min_steady_passes),
+        "acceptance": evaluate(
+            summary,
+            delays,
+            args.min_steady_passes,
+            stop_reason,
+            args.max_rpc_calls_per_min,
+        ),
         "passes": results if args.include_passes else None,
     }
 
@@ -396,6 +519,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--rpc-url", default=PUBLIC_RPC)
     p.add_argument("--max-seconds", type=float, default=900)
     p.add_argument("--max-passes", type=int, default=5000)
+    p.add_argument("--max-rpc-calls", type=int, default=10_000)
+    p.add_argument("--max-rpc-calls-per-min", type=float, default=None)
     p.add_argument("--steady-passes", type=int, default=300)
     p.add_argument("--min-steady-passes", type=int, default=100)
     p.add_argument("--backlog-blocks", type=int, default=3000)

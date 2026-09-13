@@ -58,5 +58,7 @@ No new dependencies.
 - [x] Live isolated smoke (Codex-run): backlog not drained, 3 of 7 passes throttled by 429 on header bursts
 - [x] Round 2: discriminating batch tests for both survivors; loop token-bucket pacer (logical-call cost, 429 halving, capped hold, recovery); per-pass header budget with exact prefix cutoff; timing instrumentation
 - [x] Round 2 runner: catch-up head cutoff, invalid/negative clock counting, `--db-output` isolated backup, pacing args
-- [ ] Codex native REQUEST 4: suites + 31-mutant run
-- [ ] Next live isolated probe only after review of the pacing change (not activation)
+- [x] Codex native REQUEST 4(a): 254 passed (31-mutant run pending in review worktree at 59dfc74c)
+- [x] Round 3 review fixes: owned collector connection + interleave/cancel-replay tests; batch transient vs refusal, 413 shrink; F1 throttle memory; F2 throttle classification + HTTP-date Retry-After; F3/F4 truthful isolated probe; F5/F6 attempt streak, minute SLO, gate mismatch, missing-URL log; F7 chain id per session; F8 timeout context; F9 docs
+- [ ] Codex native REQUEST 5 and re-review of the new head
+- [ ] Next live isolated probe only after the reviews clear (not activation)

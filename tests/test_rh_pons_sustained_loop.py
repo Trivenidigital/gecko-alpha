@@ -593,7 +593,8 @@ def test_window_adapts_within_bounds_and_failures_never_busy_loop(settings_facto
     assert state.span == 100
     caught_up = _PassResult("completed", start_head=500, to_block=500, duration_s=1)
     assert _after_pass(state, caught_up, settings) == 1
-    assert state.failures == 0 and state.span == 100
+    # Failures decay by one per completed pass instead of resetting (F1).
+    assert state.failures == 5 and state.span == 100
 
 
 def test_refusal_backs_off_without_shrinking_and_head_behind_idles(settings_factory):
@@ -627,6 +628,39 @@ def test_min_span_is_capped_at_configured_maximum(settings_factory):
     assert (state.span, state.min_span, state.max_span) == (10, 10, 10)
 
 
+class NullCollectorDb:
+    """Collector-owned DB stand-in for loop-control tests (records, no SQL)."""
+
+    def __init__(self, persisted=None):
+        self._conn = None
+        self.persisted = dict(persisted or {})
+        self.attempts = []
+        self.heads = []
+        self.closed = False
+
+    async def load_ingest_watchdog_state(self):
+        return dict(self.persisted)
+
+    async def upsert_ingest_watchdog_state(self, source, count):
+        self.attempts.append((source, count))
+
+    async def record_curve_scan_attempt_head(self, *args):
+        self.heads.append(args)
+
+    async def close(self):
+        self.closed = True
+
+
+def _use_owned_db(monkeypatch, owned=None):
+    owned = owned if owned is not None else NullCollectorDb()
+
+    async def open_owned(db, settings):
+        return owned
+
+    monkeypatch.setattr(rh_pons, "_open_collector_db", open_owned)
+    return owned
+
+
 async def _drive_loop(monkeypatch, settings, passes, *, stop_after_sleeps=1):
     sleeps, events, results = [], [], []
 
@@ -643,6 +677,7 @@ async def _drive_loop(monkeypatch, settings, passes, *, stop_after_sleeps=1):
 
     monkeypatch.setattr(rh_pons, "_sleep", fake_sleep)
     monkeypatch.setattr(rh_pons, "_scan_pass", fake_pass)
+    _use_owned_db(monkeypatch)
     monkeypatch.setattr(
         rh_pons.logger,
         "info",
@@ -760,12 +795,14 @@ async def test_loop_cancellation_during_idle_sleep_is_prompt(
         return _PassResult("completed", start_head=1, to_block=1, completion_head=1)
 
     monkeypatch.setattr(rh_pons, "_scan_pass", caught_up)
+    owned = _use_owned_db(monkeypatch)
     task = asyncio.create_task(rh_pons.run_rh_pons_loop(None, None, settings))
     await asyncio.wait_for(entered.wait(), 1)
     await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 1)
+    assert owned.closed  # the owned connection is closed on shutdown
 
 
 async def test_loop_disabled_returns_without_scanning(monkeypatch, settings_factory):

@@ -307,3 +307,25 @@ async def test_block_index_survives_reopen(tmp_path):
     )
     assert (await cur.fetchone())[0] == 1
     await second.close()
+
+
+async def test_attempt_head_raises_observed_head_without_touching_success_state(db):
+    await db.save_curve_scan_checkpoint(
+        CHAIN, PROTO, "0xFactory", 120, {"119": "h"}, head_block=125
+    )
+    before = await db.get_curve_scan_checkpoint(CHAIN, PROTO, "0xfactory")
+    await db.record_curve_scan_attempt_head(CHAIN, PROTO, "0xFACTORY", 900)
+    after = await db.get_curve_scan_checkpoint(CHAIN, PROTO, "0xfactory")
+    assert after["head_block"] == 900
+    for key in ("next_block", "updated_at", "block_hashes_json"):
+        assert after[key] == before[key]
+    await db.record_curve_scan_attempt_head(CHAIN, PROTO, "0xfactory", 500)
+    assert (await db.get_curve_scan_checkpoint(CHAIN, PROTO, "0xfactory"))[
+        "head_block"
+    ] == 900
+    await db.record_curve_scan_attempt_head(CHAIN, PROTO, "0xother", 1)
+    cur = await db._conn.execute("SELECT COUNT(*) FROM curve_scan_checkpoints")
+    assert (await cur.fetchone())[0] == 1
+    await db.save_curve_scan_checkpoint(CHAIN, "p2", "0xf2", 10, {})
+    await db.record_curve_scan_attempt_head(CHAIN, "p2", "0xf2", 50)
+    assert (await db.get_curve_scan_checkpoint(CHAIN, "p2", "0xf2"))["head_block"] == 50

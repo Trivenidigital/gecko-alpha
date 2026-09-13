@@ -572,6 +572,8 @@ class Settings(BaseSettings):
     # No default endpoint on purpose: the public RH RPC is documented as
     # rate-limited/non-production, and endpoint choice is an operator call.
     RH_PONS_RPC_URL: str = ""
+    # poll_once compatibility only: the dedicated loop ignores it. Reduce loop
+    # RPC load with RH_PONS_RPC_CALLS_PER_SEC / RH_PONS_IDLE_SLEEP_SEC instead.
     RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=1, ge=1, le=60)
     # Whole-poll budget: observe-only RPC/backfill must not stall live lanes.
     RH_PONS_POLL_TIMEOUT_SEC: float = Field(default=30, ge=1, le=300)
@@ -606,6 +608,16 @@ class Settings(BaseSettings):
     # half the remaining pass deadline). A pass that would exceed it covers the
     # largest block prefix that fits instead of failing on a throttled burst.
     RH_PONS_MAX_HEADERS_PER_PASS: int = Field(default=80, ge=1, le=10_000)
+    # Watchdog knobs read by scripts/rh-pons-watchdog.sh from .env; declared here
+    # so those .env lines cannot break Settings(extra="forbid"). Only the
+    # watchdog consumes them. Staleness is in MINUTES: the collector passes every
+    # few seconds, so an hours-scale SLO would hide a stalled lane.
+    RH_PONS_POLL_STALENESS_ALERT_MINUTES: int = Field(default=10, ge=1, le=10_080)
+    RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES: int = Field(default=10, ge=1, le=10_000)
+    RH_PONS_MAX_HEAD_LAG_BLOCKS: int = Field(default=2000, ge=0, le=10_000_000)
+    RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS: int = Field(default=300, ge=0, le=3600)
+    RH_PONS_WATCHDOG_COOLDOWN_HOURS: float = Field(default=24.0, gt=0, le=168)
+    RH_PONS_WATCHDOG_STATE_DIR: str = "/var/lib/gecko-alpha/rh-pons-watchdog"
 
     # Database
     DB_PATH: Path = Path("scout.db")

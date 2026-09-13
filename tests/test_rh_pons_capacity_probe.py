@@ -192,3 +192,135 @@ def test_summary_reports_pacing_and_truncation():
     assert summary["truncated_passes"] == 1
     assert (summary["rpc_s_total"], summary["pacing_wait_s_total"]) == (1.5, 0.5)
     assert summary["duration_s_total"] == 3.0
+
+
+def test_settings_ignore_process_environment(monkeypatch):
+    monkeypatch.setenv("RH_PONS_START_BLOCK", "1")
+    monkeypatch.setenv("RH_PONS_REORG_OVERLAP_BLOCKS", "99")
+    monkeypatch.setenv("SQLITE_BUSY_TIMEOUT_MS", "5")
+    monkeypatch.setenv("RH_PONS_RPC_URL", "https://leaked.example/key/SECRET")
+    settings = probe.build_settings(probe.parse_args([]))
+    assert settings.RH_PONS_START_BLOCK is None
+    assert settings.RH_PONS_REORG_OVERLAP_BLOCKS == 12
+    assert settings.SQLITE_BUSY_TIMEOUT_MS != 5
+    assert settings.RH_PONS_RPC_URL == probe.PUBLIC_RPC
+    effective = probe.effective_settings(settings)
+    assert effective["RH_PONS_START_BLOCK"] is None
+    assert effective["RH_PONS_RPC_URL"] == "https://rpc.mainnet.chain.robinhood.com"
+
+
+def test_throttled_smoke_is_reported_as_failure_with_true_stop_reason():
+    smoke = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "investigation"
+            / "rh_capacity_smoke_throttled_20260913.json"
+        ).read_text(encoding="utf-8")
+    )
+    rows = smoke["passes"]
+    args = probe.parse_args([])
+    assert probe.stop_reason_for(rows, None, args, timed_out=False) == "rate_limited"
+    summary = probe.summarize(rows, rows[0]["completed_monotonic"] - 10, None)
+    verdict = probe.evaluate(summary, {"samples": 0}, 100, "rate_limited")
+    assert verdict["verdict"] == "fail"
+    assert "stopped_on_rate_limits" in verdict["failures"]
+    assert "backlog_not_drained" in verdict["failures"]
+    assert verdict["drain_ratio_ge_1_2"] is False
+
+
+@pytest.mark.parametrize(
+    "rows,catchup,timed_out,expected",
+    [
+        ([{"rate_limited": False, "rpc_calls": 10}] * 3, None, True, "max_seconds"),
+        (
+            [{"rate_limited": False, "rpc_calls": 5000}] * 2,
+            None,
+            False,
+            "max_rpc_calls",
+        ),
+        (
+            [{"rate_limited": False, "rpc_calls": 1}] * 302,
+            {"index": 1},
+            False,
+            "steady_target",
+        ),
+        ([{"rate_limited": False, "rpc_calls": 1}] * 2, None, False, "not_stopped"),
+    ],
+)
+def test_stop_reasons_are_explicit(rows, catchup, timed_out, expected):
+    args = probe.parse_args([])
+    assert probe.stop_reason_for(rows, catchup, args, timed_out) == expected
+
+
+async def test_durable_checkpoint_is_read_from_disk_and_regressions_counted(tmp_path):
+    from scout.ingestion.rh_pons import active_deployment
+
+    path = tmp_path / "durable.db"
+    database = Database(path)
+    await database.initialize()
+    dep = active_deployment()
+    await database.save_curve_scan_checkpoint(
+        dep.chain_id, dep.version, dep.factory, 150, {}, head_block=160
+    )
+    await database.close()
+    assert probe.read_durable_checkpoint(path)["next_block"] == 150
+    assert probe.read_durable_checkpoint(tmp_path / "absent.db") is None
+    base = {
+        "status": "completed",
+        "rate_limited": False,
+        "rpc_calls": 1,
+        "duration_s": 1.0,
+        "new_blocks": 1,
+        "from_block": 1,
+        "to_block": 2,
+        "start_head": 2,
+    }
+    rows = [dict(base, durable_next_block=n) for n in (101, 150, 120, 160)]
+    assert probe.summarize(rows, 0.0, None)["checkpoint_regressions"] == 1
+
+
+def _good_summary(**steady_overrides):
+    steady = {
+        "completed_passes": 300,
+        "passes": 300,
+        "failed_passes": 0,
+        "rate_limited_passes": 0,
+        "timeouts": 0,
+        "lag_blocks_p50": 20,
+        "lag_blocks_p95": 90,
+        "rpc_calls_per_min": 300.0,
+    }
+    steady.update(steady_overrides)
+    return {
+        "checkpoint_regressions": 0,
+        "drain": {"coverage_to_chain_ratio": 1.5},
+        "steady": steady,
+    }
+
+
+GOOD_DELAYS = {"samples": 50, "p50_s": 4.0, "p95_s": 12.0, "invalid_clock": 0}
+
+
+def test_complete_evidence_passes_and_failed_steady_passes_fail():
+    assert (
+        probe.evaluate(_good_summary(), GOOD_DELAYS, 100, "steady_target")["verdict"]
+        == "pass"
+    )
+    failing = probe.evaluate(
+        _good_summary(failed_passes=10, rate_limited_passes=2),
+        GOOD_DELAYS,
+        100,
+        "steady_target",
+    )
+    assert failing["verdict"] == "fail"
+    assert {"failed_passes_le_1pct", "no_rate_limited_passes"} <= set(
+        failing["failures"]
+    )
+    budget = probe.evaluate(
+        _good_summary(), GOOD_DELAYS, 100, "steady_target", max_rpc_calls_per_min=100
+    )
+    assert "rpc_calls_per_min_within_budget" in budget["failures"]
+    thin = probe.evaluate(
+        _good_summary(completed_passes=5), GOOD_DELAYS, 100, "max_seconds"
+    )
+    assert thin["verdict"] == "inconclusive"

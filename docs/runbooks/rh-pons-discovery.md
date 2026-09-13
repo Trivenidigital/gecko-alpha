@@ -10,8 +10,9 @@ verification and RPC access have passed the live read checks below.
 An empty but fully completed scan updates it; failed or partial scans must not.
 The generic ingestion starvation watchdog must not refresh it on restart.
 
-Provisional liveness SLO: at least one completed scan per hour while enabled.
-Poll cadence should be comfortably inside that limit. A quiet launch market
+Provisional liveness SLO: a completed scan within
+`RH_PONS_POLL_STALENESS_ALERT_MINUTES` (default 10) while enabled, and fewer
+than `RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES` consecutive unsuccessful passes. A quiet launch market
 can yield zero new event/discovery rows, so row age is diagnostic rather than
 an outage verdict. Measure actual poll p50/p95 duration and launch rows/hour
 after activation; do not infer them from retrospective event counts.
@@ -23,6 +24,21 @@ no RH calls. Each pass is cancelled at the deadline. Incomplete coverage is
 retried from its durable checkpoint; a timeout is not a successful heartbeat.
 The worker never exits while enabled and is cancelled with the other workers
 at shutdown.
+
+The worker reads and writes through its OWN SQLite connection to the pipeline
+database, closed at shutdown. The shared pipeline connection is used by
+writers that open bare transactions (chains tracker), so a collector commit
+there could make their half-finished work durable, and their rollback could
+discard collector evidence. The owned connection waits at most half the pass
+deadline for the write lock; contention fails the pass, which retries. After
+any unsuccessful pass, and before every pass, uncommitted work on the owned
+connection is rolled back, so a write cancelled by the deadline is replayed
+from the checkpoint rather than committed piecemeal or left holding a lock.
+
+`RH_PONS_POLL_EVERY_N_CYCLES` affects only the `poll_once` compatibility
+entry point; the loop ignores it. Reduce loop RPC load with
+`RH_PONS_RPC_CALLS_PER_SEC` or `RH_PONS_IDLE_SLEEP_SEC`. The loop verifies the
+chain id once per session and again after any unsuccessful pass.
 
 Loop control (all in memory; a restart re-derives it):
 
@@ -96,11 +112,33 @@ python scripts/dex_discovery_watchdog.py --source rh_pons --db scout.db --enable
 For Linux deployment, install `scripts/rh-pons-watchdog.sh` alongside the
 collector and invoke every five minutes through the existing scheduler.
 Set `RH_PONS_WATCHDOG_ENABLED=true` in the scheduler environment and
-`RH_PONS_COLLECTOR_ENABLED=true` in the pipeline environment only after
-activation review. The wrapper captures the watchdog gate before loading
-`.env`, so a stray `.env` line cannot arm it. Default watchdog gate is off.
-`RH_PONS_POLL_STALENESS_ALERT_HOURS=1` selects the provisional SLO;
-`RH_PONS_WATCHDOG_STATE_DIR` separates cooldown state from the DEX lane.
+`RH_PONS_COLLECTOR_ENABLED=true` in `.env` only after activation review. The
+flag must be in `.env`, which is where the wrapper reads the lane gate; a
+value set only in a systemd `Environment=` line reads as false there. If the
+gate reads false while the DB shows a heartbeat or attempt within the SLO, the
+watchdog breaches with `enabled_gate_mismatch` instead of silently disarming.
+The wrapper captures the watchdog gate before loading `.env`, so a stray
+`.env` line cannot arm it. Default watchdog gate is off.
+
+Watchdog knobs are Settings fields, so `.env` lines are valid:
+`RH_PONS_POLL_STALENESS_ALERT_MINUTES` (default 10; the collector passes
+every few seconds, so the SLO is in minutes),
+`RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES` (default 10),
+`RH_PONS_MAX_HEAD_LAG_BLOCKS`, `RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS`,
+`RH_PONS_WATCHDOG_COOLDOWN_HOURS` and `RH_PONS_WATCHDOG_STATE_DIR`. The
+earlier `RH_PONS_POLL_STALENESS_ALERT_HOURS` knob is replaced by minutes.
+
+Per-attempt health is separate from the success heartbeat:
+`ingest_watchdog_state.source='rh_pons_attempt'` holds the consecutive
+unsuccessful-pass streak and the last attempt time. The watchdog breaches with
+`attempt_failures_exceeded` once the streak reaches the limit, even while the
+success heartbeat is fresh. Unsuccessful passes also raise the checkpoint's
+`head_block` to the newest head observed, without touching `next_block` or
+`updated_at`, so a collector that keeps failing shows growing head lag instead
+of a frozen head. The generic ingestion watchdog never hydrates or persists
+either row. Enabling the collector without `RH_PONS_RPC_URL` logs
+`rh_pons_enabled_without_rpc_url` once at startup; every pass then records a
+failed attempt, so the streak check pages.
 The RH watchdog also requires a fresh checkpoint for the exact verified
 factory and a measured head. `RH_PONS_MAX_HEAD_LAG_BLOCKS` (default 2000)
 sets the maximum permitted `head_block - next_block + 1`. Missing head,

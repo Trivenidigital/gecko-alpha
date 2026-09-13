@@ -39,8 +39,9 @@ import json
 import re
 import time
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import aiohttp
@@ -664,10 +665,12 @@ async def advance_lifecycle(
 class _RpcStats:
     """Per-pass transport counters, shared with gathered child requests."""
 
-    __slots__ = ("calls", "rate_limited", "retry_after", "rpc_seconds")
+    __slots__ = ("calls", "responses", "rate_limited", "retry_after", "rpc_seconds")
 
     def __init__(self) -> None:
         self.calls = 0
+        #: Logical calls whose response body arrived (calls counts sends).
+        self.responses = 0
         self.rate_limited = False
         self.retry_after: float | None = None
         self.rpc_seconds = 0.0
@@ -774,6 +777,45 @@ def _add_rpc_seconds(seconds: float) -> None:
         stats.rpc_seconds += seconds
 
 
+def _count_rpc_responses(count: int) -> None:
+    stats = _RPC_STATS.get()
+    if stats is not None:
+        stats.responses += count
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """Retry-After as delta-seconds or an HTTP-date; None if absent/invalid."""
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        try:
+            when = parsedate_to_datetime(str(raw))
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    return value if value >= 0 else None
+
+
+def _is_throttle_error(error: Any) -> bool:
+    """A JSON-RPC error object that means throttling, not a bad request."""
+    code = error.get("code") if isinstance(error, dict) else None
+    return (
+        isinstance(code, int)
+        and not isinstance(code, bool)
+        and code in _RATE_LIMIT_ERROR_CODES
+    )
+
+
 def _note_rate_limit(status: int, headers: Any) -> None:
     """Record a 429 (and a numeric Retry-After) for pacing and loop backoff.
 
@@ -781,13 +823,7 @@ def _note_rate_limit(status: int, headers: Any) -> None:
     """
     if status != 429:
         return
-    retry_after = None
-    try:
-        value = float(headers.get("Retry-After"))
-        if value >= 0:
-            retry_after = value
-    except (AttributeError, TypeError, ValueError):
-        pass
+    retry_after = _retry_after_seconds(headers)
     stats = _RPC_STATS.get()
     if stats is not None:
         stats.rate_limited = True
@@ -817,12 +853,19 @@ async def _rpc(
                     "rh_pons_rpc_http_error", method=method, status=response.status
                 )
                 return None
+            retry_headers = response.headers
             payload = await response.json()
+            _count_rpc_responses(1)
         if (
             not isinstance(payload, dict)
             or "error" in payload
             or "result" not in payload
         ):
+            if isinstance(payload, dict) and _is_throttle_error(payload.get("error")):
+                # HTTP 200 carrying a JSON-RPC throttle error is still throttling.
+                _note_rate_limit(429, retry_headers)
+                logger.warning("rh_pons_rpc_rate_limited", method=method)
+                return None
             logger.warning("rh_pons_rpc_invalid_response", method=method)
             return None
         return payload["result"]
@@ -911,13 +954,21 @@ async def _fetch_block_headers(
 #: Batch POSTs in flight; total concurrent header calls <= 2 * batch size.
 _BATCH_POST_CONCURRENCY = 2
 #: HTTP statuses that mean the provider refuses the batch request shape.
-_BATCH_REFUSAL_STATUSES = frozenset({400, 404, 405, 413, 415, 501})
+#: 413 is not here: it means "too big", so the batch shrinks instead.
+_BATCH_REFUSAL_STATUSES = frozenset({400, 404, 405, 415, 501})
+#: Top-level JSON-RPC errors that refuse batching (invalid request, method
+#: not found). Any other top-level error is transient and keeps batching.
+_BATCH_REFUSAL_ERROR_CODES = frozenset({-32600, -32601})
 #: JSON-RPC error codes providers use for throttling, not batch refusal.
 _RATE_LIMIT_ERROR_CODES = frozenset({-32005, 429})
 
 
 class _BatchUnsupported(Exception):
     """The provider refused JSON-RPC batching itself (not a malformed reply)."""
+
+
+class _BatchTooLarge(Exception):
+    """HTTP 413: this batch shape is too big; shrink it and keep batching."""
 
 
 async def _post_header_batch(
@@ -953,10 +1004,14 @@ async def _post_header_batch(
                 logger.warning(
                     "rh_pons_rpc_http_error", method=method, status=response.status
                 )
+                if response.status == 413:
+                    raise _BatchTooLarge("http_413")
                 if response.status in _BATCH_REFUSAL_STATUSES:
                     raise _BatchUnsupported(f"http_{response.status}")
                 return None
+            retry_headers = response.headers
             body = await response.json(content_type=None)
+            _count_rpc_responses(len(heights))
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
         logger.warning(
             "rh_pons_rpc_transport_error", method=method, error_type=type(exc).__name__
@@ -966,12 +1021,20 @@ async def _post_header_batch(
         _add_rpc_seconds(time.monotonic() - started)
     if isinstance(body, dict) and "error" in body and "result" not in body:
         error = body["error"]
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, bool) and code in _RATE_LIMIT_ERROR_CODES:
-            _note_rate_limit(429, {})
+        if _is_throttle_error(error):
+            _note_rate_limit(429, retry_headers)
             logger.warning("rh_pons_rpc_rate_limited", method=method)
             return None
-        raise _BatchUnsupported("error_object")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, bool) and code in _BATCH_REFUSAL_ERROR_CODES:
+            raise _BatchUnsupported(f"error_object_{code}")
+        # Internal/server errors (-32603, -32000, ...) are transient: fail this
+        # pass closed and keep batching for the next one.
+        logger.warning(
+            "rh_pons_header_batch_error",
+            code=code if isinstance(code, int) and not isinstance(code, bool) else None,
+        )
+        return None
     if not isinstance(body, list) or len(body) != len(heights):
         logger.warning("rh_pons_header_batch_malformed", reason="shape")
         return None
@@ -989,7 +1052,11 @@ async def _post_header_batch(
             return None
         seen.add(index)
         if "error" in item or "result" not in item:
-            logger.warning("rh_pons_header_batch_malformed", reason="item_error")
+            if _is_throttle_error(item.get("error")):
+                _note_rate_limit(429, retry_headers)
+                logger.warning("rh_pons_rpc_rate_limited", method=method)
+            else:
+                logger.warning("rh_pons_header_batch_malformed", reason="item_error")
             return None
         header = _valid_header(item["result"], heights[index])
         if header is None:
@@ -1023,11 +1090,14 @@ async def _fetch_block_headers_batched(
         )
         for result in results:
             if isinstance(result, BaseException) and not isinstance(
-                result, _BatchUnsupported
+                result, (_BatchUnsupported, _BatchTooLarge)
             ):
                 raise result
         if any(result is None for result in results):
             return None
+        for result in results:
+            if isinstance(result, _BatchTooLarge):
+                raise result
         for result in results:
             if isinstance(result, _BatchUnsupported):
                 raise result
@@ -1058,6 +1128,21 @@ class _ScanState:
     max_headers: int | None = None
     #: Monotonic deadline of the running pass, set by the loop.
     pass_deadline: float | None = None
+    #: Configured header batch size (0 for poll_once); the working size
+    #: shrinks on 413/429 and recovers additively.
+    configured_batch_size: int = 0
+    #: Throttle memory: growth never returns above these until clean passes
+    #: raise them additively, so a throttled size is not retried at once.
+    span_ceiling: int | None = None
+    batch_ceiling: int | None = None
+    #: Loop sessions verify the chain id once, and again after any
+    #: unsuccessful pass; poll_once checks it every call.
+    cache_chain_id: bool = False
+    chain_verified: bool = False
+    #: Progress of the running pass, so a timeout reports where it stopped.
+    pass_context: dict = field(default_factory=dict)
+    #: Consecutive unsuccessful attempts, persisted for the watchdog.
+    attempt_failures: int = 0
 
     @classmethod
     def for_loop(cls, settings: "Settings") -> "_ScanState":
@@ -1071,6 +1156,8 @@ class _ScanState:
             topic_only=settings.RH_PONS_TOPIC_ONLY_TRADE_QUERY,
             header_batch_size=settings.RH_PONS_HEADER_BATCH_SIZE,
             max_headers=settings.RH_PONS_MAX_HEADERS_PER_PASS,
+            configured_batch_size=settings.RH_PONS_HEADER_BATCH_SIZE,
+            cache_chain_id=True,
         )
 
     @classmethod
@@ -1117,6 +1204,9 @@ class _PassResult:
     #: Time inside HTTP exchanges, and time waiting on the pacer.
     rpc_s: float = 0.0
     pacing_wait_s: float = 0.0
+    #: Last pass stage reached: chain_head, logs, headers, write, checkpoint.
+    stage: str = ""
+    rpc_responses: int = 0
 
     @property
     def caught_up(self) -> bool:
@@ -1193,6 +1283,14 @@ async def _scan_headers(
             return await _fetch_block_headers_batched(
                 session, url, heights, state.header_batch_size
             )
+        except _BatchTooLarge:
+            state.header_batch_size = max(1, state.header_batch_size // 2)
+            state.batch_ceiling = state.header_batch_size
+            logger.warning(
+                "rh_pons_header_batch_too_large",
+                next_batch_size=state.header_batch_size,
+            )
+            return None
         except _BatchUnsupported as exc:
             state.batch_supported = False
             logger.warning(
@@ -1226,15 +1324,25 @@ async def _scan_pass(
         return _PassResult("refused", reason="no_rpc_url_configured")
 
     url = settings.RH_PONS_RPC_URL
-    if _hex_int(await _rpc(session, url, "eth_chainId", [])) != deployment.chain_id:
-        logger.warning(
-            "rh_pons_collector_refused", reason="chain_id_mismatch_or_unavailable"
-        )
-        return _PassResult("refused", reason="chain_id_mismatch_or_unavailable")
+    state.pass_context = {"stage": "chain_head"}
+    if not (state.cache_chain_id and state.chain_verified):
+        chain_id = _hex_int(await _rpc(session, url, "eth_chainId", []))
+        if chain_id is None:
+            # Unavailable or throttled: a transient failure, not a config refusal.
+            return _PassResult(
+                "failed", reason="chain_id_unavailable", stage="chain_head"
+            )
+        if chain_id != deployment.chain_id:
+            logger.warning("rh_pons_collector_refused", reason="chain_id_mismatch")
+            return _PassResult(
+                "refused", reason="chain_id_mismatch", stage="chain_head"
+            )
+        state.chain_verified = True
     head = _hex_int(await _rpc(session, url, "eth_blockNumber", []))
     if head is None or head < 0 or deployment.deploy_block is None:
-        return _PassResult("failed", reason="head_unavailable")
-    context: dict[str, Any] = {"start_head": head}
+        return _PassResult("failed", reason="head_unavailable", stage="chain_head")
+    context: dict[str, Any] = {"start_head": head, "stage": "logs"}
+    state.pass_context = context
 
     def failed(reason: str) -> _PassResult:
         return _PassResult("failed", reason=reason, **context)
@@ -1429,6 +1537,7 @@ async def _scan_pass(
     needed.update(event["block_number"] for event in prior_events)
     needed.update(range(max(deployment.deploy_block, to_block - overlap), to_block + 1))
     context.update(
+        stage="headers",
         header_heights=len(needed),
         trade_logs=trade_log_count,
         excluded_foreign_logs=excluded,
@@ -1465,6 +1574,7 @@ async def _scan_pass(
     final_header = await _block_header(session, url, to_block)
     if final_header is None or final_header["hash"] != headers[to_block]["hash"]:
         return failed("chain_moved_during_pass")
+    context["stage"] = "write"
     counters = await collect_from_logs(
         removed + raw_logs,
         db,
@@ -1477,6 +1587,7 @@ async def _scan_pass(
         return failed("undecodable_after_collect")
     # Include blocks produced while fetching/processing this pass. Persisting
     # only the starting head understates lag precisely when RPC is slow.
+    context["stage"] = "checkpoint"
     completion_head = _hex_int(await _rpc(session, url, "eth_blockNumber", []))
     if completion_head is None or completion_head < to_block:
         return failed("completion_head_invalid")
@@ -1545,6 +1656,20 @@ async def poll_once(
 _sleep = asyncio.sleep
 
 
+def _raise_ceilings(state: _ScanState) -> None:
+    """Additive recovery after a clean pass (the increase half of AIMD)."""
+    if state.span_ceiling is not None:
+        state.span_ceiling += state.min_span
+        if state.span_ceiling >= state.max_span:
+            state.span_ceiling = None
+    if state.batch_ceiling is not None and state.configured_batch_size:
+        state.batch_ceiling += 1
+        state.header_batch_size = min(state.batch_ceiling, state.configured_batch_size)
+        if state.batch_ceiling >= state.configured_batch_size:
+            state.batch_ceiling = None
+            state.header_batch_size = state.configured_batch_size
+
+
 def _after_pass(state: _ScanState, result: _PassResult, settings: "Settings") -> float:
     """Adapt the window and return the pause before the next pass.
 
@@ -1557,27 +1682,115 @@ def _after_pass(state: _ScanState, result: _PassResult, settings: "Settings") ->
     idle = settings.RH_PONS_IDLE_SLEEP_SEC
     ceiling = settings.RH_PONS_FAILURE_BACKOFF_MAX_SEC
     if result.status == "completed":
-        state.failures = 0
+        # Decay rather than reset: one success between throttles must not
+        # restore full aggressiveness.
+        state.failures = max(0, state.failures - 1)
+        if not result.rate_limited:
+            _raise_ceilings(state)
+        limit = state.max_span if state.span_ceiling is None else state.span_ceiling
         if result.caught_up:
             return idle
         if result.truncated:
             # The header budget, not the window, bound this pass: fetch logs
             # for about twice what it could verify rather than growing further.
-            state.span = max(
-                state.min_span, min(state.max_span, 2 * max(1, result.new_blocks))
-            )
+            state.span = max(state.min_span, min(limit, 2 * max(1, result.new_blocks)))
         elif result.duration_s < settings.RH_PONS_POLL_TIMEOUT_SEC / 2:
-            state.span = min(state.max_span, state.span * 2)
+            state.span = max(state.min_span, min(limit, state.span * 2))
         return 0.0
     if result.status == "head_behind":
         return idle
     state.failures += 1
     if result.status != "refused" or result.rate_limited:
         state.span = max(state.min_span, state.span // 2)
+    if result.rate_limited:
+        # Remember the throttle: neither the window nor the header batch goes
+        # back to the refused size until clean passes raise the ceilings.
+        state.span_ceiling = state.span
+        if state.configured_batch_size:
+            state.header_batch_size = max(1, state.header_batch_size // 2)
+            state.batch_ceiling = state.header_batch_size
     delay = min(ceiling, idle * 2 ** min(state.failures - 1, 30))
     if result.rate_limited and result.retry_after is not None:
         delay = max(delay, min(ceiling, result.retry_after))
     return delay
+
+
+#: ingest_watchdog_state source for the per-attempt failure streak.
+_ATTEMPT_SOURCE = "rh_pons_attempt"
+
+
+async def _open_collector_db(db: "Database", settings: "Settings") -> "Database":
+    """Open the collector's OWN connection to the pipeline database file.
+
+    The pipeline connection is shared with writers that BEGIN/ROLLBACK without
+    the transaction lock (scout/chains/tracker.py). Committing there could make
+    a sibling's half-finished unit durable, and a sibling rollback could
+    silently discard collector evidence after it reported success -- the same
+    hazard db._record_coverage_baseline avoids. The write-lock wait is bounded
+    to half the pass deadline so contention fails a pass instead of stalling it.
+    """
+    from scout.db import Database
+
+    busy_ms = min(
+        settings.SQLITE_BUSY_TIMEOUT_MS, int(settings.RH_PONS_POLL_TIMEOUT_SEC * 500)
+    )
+    owned = Database(db._db_path, busy_timeout_ms=busy_ms)
+    try:
+        await owned.initialize()
+    except BaseException:
+        try:
+            await owned.close()
+        except Exception:
+            pass
+        raise
+    return owned
+
+
+async def _discard_uncommitted(db: Any) -> None:
+    """Roll back whatever a cancelled or failed pass left open.
+
+    aiosqlite runs statements in order on one worker thread, so this rollback
+    also lands after an INSERT that was still queued when its commit was
+    cancelled. Only the collector uses this connection.
+    """
+    conn = getattr(db, "_conn", None)
+    if conn is None:
+        return
+    try:
+        await conn.rollback()
+    except Exception as exc:
+        logger.error("rh_pons_collector_rollback_failed", error_type=type(exc).__name__)
+
+
+async def _record_attempt(db: Any, state: _ScanState, result: _PassResult) -> None:
+    """Persist per-attempt health apart from the success heartbeat.
+
+    The failure streak lets the watchdog page on a lane that keeps failing
+    before its success heartbeat goes stale. An unsuccessful attempt also
+    raises the checkpoint's observed head, so coverage lag keeps growing
+    instead of freezing at the last completed pass.
+    """
+    if result.status == "completed":
+        state.attempt_failures = 0
+    elif result.status != "head_behind":
+        state.attempt_failures += 1
+    try:
+        await db.upsert_ingest_watchdog_state(_ATTEMPT_SOURCE, state.attempt_failures)
+        deployment = active_deployment()
+        if (
+            result.status != "completed"
+            and result.start_head is not None
+            and deployment is not None
+        ):
+            await db.record_curve_scan_attempt_head(
+                deployment.chain_id,
+                deployment.version,
+                deployment.factory,
+                result.start_head,
+            )
+    except Exception as exc:
+        logger.error("rh_pons_attempt_record_failed", error_type=type(exc).__name__)
+        await _discard_uncommitted(db)
 
 
 async def run_rh_pons_loop(
@@ -1593,10 +1806,16 @@ async def run_rh_pons_loop(
     returning worker would shut the whole service down. Every pass runs under
     RH_PONS_POLL_TIMEOUT_SEC; refusals, failures and timeouts are logged and
     retried with bounded backoff. Cancellation propagates for clean shutdown.
+    ``db`` only supplies the database path: all collector reads and writes use
+    a collector-owned connection that is closed when the loop ends.
     """
     if not settings.RH_PONS_COLLECTOR_ENABLED:
         logger.info("rh_pons_loop_disabled")
         return
+    if not settings.RH_PONS_RPC_URL:
+        # Enabled but unusable: say so once at startup. Passes keep refusing
+        # and recording failed attempts, so the watchdog's streak check pages.
+        logger.error("rh_pons_enabled_without_rpc_url")
     state = _ScanState.for_loop(settings)
     pacer = _RpcPacer(
         rate=settings.RH_PONS_RPC_CALLS_PER_SEC,
@@ -1615,11 +1834,58 @@ async def run_rh_pons_loop(
         rpc_burst_calls=int(pacer.burst),
     )
     pacer_token = _RPC_PACER.set(pacer)
+    owned = None
     try:
         while True:
-            await _run_loop_pass(session, db, settings, state, pacer, on_pass)
+            if owned is None:
+                owned = await _open_owned_or_backoff(
+                    db, settings, state, pacer, on_pass
+                )
+                if owned is None:
+                    continue
+            await _run_loop_pass(session, owned, settings, state, pacer, on_pass)
     finally:
         _RPC_PACER.reset(pacer_token)
+        if owned is not None:
+            try:
+                await owned.close()
+            except Exception as exc:
+                logger.error(
+                    "rh_pons_collector_db_close_failed", error_type=type(exc).__name__
+                )
+
+
+async def _open_owned_or_backoff(
+    db: "Database",
+    settings: "Settings",
+    state: _ScanState,
+    pacer: _RpcPacer,
+    on_pass: Callable[[_PassResult], None] | None,
+) -> "Database | None":
+    """Open the owned connection, or record an error attempt and back off."""
+    started = time.monotonic()
+    try:
+        owned = await _open_collector_db(db, settings)
+    except Exception as exc:
+        logger.error("rh_pons_collector_db_unavailable", error_type=type(exc).__name__)
+        result = _PassResult("error", reason="collector_db_unavailable")
+        await _finish_pass(
+            settings,
+            state,
+            pacer,
+            result,
+            _RpcStats(),
+            started,
+            pacer.waited_s,
+            on_pass,
+        )
+        return None
+    try:
+        persisted = await owned.load_ingest_watchdog_state()
+        state.attempt_failures = int(persisted.get(_ATTEMPT_SOURCE, 0))
+    except Exception as exc:
+        logger.error("rh_pons_attempt_state_unreadable", error_type=type(exc).__name__)
+    return owned
 
 
 async def _run_loop_pass(
@@ -1630,25 +1896,49 @@ async def _run_loop_pass(
     pacer: _RpcPacer,
     on_pass: Callable[[_PassResult], None] | None,
 ) -> None:
+    await _discard_uncommitted(db)
     stats = _RpcStats()
     token = _RPC_STATS.set(stats)
     started = time.monotonic()
     waited_before = pacer.waited_s
     state.pass_deadline = started + settings.RH_PONS_POLL_TIMEOUT_SEC
+    state.pass_context = {}
     try:
         async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
             result = await _scan_pass(session, db, settings, state)
     except TimeoutError:
-        result = _PassResult("timeout", reason="pass_deadline")
+        result = _PassResult("timeout", reason="pass_deadline", **state.pass_context)
     except Exception as exc:  # CancelledError is BaseException: propagates.
         # Type only: exception text can embed the RPC URL.
         logger.error("rh_pons_loop_pass_error", error_type=type(exc).__name__)
-        result = _PassResult("error", reason=type(exc).__name__)
+        result = _PassResult("error", reason=type(exc).__name__, **state.pass_context)
     finally:
         _RPC_STATS.reset(token)
         state.pass_deadline = None
+    if result.status not in ("completed", "head_behind"):
+        # Unsuccessful: drop anything left open so no write lock outlives the
+        # pass, and re-verify the chain id before trusting the provider again.
+        state.chain_verified = False
+        await _discard_uncommitted(db)
+    await _record_attempt(db, state, result)
+    await _finish_pass(
+        settings, state, pacer, result, stats, started, waited_before, on_pass
+    )
+
+
+async def _finish_pass(
+    settings: "Settings",
+    state: _ScanState,
+    pacer: _RpcPacer,
+    result: _PassResult,
+    stats: _RpcStats,
+    started: float,
+    waited_before: float,
+    on_pass: Callable[[_PassResult], None] | None,
+) -> None:
     result.duration_s = round(time.monotonic() - started, 3)
     result.rpc_calls = stats.calls
+    result.rpc_responses = stats.responses
     result.rate_limited = stats.rate_limited
     result.retry_after = stats.retry_after
     result.rpc_s = round(stats.rpc_seconds, 3)
@@ -1660,6 +1950,7 @@ async def _run_loop_pass(
         "rh_pons_loop_pass",
         status=result.status,
         reason=result.reason,
+        stage=result.stage,
         from_block=result.from_block,
         to_block=result.to_block,
         new_blocks=result.new_blocks,
@@ -1673,18 +1964,22 @@ async def _run_loop_pass(
         recorded_events=result.recorded_events,
         header_heights=result.header_heights,
         header_budget=result.header_budget,
+        header_batch_size=state.header_batch_size,
         truncated=result.truncated,
         trade_logs=result.trade_logs,
         excluded_foreign_logs=result.excluded_foreign_logs,
         active_curves=result.active_curves,
         rpc_calls=result.rpc_calls,
+        rpc_responses=result.rpc_responses,
         rate_limited=result.rate_limited,
         duration_s=result.duration_s,
         rpc_s=result.rpc_s,
         pacing_wait_s=result.pacing_wait_s,
         rpc_rate=round(pacer.rate, 3),
         next_span=state.span,
+        span_ceiling=state.span_ceiling,
         consecutive_failures=state.failures,
+        attempt_failures=state.attempt_failures,
         batch_headers=state.batch_headers and state.batch_supported,
         sleep_s=delay,
     )

@@ -128,6 +128,45 @@ Changes (smallest correction that removes the failure mechanism):
   - a bounded header cache for retries (reorg review);
   - fewer round trips per pass (cached chain id, concurrent log queries).
 
+## Round 3 — independent reviews and fixes
+
+Inputs:
+- Codex native REQUEST 4(a): **254 passed**, 2 existing marker warnings.
+- Two terminal independent reviews of `d4694a06`, the pre-pacing code:
+  `claude-review-concurrency-logic.json` and `claude-review-ops-silent.json`
+  in the review worktree.
+- Codex's check of Robinhood's documentation: the public RPC is rate-limited
+  and not meant for production high-throughput or latency-sensitive use, and
+  it publishes no numeric quota.
+- Codex runs the 31-mutant check separately at `59dfc74c`. It does not cover
+  this head.
+
+| Finding | Disposition |
+|---|---|
+| **Concurrency blocker**: collector commits on the shared connection could make the chains tracker's half-finished transaction durable, or lose collector rows to its rollback | **Fixed.** The loop opens its own connection (`_open_collector_db`), closed at shutdown, with the write-lock wait bounded to half the pass deadline. Uncommitted work is rolled back before each pass and after any unsuccessful one. New tests use a real loop: a sibling transaction on the shared connection stays uncommitted and the collector's later rows are durable; a pass cancelled after an INSERT but before its commit leaves nothing durable, and the replay matches an uninterrupted run (events, discoveries, membership, checkpoint). |
+| Transient batch errors disabled batching | **Fixed.** Only HTTP 400/404/405/415/501 or JSON-RPC -32600/-32601 disable batching. Other top-level errors fail the pass and keep batching; HTTP 413 halves the batch size. |
+| Topic query has no fallback under provider result caps | **Residual, scoped.** The pass fails closed and the new failure-streak watchdog pages; nothing is silently skipped. |
+| **F1** window/backoff bounced back to the throttled size | **Fixed.** After a throttle, a span ceiling and a batch ceiling hold both below the throttled size and rise additively on clean passes; the failure count decays instead of resetting. The pacer from round 2 empties and halves on 429. Tests cover the sequence and a synthetic provider that refuses batches above 20 calls: it converges with at most 3 throttles and no gaps. |
+| **F2** throttling not classified | **Fixed.** HTTP-200 JSON-RPC throttle errors (single call and per batch item) set rate limiting and honour Retry-After, including HTTP-date form. A failed or throttled `eth_chainId` is `failed/chain_id_unavailable`; only a real mismatch is `refused`. |
+| **F3** probe report untruthful | **Fixed.** Explicit `stop_reason` (`rate_limited`, `max_rpc_calls`, `steady_target`, `max_passes`, `max_seconds`); overall `verdict` of pass, fail or inconclusive, with missing catch-up or a rate-limit stop counting as fail. Steady-state failed and throttled passes are criteria. Checkpoint regressions come from the committed DB checkpoint read after each pass. Drain chain growth starts from the first observed head. The hardcoded `production_mutated` claim is replaced by explicit isolation facts. The throttled smoke JSON now evaluates to `fail/rate_limited`. |
+| **F4** probe settings leaked from environment | **Fixed.** Settings are init-only (no `.env`, no environment), every effective RH setting is reported, and `--max-rpc-calls` (default 10000) is added. |
+| **F5** monitoring coarse; frozen head hides lag | **Fixed.** A per-attempt streak row (`rh_pons_attempt`) and attempt heads raise the checkpoint head without touching the success clock. The watchdog gains `--staleness-minutes` (wrapper default 10) and `attempt_failures_exceeded`, and the generic ingestion watchdog excludes the new row. |
+| **F6a** watchdog disarms if the flag is not in `.env` | **Fixed.** Recent collector activity with a false gate raises `enabled_gate_mismatch`; the runbook requires the flag in `.env`, and the watchdog knobs are now Settings fields so `.env` lines are valid. |
+| **F6b** enabled without URL retries silently | **Fixed.** One startup error log, and each refused pass records a failed attempt, so the streak pages. |
+| **F7** fixed per-pass call cost | **Partly fixed.** Chain id is checked once per session and again after failures. The probe has a call ceiling and an optional calls-per-minute criterion. Overlap headers and two block-number calls per pass remain: they carry reorg and lag guarantees. |
+| **F8** timeouts lose context | **Fixed.** Timeout and error results carry the pass stage, block range, head and header count; `rpc_responses` counts answered calls separately from sends. |
+| **F9** `RH_PONS_POLL_EVERY_N_CYCLES` inert in the loop | **Documented** as `poll_once`-only in config and runbook. |
+
+The reviewer inferred a provider burst cap of roughly 100 calls. **I have not
+adopted that as a quota.** Every rate and size here stays a provisional
+setting, and the official documentation gives no number.
+
+Verification this round:
+- Local: DB suites 22 passed (scope and hardening, including the attempt-head
+  test); the header cutoff matched brute force on 5000 cases.
+- Native REQUEST 5: pending. It covers the review-fix tests, the RH suites,
+  the watchdog, config and heartbeat.
+
 ## Not established
 
 - Sustained capacity, real-time latency and provider quota. The capacity

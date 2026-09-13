@@ -982,6 +982,25 @@ class Database:
         )
         await self._conn.commit()
 
+    async def record_curve_scan_attempt_head(
+        self, chain_id: int, protocol: str, factory: str, head_block: int
+    ) -> None:
+        """Raise the checkpoint's observed head from an unsuccessful attempt.
+
+        next_block, block hashes and updated_at (the success clock) are left
+        alone, so a collector that keeps failing shows growing head lag instead
+        of a frozen head. MAX() ignores a lagging provider head; no row, no-op.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            """UPDATE curve_scan_checkpoints
+            SET head_block = MAX(COALESCE(head_block, ?), ?)
+            WHERE chain_id=? AND protocol=? AND factory=?""",
+            (head_block, head_block, chain_id, protocol, factory.lower()),
+        )
+        await self._conn.commit()
+
     async def list_curve_launch_curves(self, chain_id: int, protocol: str) -> list[str]:
         """Canonical known curve contracts for deployment-scoped trade polling."""
         if self._conn is None:

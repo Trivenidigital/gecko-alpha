@@ -12,7 +12,7 @@
 # without paging (disablement is never represented as failure).
 #
 # .env IS sourced so (a) the alert path can read Telegram credentials via
-# Settings and (b) the knobs (RH_PONS_POLL_STALENESS_ALERT_HOURS /
+# Settings and (b) the knobs (RH_PONS_POLL_STALENESS_ALERT_MINUTES / RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES /
 # RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS) flow through; the enable flag
 # itself is intentionally kept OUT of .env — it is captured from the cron
 # environment BEFORE .env is sourced and the variable is unset afterwards,
@@ -43,9 +43,13 @@ unset RH_PONS_WATCHDOG_ENABLED
 DB_PATH="${REPO_ROOT}/scout.db"
 # Watchdog gate: cron environment only (captured above); never .env.
 ENABLED="${WATCHDOG_ENABLED_FROM_CRON}"
-# Lane gate: from .env (the lane's own operator flag).
+# Lane gate: from .env (the lane's own operator flag). Set
+# RH_PONS_COLLECTOR_ENABLED in .env, not only in a systemd Environment= line:
+# otherwise this reads false. The watchdog still breaches
+# (enabled_gate_mismatch) when the DB shows recent collector activity.
 DISCOVERY_ENABLED="${RH_PONS_COLLECTOR_ENABLED:-false}"
-STALENESS_HOURS="${RH_PONS_POLL_STALENESS_ALERT_HOURS:-2}"
+STALENESS_MINUTES="${RH_PONS_POLL_STALENESS_ALERT_MINUTES:-10}"
+MAX_FAILED_PASSES="${RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES:-10}"
 MAX_HEAD_LAG_BLOCKS="${RH_PONS_MAX_HEAD_LAG_BLOCKS:-2000}"
 CLOCK_SKEW_SECONDS="${RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS:-300}"
 COOLDOWN_HOURS="${RH_PONS_WATCHDOG_COOLDOWN_HOURS:-24}"
@@ -69,7 +73,8 @@ cd "$REPO_ROOT"
 exec "${PYTHON}" "${SCRIPT_DIR}/dex_discovery_watchdog.py" --source rh_pons \
     --db "${DB_PATH}" --enabled "${ENABLED}" \
     --discovery-enabled "${DISCOVERY_ENABLED}" \
-    --staleness-hours "${STALENESS_HOURS}" \
+    --staleness-minutes "${STALENESS_MINUTES}" \
+    --max-consecutive-failed-passes "${MAX_FAILED_PASSES}" \
     --max-head-lag-blocks "${MAX_HEAD_LAG_BLOCKS}" \
     --clock-skew-seconds "${CLOCK_SKEW_SECONDS}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"
