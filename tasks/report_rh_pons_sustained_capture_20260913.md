@@ -182,9 +182,20 @@ Verification this round:
     `git archive`, gives the identical 9 with the same suites. They still
     need confirmation on Linux CI.
 - **Native REQUEST 6(a):** 35 passed (pacing and review-fix tests).
-- **Native REQUEST 7:** pending (full rerun). Mutation round 3 is on hold until
-  that baseline is green apart from the 9 known Windows failures, so an
-  unrelated failure cannot count as a kill.
+- **Native focused rerun after the fix (Codex, head `49f119e7`):**
+  - Suites: RH watchdog, DEX watchdog script and wrapper
+    (`.claude-native-watchdog-fix.txt`).
+  - Result: **52 passed, 9 failed.** The 9 are exactly the Windows-only set
+    above (6 `fcntl` send/lock tests, 3 bash-wrapper tests); nothing else
+    fails.
+  - The new guard test passes natively.
+  - The collector suites were unchanged by this fix and were not repeated;
+    REQUEST 6(a) passed 35.
+- **Not established:**
+  - A full native green run of every listed suite at this head.
+  - Linux confirmation of the 9 baseline failures, which is left to CI.
+  - Mutation round 3 has not run. It is on hold until Codex accepts this
+    baseline, so an unrelated failure cannot count as a kill.
 
 Mutation round 2 (Codex, review worktree `59dfc74c`): 31 mutants gave 28
 assertion kills, 2 hangs and 1 survivor. The hangs are not counted as kills.
