@@ -31,6 +31,14 @@ import sqlite3
 import statistics
 import sys
 from datetime import datetime, timezone
+from collections import Counter
+
+# Reuse the ingestion adapter's explicit aliases; do not infer CG slug identity.
+# Keep direct script invocation working without requiring an installed package.
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scout.ingestion.geckoterminal import GECKOTERMINAL_NETWORK_BY_CHAIN
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -41,7 +49,7 @@ def _parse_ts(value: str | None) -> datetime | None:
         # settled it for in-pipeline SQL: accept both. Naive values are UTC
         # by repo convention (SQL datetime() strips the +00:00 offset).
         parsed = datetime.fromisoformat(value.replace(" ", "T"))
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -59,6 +67,36 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone()
     return row is not None
+
+
+def _network(value: str) -> str:
+    value = (value or "").lower()
+    return GECKOTERMINAL_NETWORK_BY_CHAIN.get(value, value)
+
+
+def _earliest_observation(conn, table, address_column, chain_column, token, network):
+    """Select absolute instants in Python: SQLite datetime truncates fractions.
+
+    Table/column arguments are internal constants. Unknown chain aliases stay
+    unmatched; a same-address observation on another network is not evidence.
+    """
+    matching = [
+        row["first_seen_at"]
+        for row in conn.execute(
+            f"SELECT first_seen_at, {chain_column} AS network FROM {table} "
+            f"WHERE LOWER({address_column}) = ?",
+            (token,),
+        )
+        if _network(row["network"]) == _network(network)
+    ]
+    valid = [
+        (parsed, raw) for raw in matching if (parsed := _parse_ts(raw)) is not None
+    ]
+    return (
+        min(valid, key=lambda item: item[0])[1] if valid else None,
+        len(matching),
+        sum(_parse_ts(raw) is None for raw in matching),
+    )
 
 
 def compare(conn: sqlite3.Connection) -> dict:
@@ -89,38 +127,50 @@ def compare(conn: sqlite3.Connection) -> dict:
     cg_latencies: list[float] = []
     dex_latencies: list[float] = []
 
+    paired = {"cg_ds_gt": [], "dex_lane": []}
+    invalid_clock_counts = Counter()
+
     for launch in launches:
         token = (launch["token_address"] or "").lower()
         event_time = _parse_ts(launch["event_time"])
         rh_seen = _parse_ts(launch["first_seen_at"])
 
-        cg_seen_raw = None
+        cg_seen_raw, cg_matches, cg_invalid = None, 0, 0
         if have_candidates:
-            row = conn.execute(
-                "SELECT MIN(datetime(first_seen_at)) AS fs FROM candidates "
-                "WHERE LOWER(contract_address) = ?",
-                (token,),
-            ).fetchone()
-            cg_seen_raw = row["fs"] if row else None
-        dex_seen_raw = None
+            cg_seen_raw, cg_matches, cg_invalid = _earliest_observation(
+                conn,
+                "candidates",
+                "contract_address",
+                "chain",
+                token,
+                launch["network"],
+            )
+        dex_seen_raw, dex_matches, dex_invalid = None, 0, 0
         if have_dex:
-            row = conn.execute(
-                "SELECT MIN(datetime(first_seen_at)) AS fs FROM dex_pool_discoveries "
-                "WHERE LOWER(base_token_address) = ?",
-                (token,),
-            ).fetchone()
-            dex_seen_raw = row["fs"] if row else None
+            dex_seen_raw, dex_matches, dex_invalid = _earliest_observation(
+                conn,
+                "dex_pool_discoveries",
+                "base_token_address",
+                "network",
+                token,
+                launch["network"],
+            )
 
         provider_available_at = "unknown"
         if have_events:
-            row = conn.execute(
-                "SELECT MIN(provider_available_at) AS pa FROM curve_launch_events "
-                "WHERE chain_id = ? AND token_address = ? "
+            provider_rows = conn.execute(
+                "SELECT provider_available_at FROM curve_launch_events "
+                "WHERE chain_id = ? AND LOWER(token_address) = ? "
                 "AND provider_available_at IS NOT NULL",
                 (launch["chain_id"], token),
-            ).fetchone()
-            if row and row["pa"]:
-                provider_available_at = row["pa"]
+            ).fetchall()
+            valid_provider = [
+                (parsed, row[0])
+                for row in provider_rows
+                if (parsed := _parse_ts(row[0])) is not None
+            ]
+            if valid_provider:
+                provider_available_at = min(valid_provider, key=lambda item: item[0])[1]
 
         cg_seen = _parse_ts(cg_seen_raw)
         dex_seen = _parse_ts(dex_seen_raw)
@@ -129,25 +179,58 @@ def compare(conn: sqlite3.Connection) -> dict:
         if event_time is None:
             censored.append("event_time_unavailable")
             censor_counts["event_time_unavailable"] += 1
-        if cg_seen is None:
+        if not cg_matches:
             censored.append("never_observed_cg_ds_gt")
             censor_counts["never_observed_cg_ds_gt"] += 1
-        if dex_seen is None:
+        if not dex_matches:
             censored.append("never_observed_dex_lane")
             censor_counts["never_observed_dex_lane"] += 1
 
         event_to_rh = _delta_seconds(event_time, rh_seen)
         event_to_cg = _delta_seconds(event_time, cg_seen)
         event_to_dex = _delta_seconds(event_time, dex_seen)
-        if event_to_rh is not None:
-            rh_latencies.append(event_to_rh)
-        if event_to_cg is not None:
-            cg_latencies.append(event_to_cg)
-        if event_to_dex is not None:
-            dex_latencies.append(event_to_dex)
+        for label, count in (("cg_ds_gt", cg_invalid), ("dex_lane", dex_invalid)):
+            if count:
+                reason = f"invalid_{label}_clock"
+                censored.append(reason)
+                invalid_clock_counts[reason] += count
+        if rh_seen is None:
+            censored.append("invalid_rh_clock")
+            invalid_clock_counts["invalid_rh_clock"] += 1
+        if launch["event_time"] and event_time is None:
+            censored.append("invalid_event_clock")
+            invalid_clock_counts["invalid_event_clock"] += 1
+        for label, delta, values in (
+            ("rh", event_to_rh, rh_latencies),
+            ("cg_ds_gt", event_to_cg, cg_latencies),
+            ("dex_lane", event_to_dex, dex_latencies),
+        ):
+            if delta is not None and delta < 0:
+                reason = f"negative_event_to_{label}"
+                censored.append(reason)
+                invalid_clock_counts[reason] += 1
+            elif delta is not None:
+                values.append(delta)
+        advantages = {}
+        for label, delta in (("cg_ds_gt", event_to_cg), ("dex_lane", event_to_dex)):
+            # Pair only clocks for the same launch, with valid nonnegative
+            # event-relative measurements. Positive means RH observed earlier.
+            advantage = (
+                delta - event_to_rh
+                if delta is not None
+                and delta >= 0
+                and event_to_rh is not None
+                and event_to_rh >= 0
+                else None
+            )
+            advantages[f"rh_advantage_vs_{label}_seconds"] = advantage
+            if advantage is not None:
+                paired[label].append(advantage)
 
         rows.append(
             {
+                "chain_id": launch["chain_id"],
+                **advantages,
                 "token_address": token,
                 "network": launch["network"],
                 "protocol": launch["protocol"],
@@ -177,6 +260,19 @@ def compare(conn: sqlite3.Connection) -> dict:
     return {
         "launch_count": len(rows),
         "censoring": censor_counts,
+        "invalid_clock_counts": dict(invalid_clock_counts),
+        "provenance_counts": dict(Counter(row["provenance"] for row in rows)),
+        "measurement_scope": "Local observation clocks; provider availability is unknown unless explicitly recorded. Fixture provenance is not live effectiveness evidence.",
+        "paired_advantage_summary": {
+            f"rh_vs_{label}": {
+                **_summary(values),
+                "censored_n": len(rows) - len(values),
+                "rh_earlier_n": sum(value > 0 for value in values),
+                "rh_later_n": sum(value < 0 for value in values),
+                "tied_n": sum(value == 0 for value in values),
+            }
+            for label, values in paired.items()
+        },
         "latency_summary": {
             "event_to_rh": _summary(rh_latencies),
             "event_to_cg_ds_gt": _summary(cg_latencies),

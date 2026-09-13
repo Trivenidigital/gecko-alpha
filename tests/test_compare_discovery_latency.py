@@ -127,3 +127,103 @@ async def test_latencies_and_censoring(tmp_path, token_factory):
     }
     assert report["latency_summary"]["event_to_rh"]["n"] == 1
     assert report["latency_summary"]["event_to_rh"]["median_seconds"] == 30.0
+
+
+def _report(db_path, statements=()):
+    with sqlite3.connect(db_path) as conn:
+        for sql, params in statements:
+            conn.execute(sql, params)
+        return harness.compare(conn)
+
+
+async def test_foreign_chain_address_is_not_an_observation(tmp_path, token_factory):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            ("UPDATE candidates SET chain='base'", ()),
+            ("UPDATE dex_pool_discoveries SET network='base'", ()),
+        ],
+    )
+    row = report["launches"][0]
+    assert row["cg_ds_gt_first_seen_at"] is None
+    assert row["dex_lane_first_seen_at"] is None
+
+
+async def test_precision_and_paired_advantage(tmp_path, token_factory):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            (
+                "UPDATE candidates SET first_seen_at=?",
+                ("2026-09-13T11:00:30.125+01:00",),
+            ),
+        ],
+    )
+    row = report["launches"][0]
+    assert row["event_to_cg_ds_gt_seconds"] == 30.125
+    assert row["rh_advantage_vs_cg_ds_gt_seconds"] == 0.125
+    paired = report["paired_advantage_summary"]["rh_vs_cg_ds_gt"]
+    assert paired["n"] == 1
+    assert paired["censored_n"] == 1
+    assert paired["median_seconds"] == 0.125
+    assert report["provenance_counts"] == {"fixture:source_derived": 2}
+
+
+async def test_invalid_and_negative_clocks_excluded(tmp_path, token_factory):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            ("UPDATE candidates SET first_seen_at='broken'", ()),
+            (
+                "UPDATE dex_pool_discoveries SET first_seen_at='2026-09-13T09:59:59Z'",
+                (),
+            ),
+        ],
+    )
+    row = report["launches"][0]
+    assert "invalid_cg_ds_gt_clock" in row["censored"]
+    assert "negative_event_to_dex_lane" in row["censored"]
+    assert report["latency_summary"]["event_to_dex_lane"]["n"] == 0
+    assert report["paired_advantage_summary"]["rh_vs_dex_lane"]["n"] == 0
+
+
+async def test_alias_identity(tmp_path, token_factory):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            ("UPDATE curve_launch_discoveries SET chain_id=1, network='eth'", ()),
+            ("UPDATE candidates SET chain='ethereum'", ()),
+            ("UPDATE dex_pool_discoveries SET network='eth'", ()),
+        ],
+    )
+    assert report["launches"][0]["event_to_cg_ds_gt_seconds"] == 600.0
+    assert report["launches"][0]["event_to_dex_lane_seconds"] == 300.0
+
+
+async def test_cg_slug_not_guessed(tmp_path, token_factory):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(path, [("UPDATE candidates SET chain='cg:robinhood'", ())])
+    assert report["launches"][0]["cg_ds_gt_first_seen_at"] is None
+
+
+async def test_earliest_absolute_instant_and_negative_advantage(
+    tmp_path, token_factory
+):
+    path = await _seed(tmp_path, token_factory)
+    report = _report(
+        path,
+        [
+            (
+                "INSERT INTO dex_pool_discoveries (network,pool_address,base_token_address,first_seen_at) VALUES (?,?,?,?)",
+                ("robinhood", "another-pool", TOKEN_A, "2026-09-13T11:00:01.5+01:00"),
+            ),
+        ],
+    )
+    row = report["launches"][0]
+    assert row["event_to_dex_lane_seconds"] == 1.5
+    assert row["rh_advantage_vs_dex_lane_seconds"] == -28.5
+    assert report["paired_advantage_summary"]["rh_vs_dex_lane"]["rh_later_n"] == 1
