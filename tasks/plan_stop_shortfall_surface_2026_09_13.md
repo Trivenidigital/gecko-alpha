@@ -37,13 +37,13 @@ Production HEAD d2f0d61e, tracked clean; actual pipeline/dashboard/Hermes units 
 ## Implementation sequence
 
 - [x] Drift, ownership and runtime preflight; capture task remains separately owned.
-- [ ] Two parallel plan reviews, fold findings.
-- [ ] Write design; two parallel design reviews, fold findings.
-- [ ] Tests first: strict eligibility/arithmetic, incomplete schema retains history,
+- [x] Two parallel plan reviews, fold findings.
+- [x] Write design; two parallel design reviews, fold findings.
+- [x] Tests first: strict eligibility/arithmetic, incomplete schema retains history,
   actionability/pagination unchanged, modeled and unavailable states visible.
-- [ ] Add per-row stop_shortfall object and nonsortable column to existing table.
-- [ ] Run focused dashboard tests, frontend build/contracts and visual smoke.
-- [ ] Commit and create PR; two parallel PR reviewers across structural and
+- [x] Add per-row stop_shortfall object and nonsortable column to existing table.
+- [x] Run focused dashboard tests, frontend build/contracts and visual smoke.
+- [x] Commit and create PR; two parallel PR reviewers across structural and
   attribution/ops vectors; fold every finding before merge.
 - [ ] Exact-head CI green; merge permitted read-only PR. Deployment only with
   verified ownership, bounded smoke and rollback notes; otherwise retain merged

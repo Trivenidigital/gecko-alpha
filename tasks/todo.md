@@ -1,7 +1,8 @@
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
 
 - [x] Current-base drift and production read-only schema/state preflight.
-- [ ] Plan/design two-agent reviews, build, test, PR reviews and allowed merge.
+- [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
+- [ ] Exact-head CI and allowed merge; deployment remains separately owned.
 - Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
 
 # Backlog — gecko-alpha

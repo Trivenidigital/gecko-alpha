@@ -1,0 +1,17 @@
+pr = 575
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Terminal independent approvals in this 2026-09-13 22:15 closeout:
+# stop_gap_audit: logic/concurrency; stale_pr_audit: ops-safety/silent-failure.
+# Each independently ran all 81 targeted tests. No outstanding PR folds.
+[clearances]
+concurrency = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
+logic = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
+ops-safety = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
+silent-failure = "fce7c7c98a6fb60ea388b76e43d30f3640d4ec67"
