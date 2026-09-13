@@ -8,7 +8,7 @@
 # watched delta scopes the deadline assertion to RH heartbeat writes.
 pr = 572
 record_version = 1
-required = ["durable-evidence", "runtime"]
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
 watch = [
     ".claude", ".github", "Dockerfile", "cron", "dashboard",
     "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts",
@@ -16,5 +16,7 @@ watch = [
 ]
 
 [clearances]
-durable-evidence = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
-runtime = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
+concurrency = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
+logic = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
+ops-safety = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"
+silent-failure = "1e8ded72d6f769af46327c269bd7e8e0ef102b90"

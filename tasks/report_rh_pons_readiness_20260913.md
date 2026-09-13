@@ -72,6 +72,13 @@ redundant rescanning; final hash casing can falsely refuse a pass; and real
 mid-write cancellation deserves additional fault injection before activation.
 These are activation/capacity limits, not evidence of successful live readiness.
 
+The mandatory four-vector review is recorded at `1e8ded72`: independent
+durable reviewer cleared concurrency and silent-failure; the latency worker
+independently cleared collector logic (58 tests); the collector worker cleared
+complementary ops-safety paths (45 tests). The latter authored the head-lag
+extension, which was independently covered by the durable reviewer instead.
+Clearances authorize the default-off merge scope only, not live activation.
+
 Production read-only inspection found `gecko-pipeline` active at `6c56186e`,
 the RH collector disabled, and no configured RH RPC URL. The host can reach
 the official public RPC. Native Windows Python DNS could not, although public
