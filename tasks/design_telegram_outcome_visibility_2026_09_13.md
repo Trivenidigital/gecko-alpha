@@ -45,4 +45,4 @@ Root branch feat/telegram-outcome-visibility-20260913 owns these files. Child po
 
 ## Review
 
-Awaiting two independent design reviews. No implementation started.
+Two parallel design reviewers approved7e048536. Implementation/focused tests passed; final PR reviews and CI pending. Per-app route capture was regression-tested after discovering the legacy module-global default.

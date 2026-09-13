@@ -28,9 +28,9 @@ Add compact TelegramOutcomePanel within TGAlertsTab without changing its existin
 ## Required sequence
 
 - [x] Fresh branch from current master; independent drift audit and readonly runtime check.
-- [ ] Two parallel plan reviews and folds.
-- [ ] Design with two parallel reviews and folds before implementation.
-- [ ] Tests fail for absent endpoint; implement read-only aggregate/API and panel.
+- [x] Two parallel plan reviews and folds.
+- [x] Design with two parallel reviews and folds before implementation.
+- [x] Tests fail for absent endpoint; implement read-only aggregate/API and panel.
 - [ ] Verify prefix partition, time boundaries/timezone equivalence, invalid/future timestamps, unknown outcomes, empty/error distinction, schema absence, readonly DB preservation, sums and no raw details; executable frontend window/error/stale-response behavior; existing Telegram/API/nav regressions and frontend build.
 - [ ] PR, two independent PR reviews/folds, exact-head CI, normal merge if authorized checks pass.
 
@@ -40,4 +40,4 @@ Root owns feat/telegram-outcome-visibility-20260913 in the f39a worktree. Postmo
 
 ## Review
 
-Plan awaiting two independent reviewers. No implementation started.
+Plan and design approved by two parallel reviewers each. Implementation and102focused/regression tests passed; see review_telegram_outcome_visibility_2026_09_13.md. Final PR reviews/CI pending.
