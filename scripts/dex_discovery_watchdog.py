@@ -19,6 +19,10 @@ Armed semantics (both gates on):
   - heartbeat in the FUTURE beyond --clock-skew-seconds
     (named allowance, no embedded constant) .......... breach (future_invalid)
   - fresh heartbeat, however old the discoveries ..... ok (discovery_age logged)
+RH/Pons additionally requires a fresh exact-primary deployment checkpoint with
+known head_block. Missing head evidence, stale checkpoint evidence, or a lag
+above --max-head-lag-blocks (default 2000) breaches even with a fresh heartbeat.
+This head-coverage check does not apply to DEX discovery.
 A malformed DIAGNOSTIC timestamp (last_new_discovery_at) never affects the
 verdict: it is reported as ``discovery_timestamp_valid=false`` with
 ``discovery_age_hours=null`` and the primary verdict proceeds from the
@@ -118,6 +122,8 @@ _COOLDOWN_HOURS_MAX = 168.0
 
 def _validate_config(args: argparse.Namespace) -> str | None:
     """Return a human-readable error for out-of-range knobs, else None."""
+    if getattr(args, "max_head_lag_blocks", 2000) < 0:
+        return "--max-head-lag-blocks must be nonnegative"
     lo, hi = _STALENESS_HOURS_RANGE
     if not math.isfinite(args.staleness_hours) or not (
         lo <= args.staleness_hours <= hi
@@ -150,6 +156,7 @@ async def _read_state(
     staleness_hours: float,
     clock_skew_seconds: float,
     source: str = _HEARTBEAT_SOURCE,
+    max_head_lag_blocks: int = 2000,
 ) -> dict:
     """Run the liveness check + gather diagnostic context.
 
@@ -177,6 +184,28 @@ async def _read_state(
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
+
+        checkpoint = None
+        if source == "rh_pons":
+            from scout.ingestion.rh_pons import PONS_DEPLOYMENTS
+
+            primary = next(
+                (d for d in PONS_DEPLOYMENTS if d.version == "pons_v2"), None
+            )
+            if primary is not None:
+                try:
+                    cur = await conn.execute(
+                        "SELECT next_block, head_block, updated_at FROM curve_scan_checkpoints "
+                        "WHERE chain_id=? AND protocol=? AND factory=?",
+                        (primary.chain_id, primary.version, primary.factory.lower()),
+                    )
+                    checkpoint = await cur.fetchone()
+                except sqlite3.OperationalError as exc:
+                    if not any(
+                        text in str(exc).lower()
+                        for text in ("no such table", "no such column")
+                    ):
+                        raise
 
     # Diagnostic timestamp: malformed → flagged invalid, age null, verdict
     # UNAFFECTED (it proceeds from the heartbeat alone).
@@ -224,6 +253,32 @@ async def _read_state(
         result.update(status="breach", reason="stale")
     else:
         result.update(status="ok", reason="fresh")
+    if source == "rh_pons":
+        result.update(
+            head_lag_blocks=None,
+            max_head_lag_blocks=max_head_lag_blocks,
+            checkpoint_updated_at=checkpoint[2] if checkpoint else None,
+        )
+        if result["status"] == "ok":
+            if checkpoint is None or not all(
+                isinstance(v, int) and v >= 0 for v in checkpoint[:2]
+            ):
+                result.update(status="breach", reason="head_lag_unknown")
+            else:
+                result["head_lag_blocks"] = max(0, checkpoint[1] - checkpoint[0] + 1)
+                try:
+                    checkpoint_age = (now - _parse_ts(checkpoint[2])).total_seconds()
+                except _TS_PARSE_ERRORS:
+                    result.update(status="breach", reason="checkpoint_invalid")
+                else:
+                    if checkpoint_age < -clock_skew_seconds:
+                        result.update(
+                            status="breach", reason="checkpoint_future_invalid"
+                        )
+                    elif checkpoint_age > staleness_hours * 3600:
+                        result.update(status="breach", reason="checkpoint_stale")
+                    elif result["head_lag_blocks"] > max_head_lag_blocks:
+                        result.update(status="breach", reason="head_lag_exceeded")
     return result
 
 
@@ -232,7 +287,28 @@ def _compose_message(check: dict) -> str:
     label = "DEX-discovery" if source == "dex_discovery" else "RH/Pons"
     lines = [f"gecko-alpha {label} watchdog: poll-liveness breach"]
     reason = check["reason"]
-    if reason == "heartbeat_absent":
+    if reason == "head_lag_unknown":
+        lines.append(
+            "- RH/Pons primary deployment has no usable measured-head checkpoint; "
+            "the poll heartbeat is fresh but current-head coverage is UNKNOWN."
+        )
+    elif reason == "head_lag_exceeded":
+        lines.append(
+            f"- RH/Pons primary deployment is {check['head_lag_blocks']} blocks behind "
+            f"its measured head (limit {check['max_head_lag_blocks']}); "
+            "successful historical scans are not current-head coverage."
+        )
+    elif reason in (
+        "checkpoint_stale",
+        "checkpoint_invalid",
+        "checkpoint_future_invalid",
+    ):
+        lines.append(
+            f"- RH/Pons primary deployment head checkpoint is {reason.removeprefix('checkpoint_')}: "
+            f"{check.get('checkpoint_updated_at')!r}; "
+            "a fresh lane heartbeat cannot establish fresh primary-deployment coverage."
+        )
+    elif reason == "heartbeat_absent":
         lines.append(
             f"- {source} heartbeat: NO successful-poll record exists in "
             "ingest_watchdog_state — the discovery lane has never completed a "
@@ -333,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         "--source", choices=tuple(_DISCOVERY_TABLES), default=_HEARTBEAT_SOURCE
     )
     ap.add_argument("--db", required=True)
+    ap.add_argument("--max-head-lag-blocks", type=int, default=2000)
     ap.add_argument("--enabled", default="false")
     ap.add_argument("--discovery-enabled", default="false")
     ap.add_argument("--staleness-hours", type=float, default=2.0)
@@ -373,7 +450,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         check = asyncio.run(
             _read_state(
-                args.db, now, args.staleness_hours, args.clock_skew_seconds, args.source
+                args.db,
+                now,
+                args.staleness_hours,
+                args.clock_skew_seconds,
+                args.source,
+                args.max_head_lag_blocks,
             )
         )
     except Exception as exc:  # runtime error → exit 1, never a silent 0

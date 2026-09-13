@@ -46,6 +46,7 @@ ENABLED="${WATCHDOG_ENABLED_FROM_CRON}"
 # Lane gate: from .env (the lane's own operator flag).
 DISCOVERY_ENABLED="${RH_PONS_COLLECTOR_ENABLED:-false}"
 STALENESS_HOURS="${RH_PONS_POLL_STALENESS_ALERT_HOURS:-2}"
+MAX_HEAD_LAG_BLOCKS="${RH_PONS_MAX_HEAD_LAG_BLOCKS:-2000}"
 CLOCK_SKEW_SECONDS="${RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS:-300}"
 COOLDOWN_HOURS="${RH_PONS_WATCHDOG_COOLDOWN_HOURS:-24}"
 STATE_DIR="${RH_PONS_WATCHDOG_STATE_DIR:-/var/lib/gecko-alpha/rh-pons-watchdog}"
@@ -69,5 +70,6 @@ exec "${PYTHON}" "${SCRIPT_DIR}/dex_discovery_watchdog.py" --source rh_pons \
     --db "${DB_PATH}" --enabled "${ENABLED}" \
     --discovery-enabled "${DISCOVERY_ENABLED}" \
     --staleness-hours "${STALENESS_HOURS}" \
+    --max-head-lag-blocks "${MAX_HEAD_LAG_BLOCKS}" \
     --clock-skew-seconds "${CLOCK_SKEW_SECONDS}" \
     --cooldown-hours "${COOLDOWN_HOURS}" --state-dir "${STATE_DIR}"
