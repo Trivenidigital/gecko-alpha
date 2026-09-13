@@ -1,10 +1,12 @@
 """Exercise the existing watchdog CLI against the RH heartbeat, without sends."""
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import pytest
 from datetime import datetime, timedelta, timezone
 
 
@@ -82,3 +84,29 @@ def test_rh_future_heartbeat_does_not_hide_outage(tmp_path):
     assert (
         json.loads(result.stdout.splitlines()[0])["check"]["reason"] == "future_invalid"
     )
+
+
+def test_disabled_wrapper_does_not_require_writable_state(tmp_path):
+    bash = (
+        Path("C:/Program Files/Git/bin/bash.exe")
+        if os.name == "nt"
+        else Path("/bin/bash")
+    )
+    if not bash.exists():
+        pytest.skip("Bash is required for the deployment wrapper")
+    env = dict(
+        os.environ,
+        RH_PONS_WATCHDOG_ENABLED="false",
+        RH_PONS_WATCHDOG_STATE_DIR="/dev/null/rh-watchdog",
+        GECKO_ENV_FILE=str(tmp_path / "absent.env"),
+        GECKO_PYTHON=sys.executable.replace("\\", "/"),
+    )
+    result = subprocess.run(
+        [str(bash), str(Path(__file__).parents[1] / "scripts/rh-pons-watchdog.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert '"status": "disabled_noop"' in result.stdout

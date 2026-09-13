@@ -63,8 +63,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "$STATE_DIR"
-
 cd "$REPO_ROOT"
 
 exec "${PYTHON}" "${SCRIPT_DIR}/dex_discovery_watchdog.py" --source rh_pons \
