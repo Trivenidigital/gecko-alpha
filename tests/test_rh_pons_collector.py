@@ -375,7 +375,9 @@ async def test_poll_once_flag_off_no_http(tmp_path, settings_factory):
     await db.close()
 
 
-async def test_poll_once_refuses_unverified_deployment(tmp_path, settings_factory, monkeypatch):
+async def test_poll_once_refuses_unverified_deployment(
+    tmp_path, settings_factory, monkeypatch
+):
     # Flag ON and URL configured — but the registry has no onchain_verified
     # deployment, so the collector must still refuse without any HTTP.
     monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (DEP,))
@@ -983,4 +985,97 @@ async def test_reorg_rechecks_recently_graduated_curve(
     assert (await db.get_curve_launch(DEP.chain_id, TOKEN))[
         "lifecycle_status"
     ] == "on_curve"
+    await db.close()
+
+
+async def test_header_reads_are_unique_and_bounded(monkeypatch):
+    import asyncio
+
+    active = 0
+    peak = 0
+    calls = []
+
+    async def header(session, url, height):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        calls.append(height)
+        await asyncio.sleep(0.001)
+        active -= 1
+        return {
+            "number": hex(height),
+            "hash": "0x" + "bb" * 32,
+            "timestamp": hex(1700000000),
+        }
+
+    monkeypatch.setattr(rh_pons, "_block_header", header)
+    result = await rh_pons._fetch_block_headers(
+        None, "fixture", list(range(20)) + [1, 2]
+    )
+    assert set(result) == set(range(20))
+    assert len(calls) == 20
+    assert peak == 8
+
+
+async def test_incomplete_header_batch_is_failure(monkeypatch):
+    async def header(session, url, height):
+        return None if height == 3 else {"hash": "0x" + "bb" * 32}
+
+    monkeypatch.setattr(rh_pons, "_block_header", header)
+    assert await rh_pons._fetch_block_headers(None, "fixture", range(10)) is None
+
+
+@pytest.mark.parametrize(
+    "completion_head,expected_checkpoint", [(150, True), (None, False), (99, False)]
+)
+async def test_checkpoint_uses_completion_head(
+    tmp_path, settings_factory, monkeypatch, completion_head, expected_checkpoint
+):
+    from aioresponses import CallbackResult
+
+    db = await _db(tmp_path)
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
+    settings = settings_factory(
+        RH_PONS_COLLECTOR_ENABLED=True,
+        RH_PONS_RPC_URL="https://rpc.invalid",
+        RH_PONS_POLL_EVERY_N_CYCLES=1,
+    )
+    head_calls = 0
+
+    def rpc(url, **kw):
+        nonlocal head_calls
+        body = kw["json"]
+        method = body["method"]
+        if method == "eth_chainId":
+            result = hex(DEP.chain_id)
+        elif method == "eth_blockNumber":
+            head_calls += 1
+            result = (
+                hex(100)
+                if head_calls == 1
+                else (hex(completion_head) if completion_head is not None else None)
+            )
+        elif method == "eth_getBlockByNumber":
+            result = {
+                "number": body["params"][0],
+                "hash": "0x" + "bb" * 32,
+                "timestamp": hex(1700000000),
+            }
+        else:
+            result = []
+        return CallbackResult(payload={"result": result})
+
+    with aioresponses() as m:
+        m.post(settings.RH_PONS_RPC_URL, callback=rpc, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            await rh_pons.poll_once(session, db, settings)
+    checkpoint = await db.get_curve_scan_checkpoint(
+        DEP.chain_id, DEP.version, DEP.factory
+    )
+    if expected_checkpoint:
+        assert checkpoint["head_block"] == 150
+        assert checkpoint["next_block"] == 101
+    else:
+        assert checkpoint is None
+        assert "rh_pons" not in await db.load_ingest_watchdog_state()
     await db.close()

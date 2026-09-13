@@ -31,11 +31,12 @@ Observation gates:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 import aiohttp
 import structlog
@@ -716,6 +717,28 @@ async def _block_header(
     return result
 
 
+_HEADER_REQUEST_CONCURRENCY = 8
+
+
+async def _fetch_block_headers(
+    session: aiohttp.ClientSession, url: str, heights: Iterable[int]
+) -> dict[int, dict] | None:
+    """Fetch each needed header once, with at most eight requests in flight.
+
+    A partial batch never reaches the evidence writer or checkpoint.
+    Chunking also bounds task creation for large backfills.
+    """
+    unique = sorted(set(heights))
+    headers = {}
+    for offset in range(0, len(unique), _HEADER_REQUEST_CONCURRENCY):
+        batch = unique[offset : offset + _HEADER_REQUEST_CONCURRENCY]
+        results = await asyncio.gather(*(_block_header(session, url, h) for h in batch))
+        if any(result is None for result in results):
+            return None
+        headers.update(zip(batch, results))
+    return headers
+
+
 async def poll_once(
     session: aiohttp.ClientSession,
     db: "Database",
@@ -786,20 +809,6 @@ async def poll_once(
     if from_block > to_block:
         return 0
     old_hashes = json.loads(checkpoint["block_hashes_json"]) if checkpoint else {}
-    headers = {}
-    # Verify the retained anchor before mutating evidence. Deeper reorganizations
-    # require an operator-reviewed rewind; never silently skip orphaned history.
-    for height in sorted(map(int, old_hashes)):
-        header = await _block_header(session, url, height)
-        if header is None:
-            return 0
-        headers[height] = header
-        if (
-            height == min(map(int, old_hashes))
-            and header["hash"].lower() != old_hashes[str(height)].lower()
-        ):
-            logger.error("rh_pons_reorg_beyond_overlap", block=height)
-            return 0
     factory_logs = await _rpc_get_logs(
         session,
         url,
@@ -848,6 +857,7 @@ async def poll_once(
         if entries is None:
             return 0
         raw_logs.extend(entries)
+    identities = []
     for log in raw_logs:
         ident = _log_identity(log)
         decoded = decode_log(log)
@@ -860,27 +870,29 @@ async def poll_once(
                 return 0
         elif emitter != deployment.factory.lower():
             return 0
-        if ident[2] not in headers:
-            headers[ident[2]] = await _block_header(session, url, ident[2])
+        identities.append((log, ident))
+    # One bounded batch covers event clocks, old evidence canonicality and
+    # retained overlap headers, including empty blocks. No per-log await.
+    needed = set(map(int, old_hashes))
+    needed.update(ident[2] for _, ident in identities)
+    needed.update(event["block_number"] for event in prior_events)
+    needed.update(range(max(deployment.deploy_block, to_block - overlap), to_block + 1))
+    headers = await _fetch_block_headers(session, url, needed)
+    if headers is None:
+        return 0
+    if old_hashes:
+        anchor = min(map(int, old_hashes))
+        if headers[anchor]["hash"].lower() != old_hashes[str(anchor)].lower():
+            logger.error("rh_pons_reorg_beyond_overlap", block=anchor)
+            return 0
+    for log, ident in identities:
         header = headers[ident[2]]
-        if header is None or (
-            not log.get("removed") and header["hash"].lower() != ident[3]
-        ):
+        if not log.get("removed") and header["hash"].lower() != ident[3]:
             return 0
         log["blockTimestamp"] = header["timestamp"]
-    # Retain every header in the bounded overlap, including empty blocks.
-    for height in range(max(deployment.deploy_block, to_block - overlap), to_block + 1):
-        if height not in headers:
-            headers[height] = await _block_header(session, url, height)
-        if headers[height] is None:
-            return 0
     removed = []
     for event in prior_events:
         height = event["block_number"]
-        if height not in headers:
-            headers[height] = await _block_header(session, url, height)
-        if headers[height] is None:
-            return 0
         if event["block_hash"].lower() != headers[height]["hash"].lower():
             removed.append(
                 {
@@ -904,6 +916,11 @@ async def poll_once(
         deployment=deployment,
     )
     if counters["undecodable"]:
+        return 0
+    # Include blocks produced while fetching/processing this pass. Persisting
+    # only the starting head understates lag precisely when RPC is slow.
+    head = _hex_int(await _rpc(session, url, "eth_blockNumber", []))
+    if head is None or head < to_block:
         return 0
     retained = {
         str(h): v["hash"]
