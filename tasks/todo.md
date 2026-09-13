@@ -1,3 +1,10 @@
+## Active Work: 2026-09-13 22:15 - Historical entry-stop display
+
+- [x] Current-base drift and production read-only schema/state preflight.
+- [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
+- [ ] Exact-head CI and allowed merge; deployment remains separately owned.
+- Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
+
 ## Findings closeout: 2026-09-13 — autonomous product readiness
 
 **Status:** HISTORICAL FINDINGS — the 19:21 UTC DASH-11 denominator mismatch was corrected by PR #571; PR #573 records deployment evidence. Next engineering gate: residual DASH-11 read-only dashboard/API integration, with fresh runtime verification of producer coverage, retention and price provenance. Do not rebuild the analyzer correction. Report: tasks/findings_autonomous_product_readiness_2026_09_13.md. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
