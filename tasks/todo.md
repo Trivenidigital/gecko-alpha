@@ -8,8 +8,8 @@
 - [x] Verify public V2 deployment and replay real launch/buy/sell logs.
 - [x] Establish direct Claude CLI collaboration and cross-review.
 - [x] Run isolated live RPC capture and injected failure check.
-- [ ] Complete throughput followup, final review and Linux CI.
-- [ ] Publish reviewed branch/PR and final acceptance evidence.
+- [x] Complete throughput followup and final review; Linux CI passed at 4da32b77.
+- [x] Publish reviewed PR #572 and acceptance evidence.
 
 Results and remaining activation boundaries:
 `tasks/report_rh_pons_readiness_20260913.md`. This supersedes the review-only
@@ -32,6 +32,28 @@ Review result: 24 focused tests pass; five concrete findings recorded in
 `tasks/review_claude_rh_pons_2026_09_13.md`. Direct CLI request and same-session
 follow-up both succeeded. Product fixes and live readiness remain outstanding.
 
+## Active Work: 2026-09-13 - Autonomous closeout evidence boundaries
+
+- [x] Fresh origin/master drift audit in isolated branch; templates, role map,
+  cockpit and Signal Trust V1 already exist.
+- [x] Read-only production service/revision and endpoint checks; external Codex
+  configuration found; no matching closeout job in inspected Hermes job store.
+- [x] Two parallel plan reviews, then two parallel design reviews approved;
+  folds recorded in `tasks/design_overnight_closeout_2026_09_13.md`.
+- [x] Reporter regression reproduced before bounded wording/doc correction.
+- [x] Recovered successor tracker; runtime findings advanced DASH-09/11.
+- [x] Suppression report population mismatch corrected after two parallel plan
+  and two parallel design reviews; 21 focused tests pass, cost identical in
+  shared production read-only snapshot. No deployment or sends.
+- [x] Focused verification and PR #571; both independent PR reviewers approved
+  candidate `218a295e` across all four clearance vectors, no remaining folds.
+- [ ] Exact-head CI and conditional merge.
+- [ ] Conditional merge and final report/memory.
+
+Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and
+`tasks/closeout_report_overnight_2026_09_13.md`. No policy, runtime configuration,
+DB, vendor, or execution mutation. Successor tracker recovered from the main
+checkout as untracked dated evidence; historical parents are not rebuilt.
 
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
