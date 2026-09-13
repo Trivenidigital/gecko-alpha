@@ -212,6 +212,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     if db_path is not None:
         _db_path = db_path
 
+    # Freeze this read-only route target; legacy routes still use the module global.
+    postmortem_db_path = _db_path
+
     app = FastAPI(title="Gecko-Alpha Dashboard")
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -812,7 +815,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         headers = {"Cache-Control": "no-store"}
         try:
-            payload = await db.get_postmortem_history(_db_path, limit, before_id)
+            payload = await db.get_postmortem_history(
+                postmortem_db_path, limit, before_id
+            )
             content = PostmortemHistoryResponse.model_validate(payload).model_dump(
                 mode="json"
             )

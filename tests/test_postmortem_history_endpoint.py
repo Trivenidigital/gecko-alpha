@@ -240,3 +240,16 @@ async def test_embedded_nul_cannot_bypass_response_bounds(history_path):
         assert row["most_frequent_recorded_block_reason"] == "<b>gate</b>"
         assert row["run_pct"] is None
         assert len(response.content) < 20000
+
+
+async def test_each_app_keeps_its_own_history_database(history_path, tmp_path):
+    other = tmp_path / "second.db"
+    other.write_bytes(history_path.read_bytes())
+    with sqlite3.connect(other) as conn:
+        conn.execute("DELETE FROM moved_already_postmortems WHERE id > 1")
+    async with client_for(history_path) as first:
+        async with client_for(other) as second:
+            first_result = await first.get(PATH)
+            second_result = await second.get(PATH)
+    assert first_result.json()["meta"]["total_records"] == 31
+    assert second_result.json()["meta"]["total_records"] == 1
