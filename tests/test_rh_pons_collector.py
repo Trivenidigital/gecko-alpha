@@ -9,6 +9,7 @@ registry carries an 'onchain_verified' entry.
 """
 
 import json
+from dataclasses import replace
 
 import aiohttp
 import pytest
@@ -29,7 +30,7 @@ from scout.ingestion.rh_pons import (
 )
 from scout.safety import is_safe_strict
 
-DEP = PONS_DEPLOYMENTS[0]  # pons_v2, source_derived_unverified
+DEP = replace(PONS_DEPLOYMENTS[0], verification_status="source_derived_unverified")
 
 TOKEN = "0x" + "11" * 20
 CURVE = "0x" + "22" * 20
@@ -151,9 +152,14 @@ def test_topic_derivation_matches_known_keccak_vector():
     assert TOPIC_TOKEN_LAUNCHED == "0x" + keccak(text=rh_pons.SIG_TOKEN_LAUNCHED).hex()
 
 
-def test_registry_is_inert_no_deployment_is_collectable():
-    assert active_deployment() is None
-    assert all(not d.collectable for d in PONS_DEPLOYMENTS)
+def test_registry_selects_verified_curve_factory_but_defaults_off(settings_factory):
+    dep = active_deployment()
+    assert dep.factory == "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e"
+    assert dep.deploy_block == 26841846
+    assert dep.collectable
+    assert all(not d.collectable for d in PONS_DEPLOYMENTS[1:])
+    assert not settings_factory().RH_PONS_COLLECTOR_ENABLED
+    assert PONS_DEPLOYMENTS[1].version == "pons_direct_v3"
 
 
 # ---------------------------------------------------------------- migration
@@ -369,9 +375,10 @@ async def test_poll_once_flag_off_no_http(tmp_path, settings_factory):
     await db.close()
 
 
-async def test_poll_once_refuses_unverified_deployment(tmp_path, settings_factory):
+async def test_poll_once_refuses_unverified_deployment(tmp_path, settings_factory, monkeypatch):
     # Flag ON and URL configured — but the registry has no onchain_verified
     # deployment, so the collector must still refuse without any HTTP.
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (DEP,))
     db = await _db(tmp_path)
     settings = settings_factory(
         RH_PONS_COLLECTOR_ENABLED=True,
@@ -386,8 +393,7 @@ async def test_poll_once_refuses_unverified_deployment(tmp_path, settings_factor
 
 def _verified_dep() -> PonsDeployment:
     # Synthetic TEST-ONLY registry state: same source-derived address, marked
-    # verified so the transport/backfill path is exercisable. Prod stays
-    # inert because the real registry never carries this entry.
+    # verified so the transport/backfill path is exercisable at block 90.
     return PonsDeployment(
         version="pons_v2",
         chain_id=DEP.chain_id,

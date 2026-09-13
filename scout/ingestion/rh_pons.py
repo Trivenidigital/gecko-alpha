@@ -12,13 +12,12 @@ Observe-only guardrails (mirrors gt_new_pools / the I1-I3 discipline):
   call and the pipeline is byte-identical.
 - Never raises into run_cycle (caller wraps).
 
-Inert-by-construction guarantees (operator ruling 2026-09-13):
-- Every deployment in ``PONS_DEPLOYMENTS`` is ``source_derived_unverified``
-  today (first-party docs + chain RPC were egress-blocked at authorship;
-  conflicting factory addresses are BOTH recorded, neither selected).
-  ``poll_once`` refuses to touch the network unless the flag is on, an RPC
-  URL is configured, AND the deployment is ``onchain_verified`` — so live
-  collection stays off until a human-verified registry edit lands.
+Observation gates:
+- The V2 factory identity, deployment block and event layouts were verified
+  against public RPC and verified source on 2026-09-13. Auxiliary contracts
+  and execution eligibility are not covered by that verification.
+  ``poll_once`` requires the default-off flag, configured RPC URL and a
+  verified V2 registry entry. Other contract families remain unselected.
 - ``collect_from_logs`` is transport-free so decoding, ordering, duplicate,
   reorg, and lifecycle behavior are all testable against provenance-tagged
   fixtures without pretending a live integration check happened.
@@ -96,22 +95,36 @@ PONS_DEPLOYMENTS: tuple[PonsDeployment, ...] = (
         launch_router="0xe33e9e479df8802cb0866d5d05258bec4cf62948",
         pool_manager="0x8366a39cc670b4001a1121b8f6a443a643e40951",
         meme_hook="0xe5e702641ea86f4ae6cc3cdaed2b886f976be044",
-        deploy_block=None,
-        verification_status="source_derived_unverified",
-        sources=("github.com/ponsmcp/pons-mcp README+docs/PROTOCOL.md (2026-09-13)",),
-        notes="First-party docs + chain RPC egress-blocked at authorship.",
+        deploy_block=26841846,
+        verification_status="onchain_verified",
+        sources=(
+            "https://docs.robinhood.com/chain/connecting/",
+            "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/"
+            "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+            "investigation/rh_pons_public_evidence_20260913.json",
+            "investigation/rh_pons_trade_fixture_20260913.json",
+        ),
+        notes=(
+            "Factory bytecode, deployment receipt and launch/trade ABI verified "
+            "2026-09-13. Router, hook and pool-manager addresses remain "
+            "source-derived and independently unverified; no execution approval."
+        ),
     ),
     PonsDeployment(
-        version="pons_v2_conflict_alt",
+        version="pons_direct_v3",
         chain_id=ROBINHOOD_CHAIN_ID,
         network=NETWORK,
         factory="0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
         deploy_block=8991118,
         verification_status="source_derived_unverified",
-        sources=("Bitquery/Mobula-derived description (2026-09-13)",),
+        sources=(
+            "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/"
+            "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+        ),
         notes=(
-            "CONFLICTS with pons_v2 factory address; possibly a newer redeploy. "
-            "Recorded, not selected — resolution is an unresolved dependency."
+            "Verified source identifies PonsLaunchFactory direct Uniswap V3, "
+            "with a different ten-parameter TokenLaunched ABI. Not compatible "
+            "with this curve V2 collector; deploy block remains source-derived."
         ),
     ),
     PonsDeployment(
@@ -129,7 +142,7 @@ PONS_DEPLOYMENTS: tuple[PonsDeployment, ...] = (
 
 def active_deployment() -> PonsDeployment | None:
     """The single deployment live collection may use: the newest
-    'onchain_verified' v2 entry. None today — everything is unverified."""
+    'onchain_verified' v2 entry. Runtime activation is separately gated."""
     for dep in PONS_DEPLOYMENTS:
         if dep.version == "pons_v2" and dep.collectable:
             return dep
@@ -631,7 +644,7 @@ async def advance_lifecycle(
 
 
 # ---------------------------------------------------------------------------
-# Live polling shell — refuses until deployment verification lands.
+# Live polling shell — explicit observation activation required.
 # ---------------------------------------------------------------------------
 
 
@@ -713,7 +726,7 @@ async def poll_once(
 
     Three independent preconditions must hold before any HTTP happens:
     RH_PONS_COLLECTOR_ENABLED, a configured RH_PONS_RPC_URL, and an
-    'onchain_verified' deployment in the registry. All three are false today.
+    'onchain_verified' deployment in the registry.
     """
     global _poll_cycle_counter
 
@@ -903,6 +916,7 @@ async def poll_once(
         deployment.factory,
         next_block=to_block + 1,
         block_hashes=retained,
+        head_block=head,
     )
     await db.upsert_ingest_watchdog_state("rh_pons", 0)
     logger.info(
