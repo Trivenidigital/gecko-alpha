@@ -2417,3 +2417,13 @@ Docs-only scope; detailed findings and verification in
 
 Review: no code/runtime changes; centralized routing, stop history and postmortem
 UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
+
+## Historical postmortem viewer: 2026-09-13
+
+- [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
+- [ ] Two plan reviews and folds; two design reviews and folds.
+- [ ] Bounded read-only historical list API and Performance tab; focused tests/build.
+- [ ] PR, two independent reviews, folds, exact-head CI; parent-coordinated merge.
+
+Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
+See tasks/plan_postmortem_history_2026_09_13.md.
