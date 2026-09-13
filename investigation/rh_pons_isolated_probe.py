@@ -34,7 +34,8 @@ async def main():
                 scans = []
                 for _ in range(2):
                     started = time.monotonic()
-                    events = await poll_once(session, db, settings)
+                    async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
+                        events = await poll_once(session, db, settings)
                     cp = await db.get_curve_scan_checkpoint(dep.chain_id, dep.version, dep.factory)
                     scans.append({"events": events, "duration_seconds": round(time.monotonic()-started, 3), "checkpoint": cp})
                 cur = await db._conn.execute("SELECT updated_at FROM ingest_watchdog_state WHERE source='rh_pons'")
