@@ -27,9 +27,9 @@ historical list visibility, not full DASH-05 missed-token capture/attribution.
 
 Root runtime probe: production d2f0d61e, 31 stored rows, latest capture
 2026-08-09T01:39:15.405190+00:00, zero open paper trades. Evidence strings maximum
-15546 characters; corrected shape probe pending. List V1 never selects/parses
+15546 characters. Corrected root probe 2026-09-13T22:57:13.271140Z confirms malformed JSON=0; entry_mcap_snapshot is null in all31. List V1 never selects/parses
 that evidence, so malformed/large JSON cannot block it. No inferred evidence
-completeness from the pending probe. Existing history can be viewed independent
+completeness from historical presence alone. Existing history can be viewed independent
 of recorder flags or future trades; no forward-fire soak is needed. Parent
 coordinates current runtime schema validation before implementation, reviewers,
 PR575 base reconciliation, and any final merge. No deployment in this slice:
@@ -96,3 +96,4 @@ the viewer commit and rebuilding prior UI; no data restore/migration needed.
 Plan awaiting two reviewer passes. Design/build have not started. Current source
 and row inventory support a display; broader capture coverage, causal analysis,
 T-minus reconstruction and writer watchdog remain explicitly separate residuals.
+
