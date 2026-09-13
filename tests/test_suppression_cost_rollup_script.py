@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "suppression_cost_rollup.py"
@@ -39,6 +40,116 @@ def _load_module():
 
 
 mod = _load_module()
+
+
+@pytest.mark.parametrize("sample_count,dead", [(0, True), (1, False)])
+async def test_ledger_only_signal_cannot_mask_missing_or_low_sampling(
+    tmp_path, sample_count, dead
+):
+    conn = await _build_db(tmp_path / "s.db")
+    for i in range(10):
+        await _add_suppressed_block(conn, token_id=f"event-{i}")
+        await _add_suppressed_row(
+            conn, token_id=f"other-{i}", surface="chain_completed", days_ago=1
+        )
+    for i in range(sample_count):
+        await _add_suppressed_row(conn, token_id=f"sample-{i}", days_ago=1)
+    await conn.commit()
+    await conn.close()
+    result = await mod.analyze(str(tmp_path / "s.db"), now=NOW)
+    health = result["health"]
+    assert health["sampling_dead"] is dead
+    assert health["sampling_degraded"] is True
+    assert health["sampling_fraction"] is None
+    assert health["population_mismatch_signals"] == ["chain_completed"]
+    assert health["missing_sample_signals"] == (["gainers_early"] if dead else [])
+    if not dead:
+        assert "fraction<0.5:gainers_early" in health["degraded_reasons"]
+    text = mod.format_summary(result)
+    assert "POPULATION MISMATCH" in text
+    assert "chain_completed" in text
+    assert "not-for-pruning" in text
+
+
+async def test_excess_counts_are_unknown_not_healthy_coverage(tmp_path):
+    conn = await _build_db(tmp_path / "s.db")
+    await _add_suppressed_block(conn)
+    for i in range(2):
+        await _add_suppressed_row(conn, token_id=str(i), days_ago=1)
+    await conn.commit()
+    await conn.close()
+    result = await mod.analyze(str(tmp_path / "s.db"), now=NOW)
+    assert result["health"]["sampling_fraction"] is None
+    assert result["health"]["population_counts"] == [
+        dict(
+            signal_type="gainers_early", sampled_rows=2, decision_rows=1, count_ratio=2
+        )
+    ]
+    assert "count ratio UNKNOWN" in mod.format_summary(result)
+
+
+async def test_balanced_lanes_preserve_aggregate_absolute_floor(tmp_path):
+    conn = await _build_db(tmp_path / "s.db")
+    for signal in ("first_signal", "gainers_early"):
+        for i in range(4):
+            await _add_suppressed_block(conn, signal_type=signal)
+            await _add_suppressed_row(
+                conn, token_id=f"{signal}-{i}", surface=signal, days_ago=1
+            )
+    await conn.commit()
+    await conn.close()
+    result = await mod.analyze(str(tmp_path / "s.db"), now=NOW)
+    assert result["health"]["sampling_fraction"] == 1
+    assert result["health"]["sampling_degraded"] is False
+    assert result["health"]["sampling_dead"] is False
+    assert "count ratio" in mod.format_summary(result)
+
+
+async def test_empty_population_is_no_observed_activity(tmp_path):
+    conn = await _build_db(tmp_path / "s.db")
+    await conn.close()
+    result = await mod.analyze(str(tmp_path / "s.db"), now=NOW)
+    assert result["health"]["sampling_fraction"] is None
+    assert "NO OBSERVED ACTIVITY" in mod.format_summary(result)
+
+
+async def test_analyze_never_creates_missing_database(tmp_path):
+    missing = tmp_path / "absent.db"
+    with pytest.raises(aiosqlite.OperationalError):
+        await mod.analyze(str(missing), now=NOW)
+    assert not missing.exists()
+
+
+async def test_special_character_path_is_read_only(tmp_path, monkeypatch):
+    path = tmp_path / "report # evidence.db"
+    conn = await _build_db(path)
+    await conn.close()
+    real_connect = aiosqlite.connect
+    attempted = []
+
+    class ReadOnlyProbe:
+        async def __aenter__(self):
+            self.conn = await real_connect(
+                path.resolve().as_uri() + "?mode=ro", uri=True
+            )
+            with pytest.raises(aiosqlite.OperationalError, match="readonly"):
+                await self.conn.execute("CREATE TABLE forbidden (id INTEGER)")
+            attempted.append(True)
+            return self.conn
+
+        async def __aexit__(self, *args):
+            await self.conn.close()
+
+    def checked_connect(database, **kwargs):
+        assert database == path.resolve().as_uri() + "?mode=ro"
+        assert kwargs.get("uri") is True
+        return ReadOnlyProbe()
+
+    monkeypatch.setattr(mod.aiosqlite, "connect", checked_connect)
+    result = await mod.analyze(str(path), now=NOW)
+    assert attempted == [True]
+    assert result["health"]["sampled_in_window"] == 0
+
 
 # --- minimal schema, copied verbatim from scout/db.py CREATE statements -------
 _CREATE_LEDGER = """
@@ -121,15 +232,17 @@ async def _add_suppressed_row(
     )
 
 
-async def _add_suppressed_block(conn, *, token_id="blk", days_ago=1, anchor=None):
+async def _add_suppressed_block(
+    conn, *, token_id="blk", days_ago=1, anchor=None, signal_type="gainers_early"
+):
     created = ((anchor or NOW) - timedelta(days=days_ago)).isoformat()
     await conn.execute(
         """INSERT INTO trade_decision_events
            (token_id, signal_type, decision, reason, source_module,
             event_data, created_at)
-           VALUES (?, 'gainers_early', 'blocked', 'suppressed',
+           VALUES (?, ?, 'blocked', 'suppressed',
                    'scout.trading.signals', '{}', ?)""",
-        (token_id, created),
+        (token_id, signal_type, created),
     )
 
 
@@ -244,7 +357,8 @@ async def test_small_n_is_insufficient_data_no_dollar_figure(tmp_path):
     text = mod.format_summary(res)
     assert "INSUFFICIENT_DATA" in text
     assert "n=3 matured" in text
-    assert "first meaningful read expected ~2026-07-31" in text
+    assert "verify runtime label progress" in text
+    assert "2026-07-31" not in text
     # Hard gate: absolutely no dollar number leaks below the sample floor.
     assert "$" not in text
     assert "est counterfactual PnL" not in text
@@ -276,8 +390,8 @@ async def test_zero_sampled_with_blocks_flags_sampling_dead(tmp_path):
 
     text = mod.format_summary(res)
     assert "SAMPLING APPEARS DEAD" in text
-    assert "421" in text  # names the lane; pre-deploy this is the EXPECTED state
-    assert "EXPECTED until #421 deploys" in text
+    assert "gainers_early" in text
+    assert "EXPECTED until #421 deploys" not in text
     assert "INSUFFICIENT_DATA" in text
 
 
@@ -463,7 +577,7 @@ async def test_degraded_on_low_fraction_at_high_rows_per_day(tmp_path):
     assert any("fraction<" in reason for reason in h["degraded_reasons"])
     assert all("rows/day" not in reason for reason in h["degraded_reasons"])
     text = mod.format_summary(res)
-    assert "DEGRADED[fraction<0.5]" in text
+    assert "fraction<0.5:gainers_early" in text
 
 
 # --------------------------------------------------------------------------

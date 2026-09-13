@@ -38,7 +38,17 @@ Safety note: `--out` only allows writing to `tasks/*.md` and refuses to overwrit
 ## Interpreting the report
 
 - If `templates missing` appears: create/ship template pack first.
-- If `Runner candidates` is empty: treat overnight closeout as a **manual** process until a scheduler integration is explicitly designed and operator-approved.
+- `Runner candidates` covers this repository only. An empty list does not mean
+  the process is manual or has never run; external Codex automations or Hermes
+  jobs may exist. A candidate file likewise does not prove activation or success.
+- Verify external evidence separately: saved scheduler configuration establishes
+  intended scheduling; an observed invocation establishes a started run; verified
+  output/PR/CI establishes completion. Memory is historical attestation until
+  checked against its cited artifacts. This script does not inspect those systems.
+- Backlog anchors are historical extracted headers, not a reconciled work queue.
+  Follow the top reconciliation and verify its named successor tracker before
+  selecting superseded child work. A missing tracker is a scope-recovery blocker,
+  not permission to rebuild the parent.
 - `Reference-only mentions` are docs/history/status-surface hits. They prove the closeout was discussed or reported, not that an executable runner exists.
 - If backlog anchors show `SHIPPED-MERGED` but UI work is missing: treat as a follow-up item; do not re-implement the shipped primitive.
 

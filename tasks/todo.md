@@ -6,6 +6,30 @@
 - [x] Findings PR #570 opened: source + runtime evidence, next product gate, two PR reviews approved with citation/checklist folds. CI/final-head confirmation tracked in session report.
 # Backlog — gecko-alpha
 
+## Completed Work: 2026-09-13 - Autonomous closeout evidence boundaries
+
+- [x] Fresh origin/master drift audit in isolated branch; templates, role map,
+  cockpit and Signal Trust V1 already exist.
+- [x] Read-only production service/revision and endpoint checks; external Codex
+  configuration found; no matching closeout job in inspected Hermes job store.
+- [x] Two parallel plan reviews, then two parallel design reviews approved;
+  folds recorded in `tasks/design_overnight_closeout_2026_09_13.md`.
+- [x] Reporter regression reproduced before bounded wording/doc correction.
+- [x] Recovered successor tracker; runtime findings advanced DASH-09/11.
+- [x] Suppression report population mismatch corrected after two parallel plan
+  and two parallel design reviews; 21 focused tests pass, cost identical in
+  shared production read-only snapshot. No deployment or sends.
+- [x] Focused verification and PR #571; both independent PR reviewers approved
+  candidate `218a295e` across all four clearance vectors, no remaining folds.
+- [x] Exact-head CI: 7,625 passed/12 skipped; PR #571 merged as d2f0d61e.
+- [x] Production scripts/docs refresh and no-send smokes passed at 19:55Z;
+  final report and automation memory recorded. Remaining UI work stays open.
+
+Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and
+`tasks/closeout_report_overnight_2026_09_13.md`. No policy, runtime configuration,
+DB, vendor, or execution mutation. Successor tracker recovered from the main
+checkout as untracked dated evidence; historical parents are not rebuilt.
+
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
 **Status:** SHIPPED 2026-06-22 - PR #377 squash `dc8f70ae`. Goal: run the Gecko overnight autonomous closeout in
