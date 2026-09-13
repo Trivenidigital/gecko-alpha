@@ -37,9 +37,9 @@ successor tracker missing from this checkout. Do not rebuild those parents.
   execution from file presence/absence. Verify reporter tests and node syntax.
 - [x] Commit, open PR; two parallel PR reviews covering logic/concurrency and
   ops-safety/silent-failure; fold all findings and record exact reviewed SHA.
-- [ ] Merge only after focused tests, independent terminal reviews and exact-head
+- [x] Merge only after focused tests, independent terminal reviews and exact-head
   CI pass. Docs/script change requires no production service deployment.
-- [ ] Record final commit/PR/tests, blockers, approvals and automation memory.
+- [x] Record final commit/PR/tests, blockers, approvals and automation memory.
 
 ## Runtime assumptions to verify before any further build
 
@@ -65,3 +65,10 @@ blocker. Independent drift audit maps DASH-08 to downgraded post-quarantine,
 DASH-11 to existing suppression rollup, and DASH-09 to a residual requiring
 runtime stop-gap findings. Keep implementation unchanged; extend findings with
 those read-only checks and report remaining work honestly.
+
+## Final implementation status
+
+PR #571 merged as d2f0d61e on 2026-09-13 after 21 focused tests, independent
+reviews and full CI (7,625 passed, 12 skipped). Scripts/docs fast-forwarded
+to production at 19:55Z; no-send smokes passed, no restart or policy changes.
+See tasks/closeout_report_overnight_2026_09_13.md for exact conditions/evidence.

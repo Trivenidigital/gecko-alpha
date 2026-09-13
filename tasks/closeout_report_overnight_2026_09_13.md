@@ -2,9 +2,10 @@
 
 ## State and scope
 
-Both reporting corrections implemented and independently reviewed in
-[PR #571](https://github.com/Trivenidigital/gecko-alpha/pull/571); exact-head CI
-is the next merge gate. This report does **not** claim all Gecko backlog work is exhausted.
+Both reporting corrections merged and deployed via
+[PR #571](https://github.com/Trivenidigital/gecko-alpha/pull/571), squash
+`d2f0d61edc63cb55ae159ec952cce404991f21f5`. This report does **not** claim all
+Gecko backlog work is exhausted. Remaining read-only UI work is listed below.
 No trading, dispatch, source suppression, paid access, DB or production config
 was changed. Production baseline is `6c56186e31db24ebf6fe769a798cc9cd65e73015`.
 
@@ -148,6 +149,20 @@ entry stop, later conviction changes, partial exits and price provenance;
 do not label all observed loss beyond entry stop as execution slippage.
 No signal was revived or threshold changed to manufacture a cohort.
 
+Existing-data follow-up retained 23 historical stops (22 tokens) with v1 entry
+stop, non-legacy source, post-cutover market exit, no conviction lock/ladder legs,
+and consistent quantity/notional/zero realized partial PnL. Descriptive recorded
+exit-price shortfall versus entry stop: mean 1.347 pp, median 1.131 pp. This is
+not measured execution slippage. Repeatable query, exclusions and all rows:
+`tasks/findings_stop_shortfall_2026_09_13.md`. No new soak is required for this
+descriptive display contract; calibration remains separate.
+
+At 19:39Z, on-disk Settings had postmortem enabled and distinct configured
+health/trading destinations (IDs not recorded). Postmortem table: 31 rows,
+latest Aug 9; open paper trades=0. Recorder scans open trades, so there is no
+current input population. These config reads are not an attestation of the
+running processes' loaded settings. No flags, destinations or routes changed.
+
 ## Blocked, parked and deferred
 
 - **Operator gates unchanged:** paid vendor samples; live execution/sizing;
@@ -182,12 +197,17 @@ No signal was revived or threshold changed to manufacture a cohort.
   `loop_audit` APPROVE ops-safety/silent-failure, both naming exact candidate
   `218a295e7c944d5ef65f7a12b4c06ff12406c4c9`. Both independently ran 21 focused
   tests. All dispatched reviewers reached terminal states; no unresolved folds.
-  `.reviewers/571.toml` records those actual verdicts. Required CI must pass
-  after this documentation/clearance commit before merge.
+  `.reviewers/571.toml` records those actual verdicts. Both additionally approved
+  final metadata/deployment checkpoint `99905967`; watched code was unchanged.
+- [Final CI](https://github.com/Trivenidigital/gecko-alpha/actions/runs/34778263181)
+  passed on `99905967895443ef44773c69bc4b7eb91c3a38df`: **7,625 passed,
+  12 skipped**, 118 dashboard contract checks, baseline count 7,637 >= 1,232,
+  reviewer-clearances green. Merged 2026-09-13T19:54:27Z. Superseded CI runs
+  were canceled; none was used as this candidate's merge evidence.
 - Implementation commits: `24680ff5` (autonomous evidence boundary) and
   `218a295e` (suppression population correction). Updated suppression code was
-  verified through read-only stdin execution. Production script refresh is
-  planned after merge so the existing scheduled report benefits from the fix.
+  verified through read-only stdin execution and then installed by the verified
+  production fast-forward at **19:55:07.950247Z**.
 
 Second slice plan/design each received two parallel independent approvals.
 Folds: per-signal ratio checks but aggregate rows/day floor; explicit no-activity,
@@ -204,8 +224,8 @@ had escaped the earlier diff check); removed and verified against origin/master.
 |---|---|---|---|
 | Read-only repo/runtime probes | inspection | Current task requires runtime verification | Sept 13 19:16–19:25Z |
 | Reporter/docs/tests implementation; branch/commit/PR | reversible build | Current production-push prompt: may create branches, commits, PRs, feature pushes | Sept 13, this branch |
-| Merge | conditional | Same prompt: permitted low-risk classes after CI, focused verification and two-vector reviews | Not yet executed |
-| Scripts/docs refresh after merge | conditional deployment | Current prompt permits docs/scripts/tests deployment after smoke and rollback notes | Pending CI/merge and preflight below |
+| Merge | conditional, conditions satisfied | Same prompt: low-risk scripts/observability; focused tests, both independent reviews, final-head CI above | 2026-09-13T19:54:27Z, PR #571 |
+| Scripts/docs refresh after merge | deployment, conditions satisfied | Current prompt permits docs/scripts/tests deployment; exact-baseline/file preflight and no-send smoke below | 2026-09-13T19:55:07.950247Z, d2f0d61e |
 
 Rollback: revert this PR through normal review/CI. No production restart or
 data restore is needed for this local script/docs correction.
@@ -225,8 +245,15 @@ n-gate/counterfactual semantics and active services. Repository reporter smoke
 uses Node only if already installed; no runtime installation. If smoke fails,
 restore the two report scripts from baseline `6c56186e` (exact tracked paths
 only) and open a revert PR to reconcile deployment; never reset unrelated files.
-Final execution timestamp/SHA/result belongs in automation memory and final
-task response; this committed checkpoint intentionally leaves future gates open.
+
+**Executed result:** preflight verified all **15 incoming files** exactly match
+the reviewed PR, clean tracked worktree and master baseline. Fast-forward reached
+`d2f0d61e`. Installed suppression report exited 0, named chain_completed and
+first_signal population mismatch with UNKNOWN aggregate ratio; n=214 and
+counterfactual -$4,537.09 remained. Node report smoke passed both evidence
+qualifiers; Python compile passed. Pipeline/dashboard remained active/running
+with unchanged Sept-11 start timestamps; tracked production tree remained clean.
+No service restart, message, DB write or configuration change. Rollback unused.
 
 ## Permanent prompt adjustment and next operator action
 

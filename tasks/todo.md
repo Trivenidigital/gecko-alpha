@@ -1,6 +1,6 @@
 # Backlog — gecko-alpha
 
-## Active Work: 2026-09-13 - Autonomous closeout evidence boundaries
+## Completed Work: 2026-09-13 - Autonomous closeout evidence boundaries
 
 - [x] Fresh origin/master drift audit in isolated branch; templates, role map,
   cockpit and Signal Trust V1 already exist.
@@ -15,8 +15,9 @@
   shared production read-only snapshot. No deployment or sends.
 - [x] Focused verification and PR #571; both independent PR reviewers approved
   candidate `218a295e` across all four clearance vectors, no remaining folds.
-- [ ] Exact-head CI and conditional merge.
-- [ ] Conditional merge and final report/memory.
+- [x] Exact-head CI: 7,625 passed/12 skipped; PR #571 merged as d2f0d61e.
+- [x] Production scripts/docs refresh and no-send smokes passed at 19:55Z;
+  final report and automation memory recorded. Remaining UI work stays open.
 
 Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and
 `tasks/closeout_report_overnight_2026_09_13.md`. No policy, runtime configuration,
