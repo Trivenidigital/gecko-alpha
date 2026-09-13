@@ -41,25 +41,25 @@ GET /api/postmortems/moved-already?limit=25&before_id=<positive integer>.
 FastAPI validates limit 1..100; before_id is optional positive SQLite signed
 64-bit integer (maximum 9223372036854775807). Keyset query uses bound parameters,
 id DESC and LIMIT limit+1; next_before_id is the last returned id only when
-has_more. Ordering is explicitly newest recorded, not newest detection time.
+has_more. Response next_before_id is a decimal string; the UI preserves it without numeric conversion. Ordering is explicitly newest recorded, not newest detection time.
 No arbitrary sorting/filtering, OFFSET, evidence blobs, joins, or new dependencies.
-Rows contain id, token_id, detected_at, run_pct, and
+Rows contain decimal-string id (preserves SQLite 64-bit precision in JavaScript), token_id, detected_at, run_pct, and
 most_frequent_recorded_block_reason (alias of dropping_gate). Non-finite or
 non-numeric run_pct becomes null; preserve valid negative/zero values rather
 than making unsupported quality decisions. Token/block strings are ordinary
 React text, not HTML. Numeric database fields must serialize as strict JSON.
 
 Metadata contains ok, read_only, historical_only, generated_at, total_records,
-latest_detected_at, sort_policy, limit; envelope contains rows, has_more,
+latest_detected_at (the detected_at attached to newest recorded id; not lexical MAX), sort_policy, limit; envelope contains rows, has_more,
 next_before_id. Read count/latest/page in one read transaction so aggregate
 metadata and page agree. Missing DB/table/query failure is 503 with ok=false,
 rows=[], explicit data_missing_reason, Cache-Control:no-store; an existing empty
 table is 200 with total_records=0. Responses do not claim capture freshness health.
-Latest timestamp is reported as stored capture history, never as pipeline health.
+Latest timestamp is labeled Capture time of newest recorded row, never pipeline health.
 
 Add Historical Postmortems under Performance through dashboard/frontend/App.jsx.
-Display token id, capture time, historical run percentage, and Most frequent
-recorded pre-detection block reason. Copy: These captures came from open paper
+Display token id, capture time, Price change from paper entry, and Most frequent
+recorded pre-detection block reason. run_pct means the recorded percentage price change from the selected most-recent open paper trade entry price to the cached price at capture; it is neither a 24-hour change nor realized return. Copy: These captures came from open paper
 trades above the configured run threshold at recording time. Historical
 observations; not comprehensive missed-token coverage. Block frequency is not
 causal attribution. Null block reason means no recorded reason, not no blockage.
@@ -93,7 +93,8 @@ the viewer commit and rebuilding prior UI; no data restore/migration needed.
 
 ## Review
 
-Plan awaiting two reviewer passes. Design/build have not started. Current source
+Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, awaiting operations reapproval. Design/build have not started. Current source
 and row inventory support a display; broader capture coverage, causal analysis,
 T-minus reconstruction and writer watchdog remain explicitly separate residuals.
+
 
