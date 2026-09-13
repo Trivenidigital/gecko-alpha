@@ -62,7 +62,11 @@ async def test_poll_deadline_cancels_poll_and_pipeline_continues(
     aggregate.assert_called_once()
     assert stats["tokens_scanned"] == 1
     assert db.upsert_candidate.await_count >= 1
-    db.upsert_ingest_watchdog_state.assert_not_awaited()
+    # Other ingestion lanes legitimately persist their miss counters.
+    assert all(
+        call.args[0] != "rh_pons"
+        for call in db.upsert_ingest_watchdog_state.await_args_list
+    )
 
 
 def test_poll_deadline_config_bounds(settings_factory):
