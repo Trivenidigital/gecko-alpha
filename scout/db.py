@@ -551,6 +551,7 @@ class Database:
             await self._migrate_rh_pons_discovery_v1()
             await self._migrate_curve_scan_checkpoints_v1()
             await self._migrate_curve_reorg_markers_v1()
+            await self._migrate_curve_scan_checkpoint_head_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -896,6 +897,32 @@ class Database:
                 canonical[key] = ev["block_hash"]
         return canonical
 
+    async def _migrate_curve_scan_checkpoint_head_v1(self) -> None:
+        """Add nullable observed head for durable coverage-lag checks (20260916)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("PRAGMA table_info(curve_scan_checkpoints)")
+            columns = {row[1] for row in await cur.fetchall()}
+            if "head_block" not in columns:
+                await conn.execute(
+                    "ALTER TABLE curve_scan_checkpoints ADD COLUMN head_block INTEGER"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260916,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_scan_checkpoint_head_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
     async def get_curve_scan_checkpoint(
         self, chain_id: int, protocol: str, factory: str
     ) -> dict | None:
@@ -916,15 +943,18 @@ class Database:
         factory: str,
         next_block: int,
         block_hashes: dict,
+        head_block: int | None = None,
     ) -> None:
         """Commit completed coverage and the caller's bounded reorg header window."""
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
         await self._conn.execute(
-            """INSERT INTO curve_scan_checkpoints VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO curve_scan_checkpoints
+            (chain_id, protocol, factory, next_block, block_hashes_json, updated_at, head_block)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chain_id, protocol, factory) DO UPDATE SET
             next_block=excluded.next_block, block_hashes_json=excluded.block_hashes_json,
-            updated_at=excluded.updated_at""",
+            updated_at=excluded.updated_at, head_block=excluded.head_block""",
             (
                 chain_id,
                 protocol,
@@ -932,6 +962,7 @@ class Database:
                 next_block,
                 json.dumps(block_hashes),
                 datetime.now(timezone.utc).isoformat(),
+                head_block,
             ),
         )
         await self._conn.commit()

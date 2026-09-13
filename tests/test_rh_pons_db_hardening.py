@@ -71,6 +71,39 @@ async def test_checkpoint_durable_and_scoped(db):
     assert await db.get_curve_scan_checkpoint(2, "pons_v2", "factory") is None
 
 
+async def test_checkpoint_head_persists_and_omission_clears_old_head(db):
+    await db.save_curve_scan_checkpoint(
+        1, "pons_v2", "factory", 500, {}, head_block=750
+    )
+    await db.close()
+    await db.initialize()
+    assert (await db.get_curve_scan_checkpoint(1, "pons_v2", "factory"))[
+        "head_block"
+    ] == 750
+    await db.save_curve_scan_checkpoint(1, "pons_v2", "factory", 600, {})
+    assert (await db.get_curve_scan_checkpoint(1, "pons_v2", "factory"))[
+        "head_block"
+    ] is None
+
+
+async def test_checkpoint_head_migration_preserves_rows_and_retries(db):
+    await db.save_curve_scan_checkpoint(1, "pons_v2", "factory", 500, {499: "hash"})
+    await db._conn.execute("DELETE FROM schema_version WHERE version=20260916")
+    await db._conn.execute("ALTER TABLE curve_scan_checkpoints DROP COLUMN head_block")
+    await db._conn.commit()
+    await db._migrate_curve_scan_checkpoint_head_v1()
+    row = await db.get_curve_scan_checkpoint(1, "pons_v2", "factory")
+    assert row["next_block"] == 500
+    assert json.loads(row["block_hashes_json"]) == {"499": "hash"}
+    assert row["head_block"] is None
+    # A pre-existing column with no marker must also be safely retryable.
+    await db._conn.execute("DELETE FROM schema_version WHERE version=20260916")
+    await db._conn.commit()
+    await db._migrate_curve_scan_checkpoint_head_v1()
+    await db._migrate_curve_scan_checkpoint_head_v1()
+    assert await db.get_curve_scan_checkpoint(1, "pons_v2", "factory") == row
+
+
 async def test_removed_launch_clears_identity_without_erasing_first_observation(db):
     await discovery(db)
     await event(db)

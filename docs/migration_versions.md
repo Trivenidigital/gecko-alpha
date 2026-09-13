@@ -86,6 +86,7 @@ number to appear in the table below.
 | 20260913 | rh_pons_discovery_v1 | RH/Pons curve-launch evidence tables (design_rh_pons_discovery_delta_2026_09_13) |
 | 20260914 | curve_scan_checkpoints_v1 | Durable RH/Pons successful-range cursors and bounded reorg headers; updated_at supplies collector freshness clock |
 | 20260915 | curve_reorg_markers_v1 | Repeatable append-only reorg transitions; preserve evidence IDs and use partial unique index for original events |
+| 20260916 | curve_scan_checkpoint_head_v1 | Nullable observed chain head on scan checkpoints for durable coverage-lag checks; existing coverage preserved |
 
 ## Notes / gaps
 
