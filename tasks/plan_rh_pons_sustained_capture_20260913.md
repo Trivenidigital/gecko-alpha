@@ -42,15 +42,17 @@ No new dependencies.
 
 ## Checklist
 
-- [ ] Record test-request file for Codex (Git Bash cannot import aiohttp here)
-- [ ] DB: scoped projection repair by touched log identities (old + new tokens, NULL-token markers, append order, one atomic publish); full rebuild API kept for diagnostics
-- [ ] DB: `curve_launch_members` indexed emitter membership; `idx_curve_launch_ev_block` for range evidence
-- [ ] DB tests: scoped == full on A-B-A-B forks and NULL-token markers; token change across replacement; evidence scope insensitive to 5000 unrelated rows; query plan uses indexes
-- [ ] Config: new bounded settings + min ≤ max validator
-- [ ] Collector: strict batch headers (ids, duplicates, bools, errors, heights, hash/timestamp) with unsupported→fallback and malformed→fail
-- [ ] Collector: topic-only trade query + membership; address-batched mode retained (unbounded growth documented)
-- [ ] Collector: `_scan_pass` + `_ScanState`/`_PassResult`; pinned cold start; stale-head no-regression; `poll_once` compatible (legacy transports)
-- [ ] Collector: `run_rh_pons_loop` adaptive span, bounded backoff, 429 handling, idle sleep only when caught up, never exits while enabled
-- [ ] Main: remove in-cycle polling; spawn loop behind flag; real `main()` wiring + shutdown-cancel test
-- [ ] Capacity runner (temporary DB, public RPC, bounded, drain-then-steady metrics)
-- [ ] Runbook + report update; commit owned paths only
+- [x] Record test-request file for Codex (Git Bash cannot import aiohttp here)
+- [x] DB: scoped projection repair by touched log identities (old + new tokens, NULL-token markers, append order, one atomic publish); full rebuild API kept for diagnostics
+- [x] DB: `curve_launch_members` indexed emitter membership; `idx_curve_launch_ev_block` for range evidence
+- [x] DB tests: scoped == full on A-B-A-B forks and NULL-token markers; token change across replacement; evidence scope insensitive to 5000 unrelated rows; query plan uses indexes
+- [x] Config: new bounded settings (min is capped at max in code rather than rejected, so existing small-span settings stay valid)
+- [x] Collector: strict batch headers (ids, duplicates, bools, errors, heights, hash/timestamp) with unsupported→fallback and malformed→fail
+- [x] Collector: topic-only trade query + membership; address-batched mode retained (unbounded growth documented)
+- [x] Collector: `_scan_pass` + `_ScanState`/`_PassResult`; pinned cold start; stale-head no-regression; `poll_once` compatible (legacy transports)
+- [x] Collector: `run_rh_pons_loop` adaptive span, bounded backoff, 429 handling, idle sleep only when caught up, never exits while enabled
+- [x] Main: remove in-cycle polling; spawn loop behind flag; real `main()` wiring + shutdown-cancel test
+- [x] Capacity runner (temporary DB, public RPC, bounded, drain-then-steady metrics)
+- [x] Runbook + report update; commit owned paths only
+- [ ] Codex native REQUEST 3: formatted-HEAD rerun + collector guard mutations
+- [ ] Live isolated capacity probe on host (Codex-run; not activation)
