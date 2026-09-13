@@ -543,6 +543,15 @@ class Database:
             # occupied-page reduction. Run BEFORE retire_dead_tables as a schema
             # index change (not destructive data-level pruning).
             await self._migrate_signal_events_indexes_v1()
+            # RH/Pons curve-launch evidence substrate. schema_version 20260913.
+            # Bare-additive: two new tables + indexes, observe-only — never read
+            # by scorer/gate/alert/paper paths. Curve launches are NOT pools, so
+            # they do not reuse dex_pool_discoveries (pool-addressed UNIQUE key).
+            # See tasks/design_rh_pons_discovery_delta_2026_09_13.md.
+            await self._migrate_rh_pons_discovery_v1()
+            await self._migrate_curve_scan_checkpoints_v1()
+            await self._migrate_curve_reorg_markers_v1()
+            await self._migrate_curve_scan_checkpoint_head_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -670,6 +679,664 @@ class Database:
         )
         await self._conn.commit()
         return cur.rowcount > 0
+
+    async def _migrate_rh_pons_discovery_v1(self) -> None:
+        """Migration rh_pons_discovery_v1, schema_version 20260913.
+
+        RH/Pons curve-launch evidence (design_rh_pons_discovery_delta
+        2026-09-13): `curve_launch_discoveries` is the mutable identity/
+        lifecycle PROJECTION row (like `candidates`); `curve_launch_events`
+        is strictly append-only evidence — reorgs append marker rows, they
+        never UPDATE. Two clocks: `event_time` NULL means the block timestamp
+        was unavailable (explicit, never fabricated); `first_seen_at` /
+        `observed_at` are Gecko observation time. uint256 amounts live in
+        payload_json as decimal strings (SQLite INTEGER is 8-byte).
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS curve_launch_discoveries (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chain_id             INTEGER NOT NULL,
+                    network              TEXT NOT NULL,
+                    protocol             TEXT NOT NULL,
+                    token_address        TEXT NOT NULL,
+                    curve_address        TEXT,
+                    deployer_address     TEXT,
+                    pair_token_address   TEXT,
+                    launch_config_id     TEXT,
+                    graduation_threshold TEXT,
+                    lifecycle_status     TEXT NOT NULL CHECK (lifecycle_status IN
+                        ('on_curve','graduating','on_v4','rescued','unknown')),
+                    event_time           TEXT,
+                    first_seen_at        TEXT NOT NULL,
+                    source               TEXT NOT NULL,
+                    provenance           TEXT NOT NULL,
+                    execution_eligible   INTEGER NOT NULL DEFAULT 0,
+                    eligibility_reasons  TEXT,
+                    UNIQUE(chain_id, token_address)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_curve_launch_disc_seen "
+                "ON curve_launch_discoveries(network, first_seen_at)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_curve_launch_disc_curve "
+                "ON curve_launch_discoveries(chain_id, curve_address)"
+            )
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS curve_launch_events (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chain_id              INTEGER NOT NULL,
+                    protocol              TEXT NOT NULL,
+                    event_name            TEXT NOT NULL,
+                    token_address         TEXT,
+                    curve_address         TEXT,
+                    transaction_hash      TEXT NOT NULL,
+                    log_index             INTEGER NOT NULL,
+                    block_number          INTEGER NOT NULL,
+                    block_hash            TEXT NOT NULL,
+                    event_time            TEXT,
+                    observed_at           TEXT NOT NULL,
+                    provider_available_at TEXT,
+                    source                TEXT NOT NULL,
+                    provenance            TEXT NOT NULL,
+                    payload_json          TEXT,
+                    UNIQUE(chain_id, block_hash, transaction_hash,
+                           log_index, event_name)
+                )
+            """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_curve_launch_ev_token "
+                "ON curve_launch_events(chain_id, token_address, block_number)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_curve_launch_ev_txlog "
+                "ON curve_launch_events(chain_id, transaction_hash, log_index)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (20260913, now_iso, "rh_pons_discovery_v1"),
+            )
+            await conn.commit()
+        except Exception:
+            _log.exception("schema_migration_failed", migration="rh_pons_discovery_v1")
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                _log.exception(
+                    "schema_migration_rollback_failed",
+                    migration="rh_pons_discovery_v1",
+                )
+            _log.error("SCHEMA_DRIFT_DETECTED", migration="rh_pons_discovery_v1")
+            raise
+
+    async def _migrate_curve_scan_checkpoints_v1(self) -> None:
+        """Durable successful-range cursors, schema_version 20260914.
+
+        Stores successful scan coverage and bounded reorg headers. updated_at is
+        the freshness clock for the collector watchdog even across empty ranges.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        try:
+            await self._conn.execute("BEGIN EXCLUSIVE")
+            await self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS curve_scan_checkpoints (
+                chain_id INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                factory TEXT NOT NULL,
+                next_block INTEGER NOT NULL CHECK(next_block >= 0),
+                block_hashes_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(chain_id, protocol, factory)
+            )"""
+            )
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260914,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_scan_checkpoints_v1",
+                ),
+            )
+            await self._conn.commit()
+        except BaseException:
+            await self._conn.rollback()
+            raise
+
+    async def _migrate_curve_reorg_markers_v1(self) -> None:
+        """Allow repeatable append-only reorg transitions (schema 20260915)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT 1 FROM schema_version WHERE version=20260915"
+            )
+            if await cur.fetchone():
+                await conn.commit()
+                return
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='curve_launch_events'"
+            )
+            ddl = (await cur.fetchone())[0]
+            import re
+
+            rebuilt = re.sub(
+                r",\s*UNIQUE\s*\(chain_id,\s*block_hash,\s*transaction_hash,\s*log_index,\s*event_name\)",
+                "",
+                ddl,
+                flags=re.IGNORECASE,
+            )
+            if rebuilt == ddl:
+                raise RuntimeError(
+                    "curve_launch_events UNIQUE shape unexpectedly changed"
+                )
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='curve_launch_events' AND sql IS NOT NULL"
+            )
+            indexes = [r[0] for r in await cur.fetchall()]
+            await conn.execute(
+                "ALTER TABLE curve_launch_events RENAME TO curve_launch_events_reorg_old"
+            )
+            await conn.execute(rebuilt)
+            await conn.execute(
+                "INSERT INTO curve_launch_events SELECT * FROM curve_launch_events_reorg_old"
+            )
+            await conn.execute("DROP TABLE curve_launch_events_reorg_old")
+            for index in indexes:
+                await conn.execute(index)
+            await conn.execute(
+                """CREATE UNIQUE INDEX idx_curve_launch_ev_evidence_identity
+                ON curve_launch_events(chain_id, block_hash, transaction_hash, log_index, event_name)
+                WHERE event_name NOT IN ('reorg_removed','reorg_replaced','reorg_restored')"""
+            )
+            await conn.execute(
+                "INSERT INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260915,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_reorg_markers_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    @staticmethod
+    def _canonical_curve_hashes(
+        events: list[dict],
+    ) -> dict[tuple[str, int], str | None]:
+        """Fold append order; a later restoration supersedes earlier tombstones."""
+        canonical: dict[tuple[str, int], str | None] = {}
+        for ev in sorted(events, key=lambda event: event["id"]):
+            key = (ev["transaction_hash"], ev["log_index"])
+            name = ev["event_name"]
+            if name == "reorg_removed":
+                if canonical.get(key) == ev["block_hash"]:
+                    canonical[key] = None
+            elif name == "reorg_replaced":
+                old_hash = json.loads(ev["payload_json"] or "{}").get(
+                    "replaced_block_hash"
+                )
+                if canonical.get(key) == old_hash:
+                    canonical[key] = None
+            else:
+                canonical[key] = ev["block_hash"]
+        return canonical
+
+    async def _migrate_curve_scan_checkpoint_head_v1(self) -> None:
+        """Add nullable observed head for durable coverage-lag checks (20260916)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("PRAGMA table_info(curve_scan_checkpoints)")
+            columns = {row[1] for row in await cur.fetchall()}
+            if "head_block" not in columns:
+                await conn.execute(
+                    "ALTER TABLE curve_scan_checkpoints ADD COLUMN head_block INTEGER"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260916,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_scan_checkpoint_head_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    async def get_curve_scan_checkpoint(
+        self, chain_id: int, protocol: str, factory: str
+    ) -> dict | None:
+        """Return the last fully completed scan checkpoint for this deployment."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_scan_checkpoints WHERE chain_id=? AND protocol=? AND factory=?",
+            (chain_id, protocol, factory.lower()),
+        )
+        row = await cur.fetchone()
+        return dict(zip([c[0] for c in cur.description], row)) if row else None
+
+    async def save_curve_scan_checkpoint(
+        self,
+        chain_id: int,
+        protocol: str,
+        factory: str,
+        next_block: int,
+        block_hashes: dict,
+        head_block: int | None = None,
+    ) -> None:
+        """Commit completed coverage and the caller's bounded reorg header window."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            """INSERT INTO curve_scan_checkpoints
+            (chain_id, protocol, factory, next_block, block_hashes_json, updated_at, head_block)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, protocol, factory) DO UPDATE SET
+            next_block=excluded.next_block, block_hashes_json=excluded.block_hashes_json,
+            updated_at=excluded.updated_at, head_block=excluded.head_block""",
+            (
+                chain_id,
+                protocol,
+                factory.lower(),
+                next_block,
+                json.dumps(block_hashes),
+                datetime.now(timezone.utc).isoformat(),
+                head_block,
+            ),
+        )
+        await self._conn.commit()
+
+    async def list_curve_launch_curves(self, chain_id: int, protocol: str) -> list[str]:
+        """Canonical known curve contracts for deployment-scoped trade polling."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            """SELECT DISTINCT curve_address FROM curve_launch_discoveries
+            WHERE chain_id=? AND protocol=? AND lifecycle_status IN ('on_curve', 'graduating')
+            AND curve_address IS NOT NULL ORDER BY curve_address""",
+            (chain_id, protocol),
+        )
+        return [r[0] for r in await cur.fetchall()]
+
+    async def curve_events_in_range(
+        self, chain_id: int, protocol: str, from_block: int, to_block: int
+    ) -> list[dict]:
+        """Historical evidence, excluding markers, for canonical-header comparison."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            """SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=?
+            AND block_number BETWEEN ? AND ?
+            AND event_name NOT IN ('reorg_removed', 'reorg_replaced', 'reorg_restored')
+            ORDER BY block_number, log_index, id""",
+            (chain_id, protocol, from_block, to_block),
+        )
+        names = [c[0] for c in cur.description]
+        return [dict(zip(names, r)) for r in await cur.fetchall()]
+
+    async def reconcile_curve_launch_projection(
+        self, chain_id: int, protocol: str
+    ) -> None:
+        """Rebuild mutable identities/lifecycles from surviving append-only evidence.
+
+        Observation clocks survive reorgs; identity and lifecycle do not. The
+        collector replays discovery insertion before calling this method, which
+        also repairs interrupted event/projection writes without deleting history.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=? ORDER BY block_number, log_index, id",
+            (chain_id, protocol),
+        )
+        names = [c[0] for c in cur.description]
+        events = [dict(zip(names, r)) for r in await cur.fetchall()]
+        canonical = self._canonical_curve_hashes(events)
+        projections: dict[str, dict] = {}
+        for ev in events:
+            if ev["event_name"] not in ("token_launched", "pool_graduated"):
+                continue
+            if (
+                canonical.get((ev["transaction_hash"], ev["log_index"]))
+                != ev["block_hash"]
+            ):
+                continue
+            if not ev["token_address"]:
+                continue
+            projection = projections.setdefault(ev["token_address"], {})
+            first_observed = projection.get("first_seen_at")
+            if first_observed is None or datetime.fromisoformat(
+                ev["observed_at"]
+            ) < datetime.fromisoformat(first_observed):
+                projection["first_seen_at"] = ev["observed_at"]
+            if ev["event_name"] == "pool_graduated":
+                projection["lifecycle_status"] = "on_v4"
+                projection.setdefault("event_time", ev["event_time"])
+            else:
+                projection.update(
+                    json.loads(ev["payload_json"] or "{}").get("fields", {})
+                )
+                projection["curve_address"] = ev["curve_address"]
+                projection["event_time"] = ev["event_time"]
+                projection.setdefault("lifecycle_status", "on_curve")
+        # One SQLite statement atomically publishes the complete projection.
+        # Other pipeline writers share this connection and may commit at any
+        # await; a multi-statement SAVEPOINT is therefore unsafe here.
+        await self._conn.execute(
+            """WITH projected AS (
+                SELECT key AS token, value AS facts FROM json_each(?)
+            )
+            UPDATE curve_launch_discoveries SET
+                curve_address=json_extract(p.facts, '$.curve_address'),
+                deployer_address=json_extract(p.facts, '$.deployer_address'),
+                pair_token_address=json_extract(p.facts, '$.pair_token_address'),
+                launch_config_id=json_extract(p.facts, '$.launch_config_id'),
+                graduation_threshold=json_extract(p.facts, '$.graduation_threshold'),
+                event_time=json_extract(p.facts, '$.event_time'),
+                lifecycle_status=COALESCE(json_extract(p.facts, '$.lifecycle_status'), 'unknown'),
+                execution_eligible=0,
+                first_seen_at=CASE
+                    WHEN julianday(json_extract(p.facts, '$.first_seen_at')) < julianday(first_seen_at)
+                    THEN json_extract(p.facts, '$.first_seen_at') ELSE first_seen_at END
+            FROM (
+                SELECT d.token_address AS token, projected.facts
+                FROM curve_launch_discoveries d LEFT JOIN projected
+                ON projected.token=d.token_address
+                WHERE d.chain_id=? AND d.protocol=?
+            ) p
+            WHERE curve_launch_discoveries.chain_id=?
+            AND curve_launch_discoveries.protocol=?
+            AND curve_launch_discoveries.token_address=p.token""",
+            (json.dumps(projections), chain_id, protocol, chain_id, protocol),
+        )
+        await self._conn.commit()
+
+    async def record_curve_launch_discovery(
+        self,
+        *,
+        chain_id: int,
+        network: str,
+        protocol: str,
+        token_address: str,
+        curve_address: str | None,
+        deployer_address: str | None,
+        pair_token_address: str | None,
+        launch_config_id: str | None,
+        graduation_threshold: str | None,
+        lifecycle_status: str,
+        event_time: str | None,
+        first_seen_at: str,
+        source: str,
+        provenance: str,
+        execution_eligible: bool,
+        eligibility_reasons: list[str] | None,
+    ) -> bool:
+        """Insert a first-seen curve launch; returns True when the row is new.
+
+        On conflict (already-known token) this fills previously-NULL identity
+        facts (curve/deployer/pair-token/config/threshold/event_time) without
+        overwriting known ones, and keeps the EARLIER first_seen_at — a
+        backfilled re-sighting must not make an old launch look new. It never
+        touches lifecycle_status (that is advance-only via
+        update_curve_launch_lifecycle) or the eligibility stamp.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        reasons_json = (
+            json.dumps(eligibility_reasons) if eligibility_reasons is not None else None
+        )
+        cur = await self._conn.execute(
+            """INSERT OR IGNORE INTO curve_launch_discoveries
+               (chain_id, network, protocol, token_address, curve_address,
+                deployer_address, pair_token_address, launch_config_id,
+                graduation_threshold, lifecycle_status, event_time,
+                first_seen_at, source, provenance, execution_eligible,
+                eligibility_reasons)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                chain_id,
+                network,
+                protocol,
+                token_address,
+                curve_address,
+                deployer_address,
+                pair_token_address,
+                launch_config_id,
+                graduation_threshold,
+                lifecycle_status,
+                event_time,
+                first_seen_at,
+                source,
+                provenance,
+                1 if execution_eligible else 0,
+                reasons_json,
+            ),
+        )
+        if cur.rowcount > 0:
+            await self._conn.commit()
+            return True
+        await self._conn.execute(
+            """UPDATE curve_launch_discoveries SET
+                 curve_address        = COALESCE(curve_address, ?),
+                 deployer_address     = COALESCE(deployer_address, ?),
+                 pair_token_address   = COALESCE(pair_token_address, ?),
+                 launch_config_id     = COALESCE(launch_config_id, ?),
+                 graduation_threshold = COALESCE(graduation_threshold, ?),
+                 event_time           = COALESCE(event_time, ?),
+                 first_seen_at        = CASE
+                     WHEN datetime(?) < datetime(first_seen_at) THEN ?
+                     ELSE first_seen_at END
+               WHERE chain_id = ? AND token_address = ?""",
+            (
+                curve_address,
+                deployer_address,
+                pair_token_address,
+                launch_config_id,
+                graduation_threshold,
+                event_time,
+                first_seen_at,
+                first_seen_at,
+                chain_id,
+                token_address,
+            ),
+        )
+        await self._conn.commit()
+        return False
+
+    async def record_curve_launch_event(
+        self,
+        *,
+        chain_id: int,
+        protocol: str,
+        event_name: str,
+        token_address: str | None,
+        curve_address: str | None,
+        transaction_hash: str,
+        log_index: int,
+        block_number: int,
+        block_hash: str,
+        event_time: str | None,
+        observed_at: str,
+        provider_available_at: str | None,
+        source: str,
+        provenance: str,
+        payload_json: str | None,
+    ) -> bool:
+        """Append one evidence row; returns True when new (dedup via the
+        UNIQUE key + INSERT OR IGNORE). Append-only: no UPDATE path exists."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        prior_hash = await self.canonical_curve_event_block_hash(
+            chain_id, transaction_hash, log_index
+        )
+        markers = {"reorg_removed", "reorg_replaced", "reorg_restored"}
+        if event_name == "reorg_removed" and prior_hash != block_hash:
+            # Preserve an unsolicited removal even when its original log was
+            # never observed; repeated polling of that removal is idempotent.
+            existing = await self._conn.execute(
+                """SELECT 1 FROM curve_launch_events WHERE chain_id=? AND protocol=?
+                AND transaction_hash=? AND log_index=? AND block_hash=?
+                AND event_name='reorg_removed' LIMIT 1""",
+                (chain_id, protocol, transaction_hash, log_index, block_hash),
+            )
+            if await existing.fetchone():
+                return False
+        if event_name == "reorg_replaced":
+            target = json.loads(payload_json or "{}").get("replaced_block_hash")
+            if prior_hash != target:
+                return False
+        if event_name == "reorg_restored" and prior_hash == block_hash:
+            return False
+        cur = await self._conn.execute(
+            """INSERT OR IGNORE INTO curve_launch_events
+               (chain_id, protocol, event_name, token_address, curve_address,
+                transaction_hash, log_index, block_number, block_hash,
+                event_time, observed_at, provider_available_at, source,
+                provenance, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                chain_id,
+                protocol,
+                event_name,
+                token_address,
+                curve_address,
+                transaction_hash,
+                log_index,
+                block_number,
+                block_hash,
+                event_time,
+                observed_at,
+                provider_available_at,
+                source,
+                provenance,
+                payload_json,
+            ),
+        )
+        inserted = cur.rowcount > 0
+        if not inserted and event_name not in markers and prior_hash != block_hash:
+            # Same canonical block can return after a fork. Preserve original
+            # evidence and observation clock; append its new canonical status.
+            await self._conn.execute(
+                """INSERT INTO curve_launch_events
+                (chain_id, protocol, event_name, token_address, curve_address,
+                 transaction_hash, log_index, block_number, block_hash,
+                 event_time, observed_at, provider_available_at, source, provenance, payload_json)
+                VALUES (?, ?, 'reorg_restored', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chain_id,
+                    protocol,
+                    token_address,
+                    curve_address,
+                    transaction_hash,
+                    log_index,
+                    block_number,
+                    block_hash,
+                    event_time,
+                    observed_at,
+                    provider_available_at,
+                    source,
+                    provenance,
+                    json.dumps(
+                        {
+                            "restored_block_hash": block_hash,
+                            "prior_block_hash": prior_hash,
+                        }
+                    ),
+                ),
+            )
+        await self._conn.commit()
+        return inserted
+
+    async def get_curve_launch(self, chain_id: int, token_address: str) -> dict | None:
+        """One discovery row as a dict, or None."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_launch_discoveries "
+            "WHERE chain_id = ? AND token_address = ?",
+            (chain_id, token_address),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip([c[0] for c in cur.description], row))
+
+    async def get_curve_launch_by_curve(
+        self, chain_id: int, curve_address: str
+    ) -> dict | None:
+        """Resolve a launch through its per-token curve contract address."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_launch_discoveries "
+            "WHERE chain_id = ? AND curve_address = ?",
+            (chain_id, curve_address),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip([c[0] for c in cur.description], row))
+
+    async def update_curve_launch_lifecycle(
+        self, chain_id: int, token_address: str, lifecycle_status: str
+    ) -> None:
+        """Set the lifecycle projection. Forward-only ordering is enforced by
+        the caller (scout.ingestion.rh_pons.advance_lifecycle)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        await self._conn.execute(
+            "UPDATE curve_launch_discoveries SET lifecycle_status = ? "
+            "WHERE chain_id = ? AND token_address = ?",
+            (lifecycle_status, chain_id, token_address),
+        )
+        await self._conn.commit()
+
+    async def canonical_curve_event_block_hash(
+        self, chain_id: int, transaction_hash: str, log_index: int
+    ) -> str | None:
+        """block_hash of the latest non-marker observation of this log
+        identity, for reorg-replacement detection. None when never seen."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_launch_events WHERE chain_id=? AND transaction_hash=? AND log_index=? ORDER BY id",
+            (chain_id, transaction_hash, log_index),
+        )
+        names = [c[0] for c in cur.description]
+        events = [dict(zip(names, row)) for row in await cur.fetchall()]
+        return self._canonical_curve_hashes(events).get((transaction_hash, log_index))
+
+    async def max_curve_event_block(self, chain_id: int) -> int | None:
+        """Highest observed block number — the reconnect/backfill cursor."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized. Call initialize() first.")
+        cur = await self._conn.execute(
+            "SELECT MAX(block_number) FROM curve_launch_events WHERE chain_id = ?",
+            (chain_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row and row[0] is not None else None
 
     async def _migrate_dex_instrumentation_v1(self) -> None:
         """Migration dex_instrumentation_v1, schema_version 20260629.

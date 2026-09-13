@@ -19,6 +19,10 @@ Armed semantics (both gates on):
   - heartbeat in the FUTURE beyond --clock-skew-seconds
     (named allowance, no embedded constant) .......... breach (future_invalid)
   - fresh heartbeat, however old the discoveries ..... ok (discovery_age logged)
+RH/Pons additionally requires a fresh exact-primary deployment checkpoint with
+known head_block. Missing head evidence, stale checkpoint evidence, or a lag
+above --max-head-lag-blocks (default 2000) breaches even with a fresh heartbeat.
+This head-coverage check does not apply to DEX discovery.
 A malformed DIAGNOSTIC timestamp (last_new_discovery_at) never affects the
 verdict: it is reported as ``discovery_timestamp_valid=false`` with
 ``discovery_age_hours=null`` and the primary verdict proceeds from the
@@ -62,7 +66,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
 import json
 import math
 import sqlite3
@@ -80,6 +83,10 @@ _log = structlog.get_logger()
 
 _CHECK_KEY = "poll_liveness"
 _HEARTBEAT_SOURCE = "dex_discovery"
+_DISCOVERY_TABLES = {
+    "dex_discovery": "dex_pool_discoveries",
+    "rh_pons": "curve_launch_discoveries",
+}
 
 
 def _configure_logging() -> None:
@@ -115,6 +122,8 @@ _COOLDOWN_HOURS_MAX = 168.0
 
 def _validate_config(args: argparse.Namespace) -> str | None:
     """Return a human-readable error for out-of-range knobs, else None."""
+    if getattr(args, "max_head_lag_blocks", 2000) < 0:
+        return "--max-head-lag-blocks must be nonnegative"
     lo, hi = _STALENESS_HOURS_RANGE
     if not math.isfinite(args.staleness_hours) or not (
         lo <= args.staleness_hours <= hi
@@ -142,18 +151,24 @@ def _validate_config(args: argparse.Namespace) -> str | None:
 
 
 async def _read_state(
-    db_path: str, now: datetime, staleness_hours: float, clock_skew_seconds: float
+    db_path: str,
+    now: datetime,
+    staleness_hours: float,
+    clock_skew_seconds: float,
+    source: str = _HEARTBEAT_SOURCE,
+    max_head_lag_blocks: int = 2000,
 ) -> dict:
     """Run the liveness check + gather diagnostic context.
 
     Opens the DB read-only (sqlite mode=ro URI) so this path structurally
     cannot mutate pipeline state.
     """
+    table = _DISCOVERY_TABLES[source]  # closed mapping, never caller-supplied SQL
     async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         try:
             cur = await conn.execute(
                 "SELECT updated_at FROM ingest_watchdog_state WHERE source = ?",
-                (_HEARTBEAT_SOURCE,),
+                (source,),
             )
             row = await cur.fetchone()
         except sqlite3.OperationalError as exc:
@@ -163,14 +178,34 @@ async def _read_state(
                 raise
         last_new_discovery_at: str | None = None
         try:
-            cur = await conn.execute(
-                "SELECT MAX(first_seen_at) FROM dex_pool_discoveries"
-            )
+            cur = await conn.execute(f"SELECT MAX(first_seen_at) FROM {table}")
             drow = await cur.fetchone()
             last_new_discovery_at = drow[0] if drow else None
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
+
+        checkpoint = None
+        if source == "rh_pons":
+            from scout.ingestion.rh_pons import PONS_DEPLOYMENTS
+
+            primary = next(
+                (d for d in PONS_DEPLOYMENTS if d.version == "pons_v2"), None
+            )
+            if primary is not None:
+                try:
+                    cur = await conn.execute(
+                        "SELECT next_block, head_block, updated_at FROM curve_scan_checkpoints "
+                        "WHERE chain_id=? AND protocol=? AND factory=?",
+                        (primary.chain_id, primary.version, primary.factory.lower()),
+                    )
+                    checkpoint = await cur.fetchone()
+                except sqlite3.OperationalError as exc:
+                    if not any(
+                        text in str(exc).lower()
+                        for text in ("no such table", "no such column")
+                    ):
+                        raise
 
     # Diagnostic timestamp: malformed → flagged invalid, age null, verdict
     # UNAFFECTED (it proceeds from the heartbeat alone).
@@ -186,6 +221,7 @@ async def _read_state(
             discovery_age_hours = None
 
     result = {
+        "source": source,
         "check": _CHECK_KEY,
         "last_successful_poll_at": row[0] if row else None,
         "last_new_discovery_at": last_new_discovery_at,
@@ -217,27 +253,76 @@ async def _read_state(
         result.update(status="breach", reason="stale")
     else:
         result.update(status="ok", reason="fresh")
+    if source == "rh_pons":
+        result.update(
+            head_lag_blocks=None,
+            max_head_lag_blocks=max_head_lag_blocks,
+            checkpoint_updated_at=checkpoint[2] if checkpoint else None,
+        )
+        if result["status"] == "ok":
+            if checkpoint is None or not all(
+                isinstance(v, int) and v >= 0 for v in checkpoint[:2]
+            ):
+                result.update(status="breach", reason="head_lag_unknown")
+            else:
+                result["head_lag_blocks"] = max(0, checkpoint[1] - checkpoint[0] + 1)
+                try:
+                    checkpoint_age = (now - _parse_ts(checkpoint[2])).total_seconds()
+                except _TS_PARSE_ERRORS:
+                    result.update(status="breach", reason="checkpoint_invalid")
+                else:
+                    if checkpoint_age < -clock_skew_seconds:
+                        result.update(
+                            status="breach", reason="checkpoint_future_invalid"
+                        )
+                    elif checkpoint_age > staleness_hours * 3600:
+                        result.update(status="breach", reason="checkpoint_stale")
+                    elif result["head_lag_blocks"] > max_head_lag_blocks:
+                        result.update(status="breach", reason="head_lag_exceeded")
     return result
 
 
 def _compose_message(check: dict) -> str:
-    lines = ["gecko-alpha DEX-discovery watchdog: poll-liveness breach"]
+    source = check.get("source", _HEARTBEAT_SOURCE)
+    label = "DEX-discovery" if source == "dex_discovery" else "RH/Pons"
+    lines = [f"gecko-alpha {label} watchdog: poll-liveness breach"]
     reason = check["reason"]
-    if reason == "heartbeat_absent":
+    if reason == "head_lag_unknown":
         lines.append(
-            "- dex_discovery heartbeat: NO successful-poll record exists in "
+            "- RH/Pons primary deployment has no usable measured-head checkpoint; "
+            "the poll heartbeat is fresh but current-head coverage is UNKNOWN."
+        )
+    elif reason == "head_lag_exceeded":
+        lines.append(
+            f"- RH/Pons primary deployment is {check['head_lag_blocks']} blocks behind "
+            f"its measured head (limit {check['max_head_lag_blocks']}); "
+            "successful historical scans are not current-head coverage."
+        )
+    elif reason in (
+        "checkpoint_stale",
+        "checkpoint_invalid",
+        "checkpoint_future_invalid",
+    ):
+        lines.append(
+            f"- RH/Pons primary deployment head checkpoint is {reason.removeprefix('checkpoint_')}: "
+            f"{check.get('checkpoint_updated_at')!r}; "
+            "a fresh lane heartbeat cannot establish fresh primary-deployment coverage."
+        )
+    elif reason == "heartbeat_absent":
+        lines.append(
+            f"- {source} heartbeat: NO successful-poll record exists in "
             "ingest_watchdog_state — the discovery lane has never completed a "
             f"valid poll (SLO {check['staleness_hours']}h)"
         )
     elif reason == "heartbeat_invalid":
         lines.append(
-            "- dex_discovery heartbeat: last_successful_poll_at "
+            f"- {source} heartbeat: last_successful_poll_at "
             f"{check['last_successful_poll_at']!r} is UNPARSEABLE — corrupted "
             "heartbeat state; liveness cannot be trusted"
         )
     elif reason == "future_invalid":
         lines.append(
-            "- dex_discovery heartbeat: last_successful_poll_at "
+            f"- {source} heartbeat: last_successful_poll_at "
             f"{check['last_successful_poll_at']} is in the FUTURE "
             f"(signed age {check['poll_age_seconds_signed']}s, allowance "
             f"{check['clock_skew_seconds']}s) — clock skew or corrupted state; "
@@ -245,10 +330,10 @@ def _compose_message(check: dict) -> str:
         )
     else:
         lines.append(
-            "- dex_discovery heartbeat: last successful poll at "
+            f"- {source} heartbeat: last successful poll at "
             f"{check['last_successful_poll_at']} ({check['poll_age_hours']}h ago) "
-            f"exceeds SLO {check['staleness_hours']}h — the GT new-pools poller "
-            "has stalled (pipeline down, GT unreachable, or schema drift "
+            f"exceeds SLO {check['staleness_hours']}h — the {label} poller "
+            "has stalled (pipeline down, provider unreachable, or schema drift "
             "failing every pass)"
         )
     lines.append(
@@ -320,53 +405,66 @@ def _write_cooldown_state(state_dir: str, now: datetime) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--source", choices=tuple(_DISCOVERY_TABLES), default=_HEARTBEAT_SOURCE
+    )
     ap.add_argument("--db", required=True)
+    ap.add_argument("--max-head-lag-blocks", type=int, default=2000)
     ap.add_argument("--enabled", default="false")
     ap.add_argument("--discovery-enabled", default="false")
     ap.add_argument("--staleness-hours", type=float, default=2.0)
     ap.add_argument("--clock-skew-seconds", type=float, default=300.0)
     ap.add_argument("--cooldown-hours", type=float, default=24.0)
-    ap.add_argument(
-        "--state-dir", default="/var/lib/gecko-alpha/dex-discovery-watchdog"
-    )
+    ap.add_argument("--state-dir", default=None)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+    if args.state_dir is None:
+        lane_dir = "dex-discovery" if args.source == "dex_discovery" else "rh-pons"
+        args.state_dir = f"/var/lib/gecko-alpha/{lane_dir}-watchdog"
+    event_prefix = f"{args.source}_watchdog"
 
     # Boundary validation BEFORE any gate/DB/state access: argparse accepts
     # any float (including nan/inf/negatives), so range-check here.
     config_error = _validate_config(args)
     if config_error is not None:
-        _log.error("dex_discovery_watchdog_invalid_configuration", error=config_error)
+        _log.error(f"{event_prefix}_invalid_configuration", error=config_error)
         print(json.dumps({"status": "invalid_configuration", "error": config_error}))
         return 1
 
     if not _is_enabled(args.enabled):
-        _log.info("dex_discovery_watchdog_disabled_noop")
+        _log.info(f"{event_prefix}_disabled_noop")
         print(json.dumps({"status": "disabled_noop"}))
         return 0
     if not _is_enabled(args.discovery_enabled):
         # The lane is intentionally OFF: a liveness page here would represent
         # disablement as failure. Clean exit, no page, explicit status.
-        _log.info("dex_discovery_watchdog_not_armed_discovery_disabled")
+        _log.info(f"{event_prefix}_not_armed_discovery_disabled")
         print(json.dumps({"status": "not_armed_discovery_disabled"}))
         return 0
     if not Path(args.db).exists():
-        _log.error("dex_discovery_watchdog_db_missing", db=args.db)
+        _log.error(f"{event_prefix}_db_missing", db=args.db)
         print(json.dumps({"status": "error", "error": "db_missing"}))
         return 1
 
     now = datetime.now(timezone.utc)
     try:
         check = asyncio.run(
-            _read_state(args.db, now, args.staleness_hours, args.clock_skew_seconds)
+            _read_state(
+                args.db,
+                now,
+                args.staleness_hours,
+                args.clock_skew_seconds,
+                args.source,
+                args.max_head_lag_blocks,
+            )
         )
     except Exception as exc:  # runtime error → exit 1, never a silent 0
-        _log.error("dex_discovery_watchdog_runtime_error", error=str(exc))
+        _log.error(f"{event_prefix}_runtime_error", error=str(exc))
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 1
 
     _log.info(
-        "dex_discovery_watchdog_check",
+        f"{event_prefix}_check",
         **{k: v for k, v in check.items() if k != "check"},
     )
 
@@ -382,13 +480,16 @@ def main(argv: list[str] | None = None) -> int:
         return 5
 
     # Non-blocking lock so concurrent invocations cannot double-send.
+    # Sending is deployed on Linux; read-only checks also run on Windows.
+    import fcntl
+
     lock_dir = Path(args.state_dir)
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_fh = open(lock_dir / "lock", "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        _log.info("dex_discovery_watchdog_lock_held_skipping")
+        _log.info(f"{event_prefix}_lock_held_skipping")
         print(json.dumps({"status": "lock_held_skipped"}))
         lock_fh.close()
         return 0
@@ -398,21 +499,21 @@ def main(argv: list[str] | None = None) -> int:
             args.state_dir, now, args.cooldown_hours, args.clock_skew_seconds
         ):
             _log.info(
-                "dex_discovery_watchdog_alert_suppressed_by_cooldown",
+                f"{event_prefix}_alert_suppressed_by_cooldown",
                 check=_CHECK_KEY,
             )
             print(json.dumps({"status": "breach_cooldown_suppressed", "check": check}))
             return 5
-        _log.info("dex_discovery_watchdog_alert_dispatched", chars=len(message))
+        _log.info(f"{event_prefix}_alert_dispatched", chars=len(message))
         try:
             asyncio.run(_send_via_alerter(message))
         except Exception as exc:
             # Send failure: log + exit 1; cooldown state NOT written, so the
             # next run re-alerts instead of going quiet for a full window.
-            _log.error("dex_discovery_watchdog_alert_failed", error=str(exc))
+            _log.error(f"{event_prefix}_alert_failed", error=str(exc))
             print(json.dumps({"status": "error", "error": "alert_dispatch_failed"}))
             return 1
-        _log.info("dex_discovery_watchdog_alert_delivered")
+        _log.info(f"{event_prefix}_alert_delivered")
         _write_cooldown_state(args.state_dir, now)
         print(json.dumps({"status": "breach_paged", "check": check}))
         return 5
