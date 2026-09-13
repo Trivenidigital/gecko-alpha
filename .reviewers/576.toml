@@ -14,7 +14,8 @@ watch = [
 ]
 
 [clearances]
-concurrency = "5ca39f9c731aed521068755595bc76d22eb2508e"
-logic = "5ca39f9c731aed521068755595bc76d22eb2508e"
-ops-safety = "5ca39f9c731aed521068755595bc76d22eb2508e"
-silent-failure = "5ca39f9c731aed521068755595bc76d22eb2508e"
+concurrency = "f268fb4f1511d21a66fbda989ed5e3f3f017bec0"
+logic = "f268fb4f1511d21a66fbda989ed5e3f3f017bec0"
+ops-safety = "f268fb4f1511d21a66fbda989ed5e3f3f017bec0"
+silent-failure = "f268fb4f1511d21a66fbda989ed5e3f3f017bec0"
+

@@ -304,3 +304,11 @@ The two Claude reviewer session IDs and watched paths are in `.reviewers/576.tom
 Integration and merge of this verified increment use the user authorization
 recorded above; production activation remains excluded. Exact-head Linux CI is
 pending and must pass before merge.
+
+CI run 34787996119 completed with 7,849 passed, 12 skipped and one failure:
+the repository silent-swallow guard caught an exception/pass in owned DB
+connection cleanup. Commit ab824ac2 logs only the exception type, preserving
+the original exception. Native guard plus collector verification: 63 passed.
+Both reviewers re-cleared that fix and the subsequent upstream PR575 merge
+at f268fb4f1511d21a66fbda989ed5e3f3f017bec0. Upstream PR575 dashboard/tests
+match its reviewed head 44aee2c7. Full CI must rerun on this final integration.
