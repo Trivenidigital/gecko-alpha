@@ -42,6 +42,7 @@ from scout.ingestion import dexscreener as _dex_module
 from scout.ingestion import geckoterminal as _gt_module
 from scout.ingestion.dexscreener import fetch_trending
 from scout.ingestion.geckoterminal import fetch_trending_pools
+from scout.ingestion import rh_pons
 from scout.ingestion.gt_new_pools import discover_new_pools
 from scout.ingestion.held_position_prices import fetch_held_position_prices
 from scout.ingestion.holder_enricher import enrich_holders
@@ -1106,6 +1107,16 @@ async def run_cycle(
             await discover_new_pools(session, db, settings)
         except Exception:
             logger.exception("dex_discovery_error")
+
+    # RH/Pons curve-launch collector (observe-only, inert by default): records
+    # evidence only; emits no candidates, no alert, no paper trade. Flag off =
+    # no call; even when on, poll_once refuses without a configured RPC URL
+    # AND an onchain-verified deployment registry entry.
+    if settings.RH_PONS_COLLECTOR_ENABLED:
+        try:
+            await rh_pons.poll_once(session, db, settings)
+        except Exception:
+            logger.exception("rh_pons_collector_error")
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
