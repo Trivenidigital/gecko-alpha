@@ -1,3 +1,9 @@
+## Active Work: 2026-09-13 — autonomous product-readiness findings
+
+**Status:** AUDIT-IN-PROGRESS. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
+- [x] Refresh current master; inspect backlog drift and read-only runtime.
+- [ ] Plan/design: two parallel reviews each, with folds.
+- [ ] Findings PR: source + runtime evidence, next product gate, two PR reviews.
 # Backlog — gecko-alpha
 
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
