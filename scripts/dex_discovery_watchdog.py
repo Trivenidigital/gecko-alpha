@@ -501,9 +501,12 @@ def _write_cooldown_state(
 ) -> None:
     d = Path(state_dir)
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"last_alert_{_CHECK_KEY}").write_text(now.isoformat())
+    # Reason FIRST, then clock: a crash between the writes leaves the old clock
+    # with the new reason (no suppression gained), never a fresh clock paired
+    # with the previous reason, which would silence a real reason change.
     if reason is not None:
         (d / f"last_alert_{_CHECK_KEY}_reason").write_text(reason)
+    (d / f"last_alert_{_CHECK_KEY}").write_text(now.isoformat())
 
 
 def main(argv: list[str] | None = None) -> int:

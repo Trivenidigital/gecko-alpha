@@ -109,6 +109,33 @@ def test_rh_legacy_cooldown_without_reason_pages_once(watchdog, monkeypatch):
     assert len(sent) == 1
 
 
+def test_partial_cooldown_write_cannot_extend_old_reason(watchdog, monkeypatch):
+    from datetime import timedelta
+
+    module, sent, db, state = watchdog
+    now = module.datetime.now(module.timezone.utc)
+    # An expired page for head_lag_exceeded, then a crash while recording a
+    # new "stale" page: the fresh clock must never pair with the old reason.
+    module._write_cooldown_state(
+        str(state), now - timedelta(hours=25), "head_lag_exceeded"
+    )
+    real_write = Path.write_text
+    writes = []
+
+    def crash_on_second_write(self, *args, **kwargs):
+        writes.append(self.name)
+        if len(writes) == 2:
+            raise OSError("crash between cooldown writes")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", crash_on_second_write)
+    with pytest.raises(OSError):
+        module._write_cooldown_state(str(state), now, "stale")
+    monkeypatch.setattr(Path, "write_text", real_write)
+    assert _run(module, monkeypatch, db, state, "rh_pons", "head_lag_exceeded") == 5
+    assert len(sent) == 1, "partial write extended the old reason's cooldown"
+
+
 def test_dex_cooldown_behaviour_is_unchanged(watchdog, monkeypatch):
     module, sent, db, state = watchdog
     assert _run(module, monkeypatch, db, state, "dex_discovery", "stale") == 5
