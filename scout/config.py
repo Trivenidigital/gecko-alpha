@@ -572,11 +572,14 @@ class Settings(BaseSettings):
     # No default endpoint on purpose: the public RH RPC is documented as
     # rate-limited/non-production, and endpoint choice is an operator call.
     RH_PONS_RPC_URL: str = ""
-    RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=3, ge=1, le=60)
+    RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=1, ge=1, le=60)
     # eth_getLogs span per pass; bounds backfill after downtime.
     RH_PONS_BACKFILL_BLOCK_SPAN: int = Field(default=2000, ge=1, le=100_000)
     RH_PONS_REORG_OVERLAP_BLOCKS: int = Field(default=12, ge=1, le=256)
     RH_PONS_CURVE_ADDRESS_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    # No checkpoint: recent capture defaults to one span; archival start is explicit.
+    RH_PONS_INITIAL_LOOKBACK_BLOCKS: int | None = Field(default=None, ge=1, le=100_000)
+    RH_PONS_START_BLOCK: int | None = Field(default=None, ge=0)
 
     # Database
     DB_PATH: Path = Path("scout.db")

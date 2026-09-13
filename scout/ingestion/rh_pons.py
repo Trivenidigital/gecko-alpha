@@ -673,12 +673,16 @@ async def _rpc_get_logs(
     address: str | list[str],
     from_block: int,
     to_block: int,
+    topics: list[list[str]] | None = None,
 ) -> list[dict] | None:
+    query = {"address": address, "fromBlock": hex(from_block), "toBlock": hex(to_block)}
+    if topics is not None:
+        query["topics"] = topics
     result = await _rpc(
         session,
         rpc_url,
         "eth_getLogs",
-        [{"address": address, "fromBlock": hex(from_block), "toBlock": hex(to_block)}],
+        [query],
     )
     return result if isinstance(result, list) else None
 
@@ -743,7 +747,24 @@ async def poll_once(
     checkpoint = await db.get_curve_scan_checkpoint(
         deployment.chain_id, deployment.version, deployment.factory
     )
-    next_block = checkpoint["next_block"] if checkpoint else deployment.deploy_block
+    if checkpoint:
+        next_block = checkpoint["next_block"]
+    else:
+        lookback = (
+            settings.RH_PONS_INITIAL_LOOKBACK_BLOCKS
+            or settings.RH_PONS_BACKFILL_BLOCK_SPAN
+        )
+        start = settings.RH_PONS_START_BLOCK
+        next_block = max(
+            deployment.deploy_block, start if start is not None else head - lookback + 1
+        )
+        logger.info(
+            "rh_pons_initial_coverage",
+            coverage_start=next_block,
+            head_block=head,
+            mode="archive" if start is not None else "recent",
+            historical_coverage_complete=next_block == deployment.deploy_block,
+        )
     overlap = settings.RH_PONS_REORG_OVERLAP_BLOCKS
     from_block = (
         max(deployment.deploy_block, next_block - overlap) if checkpoint else next_block
@@ -783,6 +804,20 @@ async def poll_once(
         if decoded and decoded["event_name"] == "token_launched":
             curves.add(decoded["curve_address"])
     raw_logs = list(factory_logs)
+    # Keep recently observed curves in overlap coverage even if their projection
+    # says graduated: the graduation itself may have been orphaned on this pass.
+    prior_events = await db.curve_events_in_range(
+        deployment.chain_id, deployment.version, from_block, to_block
+    )
+    for event in prior_events:
+        if event["curve_address"]:
+            curves.add(event["curve_address"])
+        elif event["token_address"]:
+            launch = await db.get_curve_launch(
+                deployment.chain_id, event["token_address"]
+            )
+            if launch and launch["curve_address"]:
+                curves.add(launch["curve_address"])
     ordered_curves = sorted(curves)
     for offset in range(
         0, len(ordered_curves), settings.RH_PONS_CURVE_ADDRESS_BATCH_SIZE
@@ -795,6 +830,7 @@ async def poll_once(
             ],
             from_block=from_block,
             to_block=to_block,
+            topics=[[TOPIC_CURVE_BUY, TOPIC_CURVE_SELL]],
         )
         if entries is None:
             return 0
@@ -825,9 +861,6 @@ async def poll_once(
             headers[height] = await _block_header(session, url, height)
         if headers[height] is None:
             return 0
-    prior_events = await db.curve_events_in_range(
-        deployment.chain_id, deployment.version, from_block, to_block
-    )
     removed = []
     for event in prior_events:
         height = event["block_number"]
@@ -872,4 +905,14 @@ async def poll_once(
         block_hashes=retained,
     )
     await db.upsert_ingest_watchdog_state("rh_pons", 0)
+    logger.info(
+        "rh_pons_scan_complete",
+        coverage_start=from_block,
+        scanned_through=to_block,
+        next_block=to_block + 1,
+        head_block=head,
+        lag_blocks=max(0, head - to_block),
+        active_curve_count=len(curves),
+        recorded_events=counters["recorded_events"],
+    )
     return counters["recorded_events"]
