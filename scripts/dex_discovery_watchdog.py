@@ -135,7 +135,10 @@ def _validate_config(args: argparse.Namespace) -> str | None:
                 f"--staleness-minutes must be finite and within [{lo}, {hi}], "
                 f"got {minutes}"
             )
-    if getattr(args, "max_consecutive_failed_passes", 1) < 1:
+    # Unset (None, the argparse default) keeps the pre-existing behaviour: no
+    # failure-streak check. Only an explicit value is range-checked.
+    max_failed = getattr(args, "max_consecutive_failed_passes", None)
+    if max_failed is not None and max_failed < 1:
         return "--max-consecutive-failed-passes must be >= 1"
     lo, hi = _STALENESS_HOURS_RANGE
     if not math.isfinite(args.staleness_hours) or not (

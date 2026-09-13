@@ -164,8 +164,27 @@ setting, and the official documentation gives no number.
 Verification this round:
 - Local: DB suites 22 passed (scope and hardening, including the attempt-head
   test); the header cutoff matched brute force on 5000 cases.
-- Native REQUEST 5: pending. It covers the review-fix tests, the RH suites,
-  the watchdog, config and heartbeat.
+- **Native REQUEST 5 (head `2ab6354a`): FAILED, 284 passed / 54 failed.**
+  - **Root cause, a regression I introduced:** `_validate_config` compared the
+    unset argparse default of `--max-consecutive-failed-passes` (None) with
+    `< 1`. That raised TypeError for every caller without the new flag, in
+    both the DEX and RH lanes. It accounts for 45 failures: 17 in
+    `test_rh_pons_watchdog.py` and 28 in `test_dex_discovery_watchdog_script.py`.
+  - **Fix:** unset now means "no streak check", the previous behaviour; only an
+    explicit value is range-checked. A guard test covers both cases.
+  - **The other 9 are pre-existing Windows-only failures, not caused by this
+    branch.** Six `test_dex_discovery_watchdog_script.py` tests reach the
+    Linux-only send/lock path, which imports `fcntl`. Three
+    `test_dex_discovery_watchdog_wrapper.py` tests run bash with a Windows
+    `GECKO_PYTHON`.
+  - **Evidence for the 9:** with the fix, the DEX script and wrapper suites
+    run locally give 28 passed / 9 failed. Base `dcb5dd26`, exported with
+    `git archive`, gives the identical 9 with the same suites. They still
+    need confirmation on Linux CI.
+- **Native REQUEST 6(a):** 35 passed (pacing and review-fix tests).
+- **Native REQUEST 7:** pending (full rerun). Mutation round 3 is on hold until
+  that baseline is green apart from the 9 known Windows failures, so an
+  unrelated failure cannot count as a kill.
 
 Mutation round 2 (Codex, review worktree `59dfc74c`): 31 mutants gave 28
 assertion kills, 2 hangs and 1 survivor. The hangs are not counted as kills.

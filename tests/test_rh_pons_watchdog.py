@@ -245,6 +245,18 @@ def test_minute_scale_staleness_for_seconds_behind_collector(
     assert check["staleness_seconds"] == 600
 
 
+def test_unset_streak_flag_keeps_old_behaviour_and_zero_is_rejected(tmp_path):
+    # Regression: an unset --max-consecutive-failed-passes (None) once raised
+    # TypeError in validation and broke every caller that predates the flag.
+    db = _rh_db(tmp_path, heartbeat_age_min=1, attempts=50)
+    unset = _cli(db, "--staleness-minutes", "10")
+    assert unset.returncode == 0, unset.stderr
+    assert json.loads(unset.stdout)["check"]["reason"] == "fresh"
+    zero = _cli(db, "--staleness-minutes", "10", "--max-consecutive-failed-passes", "0")
+    assert zero.returncode == 1
+    assert json.loads(zero.stdout)["status"] == "invalid_configuration"
+
+
 def test_invalid_staleness_minutes_is_configuration_error(tmp_path):
     result = _cli(_rh_db(tmp_path, heartbeat_age_min=1), "--staleness-minutes", "0.5")
     assert result.returncode == 1
