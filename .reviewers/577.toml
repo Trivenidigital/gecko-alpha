@@ -8,12 +8,12 @@ watch = [
 ]
 
 # Independent terminal approvals on the exact code head below:
-# stop_gap_audit: logic/concurrency; independently reran 16 focused tests.
+# stop_gap_audit: logic/concurrency; renewed approval after per-app DB isolation fix; 17 focused tests.
 # stale_pr_audit: ops-safety/silent-failure and attribution/UI truth;
-# independently reran all 141 focused tests. No required fixes.
+# renewed approval after per-app DB isolation fix; 14 focused tests. No required fixes.
 # Later changes are review/task metadata only; no code drift.
 [clearances]
-concurrency = "4131d358c17922be8247e6981c2fc9d27788a245"
-logic = "4131d358c17922be8247e6981c2fc9d27788a245"
-ops-safety = "4131d358c17922be8247e6981c2fc9d27788a245"
-silent-failure = "4131d358c17922be8247e6981c2fc9d27788a245"
+concurrency = "2cb1d4f96d9e96461df11146194257f25df5dd63"
+logic = "2cb1d4f96d9e96461df11146194257f25df5dd63"
+ops-safety = "2cb1d4f96d9e96461df11146194257f25df5dd63"
+silent-failure = "2cb1d4f96d9e96461df11146194257f25df5dd63"

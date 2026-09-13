@@ -18,7 +18,7 @@ test failed missing helper before implementation. All final tests passed:
 
 C:/projects/gecko-alpha/.venv/Scripts/python.exe -m pytest tests/test_postmortem_history_endpoint.py tests/test_postmortem_history_frontend.py tests/test_dashboard_nav_map.py tests/test_dashboard_api.py tests/test_stop_shortfall.py -q --tb=short
 
-Result:141passed. Tests cover read-only preservation/SQLite write refusal, no
+Initial result:141passed; after per-app database isolation correction,142passed. Tests cover read-only preservation/SQLite write refusal, no
 evidence-column access via SQLite authorizer, finite numeric/null serialization,
 malformed text sanitized503, missing DB/schema vs empty history,64-bit cursors,
 intervening inserts, latest timestamp from newest ID, bounded anomalous fields,
@@ -37,7 +37,7 @@ fixture/server files are not included in PR.
 
 ## Release boundary
 
-Both final PR577 reviews approved exact 4131d358c17922be8247e6981c2fc9d27788a245: stop_gap_audit logic/concurrency (16 independently rerun tests), stale_pr_audit ops-safety/silent-failure plus attribution/UI truth (141 independently rerun tests). No required code fixes. Clearances recorded in .reviewers/577.toml. Awaiting exact final-head CI. No deployment while separately
+Both reviewers initially approved4131d358. Root then found the module-global DB path could redirect a prior app to a subsequently created app database. A failing two-app regression confirmed the issue; route-local capture fixed it in2cb1d4f96d9e96461df11146194257f25df5dd63. Both reviewers renewed approval on that exact code head: stop_gap_audit logic/concurrency (17 independently rerun tests), stale_pr_audit ops-safety/silent-failure (14 independently rerun tests). No outstanding fixes. Full related focused suite:142passed. Clearances recorded in .reviewers/577.toml. Awaiting exact final-head CI. No deployment while separately
 owned capture/migration work is active. Later rollback is revert viewer commit
 and rebuild prior frontend; no DB restore required. Historical list visibility
 is complete; comprehensive missed-token capture, causal attribution, guaranteed

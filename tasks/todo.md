@@ -2422,8 +2422,8 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 
 - [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
 - [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
-- [x] Bounded read-only historical list API and Performance tab; 141 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
-- [x] PR577 and two independent final reviews approved exact 4131d358; no code folds required.
+- [x] Bounded read-only historical list API and Performance tab; 142 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
+- [x] PR577 and two independent final reviews approved exact 2cb1d4f9; per-app DB isolation regression fixed and reviewed.
 - [ ] Exact-head CI and parent-coordinated merge; deployment held for separate capture/migration owner.
 
 Review: list-only scope; no capture/writer/schema/dispatch change or deployment.

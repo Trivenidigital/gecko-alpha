@@ -80,7 +80,7 @@ actions offering execution, dispatch, enable/disable, pruning or reclassificatio
 - [x] Add dashboard/frontend/components/PostmortemHistoryTab.jsx; wire App.jsx and minimal style.css reuse. Extend navigation guard; cover async error/stale response/page state through repo-supported frontend tests.
 - [x] Run focused endpoint/navigation tests, existing API regression tests, frontend build, git diff --check. Use shared installed Python; document exact commands/results.
 - [x] Commit meaningful verified changes; reconcile latest merged origin/master after PR575, rerun affected checks, push feature branch and create PR.
-- [x] Two independent PR reviews approved exact 4131d358 (structural/read-only bounds and semantic/UI truth); no required fixes. PR577 has codex and codex-automation labels.
+- [x] Two independent PR reviews approved exact 2cb1d4f9 (structural/read-only bounds and semantic/UI truth); per-app DB isolation fix reapproved. PR577 has codex and codex-automation labels.
 - [ ] Exact final-head CI green before parent considers merge; deployment remains held.
 
 ## Files and release boundary
@@ -94,6 +94,6 @@ the viewer commit and rebuilding prior UI; no data restore/migration needed.
 
 ## Review
 
-Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, operations reapproval received. Design and build complete; 141 focused tests and independent visual QA passed. Current source
+Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, operations reapproval received. Design and build complete; 142 focused tests and independent visual QA passed. Current source
 and row inventory support a display; broader capture coverage, causal analysis,
 T-minus reconstruction and writer watchdog remain explicitly separate residuals.
