@@ -1,5 +1,16 @@
 # Product-readiness audit: suppression denominator gap — 2026-09-13
 
+## Supersession note — 2026-09-13 closeout
+
+The findings below preserve the 19:16–19:22 UTC baseline. PR #571 subsequently
+shipped per-signal population diagnostics, degraded warnings and unknown aggregate
+coverage for mismatched populations; PR #573 records deployment evidence. This
+closeout does not independently re-attest that deployment. The analyzer correction
+and regression fixture proposed below are complete. The current engineering gate
+is residual DASH-11 read-only dashboard/API integration, scoped from fresh runtime
+evidence with producer coverage, retention and price provenance verified. DASH-08
+remains separate and open. No new runtime behavior is introduced by this note.
+
 ## Outcome
 
 DASH-11 is a real dashboard/API residual, but its existing suppression-cost
@@ -142,7 +153,7 @@ For subsequent attribution, repeat with one pinned read transaction, trace all
 suppression writers, and verify retention windows, timestamps, and price-label
 provenance. These checks are not completed by this snapshot.
 
-## Next gate
+## Historical next gate at the audit baseline (superseded above)
 
 Advance DASH-11 with a bounded read-only cohort-health contract before a cost
 panel. Reuse the existing analyzer's per-token anchor semantics. Make population
