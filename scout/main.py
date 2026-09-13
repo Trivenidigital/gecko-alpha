@@ -1211,7 +1211,13 @@ async def run_cycle(
     # AND an onchain-verified deployment registry entry.
     if settings.RH_PONS_COLLECTOR_ENABLED:
         try:
-            await rh_pons.poll_once(session, db, settings)
+            async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
+                await rh_pons.poll_once(session, db, settings)
+        except TimeoutError:
+            logger.warning(
+                "rh_pons_collector_timeout",
+                timeout_seconds=settings.RH_PONS_POLL_TIMEOUT_SEC,
+            )
         except Exception:
             logger.exception("rh_pons_collector_error")
 

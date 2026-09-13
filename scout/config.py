@@ -573,6 +573,8 @@ class Settings(BaseSettings):
     # rate-limited/non-production, and endpoint choice is an operator call.
     RH_PONS_RPC_URL: str = ""
     RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=1, ge=1, le=60)
+    # Whole-poll budget: observe-only RPC/backfill must not stall live lanes.
+    RH_PONS_POLL_TIMEOUT_SEC: float = Field(default=30, ge=1, le=300)
     # eth_getLogs span per pass; bounds backfill after downtime.
     RH_PONS_BACKFILL_BLOCK_SPAN: int = Field(default=2000, ge=1, le=100_000)
     RH_PONS_REORG_OVERLAP_BLOCKS: int = Field(default=12, ge=1, le=256)
