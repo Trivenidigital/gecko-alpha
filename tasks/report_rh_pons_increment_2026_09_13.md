@@ -17,8 +17,27 @@ suppression boundaries, safety trace).
 | Commit + push to `claude/main-session-last-discussion-b8hsn7` | branch push (no merge, no deploy) | same ruling ("Complete authorized work without another general confirmation request"); designated-branch instruction of record | 2026-09-13 |
 | Production deployment / activation / external alerts / signing / funding / live trading | — | **NOT AUTHORIZED — none performed.** `RH_PONS_COLLECTOR_ENABLED` defaults False; no deployment is `onchain_verified`; no RPC URL is configured | — |
 
-No merge was performed and no PR was opened (not requested). No flag or
-prod-state change was made.
+No PR was opened (not requested). No flag or prod-state change was made.
+
+**Branch-collision record (2026-09-13).** While this increment was in test,
+the designated branch was force-updated by a parallel session to an
+UNRELATED clone lineage (776 commits, tip `6ac3a08`, 2026-07-22
+investigation work; no common ancestor with this repo's master line).
+Resolution chosen to lose nothing and force nothing: (1) `-s ours` merge
+(`7b859b0`) records that lineage as an ancestor with the tree unchanged, so
+every parallel commit stays reachable from the branch; (2) restore commit
+(`12dd995`) brings its unique files into the tree —
+`investigation/ruling_response_queries.sh`,
+`investigation/time_death_counterfactual.py`,
+`tasks/operator_pack_p5_and_dex_activation_2026_07_20.md`, and its two test
+files preserved verbatim under
+`investigation/parallel_branch_tests_20260722/` (one asserts July-era
+schema shapes and fails on the current line — cross-lineage
+incompatibility, so they are kept out of pytest collection until rebased).
+Differing versions of shared paths remain recoverable via
+`git show 6ac3a08:<path>`. NOTE for any future PR of this branch into
+master: use a SQUASH merge, or the unrelated 776-commit lineage will enter
+master's history.
 
 ## Implemented changes
 
