@@ -688,8 +688,11 @@ class _RpcPacer:
     bucket, halves the rate (never below ``min_rate``) and holds new calls
     until a Retry-After capped at ``max_hold`` has passed; each completed pass
     restores a tenth of the configured rate. A call larger than the burst
-    waits for a full bucket and then borrows, so it cannot deadlock. Waits are
-    serialized, so concurrent batch POSTs cannot overdraw together.
+    waits for a full bucket and then borrows, so it cannot deadlock. Overdraw
+    is prevented because each check-and-deduct runs with no await in between
+    and every waiter re-checks the bucket after sleeping. The lock only orders
+    concurrent waiters (FIFO) and avoids redundant wake-ups; removing it would
+    change fairness, not the enforced rate.
     """
 
     _RECOVERY_FRACTION = 0.1

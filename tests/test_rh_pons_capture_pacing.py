@@ -57,6 +57,11 @@ class FakeClock:
     async def sleep(self, seconds):
         self.sleeps.append(round(seconds, 6))
         self.now += seconds
+        # A faulty acquire loop must FAIL the test, not spin forever: bound the
+        # simulated sleeps and yield so wait_for/cancellation can take effect.
+        if len(self.sleeps) > 1000:
+            raise AssertionError("fake clock slept more than 1000 times")
+        await asyncio.sleep(0)
 
 
 def _pacer(clock, **overrides):
@@ -342,7 +347,12 @@ async def test_pacer_allowance_shrinks_budget_below_configured_cap(
     state.pass_deadline = time.monotonic() + 0.2
     token = rh_pons._RPC_PACER.set(pacer)
     try:
-        result = await _run(fake, lambda s: rh_pons._scan_pass(s, db, settings, state))
+        # Bounded: a pass that ignored the pacer allowance would wait on a
+        # 0.5 calls/s bucket in real time; that must fail, not hang.
+        async with asyncio.timeout(5):
+            result = await _run(
+                fake, lambda s: rh_pons._scan_pass(s, db, settings, state)
+            )
     finally:
         rh_pons._RPC_PACER.reset(token)
     assert result.status == "completed", result.reason

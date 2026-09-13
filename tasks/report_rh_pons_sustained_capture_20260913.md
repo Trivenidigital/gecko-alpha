@@ -167,6 +167,33 @@ Verification this round:
 - Native REQUEST 5: pending. It covers the review-fix tests, the RH suites,
   the watchdog, config and heartbeat.
 
+Mutation round 2 (Codex, review worktree `59dfc74c`): 31 mutants gave 28
+assertion kills, 2 hangs and 1 survivor. The hangs are not counted as kills.
+
+- **Hang: `oversized_call_deadlocks`.** The fake-clock sleep never yielded, so
+  a looping `acquire` could not be cancelled. The fake clock now yields and
+  fails the test after 1000 simulated sleeps.
+- **Hang: `budget_ignores_pacer`.** The pass waited in real time on a
+  0.5 calls/s bucket. The test now runs the pass under a 5 s `asyncio.timeout`.
+- **Survivor: `pacer_waits_not_serialized` is judged equivalent for the rate
+  requirement.**
+  - `acquire` checks tokens and deducts them in one synchronous step (no await
+    in between), so two tasks cannot both spend the same tokens.
+  - A waiter recomputes the bucket after every sleep, so tasks woken together
+    serialize themselves.
+  - Removing the lock therefore changes only FIFO ordering and redundant
+    wake-ups, not the enforced rate or overdraw. No test asserts fairness, and
+    I did not add that requirement.
+  - The docstring's claim that the lock prevents overdraw was wrong and is
+    corrected. The lock is kept for ordering.
+- **Round-3 harness** (`rh_capture_mutations_round3.py`, REQUEST 6):
+  - a 180 s timeout per test run, killing the whole process tree;
+  - TIMEOUT reported separately from KILLED;
+  - covers the two formerly hanging mutants, the equivalent lock mutant
+    (reported as expected), round-1/2 guards whose code changed, and 23 new
+    round-3 guards across the collector, DB and watchdog.
+  - Results are pending.
+
 ## Not established
 
 - Sustained capacity, real-time latency and provider quota. The capacity
