@@ -6,6 +6,38 @@
 - [x] Findings PR #570 opened: source + runtime evidence, next product gate, two PR reviews approved with citation/checklist folds. CI/final-head confirmation tracked in session report.
 # Backlog — gecko-alpha
 
+## RH/Pons implementation follow-through — 2026-09-13
+
+- [x] Integrate original increment on clean production/master base.
+- [x] Repair checkpoints, curve-emitter coverage, canonical recovery and clocks.
+- [x] Correct chain-qualified latency evidence and successful-scan monitoring.
+- [x] Verify public V2 deployment and replay real launch/buy/sell logs.
+- [x] Establish direct Claude CLI collaboration and cross-review.
+- [x] Run isolated live RPC capture and injected failure check.
+- [x] Complete throughput followup and final review; Linux CI passed at 4da32b77.
+- [x] Publish reviewed PR #572 and acceptance evidence.
+
+Results and remaining activation boundaries:
+`tasks/report_rh_pons_readiness_20260913.md`. This supersedes the review-only
+status below; it does not authorize or claim live trading.
+
+## Codex / Claude coordination review — 2026-09-13
+
+- [x] Read operator handoff; fetch exact reviewed tip b8843487.
+- [x] Isolate review on feat/claude-review-20260913; preserve main checkout changes.
+- [x] Discover authenticated Claude Code CLI and request a read-only second review.
+- [x] Reproduce focused test results and investigate uncovered collection/evidence defects.
+- [x] Reconcile Claude feedback and independent durable-evidence review.
+- [x] Record findings, verification limits, and reusable direct-coordination procedure.
+
+Scope: review and coordination only. No deployment, live activation, or funding.
+No new product primitives are proposed by this review; Hermes ecosystem analysis
+does not apply to inspecting existing code and using the installed CLI.
+
+Review result: 24 focused tests pass; five concrete findings recorded in
+`tasks/review_claude_rh_pons_2026_09_13.md`. Direct CLI request and same-session
+follow-up both succeeded. Product fixes and live readiness remain outstanding.
+
 ## Completed Work: 2026-09-13 - Autonomous closeout evidence boundaries
 
 - [x] Fresh origin/master drift audit in isolated branch; templates, role map,
@@ -2361,3 +2393,20 @@ dormant), BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO (MED, operator vendor 
 BL-NEW-CG-DEMO-API-KEY (MED, operator action, runbook ready), BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE
 (LOW-MED), plus the low-priority tail enumerated in backlog.md. See backlog.md for full
 evidence and the SUPERSEDED→new-ID mapping.
+
+## Closeout follow-through: 2026-09-13 21:14 UTC
+
+Docs-only scope; detailed findings and verification in
+`tasks/closeout_followthrough_2026_09_13_2114.md`.
+
+- [x] Refresh clean isolated branch to origin/master 6dd4327b; read prior run
+  memory, current reconciliation, local AGENTS.md and lessons.
+- [x] Verify earlier automation turns completed; identify current PR572/capture
+  owner before any shared PR or production action.
+- [x] Trace alert destinations through send helpers and correct three registry
+  rows; document overlap preflight without claiming an implemented lock.
+- [x] Focused registry coverage: 2 passed; diff whitespace check passed.
+- [ ] Two independent PR reviews, folds, exact-head CI and conditional merge.
+
+Review: no code/runtime changes; centralized routing, stop history and postmortem
+UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
