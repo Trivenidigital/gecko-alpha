@@ -1,3 +1,10 @@
+## Telegram recorded-outcome visibility — 2026-09-13
+
+- [x] Drift/runtime verified on fresh d5b26ff base; plan written.
+- [ ] Two plan reviews, design and two design reviews.
+- [ ] Read-only build, tests, PR and two PR reviews; exact-head CI before merge.
+- [ ] Record results and deployment ownership boundary.
+
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
 
 - [x] Current-base drift and production read-only schema/state preflight.
