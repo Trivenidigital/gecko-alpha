@@ -13,6 +13,10 @@ Codex integrated and corrected it, repaired collection/recovery/monitoring,
 and ran independent durable-evidence reviews. The coordination runbook records
 the reusable CLI procedure, session IDs and process-ownership safeguards.
 The user's shared root checkout and unrelated interactive sessions were preserved.
+The installed memory plugin twice resumed an old coding helper unexpectedly.
+Task-owned helpers were stopped; a subsequent `--safe-mode` Claude review
+succeeded without that helper. The runbook now uses safe mode for coordinated
+jobs, preserving normal authentication and permissions without global changes.
 
 ## Delivered behavior
 

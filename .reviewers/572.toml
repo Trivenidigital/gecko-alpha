@@ -1,8 +1,10 @@
-# Durable-evidence: independent Codex reviewer checked recovery, checkpoint,
-# monitoring and cancellation at this SHA; see readiness report.
-# Runtime: primary Codex reviewer executed the isolated real-RPC probes and
-# 176 focused/regression tests. This is author-attested runtime evidence,
-# not an independent human approval or authorization to activate trading.
+# Independent durable reviewer: concurrency and silent-failure.
+# Latency worker reviewing collector: logic.
+# Collector worker reviewing complementary operations paths: ops-safety.
+# Ownership overlap for head-lag code is covered by the durable reviewer.
+# Primary Codex also executed real-RPC probes and 176 regression tests.
+# These are agent review records, not independent human approval or
+# authorization to activate trading. See readiness report for scopes.
 # Claude session 3c9deda4-5c60-4ecb-9007-96c7ebfbce0b separately cleared
 # header batching/completion head/deadline at c23ad743. The only subsequent
 # watched delta scopes the deadline assertion to RH heartbeat writes.

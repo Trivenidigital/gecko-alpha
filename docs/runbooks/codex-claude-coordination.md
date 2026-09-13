@@ -14,7 +14,7 @@ required. This is an on-demand workflow, not an unattended monitor.
 4. Request a bounded review with the CLI. Example, from the review worktree:
 
    ```powershell
-   claude -p --tools 'Read,Grep,Glob' --permission-mode plan --output-format json 'Review the pinned change read-only. Return concrete defects with file and line evidence. No edits, deployment, activation, funding or trades.' > claude-review-response.json 2> claude-review-stderr.txt
+   claude -p --safe-mode --tools 'Read,Grep,Glob' --permission-mode plan --output-format json 'Review the pinned change read-only. Return concrete defects with file and line evidence. No edits, deployment, activation, funding or trades.' > claude-review-response.json 2> claude-review-stderr.txt
    ```
 
 5. Read the JSON, check `is_error`, and capture `session_id`. Exit code alone
@@ -22,7 +22,7 @@ required. This is an on-demand workflow, not an unattended monitor.
 6. Send findings back to that same session and read its response:
 
    ```powershell
-   claude -p --resume SESSION_ID --tools 'Read,Grep,Glob' --permission-mode plan --output-format json 'Review reconciliation: ... Acknowledge and prioritize next work; remain read-only.' > claude-review-followup.json 2> claude-review-followup-stderr.txt
+   claude -p --safe-mode --resume SESSION_ID --tools 'Read,Grep,Glob' --permission-mode plan --output-format json 'Review reconciliation: ... Acknowledge and prioritize next work; remain read-only.' > claude-review-followup.json 2> claude-review-followup-stderr.txt
    ```
 
 The 2026-09-13 review session ID is
@@ -57,6 +57,15 @@ review remained read-only, but the plugin's separate sync process resumed
 the old coding worktree. Inspect background process ownership after each CLI
 start, not just after cancellation. An unattended writer handoff is not yet
 safe with that helper enabled. No global plugin setting was changed here.
+
+The verified remedy for coordinated CLI jobs is **`--safe-mode`** (supported
+by installed Claude Code 2.1.270). It disables custom hooks/plugins/background
+customizations for this invocation while retaining normal auth and permissions.
+Unlike `--bare`, it does not require replacing OAuth with an API key. A read-only
+followup succeeded in safe mode, session `c3f2403d-bb72-42f1-beb7-edca301c9200`,
+without resuming the unwanted helper. Use it for future coordinated jobs.
+Safe mode also disables automatic project instructions: implementation prompts
+must explicitly request reading AGENTS.md and the applicable plan before edits.
 
 Concurrent writers also share Git's index within a worktree. Prefer separate
 worktrees, and use `git commit --only <owned paths>` when committing disjoint
