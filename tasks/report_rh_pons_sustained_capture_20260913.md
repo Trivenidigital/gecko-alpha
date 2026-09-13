@@ -265,3 +265,32 @@ closed or dispositioned.
 |---|---|---|---|
 | Implement bounded capture increment on this branch, commit owned paths | implementation | Operator authorization relayed by Codex in this session's implementation prompt | 2026-09-13 |
 | Live capacity probe, activation, merge, deploy | ops/merge | Not requested or performed here | — |
+
+## Integration verification — Codex, 2026-09-13
+
+The implementation was integrated onto merged master in `feat/rh-capture-ready`.
+The original checkout was preserved. Claude Max supplied implementation and
+independent reviewers; Codex ran native tests, fault checks and integration.
+
+- REQUEST 5: 284 passed; the watchdog default regression was subsequently fixed.
+- Focused watchdog verification after the fixes: 57 passed, nine Windows failures.
+  The identical nine failures reproduce on the unchanged PR572 baseline: six
+  missing `fcntl` cases and three Bash-wrapper cases. Linux CI remains required.
+- Pacing/review-fix verification: 35 passed.
+- Mutation round 3: 28 assertion failures, one independently confirmed equivalent
+  lock mutation; no timeout, survivor or skipped anchor. All files restored.
+- Final cooldown checks: both changed-reason and persistence mutations caused
+  the expected assertion failure; source restored.
+- Black checked all 15 changed Python application/test/probe files; no changes
+  required. `git diff --check` passed.
+- Capacity is not established: the isolated public smoke failed to drain its
+  backlog and stopped after three rate-limited passes. Raw evidence is retained
+  under `investigation/`; the corrected probe has not been rerun on a suitable
+  provider. No activation, deployment or trade was performed.
+
+| Authorized action | Record |
+|---|---|
+| Complete implementation, coordination, review and integrate verified fixes | User: “Go on and take it to finish line, coordiante with Claude for required tasks.” |
+| Production activation, live trading, provider purchase | Not performed; remains outside this increment |
+
+Final independent clearance and exact-head CI records will accompany the PR.
