@@ -550,6 +550,7 @@ class Database:
             # See tasks/design_rh_pons_discovery_delta_2026_09_13.md.
             await self._migrate_rh_pons_discovery_v1()
             await self._migrate_curve_scan_checkpoints_v1()
+            await self._migrate_curve_reorg_markers_v1()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -781,8 +782,8 @@ class Database:
     async def _migrate_curve_scan_checkpoints_v1(self) -> None:
         """Durable successful-range cursors, schema_version 20260914.
 
-        updated_at is the freshness clock: the collector watchdog must monitor
-        successful scans, including empty ranges, rather than event arrival.
+        Stores successful scan coverage and bounded reorg headers. updated_at is
+        the freshness clock for the collector watchdog even across empty ranges.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
@@ -811,6 +812,89 @@ class Database:
         except BaseException:
             await self._conn.rollback()
             raise
+
+    async def _migrate_curve_reorg_markers_v1(self) -> None:
+        """Allow repeatable append-only reorg transitions (schema 20260915)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT 1 FROM schema_version WHERE version=20260915"
+            )
+            if await cur.fetchone():
+                await conn.commit()
+                return
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='curve_launch_events'"
+            )
+            ddl = (await cur.fetchone())[0]
+            import re
+
+            rebuilt = re.sub(
+                r",\s*UNIQUE\s*\(chain_id,\s*block_hash,\s*transaction_hash,\s*log_index,\s*event_name\)",
+                "",
+                ddl,
+                flags=re.IGNORECASE,
+            )
+            if rebuilt == ddl:
+                raise RuntimeError(
+                    "curve_launch_events UNIQUE shape unexpectedly changed"
+                )
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='curve_launch_events' AND sql IS NOT NULL"
+            )
+            indexes = [r[0] for r in await cur.fetchall()]
+            await conn.execute(
+                "ALTER TABLE curve_launch_events RENAME TO curve_launch_events_reorg_old"
+            )
+            await conn.execute(rebuilt)
+            await conn.execute(
+                "INSERT INTO curve_launch_events SELECT * FROM curve_launch_events_reorg_old"
+            )
+            await conn.execute("DROP TABLE curve_launch_events_reorg_old")
+            for index in indexes:
+                await conn.execute(index)
+            await conn.execute(
+                """CREATE UNIQUE INDEX idx_curve_launch_ev_evidence_identity
+                ON curve_launch_events(chain_id, block_hash, transaction_hash, log_index, event_name)
+                WHERE event_name NOT IN ('reorg_removed','reorg_replaced','reorg_restored')"""
+            )
+            await conn.execute(
+                "INSERT INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260915,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_reorg_markers_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    @staticmethod
+    def _canonical_curve_hashes(
+        events: list[dict],
+    ) -> dict[tuple[str, int], str | None]:
+        """Fold append order; a later restoration supersedes earlier tombstones."""
+        canonical: dict[tuple[str, int], str | None] = {}
+        for ev in sorted(events, key=lambda event: event["id"]):
+            key = (ev["transaction_hash"], ev["log_index"])
+            name = ev["event_name"]
+            if name == "reorg_removed":
+                if canonical.get(key) == ev["block_hash"]:
+                    canonical[key] = None
+            elif name == "reorg_replaced":
+                old_hash = json.loads(ev["payload_json"] or "{}").get(
+                    "replaced_block_hash"
+                )
+                if canonical.get(key) == old_hash:
+                    canonical[key] = None
+            else:
+                canonical[key] = ev["block_hash"]
+        return canonical
 
     async def get_curve_scan_checkpoint(
         self, chain_id: int, protocol: str, factory: str
@@ -858,7 +942,7 @@ class Database:
             raise RuntimeError("Database not initialized.")
         cur = await self._conn.execute(
             """SELECT DISTINCT curve_address FROM curve_launch_discoveries
-            WHERE chain_id=? AND protocol=? AND lifecycle_status != 'unknown'
+            WHERE chain_id=? AND protocol=? AND lifecycle_status IN ('on_curve', 'graduating')
             AND curve_address IS NOT NULL ORDER BY curve_address""",
             (chain_id, protocol),
         )
@@ -873,7 +957,7 @@ class Database:
         cur = await self._conn.execute(
             """SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=?
             AND block_number BETWEEN ? AND ?
-            AND event_name NOT IN ('reorg_removed', 'reorg_replaced')
+            AND event_name NOT IN ('reorg_removed', 'reorg_replaced', 'reorg_restored')
             ORDER BY block_number, log_index, id""",
             (chain_id, protocol, from_block, to_block),
         )
@@ -897,24 +981,15 @@ class Database:
         )
         names = [c[0] for c in cur.description]
         events = [dict(zip(names, r)) for r in await cur.fetchall()]
-        invalid = set()
-        for ev in events:
-            if ev["event_name"] == "reorg_removed":
-                invalid.add((ev["transaction_hash"], ev["log_index"], ev["block_hash"]))
-            elif ev["event_name"] == "reorg_replaced":
-                payload = json.loads(ev["payload_json"] or "{}")
-                invalid.add(
-                    (
-                        ev["transaction_hash"],
-                        ev["log_index"],
-                        payload.get("replaced_block_hash"),
-                    )
-                )
+        canonical = self._canonical_curve_hashes(events)
         projections: dict[str, dict] = {}
         for ev in events:
             if ev["event_name"] not in ("token_launched", "pool_graduated"):
                 continue
-            if (ev["transaction_hash"], ev["log_index"], ev["block_hash"]) in invalid:
+            if (
+                canonical.get((ev["transaction_hash"], ev["log_index"]))
+                != ev["block_hash"]
+            ):
                 continue
             if not ev["token_address"]:
                 continue
@@ -934,45 +1009,37 @@ class Database:
                 projection["curve_address"] = ev["curve_address"]
                 projection["event_time"] = ev["event_time"]
                 projection.setdefault("lifecycle_status", "on_curve")
-        fields = (
-            "curve_address",
-            "deployer_address",
-            "pair_token_address",
-            "launch_config_id",
-            "graduation_threshold",
-            "event_time",
-        )
-        try:
-            await self._conn.execute("SAVEPOINT curve_projection_reconcile")
-            await self._conn.execute(
-                """UPDATE curve_launch_discoveries SET lifecycle_status='unknown',
-                curve_address=NULL, deployer_address=NULL, pair_token_address=NULL,
-                launch_config_id=NULL, graduation_threshold=NULL, event_time=NULL,
-                execution_eligible=0 WHERE chain_id=? AND protocol=?""",
-                (chain_id, protocol),
+        # One SQLite statement atomically publishes the complete projection.
+        # Other pipeline writers share this connection and may commit at any
+        # await; a multi-statement SAVEPOINT is therefore unsafe here.
+        await self._conn.execute(
+            """WITH projected AS (
+                SELECT key AS token, value AS facts FROM json_each(?)
             )
-            for token, projection in projections.items():
-                await self._conn.execute(
-                    """UPDATE curve_launch_discoveries SET curve_address=?, deployer_address=?,
-                    pair_token_address=?, launch_config_id=?, graduation_threshold=?, event_time=?,
-                    lifecycle_status=?, first_seen_at=CASE
-                    WHEN julianday(?) < julianday(first_seen_at) THEN ? ELSE first_seen_at END
-                    WHERE chain_id=? AND protocol=? AND token_address=?""",
-                    (
-                        *[projection.get(f) for f in fields],
-                        projection["lifecycle_status"],
-                        projection["first_seen_at"],
-                        projection["first_seen_at"],
-                        chain_id,
-                        protocol,
-                        token,
-                    ),
-                )
-            await self._conn.execute("RELEASE SAVEPOINT curve_projection_reconcile")
-        except BaseException:
-            await self._conn.execute("ROLLBACK TO SAVEPOINT curve_projection_reconcile")
-            await self._conn.execute("RELEASE SAVEPOINT curve_projection_reconcile")
-            raise
+            UPDATE curve_launch_discoveries SET
+                curve_address=json_extract(p.facts, '$.curve_address'),
+                deployer_address=json_extract(p.facts, '$.deployer_address'),
+                pair_token_address=json_extract(p.facts, '$.pair_token_address'),
+                launch_config_id=json_extract(p.facts, '$.launch_config_id'),
+                graduation_threshold=json_extract(p.facts, '$.graduation_threshold'),
+                event_time=json_extract(p.facts, '$.event_time'),
+                lifecycle_status=COALESCE(json_extract(p.facts, '$.lifecycle_status'), 'unknown'),
+                execution_eligible=0,
+                first_seen_at=CASE
+                    WHEN julianday(json_extract(p.facts, '$.first_seen_at')) < julianday(first_seen_at)
+                    THEN json_extract(p.facts, '$.first_seen_at') ELSE first_seen_at END
+            FROM (
+                SELECT d.token_address AS token, projected.facts
+                FROM curve_launch_discoveries d LEFT JOIN projected
+                ON projected.token=d.token_address
+                WHERE d.chain_id=? AND d.protocol=?
+            ) p
+            WHERE curve_launch_discoveries.chain_id=?
+            AND curve_launch_discoveries.protocol=?
+            AND curve_launch_discoveries.token_address=p.token""",
+            (json.dumps(projections), chain_id, protocol, chain_id, protocol),
+        )
+        await self._conn.commit()
 
     async def record_curve_launch_discovery(
         self,
@@ -1089,6 +1156,27 @@ class Database:
         UNIQUE key + INSERT OR IGNORE). Append-only: no UPDATE path exists."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
+        prior_hash = await self.canonical_curve_event_block_hash(
+            chain_id, transaction_hash, log_index
+        )
+        markers = {"reorg_removed", "reorg_replaced", "reorg_restored"}
+        if event_name == "reorg_removed" and prior_hash != block_hash:
+            # Preserve an unsolicited removal even when its original log was
+            # never observed; repeated polling of that removal is idempotent.
+            existing = await self._conn.execute(
+                """SELECT 1 FROM curve_launch_events WHERE chain_id=? AND protocol=?
+                AND transaction_hash=? AND log_index=? AND block_hash=?
+                AND event_name='reorg_removed' LIMIT 1""",
+                (chain_id, protocol, transaction_hash, log_index, block_hash),
+            )
+            if await existing.fetchone():
+                return False
+        if event_name == "reorg_replaced":
+            target = json.loads(payload_json or "{}").get("replaced_block_hash")
+            if prior_hash != target:
+                return False
+        if event_name == "reorg_restored" and prior_hash == block_hash:
+            return False
         cur = await self._conn.execute(
             """INSERT OR IGNORE INTO curve_launch_events
                (chain_id, protocol, event_name, token_address, curve_address,
@@ -1114,8 +1202,40 @@ class Database:
                 payload_json,
             ),
         )
+        inserted = cur.rowcount > 0
+        if not inserted and event_name not in markers and prior_hash != block_hash:
+            # Same canonical block can return after a fork. Preserve original
+            # evidence and observation clock; append its new canonical status.
+            await self._conn.execute(
+                """INSERT INTO curve_launch_events
+                (chain_id, protocol, event_name, token_address, curve_address,
+                 transaction_hash, log_index, block_number, block_hash,
+                 event_time, observed_at, provider_available_at, source, provenance, payload_json)
+                VALUES (?, ?, 'reorg_restored', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chain_id,
+                    protocol,
+                    token_address,
+                    curve_address,
+                    transaction_hash,
+                    log_index,
+                    block_number,
+                    block_hash,
+                    event_time,
+                    observed_at,
+                    provider_available_at,
+                    source,
+                    provenance,
+                    json.dumps(
+                        {
+                            "restored_block_hash": block_hash,
+                            "prior_block_hash": prior_hash,
+                        }
+                    ),
+                ),
+            )
         await self._conn.commit()
-        return cur.rowcount > 0
+        return inserted
 
     async def get_curve_launch(self, chain_id: int, token_address: str) -> dict | None:
         """One discovery row as a dict, or None."""
@@ -1169,22 +1289,12 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cur = await self._conn.execute(
-            """SELECT e.block_hash FROM curve_launch_events e
-            WHERE e.chain_id = ? AND e.transaction_hash = ? AND e.log_index = ?
-            AND e.event_name NOT IN ('reorg_removed', 'reorg_replaced')
-            AND NOT EXISTS (
-                SELECT 1 FROM curve_launch_events m WHERE m.chain_id=e.chain_id
-                AND m.protocol=e.protocol AND m.transaction_hash=e.transaction_hash
-                AND m.log_index=e.log_index AND (
-                    (m.event_name='reorg_removed' AND m.block_hash=e.block_hash) OR
-                    (m.event_name='reorg_replaced' AND
-                     json_extract(m.payload_json, '$.replaced_block_hash')=e.block_hash)
-                )
-            ) ORDER BY e.id DESC LIMIT 1""",
+            "SELECT * FROM curve_launch_events WHERE chain_id=? AND transaction_hash=? AND log_index=? ORDER BY id",
             (chain_id, transaction_hash, log_index),
         )
-        row = await cur.fetchone()
-        return row[0] if row else None
+        names = [c[0] for c in cur.description]
+        events = [dict(zip(names, row)) for row in await cur.fetchall()]
+        return self._canonical_curve_hashes(events).get((transaction_hash, log_index))
 
     async def max_curve_event_block(self, chain_id: int) -> int | None:
         """Highest observed block number — the reconnect/backfill cursor."""

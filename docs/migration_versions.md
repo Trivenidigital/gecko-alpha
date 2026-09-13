@@ -85,6 +85,7 @@ number to appear in the table below.
 | 20260826 | chain_identity_recompute_pk_v2 | Rebuilds `chain_identity_recompute_v1` with `semantics_version` in the PRIMARY KEY. The v1 key was `(source_table, source_row_id)` with the version as a plain column, so under `INSERT OR REPLACE` the "versioned derived store" could hold exactly ONE version -- a replay under a bumped `RECOMPUTE_SEMANTICS` overwrote the earlier verdict in place. That is the destroys-the-previous-evidence shape ruling C forbids, deferred from the archive to the overlay. Detects the old shape from the stored DDL rather than a marker, so a database that applied the earlier build is upgraded and a fresh install is left alone. |
 | 20260913 | rh_pons_discovery_v1 | RH/Pons curve-launch evidence tables (design_rh_pons_discovery_delta_2026_09_13) |
 | 20260914 | curve_scan_checkpoints_v1 | Durable RH/Pons successful-range cursors and bounded reorg headers; updated_at supplies collector freshness clock |
+| 20260915 | curve_reorg_markers_v1 | Repeatable append-only reorg transitions; preserve evidence IDs and use partial unique index for original events |
 
 ## Notes / gaps
 
