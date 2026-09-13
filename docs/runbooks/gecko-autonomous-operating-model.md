@@ -74,6 +74,19 @@ Check the actual scheduler configuration, observed invocation and completion
 artifacts separately. The local status reporter cannot establish external runner
 health or first-run history from the presence/absence of tracked files.
 
+Before shared PR or production mutations, check active automation runs and
+operator tasks for ownership of the same work. A recent-task listing may omit
+automation tasks; inspect known prior run IDs and their latest turn status.
+If another active task owns the same PR or production operation, leave that
+operation with its owner. Independent read-only findings or isolated docs work
+can continue. An inactive task or saved scheduler configuration alone does not
+prove a production operation completed; verify its result separately.
+
+The September 13 closeout observed hourly invocations overlapping a six-hour
+mission. This guidance is a preflight convention, not a scheduler lock or an
+atomic mutual-exclusion mechanism. Scheduler overlap policy still needs explicit
+reconciliation; this document does not alter the automation configuration.
+
 **Freshness caveat:** when `git fetch origin` cannot run (no credentials / restricted network), any “compare against `origin/master`” drift-check may be stale. Record the base commit SHA + commit timestamp used for the session, and treat drift conclusions as conditional until a successful fetch confirms the base is current.
 
 ## Multi-vector review dispatch
