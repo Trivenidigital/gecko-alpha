@@ -413,36 +413,6 @@ async def test_poll_once_refuses_without_rpc_url(
     await db.close()
 
 
-async def test_poll_once_transport_and_resume(tmp_path, settings_factory, monkeypatch):
-    db = await _db(tmp_path)
-    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
-    rpc = "https://rpc.example.invalid"
-    settings = settings_factory(
-        RH_PONS_COLLECTOR_ENABLED=True,
-        RH_PONS_RPC_URL=rpc,
-        RH_PONS_POLL_EVERY_N_CYCLES=1,
-        RH_PONS_BACKFILL_BLOCK_SPAN=1000,
-    )
-    with aioresponses() as m:
-        m.post(rpc, payload={"jsonrpc": "2.0", "id": 1, "result": [_launch_log()]})
-        async with aiohttp.ClientSession() as session:
-            recorded = await rh_pons.poll_once(session, db, settings)
-        assert recorded == 1
-        (first_call,) = [c for calls in m.requests.values() for c in calls]
-        assert first_call.kwargs["json"]["params"][0]["fromBlock"] == hex(90)
-
-    # Second pass resumes AFTER the highest observed block (100), not from
-    # the deploy block — reconnect/backfill continuity.
-    rh_pons._poll_cycle_counter = 0
-    with aioresponses() as m:
-        m.post(rpc, payload={"jsonrpc": "2.0", "id": 1, "result": []})
-        async with aiohttp.ClientSession() as session:
-            assert await rh_pons.poll_once(session, db, settings) == 0
-        (second_call,) = [c for calls in m.requests.values() for c in calls]
-        assert second_call.kwargs["json"]["params"][0]["fromBlock"] == hex(101)
-    await db.close()
-
-
 # ---------------------------------------- execution eligibility (ruling 4)
 
 
@@ -538,3 +508,264 @@ async def test_strict_adverse_verdict_maps_to_adverse_reason():
         deployment_verified=True, quote_asset_approved=True, safety_verdict=verdict
     )
     assert not ok and reasons == ["safety_adverse_verdict"]
+
+
+async def test_crash_replay_repairs_discovery(tmp_path, settings_factory, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    db = await _db(tmp_path)
+    writer = db.record_curve_launch_discovery
+    monkeypatch.setattr(
+        db,
+        "record_curve_launch_discovery",
+        AsyncMock(side_effect=RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError):
+        await _collect([_launch_log()], db, settings_factory())
+    monkeypatch.setattr(db, "record_curve_launch_discovery", writer)
+    await _collect([_launch_log()], db, settings_factory())
+    assert await db.get_curve_launch(DEP.chain_id, TOKEN) is not None
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda x: x.update(data="0x01"),
+        lambda x: x.update(topics=[TOPIC_TOKEN_LAUNCHED, "0x11", "0x22", "0x33"]),
+        lambda x: x.update(topics=[None]),
+    ],
+)
+def test_malformed_layout_rejected(mutate):
+    log = _launch_log()
+    mutate(log)
+    assert rh_pons.decode_log(log) is None
+
+
+async def test_removed_graduation_reconciles(tmp_path, settings_factory):
+    db = await _db(tmp_path)
+    await _collect([_launch_log(), _graduated_log(log_index=1)], db, settings_factory())
+    await _collect([_graduated_log(log_index=1, removed=True)], db, settings_factory())
+    assert (await db.get_curve_launch(DEP.chain_id, TOKEN))[
+        "lifecycle_status"
+    ] == "on_curve"
+    assert (
+        await db.canonical_curve_event_block_hash(DEP.chain_id, "0x" + "aa" * 32, 1)
+        is None
+    )
+    await db.close()
+
+
+async def test_empty_scan_progress_and_heartbeat(
+    tmp_path, settings_factory, monkeypatch
+):
+    from aioresponses import CallbackResult
+
+    db = await _db(tmp_path)
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
+    settings = settings_factory(
+        RH_PONS_COLLECTOR_ENABLED=True,
+        RH_PONS_RPC_URL="https://rpc.invalid/key/SECRET",
+        RH_PONS_POLL_EVERY_N_CYCLES=1,
+        RH_PONS_BACKFILL_BLOCK_SPAN=10,
+    )
+    scans = []
+
+    def rpc(url, **kw):
+        body = kw["json"]
+        method = body["method"]
+        if method == "eth_chainId":
+            result = hex(DEP.chain_id)
+        elif method == "eth_blockNumber":
+            result = hex(105)
+        elif method == "eth_getBlockByNumber":
+            result = {
+                "number": body["params"][0],
+                "hash": "0x" + "bb" * 32,
+                "timestamp": hex(1700000000),
+            }
+        else:
+            scans.append(body["params"][0])
+            result = []
+        return CallbackResult(payload={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    with aioresponses() as m:
+        m.post(settings.RH_PONS_RPC_URL, callback=rpc, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            await rh_pons.poll_once(session, db, settings)
+            await rh_pons.poll_once(session, db, settings)
+    checkpoint = await db.get_curve_scan_checkpoint(
+        DEP.chain_id, DEP.version, DEP.factory
+    )
+    assert checkpoint["next_block"] == 106
+    assert int(scans[-1]["toBlock"], 16) == 105
+    assert (await db.load_ingest_watchdog_state())["rh_pons"] == 0
+    await db.close()
+
+
+async def test_poll_fetches_launch_block_trades_and_stamps_clock(
+    tmp_path, settings_factory, monkeypatch
+):
+    from aioresponses import CallbackResult
+
+    db = await _db(tmp_path)
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
+    settings = settings_factory(
+        RH_PONS_COLLECTOR_ENABLED=True,
+        RH_PONS_RPC_URL="https://rpc.invalid/SECRET",
+        RH_PONS_POLL_EVERY_N_CYCLES=1,
+    )
+
+    def rpc(url, **kw):
+        body = kw["json"]
+        method = body["method"]
+        if method == "eth_chainId":
+            result = hex(DEP.chain_id)
+        elif method == "eth_blockNumber":
+            result = hex(100)
+        elif method == "eth_getBlockByNumber":
+            result = {
+                "number": body["params"][0],
+                "hash": "0x" + "bb" * 32,
+                "timestamp": hex(1700000000),
+            }
+        else:
+            address = body["params"][0]["address"]
+            result = (
+                [_launch_log()] if address == DEP.factory else [_buy_log(log_index=1)]
+            )
+        return CallbackResult(payload={"jsonrpc": "2.0", "id": 1, "result": result})
+
+    with aioresponses() as m:
+        m.post(settings.RH_PONS_RPC_URL, callback=rpc, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            assert await rh_pons.poll_once(session, db, settings) == 2
+            assert await rh_pons.poll_once(session, db, settings) == 0
+    row = await db.get_curve_launch(DEP.chain_id, TOKEN)
+    assert row["event_time"] == "2023-11-14T22:13:20+00:00"
+    assert row["source"] == "rpc:rh_pons"
+    assert not row["execution_eligible"]
+    assert "deployment_unverified" not in row["eligibility_reasons"]
+    cur = await db._conn.execute(
+        "SELECT token_address FROM curve_launch_events WHERE event_name='curve_buy'"
+    )
+    assert (await cur.fetchone())[0] == TOKEN
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong_chain", "log_error", "header_error", "malformed_log"]
+)
+async def test_partial_failure_never_checkpoints(
+    tmp_path, settings_factory, monkeypatch, failure
+):
+    from aioresponses import CallbackResult
+
+    db = await _db(tmp_path)
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
+    settings = settings_factory(
+        RH_PONS_COLLECTOR_ENABLED=True,
+        RH_PONS_RPC_URL="https://rpc.invalid",
+        RH_PONS_POLL_EVERY_N_CYCLES=1,
+    )
+
+    def rpc(url, **kw):
+        body = kw["json"]
+        method = body["method"]
+        if method == "eth_chainId":
+            result = hex(1 if failure == "wrong_chain" else DEP.chain_id)
+        elif method == "eth_blockNumber":
+            result = hex(100)
+        elif method == "eth_getBlockByNumber":
+            result = None
+        elif failure == "log_error":
+            return CallbackResult(payload={"error": {"message": "SECRET"}})
+        elif failure == "malformed_log":
+            result = [{"topics": []}]
+        else:
+            result = []
+        return CallbackResult(payload={"result": result})
+
+    with aioresponses() as m:
+        m.post(settings.RH_PONS_RPC_URL, callback=rpc, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            assert await rh_pons.poll_once(session, db, settings) == 0
+    assert (
+        await db.get_curve_scan_checkpoint(DEP.chain_id, DEP.version, DEP.factory)
+        is None
+    )
+    assert "rh_pons" not in await db.load_ingest_watchdog_state()
+    await db.close()
+
+
+async def test_poll_detects_reorg_without_removed_provider_logs(
+    tmp_path, settings_factory, monkeypatch
+):
+    from aioresponses import CallbackResult
+
+    db = await _db(tmp_path)
+    monkeypatch.setattr(rh_pons, "PONS_DEPLOYMENTS", (_verified_dep(),))
+    settings = settings_factory(
+        RH_PONS_COLLECTOR_ENABLED=True,
+        RH_PONS_RPC_URL="https://rpc.invalid",
+        RH_PONS_POLL_EVERY_N_CYCLES=1,
+        RH_PONS_REORG_OVERLAP_BLOCKS=3,
+    )
+    reorg = False
+
+    def rpc(url, **kw):
+        body = kw["json"]
+        method = body["method"]
+        if method == "eth_chainId":
+            result = hex(DEP.chain_id)
+        elif method == "eth_blockNumber":
+            result = hex(101)
+        elif method == "eth_getBlockByNumber":
+            height = int(body["params"][0], 16)
+            result = {
+                "number": hex(height),
+                "hash": "0x" + ("cc" if reorg and height == 101 else "bb") * 32,
+                "timestamp": hex(1700000000),
+            }
+        elif isinstance(body["params"][0]["address"], str):
+            result = [_launch_log()] + (
+                [] if reorg else [_graduated_log(block=101, log_index=1)]
+            )
+        else:
+            result = []
+        return CallbackResult(payload={"result": result})
+
+    with aioresponses() as m:
+        m.post(settings.RH_PONS_RPC_URL, callback=rpc, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            assert await rh_pons.poll_once(session, db, settings) == 2
+            assert (await db.get_curve_launch(DEP.chain_id, TOKEN))[
+                "lifecycle_status"
+            ] == "on_v4"
+            reorg = True
+            await rh_pons.poll_once(session, db, settings)
+    assert (await db.get_curve_launch(DEP.chain_id, TOKEN))[
+        "lifecycle_status"
+    ] == "on_curve"
+    assert (
+        await db.canonical_curve_event_block_hash(DEP.chain_id, "0x" + "aa" * 32, 1)
+        is None
+    )
+    assert (await db.get_curve_scan_checkpoint(DEP.chain_id, DEP.version, DEP.factory))[
+        "next_block"
+    ] == 102
+    await db.close()
+
+
+async def test_trade_emitted_before_factory_launch_resolves_token(
+    tmp_path, settings_factory
+):
+    db = await _db(tmp_path)
+    await _collect(
+        [_buy_log(log_index=0), _launch_log(log_index=1)], db, settings_factory()
+    )
+    cur = await db._conn.execute(
+        "SELECT token_address FROM curve_launch_events WHERE event_name='curve_buy'"
+    )
+    assert (await cur.fetchone())[0] == TOKEN
+    await db.close()

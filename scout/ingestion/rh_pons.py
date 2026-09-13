@@ -33,6 +33,7 @@ Inert-by-construction guarantees (operator ruling 2026-09-13):
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -257,10 +258,37 @@ def decode_log(log: dict) -> dict | None:
     unknown-topic factory logs coming back as event_name='unknown_factory_event'
     (raw preserved by the caller). Never raises on malformed input.
     """
-    topics = log.get("topics") or []
-    if not topics:
+    if not isinstance(log, dict):
         return None
-    topic0 = (topics[0] or "").lower()
+    topics = log.get("topics")
+    if (
+        not isinstance(topics, list)
+        or not topics
+        or not all(
+            isinstance(t, str) and re.fullmatch(r"0x[0-9a-fA-F]{64}", t) for t in topics
+        )
+    ):
+        return None
+    data = log.get("data", "0x")
+    if not isinstance(data, str) or not re.fullmatch(r"0x(?:[0-9a-fA-F]{64})*", data):
+        return None
+    if not isinstance(log.get("address"), str) or not re.fullmatch(
+        r"0x[0-9a-fA-F]{40}", log["address"]
+    ):
+        return None
+    topic0 = topics[0].lower()
+    layouts = {
+        TOPIC_TOKEN_LAUNCHED: (4, 3),
+        TOPIC_POOL_GRADUATED: (2, 3),
+        TOPIC_CURVE_BUY: (3, 4),
+        TOPIC_CURVE_SELL: (3, 4),
+    }
+    if topic0 in layouts:
+        topic_count, word_count = layouts[topic0]
+        if len(topics) != topic_count or len(data) != 2 + 64 * word_count:
+            return None
+        if any(t[2:26] != "0" * 24 for t in topics[1:]):
+            return None
 
     try:
         if topic0 == TOPIC_TOKEN_LAUNCHED and len(topics) == 4:
@@ -338,11 +366,18 @@ def decode_log(log: dict) -> dict | None:
 
 
 def _log_identity(log: dict) -> tuple[str, int, int, str] | None:
-    tx_hash = (log.get("transactionHash") or "").lower()
+    if not isinstance(log, dict):
+        return None
+    if not all(
+        isinstance(log.get(k), str) and re.fullmatch(r"0x[0-9a-fA-F]{64}", log[k])
+        for k in ("transactionHash", "blockHash")
+    ):
+        return None
+    tx_hash = log["transactionHash"].lower()
     log_index = _hex_int(log.get("logIndex"))
     block_number = _hex_int(log.get("blockNumber"))
     block_hash = (log.get("blockHash") or "").lower()
-    if not tx_hash or log_index is None or block_number is None or not block_hash:
+    if log_index is None or block_number is None or log_index < 0 or block_number < 0:
         return None
     return (tx_hash, log_index, block_number, block_hash)
 
@@ -377,6 +412,22 @@ async def collect_from_logs(
     def _sort_key(entry: dict) -> tuple[int, int]:
         ident = _log_identity(entry)
         return (ident[2], ident[1]) if ident else (1 << 62, 1 << 62)
+
+    # A factory can emit TokenLaunched after a curve emits its first buy.
+    # Resolve the whole fetched batch before append-only evidence is written.
+    batch_curves = {}
+    for entry in logs:
+        decoded_entry = decode_log(entry)
+        if (
+            decoded_entry
+            and decoded_entry["event_name"] == "token_launched"
+            and not entry.get("removed")
+            and _log_identity(entry) is not None
+            and entry.get("address", "").lower() == deployment.factory.lower()
+        ):
+            batch_curves[decoded_entry["curve_address"]] = decoded_entry[
+                "token_address"
+            ]
 
     for log in sorted(logs, key=_sort_key):
         ident = _log_identity(log)
@@ -455,7 +506,9 @@ async def collect_from_logs(
             launch = await db.get_curve_launch_by_curve(
                 deployment.chain_id, curve_address
             )
-            if launch:
+            if curve_address in batch_curves:
+                token_address = batch_curves[curve_address]
+            elif launch:
                 token_address = launch["token_address"]
 
         payload = {
@@ -485,8 +538,9 @@ async def collect_from_logs(
         )
         if not is_new:
             counters["duplicates"] += 1
-            continue
-        counters["recorded_events"] += 1
+            # Replay projection after a crash between the evidence and discovery commits.
+        else:
+            counters["recorded_events"] += 1
 
         if event_name == "token_launched":
             fields = decoded["fields"]
@@ -506,7 +560,11 @@ async def collect_from_logs(
                 source=source,
                 provenance=provenance,
                 execution_eligible=False,
-                eligibility_reasons=list(INELIGIBLE_REASONS_CURRENT),
+                eligibility_reasons=execution_eligibility(
+                    deployment_verified=deployment.collectable,
+                    quote_asset_approved=False,
+                    safety_verdict=None,
+                )[1],
             )
             if created:
                 counters["new_launches"] += 1
@@ -529,7 +587,11 @@ async def collect_from_logs(
                 source=source,
                 provenance=provenance,
                 execution_eligible=False,
-                eligibility_reasons=list(INELIGIBLE_REASONS_CURRENT),
+                eligibility_reasons=execution_eligibility(
+                    deployment_verified=deployment.collectable,
+                    quote_asset_approved=False,
+                    safety_verdict=None,
+                )[1],
             )
             if created:
                 counters["new_launches"] += 1
@@ -540,6 +602,7 @@ async def collect_from_logs(
                 if advanced:
                     counters["lifecycle_updates"] += 1
 
+    await db.reconcile_curve_launch_projection(deployment.chain_id, deployment.version)
     logger.info("rh_pons_collect_pass", provenance=provenance, **counters)
     return counters
 
@@ -572,40 +635,68 @@ async def advance_lifecycle(
 # ---------------------------------------------------------------------------
 
 
+async def _rpc(
+    session: aiohttp.ClientSession, rpc_url: str, method: str, params: list
+) -> Any:
+    """Return JSON-RPC result; failures never include provider text or URL secrets."""
+    try:
+        async with session.post(
+            rpc_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                logger.warning(
+                    "rh_pons_rpc_http_error", method=method, status=response.status
+                )
+                return None
+            payload = await response.json()
+        if (
+            not isinstance(payload, dict)
+            or "error" in payload
+            or "result" not in payload
+        ):
+            logger.warning("rh_pons_rpc_invalid_response", method=method)
+            return None
+        return payload["result"]
+    except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+        logger.warning(
+            "rh_pons_rpc_transport_error", method=method, error_type=type(exc).__name__
+        )
+        return None
+
+
 async def _rpc_get_logs(
     session: aiohttp.ClientSession,
     rpc_url: str,
     *,
-    address: str,
+    address: str | list[str],
     from_block: int,
-    to_block: int | str,
+    to_block: int,
 ) -> list[dict] | None:
-    """eth_getLogs via JSON-RPC. None on transport/shape failure (never raises)."""
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getLogs",
-        "params": [
-            {
-                "address": address,
-                "fromBlock": hex(from_block),
-                "toBlock": to_block if isinstance(to_block, str) else hex(to_block),
-            }
-        ],
-    }
-    try:
-        async with session.post(
-            rpc_url, json=body, timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status != 200:
-                logger.warning("rh_pons_rpc_http_error", status=resp.status)
-                return None
-            payload = await resp.json()
-    except (aiohttp.ClientError, TimeoutError, ValueError) as e:
-        logger.warning("rh_pons_rpc_transport_error", error=str(e))
-        return None
-    result = payload.get("result") if isinstance(payload, dict) else None
+    result = await _rpc(
+        session,
+        rpc_url,
+        "eth_getLogs",
+        [{"address": address, "fromBlock": hex(from_block), "toBlock": hex(to_block)}],
+    )
     return result if isinstance(result, list) else None
+
+
+async def _block_header(
+    session: aiohttp.ClientSession, url: str, number: int
+) -> dict | None:
+    result = await _rpc(session, url, "eth_getBlockByNumber", [hex(number), False])
+    if not isinstance(result, dict) or _hex_int(result.get("number")) != number:
+        return None
+    if not isinstance(result.get("hash"), str) or not re.fullmatch(
+        r"0x[0-9a-fA-F]{64}", result["hash"]
+    ):
+        return None
+    stamp = _hex_int(result.get("timestamp"))
+    if stamp is None or not 0 < stamp < 253402300800:
+        return None
+    return result
 
 
 async def poll_once(
@@ -640,28 +731,145 @@ async def poll_once(
         logger.warning("rh_pons_collector_refused", reason="no_rpc_url_configured")
         return 0
 
-    # Resume/backfill: continue from the last canonical evidence block, or
-    # the registry deploy block on first run; bounded span per pass.
-    last_block = await db.max_curve_event_block(deployment.chain_id)
-    from_block = (
-        last_block + 1 if last_block is not None else (deployment.deploy_block or 0)
+    url = settings.RH_PONS_RPC_URL
+    if _hex_int(await _rpc(session, url, "eth_chainId", [])) != deployment.chain_id:
+        logger.warning(
+            "rh_pons_collector_refused", reason="chain_id_mismatch_or_unavailable"
+        )
+        return 0
+    head = _hex_int(await _rpc(session, url, "eth_blockNumber", []))
+    if head is None or head < 0 or deployment.deploy_block is None:
+        return 0
+    checkpoint = await db.get_curve_scan_checkpoint(
+        deployment.chain_id, deployment.version, deployment.factory
     )
-    to_block = from_block + settings.RH_PONS_BACKFILL_BLOCK_SPAN - 1
-    raw_logs = await _rpc_get_logs(
+    next_block = checkpoint["next_block"] if checkpoint else deployment.deploy_block
+    overlap = settings.RH_PONS_REORG_OVERLAP_BLOCKS
+    from_block = (
+        max(deployment.deploy_block, next_block - overlap) if checkpoint else next_block
+    )
+    to_block = min(head, next_block + settings.RH_PONS_BACKFILL_BLOCK_SPAN - 1)
+    if from_block > to_block:
+        return 0
+    old_hashes = json.loads(checkpoint["block_hashes_json"]) if checkpoint else {}
+    headers = {}
+    # Verify the retained anchor before mutating evidence. Deeper reorganizations
+    # require an operator-reviewed rewind; never silently skip orphaned history.
+    for height in sorted(map(int, old_hashes)):
+        header = await _block_header(session, url, height)
+        if header is None:
+            return 0
+        headers[height] = header
+        if (
+            height == min(map(int, old_hashes))
+            and header["hash"].lower() != old_hashes[str(height)].lower()
+        ):
+            logger.error("rh_pons_reorg_beyond_overlap", block=height)
+            return 0
+    factory_logs = await _rpc_get_logs(
         session,
-        settings.RH_PONS_RPC_URL,
+        url,
         address=deployment.factory,
         from_block=from_block,
         to_block=to_block,
     )
-    if raw_logs is None:
-        return 0  # transport failure already logged; retried next pass
+    if factory_logs is None:
+        return 0
+    curves = set(
+        await db.list_curve_launch_curves(deployment.chain_id, deployment.version)
+    )
+    for log in factory_logs:
+        decoded = decode_log(log)
+        if decoded and decoded["event_name"] == "token_launched":
+            curves.add(decoded["curve_address"])
+    raw_logs = list(factory_logs)
+    ordered_curves = sorted(curves)
+    for offset in range(
+        0, len(ordered_curves), settings.RH_PONS_CURVE_ADDRESS_BATCH_SIZE
+    ):
+        entries = await _rpc_get_logs(
+            session,
+            url,
+            address=ordered_curves[
+                offset : offset + settings.RH_PONS_CURVE_ADDRESS_BATCH_SIZE
+            ],
+            from_block=from_block,
+            to_block=to_block,
+        )
+        if entries is None:
+            return 0
+        raw_logs.extend(entries)
+    for log in raw_logs:
+        ident = _log_identity(log)
+        decoded = decode_log(log)
+        emitter = log.get("address", "").lower() if isinstance(log, dict) else ""
+        if ident is None or decoded is None or not from_block <= ident[2] <= to_block:
+            logger.warning("rh_pons_scan_incomplete", reason="malformed_log")
+            return 0
+        if decoded["event_name"] in ("curve_buy", "curve_sell"):
+            if emitter not in curves:
+                return 0
+        elif emitter != deployment.factory.lower():
+            return 0
+        if ident[2] not in headers:
+            headers[ident[2]] = await _block_header(session, url, ident[2])
+        header = headers[ident[2]]
+        if header is None or (
+            not log.get("removed") and header["hash"].lower() != ident[3]
+        ):
+            return 0
+        log["blockTimestamp"] = header["timestamp"]
+    # Retain every header in the bounded overlap, including empty blocks.
+    for height in range(max(deployment.deploy_block, to_block - overlap), to_block + 1):
+        if height not in headers:
+            headers[height] = await _block_header(session, url, height)
+        if headers[height] is None:
+            return 0
+    prior_events = await db.curve_events_in_range(
+        deployment.chain_id, deployment.version, from_block, to_block
+    )
+    removed = []
+    for event in prior_events:
+        height = event["block_number"]
+        if height not in headers:
+            headers[height] = await _block_header(session, url, height)
+        if headers[height] is None:
+            return 0
+        if event["block_hash"].lower() != headers[height]["hash"].lower():
+            removed.append(
+                {
+                    "removed": True,
+                    "transactionHash": event["transaction_hash"],
+                    "logIndex": hex(event["log_index"]),
+                    "blockNumber": hex(height),
+                    "blockHash": event["block_hash"],
+                }
+            )
+    # A chain movement during getLogs/header fetch invalidates this pass.
+    final_header = await _block_header(session, url, to_block)
+    if final_header is None or final_header["hash"] != headers[to_block]["hash"]:
+        return 0
     counters = await collect_from_logs(
-        raw_logs,
+        removed + raw_logs,
         db,
         settings,
-        source=f"rpc:{settings.RH_PONS_RPC_URL}",
+        source="rpc:rh_pons",
         provenance="onchain_observed",
         deployment=deployment,
     )
+    if counters["undecodable"]:
+        return 0
+    retained = {
+        str(h): v["hash"]
+        for h, v in headers.items()
+        if max(deployment.deploy_block, to_block - overlap) <= h <= to_block
+    }
+    await db.save_curve_scan_checkpoint(
+        deployment.chain_id,
+        deployment.version,
+        deployment.factory,
+        next_block=to_block + 1,
+        block_hashes=retained,
+    )
+    await db.upsert_ingest_watchdog_state("rh_pons", 0)
     return counters["recorded_events"]
