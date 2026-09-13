@@ -3,8 +3,10 @@
 import math
 from datetime import datetime, timezone
 
+import aiosqlite
 
-def _finite(value):
+
+def _finite(value: object) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
     try:
@@ -13,7 +15,7 @@ def _finite(value):
         return False
 
 
-def _utc(value):
+def _utc(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
@@ -23,7 +25,9 @@ def _utc(value):
         return None
 
 
-def classify_stop_shortfall(row, cutover, evidence_error=None):
+def classify_stop_shortfall(
+    row: dict, cutover: str | None, evidence_error: str | None = None
+) -> dict:
     """Compare recorded paper exit prices with the frozen entry stop.
 
     Prices already include modeled paper slippage. This is neither execution
@@ -80,11 +84,10 @@ def classify_stop_shortfall(row, cutover, evidence_error=None):
                          recorded_exit_return_pct=recorded_return, shortfall_pp=shortfall)
 
 
-async def enrich_stop_shortfalls(db, rows):
+async def enrich_stop_shortfalls(db: aiosqlite.Connection, rows: list[dict]) -> None:
     """Enrich only this history page; keep rows on schema/query failures."""
     if not rows:
         return
-    import aiosqlite
     import structlog
 
     error, evidence, cutover = None, {}, None
