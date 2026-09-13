@@ -604,6 +604,7 @@ async def test_empty_scan_progress_and_heartbeat(
         DEP.chain_id, DEP.version, DEP.factory
     )
     assert checkpoint["next_block"] == 106
+    assert checkpoint["head_block"] == 105
     assert int(scans[-1]["toBlock"], 16) == 105
     assert (await db.load_ingest_watchdog_state())["rh_pons"] == 0
     await db.close()
