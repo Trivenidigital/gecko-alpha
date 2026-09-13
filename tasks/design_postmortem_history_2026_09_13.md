@@ -134,5 +134,3 @@ remain open; list visibility cannot close those residuals.
 ## Design review
 
 Structural design review approved. Operations requested explicit anomalous-field handling rather than silent truncation; folded above and operations reapproval received; build authorized by parent. Tests must reject stale success, error, and finally updates. No implementation files changed.
-
-

@@ -2427,4 +2427,3 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 
 Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
 See tasks/plan_postmortem_history_2026_09_13.md.
-
