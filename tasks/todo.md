@@ -1,5 +1,20 @@
 # Backlog — gecko-alpha
 
+## RH/Pons implementation follow-through — 2026-09-13
+
+- [x] Integrate original increment on clean production/master base.
+- [x] Repair checkpoints, curve-emitter coverage, canonical recovery and clocks.
+- [x] Correct chain-qualified latency evidence and successful-scan monitoring.
+- [x] Verify public V2 deployment and replay real launch/buy/sell logs.
+- [x] Establish direct Claude CLI collaboration and cross-review.
+- [x] Run isolated live RPC capture and injected failure check.
+- [ ] Complete throughput followup, final review and Linux CI.
+- [ ] Publish reviewed branch/PR and final acceptance evidence.
+
+Results and remaining activation boundaries:
+`tasks/report_rh_pons_readiness_20260913.md`. This supersedes the review-only
+status below; it does not authorize or claim live trading.
+
 ## Codex / Claude coordination review — 2026-09-13
 
 - [x] Read operator handoff; fetch exact reviewed tip b8843487.

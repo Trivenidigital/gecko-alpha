@@ -1,5 +1,9 @@
 # Deliverable report — RH/Pons discovery increment (2026-09-13)
 
+Historical author report. Subsequent verification and repairs are recorded in
+`tasks/report_rh_pons_readiness_20260913.md`; deployment-verification statements
+below describe the original increment, not the current branch.
+
 Session: `claude/main-session-last-discussion-b8hsn7` (session-owned worktree;
 root checkout left on master). Companion docs:
 `tasks/design_rh_pons_discovery_delta_2026_09_13.md` (design delta + New

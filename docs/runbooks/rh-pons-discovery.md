@@ -32,6 +32,12 @@ activation review. The wrapper captures the watchdog gate before loading
 `.env`, so a stray `.env` line cannot arm it. Default watchdog gate is off.
 `RH_PONS_POLL_STALENESS_ALERT_HOURS=1` selects the provisional SLO;
 `RH_PONS_WATCHDOG_STATE_DIR` separates cooldown state from the DEX lane.
+The RH watchdog also requires a fresh checkpoint for the exact verified
+factory and a measured head. `RH_PONS_MAX_HEAD_LAG_BLOCKS` (default 2000)
+sets the maximum permitted `head_block - next_block + 1`. Missing head,
+stale checkpoint, and excessive lag are distinct breaches even with a fresh
+heartbeat. At the observed roughly 10 blocks/second, 2000 blocks is about
+200 seconds; measure the current chain rate before selecting a stricter SLO.
 Alerts are plain text with dispatched/delivered structured logs. Sending and
 locking use the existing Linux watchdog implementation; Windows supports
 read-only previews. This runbook does not itself install a scheduler job.
@@ -51,6 +57,19 @@ read-only previews. This runbook does not itself install a scheduler job.
   the dry-run watchdog identifies the outage.
 
 ## Evidence for early usefulness
+
+First startup begins near the head, with `RH_PONS_INITIAL_LOOKBACK_BLOCKS`
+defaulting to the configured scan span. It does not claim complete history.
+`RH_PONS_START_BLOCK` explicitly requests archival coverage on a fresh DB;
+subsequent restarts resume the durable checkpoint. Historical backfill should
+use a separate evidence DB and cannot qualify as real-time capture. The
+watchdog deliberately reports its lag until it catches up.
+
+Capacity limits still matter: active ungraduated curves accumulate, and
+projection reconciliation reads retained evidence. Measure sustained scans
+and latency as the dataset grows before enabling a production observation
+lane. A tiny successful sample proves transport and decoding, not capacity
+or signal quality.
 
 Run `scripts/compare_discovery_latency.py --db <captured-db>` over observations
 captured by the running lanes. Use the paired sample count and RH advantage on
