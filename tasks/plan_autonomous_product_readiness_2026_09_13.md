@@ -23,11 +23,11 @@ slice, not delivery of DASH-08 or DASH-11. Preserve all runtime behavior.
 - [x] Find authoritative Fable tracker in main checkout (untracked; absent master/prod).
 - [x] Parallel source drift: DASH-01 shipped; DASH-08/DASH-11 real residual gaps.
 - [x] Two parallel plan reviews approved; fold exact timestamps, considered/returned counts, and separate sampling/maturity windows into design.
-- [ ] Design evidence structure; two parallel design reviews; fold findings.
-- [ ] Verify runtime: candidate corpus and live join; dispatcher-only suppression health/maturity.
-- [ ] Write findings with reproducible read-only methods, timestamps, source lines,
+- [x] Design evidence structure; two parallel design reviews approved; folds applied.
+- [x] Verify runtime: candidate corpus and live join; dispatcher-only suppression health/maturity.
+- [x] Write findings with reproducible read-only methods, timestamps, source lines,
       limitations, and concrete next gate; add a short todo entry.
-- [ ] Run documentation checks; commit; open PR with codex/codex-automation labels.
+- [x] Documentation checks and existing analyzer tests passed; opened PR #570 with both labels.
 - [ ] Two parallel PR reviews and folds. Report CI accurately; no merge without full gates.
 
 ## Acceptance
