@@ -73,7 +73,7 @@ actions offering execution, dispatch, enable/disable, pruning or reclassificatio
 ## Review and implementation sequence
 
 - [x] Clean isolated worktree/branch; source drift and current Hermes check.
-- [ ] Two independent plan reviews coordinated by parent; fold findings here.
+- [x] Two independent plan reviews coordinated by parent; structural approval and operations reapproval at527ce25c.
 - [ ] Write tasks/design_postmortem_history_2026_09_13.md; two independent design reviews and folds before build.
 - [ ] Add failing tests in tests/test_postmortem_history_endpoint.py: populated/empty/missing DB/table; exact fields/no evidence; pagination with id gaps and intervening inserts; invalid limit/cursor; strict finite JSON; read-only database preservation.
 - [ ] Implement get_postmortem_history in dashboard/db.py and GET route in dashboard/api.py; typed response models in dashboard/models.py if consistent with reviewed design.
@@ -93,8 +93,9 @@ the viewer commit and rebuilding prior UI; no data restore/migration needed.
 
 ## Review
 
-Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, awaiting operations reapproval. Design/build have not started. Current source
+Structural plan reviewer approved for design with required precision/timestamp semantics folded above. Operations reviewer requested the price-change definition and exact column label; both folded above, operations reapproval received. Design/build have not started. Current source
 and row inventory support a display; broader capture coverage, causal analysis,
 T-minus reconstruction and writer watchdog remain explicitly separate residuals.
+
 
 
