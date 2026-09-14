@@ -2512,7 +2512,7 @@ A dependency is unwarranted for these small CLI corrections.
 - [ ] Native focused verification, independent review and exact-head CI before integration.
   Native RED 27F/30P, GREEN 74 passed, 12/12 guard mutants killed (Codex);
   all four independent review vectors cleared; 01081e09 CI green (3/3); master #583–#586
-  integrated at 7520bd82 and all four vectors renewed CLEAR; exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
+  integrated at 7520bd82 and #587 at e22e0db7; all four vectors renewed CLEAR at each; exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
 - [x] Operator confirmed public RPC, chain 4663, no provider account; separate macOS collector path recorded.
 - [ ] Assess existing public-collector lag/failure evidence; capacity remains unverified.
 
