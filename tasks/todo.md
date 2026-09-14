@@ -3,8 +3,18 @@
 - [x] Current-master drift and initial production read-only check.
 - [x] Plan/design: two parallel reviewers each; folds applied.
 - [x] Pinned audit, findings PR #579 and two-vector PR review; factual folds applied.
-- [ ] CI/merge gate for #579; no deployment. Next engineering slice remains health-only DASH-11 UI.
+- [ ] CI/merge gate for #579; no deployment. Health-only UI merged in #585; next gate is coordinated deployment with fresh runtime/smoke verification. Provenance and monetary interpretations remain unverified.
 - Plan: tasks/plan_dash11_provenance_2026_09_14.md.
+
+## DASH-11 suppression cohort health — 2026-09-14
+
+- [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
+- [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
+- [x] Design and both resource amendments received two independent approvals before each build slice.
+- [x] Final14d scope approved; exact three private-copy trials2.047/0.444/0.388s pass predeclared4s gate and full parity.85focused tests and React/browser fixture QA pass.
+- [x] PR585 original and renewed integration661020e8 received two independent approvals; four-vector clearances recorded.100combined tests and84-module/3-file build parity pass.
+
+- [x] PR585 merged as 829d12b1 at 2026-09-14T12:32:18Z. Deployment is not verified by this closeout.
 
 ## DASH-12 full frontend rebuild parity — 2026-09-14
 
@@ -2486,6 +2496,18 @@ Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive sum
 - [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
 
 Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
+## DASH-08 current recorded lane status — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift/data-path and Hermes checks.
+- [x] Bounded read-only runtime schema/status/flag observations; plan only written.
+- [x] Plan a0703322 approved by root structural and ops provenance reviewers.
+- [x] Separate design drafted with raw storage, per-app target and freshness contracts.
+- [x] Design d0130893 approved by root reader/provenance and postmortem lifecycle/freshness reviewers.
+- [x] Annotation-only implementation52ba7dd7; Linux164 tests, exact fresh-build parity, and built-page mixed-lane visual/failure checks passed.
+- [x] WS master552db707 integrated at555f1676;76 relevant API/lifecycle tests passed; lane/frontend bytes unchanged.
+- [x] PR584 independently approved at25733ca5: ops reader/provenance74tests and postmortem controller/render/mapping29tests; no findings, clearances recorded.
+- [ ] Exact final-head CI before root merge; no deployment by this task.
+- Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
 
 ## WebSocket disconnect cleanup: 2026-09-14
 

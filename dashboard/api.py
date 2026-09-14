@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from dashboard import db
 from dashboard.stop_shortfall_summary import get_stop_shortfall_summary
+from dashboard.suppression_health import HealthReader
 from starlette.responses import JSONResponse
 from dashboard.models import (
     AlertResponse,
@@ -218,8 +220,28 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     # Freeze this read-only route target; legacy routes still use the module global.
     postmortem_db_path = _db_path
+    lane_status_db_path = str(Path(_db_path).resolve())
 
-    app = FastAPI(title="Gecko-Alpha Dashboard")
+    suppression_reader = HealthReader(_db_path)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await suppression_reader.drain()
+
+    app = FastAPI(title="Gecko-Alpha Dashboard", lifespan=lifespan)
+
+    @app.get("/api/suppression_cohort/health")
+    async def suppression_health_endpoint():
+        result = await suppression_reader.get()
+        return JSONResponse(
+            result,
+            status_code=200 if result["meta"]["ok"] else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
     repo_root = Path(__file__).resolve().parent.parent
 
     def _iso_utc(dt: datetime) -> str:
@@ -408,6 +430,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/win-rate", response_model=WinRateResponse)
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
+
+    @app.get("/api/signal_lane_status")
+    async def get_signal_lane_status():
+        from dashboard.lane_status import (
+            LaneStatusUnavailable,
+            get_lane_status,
+            metadata,
+        )
+
+        try:
+            payload = await get_lane_status(lane_status_db_path)
+            status_code = 200
+        except LaneStatusUnavailable as exc:
+            payload = {"meta": metadata(False, None, str(exc)), "lanes": []}
+            status_code = 503
+        return JSONResponse(
+            payload, status_code=status_code, headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/api/signal_trust_registry", response_model=None)
     async def get_signal_trust_registry():

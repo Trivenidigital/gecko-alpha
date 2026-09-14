@@ -1,6 +1,10 @@
 # DASH-11 retained-price provenance audit — 2026-09-14
 
-## Result and next engineering gate
+## Current closeout — 2026-09-14
+
+PR #585 merged the bounded health-only API/Pipeline panel as `829d12b1` at 12:32:18Z. The recommendation below is historical and must not trigger a duplicate UI build. Next gate: coordinated deployment with fresh runtime and smoke verification; this documentation closeout makes no deployment claim. The 120-day audit cohort below is distinct from #585's 14-day recorded-label availability window. Its counts are not current panel counts or economic validation. Producer coverage and price-provenance limitations remain unresolved.
+
+## Historical result and next engineering gate (00:26 UTC audit)
 
 DASH-11 health-only dashboard integration remains actionable. Keep monetary/ranking interpretations unverified: 189 of 214 earliest-token matured anchors have seven-day horizons older than the earliest surviving historical price observation. Only 25 have a numerically matching current historical candidate. This is a present-day replayability limitation, **not evidence that 189 original labels were wrong**.
 
