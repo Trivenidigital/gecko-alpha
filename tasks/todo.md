@@ -2475,7 +2475,7 @@ A dependency is unwarranted for these small CLI corrections.
 - [x] Document secure invocation and account/range/cost prerequisites; retain unrelated settings isolation.
 - [ ] Native focused verification, independent review and exact-head CI before integration.
   Native RED 27F/30P, GREEN 74 passed, 12/12 guard mutants killed (Codex);
-  independent review and exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
+  all four independent review vectors cleared; PR #581 exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
 - [ ] Obtain provider/account details and run bounded assessment only when configuration is available.
 
 Scope: probe, corresponding tests, runbook and this task record. No collector,

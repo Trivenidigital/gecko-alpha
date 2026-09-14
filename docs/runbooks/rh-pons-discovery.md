@@ -268,7 +268,7 @@ command and land in shell history.
 If the URL must live in a file, single-quote it (`?` and `&` break
 `source`, which `scripts/rh-pons-watchdog.sh` uses on `.env`), `chmod 600` it
 and keep it out of the repo. Do not put it in a systemd `Environment=` line,
-which `systemctl show` exposes:
+which `systemctl show` exposes. The following is file content, not a shell command:
 
 ```bash
 RH_PONS_RPC_URL='https://provider.example/v2/KEY?opt=1&x=2'
@@ -295,7 +295,7 @@ variables (`trust_env=False`), like the pipeline.
 Alchemy's free tier allows 10 blocks per eth_getLogs query (see
 `tasks/findings_rh_provider_readiness_20260914.md`). With the current reorg
 overlap of 12 (fixed in the probe, and the collector default), the smallest
-checkpointed query is 1 + 12 = 13 blocks. So the free tier cannot run this
+advancing checkpointed query is 1 + 12 = 13 blocks (a caught-up replay can be 12). So the free tier cannot run this
 probe or the collector at its current configuration.
 `--provider-log-range-cap 10` refuses it before traffic. The
 pay-as-you-go tier documents an unlimited Robinhood mainnet range with a

@@ -96,5 +96,5 @@ before traffic when given `--provider-log-range-cap 10`.
   mutual exclusion, preflight call, report endpoint source, `from None`),
   Codex native run: all 12 killed with no survivors or skips. Source was
   restored byte-identical; 74 passed afterwards.
-- Independent review and exact-head CI: pending. Nothing was integrated.
-- No network, production, merge or activation actions were taken.
+- Independent concurrency/logic (Claude session e01d2b39-29ed-4d9e-bc18-bb3df171be6a) and ops-safety/silent-failure (f951dc2f-0fc8-428b-8f08-9413619414d9) are terminal CLEAR at b253aca429ce75b629bb6c4fc72ee429497d8189. The separate logic reviewer also cleared the ops-authored documentation fix. Final nonblocking wording notes were clarified. PR #581 exact-head CI remains pending.
+- PR #581 opened; origin/master dashboard PRs #577/#578 merged into this branch and interaction-reviewed. No provider traffic, production configuration, collector activation or trading actions were taken.

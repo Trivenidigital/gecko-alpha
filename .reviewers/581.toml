@@ -1,0 +1,17 @@
+# Independent Claude Max terminal sessions: e01d2b39-29ed-4d9e-bc18-bb3df171be6a (concurrency/logic), f951dc2f-0fc8-428b-8f08-9413619414d9 (ops-safety/silent-failure).
+pr = 581
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    ".claude", ".github", "Dockerfile", "cron", "dashboard",
+    "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts",
+    "start.sh", "systemd", "tests", "uv.lock", "investigation",
+]
+
+[clearances]
+concurrency = "b253aca429ce75b629bb6c4fc72ee429497d8189"
+logic = "b253aca429ce75b629bb6c4fc72ee429497d8189"
+ops-safety = "b253aca429ce75b629bb6c4fc72ee429497d8189"
+silent-failure = "b253aca429ce75b629bb6c4fc72ee429497d8189"
+
+
