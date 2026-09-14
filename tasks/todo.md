@@ -2354,3 +2354,11 @@ dormant), BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO (MED, operator vendor 
 BL-NEW-CG-DEMO-API-KEY (MED, operator action, runbook ready), BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE
 (LOW-MED), plus the low-priority tail enumerated in backlog.md. See backlog.md for full
 evidence and the SUPERSEDED→new-ID mapping.
+
+## Selective dashboard release plan: 2026-09-14
+
+- [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
+- [ ] Two plan reviews, runtime/copy/CI feasibility then two design reviews before code assembly.
+- [ ] Exact old-core release verification and two candidate reviews before conditional dashboard-only deploy.
+
+Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Existing CI does not directly attest a release-base candidate.
