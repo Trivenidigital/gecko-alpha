@@ -2470,6 +2470,8 @@ Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No producti
 
 - [x] Fresh-master isolated worktree; drift/data-path and Hermes checks.
 - [x] Bounded read-only runtime schema/status/flag observations; plan only written.
-- [ ] Two plan reviews, then separate design and two design reviews before build.
+- [x] Plan a0703322 approved by root structural and ops provenance reviewers.
+- [x] Separate design drafted with raw storage, per-app target and freshness contracts.
+- [ ] Two independent design reviews/folds before build.
 - [ ] Annotation-only implementation, falsifiers, PR/two reviews and exact CI.
 - Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
