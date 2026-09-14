@@ -1,8 +1,8 @@
 ## DASH-11 suppression cohort health — 2026-09-14
 
 - [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
-- [ ] Two plan reviews and fresh bounded runtime prerequisite snapshot.
-- [ ] Design and two independent design approvals before implementation.
+- [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
+- [ ] Design written; two independent design approvals required before implementation.
 - [ ] Health-only build, focused tests/visual QA and two PR reviews; no cost/ranking or producer changes.
 
 ## Telegram recorded-outcome visibility — 2026-09-13

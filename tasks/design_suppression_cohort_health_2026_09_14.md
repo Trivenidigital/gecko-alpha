@@ -49,16 +49,16 @@ SELECT id,token_id,surface,gate_verdicts,emitted_at,
        r24h IS NOT NULL,r7d IS NOT NULL,label_status
 FROM signal_outcome_ledger
 WHERE kind='gated_out_sample'
-  AND julianday(emitted_at)>=julianday(:lookback_start)
-  AND julianday(emitted_at)<julianday(:observed_at);
+  AND julianday(emitted_at)>=julianday(:lookback_start)-1.0/86400
+  AND julianday(emitted_at)<julianday(:observed_at)+1.0/86400;
 
 SELECT signal_type,created_at FROM trade_decision_events
 WHERE reason='suppressed'
-  AND julianday(created_at)>=julianday(:window_start)
-  AND julianday(created_at)<julianday(:observed_at);
+  AND julianday(created_at)>=julianday(:window_start)-1.0/86400
+  AND julianday(created_at)<julianday(:observed_at)+1.0/86400;
 ```
 
-Parse returned timestamps to UTC (legacy naive timestamps mean UTC, aware offsets normalized with overflow guard); accept only valid full date/time. Recheck membership in Python to avoid SQLite fractional precision becoming an incorrect boundary count. Unsupported selected timestamps increment excluded_timestamp_rows, separately for each scanned population. SQL-unparseable timestamps and future/outside-window rows are not selected; their counts are **not measured by this endpoint**. Metadata explicitly says table-wide timestamp diagnostics were not run. Do not copy the dated probe's zero into live responses or represent unparseable rows as a selected-window total. A failed timestamp parse cannot enter counts or anchor selection.
+Parse returned timestamps to UTC (legacy naive timestamps mean UTC, aware offsets normalized with overflow guard); accept only valid full date/time. SQL deliberately overfetches one second at each edge to cover SQLite fractional precision rounding; enforce the exact inclusive-start/exclusive-end membership in Python before any count, so rounding cannot exclude an otherwise valid boundary row. Overfetched valid rows outside the exact interval are discarded, not counted as malformed. Unsupported selected timestamps increment excluded_timestamp_rows, separately for each scanned population. SQL-unparseable timestamps and future/outside-window rows are not selected; their counts are **not measured by this endpoint**. Metadata explicitly says table-wide timestamp diagnostics were not run. Do not copy the dated probe's zero into live responses or represent unparseable rows as a selected-window total. A failed timestamp parse cannot enter counts or anchor selection.
 
 Parse JSON object verdicts only. Missing/null/nonobject/malformed JSON increments malformed_verdict_rows for the broader selected gated_out population. Require both exact tags reason=suppressed/source_layer=dispatcher. This preserves analyzer cohort semantics without evaluating cost. Show broader scan counts separately from classified suppression cohort counts.
 
