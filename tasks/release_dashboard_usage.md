@@ -6,6 +6,27 @@ SHAs after merge. They are disposable release artifacts, not a runtime framework
 
 ## Manifest (local, read-only)
 
+Successor CLI: retain `--base d2f0d61edc63cb55ae159ec952cce404991f21f5`,
+add `--runtime-base 5c43526c46a33b06e7ed18509c8a0ea43c7772d3`,
+`--rollback-branch docs/dashboard-release-retry-20260914` and
+`--runtime-manifest <frozen retry-verified-manifest.json>`. Supply all seven
+PRs575/577/578/580/583/584/585, with584=1967cbfc42185fe4fb74d527bd0af9929375dae0
+and585=829d12b191ef2a1122dc18755492a5dd4fc106fc, and pin the latter as master.
+The original five-PR builder remains available to revalidate the frozen runtime
+proof. The CLI now requires the separate runtime inputs; the historical example
+below documents the old proof format rather than a complete successor command.
+
+The successor retains `original_core_files` (1358 entries), `core_files` (1356
+unchanged entries), and the exact two reviewed old/new UI blob/mode pins in
+`core_ui_exceptions`. `runtime_baseline_files` is the full deployed5c tree.
+`candidate_metadata_files` contains exact candidate Git entries for the explicit
+metadata allowlist; combine it with `expected_files` for complete candidate
+attestation, rejecting overlap. No metadata wildcard or additional UI exemption
+is accepted. The manifest itself belongs outside the source tree to avoid a
+self-referential candidate SHA. Proposal manifests have no candidate metadata
+mapping and `verified=false`; only the final exact-candidate manifest can gate
+rollout.
+
 Run `python tasks/release_dashboard_manifest.py --repo <repo> --base
 d2f0d61edc63cb55ae159ec952cce404991f21f5 --master <final-master-40SHA>
 --pr 575=d5b26ff791ff64dac65d77d2a10a841df1c34007

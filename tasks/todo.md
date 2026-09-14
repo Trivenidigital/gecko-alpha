@@ -2383,3 +2383,6 @@ Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production chan
 Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; no application assembly, helper changes, DB copies or deployment.
 - [x] Successor plan5e249634 approved by root and postmortem; concrete design audits core/runtime baseline separation, copy reuse and helper dependencies.
 - [ ] Two exact design approvals before implementation or archive/copy changes.
+- [x] Root/ops approved design f1a9250c and exact two-UI exception amendment ed680902 before implementation.
+- [x] Successor manifest red/green:25 local harness tests passed; original1358 proof preserved,1356 unchanged, two exact merged UI replacements, full runtime/candidate metadata mappings.
+- [ ] Assemble exact829d12b1 selected blobs, local regression/build proofs, then Linux/copy validation and two final reviews.

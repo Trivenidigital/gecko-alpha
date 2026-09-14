@@ -1,6 +1,7 @@
 """Disposable release harness boundaries, without touching production."""
 
 import importlib.util
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -164,3 +165,169 @@ def test_fingerprint_bounds_and_order_independent_multiplicity(tmp_path, monkeyp
         )
     with pytest.raises(sqlite3.DataError):
         mod.fingerprint(path)
+
+
+@pytest.fixture
+def successor_git(tmp_path):
+    mod = load("dashboard_manifest")
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(tmp_path), *args], stderr=subprocess.PIPE
+        ).decode().strip()
+
+    def commit(path, content, message):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        git("add", ".")
+        git("commit", "-qm", message)
+        return git("rev-parse", "HEAD")
+
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.invalid")
+    (tmp_path / "dashboard").mkdir()
+    (tmp_path / "dashboard/db.py").write_text(
+        "\n".join(f"def {name}(): return 1" for name in mod.CONSUMERS)
+    )
+    ui_paths = (
+        "dashboard/frontend/components/TodayFocusPanel.jsx",
+        "dashboard/frontend/components/TradeInboxTab.jsx",
+    )
+    for path in ui_paths:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(
+            ["git", "-C", str(ROOT), "show", f"d2f0d61edc63cb55ae159ec952cce404991f21f5:{path}"]
+        ))
+    base = commit("dashboard/protected.py", "CORE = 1\n", "core")
+    prs = {}
+    for number in ("575", "577", "578", "580", "583"):
+        prs[number] = commit(f"dashboard/view{number}.py", "VALUE = 1\n", number)
+    old_master = prs["583"]
+    git("checkout", "-qb", "rollback")
+    runtime = commit("tasks/release_proof.md", "Frozen proof\n", "release")
+    prior = json.loads(json.dumps(mod.build_manifest(
+        tmp_path, base, old_master, prs, runtime, ["tasks/release_proof.md"]
+    )))
+    git("checkout", "-qb", "features", old_master)
+    for number in ("584", "585"):
+        if number == "584":
+            for path in ui_paths:
+                (tmp_path / path).write_bytes(subprocess.check_output(
+                    ["git", "-C", str(ROOT), "show", f"829d12b191ef2a1122dc18755492a5dd4fc106fc:{path}"]
+                ))
+        prs[number] = commit(f"dashboard/view{number}.py", "VALUE = 1\n", number)
+    master = prs["585"]
+    git("checkout", "-qb", "candidate", runtime)
+    for number in ("584", "585"):
+        git("checkout", master, "--", f"dashboard/view{number}.py")
+    git("checkout", master, "--", *ui_paths)
+    candidate = commit("tasks/release_successor.md", "New proof\n", "successor")
+    kwargs = dict(
+        repo=tmp_path, base=base, master=master, prs=prs, candidate=candidate,
+        metadata=["tasks/release_proof.md", "tasks/release_successor.md"],
+        runtime_base=runtime, rollback_branch="rollback", runtime_manifest=prior,
+    )
+    return mod, kwargs, git, commit
+
+
+def test_successor_preserves_core_and_distinct_runtime_tree(successor_git):
+    mod, kwargs, _, _ = successor_git
+    build = getattr(mod, "build_successor_manifest", None)
+    assert callable(build), "successor manifest boundary is missing"
+    result = build(**kwargs)
+    assert result["verified"]
+    assert result["production_base_sha"] == kwargs["base"]
+    assert result["runtime_base_sha"] == kwargs["runtime_base"]
+    assert result["rollback_branch"] == "rollback"
+    assert "tasks/release_proof.md" in result["runtime_baseline_files"]
+    assert "tasks/release_proof.md" not in result["baseline_files"]
+    assert result["core_files"]["dashboard/protected.py"] == kwargs["runtime_manifest"]["core_files"]["dashboard/protected.py"]
+    assert len(result["original_core_files"]) == len(result["core_files"]) + 2
+    assert set(result["core_ui_exceptions"]) == {
+        "dashboard/frontend/components/TodayFocusPanel.jsx",
+        "dashboard/frontend/components/TradeInboxTab.jsx",
+    }
+    assert result["candidate_metadata_files"]["tasks/release_successor.md"] == {
+        "mode": "100644", "blob": subprocess.check_output(
+            ["git", "-C", str(kwargs["repo"]), "rev-parse", f"{kwargs['candidate']}:tasks/release_successor.md"]
+        ).decode().strip(),
+    }
+
+
+@pytest.mark.parametrize("fault", ["core_repointed", "runtime_repointed", "rollback_drift", "prior_unverified", "prior_core_missing", "missing_pr", "extra_pr", "intermediate_pr", "candidate_not_descendant", "metadata_widened"])
+def test_successor_rejects_identity_and_protection_drift(successor_git, fault):
+    mod, kwargs, git, _ = successor_git
+    build = getattr(mod, "build_successor_manifest", None)
+    assert callable(build), "successor manifest boundary is missing"
+    if fault == "core_repointed":
+        kwargs["base"] = kwargs["runtime_base"]
+    elif fault == "runtime_repointed":
+        kwargs["runtime_base"] = kwargs["master"]
+    elif fault == "rollback_drift":
+        git("branch", "-f", "rollback", kwargs["master"])
+    elif fault == "prior_unverified":
+        kwargs["runtime_manifest"]["verified"] = False
+    elif fault == "prior_core_missing":
+        kwargs["runtime_manifest"]["core_files"].pop("dashboard/protected.py")
+    elif fault == "missing_pr":
+        kwargs["prs"].pop("585")
+    elif fault == "extra_pr":
+        kwargs["prs"]["999"] = kwargs["master"]
+    elif fault == "intermediate_pr":
+        kwargs["prs"]["585"] = kwargs["candidate"]
+    elif fault == "candidate_not_descendant":
+        kwargs["candidate"] = kwargs["master"]
+    elif fault == "metadata_widened":
+        kwargs["metadata"].append("tasks/health_successor_unreviewed.py")
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        build(**kwargs)
+
+
+def test_newly_selected_path_cannot_escape_original_core(successor_git):
+    mod, kwargs, git, commit = successor_git
+    build = getattr(mod, "build_successor_manifest", None)
+    assert callable(build), "successor manifest boundary is missing"
+    git("checkout", "features")
+    changed = commit("dashboard/protected.py", "CORE = 2\n", "585 replacement")
+    kwargs["prs"]["585"] = changed
+    kwargs["master"] = changed
+    kwargs["candidate"] = None
+    with pytest.raises(ValueError, match="protected core"):
+        build(**kwargs)
+
+
+def test_successor_metadata_is_exact():
+    mod = load("dashboard_manifest")
+    for kind in ("plan", "design", "report"):
+        path = f"tasks/{kind}_dashboard_health_successor_release_2026_09_14.md"
+        assert mod.metadata_path(path) == path
+        with pytest.raises(ValueError):
+            mod.metadata_path(path.replace("2026_09_14", "2026_09_15"))
+
+
+@pytest.mark.parametrize("fault", ["final_blob", "final_mode", "original_blob", "third_metadata_exemption"])
+def test_ui_exception_pins_cannot_be_widened(successor_git, fault):
+    mod, kwargs, git, commit = successor_git
+    build = getattr(mod, "build_successor_manifest", None)
+    assert callable(build), "successor manifest boundary is missing"
+    path = "dashboard/frontend/components/TodayFocusPanel.jsx"
+    if fault == "original_blob":
+        kwargs["runtime_manifest"]["core_files"][path]["blob"] = "0" * 40
+    elif fault == "third_metadata_exemption":
+        kwargs["metadata"].append("dashboard/protected.py")
+    else:
+        git("checkout", "features")
+        if fault == "final_blob":
+            changed = commit(path, "UNREVIEWED = true\n", "unreviewed UI")
+        else:
+            git("update-index", "--chmod=+x", path)
+            git("commit", "-qm", "unexpected mode")
+            changed = git("rev-parse", "HEAD")
+        kwargs["prs"]["585"] = changed
+        kwargs["master"] = changed
+        kwargs["candidate"] = None
+    with pytest.raises(ValueError):
+        build(**kwargs)
