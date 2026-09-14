@@ -31,8 +31,8 @@ Only allowlisted event names and allowlisted field names may leave the host, plu
 
 ## Steps and deliverables
 - [x] Fresh master, backlog/lessons/contract drift, initial runtime identity, Hermes check.
-- [ ] Two parallel plan reviews; fold before design.
-- [ ] Write design specifying reducer, allowlists and failure semantics; two parallel reviews; fold before execution.
+- [x] Two parallel plan reviews approved 8836b14a; recommendations folded into design.
+- [x] Two parallel design reviews; process cleanup, duplicate-key, cap and observed-span folds approved d8625be4.
 - [ ] Execute bounded read-only preflight and journal reducer; preserve sanitized output locally.
 - [ ] Build findings with source evidence, observed bounds, D1-D4 candidate classification and explicit exclusions. All contract verdicts remain UNKNOWN; candidate availability is not ACCEPTED.
 - [ ] Open docs PR; two parallel independent PR reviews, folds and exact-head checks.

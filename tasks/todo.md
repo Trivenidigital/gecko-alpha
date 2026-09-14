@@ -2,7 +2,8 @@
 
 - [x] Refresh master, canonical memory/backlog/source drift and initial production identity.
 - [x] Plan 8836b14a: independent evidence and ops reviews approved.
-- [ ] Design and two reviews; execute bounded read-only journal inventory.
+- [x] Design and two reviews; required cleanup/parsing folds approved d8625be4.
+- [ ] Runtime inventory blocked: healthy non-production Linux cleanup-test runner required; reducer not built or executed.
 - [ ] Findings PR and two PR reviews; final verification.
 - Plan: tasks/plan_suppression_receipt_inventory_2026_09_14.md.
 ## Active Work: 2026-09-14 — Suppression trust evidence contract
