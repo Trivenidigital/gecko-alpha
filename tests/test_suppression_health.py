@@ -1,3 +1,4 @@
+from contextlib import closing, contextmanager
 import asyncio
 import json
 import sqlite3
@@ -12,10 +13,17 @@ from dashboard import suppression_health as health
 NOW = datetime(2026, 9, 14, tzinfo=timezone.utc)
 
 
+@contextmanager
+def db_connection(path):
+    with closing(sqlite3.connect(path)) as conn:
+        with conn:
+            yield conn
+
+
 @pytest.fixture
 def ledger(tmp_path):
     path = tmp_path / "ledger.db"
-    with sqlite3.connect(path) as conn:
+    with db_connection(path) as conn:
         conn.executescript("""
         CREATE TABLE signal_outcome_ledger(id INTEGER PRIMARY KEY, kind TEXT,
         token_id, surface, gate_verdicts, emitted_at, r24h, r7d, label_status);
@@ -34,7 +42,7 @@ def add(
     status="complete",
     verdict=None,
 ):
-    with sqlite3.connect(path) as conn:
+    with db_connection(path) as conn:
         conn.execute(
             "INSERT INTO signal_outcome_ledger VALUES(NULL,?,?,?,?,?,?,?,?)",
             (
@@ -61,7 +69,7 @@ def test_cohort_and_anchor_are_not_price_readiness(ledger):
     add(ledger, stamp="2026-09-11T00:00:00Z", r7=2)
     add(ledger, token="b", surface="chain", r7=1)
     add(ledger, token="bad", verdict="[]")
-    with sqlite3.connect(ledger) as conn:
+    with db_connection(ledger) as conn:
         conn.execute(
             "INSERT INTO trade_decision_events VALUES('losers','suppressed','2026-09-10T00:00:00Z','blocked')"
         )
@@ -164,7 +172,7 @@ def test_sql_timeout_and_python_timeout(ledger, monkeypatch):
     monkeypatch.setattr(health, "_stamp", slow)
     assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "read_limit"
     monkeypatch.setattr(health, "_stamp", original)
-    with sqlite3.connect(ledger) as conn:
+    with db_connection(ledger) as conn:
         conn.execute("ALTER TABLE signal_outcome_ledger RENAME TO original")
         conn.execute("""CREATE VIEW signal_outcome_ledger AS
           WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000)
@@ -194,7 +202,7 @@ def test_invalid_keys_unknown_status_ties_and_no_writes(ledger):
     ],
 )
 def test_missing_wrong_or_partial_index_refuses(ledger, definition):
-    with sqlite3.connect(ledger) as conn:
+    with db_connection(ledger) as conn:
         conn.execute("DROP INDEX idx_tde_decision_reason_created")
         if definition:
             conn.execute(definition)
@@ -202,7 +210,7 @@ def test_missing_wrong_or_partial_index_refuses(ledger, definition):
 
 
 def test_reason_only_population_across_decision_values(ledger):
-    with sqlite3.connect(ledger) as conn:
+    with db_connection(ledger) as conn:
         conn.executemany(
             "INSERT INTO trade_decision_events VALUES(?,?,?,?)",
             [
@@ -219,3 +227,93 @@ def test_reason_only_population_across_decision_values(ledger):
             "state": "decision_only",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_real_acquisition_cancel_eventually_closes_connection(
+    ledger, monkeypatch
+):
+    opened, release, closed = threading.Event(), threading.Event(), threading.Event()
+    original = sqlite3.connect
+
+    class Tracked(sqlite3.Connection):
+        def close(self):
+            super().close()
+            closed.set()
+
+    def connect(*args, **kwargs):
+        connection = original(*args, **kwargs, factory=Tracked)
+        opened.set()
+        assert release.wait(2)
+        return connection
+
+    monkeypatch.setattr(health.sqlite3, "connect", connect)
+    reader = health.HealthReader(ledger)
+    task = asyncio.create_task(reader.get())
+    try:
+        while not opened.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not closed.is_set()
+        assert (await reader.get())["meta"]["reason"] == "busy"
+    finally:
+        release.set()
+        await reader.drain()
+    assert closed.is_set()
+    ledger.unlink()  # Windows proves there is no remaining acquired handle.
+
+
+@pytest.mark.parametrize("setting", ["TOKEN_LIMIT", "SIGNAL_LIMIT", "DECISION_LIMIT"])
+def test_population_budgets_fail_without_partial_counts(ledger, monkeypatch, setting):
+    add(ledger)
+    with db_connection(ledger) as conn:
+        conn.execute(
+            "INSERT INTO trade_decision_events VALUES('lane','suppressed','2026-09-10T00:00:00Z','anything')"
+        )
+    monkeypatch.setattr(health, setting, 0)
+    assert health.read_health(ledger, now=NOW) == health.unavailable("read_limit")
+
+
+def test_snapshot_spans_ledger_and_decisions(ledger, monkeypatch):
+    with db_connection(ledger) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+    add(ledger)
+    original = health._stamp
+    changed = False
+
+    def concurrent_write(value):
+        nonlocal changed
+        if not changed:
+            changed = True
+            with db_connection(ledger) as writer:
+                writer.execute(
+                    "INSERT INTO trade_decision_events VALUES('new','suppressed','2026-09-10T00:00:00Z','blocked')"
+                )
+        return original(value)
+
+    monkeypatch.setattr(health, "_stamp", concurrent_write)
+    result = health.read_health(ledger, now=NOW)
+    assert sum(row["decision_rows"] for row in result["population"]) == 0
+    assert (
+        sum(
+            row["decision_rows"]
+            for row in health.read_health(ledger, now=NOW)["population"]
+        )
+        == 1
+    )
+
+
+def test_oversized_verdict_and_invalid_anchor_id_refuse(ledger):
+    add(ledger, verdict=" " * 16385)
+    assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "read_limit"
+    with db_connection(ledger) as conn:
+        conn.execute("DELETE FROM signal_outcome_ledger")
+    add(ledger)
+    with db_connection(ledger) as conn:
+        conn.execute("ALTER TABLE signal_outcome_ledger RENAME TO original")
+        conn.execute(
+            "CREATE VIEW signal_outcome_ledger AS SELECT CAST(id AS TEXT) AS id,kind,token_id,surface,gate_verdicts,emitted_at,r24h,r7d,label_status FROM original"
+        )
+    assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "schema_unavailable"
