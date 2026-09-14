@@ -39,13 +39,18 @@ Repeat `--metadata <exact-path>` for each release document/harness/test and
 tasks/todo.md. Redirect JSON to a private manifest file outside the source archive.
 Without `--candidate` the output is a proposal, explicitly `verified=false`.
 
-The verifier unions only dashboard/tests paths from the four squash deltas,
+The successor verifier unions only dashboard/tests paths from the seven squash deltas,
 substitutes their FINAL master blobs (including combined dist), and compares EVERY
 other candidate file and mode to production. It also compares the AST of all five
 dashboard.db functions imported by operational trade-surface alerts. Feature tests
 must include tests/test_trade_surface_tg_alerts.py on the old-core candidate.
 
 ## Linux backup (root executes only after inspection and fresh prerequisites)
+
+This historical helper section does not authorize a new successor backup. The
+successor design requires at least12GiB free throughout validation and rollout,
+and verified reuse of the retained private copies. Its stricter rule supersedes
+the original helper's4GiB in-progress floor below.
 
 Use the existing interpreter directly; never dependency sync/install during this
 step. Run `timeout --signal=TERM --kill-after=5s 150s /usr/bin/python3.12
