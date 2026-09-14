@@ -43,9 +43,9 @@ Findings cite the `5c43526c` blobs. The current worktree shows these offsets, wh
 - **A2 wrong denominator:** a ledger/decision ratio for chain_completed or first_signal → rejected. Those branches never request decision writes (873/1430).
 - **A3 reconciliation:** joining on token plus nearest timestamp → rejected. Duplicate token/combo inside one second is ambiguous; a combo mismatch between JSON and column counts as unreconciled. Only a 1:1 join on a shared key captured at emission can be accepted.
 - **A4 emission lineage:** `anchor_cache_age_seconds=0.0` → not freshness (511-518). Using the losers snapshot price without its source timestamp → `UNKNOWN`.
-- **A5 horizon lineage:** an r7d from a `volume_history_cg` row days late → `NOT_MET` (no history lateness cap). A cache fallback inside 120m but with an overwritten source → `UNVERIFIABLE_HISTORICAL`. A pruned observation → `UNVERIFIABLE_HISTORICAL`.
+- **A5 horizon lineage:** an r7d from a `volume_history_cg` row days late → `NOT_MET` (no history lateness cap). An overwritten cache source or pruned observation stays `UNKNOWN` pending independent-receipt inventory; use `UNVERIFIABLE_HISTORICAL` only after scoped irrecoverable loss is documented.
 - **A6 terminal labels:** 9,832 complete rows with 4,486 missing r7d; peak7d-only `complete` → not maturity.
-- **A7 null/missingness:** dropping `price=None` rows before computing returns → rejected unless the excluded share is reported per signal. Treating NULL as a zero return → rejected.
+- **A7 null/missingness:** dropping `price=None` rows before computing returns → rejected unless a declared estimand and reviewed missingness/selection treatment support the claim; reporting excluded share per signal is necessary but insufficient. Treating NULL as a zero return → rejected.
 - **A8 earliest anchor:** the cohort picks each token's earliest in-window anchor (51 of 1,530 with r7d). The contract must report left censoring at the window edge, anchor-selection skew toward priced branches, and not sum counts across status groups.
 - **A9 freshness laundering:** a runtime check today reproduces the dated counts → the counts keep their 13:03:47Z date.
 
@@ -72,3 +72,8 @@ Findings cite the `5c43526c` blobs. The current worktree shows these offsets, wh
 - A grep of the final doc finds no ranking or capture authorization and no retroactive `ACCEPTED`.
 
 **Boundary:** no implementation, writers, schema, activation, retention, soak, paid calls or ranking. Dated counts stay dated. Historical gaps stay `UNKNOWN` / `UNVERIFIABLE_HISTORICAL`.
+
+## Plan review folds
+
+2026-09-14: contract_evidence (evidence/statistics) and contract_scope (authorization/ops) completed independent reviews of e477f64f. Folded UNKNOWN until scoped evidence loss is proven; disclosure alone cannot cure missingness bias. Even all dimensions ACCEPTED does not authorize warning removal, ranking, capture or activation; those require separately scoped authorization. No application implementation is included.
+
