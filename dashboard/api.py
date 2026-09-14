@@ -12,12 +12,14 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi import Path as FPath
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from dashboard import db
 from dashboard.models import (
     AlertResponse,
     CandidateResponse,
+    PostmortemHistoryResponse,
     FunnelResponse,
     LiveCandidateCockpit,
     SignalTrustScorecardsResponse,
@@ -209,6 +211,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     global _db_path
     if db_path is not None:
         _db_path = db_path
+
+    # Freeze this read-only route target; legacy routes still use the module global.
+    postmortem_db_path = _db_path
 
     app = FastAPI(title="Gecko-Alpha Dashboard")
     repo_root = Path(__file__).resolve().parent.parent
@@ -799,6 +804,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():
         return await db.get_trading_positions(_db_path)
+
+    @app.get("/api/postmortems/moved-already", response_model=PostmortemHistoryResponse)
+    async def get_postmortem_history_endpoint(
+        limit: int = Query(25, ge=1, le=100),
+        before_id: int | None = Query(None, ge=1, le=9223372036854775807),
+    ) -> JSONResponse:
+        """Descriptive stored history, not missed-token coverage or causality."""
+        from fastapi.responses import JSONResponse
+
+        headers = {"Cache-Control": "no-store"}
+        try:
+            payload = await db.get_postmortem_history(
+                postmortem_db_path, limit, before_id
+            )
+            content = PostmortemHistoryResponse.model_validate(payload).model_dump(
+                mode="json"
+            )
+            return JSONResponse(content=content, headers=headers)
+        except Exception as exc:
+            reason = "query_failed"
+            if isinstance(exc, FileNotFoundError):
+                reason = "database_unavailable"
+            elif isinstance(exc, aiosqlite.OperationalError) and (
+                "no such table:" in str(exc) or "no such column:" in str(exc)
+            ):
+                reason = "schema_unavailable"
+            _log.warning(
+                "postmortem_history_unavailable",
+                reason=reason,
+                exception_type=type(exc).__name__,
+                exc_info=reason == "query_failed",
+            )
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": {
+                        "ok": False,
+                        "read_only": True,
+                        "historical_only": True,
+                        "generated_at": _now_iso_utc(),
+                        "data_missing_reason": reason,
+                    },
+                    "rows": [],
+                    "has_more": False,
+                    "next_before_id": None,
+                },
+            )
 
     @app.get("/api/trading/history")
     async def get_trading_history_endpoint(
