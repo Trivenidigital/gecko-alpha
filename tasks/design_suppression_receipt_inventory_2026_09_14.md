@@ -2,6 +2,14 @@
 
 **New primitives introduced:** NONE. Nothing was written or run.
 
+## Hermes-first analysis
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Receipt/log inventory | Hub fetched 2026-09-14, catalog stayed loading: https://hermes-agent.nousresearch.com/docs/skills | Reuse standard read-only tools; no dependency |
+| Runtime evidence | Existing Gecko contract/source | Reuse |
+
+awesome-hermes-agent checked https://github.com/0xNyk/awesome-hermes-agent on 2026-09-14; general orchestration listings do not supply Gecko receipts. No exhaustive absence claim.
+
 ## Process model
 The design never starts a child in its own session and never spawns from Python. Both host commands run inside one outer bound:
 
@@ -77,11 +85,3 @@ If Linux cleanup can't be validated this run, the correct output is a findings-o
 - D1-D4 stay `UNKNOWN`. No `ACCEPTED`, no `UNVERIFIABLE_HISTORICAL`.
 
 **Rollback:** revert the docs.
-
-## Hermes-first analysis
-| Domain | Hermes skill found? | Decision |
-|---|---|---|
-| Receipt/log inventory | Hub fetched 2026-09-14, catalog stayed loading: https://hermes-agent.nousresearch.com/docs/skills | Reuse standard read-only tools; no dependency |
-| Runtime evidence | Existing Gecko contract/source | Reuse |
-
-awesome-hermes-agent checked https://github.com/0xNyk/awesome-hermes-agent on 2026-09-14; general orchestration listings do not supply Gecko receipts. No exhaustive absence claim.
