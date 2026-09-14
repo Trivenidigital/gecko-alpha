@@ -54,7 +54,7 @@ def read_health(path, *, now=None):
     """Read one retained snapshot, failing closed on bounded-resource errors."""
     deadline = time.monotonic() + READ_SECONDS
     now = now or datetime.now(timezone.utc)
-    start7, start30 = now - timedelta(days=7), now - timedelta(days=30)
+    start7, start14 = now - timedelta(days=7), now - timedelta(days=14)
 
     def check():
         if time.monotonic() >= deadline:
@@ -164,7 +164,7 @@ def read_health(path, *, now=None):
                      AND julianday(emitted_at)<julianday(?)+1.0/86400
                      AND kind='gated_out_sample'"""
             for ident, token, surface, raw, emitted, r24, r7, status in rows(
-                sql, (start30.isoformat(), now.isoformat()), LEDGER_LIMIT
+                sql, (start14.isoformat(), now.isoformat()), LEDGER_LIMIT
             ):
                 if type(ident) is not int:
                     return unavailable("schema_unavailable")
@@ -172,7 +172,7 @@ def read_health(path, *, now=None):
                 if stamp is None:
                     diagnostics["excluded_ledger_timestamp_rows"] += 1
                     continue
-                if not start30 <= stamp < now:
+                if not start14 <= stamp < now:
                     continue
                 diagnostics["broader_selected_gated_out_rows"] += 1
                 if isinstance(raw, (str, bytes)) and len(raw) > 16384:
@@ -256,7 +256,9 @@ def read_health(path, *, now=None):
                     ok=True,
                     observed_at=now.isoformat(),
                     window_start=start7.isoformat(),
-                    lookback_start=start30.isoformat(),
+                    lookback_start=start14.isoformat(),
+                    window_days=7,
+                    lookback_days=14,
                     retained_rows_only=True,
                     timestamp_diagnostics_scope="selected_parse_exclusions_only",
                     table_wide_timestamp_counts=None,

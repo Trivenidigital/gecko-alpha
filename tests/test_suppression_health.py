@@ -88,8 +88,8 @@ def test_cohort_and_anchor_are_not_price_readiness(ledger):
 
 
 def test_exact_windows_future_invalid_and_offset(ledger):
-    add(ledger, stamp="2026-08-15T00:00:00Z")
-    add(ledger, token="b", stamp="2026-08-14T23:59:59.999999Z")
+    add(ledger, stamp="2026-08-31T00:00:00Z")
+    add(ledger, token="b", stamp="2026-08-30T23:59:59.999999Z")
     add(ledger, token="c", stamp="2026-09-14T00:00:00Z")
     add(ledger, token="d", stamp="garbage")
     add(ledger, token="e", stamp="2026-09-07T01:00:00+01:00")
@@ -97,6 +97,8 @@ def test_exact_windows_future_invalid_and_offset(ledger):
     assert result["cohort"]["rows"] == 2
     assert result["population"][0]["ledger_rows"] == 1
     assert result["meta"]["table_wide_timestamp_counts"] is None
+    assert result["meta"]["window_days"] == 7
+    assert result["meta"]["lookback_days"] == 14
 
 
 def test_empty_missing_and_budget_are_distinct(ledger, tmp_path, monkeypatch):
@@ -356,3 +358,14 @@ def test_all_statuses_and_earliest_anchor_ignore_index_iteration_order(ledger):
     assert result["cohort"]["rows"] == 5
     assert all(value == 1 for value in result["cohort"]["label_status"].values())
     assert result["cohort"]["earliest_anchor_tokens_with_recorded_r7d"] == 0
+
+
+def test_fourteen_day_anchor_is_window_relative(ledger):
+    add(ledger, stamp="2026-08-30T00:00:00Z")  # 15days, excluded
+    add(ledger, stamp="2026-09-01T01:00:00+01:00", r7=1)  # 13days, earliest in-window
+    add(ledger, stamp="2026-09-10T00:00:00Z")
+    result = health.read_health(ledger, now=NOW)
+    assert result["cohort"]["rows"] == 2
+    assert result["cohort"]["earliest_anchor_tokens_with_recorded_r7d"] == 1
+    assert result["population"][0]["ledger_rows"] == 1
+    assert result["meta"]["lookback_start"] == "2026-08-31T00:00:00+00:00"
