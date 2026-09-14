@@ -10,6 +10,28 @@ in the project dotenv/service environment. The RH collector is not enabled.
 The local project dotenv check also found none of those configured keys.
 No key values were printed and no production state was changed.
 
+## Operator clarification (2026-09-14)
+
+The operator confirms the current collector uses public Robinhood Chain mainnet
+RPC `https://rpc.mainnet.chain.robinhood.com`, expected chain ID 4663, with no
+provider account or API key. The reported source is
+`/Users/sriniyalavarthi/Documents/Codex/2026-09-13/do/outputs/token-detector/detector.py:17`,
+constant `RPC`. That macOS file is not accessible from this Windows workspace;
+its implementation and deployment identity have not been independently checked.
+The operator reports read-only collection with occasional rate limits and
+connection resets; live trading remains disabled.
+
+This corrects the earlier inference that a provider account was missing input.
+The configuration is now known. Absence of override environment variables on
+the checked Windows/VPS installations does not imply absence of a hardcoded
+public endpoint in the separate collector. The existing failed smoke used this
+same public URL. It establishes successful reads and throttling at that workload,
+not an absolute incapacity of the endpoint or a numeric sustainable quota.
+Do not assume a paid account exists or is required for every read-only workload.
+A production-capacity decision still needs measured lag/failure evidence and
+appropriate service terms; no new public load test or purchase is authorized
+by this clarification alone.
+
 ## Provider constraints checked
 
 | Source | Observed documentation | Consequence |
@@ -35,7 +57,7 @@ authenticated RPC request has been made in this follow-up.
    transport success alone; those remain separate measured gates.
 
 Claude Max is performing the independent credential/compatibility audit.
-Provider account information has been requested from the operator. Coding
+The operator has confirmed the public endpoint; no provider account exists. Coding
 changes, if needed, must address concrete gaps found by that audit.
 
 ## Probe readiness fixes (2026-09-14, branch codex/rh-provider-readiness)

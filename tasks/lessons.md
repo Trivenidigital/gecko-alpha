@@ -449,3 +449,13 @@ handoffs and test summaries, reuse unchanged-code verification, and check usage
 at milestones rather than consuming reset credits or promising unlimited work.
 Required independent review remains mandatory; choose complementary review
 scopes and use the other subscription where appropriate.
+
+## 2026-09-14 — Distinguish endpoint defaults from configured provider accounts
+
+The operator clarified that the working collector uses a hardcoded public RPC
+in a separate macOS detector. Checking a Windows/VPS dotenv and finding no
+provider key does not mean the project has no endpoint. State the installation
+and configuration source inspected; inspect defaults too. Treat operator-supplied
+paths on another machine as reported evidence until accessible. Ask for current
+workload/configuration, not a paid account by assumption. A throttled test proves
+failure at its tested workload, not inability to perform all read-only collection.
