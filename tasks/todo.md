@@ -2432,3 +2432,12 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
 and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
 watchdog remain off; captured discoveries remain execution-ineligible.
+
+## DASH-09 all-history summary plan: 2026-09-14
+
+- [x] New clean worktree from e6a55d7a; drift and Hermes checks; reuse classifier.
+- [x] Plan-only scope and fresh historical cohort evidence documented in tasks/plan_stop_shortfall_summary_2026_09_14.md.
+- [ ] Two independent plan reviews/folds; remaining runtime assumptions before design.
+- [ ] Design plus two independent reviews before any code build.
+
+Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
