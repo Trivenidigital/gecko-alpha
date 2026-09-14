@@ -19,7 +19,7 @@ APP = ROOT / "dashboard" / "frontend" / "App.jsx"
 EXPECTED_GROUPS = {
     "act": ["todays_focus", "trade_inbox", "now_tradable", "conviction"],
     "watch": ["prospective", "what_changed", "signals"],
-    "performance": ["trading", "signal_trust", "briefing"],
+    "performance": ["trading", "signal_trust", "postmortem_history", "briefing"],
     "system": ["pipeline", "health", "tg", "x"],
 }
 EXPECTED_TABS = {tab for tabs in EXPECTED_GROUPS.values() for tab in tabs}

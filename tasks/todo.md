@@ -1,8 +1,15 @@
+## Telegram recorded-outcome visibility — 2026-09-13
+
+- [x] Drift/runtime verified on fresh d5b26ff base; plan written.
+- [x] Two plan reviews, design and two design reviews.
+- [x] Read-only build and102focused tests; PR578 and two independent PR approvals at21886e79.
+- [x] PR578 merged as f55271fc at 2026-09-14T01:03:20Z after 7964 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
+
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
 
 - [x] Current-base drift and production read-only schema/state preflight.
 - [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
-- [ ] Exact-head CI and allowed merge; deployment remains separately owned.
+- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Not deployed; selective release validation remains separate from capture/migration rollout.
 - Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
 
 ## Findings closeout: 2026-09-13 — autonomous product readiness
@@ -2417,6 +2424,17 @@ Docs-only scope; detailed findings and verification in
 
 Review: no code/runtime changes; centralized routing, stop history and postmortem
 UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
+
+## Historical postmortem viewer: 2026-09-13
+
+- [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
+- [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
+- [x] Bounded read-only historical list API and Performance tab; 142 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
+- [x] PR577 and two independent final reviews approved exact 2cb1d4f9; per-app DB isolation regression fixed and reviewed.
+- [x] PR577 merged as 7cbd82dd at 2026-09-14T00:42:14Z after 7945 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
+
+Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
+See tasks/plan_postmortem_history_2026_09_13.md.
 
 ## 2026-09-13 — Sustained RH/Pons capture integration
 

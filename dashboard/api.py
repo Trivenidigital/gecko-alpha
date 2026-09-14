@@ -12,6 +12,7 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi import Path as FPath
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from dashboard import db
@@ -20,6 +21,7 @@ from starlette.responses import JSONResponse
 from dashboard.models import (
     AlertResponse,
     CandidateResponse,
+    PostmortemHistoryResponse,
     FunnelResponse,
     LiveCandidateCockpit,
     SignalTrustScorecardsResponse,
@@ -31,6 +33,7 @@ from dashboard.models import (
     WinRateResponse,
 )
 from dashboard.signal_trust_registry import load_signal_trust_registry_payload
+from dashboard.telegram_outcomes import get_telegram_outcomes
 
 _log = structlog.get_logger()
 
@@ -213,6 +216,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
     if db_path is not None:
         _db_path = db_path
 
+    # Freeze this read-only route target; legacy routes still use the module global.
+    postmortem_db_path = _db_path
+
     app = FastAPI(title="Gecko-Alpha Dashboard")
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -267,6 +273,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/alerts/recent", response_model=list[AlertResponse])
     async def get_alerts():
         return await db.get_recent_alerts(_db_path, limit=20)
+
+    # Capture per app; legacy routes still consult the module-level default.
+    telegram_outcomes_db_path = _db_path
+
+    @app.get("/api/tg_alerts/outcomes")
+    async def telegram_outcomes(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
+        payload = await get_telegram_outcomes(telegram_outcomes_db_path, days)
+        available = payload["meta"]["ok"]
+        headers = {"Cache-Control": "no-store"}
+        if not available:
+            headers["Retry-After"] = "60"
+        return JSONResponse(
+            payload, status_code=200 if available else 503, headers=headers
+        )
 
     @app.get("/api/tg_alerts/recent")
     async def get_recent_tg_dispatch_alerts(limit: int = Query(50, ge=1, le=200)):
@@ -819,6 +839,54 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return JSONResponse(
             payload, status_code=200 if payload["meta"]["ok"] else 503, headers=headers
         )
+
+    @app.get("/api/postmortems/moved-already", response_model=PostmortemHistoryResponse)
+    async def get_postmortem_history_endpoint(
+        limit: int = Query(25, ge=1, le=100),
+        before_id: int | None = Query(None, ge=1, le=9223372036854775807),
+    ) -> JSONResponse:
+        """Descriptive stored history, not missed-token coverage or causality."""
+        from fastapi.responses import JSONResponse
+
+        headers = {"Cache-Control": "no-store"}
+        try:
+            payload = await db.get_postmortem_history(
+                postmortem_db_path, limit, before_id
+            )
+            content = PostmortemHistoryResponse.model_validate(payload).model_dump(
+                mode="json"
+            )
+            return JSONResponse(content=content, headers=headers)
+        except Exception as exc:
+            reason = "query_failed"
+            if isinstance(exc, FileNotFoundError):
+                reason = "database_unavailable"
+            elif isinstance(exc, aiosqlite.OperationalError) and (
+                "no such table:" in str(exc) or "no such column:" in str(exc)
+            ):
+                reason = "schema_unavailable"
+            _log.warning(
+                "postmortem_history_unavailable",
+                reason=reason,
+                exception_type=type(exc).__name__,
+                exc_info=reason == "query_failed",
+            )
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": {
+                        "ok": False,
+                        "read_only": True,
+                        "historical_only": True,
+                        "generated_at": _now_iso_utc(),
+                        "data_missing_reason": reason,
+                    },
+                    "rows": [],
+                    "has_more": False,
+                    "next_before_id": None,
+                },
+            )
 
     @app.get("/api/trading/history")
     async def get_trading_history_endpoint(
