@@ -236,17 +236,34 @@ leaks it. Only use providers that put the key in the path, query or userinfo.
 Do not add a new key such as `ALCHEMY_API_KEY` or `RH_PROBE_RPC_URL` to the
 project `.env`. Settings uses `extra="forbid"`, so an unknown line stops the
 pipeline from starting. Use the existing `RH_PONS_RPC_URL` name: in `.env`
-only at collector activation, and for the probe entered for one shell:
+only at collector activation, and for the probe entered for one shell.
+Run the three steps separately. Never paste them as one block: `read` would
+consume the next pasted line, and the key pasted afterwards would run as a
+command and land in shell history.
 
-```bash
-read -rs RH_PONS_RPC_URL && export RH_PONS_RPC_URL   # paste; not echoed or saved to history
-python investigation/rh_pons_sustained_capacity_probe_20260913.py \
-    --rpc-url-env RH_PONS_RPC_URL \
-    --provider-log-range-cap <provider max blocks> --provider-batch-cap <provider max batch> \
-    --stop-after-failed-passes 5 --max-rpc-calls 2000 --max-seconds 900 \
-    --output rh_capacity.json
-unset RH_PONS_RPC_URL
-```
+1. Run this line alone, then paste the URL at the prompt (not echoed, not
+   saved to history):
+
+   ```bash
+   IFS= read -rsp 'RH RPC URL: ' RH_PONS_RPC_URL; echo; export RH_PONS_RPC_URL
+   ```
+
+2. Run the probe:
+
+   ```bash
+   python investigation/rh_pons_sustained_capacity_probe_20260913.py \
+       --rpc-url-env RH_PONS_RPC_URL \
+       --provider-log-range-cap <provider max blocks> --provider-batch-cap <provider max batch> \
+       --stop-after-failed-passes 5 --max-rpc-calls 2000 --max-seconds 900 \
+       --output rh_capacity.json
+   ```
+
+3. Always clear the variable afterwards, even if the probe failed or was
+   interrupted:
+
+   ```bash
+   unset RH_PONS_RPC_URL
+   ```
 
 If the URL must live in a file, single-quote it (`?` and `&` break
 `source`, which `scripts/rh-pons-watchdog.sh` uses on `.env`), `chmod 600` it
@@ -276,9 +293,11 @@ All flags need positive integers. The probe session ignores proxy environment
 variables (`trust_env=False`), like the pipeline.
 
 Alchemy's free tier allows 10 blocks per eth_getLogs query (see
-`tasks/findings_rh_provider_readiness_20260914.md`). The smallest possible
-query is 1 + 12 = 13 blocks, so the free tier cannot run the collector or
-this probe. `--provider-log-range-cap 10` refuses it before traffic. The
+`tasks/findings_rh_provider_readiness_20260914.md`). With the current reorg
+overlap of 12 (fixed in the probe, and the collector default), the smallest
+checkpointed query is 1 + 12 = 13 blocks. So the free tier cannot run this
+probe or the collector at its current configuration.
+`--provider-log-range-cap 10` refuses it before traffic. The
 pay-as-you-go tier documents an unlimited Robinhood mainnet range with a
 150 MB response cap. Confirm your own account's range, batch and throughput
 limits first. The call budget counts calls, not compute units: header reads

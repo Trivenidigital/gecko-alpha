@@ -59,9 +59,29 @@ transport field, paid-provider integration and `SecretStr` for
 `RH_PONS_RPC_URL`. The existing call cap, rate-limit stop and new failure stop
 bound diagnostics for now.
 
-The Alchemy free tier is incompatible: the smallest query is 13 blocks, above
-its 10-block cap. The probe refuses it before traffic when given
-`--provider-log-range-cap 10`.
+The Alchemy free tier is incompatible with the current configuration: with the
+reorg overlap of 12 (fixed in the probe, collector default), the smallest
+checkpointed query is 13 blocks, above its 10-block cap. The probe refuses it
+before traffic when given `--provider-log-range-cap 10`.
+
+### Independent ops-safety review follow-up (2026-09-14)
+
+- F1 (fixed, docs only): the runbook's authenticated invocation was one
+  copy-paste block, so pasting it let `read` consume the probe line and the
+  key pasted afterwards would run as a command and enter shell history. The
+  secret read (`IFS= read -rsp`, run alone), the probe invocation and `unset`
+  are now separate steps.
+- N2 (fixed, docs only): the free-tier incompatibility is stated for the
+  current overlap of 12, not as absolute.
+- Non-blocking residuals, no code change:
+  - N1: out-of-range CLI values raise a Pydantic `ValidationError` from
+    `build_settings` (exit 1 with a traceback) instead of the documented exit
+    2 refusal. It happens before traffic and field errors carry only that
+    field's input, not the URL.
+  - N3 (collector-side, existing): an exception escaping the per-pass guard
+    (for example in `_record_attempt` or `_finish_pass`) ends the worker task.
+    The probe then waits `--max-seconds` and fails loudly at `await task`
+    without a report. That is a crash, never a false pass.
 
 ### Verification record
 
