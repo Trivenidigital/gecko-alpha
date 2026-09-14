@@ -2386,3 +2386,5 @@ Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; 
 - [x] Root/ops approved design f1a9250c and exact two-UI exception amendment ed680902 before implementation.
 - [x] Successor manifest red/green:25 local harness tests passed; original1358 proof preserved,1356 unchanged, two exact merged UI replacements, full runtime/candidate metadata mappings.
 - [ ] Assemble exact829d12b1 selected blobs, local regression/build proofs, then Linux/copy validation and two final reviews.
+- [x] Exact829d source assembled at4e677167;315 local regression tests plus25 manifest tests passed;84-module private frontend build matches all3 served merged blobs.
+- [ ] Root-owned exact archive/Linux/copy proofs and two final reviews remain; Windows aiosqlite warning recorded for comparison.
