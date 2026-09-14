@@ -2484,6 +2484,7 @@ Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No producti
 - [x] Bounded read-only runtime schema/status/flag observations; plan only written.
 - [x] Plan a0703322 approved by root structural and ops provenance reviewers.
 - [x] Separate design drafted with raw storage, per-app target and freshness contracts.
-- [ ] Two independent design reviews/folds before build.
-- [ ] Annotation-only implementation, falsifiers, PR/two reviews and exact CI.
+- [x] Design d0130893 approved by root reader/provenance and postmortem lifecycle/freshness reviewers.
+- [x] Annotation-only implementation52ba7dd7; Linux164 tests, exact fresh-build parity, and built-page mixed-lane visual/failure checks passed.
+- [ ] Pending WS base integration, PR/two reviews and exact final-head CI.
 - Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
