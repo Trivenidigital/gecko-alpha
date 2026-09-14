@@ -71,6 +71,24 @@ def read_health(path, *, now=None):
             conn.execute("PRAGMA query_only=ON")
             conn.execute("BEGIN")
             check()
+            indexes = conn.execute("PRAGMA index_list(trade_decision_events)")
+            found = False
+            for index in indexes:
+                check()
+                if index[1] == "idx_tde_decision_reason_created" and not index[4]:
+                    found = True
+            indexes.close()
+            if not found:
+                return unavailable("schema_unavailable")
+            columns = conn.execute(
+                "PRAGMA index_info(idx_tde_decision_reason_created)"
+            ).fetchmany(4)
+            if [column[2] for column in columns] != [
+                "decision",
+                "reason",
+                "created_at",
+            ]:
+                return unavailable("schema_unavailable")
             cohort = dict(
                 rows=0,
                 distinct_tokens=0,
@@ -178,6 +196,7 @@ def read_health(path, *, now=None):
                 if stamp >= start7:
                     samples[signal_key(surface)] += 1
             sql = """SELECT signal_type,created_at FROM trade_decision_events
+                     INDEXED BY idx_tde_decision_reason_created
                      WHERE reason='suppressed'
                      AND julianday(created_at)>=julianday(?)-1.0/86400
                      AND julianday(created_at)<julianday(?)+1.0/86400"""

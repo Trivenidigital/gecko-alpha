@@ -19,7 +19,8 @@ def ledger(tmp_path):
         conn.executescript("""
         CREATE TABLE signal_outcome_ledger(id INTEGER PRIMARY KEY, kind TEXT,
         token_id, surface, gate_verdicts, emitted_at, r24h, r7d, label_status);
-        CREATE TABLE trade_decision_events(signal_type, reason, created_at);
+        CREATE TABLE trade_decision_events(signal_type, reason, created_at, decision);
+        CREATE INDEX idx_tde_decision_reason_created ON trade_decision_events(decision,reason,created_at);
         """)
     return path
 
@@ -62,7 +63,7 @@ def test_cohort_and_anchor_are_not_price_readiness(ledger):
     add(ledger, token="bad", verdict="[]")
     with sqlite3.connect(ledger) as conn:
         conn.execute(
-            "INSERT INTO trade_decision_events VALUES('losers','suppressed','2026-09-10T00:00:00Z')"
+            "INSERT INTO trade_decision_events VALUES('losers','suppressed','2026-09-10T00:00:00Z','blocked')"
         )
     result = health.read_health(ledger, now=NOW)
     assert result["meta"]["ok"]
@@ -182,3 +183,39 @@ def test_invalid_keys_unknown_status_ties_and_no_writes(ledger):
     assert result["cohort"]["label_status"]["unknown"] == 1
     assert result["cohort"]["earliest_anchor_tokens_with_recorded_r7d"] == 0
     assert result["population"][-1]["signal_type"] is None
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        None,
+        "CREATE INDEX idx_tde_decision_reason_created ON trade_decision_events(reason,decision,created_at)",
+        "CREATE INDEX idx_tde_decision_reason_created ON trade_decision_events(decision,reason,created_at) WHERE decision='blocked'",
+    ],
+)
+def test_missing_wrong_or_partial_index_refuses(ledger, definition):
+    with sqlite3.connect(ledger) as conn:
+        conn.execute("DROP INDEX idx_tde_decision_reason_created")
+        if definition:
+            conn.execute(definition)
+    assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "schema_unavailable"
+
+
+def test_reason_only_population_across_decision_values(ledger):
+    with sqlite3.connect(ledger) as conn:
+        conn.executemany(
+            "INSERT INTO trade_decision_events VALUES(?,?,?,?)",
+            [
+                ("lane", "suppressed", "2026-09-10T00:00:00Z", state)
+                for state in ("blocked", "opened", "unknown", None)
+            ],
+        )
+    result = health.read_health(ledger, now=NOW)
+    assert result["population"] == [
+        {
+            "signal_type": "lane",
+            "ledger_rows": 0,
+            "decision_rows": 4,
+            "state": "decision_only",
+        }
+    ]
