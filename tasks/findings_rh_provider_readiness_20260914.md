@@ -12,7 +12,7 @@ No key values were printed and no production state was changed.
 
 ## Operator clarification (2026-09-14)
 
-The operator confirms the current collector uses public Robinhood Chain mainnet
+The operator confirms the separate macOS detector uses public Robinhood Chain mainnet
 RPC `https://rpc.mainnet.chain.robinhood.com`, expected chain ID 4663, with no
 provider account or API key. The reported source is
 `/Users/sriniyalavarthi/Documents/Codex/2026-09-13/do/outputs/token-detector/detector.py:17`,
@@ -55,7 +55,7 @@ authenticated RPC request has been made in this follow-up.
 4. Do not infer useful early-alert performance or execution readiness from
    transport success alone; those remain separate measured gates.
 
-Claude Max is performing the independent credential/compatibility audit.
+Claude Max completed the independent credential/compatibility audit.
 The operator has confirmed the public endpoint; no provider account exists. Coding
 changes, if needed, must address concrete gaps found by that audit.
 
@@ -119,3 +119,8 @@ before traffic when given `--provider-log-range-cap 10`.
   restored byte-identical; 74 passed afterwards.
 - Independent concurrency/logic (Claude session e01d2b39-29ed-4d9e-bc18-bb3df171be6a) and ops-safety/silent-failure (f951dc2f-0fc8-428b-8f08-9413619414d9) are terminal CLEAR at b253aca429ce75b629bb6c4fc72ee429497d8189. The separate logic reviewer also cleared the ops-authored documentation fix. Final nonblocking wording notes were clarified. PR #581 exact-head CI remains pending.
 - PR #581 opened; origin/master dashboard PRs #577/#578 merged into this branch and interaction-reviewed. No provider traffic, production configuration, collector activation or trading actions were taken.
+
+
+### Integration renewal
+
+PR #581 revision d2dba76d passed 8,007 tests (12 skipped), 118 contract checks and reviewer clearances. The guarded merge stopped because master advanced. PRs #580 and #582 were integrated, and both independent sessions renewed all four vectors at f74e7cb12f3eca94caa7c7662a3972bf3ccdfd35. The updated revision needs fresh CI, including frontend-dist-parity. No provider traffic or production changes were made.
