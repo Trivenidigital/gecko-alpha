@@ -4,7 +4,9 @@
 - [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
 - [x] Design and both resource amendments received two independent approvals before each build slice.
 - [x] Final14d scope approved; exact three private-copy trials2.047/0.444/0.388s pass predeclared4s gate and full parity.85focused tests and React/browser fixture QA pass.
-- [ ] Two independent PR reviews and exact-head CI; no deployment.
+- [x] PR585 original and renewed integration661020e8 received two independent approvals; four-vector clearances recorded.100combined tests and84-module/3-file build parity pass.
+
+- [ ] PR585 exact final-head CI and coordinated merge; no deployment.
 
 ## DASH-12 full frontend rebuild parity — 2026-09-14
 

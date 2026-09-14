@@ -1,0 +1,17 @@
+# Independent integration approvals relayed by root: ops ownership/schema
+# (111 combined tests), logic semantics/controller (54 focused tests), no findings.
+# Final follow-up changes review metadata only; implementation stays at661020e8.
+pr = 585
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+[clearances]
+concurrency = "661020e8e4b60716e37b3e0cab00e3ebdc30574c"
+logic = "661020e8e4b60716e37b3e0cab00e3ebdc30574c"
+ops-safety = "661020e8e4b60716e37b3e0cab00e3ebdc30574c"
+silent-failure = "661020e8e4b60716e37b3e0cab00e3ebdc30574c"
