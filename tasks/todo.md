@@ -2,8 +2,8 @@
 
 - [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
 - [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
-- [ ] Design written; two independent design approvals required before implementation.
-- [ ] Health-only build, focused tests/visual QA and two PR reviews; no cost/ranking or producer changes.
+- [x] Design and both resource amendments received two independent approvals before each build slice.
+- [ ] Acceptance HELD:21reader tests and private-copy parity pass, but worst4.691s/5s leaves narrow margin. Frontend paused; see report_suppression_cohort_health_2026_09_14.md. No PR/deploy.
 
 ## Telegram recorded-outcome visibility — 2026-09-13
 
