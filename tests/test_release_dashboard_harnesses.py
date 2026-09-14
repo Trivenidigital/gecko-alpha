@@ -1,0 +1,142 @@
+"""Disposable release harness boundaries, without touching production."""
+
+import importlib.util
+import sqlite3
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load(name):
+    path = ROOT / "tasks" / f"release_{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_manifest_rejects_core_allowlist_and_mutated_blob(tmp_path):
+    mod = load("dashboard_manifest")
+    with pytest.raises(ValueError):
+        mod.metadata_path("scout/config.py")
+    assert mod.metadata_path("tasks/release_dashboard_manifest.py")
+    file = tmp_path / "sample"
+    file.write_bytes(b"abc")
+    expected = mod.blob_hash(file.read_bytes())
+    assert expected == "f2ba8f84ab5c1bce84a7b441cb1959cfc7093b7f"
+    file.write_bytes(b"abcd")
+    assert mod.blob_hash(file.read_bytes()) != expected
+
+
+def test_backup_preserves_source_and_refuses_destination_reuse(tmp_path):
+    mod = load("dashboard_backup")
+    source = tmp_path / "source.sqlite"
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE evidence (value)")
+        db.execute("INSERT INTO evidence VALUES (42)")
+    before = source.read_bytes()
+    dest = tmp_path / "backup.sqlite"
+    result = mod.backup(source, dest, seconds=5, minimum_free=0)
+    assert result["quick_check"] == "ok"
+    assert source.read_bytes() == before
+    with pytest.raises(FileExistsError):
+        mod.backup(source, dest, seconds=5, minimum_free=0)
+
+
+def test_backup_deadline_leaves_no_valid_success(tmp_path):
+    mod = load("dashboard_backup")
+    source = tmp_path / "source.sqlite"
+    with sqlite3.connect(source) as db:
+        db.execute("CREATE TABLE evidence (value)")
+    with pytest.raises(TimeoutError):
+        mod.backup(source, tmp_path / "partial.sqlite", seconds=-1, minimum_free=0)
+
+
+def test_copy_guard_rejects_escape_and_attached_database(tmp_path):
+    mod = load("dashboard_validate")
+    copy = tmp_path / "copy.sqlite"
+    with sqlite3.connect(copy) as db:
+        db.execute("CREATE TABLE signal_params (signal_type,enabled)")
+        db.execute("INSERT INTO signal_params VALUES ('x',1)")
+    real = sqlite3.connect
+    guarded = mod.guarded_connect(real, tmp_path, [])
+    with pytest.raises(PermissionError):
+        guarded(tmp_path.parent / "outside.sqlite")
+    with guarded(copy) as db:
+        with pytest.raises(sqlite3.DatabaseError):
+            db.execute("ATTACH DATABASE ':memory:' AS other")
+    first = mod.fingerprint(copy)
+    with real(copy) as db:
+        db.execute("UPDATE signal_params SET enabled=0")
+    second = mod.fingerprint(copy)
+    assert first["policy"] != second["policy"]
+    assert first["schema"] == second["schema"]
+
+
+def test_manifest_rejects_core_delta_in_real_git_tree(tmp_path):
+    mod = load("dashboard_manifest")
+
+    def git(*args):
+        return (
+            subprocess.check_output(["git", "-C", str(tmp_path), *args])
+            .decode()
+            .strip()
+        )
+
+    git("init", "-q")
+    git("config", "user.name", "test")
+    git("config", "user.email", "test@example.invalid")
+    (tmp_path / "dashboard").mkdir()
+    (tmp_path / "dashboard/db.py").write_text(
+        "\n".join(f"def {name}(): return 1" for name in mod.CONSUMERS)
+    )
+    (tmp_path / "core.py").write_text("BASE = 1\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    prs = {}
+    for number in ("575", "577", "578", "580"):
+        (tmp_path / f"dashboard/view{number}.py").write_text("VALUE = 1\n")
+        git("add", ".")
+        git("commit", "-qm", number)
+        prs[number] = git("rev-parse", "HEAD")
+    final = prs["580"]
+    assert mod.build_manifest(tmp_path, base, final, prs, final)["verified"]
+    (tmp_path / "core.py").write_text("BASE = 2\n")
+    git("add", ".")
+    git("commit", "-qm", "unexpected core change")
+    with pytest.raises(ValueError, match="selective tree mismatch: core.py"):
+        mod.build_manifest(tmp_path, base, final, prs, git("rev-parse", "HEAD"))
+
+
+def test_trigger_targets_and_duplicate_rows_are_compared(tmp_path):
+    mod = load("dashboard_validate")
+    path = tmp_path / "copy.sqlite"
+    with sqlite3.connect(path) as db:
+        db.executescript(
+            "CREATE TABLE signal_params (enabled); CREATE TABLE bookkeeping (value); CREATE TRIGGER record AFTER INSERT ON signal_params BEGIN INSERT INTO bookkeeping VALUES (1); END;"
+        )
+    before = mod.fingerprint(path, ["bookkeeping"])
+    writes = []
+    with mod.guarded_connect(sqlite3.connect, tmp_path, writes)(path) as db:
+        db.execute("INSERT INTO signal_params VALUES (1)")
+        db.execute("INSERT INTO signal_params VALUES (1)")
+    assert "bookkeeping" in {w["table"] for w in writes}
+    after = mod.fingerprint(path, ["bookkeeping"])
+    assert after["policy"]["bookkeeping"]["count"] == 2
+    assert before["policy"]["bookkeeping"] != after["policy"]["bookkeeping"]
+    readonly = [True]
+    with mod.guarded_connect(sqlite3.connect, tmp_path, [], readonly)(path) as db:
+        with pytest.raises(sqlite3.DatabaseError):
+            db.execute("DELETE FROM signal_params")
+
+
+def test_source_attestation_rejects_untracked_import_shadow(tmp_path):
+    mod = load("dashboard_validate")
+    manifest = {"expected_files": {}, "metadata_allowlist": []}
+    (tmp_path / "sqlite3.py").write_text("pass")
+    with pytest.raises(ValueError, match="unexpected source file"):
+        mod.attest(tmp_path, manifest)

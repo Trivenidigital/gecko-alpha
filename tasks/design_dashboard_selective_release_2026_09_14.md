@@ -18,10 +18,12 @@ release existing artifacts without introducing orchestration or deployment tools
 ## Review status and current evidence
 
 Both plan reviewers APPROVE bc4c5837c5727e971215f290d997eeac6028e694, no folds.
-DESIGN ONLY: no code assembly, cherry-pick, source switch, services or production
-mutations until two independent design approvals and root authorization.
+Both design reviewers APPROVE 38150404fdfd4c649a69fdd0fbeefde0fb61ddbe, no folds.
+Root authorized local disposable harness preparation only. No code assembly until
+PR580 merges, and no production actions in this preparation task.
 Worktree C:/projects/gecko-alpha-dashboard-release-20260914 remains based on
-production d2f0d61edc63cb55ae159ec952cce404991f21f5; only release docs change here.
+production d2f0d61edc63cb55ae159ec952cce404991f21f5; release docs and disposable
+tasks/release_* harnesses plus their boundary tests change here.
 
 Root00:58:43UTC runtime evidence, not independently re-attested by this agent:
 actual uv run uvicorn dashboard.main:app --host0.0.0.0 --port8000; Restartalways,
@@ -206,5 +208,6 @@ candidate terminal reviews, fresh preflight and rollback artifacts must exist.
 Root's user production-push authorization supplies the deployment permission once
 these conditions are satisfied; no additional operator approval ask is invented.
 
-Current result: design only. Await two design reviews before assembly, backup/copy
-creation or deployment work. No production mutations in this task.
+Current result: design approved; local harnesses prepared for inspection. Actual
+assembly and Linux copy validation remain pending. See tasks/release_dashboard_usage.md.
+No production mutations in this task.
