@@ -25,3 +25,8 @@ ALR-07 visibility is the only backlog closure supported. Source/signal suppressi
 
 ## Final independent reviews
 PR578 reviewed code21886e79162f60da702b51fdfa226fd7bb1e142c: stop_gap_audit approved logic/concurrency after19independent tests; stale_pr_audit approved ops-safety/silent-failure/attribution after102independent tests. No required folds. Clearance anchors reference that actual reviewed code; final metadata-head CI remains pending.
+
+## Resumed integration 2026-09-14
+Prior automation owner stopped at a usage limit; root independently verified the failed terminal turn before assuming this PR. Original headad8cf590 CI34789749967 passed. Integration with current master and PR577 remains required, with renewed two-vector reviews and final-head CI.
+Fresh focused verification:72tests passed for endpoint, executable frontend lifecycle, existing operator actions, funnel/outcomes and dashboard API. Actual unchanged helper executed in memory against production readonly SQLite at2026-09-14T00:24:18.640965Z:30days1,305 recorded events=76sent+436blocked eligibility+793cooldown. All436eligibility rows are detection-universe; invalid/futuretimestamps0. This is not independent delivery confirmation.
+Production srilu HEADd2f0d61e, trackedclean and pipeline/dashboard/Hermes active at00:20:59Z. Full master includes separately scoped capture/schema changes, so this PR does not authorize an unreviewed full production refresh. No production file/DB/config writes or external messages.
