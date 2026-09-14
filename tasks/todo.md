@@ -2369,3 +2369,6 @@ Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production chan
 - [x] Isolate from frozen07af and record retry plan.
 - [ ] Two plan reviews, design/two reviews, merged WS fix, assembly and exact verification.
 - [ ] Final candidate/helper reviews, fresh preflight, conditional dashboard-only rollout and recovery checks.
+- [x] Retry plan/design each received two approvals, sibling-baseline fold recorded.
+- [x] PR583 merged with reviews/green CI; exact two-file application delta applied to frozen07af;59local tests passed.
+- [ ] Exact new manifest/Linux/copy proofs, final candidate/helper reviews and conditional rollout remain.
