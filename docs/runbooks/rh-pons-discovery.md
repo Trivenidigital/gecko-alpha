@@ -222,6 +222,68 @@ Record the JSON report with the endpoint class, pass count and RPC calls per
 minute. A throttled probe (repeated 429s) is a provider-capacity finding, not
 a collector pass.
 
+### Authenticated provider endpoints
+
+Never put a keyed URL on the command line (`--rpc-url`): arguments show up in
+`ps`, `/proc/<pid>/cmdline`, shell history and ssh logs. Pass the variable
+NAME with `--rpc-url-env`; the probe reads only that variable and keeps every
+other setting in code. A missing, empty or non-http(s) value is refused
+before any traffic, and the message names the variable without its value.
+The report shows only `scheme://host` plus the variable name. Redaction keeps
+the full hostname, so a provider that puts its key in a subdomain still
+leaks it. Only use providers that put the key in the path, query or userinfo.
+
+Do not add a new key such as `ALCHEMY_API_KEY` or `RH_PROBE_RPC_URL` to the
+project `.env`. Settings uses `extra="forbid"`, so an unknown line stops the
+pipeline from starting. Use the existing `RH_PONS_RPC_URL` name: in `.env`
+only at collector activation, and for the probe entered for one shell:
+
+```bash
+read -rs RH_PONS_RPC_URL && export RH_PONS_RPC_URL   # paste; not echoed or saved to history
+python investigation/rh_pons_sustained_capacity_probe_20260913.py \
+    --rpc-url-env RH_PONS_RPC_URL \
+    --provider-log-range-cap <provider max blocks> --provider-batch-cap <provider max batch> \
+    --stop-after-failed-passes 5 --max-rpc-calls 2000 --max-seconds 900 \
+    --output rh_capacity.json
+unset RH_PONS_RPC_URL
+```
+
+If the URL must live in a file, single-quote it (`?` and `&` break
+`source`, which `scripts/rh-pons-watchdog.sh` uses on `.env`), `chmod 600` it
+and keep it out of the repo. Do not put it in a systemd `Environment=` line,
+which `systemctl show` exposes:
+
+```bash
+RH_PONS_RPC_URL='https://provider.example/v2/KEY?opt=1&x=2'
+```
+
+Provider limits checked before traffic:
+
+- `--provider-log-range-cap N`: a checkpointed pass queries eth_getLogs
+  over `--max-span` plus `RH_PONS_REORG_OVERLAP_BLOCKS` (12) blocks
+  inclusive. The probe refuses a span where `max_span + 12 > N`, so set
+  `--max-span` to at most `N - 12`.
+- `--provider-batch-cap N`: refuses `--header-batch-size` above N. An
+  oversized batch that the provider rejects with HTTP 400 or -32600 would
+  otherwise silently switch the collector to single header requests.
+- `--stop-after-failed-passes N`: stops after N consecutive
+  failed/timeout/error/refused passes with `stop_reason=failed_passes` and
+  verdict fail. Without it, a provider that rejects every range keeps using
+  budget until `--max-rpc-calls` or `--max-seconds`. The rate-limit stop
+  still takes priority.
+
+All flags need positive integers. The probe session ignores proxy environment
+variables (`trust_env=False`), like the pipeline.
+
+Alchemy's free tier allows 10 blocks per eth_getLogs query (see
+`tasks/findings_rh_provider_readiness_20260914.md`). The smallest possible
+query is 1 + 12 = 13 blocks, so the free tier cannot run the collector or
+this probe. `--provider-log-range-cap 10` refuses it before traffic. The
+pay-as-you-go tier documents an unlimited Robinhood mainnet range with a
+150 MB response cap. Confirm your own account's range, batch and throughput
+limits first. The call budget counts calls, not compute units: header reads
+and log reads are billed differently, and batches are billed per method.
+
 Run `scripts/compare_discovery_latency.py --db <captured-db>` over observations
 captured by the running lanes. Use the paired sample count and RH advantage on
 the same chain-qualified tokens. Keep unobserved, invalid-clock and unsupported
