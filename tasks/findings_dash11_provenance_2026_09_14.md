@@ -4,7 +4,7 @@ Closeout reconciliation: tasks/current_closeout_queue_2026_09_14.md records the 
 
 ## Current closeout — 2026-09-14
 
-PR #585 merged the bounded health-only API/Pipeline panel as `829d12b1` at 12:32:18Z. The recommendation below is historical and must not trigger a duplicate UI build. Next gate: coordinated deployment with fresh runtime and smoke verification; this documentation closeout makes no deployment claim. The 120-day audit cohort below is distinct from #585's 14-day recorded-label availability window. Its counts are not current panel counts or economic validation. Producer coverage and price-provenance limitations remain unresolved.
+PR #585 merged the bounded health-only API/Pipeline panel as `829d12b1` at 12:32:18Z. The recommendation below is historical and must not trigger a duplicate UI build. The tracked closeout queue separately records completed deployment and smoke verification; this historical documentation closeout does not independently re-attest that runtime. Next gate for this PR is final-head CI and merge. The 120-day audit cohort below is distinct from #585's 14-day recorded-label availability window. Its counts are not current panel counts or economic validation. Producer coverage and price-provenance limitations remain unresolved.
 
 ## Historical result and next engineering gate (00:26 UTC audit)
 
