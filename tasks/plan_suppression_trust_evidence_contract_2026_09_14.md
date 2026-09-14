@@ -4,12 +4,12 @@
 
 **Context:** `tasks/findings_suppression_provenance_2026_09_14.md:82` says future cost or ranking conclusions stay on HOLD until an independently reviewed evidence contract exists. This plan turns that gate into acceptance criteria. It adds no writers, schema, activation, retention change, ranking or runtime work. Planning was read-only; no files were written.
 
-## Hermes-first check
-| Check | Source | State | Claim limit |
-|---|---|---|---|
-| Skill hub | https://hermes-agent.nousresearch.com/docs/skills | Fetched today; the dynamic catalog did not render | No claim that a skill is absent |
-| Ecosystem list | https://github.com/0xNyk/awesome-hermes-agent | Fetched and inspected by parent 2026-09-14 | No listed general orchestration tool supplies Gecko historical event/price receipts |
-| Dependency | n/a | None needed; the contract is repo-specific prose | No package, tool or service added |
+## Hermes-first analysis
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Evidence contract | https://hermes-agent.nousresearch.com/docs/skills fetched; dynamic catalog unavailable | Repo-specific prose; no new dependency and no exhaustive absence claim |
+| Ecosystem | https://github.com/0xNyk/awesome-hermes-agent inspected 2026-09-14 | General orchestration listings do not supply Gecko receipts; retain existing workflow |
+| Runtime evidence | Existing in-tree audit and health primitives | Reuse; no package, service or collector added |
 
 ## Source references and drift (worktree vs. line numbers cited in findings)
 Findings cite the `5c43526c` blobs. The current worktree shows these offsets, which the design must correct:
@@ -39,13 +39,14 @@ Findings cite the `5c43526c` blobs. The current worktree shows these offsets, wh
 - **Forward rule:** the contract may list what future evidence would satisfy a dimension. That list does not authorize capture, writers, schema, flags or soak. Any later implementation needs its own plan and must set bounded resource and cadence gates before collecting data: row/byte budget, query timeout, sampling cadence, retention cap, stop condition.
 
 ## Adversarial acceptance examples (each must fail or be labeled correctly)
+Numeric examples below are dated 2026-09-14T13:03:47Z audit observations, not current counts.
 - **A1 attempt/receipt:** equal counts (13,793 = 13,793) → `NOT_MET`; counts are not a denominator. Seeing ledger rows while the recorder is fail-soft → `UNKNOWN`. first_signal's 10.1h gap → not proof a producer is disabled.
 - **A2 wrong denominator:** a ledger/decision ratio for chain_completed or first_signal → rejected. Those branches never request decision writes (873/1430).
-- **A3 reconciliation:** joining on token plus nearest timestamp → rejected. Duplicate token/combo inside one second is ambiguous; a combo mismatch between JSON and column counts as unreconciled. Only a 1:1 join on a shared key captured at emission can be accepted.
+- **A3 reconciliation:** joining on token plus nearest timestamp → rejected. Duplicate token/combo inside one second is ambiguous; a combo mismatch between JSON and column counts as unreconciled. Require a demonstrably exact 1:1 mapping using a shared emission key or independently retained equivalent evidence; approximate matching cannot establish it.
 - **A4 emission lineage:** `anchor_cache_age_seconds=0.0` → not freshness (511-518). Using the losers snapshot price without its source timestamp → `UNKNOWN`.
 - **A5 horizon lineage:** an r7d from a `volume_history_cg` row days late → `NOT_MET` (no history lateness cap). An overwritten cache source or pruned observation stays `UNKNOWN` pending independent-receipt inventory; use `UNVERIFIABLE_HISTORICAL` only after scoped irrecoverable loss is documented.
 - **A6 terminal labels:** 9,832 complete rows with 4,486 missing r7d; peak7d-only `complete` → not maturity.
-- **A7 null/missingness:** dropping `price=None` rows before computing returns → rejected unless a declared estimand and reviewed missingness/selection treatment support the claim; reporting excluded share per signal is necessary but insufficient. Treating NULL as a zero return → rejected.
+- **A7 null/missingness:** dropping `price=None` rows before computing returns → rejected unless a declared estimand and reviewed missingness/selection treatment support the claim; reporting excluded share per signal is necessary but insufficient. Separate immature outcomes from mature-missing returns. Treating NULL as a zero return → rejected.
 - **A8 earliest anchor:** the cohort picks each token's earliest in-window anchor (51 of 1,530 with r7d). The contract must report left censoring at the window edge, anchor-selection skew toward priced branches, and not sum counts across status groups.
 - **A9 freshness laundering:** a runtime check today reproduces the dated counts → the counts keep their 13:03:47Z date.
 
@@ -76,4 +77,3 @@ Findings cite the `5c43526c` blobs. The current worktree shows these offsets, wh
 ## Plan review folds
 
 2026-09-14: contract_evidence (evidence/statistics) and contract_scope (authorization/ops) completed independent reviews of e477f64f. Folded UNKNOWN until scoped evidence loss is proven; disclosure alone cannot cure missingness bias. Even all dimensions ACCEPTED does not authorize warning removal, ranking, capture or activation; those require separately scoped authorization. No application implementation is included.
-
