@@ -1,3 +1,10 @@
+## Active Work: 2026-09-14 — Bounded suppression receipt inventory
+
+- [x] Refresh master, canonical memory/backlog/source drift and initial production identity.
+- [x] Plan 8836b14a: independent evidence and ops reviews approved.
+- [ ] Design and two reviews; execute bounded read-only journal inventory.
+- [ ] Findings PR and two PR reviews; final verification.
+- Plan: tasks/plan_suppression_receipt_inventory_2026_09_14.md.
 ## Active Work: 2026-09-14 — Suppression trust evidence contract
 
 - [x] Refresh master, drift/Hermes checks and schema/source-only production preflight.
