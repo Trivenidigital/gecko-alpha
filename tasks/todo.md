@@ -2428,3 +2428,18 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 
 Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
 See tasks/plan_postmortem_history_2026_09_13.md.
+
+## 2026-09-13 — Sustained RH/Pons capture integration
+
+- [x] Coordinate implementation and independent reviews through Claude Max; preserve the original checkout.
+- [x] Implement dedicated capture, bounded DB queries, strict header batches and paced requests.
+- [x] Fix shared-connection interference; test cancellation and replay.
+- [x] Fix attempt freshness, probe verdicts, watchdog arguments and reason-aware cooldown.
+- [x] Native affected tests verified; nine Linux-specific watchdog failures reproduced on unchanged Windows baseline.
+- [x] Mutation round 3: 28 caught, one documented equivalent, no unresolved result; two cooldown mutations caught; files restored.
+- [ ] Final independent clearances and exact-head Linux CI.
+- [ ] Production capacity assessment on a suitable provider; public smoke failed and further load is paused.
+
+Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
+and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
+watchdog remain off; captured discoveries remain execution-ineligible.

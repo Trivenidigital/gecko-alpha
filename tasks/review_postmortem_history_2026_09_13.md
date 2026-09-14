@@ -42,3 +42,22 @@ owned capture/migration work is active. Later rollback is revert viewer commit
 and rebuild prior frontend; no DB restore required. Historical list visibility
 is complete; comprehensive missed-token capture, causal attribution, guaranteed
 T-minus evidence and writer freshness watchdog remain separate residuals.
+
+## Master integration 2026-09-14
+
+Integrated origin/master e6a55d7a (PR576) into prior PR577 head2e32df72.
+Only conflict was tasks/todo.md; retained both independent checklist sections.
+No custom code changed. Dashboard source and generated assets were preserved;
+a fresh frontend build reproduced the committed bundle with no diff.
+
+Fresh verification: the exact five-file pytest command above passed142tests;
+npm --prefix dashboard/frontend run build passed76modules. Black --check on
+dashboard/api.py, dashboard/db.py, dashboard/models.py and the three postmortem/
+navigation test files passed unchanged (Python3.12/3.14 target warning emitted).
+The PR delta passes git diff --cached origin/master --check. The merge delta
+against the old feature head reports only two pre-existing blank-at-EOF warnings
+imported unchanged from PR576 (.reviewers/576.toml and capacity smoke JSON).
+
+Existing clearances have not been repointed: the inherited scout/scripts/tests
+changes require renewed independent review of the integrated candidate and
+fresh exact-head CI. Root coordinates those gates. No merge or deploy performed.

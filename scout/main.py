@@ -1205,21 +1205,9 @@ async def run_cycle(
         except Exception:
             logger.exception("dex_discovery_error")
 
-    # RH/Pons curve-launch collector (observe-only, inert by default): records
-    # evidence only; emits no candidates, no alert, no paper trade. Flag off =
-    # no call; even when on, poll_once refuses without a configured RPC URL
-    # AND an onchain-verified deployment registry entry.
-    if settings.RH_PONS_COLLECTOR_ENABLED:
-        try:
-            async with asyncio.timeout(settings.RH_PONS_POLL_TIMEOUT_SEC):
-                await rh_pons.poll_once(session, db, settings)
-        except TimeoutError:
-            logger.warning(
-                "rh_pons_collector_timeout",
-                timeout_seconds=settings.RH_PONS_POLL_TIMEOUT_SEC,
-            )
-        except Exception:
-            logger.exception("rh_pons_collector_error")
+    # RH/Pons capture no longer runs inside the cycle: a 60 s+ cycle cannot keep
+    # up with ~10 blocks/s. It is a dedicated worker spawned in main() behind
+    # RH_PONS_COLLECTOR_ENABLED (plan_rh_pons_sustained_capture_20260913).
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -3093,6 +3081,19 @@ async def main(argv: list[str] | None = None) -> int:
 
                 tasks.append(
                     asyncio.create_task(tg_shadow_loop(db=db, settings=settings))
+                )
+
+            # RH/Pons curve-launch capture (observe-only, inert by default):
+            # evidence only — no candidates, alerts or paper trades. The loop
+            # never returns while enabled, bounds each pass by
+            # RH_PONS_POLL_TIMEOUT_SEC, backs off on refusals/failures, and is
+            # cancelled with the other workers at shutdown.
+            if settings.RH_PONS_COLLECTOR_ENABLED:
+                tasks.append(
+                    asyncio.create_task(
+                        rh_pons.run_rh_pons_loop(session, db, settings),
+                        name="rh-pons-collector",
+                    )
                 )
 
             # BL-055 live-subsystem loops (spec §10) — only spawned when a

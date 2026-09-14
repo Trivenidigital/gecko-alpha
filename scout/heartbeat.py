@@ -36,7 +36,9 @@ _ingest_watchdog_state: dict[str, dict] = {}
 # These rows use updated_at as the last completed successful poll, including
 # empty polls. Only their collectors may write them; generic per-cycle miss
 # persistence would make a stopped collector look alive after a restart.
-_POLL_ONLY_SOURCES = frozenset({"rh_pons", "dex_discovery"})
+# rh_pons_attempt is the RH collector's per-attempt failure streak, written
+# only by the collector and read only by its watchdog.
+_POLL_ONLY_SOURCES = frozenset({"rh_pons", "rh_pons_attempt", "dex_discovery"})
 
 
 @dataclass(frozen=True)

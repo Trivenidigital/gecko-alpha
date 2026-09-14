@@ -437,3 +437,15 @@ surviving mutant turns out genuinely unreachable, keep the guard and fix the
 *comment*: an `amount < required_amount` check here was unreachable under integer
 floor division but **had** been reachable under the earlier `Decimal`
 formulation, so the comment asserting reachability had silently become false.
+
+## 2026-09-13 — Allocate work across the operator's subscriptions
+
+The operator explicitly asked to conserve ChatGPT credits while using both
+subscriptions. Default to one Claude Max implementation task at a time through
+the verified safe-mode CLI; keep Codex on compact coordination, independent
+review of material risks, and native verification. Do not launch redundant
+Codex coding/review swarms for work already assigned to Claude. Use bounded
+handoffs and test summaries, reuse unchanged-code verification, and check usage
+at milestones rather than consuming reset credits or promising unlimited work.
+Required independent review remains mandatory; choose complementary review
+scopes and use the other subscription where appropriate.
