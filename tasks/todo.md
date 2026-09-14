@@ -2437,7 +2437,9 @@ watchdog remain off; captured discoveries remain execution-ineligible.
 
 - [x] New clean worktree from e6a55d7a; drift and Hermes checks; reuse classifier.
 - [x] Plan-only scope and fresh historical cohort evidence documented in tasks/plan_stop_shortfall_summary_2026_09_14.md.
-- [ ] Two independent plan reviews/folds; remaining runtime assumptions before design.
-- [ ] Design plus two independent reviews before any code build.
+- [x] Two independent plan reviews approved4085bf88; fresh schema/hash/cohort runtime prerequisites verified.
+- [x] Design-only artifact tasks/design_stop_shortfall_summary_2026_09_14.md prepared with SQL and Python deadlines.
+
+- [ ] Two independent design reviews/folds before any code build.
 
 Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
