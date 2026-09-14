@@ -18,6 +18,7 @@ import {
   bucketToneBg,
 } from './traderQueue.js'
 import TradeDetailDrawer from './TradeDetailDrawer.jsx'
+import StopShortfallSummary from './StopShortfallSummary.jsx'
 
 const CLOSED_PER_PAGE = 20  // closed-trades pagination size
 
@@ -1668,6 +1669,8 @@ export default function TradingTab({ deepLinkTradeId = null }) {
           </div>
         )}
       </div>
+
+      <StopShortfallSummary />
 
       {/* Section 4: Closed Trades (paginated) */}
       <div className="panel" style={{ marginBottom: 16 }}>
