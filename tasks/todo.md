@@ -2,7 +2,8 @@
 
 - [x] Current-master drift and initial production read-only check.
 - [x] Plan/design: two parallel reviewers each; folds applied.
-- [ ] Pinned provenance/retention audit, findings PR and two-vector PR review.
+- [x] Pinned audit, findings PR #579 and two-vector PR review; factual folds applied.
+- [ ] CI/merge gate for #579; no deployment. Next engineering slice remains health-only DASH-11 UI.
 - Plan: tasks/plan_dash11_provenance_2026_09_14.md.
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
 

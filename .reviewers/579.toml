@@ -1,0 +1,17 @@
+pr = 579
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Terminal independent reviews of corrected substantive findings.
+# dash_drift approved logic/concurrency; audit_safety approved
+# ops-safety/silent-failure. Schema count and citation folds verified.
+[clearances]
+concurrency = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
+logic = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
+ops-safety = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
+silent-failure = "ad4453d3dab765176b3192f9dc6521dce2c2a223"

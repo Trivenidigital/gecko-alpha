@@ -73,7 +73,7 @@ This verifies those source segments on disk, not all production files or the loa
 
 ## Review, verification and next gate
 
-Plan and design each received two parallel reviews: dash_drift (structure/cohort evidence) and audit_safety (runtime safety/attribution). Folds adopted: canonical cohort, ties, pinned transaction, deadlines, indexed lookup, explicit invalid-anchor counts, UTF-8 source equivalence, and no corruption inference from present-day non-replayability. PR review recorded after publication.
+Plan and design each received two parallel reviews: dash_drift (structure/cohort evidence) and audit_safety (runtime safety/attribution). Folds adopted: canonical cohort, ties, pinned transaction, deadlines, indexed lookup, explicit invalid-anchor counts, UTF-8 source equivalence, and no corruption inference from present-day non-replayability. PR #579 reviews completed at ad4453d3: dash_drift approved logic/concurrency and audit_safety approved ops-safety/silent-failure. Both verified the 19-field schema correction; analyzer maturity citation also corrected. No unresolved review findings. Clearance metadata records those actual terminal verdicts.
 
 Existing analyzer tests: `uv run --no-sync pytest -q tests/test_suppression_cost_rollup_script.py --tb=short` — **15 passed**. These verify unchanged analyzer behavior, not historical label correctness. No new runtime tests are appropriate for documentation-only changes. Diff and citation checks precede publication.
 
