@@ -1,15 +1,27 @@
+## DASH-12 full frontend rebuild parity — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift and Hermes-first checks; plan only written.
+- [x] Existing asset-existence baseline: 3 tests passed; no fresh build or CI edits.
+- [x] Two independent plan reviewers approved ab2a4aac with no required folds.
+- [x] Separate design written; no comparator/workflow/build changes yet.
+- [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
+- [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
+- [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
+- [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
+- Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
+
 ## Telegram recorded-outcome visibility — 2026-09-13
 
 - [x] Drift/runtime verified on fresh d5b26ff base; plan written.
 - [x] Two plan reviews, design and two design reviews.
 - [x] Read-only build and102focused tests; PR578 and two independent PR approvals at21886e79.
-- [ ] Wait exact-head CI and merge serially after577; deployment remains separately owned.
+- [x] PR578 merged as f55271fc at 2026-09-14T01:03:20Z after 7964 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
 
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
 
 - [x] Current-base drift and production read-only schema/state preflight.
 - [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
-- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Deployment held separately for active capture/migration owner.
+- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Not deployed; selective release validation remains separate from capture/migration rollout.
 - Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
 
 ## Findings closeout: 2026-09-13 — autonomous product readiness
@@ -2431,7 +2443,7 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 - [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
 - [x] Bounded read-only historical list API and Performance tab; 142 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
 - [x] PR577 and two independent final reviews approved exact 2cb1d4f9; per-app DB isolation regression fixed and reviewed.
-- [ ] Exact-head CI and parent-coordinated merge; deployment held for separate capture/migration owner.
+- [x] PR577 merged as 7cbd82dd at 2026-09-14T00:42:14Z after 7945 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
 
 Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
 See tasks/plan_postmortem_history_2026_09_13.md.
@@ -2476,8 +2488,25 @@ A dependency is unwarranted for these small CLI corrections.
 - [ ] Native focused verification, independent review and exact-head CI before integration.
   Native RED 27F/30P, GREEN 74 passed, 12/12 guard mutants killed (Codex);
   all four independent review vectors cleared; PR #581 exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
-- [ ] Obtain provider/account details and run bounded assessment only when configuration is available.
+- [x] Operator confirmed public RPC, chain 4663, no provider account; separate macOS collector path recorded.
+- [ ] Assess existing public-collector lag/failure evidence; capacity remains unverified.
 
 Scope: probe, corresponding tests, runbook and this task record. No collector,
 schema, production configuration or trading changes. Authorization: operator
 “go on” on 2026-09-14, continuing the announced provider-readiness work.
+
+## DASH-09 all-history summary plan: 2026-09-14
+
+- [x] New clean worktree from e6a55d7a; drift and Hermes checks; reuse classifier.
+- [x] Plan-only scope and fresh historical cohort evidence documented in tasks/plan_stop_shortfall_summary_2026_09_14.md.
+- [x] Two independent plan reviews approved4085bf88; fresh schema/hash/cohort runtime prerequisites verified.
+- [x] Design-only artifact tasks/design_stop_shortfall_summary_2026_09_14.md prepared with SQL and Python deadlines.
+
+- [x] Both independent design reviewers approved e4f8ecbc without folds before build; root authorized implementation.
+
+Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
+
+- [x] All-history summary API/panel built;190focused tests, Vite76module build and synthetic browser QA passed.
+- [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
+
+Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
