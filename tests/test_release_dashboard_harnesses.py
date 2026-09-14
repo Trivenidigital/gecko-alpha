@@ -98,12 +98,16 @@ def test_manifest_rejects_core_delta_in_real_git_tree(tmp_path):
     git("commit", "-qm", "base")
     base = git("rev-parse", "HEAD")
     prs = {}
-    for number in ("575", "577", "578", "580"):
+    for number in ("575", "577", "578", "580", "583"):
         (tmp_path / f"dashboard/view{number}.py").write_text("VALUE = 1\n")
         git("add", ".")
         git("commit", "-qm", number)
         prs[number] = git("rev-parse", "HEAD")
-    final = prs["580"]
+    final = prs["583"]
+    with pytest.raises(ValueError, match="all five selected merged PRs"):
+        mod.build_manifest(
+            tmp_path, base, final, {k: v for k, v in prs.items() if k != "583"}
+        )
     assert mod.build_manifest(tmp_path, base, final, prs, final)["verified"]
     (tmp_path / "core.py").write_text("BASE = 2\n")
     git("add", ".")

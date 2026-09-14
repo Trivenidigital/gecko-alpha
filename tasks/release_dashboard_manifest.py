@@ -82,8 +82,8 @@ def consumer_ast(repo, sha):
 def build_manifest(repo, base, master, prs, candidate=None, metadata=()):
     for sha in [base, master, *prs.values(), *([candidate] if candidate else [])]:
         exact_sha(repo, sha)
-    if set(prs) != {"575", "577", "578", "580"}:
-        raise ValueError("all four selected merged PRs are required")
+    if set(prs) != {"575", "577", "578", "580", "583"}:
+        raise ValueError("all five selected merged PRs are required")
     git(repo, "merge-base", "--is-ancestor", base, master)
     selected = set()
     for sha in prs.values():
