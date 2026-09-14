@@ -66,3 +66,7 @@ and failure cleanup. These reviews cover the four recorded vectors in
 Exact final-head CI remains required. Root owns
 merge/base integration and later combined release; this task performs no deployment.
 A revert would restore the known disconnect leak and must be recorded accordingly.
+
+## Fresh-master integration review
+
+Integrated merged PR582 master2b084e27 at d2c91fd020990295e1ccf22f6af02d307b8149d0. WebSocket API and lifecycle test blobs remain identical to reviewed6a644a45. Root independently passed71 tests with one Windows symlink skip across WS/API/cold-start/parity; ops passed51 WS/API/cold-start tests. Both approved exact integration without findings; three documented dependency warnings remain. Clearances renewed at d2c91fd0. This following commit changes review metadata only; exact final CI remains required before merge.
