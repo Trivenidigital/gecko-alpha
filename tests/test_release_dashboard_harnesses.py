@@ -168,7 +168,7 @@ def test_fingerprint_bounds_and_order_independent_multiplicity(tmp_path, monkeyp
 
 
 @pytest.fixture
-def successor_git(tmp_path):
+def successor_git(tmp_path, monkeypatch):
     mod = load("dashboard_manifest")
 
     def git(*args):
@@ -195,12 +195,25 @@ def successor_git(tmp_path):
         "dashboard/frontend/components/TodayFocusPanel.jsx",
         "dashboard/frontend/components/TradeInboxTab.jsx",
     )
+    # Tiny independent Git blobs keep this guard fixture usable in shallow CI.
+    # Actual release pins are separately checked by the real manifest proof.
+    original_ui, replacement_ui = b"ORIGINAL = 1\n", b"LANE = 1\n"
+    original_blob = subprocess.check_output(
+        ["git", "hash-object", "--stdin"], input=original_ui
+    ).decode().strip()
+    replacement_blob = subprocess.check_output(
+        ["git", "hash-object", "--stdin"], input=replacement_ui
+    ).decode().strip()
+    monkeypatch.setattr(mod, "CORE_UI_EXCEPTIONS", {
+        path: {
+            "original": {"mode": "100644", "blob": original_blob},
+            "replacement": {"mode": "100644", "blob": replacement_blob},
+        } for path in ui_paths
+    })
     for path in ui_paths:
         target = tmp_path / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(subprocess.check_output(
-            ["git", "-C", str(ROOT), "show", f"d2f0d61edc63cb55ae159ec952cce404991f21f5:{path}"]
-        ))
+        target.write_bytes(original_ui)
     base = commit("dashboard/protected.py", "CORE = 1\n", "core")
     prs = {}
     for number in ("575", "577", "578", "580", "583"):
@@ -215,9 +228,7 @@ def successor_git(tmp_path):
     for number in ("584", "585"):
         if number == "584":
             for path in ui_paths:
-                (tmp_path / path).write_bytes(subprocess.check_output(
-                    ["git", "-C", str(ROOT), "show", f"829d12b191ef2a1122dc18755492a5dd4fc106fc:{path}"]
-                ))
+                (tmp_path / path).write_bytes(replacement_ui)
         prs[number] = commit(f"dashboard/view{number}.py", "VALUE = 1\n", number)
     master = prs["585"]
     git("checkout", "-qb", "candidate", runtime)
