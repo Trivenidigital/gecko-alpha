@@ -7,6 +7,37 @@ on:
     branches: [master]
 
 jobs:
+  frontend-dist-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.0'
+      - name: Install locked frontend dependencies
+        working-directory: dashboard/frontend
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify committed frontend rebuild parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          node --version
+          npm --version
+          sha256sum dashboard/frontend/package-lock.json
+          build_dir=$(mktemp -d "$RUNNER_TEMP/gecko-dist-parity.XXXXXX")
+          npm --prefix dashboard/frontend run build -- --outDir "$build_dir"
+          python scripts/check_dist_rebuild_parity.py --repo-root . --build-dir "$build_dir"
+
   test:
     runs-on: ubuntu-latest
     steps:
