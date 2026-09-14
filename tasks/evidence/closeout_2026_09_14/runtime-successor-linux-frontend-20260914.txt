@@ -1,0 +1,51 @@
+before available_bytes 14320218112
+CLEAN_ARCHIVE_TREE_MATCH 1420
+RUN ['/root/gecko-dash08-validation-20260914/node-v24.14.0-linux-x64/bin/npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'] cwd /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source/dashboard/frontend
+
+added 65 packages in 25s
+npm notice
+npm notice New minor version of npm available! 11.9.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+EXIT 0
+after_npm available_bytes 14231162880
+RUN ['/root/gecko-dashboard-release-20260914/07afc0adc27f708cd2a4ed6e9001a4baa1edb295/testvenv/bin/python', '-B', '-m', 'pytest', '-p', 'no:cacheprovider', 'tests/test_signal_lane_status_frontend.py', 'tests/test_suppression_health_frontend.py', '-q', '--tb=short', '--basetemp', '/root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source/.pytest-temp-frontend'] cwd /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source
+....                                                                     [100%]
+4 passed in 0.53s
+EXIT 0
+RUN ['/root/gecko-dash08-validation-20260914/node-v24.14.0-linux-x64/bin/npm', 'run', 'build', '--', '--outDir', '/root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/frontend-build-77751890'] cwd /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source/dashboard/frontend
+
+> build
+> vite build --outDir /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/frontend-build-77751890
+
+vite v6.4.1 building for production...
+
+(!) outDir /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/frontend-build-77751890 is not inside project root and will not be emptied.
+Use --emptyOutDir to override.
+
+transforming...
+✓ 84 modules transformed.
+rendering chunks...
+computing gzip size...
+../../../frontend-build-77751890/index.html                   0.39 kB │ gzip:   0.27 kB
+../../../frontend-build-77751890/assets/index-Cz-MDdDf.css   32.30 kB │ gzip:   6.05 kB
+../../../frontend-build-77751890/assets/index-iyKeNbDn.js   480.82 kB │ gzip: 132.72 kB
+✓ built in 1.24s
+EXIT 0
+EXACT_BUILD_PARITY dashboard/frontend/dist/assets/index-Cz-MDdDf.css 0258ea033ee74777a313778dcece9035849857dcd7a65e08975578a5eb2077f6
+EXACT_BUILD_PARITY dashboard/frontend/dist/assets/index-iyKeNbDn.js 2f31355477e19bc600e5023c00038676307849de9f2326c888aa440df5db5e7a
+EXACT_BUILD_PARITY dashboard/frontend/dist/index.html 6529ceb83bef024929319bd0d9806ca579c873fbf81a4ccfd5c396b5fea4926e
+API_COMPARISON_BEGIN
+API_COMPARISON baseline5c
+RUN ['/root/gecko-dashboard-release-20260914/07afc0adc27f708cd2a4ed6e9001a4baa1edb295/testvenv/bin/python', '-B', '-m', 'pytest', '-p', 'no:cacheprovider', 'tests/test_dashboard_api.py', '-q', '--tb=short', '--basetemp', '/root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source/.pytest-temp-api-baseline5c'] cwd /root/gecko-dashboard-release-20260914/5c43526c46a33b06e7ed18509c8a0ea43c7772d3/content-proof-source
+............................................                             [100%]
+44 passed in 2.73s
+EXIT 0
+API_COMPARISON candidate777
+RUN ['/root/gecko-dashboard-release-20260914/07afc0adc27f708cd2a4ed6e9001a4baa1edb295/testvenv/bin/python', '-B', '-m', 'pytest', '-p', 'no:cacheprovider', 'tests/test_dashboard_api.py', '-q', '--tb=short', '--basetemp', '/root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source/.pytest-temp-api-candidate777'] cwd /root/gecko-dashboard-release-20260914/successor-recovery-20260914T1240Z/test-source
+............................................                             [100%]
+44 passed in 2.88s
+EXIT 0
+after_all available_bytes 14217969664
+LINUX_FRONTEND_AND_API_PROOF_COMPLETE

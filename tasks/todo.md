@@ -1,3 +1,17 @@
+## Overnight closeout recovery — 2026-09-14
+
+- [x] Recover failed owner, refresh clean master and verify first retained work-loop artifact.
+- [x] Merge PR585 after exact CI and two independent recovery reviews.
+- [x] Review successor plan/design and two-file UI amendment before assembly.
+- [x] Merge PR586 release tools after two PR reviews and8080 tests/118 contracts.
+- [x] Verify exact source, Linux build/render/regressions, copy initializer/content, and pinned rollout helper.
+- [x] Deploy77751890 dashboard only at13:14:10Z; full smokes/invariants passed, pipeline unchanged, rollback unused.
+- [x] Complete bounded producer/retention/price-provenance audit and reconcile the tracked closeout queue.
+- [x] Prepare final findings/queue and retained deployment evidence for independent review; PR records track review, CI and merge status.
+
+Review evidence: tasks/closeout_recovery_2026_09_14.md. Worker OAuth remains
+operator-gated; no trading, policy, paid-vendor or account changes were made.
+
 ## DASH-11 suppression cohort health — 2026-09-14
 
 - [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
