@@ -2466,3 +2466,10 @@ Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive sum
 - [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
 
 Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
+## DASH-08 current recorded lane status — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift/data-path and Hermes checks.
+- [x] Bounded read-only runtime schema/status/flag observations; plan only written.
+- [ ] Two plan reviews, then separate design and two design reviews before build.
+- [ ] Annotation-only implementation, falsifiers, PR/two reviews and exact CI.
+- Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
