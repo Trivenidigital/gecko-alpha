@@ -1,0 +1,6 @@
+{"candidate": "77751890c9f1f51ed348c365d4e7a5985ea2827d", "event": "preflight_passed", "utc": "2026-09-14T13:14:01Z"}
+{"event": "dashboard_stop_begin", "utc": "2026-09-14T13:14:01Z"}
+{"event": "dashboard_processes_stopped", "stop_client_returncode": 0, "unit_state": "failed", "utc": "2026-09-14T13:14:04Z"}
+{"asset_count": 3, "candidate": true, "event": "smokes_passed", "history_count": 20, "utc": "2026-09-14T13:14:10Z"}
+{"event": "dashboard_runtime_verified", "journal_error_lines": 0, "journal_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "pid": "3478145", "start_monotonic": "15688709297048", "utc": "2026-09-14T13:14:10Z"}
+{"candidate": "77751890c9f1f51ed348c365d4e7a5985ea2827d", "event": "rollout_succeeded", "utc": "2026-09-14T13:14:10Z"}
