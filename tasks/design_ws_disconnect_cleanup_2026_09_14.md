@@ -20,7 +20,10 @@ The Hub loading shell does not support an exhaustive negative catalog claim.
 
 Root reports independent operations and logic plan approvals without folds on
 3e86326cae1f0d409c2c42b250e5f4a06a69322f. This is DESIGN ONLY, awaiting two
-design approvals before tests or implementation. Isolated worktree
+design approvals before tests or implementation at the time it was written.
+Both independent operations and logic design reviews subsequently APPROVED
+7cc39a0acc027c8d65564516fb9d6f86ef738372 without folds; root authorized build.
+Isolated worktree
 C:/projects/gecko-alpha-ws-cleanup-20260914 remains based on master d7a0e267.
 Frozen release07af, rollout helper, production services and other worktrees are
 unchanged. Only this design and task status change now.

@@ -2478,3 +2478,9 @@ Review: PLAN ONLY. Frozen selective release07afc0ad unchanged; no application co
 
 - [x] WS plan3e86326c approved independently by ops and logic without folds; design-only lifecycle/shutdown artifact prepared.
 - [ ] Two independent WS design approvals before implementation; no code/test/deployment changes yet.
+
+- [x] WS design7cc39a0a approved by ops and logic; minimal send-boundary fix built after actual-handler red tests.
+- [x] Natural Uvicorn old-code shutdown falsifier failed; corrected lifecycle5pass and combined API/cold-start51pass; formatting/diff checks pass.
+- [ ] WS PR: two independent terminal reviews and exact CI before root merge/integration.
+
+WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
