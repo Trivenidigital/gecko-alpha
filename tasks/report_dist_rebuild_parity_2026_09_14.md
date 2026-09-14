@@ -42,6 +42,11 @@ builds; the resume log records all21 focused tests and the completed falsifier.
 ## Remaining gate
 
 This report/checklist-only commit follows the verified implementation candidate.
-Two independent PR reviews and exact final-head GitHub CI, including the new job,
-remain required before merge. No deployment is needed or authorized by this PR.
+PR582 received two independent approvals at fe034d3cb46841ebaaa2be9d5deb5fcfca777970:
+ops_review covered CI/reproducibility; postmortem_integration covered structural
+comparator behavior. Root relayed both terminal approvals with no folds; each
+reviewer independently passed20 Windows tests with one symlink-permission skip.
+The active .reviewers/582.toml records that reviewed SHA. This clearance/status-only
+update preserves every implementation file. Exact final-head GitHub CI, including
+the new job, remains required before merge. No deployment is authorized by this PR.
 Rollback is an ordinary revert; the original Python existence guard is unchanged.

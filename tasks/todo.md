@@ -6,7 +6,7 @@
 - [x] Separate design written; no comparator/workflow/build changes yet.
 - [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
 - [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
-- [ ] PR and two independent code reviews/folds.
+- [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
 - [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
 - Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
 
