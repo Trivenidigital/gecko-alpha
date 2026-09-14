@@ -140,3 +140,23 @@ def test_source_attestation_rejects_untracked_import_shadow(tmp_path):
     (tmp_path / "sqlite3.py").write_text("pass")
     with pytest.raises(ValueError, match="unexpected source file"):
         mod.attest(tmp_path, manifest)
+
+
+def test_fingerprint_bounds_and_order_independent_multiplicity(tmp_path, monkeypatch):
+    mod = load("dashboard_validate")
+    assert mod.row_fingerprint(iter([(1,), (2,), (1,)])) == mod.row_fingerprint(
+        iter([(2,), (1,), (1,)])
+    )
+    assert mod.row_fingerprint(iter([(1,), (1,)])) != mod.row_fingerprint(iter([(1,)]))
+    monkeypatch.setattr(mod, "MAX_FINGERPRINT_ROWS", 2)
+    with pytest.raises(ValueError, match="row budget"):
+        mod.row_fingerprint((i,) for i in range(3))
+    path = tmp_path / "large.sqlite"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE signal_params (value)")
+        db.execute(
+            "INSERT INTO signal_params VALUES (?)",
+            (b"x" * (mod.MAX_SQLITE_ROW_BYTES + 1),),
+        )
+    with pytest.raises(sqlite3.DataError):
+        mod.fingerprint(path)

@@ -90,3 +90,10 @@ Local preparation: seven boundary tests pass using the existing project Python.
 `uv run` could not create a fresh environment because package-index TLS trust failed;
 no dependency/configuration changes were made. Production-copy/app validation has
 not run, and final merged PR580 SHA remains a required input.
+
+Memory-bound review fold: copy helper Linux CLI sets a 512MiB address-space limit
+before source import or DB work. Fingerprints stream rows with a 100,000-row/table
+ceiling, SQLite 1MiB row/cell limit, serialized-row ceiling and incremental hashing;
+only bounded 32-byte row digests are sorted to preserve multiplicity/order independence.
+Oversize evidence fails closed rather than sampling. Eight boundary tests now pass,
+including row-budget refusal and a real SQLite oversized-cell rejection.

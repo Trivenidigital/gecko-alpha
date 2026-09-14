@@ -15,6 +15,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 REAL_CONNECT = sqlite3.connect
+MAX_FINGERPRINT_ROWS = 100000
+MAX_SQLITE_ROW_BYTES = 1024 * 1024
 POLICY_TABLES = {
     "signal_params",
     "chain_patterns",
@@ -47,15 +49,32 @@ def quote(value):
     return '"' + value.replace('"', '""') + '"'
 
 
-def digest_rows(rows):
+def row_fingerprint(rows):
     # Only hashes leave the process; preserve SQLite types, never expose cell values.
-    hashes = sorted(hashlib.sha256(repr(tuple(row)).encode()).digest() for row in rows)
-    return hashlib.sha256(b"".join(hashes)).hexdigest()
+    hashes = []
+    for row in rows:
+        if len(hashes) >= MAX_FINGERPRINT_ROWS:
+            raise ValueError("fingerprint row budget exceeded")
+        encoded = repr(tuple(row)).encode()
+        if len(encoded) > 4 * MAX_SQLITE_ROW_BYTES:
+            raise ValueError("fingerprint serialized row budget exceeded")
+        hashes.append(hashlib.sha256(encoded).digest())
+    hashes.sort()
+    digest = hashlib.sha256()
+    for value in hashes:
+        digest.update(value)
+    return {"count": len(hashes), "sha256": digest.hexdigest()}
+
+
+def digest_rows(rows):
+    return row_fingerprint(rows)["sha256"]
 
 
 def fingerprint(path, extra_tables=()):
     conn = REAL_CONNECT(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     try:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_SQLITE_ROW_BYTES)
+        conn.execute("PRAGMA cache_size=-2048")
         deadline = time.monotonic() + 30
         conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         schema = conn.execute(
@@ -73,8 +92,9 @@ def fingerprint(path, extra_tables=()):
         for table in sorted(
             protected | ({"paper_migrations", "schema_version"} & tables)
         ):
-            rows = conn.execute(f"SELECT * FROM {quote(table)}").fetchall()
-            policy[table] = {"count": len(rows), "sha256": digest_rows(rows)}
+            policy[table] = row_fingerprint(
+                conn.execute(f"SELECT * FROM {quote(table)}")
+            )
         return {
             "schema": digest_rows(schema),
             "policy": policy,
@@ -277,6 +297,10 @@ async def app_check(source, db_path, candidate):
 
 
 def main():
+    # Disposable Linux process only; never alter the production service limits.
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024**2, 512 * 1024**2))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--copy", type=Path, required=True)
