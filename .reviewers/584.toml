@@ -1,0 +1,16 @@
+# Independent approvals relayed by root: ops reader/provenance (74 tests),
+# postmortem controller/render/exact mapping (29 tests), no findings.
+pr = 584
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+[clearances]
+concurrency = "25733ca5b82e12527204cc59d6aa6ab9d3d4dd78"
+logic = "25733ca5b82e12527204cc59d6aa6ab9d3d4dd78"
+ops-safety = "25733ca5b82e12527204cc59d6aa6ab9d3d4dd78"
+silent-failure = "25733ca5b82e12527204cc59d6aa6ab9d3d4dd78"
