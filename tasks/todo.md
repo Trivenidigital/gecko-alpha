@@ -2470,17 +2470,19 @@ Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No producti
 ## WebSocket disconnect cleanup: 2026-09-14
 
 - [x] Fresh isolated master worktree; drift/Hermes/source/runtime evidence documented in plan_ws_disconnect_cleanup_2026_09_14.md.
-- [ ] Two plan reviews before design; two design reviews before implementation.
-- [ ] Real-handler disconnect/cleanup/transient-DB regressions, bounded shutdown proof where feasible, and focused verification.
-- [ ] Two PR reviews and exact CI before root integration; no production actions in this task.
+- [x] Two plan reviews before design; two design reviews before implementation.
+- [x] Real-handler disconnect/cleanup/transient-DB regressions, bounded natural shutdown proof and focused verification.
+- [x] Two independent PR583 approvals at6a644a45; four-vector clearances recorded truthfully.
+- [ ] Exact final-head CI before root integration; no production actions in this task.
 
-Review: PLAN ONLY. Frozen selective release07afc0ad unchanged; no application code edits or tests implemented.
+Review: PR583 built and independently approved; CI pending. Frozen selective release07afc0ad unchanged.
 
 - [x] WS plan3e86326c approved independently by ops and logic without folds; design-only lifecycle/shutdown artifact prepared.
-- [ ] Two independent WS design approvals before implementation; no code/test/deployment changes yet.
+- [x] Two independent WS design approvals preceded implementation.
 
 - [x] WS design7cc39a0a approved by ops and logic; minimal send-boundary fix built after actual-handler red tests.
 - [x] Natural Uvicorn old-code shutdown falsifier failed; corrected lifecycle5pass and combined API/cold-start51pass; formatting/diff checks pass.
-- [ ] WS PR: two independent terminal reviews and exact CI before root merge/integration.
+- [x] WS PR: operations51tests and independent structural49tests approved6a644a45 without findings.
+- [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.

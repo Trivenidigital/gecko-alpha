@@ -56,6 +56,13 @@ disconnect during indefinitely failing/stuck database reads, nor bound unrelated
 HTTP operations. The passing Uvicorn test does not establish systemd's stop-state
 semantics; root's separate rollout guards and refreshed runtime checks remain needed.
 
-Two independent PR reviews/folds and exact final-head CI remain required. Root owns
+PR583 received two independent terminal APPROVE verdicts without findings at
+6a644a4561fb7dadc5954440776f2a53d5f87aee: operations reviewer ran51 tests and
+verified lifecycle/natural shutdown; root's independent structural review ran49
+tests and checked exception boundaries, payload/read limits, cancellation/drain
+and failure cleanup. These reviews cover the four recorded vectors in
+.reviewers/583.toml; the follow-up commit changes review/status metadata only.
+
+Exact final-head CI remains required. Root owns
 merge/base integration and later combined release; this task performs no deployment.
 A revert would restore the known disconnect leak and must be recorded accordingly.

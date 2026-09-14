@@ -1,0 +1,18 @@
+pr = 583
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Two independent terminal approvals at the exact implementation revision:
+# ops_review: concurrency/ops-safety, 51 tests and natural shutdown/cleanup.
+# root structural review: logic/silent-failure, 49 tests and real handler behavior.
+# Both approved without findings; no watched source/test delta follows this SHA.
+[clearances]
+concurrency = "6a644a4561fb7dadc5954440776f2a53d5f87aee"
+logic = "6a644a4561fb7dadc5954440776f2a53d5f87aee"
+ops-safety = "6a644a4561fb7dadc5954440776f2a53d5f87aee"
+silent-failure = "6a644a4561fb7dadc5954440776f2a53d5f87aee"
