@@ -31,7 +31,7 @@ The only runtime evidence is the 2026-09-14T21:37:54Z preflight: production HEAD
 | Dimension | Verdict | Reason |
 |---|---|---|
 | D1 attempts | `UNKNOWN` | Inspected success logs copy receipts, warnings describe failures and flag-return sites are silent; no independent denominator established |
-| D2 identity | `UNKNOWN` | Each store logs its own ID; no shared key |
+| D2 identity | `UNKNOWN` | Each store logs its own ID; no shared key in inspected helpers/logs |
 | D3 emission lineage | `UNKNOWN` | No observation ID/source time in the inspected candidate logs |
 | D4 horizon lineage | `UNKNOWN` | Label events are aggregates; overwrite and prune behavior not verified in production |
 | D5, D6 | Untouched | Out of scope |
