@@ -15,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from dashboard import db
+from dashboard.stop_shortfall_summary import get_stop_shortfall_summary
+from starlette.responses import JSONResponse
 from dashboard.models import (
     AlertResponse,
     CandidateResponse,
@@ -23,6 +25,7 @@ from dashboard.models import (
     SignalTrustScorecardsResponse,
     SignalHitRate,
     StatusResponse,
+    StopShortfallSummaryResponse,
     TodaysFocusResponse,
     TradeInboxResponse,
     WinRateResponse,
@@ -799,6 +802,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():
         return await db.get_trading_positions(_db_path)
+
+    summary_db_path = db_path or _db_path
+
+    @app.get(
+        "/api/trading/stop-shortfall-summary",
+        response_model=StopShortfallSummaryResponse,
+    )
+    async def stop_shortfall_summary_endpoint():
+        payload = StopShortfallSummaryResponse.model_validate(
+            await get_stop_shortfall_summary(summary_db_path)
+        ).model_dump()
+        headers = {"Cache-Control": "no-store"}
+        if not payload["meta"]["ok"]:
+            headers["Retry-After"] = "60"
+        return JSONResponse(
+            payload, status_code=200 if payload["meta"]["ok"] else 503, headers=headers
+        )
 
     @app.get("/api/trading/history")
     async def get_trading_history_endpoint(

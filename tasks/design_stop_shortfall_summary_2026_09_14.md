@@ -220,3 +220,7 @@ If evidence changed, explain using current rows rather than expecting355/23 fore
 Revert new dashboard source/component/dist to previous approved version; no data
 restore/migration. No source suppression, flag changes, live orders, capital,
 paid APIs or external messages. Design review pending; implementation remains held.
+
+## Design clearance
+
+Both independent design reviewers APPROVE e4f8ecbc0895fd69f8dc2a98edb4d180805391b9, no folds. Root explicitly authorized build after those terminal approvals. Fresh dashboard WorkingDirectory=/root/gecko-alpha and checkout d2f0d61e at00:36Z are root-provided runtime evidence, not deployment of this candidate.

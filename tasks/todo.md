@@ -2440,6 +2440,6 @@ watchdog remain off; captured discoveries remain execution-ineligible.
 - [x] Two independent plan reviews approved4085bf88; fresh schema/hash/cohort runtime prerequisites verified.
 - [x] Design-only artifact tasks/design_stop_shortfall_summary_2026_09_14.md prepared with SQL and Python deadlines.
 
-- [ ] Two independent design reviews/folds before any code build.
+- [x] Both independent design reviewers approved e4f8ecbc without folds before build; root authorized implementation.
 
 Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
