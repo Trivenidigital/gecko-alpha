@@ -17,8 +17,15 @@ Phases, measured separately:
 
 Every report carries an overall ``verdict`` (pass | fail | inconclusive) and an
 explicit ``stop_reason``. A run that never catches up, or stops on repeated
-429s, is a FAIL. Quota is unknown and NOT probed: the probe stops after
+429s or ``--stop-after-failed-passes`` consecutive failed passes, is a FAIL.
+Quota is unknown and NOT probed: the probe stops after
 ``--stop-after-rate-limits`` throttled passes or ``--max-rpc-calls``.
+
+An authenticated endpoint is passed by environment variable NAME
+(``--rpc-url-env``), never on the command line; only that one variable is
+read. ``--provider-log-range-cap`` / ``--provider-batch-cap`` refuse, before
+any traffic, settings whose eth_getLogs range (span + reorg overlap) or header
+batch exceeds the provider's documented limits.
 
 Run on the host (native shell), from the repo root:
     python investigation/rh_pons_sustained_capacity_probe_20260913.py \
@@ -31,6 +38,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sqlite3
 import sys
 import tempfile
@@ -38,6 +46,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -50,6 +59,44 @@ from scout.ingestion import rh_pons  # noqa: E402
 PUBLIC_RPC = "https://rpc.mainnet.chain.robinhood.com"
 REAL_TIME_EVENTS = ("token_launched", "curve_buy", "curve_sell", "pool_graduated")
 FAILED_STATUSES = ("failed", "timeout", "error", "refused")
+
+
+class ProbeConfigError(ValueError):
+    """Invalid probe configuration, raised before any RPC traffic. Messages
+    name inputs but never contain endpoint values."""
+
+
+def positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def resolve_rpc_url(args: argparse.Namespace) -> str:
+    """``--rpc-url`` or, with ``--rpc-url-env``, only that named variable."""
+    name = args.rpc_url_env
+    if name is None:
+        return args.rpc_url
+    value = os.environ.get(name, "")
+    if not value.strip():
+        raise ProbeConfigError(
+            f"environment variable {name} is not set or empty"
+        ) from None
+    try:
+        parts = urlsplit(value)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+        parts.port  # raises ValueError (quoting the port text) when malformed
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ProbeConfigError(
+            f"environment variable {name} is not an http(s) URL with a host"
+        ) from None
+    return value
 
 
 class IsolatedSettings(Settings):
@@ -70,8 +117,6 @@ class IsolatedSettings(Settings):
 
 
 def redact(url: str) -> str:
-    from urllib.parse import urlsplit
-
     parts = urlsplit(url)
     return f"{parts.scheme or 'unknown'}://{parts.hostname or 'unknown'}"
 
@@ -91,7 +136,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         ANTHROPIC_API_KEY="unused",
         DB_PATH="unused.db",
         RH_PONS_COLLECTOR_ENABLED=True,
-        RH_PONS_RPC_URL=args.rpc_url,
+        RH_PONS_RPC_URL=resolve_rpc_url(args),
         RH_PONS_INITIAL_LOOKBACK_BLOCKS=args.backlog_blocks,
         RH_PONS_START_BLOCK=None,
         RH_PONS_BACKFILL_BLOCK_SPAN=args.max_span,
@@ -117,6 +162,41 @@ def effective_settings(settings: Settings) -> dict[str, Any]:
     values["RH_PONS_RPC_URL"] = redact(settings.RH_PONS_RPC_URL)
     values["SQLITE_BUSY_TIMEOUT_MS"] = settings.SQLITE_BUSY_TIMEOUT_MS
     return values
+
+
+def isolation_report(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "database": "temporary_directory",
+        "settings_sources": "in_code_init_only",
+        "reads_dotenv": False,
+        # The endpoint variable's NAME only; its value is never reported.
+        "environment_variables_read": [args.rpc_url_env] if args.rpc_url_env else [],
+    }
+
+
+def preflight_provider_caps(args: argparse.Namespace, settings: Settings) -> None:
+    """Refuse settings beyond the provider's documented limits, before traffic.
+
+    A checkpointed pass queries eth_getLogs from ``next_block - overlap``
+    through ``next_block + span - 1``: span + overlap blocks inclusive. The
+    header batch only ever shrinks (HTTP 413) from its configured size.
+    """
+    range_cap = args.provider_log_range_cap
+    if range_cap is not None:
+        span = settings.RH_PONS_BACKFILL_BLOCK_SPAN
+        overlap = settings.RH_PONS_REORG_OVERLAP_BLOCKS
+        if span + overlap > range_cap:
+            raise ProbeConfigError(
+                f"eth_getLogs range needs {span + overlap} blocks (max span {span}"
+                f" + reorg overlap {overlap}), above --provider-log-range-cap"
+                f" {range_cap}"
+            )
+    batch_cap = args.provider_batch_cap
+    batch = settings.RH_PONS_HEADER_BATCH_SIZE
+    if batch_cap is not None and batch > batch_cap:
+        raise ProbeConfigError(
+            f"header batch size {batch} is above --provider-batch-cap {batch_cap}"
+        )
 
 
 def read_durable_checkpoint(db_path: Path) -> dict[str, Any] | None:
@@ -205,6 +285,16 @@ def stop_reason_for(
     """The limit that actually ended the run, most severe first."""
     if sum(1 for r in results if r["rate_limited"]) >= args.stop_after_rate_limits:
         return "rate_limited"
+    failed_limit = getattr(args, "stop_after_failed_passes", None)
+    if failed_limit is not None:
+        # Longest run anywhere: once the stop fired, a pass that finished
+        # during cancellation does not rewrite the reason.
+        streak = longest = 0
+        for r in results:
+            streak = streak + 1 if r.get("status") in FAILED_STATUSES else 0
+            longest = max(longest, streak)
+        if longest >= failed_limit:
+            return "failed_passes"
     max_calls = getattr(args, "max_rpc_calls", None)
     if max_calls is not None and sum(r["rpc_calls"] for r in results) >= max_calls:
         return "max_rpc_calls"
@@ -325,6 +415,8 @@ def evaluate(
     inconclusive: list[str] = []
     if stop_reason == "rate_limited":
         failures.append("stopped_on_rate_limits")
+    if stop_reason == "failed_passes":
+        failures.append("stopped_on_failed_passes")
     drain = summary.get("drain")
     if not drain or drain.get("coverage_to_chain_ratio") is None:
         verdict["drain_ratio_ge_1_2"] = False
@@ -387,10 +479,12 @@ def evaluate(
 
 
 async def run(args: argparse.Namespace) -> dict:
-    if args.db_output is not None and args.db_output.exists():
-        # Fail before any network call; never overwrite an existing database.
-        raise FileExistsError(f"refusing to overwrite {args.db_output}")
+    # Every refusal below happens before any network call.
     settings = build_settings(args)
+    preflight_provider_caps(args, settings)
+    if args.db_output is not None and args.db_output.exists():
+        # Never overwrite an existing database.
+        raise FileExistsError(f"refusing to overwrite {args.db_output}")
     results: list[dict] = []
     catchup: dict | None = None
     done = asyncio.Event()
@@ -448,7 +542,8 @@ async def run(args: argparse.Namespace) -> dict:
         db = Database(db_path)
         await db.initialize()
         try:
-            async with aiohttp.ClientSession(trust_env=True) as session:
+            # Like the pipeline session: no proxy from the environment.
+            async with aiohttp.ClientSession(trust_env=False) as session:
                 task = asyncio.create_task(
                     rh_pons.run_rh_pons_loop(session, db, settings, on_pass=observe)
                 )
@@ -483,12 +578,8 @@ async def run(args: argparse.Namespace) -> dict:
         )
     return {
         "scope": "isolated_public_rpc_sustained_capacity",
-        "isolation": {
-            "database": "temporary_directory",
-            "settings_sources": "in_code_init_only",
-            "reads_dotenv_or_environment": False,
-        },
-        "endpoint": redact(args.rpc_url),
+        "isolation": isolation_report(args),
+        "endpoint": redact(settings.RH_PONS_RPC_URL),
         "quota": "unknown_not_probed",
         "stop_reason": stop_reason,
         "effective_settings": effective_settings(settings),
@@ -516,7 +607,32 @@ async def run(args: argparse.Namespace) -> dict:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--rpc-url", default=PUBLIC_RPC)
+    endpoint = p.add_mutually_exclusive_group()
+    endpoint.add_argument(
+        "--rpc-url",
+        default=PUBLIC_RPC,
+        help="Credential-free endpoint only: arguments are visible to other users",
+    )
+    endpoint.add_argument(
+        "--rpc-url-env",
+        metavar="NAME",
+        help="Read the endpoint URL from this one environment variable",
+    )
+    p.add_argument(
+        "--provider-log-range-cap",
+        type=positive_int,
+        help="Provider's max eth_getLogs blocks; refuse max span + reorg overlap above it",
+    )
+    p.add_argument(
+        "--provider-batch-cap",
+        type=positive_int,
+        help="Provider's max JSON-RPC batch; refuse a larger header batch",
+    )
+    p.add_argument(
+        "--stop-after-failed-passes",
+        type=positive_int,
+        help="Stop (verdict fail) after this many consecutive failed passes",
+    )
     p.add_argument("--max-seconds", type=float, default=900)
     p.add_argument("--max-passes", type=int, default=5000)
     p.add_argument("--max-rpc-calls", type=int, default=10_000)
@@ -547,7 +663,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    report = asyncio.run(run(args))
+    try:
+        report = asyncio.run(run(args))
+    except ProbeConfigError as exc:
+        print(f"refused before any RPC traffic: {exc}", file=sys.stderr)
+        return 2
     text = json.dumps(report, indent=2, default=str)
     if args.output:
         args.output.write_text(text + "\n", encoding="utf-8")
