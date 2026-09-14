@@ -47,6 +47,7 @@ Mapping to chain, contract address and quote currency must be shown, not assumed
 
 **D3 — Emission price lineage**
 - *Requirement:* identifies the actual price selected at emission: source store or provider, observation ID or equivalent, observed time and ingested time kept separate from `emitted_at`, and the asset, chain and quote currency.
+- *Freshness:* before a future study, declare maximum emission observation age and its timestamp basis. Reject invalid or future timestamps and observations beyond that age as NOT_MET; keep exclusions visible under D5. This contract sets no numeric live policy.
 - *Counterexamples:* `anchor_cache_age_seconds=0.0` produced by the default (`outcome_ledger.py:511-518`); a losers `price_at_snapshot` with no snapshot source time; a `price_cache` value that was later overwritten.
 
 **D4 — Horizon price lineage and lateness**
@@ -88,3 +89,7 @@ Also confirm by hand that the diff is docs-only, every number carries its date, 
 - [ ] Contract build · [ ] PR · [ ] PR reviews ×2 (both finished) · [ ] PR folds and re-review on the new SHA
 
 **Boundary:** no application changes, schema proposal, writers, activation, retention, soak, paid calls, UI or ranking. The verdict stays `UNKNOWN` until an evidence inventory shows otherwise.
+
+## Design reviews
+
+Both independent reviewers completed a4774e63: contract_scope approved; contract_evidence requested an emission-age requirement. Folded a predeclared age limit, timestamp basis, invalid/future rejection and D5 exclusion treatment. No implementation or live policy change.
