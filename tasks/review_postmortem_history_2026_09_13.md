@@ -61,3 +61,4 @@ imported unchanged from PR576 (.reviewers/576.toml and capacity smoke JSON).
 Existing clearances have not been repointed: the inherited scout/scripts/tests
 changes require renewed independent review of the integrated candidate and
 fresh exact-head CI. Root coordinates those gates. No merge or deploy performed.
+Both renewed reviewers terminal APPROVE cbb23c5314c9914b1fb372b06d342b5742bbf43f: logic_review (logic/concurrency) and ops_review (ops-safety/silent-failure/attribution). Each independently reran142focused tests; no actionable findings. Verified viewer unchanged from2cb1d4f9 and capture unchanged from reviewed master. Clearance metadata renewed to this exact candidate; final metadata-head CI required. Fresh srilu runtime2026-09-14T00:22:20Z confirms31postmortems and expected schema; services active at00:20:59Z, HEADd2f0d61e. No deployment.

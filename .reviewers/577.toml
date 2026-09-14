@@ -13,7 +13,7 @@ watch = [
 # renewed approval after per-app DB isolation fix; 14 focused tests. No required fixes.
 # Later changes are review/task metadata only; no code drift.
 [clearances]
-concurrency = "2cb1d4f96d9e96461df11146194257f25df5dd63"
-logic = "2cb1d4f96d9e96461df11146194257f25df5dd63"
-ops-safety = "2cb1d4f96d9e96461df11146194257f25df5dd63"
-silent-failure = "2cb1d4f96d9e96461df11146194257f25df5dd63"
+concurrency = "cbb23c5314c9914b1fb372b06d342b5742bbf43f"
+logic = "cbb23c5314c9914b1fb372b06d342b5742bbf43f"
+ops-safety = "cbb23c5314c9914b1fb372b06d342b5742bbf43f"
+silent-failure = "cbb23c5314c9914b1fb372b06d342b5742bbf43f"
