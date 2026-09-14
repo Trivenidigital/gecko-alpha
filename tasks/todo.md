@@ -1,7 +1,7 @@
 ## Active Work: 2026-09-14 — DASH-11 provenance readiness
 
 - [x] Current-master drift and initial production read-only check.
-- [ ] Plan/design: two parallel reviewers each; fold before audit artifact.
+- [x] Plan/design: two parallel reviewers each; folds applied.
 - [ ] Pinned provenance/retention audit, findings PR and two-vector PR review.
 - Plan: tasks/plan_dash11_provenance_2026_09_14.md.
 ## Active Work: 2026-09-13 22:15 - Historical entry-stop display
@@ -2438,4 +2438,3 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
 and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
 watchdog remain off; captured discoveries remain execution-ineligible.
-

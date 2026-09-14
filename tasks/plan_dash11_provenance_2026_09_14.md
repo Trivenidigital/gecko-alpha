@@ -27,10 +27,10 @@ Base e6a55d7a, production d2f0d61e. Prior #571 fixed population-ratio reporting;
 ## Sequence
 
 - [x] Refresh master; read memory/rules/lessons/todo/top snapshot; drift and Hermes checks.
-- [ ] Two parallel plan reviews; fold issues before design.
-- [ ] Write audit design; two parallel design reviews; fold issues.
-- [ ] Run bounded pinned SQLite mode=ro/query_only snapshot; aggregate evidence only, no secrets or vendor calls.
-- [ ] Write findings with exact source citations, snapshot times, observed/inferred/unproven distinctions and health-only versus cost gates.
+- [x] Two parallel plan reviews; fold issues before design.
+- [x] Write audit design; two parallel design reviews; fold issues.
+- [x] Run bounded pinned SQLite mode=ro/query_only snapshot; aggregate evidence only, no secrets or vendor calls.
+- [x] Write findings with exact source citations, snapshot times, observed/inferred/unproven distinctions and health-only versus cost gates.
 - [ ] Verify existing analyzer tests and document checks; commit findings and open PR.
 - [ ] Two parallel PR reviews; fold findings. Leave PR for CI if merge prerequisites are incomplete.
 

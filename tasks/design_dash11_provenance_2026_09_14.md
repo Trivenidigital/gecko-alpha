@@ -31,3 +31,5 @@ Write tasks/findings_dash11_provenance_2026_09_14.md, update only active todo/pl
 Structural reviewer approved: exact analyzer cohort/tie semantics and replayability-versus-validity distinction adopted above. Safety review recorded after response; design cannot proceed to execution before both plan and both design reviews complete.
 
 Safety plan review approved with folds adopted: pinned BEGIN, UTC/canonical selection, hard query deadlines; inspect EXPLAIN QUERY PLAN for the per-token historical lookup before running the cohort. No raw DB copy.
+
+Both design reviewers approved. Execution folds: original stored anchor; invalid anchors counted; timeouts mean incomplete evidence. Runtime results and the EXPLAIN inspection timing deviation are recorded in findings.
