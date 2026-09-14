@@ -1,6 +1,7 @@
 **New primitives introduced:** one small read-only status endpoint and a shared
-frontend status annotation/fetch helper. Reuse existing signal_params reader and
-badge/provenance patterns; no new policy, ranking, state store or DB table.
+frontend status annotation/fetch helper, with a narrow lossless status reader.
+Reuse existing read-only connection and badge/provenance patterns; no new policy,
+ranking, state store or DB table. Existing status readers keep their behavior.
 
 # DASH-08 current lane status annotation plan
 
@@ -11,7 +12,7 @@ residual are documented below; this is not a replacement Signal Trust surface.
 
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
-| Gecko current lane status | none applicable identified in accessible directory; Hub catalog loading | Reuse dashboard.db.get_signal_params_live; narrow read-only API projection |
+| Gecko current lane status | none applicable identified in accessible directory; Hub catalog loading | Reuse read-only DB access; narrow lossless reader/API projection because existing reader coerces invalid values |
 | React annotation and freshness | no Gecko-specific replacement identified | Existing React fetch, badge and provenance patterns; small shared presentation helper |
 
 Checked2026-09-14: https://hermes-agent.nousresearch.com/docs/skills/ returned a
@@ -44,7 +45,11 @@ this planning task performs no build and authorizes no deployment.
   evidence. Root narrowed this task to annotation only; demotion is excluded.
 - dashboard/db.py:3620 already reads signal_params through _ro_db and returns
   enabled, suspended_at/reason and last_calibration_at keyed by signal_type.
-  Missing schema/read errors propagate to the caller. Reuse this reader.
+  Missing schema/read errors propagate to the caller. However its int(enabled)
+  coercion at3647 maps SQLite REAL1.5 to1, destroying evidence required to classify
+  invalid data as unknown. Its output is therefore insufficient for the new
+  annotation. A narrow lossless read of the same fields is justified; preserve
+  this existing function and all its consumers unchanged.
 - dashboard/api.py:412 joins that reader into the static Signal Trust registry,
   but only for registry entries and only when registry loading succeeds. This
   cannot provide independent complete lane status if the registry fails or omits
@@ -66,6 +71,10 @@ this planning task performs no build and authorizes no deployment.
 - Operational code scout/trading/trade_surface_alerts.py:163-188 consumes existing
   Inbox/Focus db helpers. Preserve those helpers and their return values exactly;
   keep annotation in a separate read-only API/frontend presentation path.
+- create_app at dashboard/api.py:215 declares _db_path global; legacy route reads
+  can follow the last-created app. postmortem_db_path at220 demonstrates the
+  explicit local capture pattern. The new route must capture its own path inside
+  create_app at construction and never read the mutable global at request time.
 - scout/trading/params.py:157 bypasses table params when SIGNAL_PARAMS_ENABLED is
   false and can fall back to settings on a missing row. engine.py:402 checks the
   resolved enabled value; further trust/execution gates exist. A table-status
@@ -98,9 +107,16 @@ freshness must refer to observation time, not the age of policy changes.
 
 ## Proposed annotation contract for design
 
-Add a small GET /api/signal_lane_status using the existing per-app _db_path closure
-and get_signal_params_live, without ScoutDatabase.initialize or Settings-driven
-engine evaluation. Return the raw current store fields with an observation timestamp,
+Add a small GET /api/signal_lane_status with an explicit app-local path captured
+inside create_app, analogous to postmortem_db_path. A narrow read-only helper reads
+the required fields without int/bool/string normalization of enabled. Validate the
+raw SQLite type/value before classification or Pydantic coercion: fractional REAL
+values such as1.5, invalid text, NULL and other noncanonical evidence must remain
+unknown rather than become0/1. Design must specify strict accepted storage types
+and JSON-safe unknown provenance without converting invalid values into valid ones.
+Do not change get_signal_params_live or existing Signal Trust behavior as a shortcut.
+Use no ScoutDatabase.initialize or Settings-driven engine evaluation. Return current
+store evidence with an observation timestamp,
 explicit source=signal_params, no-store caching, and visibility-only semantics.
 Missing DB/schema/query errors produce explicit unavailable status, never an empty
 success interpreted as enabled. Exact response/error schema and limits belong in
@@ -144,6 +160,10 @@ endpoint; partial registry matching alone is insufficient.
 - [ ] Separate design pins endpoint schema, lifecycle/ownership/freshness behavior,
   exact join semantics and additive component placement; two design approvals.
 - [ ] Test-first API isolation/missing-schema/error/empty-map cases with fixture DBs;
+  create two app instances against distinct databases, then alternate/concurrently
+  request each after the second construction: each must retain its captured path.
+  Insert enabled=1.5 into a real SQLite fixture and assert unknown with preserved
+  invalid evidence; int/bool/Pydantic coercion restoring enabled must fail the test.
   enabled0 versus suspension, enabled1, invalid/null/conflicting fields, mixed lanes,
   absent tracker key and stale/future observation cases with hand-derived outcomes.
 - [ ] Prove presentation does not change ordered row keys, counts, groups, scores,
@@ -153,7 +173,9 @@ endpoint; partial registry matching alone is insufficient.
   pause/unmount, cached Focus rows and clock expiry. Old enabled status must not be
   resurrected or rendered current; status failure leaves all original cards usable.
 - [ ] Implement only approved API/model/presentation files and focused tests. Likely
-  files: dashboard/api.py, optional dashboard/models.py response model, shared
+  files: dashboard/api.py, a narrowly scoped raw reader (separate module or additive
+  helper chosen in design, existing reader unchanged), optional strict
+  dashboard/models.py response model, shared
   frontend signalLaneStatus helper/component/hook, TodayFocusPanel/TradeInboxTab,
   tests/test_signal_lane_status_endpoint.py and frontend behavior tests.
 - [ ] Run relevant API/Focus/Inbox/contract and frontend tests, reviewed build/dist
