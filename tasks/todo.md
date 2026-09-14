@@ -1,3 +1,13 @@
+## DASH-11 suppression cohort health — 2026-09-14
+
+- [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
+- [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
+- [x] Design and both resource amendments received two independent approvals before each build slice.
+- [x] Final14d scope approved; exact three private-copy trials2.047/0.444/0.388s pass predeclared4s gate and full parity.85focused tests and React/browser fixture QA pass.
+- [x] PR585 original and renewed integration661020e8 received two independent approvals; four-vector clearances recorded.100combined tests and84-module/3-file build parity pass.
+
+- [x] PR585 exact f64bf7c2 CI passed (8055 tests,14 skipped,118 contracts); two recovery reviews passed and merged829d12b1 at2026-09-14T12:32:18Z. Successor deployment remains separately verified.
+
 ## DASH-12 full frontend rebuild parity — 2026-09-14
 
 - [x] Fresh-master isolated worktree; drift and Hermes-first checks; plan only written.
@@ -7,7 +17,7 @@
 - [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
 - [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
 - [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
-- [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
+- [x] PR582 final CI passed (8003 tests,12 skipped,118 contracts); merged2b084e27 at2026-09-14T02:53:28Z. CI-only change; no runtime deployment required.
 - Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
 
 ## Telegram recorded-outcome visibility — 2026-09-13
@@ -2510,3 +2520,35 @@ Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive sum
 - [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
 
 Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
+## DASH-08 current recorded lane status — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift/data-path and Hermes checks.
+- [x] Bounded read-only runtime schema/status/flag observations; plan only written.
+- [x] Plan a0703322 approved by root structural and ops provenance reviewers.
+- [x] Separate design drafted with raw storage, per-app target and freshness contracts.
+- [x] Design d0130893 approved by root reader/provenance and postmortem lifecycle/freshness reviewers.
+- [x] Annotation-only implementation52ba7dd7; Linux164 tests, exact fresh-build parity, and built-page mixed-lane visual/failure checks passed.
+- [x] WS master552db707 integrated at555f1676;76 relevant API/lifecycle tests passed; lane/frontend bytes unchanged.
+- [x] PR584 independently approved at25733ca5: ops reader/provenance74tests and postmortem controller/render/mapping29tests; no findings, clearances recorded.
+- [ ] Exact final-head CI before root merge; no deployment by this task.
+- Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
+
+## WebSocket disconnect cleanup: 2026-09-14
+
+- [x] Fresh isolated master worktree; drift/Hermes/source/runtime evidence documented in plan_ws_disconnect_cleanup_2026_09_14.md.
+- [x] Two plan reviews before design; two design reviews before implementation.
+- [x] Real-handler disconnect/cleanup/transient-DB regressions, bounded natural shutdown proof and focused verification.
+- [x] Two independent PR583 approvals at6a644a45; four-vector clearances recorded truthfully.
+- [ ] Exact final-head CI before root integration; no production actions in this task.
+
+Review: PR583 built and independently approved; CI pending. Frozen selective release07afc0ad unchanged.
+
+- [x] WS plan3e86326c approved independently by ops and logic without folds; design-only lifecycle/shutdown artifact prepared.
+- [x] Two independent WS design approvals preceded implementation.
+
+- [x] WS design7cc39a0a approved by ops and logic; minimal send-boundary fix built after actual-handler red tests.
+- [x] Natural Uvicorn old-code shutdown falsifier failed; corrected lifecycle5pass and combined API/cold-start51pass; formatting/diff checks pass.
+- [x] WS PR: operations51tests and independent structural49tests approved6a644a45 without findings.
+- [ ] Exact CI before root merge/integration.
+
+WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.

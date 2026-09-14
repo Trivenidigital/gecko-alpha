@@ -1,0 +1,12 @@
+# Independent PR reviews: content_probe structural/logic/concurrency and
+# merge_ops operations/silent-failure. Each independently ran25 harness tests.
+pr = 586
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh", "tasks/release_dashboard_backup.py", "tasks/release_dashboard_manifest.py", "tasks/release_dashboard_validate.py"]
+
+[clearances]
+concurrency = "32508af8f0afae3610122bb37039178eaaa682f6"
+logic = "32508af8f0afae3610122bb37039178eaaa682f6"
+ops-safety = "32508af8f0afae3610122bb37039178eaaa682f6"
+silent-failure = "32508af8f0afae3610122bb37039178eaaa682f6"

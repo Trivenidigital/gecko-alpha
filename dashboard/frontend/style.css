@@ -2045,3 +2045,35 @@ body {
 .postmortem-history button { padding: 8px 14px; border: 1px solid var(--color-border); border-radius: 6px; color: var(--color-text-primary); background: var(--color-bg-secondary); cursor: pointer; }
 .postmortem-history button:disabled { opacity: .45; cursor: default; }
 .postmortem-history-paging { margin-top: 20px; }
+/* Read-only suppression health; bounded fixed-window observations. */
+.suppression-health p { margin: .6rem 0; line-height: 1.5; }
+.suppression-health table { width: 100%; min-width: 520px; border-collapse: collapse; margin: .75rem 0; }
+.suppression-health th, .suppression-health td { padding: .45rem .65rem; text-align: left; border-bottom: 1px solid var(--color-border, #30363d); }
+.suppression-health small { color: var(--color-text-secondary, #9ca3af); font-size: .75rem; }
+.suppression-health button { padding: .4rem .7rem; color: inherit; background: transparent; border: 1px solid var(--color-border, #30363d); border-radius: 4px; cursor: pointer; }
+.suppression-health button:disabled { opacity: .55; cursor: wait; }
+.lane-status-notice {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin: 0 0 10px;
+}
+.lane-status-annotations {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  margin: 6px 0;
+  min-width: 0;
+  max-width: 100%;
+}
+.lane-status-annotations summary { cursor: pointer; overflow-wrap: anywhere; }
+.lane-status-chip {
+  display: inline-block;
+  max-width: 100%;
+  padding: 2px 5px;
+  margin: 2px 4px 2px 0;
+  border: 1px solid var(--color-border, #334155);
+  border-radius: 4px;
+  white-space: normal;
+  vertical-align: middle;
+}
+.lane-status-evidence { padding: 6px 0; overflow-wrap: anywhere; }
+.lane-status-detail { margin-top: 6px; }
