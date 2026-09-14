@@ -2475,3 +2475,6 @@ Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No producti
 - [ ] Two PR reviews and exact CI before root integration; no production actions in this task.
 
 Review: PLAN ONLY. Frozen selective release07afc0ad unchanged; no application code edits or tests implemented.
+
+- [x] WS plan3e86326c approved independently by ops and logic without folds; design-only lifecycle/shutdown artifact prepared.
+- [ ] Two independent WS design approvals before implementation; no code/test/deployment changes yet.
