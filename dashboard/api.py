@@ -2008,9 +2008,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         default=str,
                     )
 
-                    await ws.send_text(payload)
                 except Exception:
-                    pass  # DB may not exist yet -- keep connection alive
+                    pass  # Retry transient DB/payload preparation failures.
+                else:
+                    await ws.send_text(payload)
 
                 await asyncio.sleep(5)
         except WebSocketDisconnect:
