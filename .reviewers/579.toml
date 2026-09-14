@@ -8,10 +8,10 @@ watch = [
 ]
 
 # Refreshed-head reviews after preserving both todo sections during master merge.
-# audit_structure approved logic/concurrency; audit_safety approved
-# ops-safety/silent-failure. Schema count and citation folds verified.
+# refresh_logic approved logic/concurrency; refresh_safety approved
+# ops-safety/silent-failure. No new blockers; both todo sections preserved.
 [clearances]
-concurrency = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
-logic = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
-ops-safety = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
-silent-failure = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
+concurrency = "3fee28608869edaf18413e8c286b8b15600dde55"
+logic = "3fee28608869edaf18413e8c286b8b15600dde55"
+ops-safety = "3fee28608869edaf18413e8c286b8b15600dde55"
+silent-failure = "3fee28608869edaf18413e8c286b8b15600dde55"
