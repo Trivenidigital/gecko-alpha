@@ -1,3 +1,9 @@
+## Active Work: 2026-09-14 — Suppression trust evidence contract
+
+- [x] Refresh master, drift/Hermes checks and schema/source-only production preflight.
+- [ ] Plan and two reviews; design and two reviews; docs contract and two PR reviews.
+- Plan: tasks/plan_suppression_trust_evidence_contract_2026_09_14.md.
+
 ## Active Work: 2026-09-14 — DASH-11 provenance readiness
 
 - [x] Current-master drift and initial production read-only check.
@@ -2575,3 +2581,4 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
