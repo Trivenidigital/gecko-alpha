@@ -2487,7 +2487,8 @@ Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No producti
 - [x] Design d0130893 approved by root reader/provenance and postmortem lifecycle/freshness reviewers.
 - [x] Annotation-only implementation52ba7dd7; Linux164 tests, exact fresh-build parity, and built-page mixed-lane visual/failure checks passed.
 - [x] WS master552db707 integrated at555f1676;76 relevant API/lifecycle tests passed; lane/frontend bytes unchanged.
-- [ ] PR/two reviews and exact final-head CI.
+- [x] PR584 independently approved at25733ca5: ops reader/provenance74tests and postmortem controller/render/mapping29tests; no findings, clearances recorded.
+- [ ] Exact final-head CI before root merge; no deployment by this task.
 - Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
 
 ## WebSocket disconnect cleanup: 2026-09-14

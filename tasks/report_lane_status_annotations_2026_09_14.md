@@ -72,7 +72,10 @@ visual finding. Inbox fixture omits unrelated metadata and is not evidence of
 production metadata correctness. All browser assertions concern the new annotations
 and preservation of fixture cards, not production data.
 
-Open PR with codex/codex-automation labels. Two
-independent code approvals and exact final-head CI remain mandatory. No merge or
+PR584 has codex/codex-automation labels and two independent terminal approvals at
+25733ca5b82e12527204cc59d6aa6ab9d3d4dd78, relayed by root: ops reader/provenance
+review74 tests; postmortem controller/render/exact-mapping review29 tests. No findings.
+Clearance/status metadata preserves all implementation files. Exact final-head CI
+remains mandatory. No merge or
 deployment is performed by this task. Runtime evidence in the plan is dated and
 does not claim any current engine process's in-memory eligibility state.
