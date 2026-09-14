@@ -48,7 +48,7 @@ Numeric examples below are dated 2026-09-14T13:03:47Z audit observations, not cu
 - **A6 terminal labels:** 9,832 complete rows with 4,486 missing r7d; peak7d-only `complete` → not maturity.
 - **A7 null/missingness:** dropping `price=None` rows before computing returns → rejected unless a declared estimand and reviewed missingness/selection treatment support the claim; reporting excluded share per signal is necessary but insufficient. Separate immature outcomes from mature-missing returns. Treating NULL as a zero return → rejected.
 - **A8 earliest anchor:** the cohort picks each token's earliest in-window anchor (51 of 1,530 with r7d). The contract must report left censoring at the window edge, anchor-selection skew toward priced branches, and not sum counts across status groups.
-- **A9 freshness laundering:** a runtime check today reproduces the dated counts → the counts keep their 13:03:47Z date.
+- **A9 freshness laundering:** copying the dated counts keeps their 13:03:47Z date; a new query must be separately timestamped.
 
 ## Assumptions the parent verifies before any runtime decision
 - Current schema and the source lines above match production HEAD. The parent checks only schema and source, not counts.
@@ -56,13 +56,13 @@ Numeric examples below are dated 2026-09-14T13:03:47Z audit observations, not cu
 - There is no ledger pruner and no shared key. This comes from a source search and is not exhaustive.
 
 ## Checklist
-- [ ] Plan (this)
-- [ ] Plan review 1 (evidence/statistics) · [ ] Plan review 2 (scope/authorization boundary)
-- [ ] Fold plan findings
-- [ ] Design doc
-- [ ] Design review 1 · [ ] Design review 2
-- [ ] Fold design findings
-- [ ] Contract build (findings doc plus queue link)
+- [x] Plan (this)
+- [x] Plan review 1 (evidence/statistics) · [x] Plan review 2 (scope/authorization boundary)
+- [x] Fold plan findings
+- [x] Design doc
+- [x] Design review 1 · [x] Design review 2
+- [x] Fold design findings
+- [x] Contract build (findings doc plus queue link)
 - [ ] PR (docs-only; `.reviewers/<PR>.toml` records the reviewer SHAs)
 - [ ] PR review 1 · [ ] PR review 2 (both must finish before merge)
 - [ ] Fold PR findings; re-run affected reviewers on the new SHA

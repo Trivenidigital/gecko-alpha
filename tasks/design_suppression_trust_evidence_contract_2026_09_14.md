@@ -85,7 +85,7 @@ Also confirm by hand that the diff is docs-only, every number carries its date, 
 
 ## Checklist
 - [x] Plan · [x] Plan reviews ×2 · [x] Plan folds
-- [ ] Design · [ ] Design reviews ×2 · [ ] Design folds
+- [x] Design · [x] Design reviews ×2 · [x] Design folds
 - [ ] Contract build · [ ] PR · [ ] PR reviews ×2 (both finished) · [ ] PR folds and re-review on the new SHA
 
 **Boundary:** no application changes, schema proposal, writers, activation, retention, soak, paid calls, UI or ranking. The verdict stays `UNKNOWN` until an evidence inventory shows otherwise.
@@ -93,3 +93,5 @@ Also confirm by hand that the diff is docs-only, every number carries its date, 
 ## Design reviews
 
 Both independent reviewers completed a4774e63: contract_scope approved; contract_evidence requested an emission-age requirement. Folded a predeclared age limit, timestamp basis, invalid/future rejection and D5 exclusion treatment. No implementation or live policy change.
+
+Fold closure: contract_evidence approved 7b337985; contract_scope approval of a4774e63 remains applicable to the narrowed freshness requirement.
