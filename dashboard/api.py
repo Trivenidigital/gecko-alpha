@@ -232,11 +232,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(title="Gecko-Alpha Dashboard", lifespan=lifespan)
 
-    @app.get('/api/suppression_cohort/health')
+    @app.get("/api/suppression_cohort/health")
     async def suppression_health_endpoint():
         result = await suppression_reader.get()
-        return JSONResponse(result, status_code=200 if result['meta']['ok'] else 503,
-                            headers={'Cache-Control': 'no-store'})
+        return JSONResponse(
+            result,
+            status_code=200 if result["meta"]["ok"] else 503,
+            headers={"Cache-Control": "no-store"},
+        )
 
     repo_root = Path(__file__).resolve().parent.parent
 

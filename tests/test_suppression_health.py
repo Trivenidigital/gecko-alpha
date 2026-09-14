@@ -328,7 +328,11 @@ def test_oversized_verdict_and_invalid_anchor_id_refuse(ledger):
     with db_connection(ledger) as conn:
         conn.execute("ALTER TABLE signal_outcome_ledger RENAME TO original")
         conn.execute(
-            "CREATE VIEW signal_outcome_ledger AS SELECT CAST(id AS TEXT) AS id,kind,token_id,surface,gate_verdicts,emitted_at,r24h,r7d,label_status FROM original"
+            "CREATE TABLE signal_outcome_ledger AS SELECT CAST(id AS TEXT) AS id,kind,token_id,surface,gate_verdicts,emitted_at,r24h,r7d,label_status FROM original"
+        )
+        conn.execute("DROP INDEX idx_sol_status_emitted")
+        conn.execute(
+            "CREATE INDEX idx_sol_status_emitted ON signal_outcome_ledger(label_status,emitted_at)"
         )
     assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "schema_unavailable"
 
