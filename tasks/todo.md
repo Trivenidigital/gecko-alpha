@@ -14,7 +14,7 @@
 - [x] Final14d scope approved; exact three private-copy trials2.047/0.444/0.388s pass predeclared4s gate and full parity.85focused tests and React/browser fixture QA pass.
 - [x] PR585 original and renewed integration661020e8 received two independent approvals; four-vector clearances recorded.100combined tests and84-module/3-file build parity pass.
 
-- [x] PR585 merged as 829d12b1 at 2026-09-14T12:32:18Z. Deployment is not verified by this closeout.
+- [x] PR585 exact f64bf7c2 CI passed (8055 tests,14 skipped,118 contracts); two recovery reviews passed and merged829d12b1 at2026-09-14T12:32:18Z. Successor deployment remains separately verified.
 
 ## DASH-12 full frontend rebuild parity — 2026-09-14
 
@@ -25,7 +25,7 @@
 - [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
 - [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
 - [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
-- [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
+- [x] PR582 final CI passed (8003 tests,12 skipped,118 contracts); merged2b084e27 at2026-09-14T02:53:28Z. CI-only change; no runtime deployment required.
 - Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
 
 ## Telegram recorded-outcome visibility — 2026-09-13
