@@ -8,10 +8,10 @@ watch = [
 ]
 
 # Refreshed-head reviews after preserving both todo sections during master merge.
-# closeout_logic approved logic/concurrency; closeout_safety approved
+# closeout_structure approved logic/concurrency; closeout_operations approved
 # ops-safety/silent-failure. No new blockers; both todo sections preserved.
 [clearances]
-concurrency = "c42fcbe41ac6ce923113ed04e710cdccc2fbc322"
-logic = "c42fcbe41ac6ce923113ed04e710cdccc2fbc322"
-ops-safety = "c42fcbe41ac6ce923113ed04e710cdccc2fbc322"
-silent-failure = "c42fcbe41ac6ce923113ed04e710cdccc2fbc322"
+concurrency = "cab657df8e4f4e8bdf3f3f7124ca14b78d48b4cb"
+logic = "cab657df8e4f4e8bdf3f3f7124ca14b78d48b4cb"
+ops-safety = "cab657df8e4f4e8bdf3f3f7124ca14b78d48b4cb"
+silent-failure = "cab657df8e4f4e8bdf3f3f7124ca14b78d48b4cb"
