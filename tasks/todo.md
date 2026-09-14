@@ -2466,3 +2466,12 @@ Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive sum
 - [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
 
 Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
+
+## WebSocket disconnect cleanup: 2026-09-14
+
+- [x] Fresh isolated master worktree; drift/Hermes/source/runtime evidence documented in plan_ws_disconnect_cleanup_2026_09_14.md.
+- [ ] Two plan reviews before design; two design reviews before implementation.
+- [ ] Real-handler disconnect/cleanup/transient-DB regressions, bounded shutdown proof where feasible, and focused verification.
+- [ ] Two PR reviews and exact CI before root integration; no production actions in this task.
+
+Review: PLAN ONLY. Frozen selective release07afc0ad unchanged; no application code edits or tests implemented.
