@@ -18,7 +18,7 @@ Production preflight at 21:37:54Z found HEAD 77751890c9f1f51ed348c365d4e7a5985ea
 ## Runtime assumptions and limits
 Verify repo revision and source hashes for scout/main.py, scout/outcome_ledger.py, scout/trading/signals.py and scout/trading/decision_events.py before interpreting their runtime logs. Verify pipeline StandardOutput and active state. No settings/env reads: effective flags, levels and retention remain unknown.
 
-One metadata command and one journal command, each bounded to 15 seconds on host. No DB queries, directory scans, backup reads, raw log exports, outbound vendor calls, config or runtime writes. Journal window pinned to explicit UTC start/end, last 200 entries maximum. Read at most 2 MiB from journal subprocess, kill on overflow/timeout and return incomplete. No retries to widen coverage.
+One metadata command and one journal command, each bounded to 15 seconds on host. No DB queries, directory scans, backup reads, raw log exports, outbound vendor calls, config or runtime writes. Journal window pinned to explicit UTC start/end, last 200 entries maximum. Read at most 2 MiB plus one overflow sentinel byte through a bounded pipeline; timeout kills the entire group and any incomplete result stays UNKNOWN. No retries to widen coverage.
 
 Only allowlisted event names and allowlisted field names may leave the host, plus aggregate entry/parse/truncation counters and journal timestamps. Unknown event/field strings are counted, never printed. The reducer must suppress raw MESSAGE, values, exceptions, token IDs and URLs. Missing, capped or malformed evidence stays UNKNOWN. Source hashes mismatch: stop runtime interpretation and report drift.
 
