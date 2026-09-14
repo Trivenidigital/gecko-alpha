@@ -2432,3 +2432,32 @@ UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
 Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
 and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
 watchdog remain off; captured discoveries remain execution-ineligible.
+
+## 2026-09-14 — Authenticated RH capacity-probe readiness
+
+**New primitives introduced:** NONE; extend the existing investigation CLI only.
+
+### Hermes-first analysis
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Explicit secret input to existing probe | No verified matching skill; hub catalog did not load | Extend existing argparse boundary and redaction; no new service |
+| Provider range/batch preflight and failure stop | No verified matching skill | Reuse existing settings, stop_reason_for and evaluation code |
+
+Ecosystem check: https://github.com/Anil-matcha/awesome-hermes-agent inspected;
+no Alchemy-specific drop-in found. Hub at https://hermes-agent.nousresearch.com/docs/skills/
+returned its loading shell, not a usable catalog; that is not proof no skill exists.
+A dependency is unwarranted for these small CLI corrections.
+
+- [x] Verify runtime configuration and provider documentation; no endpoint configured.
+- [x] Drift review: existing redaction/preflight preserved; CLI lacks a secure URL input.
+- [ ] Claude: tests first, explicit named environment URL input, conflict/missing-value refusal.
+- [ ] Claude: configured provider range/batch caps checked before any traffic, including reorg overlap.
+- [ ] Claude: stop after consecutive failed passes; truthful failure verdict; proxy behavior matches production.
+- [ ] Document secure invocation and account/range/cost prerequisites; retain unrelated settings isolation.
+- [ ] Native focused verification, independent review and exact-head CI before integration.
+- [ ] Obtain provider/account details and run bounded assessment only when configuration is available.
+
+Scope: probe, corresponding tests, runbook and this task record. No collector,
+schema, production configuration or trading changes. Authorization: operator
+“go on” on 2026-09-14, continuing the announced provider-readiness work.
