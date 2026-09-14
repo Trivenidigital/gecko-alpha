@@ -30,6 +30,7 @@ from dashboard.models import (
     WinRateResponse,
 )
 from dashboard.signal_trust_registry import load_signal_trust_registry_payload
+from dashboard.telegram_outcomes import get_telegram_outcomes
 
 _log = structlog.get_logger()
 
@@ -269,6 +270,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/alerts/recent", response_model=list[AlertResponse])
     async def get_alerts():
         return await db.get_recent_alerts(_db_path, limit=20)
+
+    # Capture per app; legacy routes still consult the module-level default.
+    telegram_outcomes_db_path = _db_path
+
+    @app.get("/api/tg_alerts/outcomes")
+    async def telegram_outcomes(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
+        payload = await get_telegram_outcomes(telegram_outcomes_db_path, days)
+        available = payload["meta"]["ok"]
+        headers = {"Cache-Control": "no-store"}
+        if not available:
+            headers["Retry-After"] = "60"
+        return JSONResponse(payload, status_code=200 if available else 503, headers=headers)
 
     @app.get("/api/tg_alerts/recent")
     async def get_recent_tg_dispatch_alerts(limit: int = Query(50, ge=1, le=200)):
