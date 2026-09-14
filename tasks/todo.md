@@ -2,7 +2,8 @@
 
 - [x] Refresh master, drift/Hermes checks and schema/source-only production preflight.
 - [x] Plan and two reviews; design and two reviews; folds verified.
-- [ ] Publish docs contract and complete two PR reviews; CI/merge status recorded separately.
+- [x] Published docs contract as PR #588; both final PR reviews approved 5fb149b1 after folds.
+- [ ] Final-head CI/merge gate; no deployment. Review: tasks/review_suppression_trust_evidence_contract_2026_09_14.md.
 - Plan: tasks/plan_suppression_trust_evidence_contract_2026_09_14.md.
 
 ## Active Work: 2026-09-14 — DASH-11 provenance readiness

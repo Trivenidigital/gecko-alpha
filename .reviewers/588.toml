@@ -1,0 +1,11 @@
+pr = 588
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
+# contract_evidence: evidence/logic/concurrency; contract_scope: ops/silent-failure.
+# Both terminal approvals at final substantive candidate; all folds verified.
+[clearances]
+concurrency = "5fb149b128a1eb1775704da50e4ab0ae1f94da95"
+logic = "5fb149b128a1eb1775704da50e4ab0ae1f94da95"
+ops-safety = "5fb149b128a1eb1775704da50e4ab0ae1f94da95"
+silent-failure = "5fb149b128a1eb1775704da50e4ab0ae1f94da95"
