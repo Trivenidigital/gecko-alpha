@@ -27,6 +27,21 @@ Root's04:01:39Z success and independent04:02:53Z production review establish the
 
 ## Manifest and assembly
 
+### Amendment: explicit two-file UI exception (design review required)
+
+The first successor manifest inspection found that the original1358-file `core_files` set includes two frontend consumers intentionally changed by PR584. Therefore the earlier blanket1358-byte-identity requirement below is superseded ONLY for the exact two entries in this table. Source assembly remains stopped until two reviewers approve this amendment. PR585 has now merged as829d12b191ef2a1122dc18755492a5dd4fc106fc; pin that same commit as final feature master for this assembly.
+
+| Exact path | Original d2 and runtime5c blob | Approved final829d12b1 blob | Mode |
+|---|---|---|---|
+| dashboard/frontend/components/TodayFocusPanel.jsx | 8e6d223febbabf00e7b752170ed565e00ad99a1f | 37ed8e68172de97a68c69d80432fbfa74752414a | 100644 |
+| dashboard/frontend/components/TradeInboxTab.jsx | a816742d793b401e9ce1484c0a61799eb21251f9 | 9258c696f806237202659ab04658d088b83a61b8 | 100644 |
+
+Both deltas are PR584 lane-status annotations: hook/import, recorded-status notice and badges, and passing the observed status through existing rendered decision rows. They do not change the existing decision-board builder, score function, sorting, filtering, row identity, card selection, execution eligibility or operational Python consumers. Both files must equal the exact reviewed final merged blobs, not locally adapted variants.
+
+The successor manifest must retain the complete original1358-entry proof as `original_core_files`, expose this exact two-entry old/new/mode mapping as `core_ui_exceptions`, and verify all remaining1356 original files byte-for-byte and mode-for-mode against d2 and5c. Preserve all scout/policy/settings files and the five operational dashboard.db AST identities against d2,5c and successor. These two paths are the complete exception set; no caller-supplied wildcard, arbitrary path exemption or silently recomputed reduced set is permitted. Each exception must exist in the original core set and PR584 selected paths, have the pinned original blob/mode at d2 and5c and the pinned replacement blob/mode at final master and candidate. Missing, extra, mutated or reclassified exceptions fail closed. Newly selected paths beyond these two still cannot escape original protection.
+
+Keep the refusal test for an arbitrary newly selected protected file. Add narrow tests proving both exact UI replacements succeed, a third exemption is refused, and changed original/final blobs or modes are refused. The existing original five-PR proof must still validate independently before successor exceptions apply. Runtime rollback remains the complete immutable5c tree, including the OLD UI blobs; exception mappings never alter rollback attestation. No helper, copy or production action is authorized by this design-only amendment.
+
 Keep production_base_sha and baseline_files with their existing meaning: d2 core source and its full tree. Do NOT replace them with5c; ancestry checks d2→final master and selected squash→final master remain valid. Add explicit runtime_base_sha, rollback_branch, runtime_baseline_files fields. runtime_baseline_files is the full tree of pinned5c, including its release metadata; obtain it directly from its Git object. Validate that5c matches the previously verified five-PR manifest, including its core and existing viewer/WS source. The5c release branch is not presumed an ancestor of master.
 
 Extend the manifest's exact selected PR set from five to seven575/577/578/580/583/584/585. Reject missing/extra IDs, non-squash/intermediate commits and non-ancestor feature commits. Use the same selected dashboard/tests path union and final master blobs/modes. Attest all1358 previously protected core files unchanged against d2 and all five operational consumer ASTs unchanged against d2,5c and successor. Newly selected files cannot silently remove an old protected core file from that explicit prior set.
