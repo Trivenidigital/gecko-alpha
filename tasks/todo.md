@@ -2360,6 +2360,7 @@ evidence and the SUPERSEDED→new-ID mapping.
 - [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
 - [x] Both plan reviewers approved bc4c5837 without folds; design-only artifact prepared with copy/lock/runtime bounds.
 - [x] Both design reviewers approved 38150404 without folds; local disposable harnesses prepared with boundary tests.
+- [x] All four features merged; selective old-core source assembled locally, focused tests and combined build parity recorded in release report.
 - [ ] Exact old-core release verification and two candidate reviews before conditional dashboard-only deploy.
 
 Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Merged-feature CI and exact selective-candidate local Linux validation remain distinct evidence.
