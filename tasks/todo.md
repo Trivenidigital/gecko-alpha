@@ -1,3 +1,15 @@
+## DASH-12 full frontend rebuild parity — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift and Hermes-first checks; plan only written.
+- [x] Existing asset-existence baseline: 3 tests passed; no fresh build or CI edits.
+- [x] Two independent plan reviewers approved ab2a4aac with no required folds.
+- [x] Separate design written; no comparator/workflow/build changes yet.
+- [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
+- [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
+- [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
+- [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
+- Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
+
 ## Telegram recorded-outcome visibility — 2026-09-13
 
 - [x] Drift/runtime verified on fresh d5b26ff base; plan written.
