@@ -20,6 +20,7 @@ import ConvictionTab from './components/ConvictionTab.jsx'
 import ProspectiveWatchlistTab from './components/ProspectiveWatchlistTab.jsx'
 import TodayFocusPanel from './components/TodayFocusPanel.jsx'
 import WhatChangedPanel from './components/WhatChangedPanel.jsx'
+import PostmortemHistoryTab from './components/PostmortemHistoryTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -85,6 +86,7 @@ const NAV_GROUPS = [
     tabs: [
       { id: 'trading', label: 'Trading' },
       { id: 'signal_trust', label: 'Signal Trust' },
+      { id: 'postmortem_history', label: 'Historical Postmortems' },
       { id: 'briefing', label: 'Briefing' },
     ],
   },
@@ -268,6 +270,7 @@ export default function App() {
       {activeTab === 'prospective' && <ProspectiveWatchlistTab />}
 
       {activeTab === 'signal_trust' && <SignalTrustTab />}
+      {activeTab === 'postmortem_history' && <PostmortemHistoryTab />}
 
       {activeTab === 'pipeline' && (
         <>
