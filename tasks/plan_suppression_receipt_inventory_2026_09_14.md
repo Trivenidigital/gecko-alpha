@@ -34,8 +34,8 @@ Only allowlisted event names and allowlisted field names may leave the host, plu
 - [x] Two parallel plan reviews approved 8836b14a; recommendations folded into design.
 - [x] Two parallel design reviews; process cleanup, duplicate-key, cap and observed-span folds approved d8625be4.
 - [ ] Execute bounded read-only preflight and journal reducer; preserve sanitized output locally.
-- [ ] Build findings with source evidence, observed bounds, D1-D4 candidate classification and explicit exclusions. All contract verdicts remain UNKNOWN; candidate availability is not ACCEPTED.
-- [ ] Open docs PR; two parallel independent PR reviews, folds and exact-head checks.
+- [x] Build source-only findings with explicit exclusions and Linux-test blocker. No runtime observations claimed; all contract verdicts remain UNKNOWN.
+- [x] Open PR589; two parallel independent PR reviews and final folds approved 90dd5f7d. Final CI/merge status remains separate.
 
 Files: this plan, tasks/design_suppression_receipt_inventory_2026_09_14.md, tasks/findings_suppression_receipt_inventory_2026_09_14.md, tasks/review_suppression_receipt_inventory_2026_09_14.md, a new checklist in tasks/todo.md, and PR-owned reviewer metadata after real reviews.
 

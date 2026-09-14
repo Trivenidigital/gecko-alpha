@@ -4,7 +4,8 @@
 - [x] Plan 8836b14a: independent evidence and ops reviews approved.
 - [x] Design and two reviews; required cleanup/parsing folds approved d8625be4.
 - [ ] Runtime inventory blocked: healthy non-production Linux cleanup-test runner required; reducer not built or executed.
-- [ ] Findings PR and two PR reviews; final verification.
+- [x] Findings PR589 and two PR reviews approved 90dd5f7d; source/diff verification complete.
+- [ ] Final-head CI/merge gate; no deployment. Review: tasks/review_suppression_receipt_inventory_2026_09_14.md.
 - Plan: tasks/plan_suppression_receipt_inventory_2026_09_14.md.
 ## Active Work: 2026-09-14 — Suppression trust evidence contract
 
