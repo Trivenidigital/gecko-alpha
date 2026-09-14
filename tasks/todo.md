@@ -1,3 +1,11 @@
+## Active Work: 2026-09-14 — DASH-11 provenance readiness
+
+- [x] Current-master drift and initial production read-only check.
+- [x] Plan/design: two parallel reviewers each; folds applied.
+- [x] Pinned audit, findings PR #579 and two-vector PR review; factual folds applied.
+- [ ] CI/merge gate for #579; no deployment. Health-only UI merged in #585; current_closeout_queue_2026_09_14.md separately records the verified 77751890 deployment. This historical audit does not re-attest runtime or establish provenance and monetary interpretations.
+- Plan: tasks/plan_dash11_provenance_2026_09_14.md.
+
 ## Overnight closeout recovery — 2026-09-14
 
 - [x] Recover failed owner, refresh clean master and verify first retained work-loop artifact.

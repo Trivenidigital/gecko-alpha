@@ -1,0 +1,17 @@
+pr = 579
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Refreshed-head reviews after preserving both todo sections during master merge.
+# review_evidence approved logic/concurrency; review_ops approved
+# ops-safety/silent-failure. No new blockers; both todo sections preserved.
+[clearances]
+concurrency = "c6f9b35873f29635d0ee3b8ca6d344d37182d6b7"
+logic = "c6f9b35873f29635d0ee3b8ca6d344d37182d6b7"
+ops-safety = "c6f9b35873f29635d0ee3b8ca6d344d37182d6b7"
+silent-failure = "c6f9b35873f29635d0ee3b8ca6d344d37182d6b7"
