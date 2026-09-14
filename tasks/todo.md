@@ -2372,3 +2372,12 @@ Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production chan
 - [x] Retry plan/design each received two approvals, sibling-baseline fold recorded.
 - [x] PR583 merged with reviews/green CI; exact two-file application delta applied to frozen07af;59local tests passed.
 - [ ] Exact new manifest/Linux/copy proofs, final candidate/helper reviews and conditional rollout remain.
+
+## Successor read-only health/lanes release (2026-09-14)
+- [x] Isolate from frozen5c; inspect current source, existing validators, prior Hermes evidence and available disk.
+- [x] Write plan separating immutable d2 core reference from actual deployed/rollback release.
+- [ ] Two plan reviews; separate design and two design reviews before assembly.
+- [ ] PR585 merged/CI green; exact seven-PR manifest, candidate source/Linux/copy/content evidence.
+- [ ] Two final candidate/helper reviews; root-owned fresh runtime preflight and conditional rollout.
+
+Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; no application assembly, helper changes, DB copies or deployment.
