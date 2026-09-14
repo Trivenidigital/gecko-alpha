@@ -450,3 +450,31 @@ class TodaysFocusMeta(BaseModel):
 class TodaysFocusResponse(BaseModel):
     meta: TodaysFocusMeta
     rows: list[TodaysFocusRow] = Field(default_factory=list)
+
+
+class PostmortemHistoryRow(BaseModel):
+    id: str
+    token_id: str | None
+    detected_at: str | None
+    run_pct: float | None
+    most_frequent_recorded_block_reason: str | None
+    field_unavailable_reasons: dict[str, str] = Field(default_factory=dict)
+
+
+class PostmortemHistoryMeta(BaseModel):
+    ok: bool = True
+    read_only: bool = True
+    historical_only: bool = True
+    generated_at: str
+    total_records: int
+    latest_detected_at: str | None
+    latest_detected_at_unavailable_reason: str | None = None
+    sort_policy: str = "id_desc"
+    limit: int
+
+
+class PostmortemHistoryResponse(BaseModel):
+    meta: PostmortemHistoryMeta
+    rows: list[PostmortemHistoryRow]
+    has_more: bool
+    next_before_id: str | None

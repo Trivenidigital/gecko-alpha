@@ -9,7 +9,7 @@
 
 - [x] Current-base drift and production read-only schema/state preflight.
 - [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
-- [ ] Exact-head CI and allowed merge; deployment remains separately owned.
+- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Deployment held separately for active capture/migration owner.
 - Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
 
 ## Findings closeout: 2026-09-13 — autonomous product readiness
@@ -2424,3 +2424,29 @@ Docs-only scope; detailed findings and verification in
 
 Review: no code/runtime changes; centralized routing, stop history and postmortem
 UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
+
+## Historical postmortem viewer: 2026-09-13
+
+- [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
+- [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
+- [x] Bounded read-only historical list API and Performance tab; 142 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
+- [x] PR577 and two independent final reviews approved exact 2cb1d4f9; per-app DB isolation regression fixed and reviewed.
+- [ ] Exact-head CI and parent-coordinated merge; deployment held for separate capture/migration owner.
+
+Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
+See tasks/plan_postmortem_history_2026_09_13.md.
+
+## 2026-09-13 — Sustained RH/Pons capture integration
+
+- [x] Coordinate implementation and independent reviews through Claude Max; preserve the original checkout.
+- [x] Implement dedicated capture, bounded DB queries, strict header batches and paced requests.
+- [x] Fix shared-connection interference; test cancellation and replay.
+- [x] Fix attempt freshness, probe verdicts, watchdog arguments and reason-aware cooldown.
+- [x] Native affected tests verified; nine Linux-specific watchdog failures reproduced on unchanged Windows baseline.
+- [x] Mutation round 3: 28 caught, one documented equivalent, no unresolved result; two cooldown mutations caught; files restored.
+- [ ] Final independent clearances and exact-head Linux CI.
+- [ ] Production capacity assessment on a suitable provider; public smoke failed and further load is paused.
+
+Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
+and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
+watchdog remain off; captured discoveries remain execution-ineligible.

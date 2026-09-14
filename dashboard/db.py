@@ -1,6 +1,7 @@
 """Read-only database queries for the dashboard against scout.db."""
 
 import json
+import math
 import re
 import unicodedata
 from contextlib import asynccontextmanager
@@ -5438,3 +5439,94 @@ async def get_source_calls_health(db_path: str) -> dict:
                 base_response["writer_freshness"]["max_observed_at"] = max_observed
 
         return base_response
+
+
+async def get_postmortem_history(
+    db_path: str, limit: int = 25, before_id: int | None = None
+) -> dict:
+    """Read stored capture summaries; never read evidence or invoke the recorder."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be 1..100")
+    if before_id is not None and (
+        isinstance(before_id, bool)
+        or not isinstance(before_id, int)
+        or not 1 <= before_id <= 9223372036854775807
+    ):
+        raise ValueError("before_id must be a positive SQLite integer")
+
+    def safe_text(column: str, maximum: int, alias: str) -> str:
+        # Identifiers and bounds are internal constants, never request input.
+        return (
+            f"CASE WHEN typeof({column})='text' AND length({column})<={maximum} "
+            f"AND length(CAST({column} AS BLOB))<={maximum * 4} "
+            f"THEN {column} ELSE NULL END AS {alias}, "
+            f"CASE WHEN {column} IS NULL THEN NULL "
+            f"WHEN typeof({column})!='text' THEN 'non_text' "
+            f"WHEN length({column})>{maximum} OR length(CAST({column} AS BLOB))>{maximum * 4} THEN 'too_long' "
+            f"ELSE NULL END AS {alias}_unavailable_reason"
+        )
+
+    projection = ", ".join(
+        [
+            "id",
+            safe_text("token_id", 256, "token_id"),
+            safe_text("detected_at", 128, "detected_at"),
+            "CASE WHEN typeof(run_pct) IN ('real', 'integer') THEN run_pct ELSE NULL END AS run_pct",
+            safe_text("dropping_gate", 512, "most_frequent_recorded_block_reason"),
+        ]
+    )
+    async with _ro_db(db_path) as conn:
+        await conn.execute("BEGIN")
+        count = await conn.execute("SELECT COUNT(*) FROM moved_already_postmortems")
+        total = (await count.fetchone())[0]
+        newest_cursor = await conn.execute(
+            "SELECT "
+            + safe_text("detected_at", 128, "detected_at")
+            + " FROM moved_already_postmortems ORDER BY id DESC LIMIT 1"
+        )
+        newest = await newest_cursor.fetchone()
+        where = " WHERE id < ?" if before_id is not None else ""
+        params = (before_id, limit + 1) if before_id is not None else (limit + 1,)
+        cursor = await conn.execute(
+            f"SELECT {projection} FROM moved_already_postmortems{where} "
+            "ORDER BY id DESC LIMIT ?",
+            params,
+        )
+        stored = await cursor.fetchall()
+    rows = []
+    for row in stored[:limit]:
+        pct = row["run_pct"]
+        fields = ("token_id", "detected_at", "most_frequent_recorded_block_reason")
+        rows.append(
+            {
+                "id": str(row["id"]),
+                **{field: row[field] for field in fields},
+                "run_pct": (
+                    pct if type(pct) in (float, int) and math.isfinite(pct) else None
+                ),
+                "field_unavailable_reasons": {
+                    field: row[f"{field}_unavailable_reason"]
+                    for field in fields
+                    if row[f"{field}_unavailable_reason"] is not None
+                },
+            }
+        )
+    has_more = len(stored) > limit
+    return {
+        "meta": {
+            "ok": True,
+            "read_only": True,
+            "historical_only": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total_records": total,
+            "latest_detected_at": newest["detected_at"] if newest else None,
+            "latest_detected_at_unavailable_reason": (
+                newest["detected_at_unavailable_reason"] if newest else None
+            ),
+            "sort_policy": "id_desc",
+            "limit": limit,
+        },
+        "rows": rows,
+        "has_more": has_more,
+        "next_before_id": rows[-1]["id"] if has_more else None,
+    }

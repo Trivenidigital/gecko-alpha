@@ -7,7 +7,7 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import aiosqlite
 import structlog
@@ -552,6 +552,7 @@ class Database:
             await self._migrate_curve_scan_checkpoints_v1()
             await self._migrate_curve_reorg_markers_v1()
             await self._migrate_curve_scan_checkpoint_head_v1()
+            await self._ensure_curve_event_block_index()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -923,6 +924,20 @@ class Database:
             await conn.rollback()
             raise
 
+    async def _ensure_curve_event_block_index(self) -> None:
+        """Index overlap-range evidence reads so each scan pass stays bounded.
+
+        Pure access-path addition: idempotent, no data or schema_version change,
+        and older code simply ignores it on rollback.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_curve_launch_ev_block "
+            "ON curve_launch_events(chain_id, protocol, block_number)"
+        )
+        await self._conn.commit()
+
     async def get_curve_scan_checkpoint(
         self, chain_id: int, protocol: str, factory: str
     ) -> dict | None:
@@ -967,6 +982,25 @@ class Database:
         )
         await self._conn.commit()
 
+    async def record_curve_scan_attempt_head(
+        self, chain_id: int, protocol: str, factory: str, head_block: int
+    ) -> None:
+        """Raise the checkpoint's observed head from an unsuccessful attempt.
+
+        next_block, block hashes and updated_at (the success clock) are left
+        alone, so a collector that keeps failing shows growing head lag instead
+        of a frozen head. MAX() ignores a lagging provider head; no row, no-op.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            """UPDATE curve_scan_checkpoints
+            SET head_block = MAX(COALESCE(head_block, ?), ?)
+            WHERE chain_id=? AND protocol=? AND factory=?""",
+            (head_block, head_block, chain_id, protocol, factory.lower()),
+        )
+        await self._conn.commit()
+
     async def list_curve_launch_curves(self, chain_id: int, protocol: str) -> list[str]:
         """Canonical known curve contracts for deployment-scoped trade polling."""
         if self._conn is None:
@@ -978,6 +1012,28 @@ class Database:
             (chain_id, protocol),
         )
         return [r[0] for r in await cur.fetchall()]
+
+    async def curve_launch_members(
+        self, chain_id: int, protocol: str, addresses: Iterable[str]
+    ) -> set[str]:
+        """Which of these emitters are pollable known curves.
+
+        Same lifecycle filter as list_curve_launch_curves, but bounded by the
+        emitters a topic-only log query actually returned instead of every
+        historical curve.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        wanted = sorted({a.lower() for a in addresses if isinstance(a, str)})
+        if not wanted:
+            return set()
+        cur = await self._conn.execute(
+            """SELECT DISTINCT curve_address FROM curve_launch_discoveries
+            WHERE chain_id=? AND protocol=? AND lifecycle_status IN ('on_curve', 'graduating')
+            AND curve_address IN (SELECT value FROM json_each(?))""",
+            (chain_id, protocol, json.dumps(wanted)),
+        )
+        return {r[0] for r in await cur.fetchall()}
 
     async def curve_events_in_range(
         self, chain_id: int, protocol: str, from_block: int, to_block: int
@@ -996,20 +1052,65 @@ class Database:
         return [dict(zip(names, r)) for r in await cur.fetchall()]
 
     async def reconcile_curve_launch_projection(
-        self, chain_id: int, protocol: str
+        self,
+        chain_id: int,
+        protocol: str,
+        *,
+        identities: Iterable[tuple[str, int]] | None = None,
     ) -> None:
         """Rebuild mutable identities/lifecycles from surviving append-only evidence.
 
         Observation clocks survive reorgs; identity and lifecycle do not. The
         collector replays discovery insertion before calling this method, which
         also repairs interrupted event/projection writes without deleting history.
+
+        ``identities=None`` rebuilds every row (diagnostics/migration checks).
+        Otherwise ``identities`` are the (transaction_hash, log_index) pairs a
+        pass processed. Their launch/graduation rows name the affected tokens,
+        including the old and new token when a replacement changed identity;
+        NULL-token reorg markers are reached through the identity itself. All
+        evidence for those tokens' launch/graduation identities is folded in
+        append order, exactly as the full rebuild would, and only those tokens
+        are published.
         """
         if self._conn is None:
             raise RuntimeError("Database not initialized.")
-        cur = await self._conn.execute(
-            "SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=? ORDER BY block_number, log_index, id",
-            (chain_id, protocol),
-        )
+        tokens: list[str] | None = None
+        if identities is None:
+            cur = await self._conn.execute(
+                "SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=? ORDER BY block_number, log_index, id",
+                (chain_id, protocol),
+            )
+        else:
+            keys = sorted({(str(tx), int(index)) for tx, index in identities})
+            if not keys:
+                return
+            cur = await self._conn.execute(
+                """SELECT DISTINCT e.token_address
+                FROM json_each(?) j JOIN curve_launch_events e
+                ON e.chain_id=? AND e.transaction_hash=json_extract(j.value, '$[0]')
+                AND e.log_index=json_extract(j.value, '$[1]')
+                WHERE e.protocol=? AND e.token_address IS NOT NULL
+                AND e.event_name IN ('token_launched', 'pool_graduated')""",
+                (json.dumps(keys), chain_id, protocol),
+            )
+            tokens = sorted(r[0] for r in await cur.fetchall())
+            if not tokens:
+                return
+            cur = await self._conn.execute(
+                """WITH ids AS (
+                    SELECT DISTINCT transaction_hash, log_index FROM curve_launch_events
+                    WHERE chain_id=? AND protocol=?
+                    AND token_address IN (SELECT value FROM json_each(?))
+                    AND event_name IN ('token_launched', 'pool_graduated')
+                )
+                SELECT e.* FROM ids JOIN curve_launch_events e
+                ON e.chain_id=? AND e.transaction_hash=ids.transaction_hash
+                AND e.log_index=ids.log_index
+                WHERE e.protocol=?
+                ORDER BY e.block_number, e.log_index, e.id""",
+                (chain_id, protocol, json.dumps(tokens), chain_id, protocol),
+            )
         names = [c[0] for c in cur.description]
         events = [dict(zip(names, r)) for r in await cur.fetchall()]
         canonical = self._canonical_curve_hashes(events)
@@ -1064,11 +1165,20 @@ class Database:
                 FROM curve_launch_discoveries d LEFT JOIN projected
                 ON projected.token=d.token_address
                 WHERE d.chain_id=? AND d.protocol=?
+                AND (? IS NULL OR d.token_address IN (SELECT value FROM json_each(?)))
             ) p
             WHERE curve_launch_discoveries.chain_id=?
             AND curve_launch_discoveries.protocol=?
             AND curve_launch_discoveries.token_address=p.token""",
-            (json.dumps(projections), chain_id, protocol, chain_id, protocol),
+            (
+                json.dumps(projections),
+                chain_id,
+                protocol,
+                None if tokens is None else 1,
+                json.dumps(tokens or []),
+                chain_id,
+                protocol,
+            ),
         )
         await self._conn.commit()
 
