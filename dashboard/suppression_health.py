@@ -89,6 +89,20 @@ def read_health(path, *, now=None):
                 "created_at",
             ]:
                 return unavailable("schema_unavailable")
+            indexes = conn.execute("PRAGMA index_list(signal_outcome_ledger)")
+            found = False
+            for index in indexes:
+                check()
+                if index[1] == "idx_sol_status_emitted" and not index[4]:
+                    found = True
+            indexes.close()
+            if not found:
+                return unavailable("schema_unavailable")
+            columns = conn.execute(
+                "PRAGMA index_info(idx_sol_status_emitted)"
+            ).fetchmany(3)
+            if [column[2] for column in columns] != ["label_status", "emitted_at"]:
+                return unavailable("schema_unavailable")
             cohort = dict(
                 rows=0,
                 distinct_tokens=0,
@@ -145,9 +159,10 @@ def read_health(path, *, now=None):
 
             sql = """SELECT id,token_id,surface,gate_verdicts,emitted_at,
                      r24h IS NOT NULL,r7d IS NOT NULL,label_status
-                     FROM signal_outcome_ledger WHERE kind='gated_out_sample'
-                     AND julianday(emitted_at)>=julianday(?)-1.0/86400
-                     AND julianday(emitted_at)<julianday(?)+1.0/86400"""
+                     FROM signal_outcome_ledger INDEXED BY idx_sol_status_emitted
+                     WHERE julianday(emitted_at)>=julianday(?)-1.0/86400
+                     AND julianday(emitted_at)<julianday(?)+1.0/86400
+                     AND kind='gated_out_sample'"""
             for ident, token, surface, raw, emitted, r24, r7, status in rows(
                 sql, (start30.isoformat(), now.isoformat()), LEDGER_LIMIT
             ):

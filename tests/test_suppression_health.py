@@ -28,6 +28,7 @@ def ledger(tmp_path):
         CREATE TABLE signal_outcome_ledger(id INTEGER PRIMARY KEY, kind TEXT,
         token_id, surface, gate_verdicts, emitted_at, r24h, r7d, label_status);
         CREATE TABLE trade_decision_events(signal_type, reason, created_at, decision);
+        CREATE INDEX idx_sol_status_emitted ON signal_outcome_ledger(label_status,emitted_at);
         CREATE INDEX idx_tde_decision_reason_created ON trade_decision_events(decision,reason,created_at);
         """)
     return path
@@ -172,11 +173,22 @@ def test_sql_timeout_and_python_timeout(ledger, monkeypatch):
     monkeypatch.setattr(health, "_stamp", slow)
     assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "read_limit"
     monkeypatch.setattr(health, "_stamp", original)
-    with db_connection(ledger) as conn:
-        conn.execute("ALTER TABLE signal_outcome_ledger RENAME TO original")
-        conn.execute("""CREATE VIEW signal_outcome_ledger AS
-          WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000)
-          SELECT * FROM original WHERE id=(SELECT sum(x) FROM n)""")
+    original_connect = sqlite3.connect
+
+    class ExpensiveQuery(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith("SELECT id,token_id"):
+                # Keep real schema/index guards, then force actual VM work.
+                return super().execute("""WITH RECURSIVE n(x) AS
+                    (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000)
+                    SELECT sum(x) FROM n""")
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(
+        health.sqlite3,
+        "connect",
+        lambda *a, **kw: original_connect(*a, **kw, factory=ExpensiveQuery),
+    )
     assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "read_limit"
 
 
@@ -317,3 +329,30 @@ def test_oversized_verdict_and_invalid_anchor_id_refuse(ledger):
             "CREATE VIEW signal_outcome_ledger AS SELECT CAST(id AS TEXT) AS id,kind,token_id,surface,gate_verdicts,emitted_at,r24h,r7d,label_status FROM original"
         )
     assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "schema_unavailable"
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        None,
+        "CREATE INDEX idx_sol_status_emitted ON signal_outcome_ledger(emitted_at,label_status)",
+        "CREATE INDEX idx_sol_status_emitted ON signal_outcome_ledger(label_status,emitted_at) WHERE label_status='complete'",
+    ],
+)
+def test_missing_wrong_or_partial_ledger_index_refuses(ledger, definition):
+    with db_connection(ledger) as conn:
+        conn.execute("DROP INDEX idx_sol_status_emitted")
+        if definition:
+            conn.execute(definition)
+    assert health.read_health(ledger, now=NOW)["meta"]["reason"] == "schema_unavailable"
+
+
+def test_all_statuses_and_earliest_anchor_ignore_index_iteration_order(ledger):
+    add(ledger, token="repeat", status="unlabelable", stamp="2026-09-09T00:00:00Z")
+    add(ledger, token="repeat", status="complete", r7=1)
+    for status in ("pending", "partial", "strange"):
+        add(ledger, token=status, status=status)
+    result = health.read_health(ledger, now=NOW)
+    assert result["cohort"]["rows"] == 5
+    assert all(value == 1 for value in result["cohort"]["label_status"].values())
+    assert result["cohort"]["earliest_anchor_tokens_with_recorded_r7d"] == 0
