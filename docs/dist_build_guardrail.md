@@ -24,23 +24,36 @@ the `scripts/pre-commit-dist-consistency.sh` pre-commit hook).
    updating `index.html`. It runs anywhere the Python suite runs, including
    `uv run pytest` in CI (`.github/workflows/test.yml`).
 
-2. **Full hash-match — CI-only, node-gated (not wired today).**
-   A stronger check reruns the vite build (`npm ci && npm run build`) and
-   asserts the freshly-produced asset hashes equal the committed ones — i.e.
-   the committed `dist/` is byte-for-byte what the current source produces. This
-   requires a Node toolchain. The current CI image (`ubuntu-latest`,
-   `astral-sh/setup-uv`) has **no Node step**, so the full rebuild is *not* run
-   today; if a Node step is added, extend the guardrail to build and compare
-   hashes there. The intended behavior when Node is absent is to **skip
-   gracefully** (never fail for lack of a toolchain) — the existence check in
-   layer 1 remains the always-on floor.
+2. **Fresh rebuild parity — independent CI job.**
+   `frontend-dist-parity` installs Node 24.14.0 and uses `npm ci --ignore-scripts
+   --no-audit --no-fund` with the existing lockfile. The ordinary Vite build emits
+   into a fresh directory outside the checkout. The standard-library comparator
+   `scripts/check_dist_rebuild_parity.py` compares every emitted file's bytes to
+   immutable HEAD Git blobs: index, directly referenced assets, lazy chunks and
+   copied public files. Extra committed historical assets are permitted.
+   Missing tooling, install/build errors and mismatches fail this job; local
+   Python tests still require no Node.
 
 ## What CI does today
 
 - Runs `tests/test_dist_build_guardrail.py` as part of the normal
   `uv run pytest` step → the existence check is enforced on every PR.
-- Does **not** rebuild the frontend (no Node in the CI image), so a stale bundle
-  whose `index.html` still references valid on-disk hashes is not caught by CI
-  yet — that residual is covered at commit time by
-  `scripts/pre-commit-dist-consistency.sh` and would be closed fully by adding
-  the layer-2 Node step above.
+- Rebuilds in the independent parity job on the same push/PR events. PRs test
+  GitHub's synthetic merge checkout; logs include actual HEAD, Node/npm versions
+  and lockfile SHA256. Success identifies the compared SHA and file count.
+
+## Diagnosing a parity failure
+
+`byte_mismatch` means a generated file differs despite its committed name;
+`missing_committed_file` means a fresh file is absent from Git. Rebuild with the
+pinned toolchain, review the source/output change, and commit the intended index
+and assets together. Do not delete historical unreferenced assets to satisfy this
+check. Do not mask failures or update the lockfile just to change the result.
+
+For manual validation, use a clean committed checkout and a fresh output directory
+outside it, then run `python scripts/check_dist_rebuild_parity.py --repo-root .
+--build-dir /absolute/fresh/output`. A preexisting directory by itself provides no
+source provenance: the CI job establishes this by building first. Dirty tracked
+files, checkout changes, unsafe output entries and invalid references fail closed.
+The checker never edits or deletes files, and parity does not prove browser or
+production behavior.
