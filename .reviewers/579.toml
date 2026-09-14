@@ -7,11 +7,11 @@ watch = [
     "docker-compose.yml", "start.sh",
 ]
 
-# Terminal independent reviews of corrected substantive findings.
-# dash_drift approved logic/concurrency; audit_safety approved
+# Refreshed-head reviews after preserving both todo sections during master merge.
+# audit_structure approved logic/concurrency; audit_safety approved
 # ops-safety/silent-failure. Schema count and citation folds verified.
 [clearances]
-concurrency = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
-logic = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
-ops-safety = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
-silent-failure = "ad4453d3dab765176b3192f9dc6521dce2c2a223"
+concurrency = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
+logic = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
+ops-safety = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
+silent-failure = "17e1654cb1c7e54e2cf4eb581a38740b46fb0e54"
