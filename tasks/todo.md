@@ -2381,3 +2381,5 @@ Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production chan
 - [ ] Two final candidate/helper reviews; root-owned fresh runtime preflight and conditional rollout.
 
 Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; no application assembly, helper changes, DB copies or deployment.
+- [x] Successor plan5e249634 approved by root and postmortem; concrete design audits core/runtime baseline separation, copy reuse and helper dependencies.
+- [ ] Two exact design approvals before implementation or archive/copy changes.
