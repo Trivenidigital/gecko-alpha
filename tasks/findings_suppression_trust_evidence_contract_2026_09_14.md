@@ -44,7 +44,7 @@ Ledger `token_id`, decision `token_id`, `volume_history_cg.coin_id` and `price_c
 ## Six dimensions
 
 **D1 — Attempt denominator and receipt coverage.**
-- *Required:* an attempt record that can be reconstructed independently of the receipt store being measured. Declare logical event IDs separately from retry attempt IDs, and reconcile idempotent retries explicitly without inflating event counts. It must count successes, retries, and drops by lane flag, global ledger switch, swallowed exception or decision-emit failure. Coverage is receipts ÷ attempts for each branch, with each drop class shown.
+- *Required:* an attempt record that can be reconstructed independently of the receipt store being measured. Declare logical event IDs separately from retry attempt IDs, and reconcile idempotent retries explicitly without inflating event counts. It must count successes, retries, and drops by lane flag, global ledger switch, swallowed exception or decision-emit failure. Logical-event coverage is distinct logical events with all branch-required receipts divided by distinct in-scope logical events expected to produce those receipts; never divide deduplicated receipts by retry attempts. Separately reconcile every attempt to success, idempotent retry, flag exclusion, drop or failure, with each class counted. Declare branch/flag inclusion before the study and retain excluded event counts; disabled periods cannot masquerade as fully observed coverage. A zero eligible-event denominator is undefined, not 100%.
 - *Rejected:* receipt ÷ receipt ratios; equal ledger and decision aggregates treated as coverage; ledger rows treated as attempts; a quiet producer read as disabled or idle without separate activity evidence.
 
 **D2 — Event identity reconciliation.**
@@ -57,11 +57,13 @@ Ledger `token_id`, decision `token_id`, `volume_history_cg.coin_id` and `price_c
   - observation ID or equivalent;
   - observed time and ingested time, kept separate from `emitted_at`;
   - chain, asset and quote identity.
+- Prove that the actual source version was available to the consuming path at emission selection, using trustworthy ingest/consumption/write chronology. An old observed timestamp ingested only after emission fails D3; it cannot repair the anchor retrospectively.
 - A later study must predeclare a maximum emission observation age and its timestamp basis before looking at outcomes. Observations beyond that age are `NOT_MET`. An emission observation must not postdate emission; future/invalid observations fail even if they predate the evidence snapshot. This contract sets no numeric threshold and no live policy.
 - *Rejected:* the default `anchor_cache_age_seconds=0.0`; a snapshot price with no source time; an overwritten `price_cache` value.
 
 **D4 — Horizon price lineage and lateness.**
 - *Required:* the actual observation selected for each horizon, with observed and ingested times separate from `labeled_at`, and asset identity as in D3. A later study must predeclare lateness limits per horizon before looking at outcomes. A late horizon is `NOT_MET` for that horizon and stays visible in D5 denominators. A selected horizon observation must be at or after the declared horizon deadline and no later than the evidence snapshot. This contract sets no values.
+- Require trustworthy selection/consumption/write chronology proving that the source version was available when the labeler selected it. Ingest after the horizon deadline can be legitimate within the declared lateness policy, but ingest after the recorded selection cannot prove that selection; neither observed time nor presence today is sufficient.
 - *Rejected:* inferring the selected source from today's preference order, which launders an unrecorded historical selection; a history row with no lateness bound; a pruned or overwritten observation.
 
 **D5 — Maturity, missingness and selection.**
@@ -107,6 +109,8 @@ No dimension is `UNVERIFIABLE_HISTORICAL` yet, because no inventory has document
 | A10 | Contract address matched to a `coin_id` price with no mapping evidence | Identity `NOT_MET` |
 | A11 | All six `ACCEPTED` used to remove the dashboard warning or rank | Rejected; eligibility only |
 | A12 | 19:39:58Z hash match cited as row coverage | Rejected; metadata only |
+| A13 | One event, success plus idempotent retry: receipt/attempt ratio is 1/2 | Logical-event coverage 1/1; two attempt outcomes separately reconciled |
+| A14 | Old observation ingested after emission or after recorded horizon selection | D3/D4 NOT_MET for that asserted selection |
 
 **Positive hypothetical, for illustration and not a claim about current data:** Suppose a future forward window for one signal has:
 - an independent attempt log with drop classes, mapped by unique logical keys to all branch-required ledger and decision receipts, with retries reconciled and no unexplained unmatched records;
