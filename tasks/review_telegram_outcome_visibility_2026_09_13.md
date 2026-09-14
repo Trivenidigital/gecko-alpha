@@ -32,3 +32,5 @@ Fresh focused verification:72tests passed for endpoint, executable frontend life
 Production srilu HEADd2f0d61e, trackedclean and pipeline/dashboard/Hermes active at00:20:59Z. Full master includes separately scoped capture/schema changes, so this PR does not authorize an unreviewed full production refresh. No production file/DB/config writes or external messages.
 
 Integrated PR577 merge7cbd82dd after exactCI7945passed12skipped and118dashboard checks. Only generated frontend assets conflicted; rebuilt combined source with Vite78modules. Combined Telegram/postmortem/API/navigation suite89passed. No unresolved merge paths. Both renewed reviews and exact final-head CI remain required.
+
+Renewed final reviews: logic_review and ops_review both terminal APPROVE b0d694c52cd2e9aa1934ffbad7f3e8d90e05c5d3, each independently80combined tests. No findings. Verified Telegram source unchanged from original reviewed21886e79; postmortem/capture imports unchanged from reviewedmaster. Allfourclearances renewed to this integration candidate; metadata-only final CI required.

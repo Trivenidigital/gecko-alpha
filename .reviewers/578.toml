@@ -10,7 +10,7 @@ watch = [
 # Independent terminal approvals: stop_gap_audit logic/concurrency (19 tests);
 # stale_pr_audit ops-safety/silent-failure/attribution (102 tests). No PR folds.
 [clearances]
-concurrency = "21886e79162f60da702b51fdfa226fd7bb1e142c"
-logic = "21886e79162f60da702b51fdfa226fd7bb1e142c"
-ops-safety = "21886e79162f60da702b51fdfa226fd7bb1e142c"
-silent-failure = "21886e79162f60da702b51fdfa226fd7bb1e142c"
+concurrency = "b0d694c52cd2e9aa1934ffbad7f3e8d90e05c5d3"
+logic = "b0d694c52cd2e9aa1934ffbad7f3e8d90e05c5d3"
+ops-safety = "b0d694c52cd2e9aa1934ffbad7f3e8d90e05c5d3"
+silent-failure = "b0d694c52cd2e9aa1934ffbad7f3e8d90e05c5d3"
