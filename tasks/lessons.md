@@ -450,6 +450,15 @@ at milestones rather than consuming reset credits or promising unlimited work.
 Required independent review remains mandatory; choose complementary review
 scopes and use the other subscription where appropriate.
 
+## 2026-09-14 — Claude Code performs the routine workload
+
+The operator explicitly set the allocation target: Claude Code should perform
+about 95% of implementation, testing, review follow-through, CI monitoring and
+routine investigation. Preserve GPT credits for high-value scope control,
+risk decisions, synthesis and final verification. Do not duplicate Claude's
+work in Codex unless evidence is missing, a material conflict appears, or an
+independent judgment is required by the review barrier.
+
 ## 2026-09-14 — Distinguish endpoint defaults from configured provider accounts
 
 The operator clarified that the working collector uses a hardcoded public RPC
