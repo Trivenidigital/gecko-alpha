@@ -324,3 +324,237 @@ def test_complete_evidence_passes_and_failed_steady_passes_fail():
         _good_summary(completed_passes=5), GOOD_DELAYS, 100, "max_seconds"
     )
     assert thin["verdict"] == "inconclusive"
+
+
+# --- Authenticated-provider readiness (2026-09-14) -------------------------
+
+SECRET = "SECRETKEY123"
+SECRET_URL = f"https://rpc.example.com/v2/{SECRET}"
+
+
+def _forbid_network(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("network session created")
+
+    monkeypatch.setattr(probe.aiohttp, "ClientSession", forbidden)
+
+
+def test_rpc_url_env_reads_only_the_named_variable(monkeypatch):
+    monkeypatch.setenv("RH_PROBE_URL", SECRET_URL)
+    monkeypatch.setenv("RH_PONS_RPC_URL", "https://other.example/key/OTHER")
+    monkeypatch.setenv("RH_PONS_START_BLOCK", "1")
+    args = probe.parse_args(["--rpc-url-env", "RH_PROBE_URL"])
+    assert SECRET not in repr(vars(args))
+    settings = probe.build_settings(args)
+    assert settings.RH_PONS_RPC_URL == SECRET_URL
+    assert settings.RH_PONS_START_BLOCK is None
+    text = json.dumps(
+        {
+            "effective": probe.effective_settings(settings),
+            "isolation": probe.isolation_report(args),
+        }
+    )
+    assert SECRET not in text
+    assert "RH_PROBE_URL" in text
+    assert (
+        probe.isolation_report(probe.parse_args([]))["environment_variables_read"] == []
+    )
+
+
+def test_public_default_retained_without_env_flag():
+    args = probe.parse_args([])
+    assert args.rpc_url_env is None
+    assert probe.build_settings(args).RH_PONS_RPC_URL == probe.PUBLIC_RPC
+
+
+def test_rpc_url_and_rpc_url_env_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        probe.parse_args(["--rpc-url", SECRET_URL, "--rpc-url-env", "RH_PROBE_URL"])
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        f"not a url {SECRET}",
+        f"ftp://rpc.example.com/{SECRET}",
+        f"https:///{SECRET}",
+        f"https://[{SECRET}/",
+        f"https://rpc.example.com:{SECRET}/",
+    ],
+)
+async def test_missing_or_invalid_env_url_refused_before_traffic(
+    value, monkeypatch, tmp_path
+):
+    _forbid_network(monkeypatch)
+    monkeypatch.delenv("RH_PROBE_URL", raising=False)
+    if value is not None:
+        monkeypatch.setenv("RH_PROBE_URL", value)
+    output = tmp_path / "evidence.db"
+    args = probe.parse_args(
+        ["--rpc-url-env", "RH_PROBE_URL", "--db-output", str(output)]
+    )
+    with pytest.raises(probe.ProbeConfigError) as refused:
+        await probe.run(args)
+    assert "RH_PROBE_URL" in str(refused.value)
+    assert SECRET not in str(refused.value)
+    assert SECRET not in repr(refused.value.__cause__)
+    assert refused.value.__suppress_context__
+    assert not output.exists()
+
+
+def test_main_reports_refusal_without_secret(monkeypatch, capsys):
+    _forbid_network(monkeypatch)
+    monkeypatch.setenv("RH_PROBE_URL", f"ftp://rpc.example.com/{SECRET}")
+    assert probe.main(["--rpc-url-env", "RH_PROBE_URL"]) == 2
+    captured = capsys.readouterr()
+    assert SECRET not in captured.out + captured.err
+    assert "RH_PROBE_URL" in captured.err
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://user:{SECRET}@rpc.example.com:8443/v2/{SECRET}?key={SECRET}#{SECRET}",
+        f"https://rpc.example.com/v2/{SECRET}",
+        f"https://rpc.example.com/?apikey={SECRET}&x=1",
+        f"https://{SECRET}@rpc.example.com/",
+        f"https://rpc.example.com#{SECRET}",
+    ],
+)
+def test_redaction_drops_userinfo_path_query_and_fragment(url):
+    assert probe.redact(url) == "https://rpc.example.com"
+
+
+@pytest.mark.parametrize(
+    "extra,refused_fragment",
+    [
+        ([], None),
+        (["--provider-log-range-cap", "2012"], None),  # 2000 span + 12 overlap
+        (["--provider-log-range-cap", "2011"], "2012"),
+        (
+            ["--provider-log-range-cap", "10", "--max-span", "1", "--min-span", "1"],
+            "13",
+        ),
+        (["--provider-batch-cap", "50"], None),
+        (["--provider-batch-cap", "49"], "50"),
+        (["--provider-batch-cap", "10", "--header-batch-size", "10"], None),
+    ],
+)
+def test_provider_caps_preflight_includes_reorg_overlap(extra, refused_fragment):
+    args = probe.parse_args(extra)
+    settings = probe.build_settings(args)
+    assert settings.RH_PONS_REORG_OVERLAP_BLOCKS == 12
+    if refused_fragment is None:
+        probe.preflight_provider_caps(args, settings)
+        return
+    with pytest.raises(probe.ProbeConfigError, match=refused_fragment):
+        probe.preflight_provider_caps(args, settings)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--provider-log-range-cap", "2011"],
+        ["--provider-batch-cap", "49"],
+    ],
+)
+async def test_provider_cap_refusal_happens_before_traffic(extra, monkeypatch):
+    _forbid_network(monkeypatch)
+    with pytest.raises(probe.ProbeConfigError):
+        await probe.run(probe.parse_args(extra))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--provider-log-range-cap", "--provider-batch-cap", "--stop-after-failed-passes"],
+)
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_new_bounds_must_be_positive_integers(flag, value):
+    with pytest.raises(SystemExit):
+        probe.parse_args([flag, value])
+
+
+def _rows(*statuses, rate_limited=False):
+    return [
+        {"status": s, "rate_limited": rate_limited, "rpc_calls": 1} for s in statuses
+    ]
+
+
+@pytest.mark.parametrize(
+    "statuses,expected",
+    [
+        (("failed", "failed", "completed", "failed", "failed"), "not_stopped"),
+        (("completed", "failed", "timeout", "error"), "failed_passes"),
+        (("refused", "refused", "refused"), "failed_passes"),
+        # Once the streak fired, a later success does not rewrite the reason.
+        (("failed", "failed", "failed", "completed"), "failed_passes"),
+        (("completed", "head_behind", "completed"), "not_stopped"),
+    ],
+)
+def test_consecutive_failed_passes_stop(statuses, expected):
+    args = probe.parse_args(["--stop-after-failed-passes", "3"])
+    assert probe.stop_reason_for(_rows(*statuses), None, args, False) == expected
+
+
+def test_failed_pass_stop_is_opt_in_and_rate_limit_keeps_priority():
+    default = probe.parse_args([])
+    assert default.stop_after_failed_passes is None
+    assert probe.stop_reason_for(_rows(*["failed"] * 50), None, default, False) == (
+        "not_stopped"
+    )
+    args = probe.parse_args(["--stop-after-failed-passes", "3"])
+    throttled = _rows("failed", "failed", "failed", rate_limited=True)
+    assert probe.stop_reason_for(throttled, None, args, False) == "rate_limited"
+
+
+def test_failed_pass_stop_is_a_failure_verdict_even_with_good_evidence():
+    verdict = probe.evaluate(_good_summary(), GOOD_DELAYS, 100, "failed_passes")
+    assert verdict["verdict"] == "fail"
+    assert "stopped_on_failed_passes" in verdict["failures"]
+
+
+async def test_probe_session_ignores_proxy_environment_like_production(monkeypatch):
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_session(*args, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(probe.aiohttp, "ClientSession", fake_session)
+    with pytest.raises(_Stop):
+        await probe.run(probe.parse_args([]))
+    assert seen.get("trust_env") is False
+
+
+async def test_report_endpoint_comes_from_env_url_and_never_leaks_it(monkeypatch):
+    import asyncio
+
+    class _Session:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def idle_loop(session, db, settings, on_pass):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(probe.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(probe.rh_pons, "run_rh_pons_loop", idle_loop)
+    monkeypatch.setenv(
+        "RH_PROBE_URL", f"https://u:{SECRET}@rpc.example.com/v2/{SECRET}"
+    )
+    args = probe.parse_args(["--rpc-url-env", "RH_PROBE_URL", "--max-seconds", "0.05"])
+    report = await probe.run(args)
+    assert report["endpoint"] == "https://rpc.example.com"
+    assert report["isolation"]["environment_variables_read"] == ["RH_PROBE_URL"]
+    assert report["stop_reason"] == "max_seconds"
+    assert SECRET not in json.dumps(report, default=str)

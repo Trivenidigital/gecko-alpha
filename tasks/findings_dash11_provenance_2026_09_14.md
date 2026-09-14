@@ -1,5 +1,7 @@
 # DASH-11 retained-price provenance audit — 2026-09-14
 
+Closeout reconciliation: tasks/current_closeout_queue_2026_09_14.md records the later 13:03 UTC audit and verified 77751890 dashboard deployment. The observations below remain the separate historical 00:26 UTC, 120-day audit; they are not current runtime or deployment verification.
+
 ## Current closeout — 2026-09-14
 
 PR #585 merged the bounded health-only API/Pipeline panel as `829d12b1` at 12:32:18Z. The recommendation below is historical and must not trigger a duplicate UI build. Next gate: coordinated deployment with fresh runtime and smoke verification; this documentation closeout makes no deployment claim. The 120-day audit cohort below is distinct from #585's 14-day recorded-label availability window. Its counts are not current panel counts or economic validation. Producer coverage and price-provenance limitations remain unresolved.

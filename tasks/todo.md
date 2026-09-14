@@ -3,8 +3,22 @@
 - [x] Current-master drift and initial production read-only check.
 - [x] Plan/design: two parallel reviewers each; folds applied.
 - [x] Pinned audit, findings PR #579 and two-vector PR review; factual folds applied.
-- [ ] CI/merge gate for #579; no deployment. Health-only UI merged in #585; next gate is coordinated deployment with fresh runtime/smoke verification. Provenance and monetary interpretations remain unverified.
+- [ ] CI/merge gate for #579; no deployment. Health-only UI merged in #585; current_closeout_queue_2026_09_14.md separately records the verified 77751890 deployment. This historical audit does not re-attest runtime or establish provenance and monetary interpretations.
 - Plan: tasks/plan_dash11_provenance_2026_09_14.md.
+
+## Overnight closeout recovery — 2026-09-14
+
+- [x] Recover failed owner, refresh clean master and verify first retained work-loop artifact.
+- [x] Merge PR585 after exact CI and two independent recovery reviews.
+- [x] Review successor plan/design and two-file UI amendment before assembly.
+- [x] Merge PR586 release tools after two PR reviews and8080 tests/118 contracts.
+- [x] Verify exact source, Linux build/render/regressions, copy initializer/content, and pinned rollout helper.
+- [x] Deploy77751890 dashboard only at13:14:10Z; full smokes/invariants passed, pipeline unchanged, rollback unused.
+- [x] Complete bounded producer/retention/price-provenance audit and reconcile the tracked closeout queue.
+- [x] Prepare final findings/queue and retained deployment evidence for independent review; PR records track review, CI and merge status.
+
+Review evidence: tasks/closeout_recovery_2026_09_14.md. Worker OAuth remains
+operator-gated; no trading, policy, paid-vendor or account changes were made.
 
 ## DASH-11 suppression cohort health — 2026-09-14
 
@@ -2480,6 +2494,39 @@ See tasks/plan_postmortem_history_2026_09_13.md.
 Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
 and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
 watchdog remain off; captured discoveries remain execution-ineligible.
+
+## 2026-09-14 — Authenticated RH capacity-probe readiness
+
+**New primitives introduced:** NONE; extend the existing investigation CLI only.
+
+### Hermes-first analysis
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Explicit secret input to existing probe | No verified matching skill; hub catalog did not load | Extend existing argparse boundary and redaction; no new service |
+| Provider range/batch preflight and failure stop | No verified matching skill | Reuse existing settings, stop_reason_for and evaluation code |
+
+Ecosystem check: https://github.com/Anil-matcha/awesome-hermes-agent inspected;
+no Alchemy-specific drop-in found. Hub at https://hermes-agent.nousresearch.com/docs/skills/
+returned its loading shell, not a usable catalog; that is not proof no skill exists.
+A dependency is unwarranted for these small CLI corrections.
+
+- [x] Verify runtime configuration and provider documentation; no endpoint configured.
+- [x] Drift review: existing redaction/preflight preserved; CLI lacks a secure URL input.
+- [x] Claude: tests first, explicit named environment URL input, conflict/missing-value refusal.
+- [x] Claude: configured provider range/batch caps checked before any traffic, including reorg overlap.
+- [x] Claude: stop after consecutive failed passes; truthful failure verdict; proxy behavior matches production.
+- [x] Document secure invocation and account/range/cost prerequisites; retain unrelated settings isolation.
+- [ ] Native focused verification, independent review and exact-head CI before integration.
+  Native RED 27F/30P, GREEN 74 passed, 12/12 guard mutants killed (Codex);
+  all four independent review vectors cleared; 01081e09 CI green (3/3); master #583–#586
+  integrated at 7520bd82 and #587 at e22e0db7; all four vectors renewed CLEAR at each; exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
+- [x] Operator confirmed public RPC, chain 4663, no provider account; separate macOS collector path recorded.
+- [ ] Assess existing public-collector lag/failure evidence; capacity remains unverified.
+
+Scope: probe, corresponding tests, runbook and this task record. No collector,
+schema, production configuration or trading changes. Authorization: operator
+“go on” on 2026-09-14, continuing the announced provider-readiness work.
 
 ## DASH-09 all-history summary plan: 2026-09-14
 

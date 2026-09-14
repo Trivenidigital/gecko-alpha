@@ -1,0 +1,130 @@
+# RH provider readiness — 2026-09-14
+
+## Current state
+
+PR576 is merged as `e6a55d7ad3f2029d3ef63fea0104d49a9e082fca`.
+Its final CI passed 7,931 tests plus 118 dashboard contract checks.
+The read-only production check on 2026-09-14 found `gecko-pipeline` active,
+but no configured `RH_PONS_RPC_URL`, `ROBINHOOD_RPC_URL` or `ALCHEMY_API_KEY`
+in the project dotenv/service environment. The RH collector is not enabled.
+The local project dotenv check also found none of those configured keys.
+No key values were printed and no production state was changed.
+
+## Operator clarification (2026-09-14)
+
+The operator confirms the separate macOS detector uses public Robinhood Chain mainnet
+RPC `https://rpc.mainnet.chain.robinhood.com`, expected chain ID 4663, with no
+provider account or API key. The reported source is
+`/Users/sriniyalavarthi/Documents/Codex/2026-09-13/do/outputs/token-detector/detector.py:17`,
+constant `RPC`. That macOS file is not accessible from this Windows workspace;
+its implementation and deployment identity have not been independently checked.
+The operator reports read-only collection with occasional rate limits and
+connection resets; live trading remains disabled.
+
+This corrects the earlier inference that a provider account was missing input.
+The configuration is now known. Absence of override environment variables on
+the checked Windows/VPS installations does not imply absence of a hardcoded
+public endpoint in the separate collector. The existing failed smoke used this
+same public URL. It establishes successful reads and throttling at that workload,
+not an absolute incapacity of the endpoint or a numeric sustainable quota.
+Do not assume a paid account exists or is required for every read-only workload.
+A production-capacity decision still needs measured lag/failure evidence and
+appropriate service terms; no new public load test or purchase is authorized
+by this clarification alone.
+
+## Provider constraints checked
+
+| Source | Observed documentation | Consequence |
+|---|---|---|
+| [Robinhood connection guide](https://docs.robinhood.com/chain/connecting/) | Public RPC is rate-limited and not recommended for production; Alchemy and other providers are listed | Do not repeat sustained public-endpoint load after the failed smoke |
+| [Alchemy RH getLogs](https://www.alchemy.com/docs/chains/robinhood-chain/robinhood-chain-api-endpoints/eth-get-logs) | Free tier permits 10 blocks per query; PAYG lists unlimited block range for Robinhood mainnet, with a 150 MB response cap | Free-tier credentials alone do not support the collector's current scan and overlap settings |
+| [Alchemy throughput](https://www.alchemy.com/docs/reference/throughput) | Limits apply across an account and use a rolling 10-second window | Verify actual account limits and competing app usage before assessment |
+| [Alchemy compute-unit costs](https://www.alchemy.com/docs/reference/compute-unit-costs) | Block-header reads cost 20 CU, log reads 60 CU; batches sum their constituent methods | HTTP batching does not remove metered method costs |
+
+These are documented limits, not verified runtime entitlements for a user
+account. No account has been selected, no subscription purchased, and no
+authenticated RPC request has been made in this follow-up.
+
+## Next evidence required
+
+1. Public endpoint identified by the operator. Verify the separate collector workload and existing lag/failure evidence before selecting the next bounded assessment.
+2. Verify chain 4663, supported log ranges, batch behavior and actual rate limits
+   with a small preflight, without activating the production collector.
+3. Run the corrected bounded capacity assessment in an isolated evidence DB;
+   retain backlog-drain, steady-state delay, failure and checkpoint results.
+4. Do not infer useful early-alert performance or execution readiness from
+   transport success alone; those remain separate measured gates.
+
+Claude Max completed the independent credential/compatibility audit.
+The operator has confirmed the public endpoint; no provider account exists. Coding
+changes, if needed, must address concrete gaps found by that audit.
+
+## Probe readiness fixes (2026-09-14, branch codex/rh-provider-readiness)
+
+The audit found probe-side blockers only; the collector's own logs already
+omit the URL. The fixes change only the investigation CLI, its tests and the
+runbook. Collector, config, DB and schema are untouched.
+
+| Gap | Design | Pinned by |
+|---|---|---|
+| Keyed URL only accepted on the command line | `--rpc-url-env NAME` reads only that variable, in a mutually exclusive group with `--rpc-url` (public default kept). Settings stay init-only. A missing, empty or malformed value (scheme, host or port) raises `ProbeConfigError ... from None` before traffic, naming the variable without its value; `main` exits 2 | env, exclusion, 7 refusal cases, `main` stderr, end-to-end report without the secret |
+| Report `endpoint` redacted `args.rpc_url` (found while implementing) | Redact the URL actually used; `isolation` lists variable names read, replacing the untrue `reads_dotenv_or_environment: false` | end-to-end report test |
+| Provider range/batch limits unchecked | `--provider-log-range-cap` refuses `max_span + RH_PONS_REORG_OVERLAP_BLOCKS` above the cap (a checkpointed pass queries `next - overlap .. next + span - 1`). `--provider-batch-cap` refuses a header batch above its cap. Both run in `run()` before the DB-output check and the session | 2012/2011 boundary, Alchemy free 10 vs 13, batch 50/49, refusal before traffic |
+| Failing provider kept using budget | `--stop-after-failed-passes N` (opt-in, positive): the longest consecutive failed/timeout/error/refused streak reaching N gives `stop_reason=failed_passes` and failure `stopped_on_failed_passes`. It is checked after the rate-limit stop, which keeps priority | streak and reset cases, opt-in default, priority, fail verdict despite good evidence |
+| Probe used the proxy environment | `ClientSession(trust_env=False)`, like the pipeline | session kwargs test |
+| Redaction only tested with a path key | userinfo, path, query and fragment tests; hostname kept (a key in a subdomain is a residual, documented) | 5 cases |
+
+Deliberately deferred (out of scope): the error-code delta in the collector's
+invalid-response log, per-method or compute-unit counters, a `batch_headers`
+transport field, paid-provider integration and `SecretStr` for
+`RH_PONS_RPC_URL`. The existing call cap, rate-limit stop and new failure stop
+bound diagnostics for now.
+
+The Alchemy free tier is incompatible with the current configuration: with the
+reorg overlap of 12 (fixed in the probe, collector default), the smallest
+checkpointed query is 13 blocks, above its 10-block cap. The probe refuses it
+before traffic when given `--provider-log-range-cap 10`.
+
+### Independent ops-safety review follow-up (2026-09-14)
+
+- F1 (fixed, docs only): the runbook's authenticated invocation was one
+  copy-paste block, so pasting it let `read` consume the probe line and the
+  key pasted afterwards would run as a command and enter shell history. The
+  secret read (`IFS= read -rsp`, run alone), the probe invocation and `unset`
+  are now separate steps.
+- N2 (fixed, docs only): the free-tier incompatibility is stated for the
+  current overlap of 12, not as absolute.
+- Non-blocking residuals, no code change:
+  - N1: out-of-range CLI values raise a Pydantic `ValidationError` from
+    `build_settings` (exit 1 with a traceback) instead of the documented exit
+    2 refusal. It happens before traffic and field errors carry only that
+    field's input, not the URL.
+  - N3 (collector-side, existing): an exception escaping the per-pass guard
+    (for example in `_record_attempt` or `_finish_pass`) ends the worker task.
+    The probe then waits `--max-seconds` and fails loudly at `await task`
+    without a report. That is a crash, never a false pass.
+
+### Verification record
+
+- Tests first (commit `a5f2149a`), Codex native run: 27 failed / 30 passed. The
+  15 pre-existing tests stayed green; the redaction cases and argparse-only
+  rejections passed before the change, as predicted.
+- Implementation `deee7772`, Codex native run: probe and RPC-check suites,
+  74 passed. The local stubbed-aiohttp smoke caught a missing `from None` on
+  the empty-variable refusal before the native run.
+- Guard mutants (12: URL validity, port, overlap in the range check, batch
+  cap, positivity boundary, streak memory, failure verdict, `trust_env`,
+  mutual exclusion, preflight call, report endpoint source, `from None`),
+  Codex native run: all 12 killed with no survivors or skips. Source was
+  restored byte-identical; 74 passed afterwards.
+- Independent concurrency/logic (Claude session e01d2b39-29ed-4d9e-bc18-bb3df171be6a) and ops-safety/silent-failure (f951dc2f-0fc8-428b-8f08-9413619414d9) are terminal CLEAR at b253aca429ce75b629bb6c4fc72ee429497d8189. The separate logic reviewer also cleared the ops-authored documentation fix. Final nonblocking wording notes were clarified. PR #581 exact-head CI remains pending.
+- PR #581 opened; origin/master dashboard PRs #577/#578 merged into this branch and interaction-reviewed. No provider traffic, production configuration, collector activation or trading actions were taken.
+
+
+### Integration renewal
+
+PR #581 revision d2dba76d passed 8,007 tests (12 skipped), 118 contract checks and reviewer clearances. The guarded merge stopped because master advanced. PRs #580 and #582 were integrated, and both independent sessions renewed all four vectors at f74e7cb12f3eca94caa7c7662a3972bf3ccdfd35. The updated revision needs fresh CI, including frontend-dist-parity. No provider traffic or production changes were made.
+
+Revision 01081e09 passed all three exact-head checks (test, reviewer-clearances, frontend-dist-parity), but master had advanced by PRs #583–#586 (dashboard, tests and task records only; no RH, scout, scripts or CI paths). Merge 7520bd82744a2ce975f54d205b6806a753ca1885 integrated them without conflicts; both independent sessions (e01d2b39, f951dc2f) renewed all four vectors CLEAR at that SHA with no material findings. The probe, its tests, the runbook and `scout/` are byte-identical to the CI-green 01081e09. A local focused rerun from this Claude shell produced no output (the known Git Bash aiohttp import limitation), so exact-head CI is the verification of record.
+
+While 2b7b046f CI ran, master advanced again with PR #587 (closeout evidence: backlog.md, tasks/**, no watched paths). Merge e22e0db70d3d584f069c3f275f8ada74a2495674 integrated it without conflicts; both independent sessions renewed all four vectors CLEAR at that SHA (evidence script is read-only, unimported, and carries no secrets or activation). No provider traffic or production changes were made.

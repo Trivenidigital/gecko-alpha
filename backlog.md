@@ -1,5 +1,17 @@
 # gecko-alpha — Backlog
 
+## Scoped closeout reconciliation 2026-09-14
+
+The verified current closeout queue is recorded in
+`tasks/current_closeout_queue_2026_09_14.md`. PR584 lane annotations and PR585
+bounded suppression-health visibility are merged and deployed in selective
+candidate77751890; broader cockpit/trust parents are not reopened or globally
+closed by these child slices. The read-only provenance audit is complete;
+cost/ranking/maturity conclusions remain evidence-gated. Historical pool-selection
+work stays closed with its bounded negative result, and paid samples/activation
+retain their operator gates. The dated broader Fable tracker is not copied forward
+as current requirements. Final evidence: `tasks/closeout_recovery_2026_09_14.md`.
+
 ## Closeout evidence note 2026-09-13
 
 Fresh fetch and read-only production check at master `6c56186e` found the July
