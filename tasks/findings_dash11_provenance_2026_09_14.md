@@ -54,10 +54,10 @@ Latest suppression emission: 00:22:40.510548Z. Latest non-null labeled_at in the
 
 Source citations refer to inspected master e6a55d7a:
 
-- scripts/suppression_cost_rollup.py:137 reads decision populations; :146 reads ledger; :166 filters dispatcher suppression. :196 selects earliest per token before :202 checks r7d. Equal timestamps preserve first encountered row; no stable identity tie-break is guaranteed, but this cohort had zero ties. :275 cost gate uses n alone.
+- scripts/suppression_cost_rollup.py:137 reads decision populations; :146 reads ledger; :166 filters dispatcher suppression. :193 selects earliest per token before :199 checks r7d. Equal timestamps preserve first encountered row; no stable identity tie-break is guaranteed, but this cohort had zero ties. :276 cost gate uses n alone.
 - scout/outcome_ledger.py:747 selects pending/partial rows. :783 calls _price_at_or_after and :787 computes return from stored entry price. :809 finalizes rows; labeled_at is row finalization, not per-horizon observed_at.
 - scout/outcome_ledger.py:655 selects first positive volume_history_cg observation at/after deadline with no upper lateness bound. :666 cache fallback has a lateness check. This reachable code path establishes a possible late-history selection; it does not establish which source produced these historical labels.
-- Production PRAGMA table_info returned the ledger's 20 fields, including price_at_emission, anchor_cache_age_seconds, r7d and labeled_at, but no per-horizon price source/observed timestamp. Creation is scout/db.py:10001. No claim is made that the whole system lacks every possible external audit record.
+- Production PRAGMA table_info returned the ledger's 19 fields, including price_at_emission, anchor_cache_age_seconds, r7d and labeled_at, but no per-horizon price source/observed timestamp. Creation is scout/db.py:10001. No claim is made that the whole system lacks every possible external audit record.
 - scout/db.py:12767 exposes history pruning. Surviving bounds do not prove the current configured keep_days or that this method caused the missing history. Effective retention config and prune job execution were not verified and are not required for the narrower surviving-data finding.
 
 Four function-segment SHA256 values matched current checkout and production after explicit UTF-8 decoding (initial Windows default-decoding mismatch was corrected):
