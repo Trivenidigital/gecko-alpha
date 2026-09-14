@@ -11,7 +11,7 @@ const finiteClock = time => Number.isFinite(time.wall) && Number.isFinite(time.m
 function parseObservation(payload, received) {
   const meta = payload?.meta
   const observed = typeof meta?.observed_at === 'string' ? Date.parse(meta.observed_at) : NaN
-  if (!meta?.ok || meta.source !== 'signal_params' || meta.read_only !== true || meta.not_execution_eligibility !== true ||
+  if (meta?.ok !== true || meta.source !== 'signal_params' || meta.read_only !== true || meta.not_execution_eligibility !== true ||
       !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(meta.observed_at || '') ||
       !Number.isFinite(observed) || !finiteClock(received) || observed - received.wall > 5000 ||
       !Array.isArray(payload.lanes) || payload.lanes.length > 128) throw Error('Invalid lane observation')
