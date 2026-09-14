@@ -2443,3 +2443,8 @@ watchdog remain off; captured discoveries remain execution-ineligible.
 - [x] Both independent design reviewers approved e4f8ecbc without folds before build; root authorized implementation.
 
 Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
+
+- [x] All-history summary API/panel built;190focused tests, Vite76module build and synthetic browser QA passed.
+- [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
+
+Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.

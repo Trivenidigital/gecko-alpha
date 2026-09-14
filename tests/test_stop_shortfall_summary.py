@@ -253,3 +253,64 @@ async def test_repeated_cancellation_waits_for_cleanup(tmp_path, monkeypatch):
             await task
         assert closed
     assert (await response(path)).status_code == 200
+
+
+async def test_all_history_not_first_page_and_classifier_parity(tmp_path):
+    from collections import Counter
+    from dashboard.stop_shortfall import classify_stop_shortfall
+    from tests.test_stop_shortfall import CUTOVER
+
+    path = history_db(tmp_path)
+    with sqlite3.connect(path) as c:
+        c.row_factory = sqlite3.Row
+        original = dict(c.execute("SELECT * FROM paper_trades WHERE id=1").fetchone())
+        for i in range(4, 64):
+            row = dict(
+                original, id=i, closed_at="2026-08-20T00:00:00Z", price_source="legacy"
+            )
+            c.execute(
+                f"INSERT INTO paper_trades ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
+                tuple(row.values()),
+            )
+            c.execute(
+                "INSERT INTO paper_trade_entry_snapshots VALUES (?, 'v1', 25)", (i,)
+            )
+        c.execute(
+            "UPDATE paper_trades SET price_source='cg_lane',conviction_locked_at='changed' WHERE id=4"
+        )
+        c.execute(
+            "UPDATE paper_trades SET price_source='cg_lane',remaining_qty=0 WHERE id=5"
+        )
+        c.execute(
+            "UPDATE paper_trades SET price_source='cg_lane',entry_price='invalid' WHERE id=6"
+        )
+        expected = [
+            classify_stop_shortfall(dict(r), CUTOVER)
+            for r in c.execute(
+                "SELECT p.*,s.entry_snapshot_version,s.sl_pct_at_entry FROM paper_trades p LEFT JOIN paper_trade_entry_snapshots s ON p.id=s.paper_trade_id"
+            )
+        ]
+    data = (await response(path)).json()["data"]
+    assert data["total_stop_rows"] == 63 and data["eligible_rows"] == 2
+    assert data["mean_shortfall_pp"] == pytest.approx(3)
+    reasons = Counter(
+        r["exclusion_reason"] for r in expected if r["state"] != "available"
+    )
+    assert data["exclusions_by_reason"] == dict(reasons)
+
+
+async def test_outer_async_timeout_also_cleans_up(tmp_path, monkeypatch):
+    from dashboard import stop_shortfall_summary as mod
+
+    path = history_db(tmp_path)
+
+    async def stalled_read(*args):
+        await asyncio.sleep(10)
+
+    with monkeypatch.context() as m:
+        m.setattr(mod, "REQUEST_SECONDS", 0.03)
+        m.setattr(mod, "_read", stalled_read)
+        result = (await response(path)).json()
+        assert result["meta"]["data_missing_reason"] == "query_timeout"
+        assert result["data"]["total_stop_rows"] is None
+    assert (await response(path)).status_code == 200
