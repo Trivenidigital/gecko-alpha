@@ -314,3 +314,68 @@ async def test_outer_async_timeout_also_cleans_up(tmp_path, monkeypatch):
         assert result["meta"]["data_missing_reason"] == "query_timeout"
         assert result["data"]["total_stop_rows"] is None
     assert (await response(path)).status_code == 200
+
+
+@pytest.mark.parametrize("cancel_kind", ["repeated_cancel", "outer_timeout"])
+async def test_acquisition_remains_owned_until_real_connection_closed(
+    tmp_path, monkeypatch, cancel_kind
+):
+    import threading
+    from dashboard import stop_shortfall_summary as mod
+
+    path = history_db(tmp_path)
+    entered, release = threading.Event(), threading.Event()
+    opened = []
+    original_connect = sqlite3.connect
+
+    class Tracked(sqlite3.Connection):
+        was_closed = False
+
+        def close(self):
+            self.was_closed = True
+            return super().close()
+
+    def held_connect(*args, **kwargs):
+        kwargs.update(factory=Tracked, check_same_thread=False)
+        conn = original_connect(*args, **kwargs)
+        opened.append(conn)
+        entered.set()
+        release.wait(2)
+        return conn
+
+    with monkeypatch.context() as m:
+        m.setattr(sqlite3, "connect", held_connect)
+        if cancel_kind == "outer_timeout":
+            m.setattr(mod, "REQUEST_SECONDS", 0.03)
+        task = asyncio.create_task(mod.get_stop_shortfall_summary(str(path)))
+        assert await asyncio.to_thread(entered.wait, 1)
+        if cancel_kind == "repeated_cancel":
+            task.cancel()
+            await asyncio.sleep(0.01)
+            task.cancel()
+        await asyncio.sleep(0.06)
+        premature = task.done()
+        release.set()
+        if cancel_kind == "repeated_cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert (await task)["meta"]["data_missing_reason"] == "query_timeout"
+        await asyncio.sleep(0.02)
+        properly_closed = all(conn.was_closed for conn in opened)
+        # Release resources even when the intentional red run exposes abandonment.
+        for conn in opened:
+            if not conn.was_closed:
+                conn.close()
+        assert not premature, "request abandoned in-flight SQLite acquisition"
+        assert properly_closed, "acquired native connection leaked"
+    assert (await response(path)).status_code == 200
+
+
+async def test_cutover_must_be_utc_normalizable(tmp_path):
+    path = history_db(tmp_path)
+    with sqlite3.connect(path) as c:
+        c.execute("UPDATE paper_migrations SET cutover_ts='0001-01-01T00:00:00+01:00'")
+    result = await response(path)
+    assert result.status_code == 503
+    assert result.json()["meta"]["data_missing_reason"] == "cutover_unavailable"

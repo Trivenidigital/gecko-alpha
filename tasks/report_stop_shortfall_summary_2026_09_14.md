@@ -76,3 +76,9 @@ per-row checks/yield every128rows,50000row fail-closed cap and4096byte-cell guar
 They do not promise preemption of an OS filesystem stall. Oversized/missing evidence
 and timeout return explicit503, never partial/zero success. No ranking, pruning,
 capital, dispatch, source or strategy changes. Next action: independent PRreviews.
+
+## PR580 review fixes
+
+Logic review found acquisition cancellation could abandon sqlite3.connect's newly opened native connection before _ro_db received it. Two real connector-barrier regressions failed (repeated cancellation and outer timeout); the adapter now owns/shields acquisition and awaits its eventual result before interrupt/close. Both tests prove the request waits for connector release and TrackedConnection.close is called, then a fresh request works. Shared _ro_db and classifier unchanged. Another failing fixture proved an aware cutover whose UTC conversion overflows returned200; validation now normalizes to UTC and returns503 cutover_unavailable. Summary focused tests20passed after fixes. Root's prior actual-candidate00:46:18UTC read-only probe matched355/23/4/328 and mean/median (9.454ms single observation); it predates these fixes and is not re-attested here. Renewed two-vector review required.
+
+After both review fixes, the same complete focused command above passed193tests in20.52seconds. Black and diff checks passed; frontend source/dist unchanged, so no rebuild needed for these Python-only fixes.

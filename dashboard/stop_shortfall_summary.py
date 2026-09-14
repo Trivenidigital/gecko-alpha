@@ -87,6 +87,7 @@ async def _read(conn, check):
             or datetime.fromisoformat(cutover.replace("Z", "+00:00")).tzinfo is None
         ):
             raise ValueError
+        datetime.fromisoformat(cutover.replace("Z", "+00:00")).astimezone(timezone.utc)
     except (ValueError, OverflowError):
         raise SummaryUnavailable("cutover_unavailable") from None
     cursor = await conn.execute(
@@ -185,8 +186,11 @@ async def get_stop_shortfall_summary(db_path: str) -> dict:
     try:
         async with asyncio.timeout(REQUEST_SECONDS):
             context = _ro_db(db_path)
-            conn = await context.__aenter__()
+            # A worker may already own a native connection before this await returns.
+            # Shield and retain acquisition so cancellation cannot abandon its result.
+            acquisition = asyncio.create_task(context.__aenter__())
             try:
+                conn = await asyncio.shield(acquisition)
                 await conn.execute("PRAGMA query_only=ON")
                 await conn.execute("PRAGMA busy_timeout=100")
                 await conn.set_progress_handler(lambda: int(expired()), 1000)
@@ -199,7 +203,12 @@ async def get_stop_shortfall_summary(db_path: str) -> dict:
 
                 async def close():
                     try:
-                        await conn.interrupt()
+                        acquired = await acquisition
+                    except Exception:
+                        # Failed acquisition already ran the context's finally.
+                        return
+                    try:
+                        await acquired.interrupt()
                     finally:
                         await context.__aexit__(None, None, None)
 

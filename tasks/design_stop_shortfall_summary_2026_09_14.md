@@ -224,3 +224,7 @@ paid APIs or external messages. Design review pending; implementation remains he
 ## Design clearance
 
 Both independent design reviewers APPROVE e4f8ecbc0895fd69f8dc2a98edb4d180805391b9, no folds. Root explicitly authorized build after those terminal approvals. Fresh dashboard WorkingDirectory=/root/gecko-alpha and checkout d2f0d61e at00:36Z are root-provided runtime evidence, not deployment of this candidate.
+
+## PR review cleanup and cutover fold
+
+Acquire the read-only context in an owned asyncio task and await it through shield. The cleanup try begins before that await. On cancellation/timeout, retain and await eventual acquisition before interrupting and closing its connection, including repeated cancellation. An OS connector stall can therefore outlive the request budget while cleanup waits; the request must not falsely complete and abandon ownership. No shared _ro_db refactor. Validate cutover UTC normalization, including overflow, consistently with the unchanged classifier.
