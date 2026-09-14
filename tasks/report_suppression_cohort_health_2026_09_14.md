@@ -39,4 +39,8 @@ Artifacts under C:/Users/srini/.codex/automations/gecko-overnight-autonomous-clo
 - runtime-dash11-ledger-vdbe-20260914.txt — second amendment predicate ordering.
 - runtime-dash11-ledger-full-validation-20260914.txt — all-field parity, three runs, source/copy hashes.
 
-No cache flushing, host-load changes, new indexes, retention changes, suppressed decision-value filter, lexical timestamp restriction or limit widening was used. Faster subsequent observations are retained but cannot replace the worst run. A further scope/query redesign requires review before implementation; otherwise retain this as a findings-only engineering pause. Root owns that disposition and any later publication. PR579 and frozen release07af remain untouched.
+No cache flushing, host-load changes, new indexes, retention changes, suppressed decision-value filter, lexical timestamp restriction or limit widening was used. Faster subsequent observations are retained but cannot replace the worst run. The failed30d attempts were superseded by the reviewed14d scope and accepted resource gate described above. Current status is PR585 integration verification and renewed independent review; this is no longer a findings-only engineering pause. Root owns final CI, merge and any later deployment. PR579 and frozen release07af remain untouched.
+
+## PR and integration review record
+
+PR585 initial implementation c3d67d14 received independent ops ownership/schema approval after88 tests and logic semantic/controller approval after39 tests, with no findings. PR584 subsequently merged as1967cbfc; integrating that source requires renewed reviews of the combined API, styles and assets before final clearances. Both feature-specific source modules retain their reviewed behavior. No release-copy or production action accompanies this integration.

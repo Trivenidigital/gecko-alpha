@@ -4,6 +4,7 @@ import Sparkline from './Sparkline'
 import BtcSolBenchmarkStrip from './BtcSolBenchmarkStrip'
 import RegimeStrip from './RegimeStrip'
 import ProvenanceExpander from './ProvenanceExpander'
+import LaneStatusAnnotations, { LaneStatusNotice, useLaneStatus } from './LaneStatusAnnotations'
 import { researchLinks } from '../todayFocusLinks.js'
 import { buildFocusDetailRows, primaryBlockFacts } from '../todayFocusFacts.js'
 import { formatDetectionAge } from '../todayFocusAge.js'
@@ -56,6 +57,7 @@ function joinFacts(values) {
 }
 
 export default function TodayFocusPanel() {
+  const laneStatus = useLaneStatus()
   const [state, setState] = useState(() => recordSession(loadTodayFocusState()))
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -138,6 +140,7 @@ export default function TodayFocusPanel() {
 
   return (
     <div className="todays-focus-panel">
+      <LaneStatusNotice />
       <div className="panel todays-focus-shell">
         <div className="panel-header todays-focus-header">
           <div className="todays-focus-heading">
@@ -246,6 +249,7 @@ export default function TodayFocusPanel() {
                         ) : null}
                         {action.save_for_review ? <span className="signal-badge fired">saved</span> : null}
                       </div>
+                      <LaneStatusAnnotations surfaces={row.surfaces} status={laneStatus} />
                       <div className="todays-focus-price">
                         <span className={Number(row.current_move_pct) >= 0 ? 'move-pos' : 'move-neg'}>
                           {fmtPct(row.current_move_pct)}

@@ -2052,3 +2052,28 @@ body {
 .suppression-health small { color: var(--color-text-secondary, #9ca3af); font-size: .75rem; }
 .suppression-health button { padding: .4rem .7rem; color: inherit; background: transparent; border: 1px solid var(--color-border, #30363d); border-radius: 4px; cursor: pointer; }
 .suppression-health button:disabled { opacity: .55; cursor: wait; }
+.lane-status-notice {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin: 0 0 10px;
+}
+.lane-status-annotations {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  margin: 6px 0;
+  min-width: 0;
+  max-width: 100%;
+}
+.lane-status-annotations summary { cursor: pointer; overflow-wrap: anywhere; }
+.lane-status-chip {
+  display: inline-block;
+  max-width: 100%;
+  padding: 2px 5px;
+  margin: 2px 4px 2px 0;
+  border: 1px solid var(--color-border, #334155);
+  border-radius: 4px;
+  white-space: normal;
+  vertical-align: middle;
+}
+.lane-status-evidence { padding: 6px 0; overflow-wrap: anywhere; }
+.lane-status-detail { margin-top: 6px; }
