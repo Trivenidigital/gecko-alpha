@@ -356,9 +356,9 @@ def test_rpc_url_env_reads_only_the_named_variable(monkeypatch):
     )
     assert SECRET not in text
     assert "RH_PROBE_URL" in text
-    assert probe.isolation_report(probe.parse_args([]))[
-        "environment_variables_read"
-    ] == []
+    assert (
+        probe.isolation_report(probe.parse_args([]))["environment_variables_read"] == []
+    )
 
 
 def test_public_default_retained_without_env_flag():
@@ -467,7 +467,8 @@ async def test_provider_cap_refusal_happens_before_traffic(extra, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "flag", ["--provider-log-range-cap", "--provider-batch-cap", "--stop-after-failed-passes"]
+    "flag",
+    ["--provider-log-range-cap", "--provider-batch-cap", "--stop-after-failed-passes"],
 )
 @pytest.mark.parametrize("value", ["0", "-1", "abc"])
 def test_new_bounds_must_be_positive_integers(flag, value):
@@ -528,3 +529,32 @@ async def test_probe_session_ignores_proxy_environment_like_production(monkeypat
     with pytest.raises(_Stop):
         await probe.run(probe.parse_args([]))
     assert seen.get("trust_env") is False
+
+
+async def test_report_endpoint_comes_from_env_url_and_never_leaks_it(monkeypatch):
+    import asyncio
+
+    class _Session:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def idle_loop(session, db, settings, on_pass):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(probe.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(probe.rh_pons, "run_rh_pons_loop", idle_loop)
+    monkeypatch.setenv(
+        "RH_PROBE_URL", f"https://u:{SECRET}@rpc.example.com/v2/{SECRET}"
+    )
+    args = probe.parse_args(["--rpc-url-env", "RH_PROBE_URL", "--max-seconds", "0.05"])
+    report = await probe.run(args)
+    assert report["endpoint"] == "https://rpc.example.com"
+    assert report["isolation"]["environment_variables_read"] == ["RH_PROBE_URL"]
+    assert report["stop_reason"] == "max_seconds"
+    assert SECRET not in json.dumps(report, default=str)
