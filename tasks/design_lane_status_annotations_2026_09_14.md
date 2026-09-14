@@ -113,7 +113,13 @@ text presentation at1024/80 characters respectively, with an explicit truncated
 flag. Nontext descriptive fields are marked invalid details without inventing text
 or overriding otherwise valid enabled/suspension evidence.
 
-Raw enabled evidence contains sqlite_type and a bounded display representation;
+Each evidence field uses the same object: sqlite_type in integer/real/text/blob/null,
+display as string or null, truncated as boolean, and valid as boolean. The enabled
+display is capped at256 characters; suspension timestamp at80, reason at1024 and
+calibration at80. NULL has display=null/truncated=false; optional descriptive NULL
+is valid, enabled NULL invalid. SQLite types for descriptive fields are identified
+from the sqlite3-returned native types without coercion. Raw enabled evidence
+contains sqlite_type and a bounded display representation;
 never feed that display representation back into classification. JSON numeric values
 must be finite; nonfinite values use explicit text evidence, blobs use bounded hex,
 and truncation is flagged. React renders all details as text, never HTML. Unavailable
@@ -129,13 +135,15 @@ GET /api/signal_lane_status has no query parameters and Cache-Control:no-store.
 {"meta":{"ok":true,"source":"signal_params","read_only":true,
 "not_execution_eligibility":true,"observed_at":"2026-09-14T02:36:26Z"},
 "lanes":[{"signal_type":"example","state":"enabled","reason":"enabled_in_store",
-"evidence":{"enabled":{"sqlite_type":"integer","display":"1","truncated":false},
-"suspended_at":null,"suspended_reason":null,"last_calibration_at":null}}]}
+"evidence":{"enabled":{"sqlite_type":"integer","display":"1","truncated":false,"valid":true},
+"suspended_at":{"sqlite_type":"null","display":null,"truncated":false,"valid":true},
+"suspended_reason":{"sqlite_type":"null","display":null,"truncated":false,"valid":true},
+"last_calibration_at":{"sqlite_type":"null","display":null,"truncated":false,"valid":true}}}]}
 ```
 
-Design implementation may represent descriptive evidence as typed objects for
-invalid/truncated fields; tests must pin the final additive endpoint schema before
-building the UI. Raw status information never changes existing card payloads.
+These objects are required for every lane; no scalar/object shape change based on
+validity. Tests pin this additive endpoint schema before building the UI. Raw status
+information never changes existing card payloads.
 503 body has meta.ok=false, the same source/read_only/not_execution_eligibility
 flags, observed_at=null, a fixed reason (read_unavailable/schema_unavailable/
 read_limit/invalid_keys), and lanes=[]. A successful empty table is200/oktrue;
