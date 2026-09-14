@@ -117,7 +117,7 @@ Root is querying production size/schema/units/import/dependency evidence and cop
 feasibility. Do not claim these prerequisites passed from this source-only plan.
 SSH results must use redirect-to-file then separate read; never print secrets.
 
-## Compatibility, production-copy and exact-candidate CI gates
+## Compatibility, production-copy and exact-candidate validation
 
 Run tests from the selective candidate with OLD scout tree and retained dependency
 versions, not with current master source on sys.path. Prove module origins/core
@@ -138,26 +138,26 @@ initialize probe is permitted as a shortcut. Database copy write permissions app
 only to isolated test copy, never production; delete only named test artifacts
 under verified scratch paths after review/evidence extraction.
 
-CI routing is an explicit unresolved release gate: baseline
-.github/workflows/test.yml:3-7 runs only pushmaster/PRtomaster, no manual dispatch;
-checkout at13-18 uses default PR merge ref. PR against a release-base branch would
-not trigger that workflow; PR against master would test a synthetic NEW-core merge,
-not this OLD-core candidate. Neither is exact release-candidate CI evidence.
-Design must establish an approved Linux CI/execution path that checks out and
-attests this exact release SHA/core manifest without changing production config or
-silently treating master CI as sufficient. No deployment until that gate is met.
-This plan does not authorize modifying .github or bypassing branch protection.
+Feature CI and selective-release validation have different evidence scopes.
+Each selected feature PR must already be merged with its own exact-candidate
+GitHub CI green. Baseline .github/workflows/test.yml:3-7 only targets master;
+its PR checkout tests a merge ref, so it is not proof of the old-core combination.
+No extra GitHub workflow, configuration change, release PR merge or operator gate
+is required: the user's deploy authorization requires merged reviewed features,
+smoke tests and rollback notes, with this plan adding the necessary compatibility
+verification for the selective combination.
 
-After assembly create a reviewable release PR/artifact against the verified
-production baseline, with exact diff/core manifest and source provenance. The
-review mechanism must not merge the release branch into master (would confuse the
-selective release with product development). Root resolves the PR/CI target in
-design. Two independent candidate reviews cover import/runtime/migration reachability
-and operational rollback/isolation. All findings terminal and folded before release.
+Run focused Linux tests, actual app import/startup and production-copy checks on
+the exact selective SHA and attest the old-core manifest. Label that evidence
+honestly as local Linux candidate validation, not GitHub CI. Publish the immutable
+release manifest/report with selected PR source/CI links and the local validation
+commands/results. Two independent release-candidate reviewers cover import/runtime/
+migration reachability and operational rollback/isolation; all findings must be
+terminal and folded. Do not merge the selective branch into product master.
 
 ## Conditional rollout and rollback requirements
 
-No rollout until all upstream merges, exact selective-candidate verification/CI,
+No rollout until all upstream merges, exact selective-candidate local Linux verification,
 two candidate review clearances and fresh runtime preflight pass. Root records
 conditions and release SHA with rollback SHA d2f0d61e and original branch.
 
@@ -188,14 +188,25 @@ post-restart-only logs, old/new SHAs and merged-versus-deployed status separatel
 ## Checklist and present review result
 
 - [x] Own isolated production-baseline worktree; source drift and Hermes checks.
-- [x] Plan-only release boundaries, runtime assumptions and CI gap documented.
+- [x] Plan-only release boundaries, runtime assumptions and distinct CI/local-validation evidence documented.
 - [ ] Two parallel plan reviews/folds.
-- [ ] Root runtime/copy feasibility evidence and explicit CI path resolved.
+- [ ] Root runtime/copy feasibility evidence and local Linux validation path confirmed.
 - [ ] Separate design and two parallel reviews/folds before assembly.
 - [ ] Assemble exact dashboard artifact, prove full core parity, test old-core/copy.
-- [ ] Publish reviewable candidate with two independent reviews and exact CI.
+- [ ] Publish release report with two reviews, merged-feature CI links and local Linux validation.
 - [ ] Root-controlled conditional dashboard-only rollout/smokes/rollback evidence.
 
 Self-review: no source or production actions taken. Production-push authorization
 is conditional and has not yet been satisfied. Existing no-deploy report remains
 true until root records verified rollout; a plan does not close that gate.
+
+## Runtime and authorization clarification
+
+Root2026-09-14T00:54:39UTC: DB2.7GB,28GBfree (63percent diskused),
+Python3.12.3/aiosqlite0.22.1/SQLite3.45.1; dashboardPID3032127 and pipeline3032091
+both cwd/root/gecko-alpha; only10-telegram-onfailure.conf drop-ins; tracked-clean
+masterd2f0d61e. These observations inform copy feasibility but do not by themselves
+prove completed backup/copy, dependency parity, import correctness or unit-dependency
+isolation. Recheck immediately before release. No new GitHub CI/config/operator gate
+is imposed; per-feature merged CI plus exact selective-candidate local Linux/app/
+prod-copy validation and two-vector review are the distinct required evidence.

@@ -2358,7 +2358,7 @@ evidence and the SUPERSEDED→new-ID mapping.
 ## Selective dashboard release plan: 2026-09-14
 
 - [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
-- [ ] Two plan reviews, runtime/copy/CI feasibility then two design reviews before code assembly.
+- [ ] Two plan reviews, runtime/copy/local Linux validation feasibility then two design reviews before code assembly.
 - [ ] Exact old-core release verification and two candidate reviews before conditional dashboard-only deploy.
 
-Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Existing CI does not directly attest a release-base candidate.
+Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Merged-feature CI and exact selective-candidate local Linux validation remain distinct evidence.
