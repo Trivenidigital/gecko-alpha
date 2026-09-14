@@ -59,9 +59,20 @@ recorded status is not execution eligibility; this is not a trust-tier classifie
 
 ## Remaining gate
 
-Root requested holding PR creation briefly for pending WS PR583/master integration
-to avoid duplicate CI. Integrate at this clean checkpoint, verify the inherited
-delta and affected tests, then open PR with codex/codex-automation labels. Two
+WS PR583 merged as552db707b2f4698fba0c4f705100c2a641e066be and was integrated at
+555f16769647ebadf60b279cc77ac27ac4dab452. Only tasks/todo.md conflicted; both task
+sections were preserved. Actual API merge delta is exactly the inherited send
+exception-boundary correction. Lane reader, frontend source/dist and lane tests
+are byte-identical to the Linux/visual-verified checkpoint. Relevant lane/API/
+cold-start/WebSocket tests76 passed, with3 existing dependency deprecation warnings.
+No frontend reassembly was needed for this Python-only inherited change.
+
+Root independently inspected the Focus-mobile and Inbox-desktop fixtures with no
+visual finding. Inbox fixture omits unrelated metadata and is not evidence of
+production metadata correctness. All browser assertions concern the new annotations
+and preservation of fixture cards, not production data.
+
+Open PR with codex/codex-automation labels. Two
 independent code approvals and exact final-head CI remain mandatory. No merge or
 deployment is performed by this task. Runtime evidence in the plan is dated and
 does not claim any current engine process's in-memory eligibility state.
