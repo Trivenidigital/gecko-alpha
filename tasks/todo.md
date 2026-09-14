@@ -1,3 +1,11 @@
+## Active Work: 2026-09-14 — Suppression trust evidence contract
+
+- [x] Refresh master, drift/Hermes checks and schema/source-only production preflight.
+- [x] Plan and two reviews; design and two reviews; folds verified.
+- [x] Published docs contract as PR #588; both final PR reviews approved 5fb149b1 after folds.
+- [ ] Final-head CI/merge gate; no deployment. Review: tasks/review_suppression_trust_evidence_contract_2026_09_14.md.
+- Plan: tasks/plan_suppression_trust_evidence_contract_2026_09_14.md.
+
 ## Active Work: 2026-09-14 — DASH-11 provenance readiness
 
 - [x] Current-master drift and initial production read-only check.

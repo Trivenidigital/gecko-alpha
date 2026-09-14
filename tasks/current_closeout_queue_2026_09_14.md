@@ -30,6 +30,8 @@ The July Fable tracker remains dated requirements evidence, recovered as an untr
 
 ## Evidence follow-through and remaining gates
 
+- **Evidence contract:** [suppression trust acceptance criteria](findings_suppression_trust_evidence_contract_2026_09_14.md) defines the next read-only receipt inventory; it changes none of the statuses or authorization gates below.
+
 - **Shared reconciliation completed:** this file is the tracked queue for the verified closeout scope. The dated broader tracker is retained as evidence; additional child priorities still need their own current requirements and runtime checks.
 - **Producer, retention and provenance audit completed:** the 13:03:47Z read-only snapshot established different ledger/decision recording contracts, 9,832 complete rows versus only 5,346 recorded r7d values, and missing durable price-observation lineage. See [the findings](https://github.com/Trivenidigital/gecko-alpha/blob/docs/closeout-evidence-20260914/tasks/findings_suppression_provenance_2026_09_14.md). These are explicit evidence gaps, not authorization to add writers or alter retention.
 - **Trust maturity remains evidence-gated:** the registry explicitly marks static labels stale and separately joins live suspension state. This audit supplies no basis to promote labels or calculate rankings. Preserve the warning until a reviewed evidence contract establishes comparable producer coverage and price lineage; do not infer maturity from label status, source presence or sample counts alone.
