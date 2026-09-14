@@ -1,3 +1,13 @@
+## DASH-12 full frontend rebuild parity — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift and Hermes-first checks; plan only written.
+- [x] Existing asset-existence baseline: 3 tests passed; no fresh build or CI edits.
+- [ ] Two independent plan reviews/folds at the committed candidate.
+- [ ] Separate design and two independent design reviews/folds before build.
+- [ ] Comparator/workflow implementation, stale-source falsifier, PR and two reviews.
+- [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
+- Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
+
 ## Telegram recorded-outcome visibility — 2026-09-13
 
 - [x] Drift/runtime verified on fresh d5b26ff base; plan written.
