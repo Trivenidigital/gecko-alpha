@@ -47,8 +47,7 @@ authenticated RPC request has been made in this follow-up.
 
 ## Next evidence required
 
-1. Identify the provider/account and its available Robinhood mainnet endpoint
-   through a secret-safe local configuration path.
+1. Public endpoint identified by the operator. Verify the separate collector workload and existing lag/failure evidence before selecting the next bounded assessment.
 2. Verify chain 4663, supported log ranges, batch behavior and actual rate limits
    with a small preflight, without activating the production collector.
 3. Run the corrected bounded capacity assessment in an isolated evidence DB;
