@@ -4,7 +4,7 @@
 - [x] Existing asset-existence baseline: 3 tests passed; no fresh build or CI edits.
 - [x] Two independent plan reviewers approved ab2a4aac with no required folds.
 - [x] Separate design written; no comparator/workflow/build changes yet.
-- [ ] Separate design and two independent design reviews/folds before build.
+- [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
 - [ ] Comparator/workflow implementation, stale-source falsifier, PR and two reviews.
 - [ ] Exact final-candidate CI proves full rebuild parity; no production deployment.
 - Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
