@@ -1,0 +1,57 @@
+# Receipt reducer/META design review — 2026-09-16
+
+## Plan gate completed
+
+PR [#591](https://github.com/Trivenidigital/gecko-alpha/pull/591) merged at
+2026-09-16T18:37:27Z as `363b9614bdf946cef5b9612961ee73b3c69f9839`.
+Reviewed head `dd3251da1bee937a8e0bf17313c8b47b3b16eb30` retained both terminal
+independent approvals. CI run 35124293471 attempt 2 passed all four checks.
+The earlier full-suite timeout is superseded by this successful retry; no
+workflow timeout or executable source was changed. No deployment was needed.
+
+## Design draft and independent review
+
+Configured safe-mode Claude session `5e207c93-18ab-4dd7-8a41-56497f382438`
+returned a read-only design draft with `is_error=false`; the coordinator saved
+it at `3284233791ca3f68646a23cdc25acea226bea481`. No implementation was produced.
+
+Two parallel reviewers independently returned **REQUEST CHANGES**:
+
+| Reviewer/vector | Required fold |
+|---|---|
+| design_logic: parsing/consumer correctness | Exclude structural `event` from unknown-key counts; enforce reducer conservation, domain and span invariants; enforce META success consistency and slot rules; reject non-finite elapsed values and non-integer return codes; classify partial tails before parsing |
+| design_ops: filesystem/operational safety | Make guard falsifiers reach the actual open; isolate blocking mutations in bounded subprocesses with cleanup; narrow change-detection claims; enforce a cumulative cap-plus-one read budget |
+| Both | Earlier realpath/lstat rejection masks proposed O_NOFOLLOW/O_NONBLOCK mutations; tests must discriminate each guard |
+| design_logic: scope | Explicitly review the bounded addition of fixed presence/unknown counters to the approved schema; pin the output-bound constant |
+
+The configured author was asked to fold these findings in the design file only.
+**Design approval remains pending. No build or production collection is authorized
+by this review record.** Separate implementation and PR review gates remain.
+
+## Runtime and existing artifacts
+
+Read-only observations at approximately 18:38 UTC: production remains selective
+`77751890c9f1f51ed348c365d4e7a5985ea2827d`, tracked clean. Pipeline and dashboard
+were active. Correct unit inventory showed `hermes-gateway.service` active;
+the initially queried `hermes` name was incorrect and is excluded from health
+conclusions. Registry endpoint returned HTTP 200. These are process/HTTP facts,
+not evidence of data freshness or worker completion.
+
+`codex-autonomous-dev-srilu.service` remains failed at its pre-start auth guard:
+13:25:33 UTC, exit 21. The timer is active. Main-process exit zero is irrelevant
+when the pre-start command failed. Restoring the intended worker OAuth login is
+an operator account action; this design work does not require that change.
+
+The local autonomous status reporter exited zero. Requested templates, role map
+and bounded cockpit/trust surfaces already exist; no parent rebuild is scoped.
+Historical first-run evidence is retained in the earlier reviewed report; this
+run does not reinterpret the current auth failure as never having run.
+
+## Boundaries
+
+No deployment, receipt collection, DB/config/account/vendor/trading changes or
+message sends. Paid vendors, activation, execution, sizing, pruning and destructive
+changes retain operator gates. Broader backlog children are not claimed exhausted.
+Permanent prompt adjustment remains recommended: consult both automation memories,
+verify current ownership, retire superseded CI blockers and distinguish plan,
+design, implementation, collection and deployment gates. Configuration unchanged.

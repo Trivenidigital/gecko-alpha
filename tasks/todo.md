@@ -1,3 +1,13 @@
+## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
+
+- [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
+- [x] Configured Claude drafts separate design; preserve32842337.
+- [x] Two parallel design reviews completed; both request correctness and filesystem-test folds.
+- [ ] Configured author folds; both reviewers approve amended design before any build.
+- [ ] Implementation, adversarial validation, PR reviews and exact-head CI remain separate.
+- Review: tasks/review_receipt_reducer_meta_design_2026_09_16.md.
+- Production collection remains outside this local/synthetic slice.
+
 ## Active Work: 2026-09-16 16:35 UTC — Receipt reducer/META, local and synthetic only
 
 - [x] Refresh master f5bc54ba (PR590 merged, Linux cleanup tests green); read AGENTS/CLAUDE/lessons/queue, receipt inventory plan/design/findings, cleanup design revision 7, handoff assessment.
