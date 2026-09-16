@@ -1,6 +1,6 @@
 **New primitives introduced:** NONE beyond the revision5 design.
 
-# Receipt cleanup revision6 amendment — candidate, NO BUILD
+# Receipt cleanup revision7 amendment — candidate, NO BUILD
 
 ## Hermes-first analysis
 
@@ -14,11 +14,11 @@ re-attestation.
 
 This amendment explicitly replaces the named paragraphs and rows of
 `design_receipt_cleanup_replacement_2026_09_16.md` at38dd5cca. Other text remains
-unchanged, not newly approved. Both files together are the candidate revision6.
+unchanged, not newly approved. Both files together are the candidate revision7.
 Build remains blocked until two independent design approvals.
 **Section 6, replace "Identity acquisition, normal path" and "Release handshake":**
 
-**Identity acquisition and acknowledgment, normal path.** After readiness records appear, W reads `DIR/wrapper.pgid` (retry until present, 4 s bound), asserts `/proc/<G>/stat` has `pid == pgrp == session == G` and `ppid == S.pid`, and that every readiness record's `pgid == G`. S's `Popen.pid` is never a group id. Only after all three checks pass does W write `DIR/identity.ready` by atomic rename, then `DIR/release`. W never waits for any supervisor-side file before writing `identity.ready`, so no wait is circular. For gated faults W then waits for `DIR/fault.fired` (4 s bound, failure `FAULT_NOT_FIRED`) while continuing to drain, and later asserts `fault.fired` `st_mtime_ns` is not earlier than `identity.ready`'s. Because `release` follows `identity.ready`, no release-gated fixture can let L exit, and therefore no cleanup phase can begin, before W holds verified identity.
+**Identity acquisition and acknowledgment, normal path.** After readiness records appear, W reads `DIR/wrapper.pgid` (retry until present, 4 s bound), asserts `/proc/<G>/stat` has `pid == pgrp == session == G` and `ppid == S.pid`, and that every readiness record's `pgid == G`. S's `Popen.pid` is never a group id. Only after all three checks pass does W write `DIR/identity.ready` by atomic rename, then `DIR/release`. W waits for exactly one supervisor-side file before writing `identity.ready`: `wrapper.pgid`, which S publishes before any gated fault can act. W never waits for `fault.fired` before writing `identity.ready`, and every identity-gated fault waits for `identity.ready` before writing `fault.fired`, so the dependency order is acyclic. For gated faults W then waits for `DIR/fault.fired` (4 s bound, failure `FAULT_NOT_FIRED`) while continuing to drain, and later asserts `fault.fired` `st_mtime_ns` is not earlier than `identity.ready`'s. Because `release` follows `identity.ready`, no release-gated fixture can let L exit, and therefore no cleanup phase can begin, before W holds verified identity.
 
 **Publication-free path.** `publish_error` and `die_before_publish` never produce `wrapper.pgid`, so W performs no live `/proc` acquisition and writes no `identity.ready`. W waits for `producer.json` (4 s), then for `fault.fired` (4 s), asserts `wrapper.pgid` absent, and takes identity from the readiness record, cross-checked against status `pgid` (`publish_error`) or the kernel-derived group from recovery (`die_before_publish`). S-side these faults gate only on `producer.json`, written by the fixture independently of W, so neither side waits on the other.
 
