@@ -1,4 +1,4 @@
-**New primitives introduced:** two proposed stdlib-only, spawn-nothing scripts, `scripts/receipt_inventory_reducer.py` and `scripts/receipt_inventory_meta.py`; three proposed test modules, `tests/test_receipt_inventory_reducer.py`, `tests/test_receipt_inventory_meta.py` and `tests/test_receipt_inventory_envelope.py` (the last is Linux-only and spawns the existing supervisor with synthetic input); one pure test helper `usable_envelope()` that encodes the consumer rule. No collector, transport, host command, production path, dependency, CI job, secret, config, schema or writer. Implementation is not authorized by this plan.
+**New primitives introduced:** two proposed stdlib-only, spawn-nothing scripts, `scripts/receipt_inventory_reducer.py` and `scripts/receipt_inventory_meta.py`; three proposed test modules, `tests/test_receipt_inventory_reducer.py`, `tests/test_receipt_inventory_meta.py` and `tests/test_receipt_inventory_envelope.py` (the last is Linux-only and spawns the existing supervisor with synthetic input); one pure test helper `usable_envelope(returncode, line)` that encodes the consumer rule. No collector, transport, host command, production path, dependency, CI job, secret, config, schema or writer. Implementation remains pending the two plan approvals, separate design and two design approvals. Standing production-push authority applies after the specified review and verification gates.
 
 # Plan: receipt inventory reducer and META, local and synthetic only
 
@@ -71,15 +71,18 @@ The design must choose and prove these; the plan only fixes what the approved 20
 **Reducer, new obligations.**
 - No baked-in production values: the window bounds are explicit inputs; the record cap and byte cap are module constants; no `journalctl`, unit name, host path or the 2026-09-14 window appears in the script. A static test enforces this.
 - Import allowlist enforced by a static test: `sys`, `json`, and at most `re` and `datetime`. No `os` beyond what a test proves necessary, no `subprocess`, `socket`, `urllib`, `http`, `sqlite3`, `ctypes`, `signal`, `shutil`, `asyncio`, `aiohttp`, no `open()` in a write mode, no `eval`, `exec` or `__import__`.
-- Output key set equals the fixed set exactly; no key is derived from input. Serialization is `json.dumps(..., separators=(",", ":"), sort_keys=True)` so the size bound is checkable.
+- Output schemas are fixed per status: `OK` uses the complete success schema above; `OVERFLOW`, `RECORD_CAP`, and `INTERNAL_ERROR` use only `status`, with no counts. Any additional argument/error status must receive its own exact count-free schema in the design. No key is derived from input. Serialization is `json.dumps(..., separators=(",", ":"), sort_keys=True)` so the size bound is checkable.
 - A pure function `reduce(data: bytes, start_us: int, end_us: int) -> dict` is separated from `main()` so tests call it in-process and through a `python -I -S` subprocess.
 
 **META, carried over from d8625be4 and adapted for local testing.**
-- Reads stdin only; validates a 40-lowercase-hex HEAD; checks `ActiveState` and `StandardOutput` against fixed value sets; computes sha256 in-process with `hashlib` for an explicit bounded list of files, reading at most 16 MiB each; emits fixed-key JSON, or a fixed status with no raw text.
+- Reads at most 4,097 bytes of metadata stdin; more than 4,096 yields a fixed count-free failure before parsing. Validates a 40-lowercase-hex HEAD; checks `ActiveState` and `StandardOutput` against fixed value sets; computes sha256 in-process with `hashlib` for an explicit bounded list of files, reading at most 16 MiB each; emits fixed-key JSON, or a fixed status with no raw text.
 - New: file paths are explicit inputs relative to an explicit root so tests use `tmp_path`; no `/root/gecko-alpha` or `gecko-pipeline.service` literal in the script. The future preflight, not this script, decides which files to hash; the plan only requires the list to be able to include the supervisor, reducer and META themselves, which the handoff asked for.
 - Unknown or malformed values are reported as fixed status codes, never echoed.
+- File access is restricted to at most eight explicitly listed regular files beneath a resolved explicit root. Reject absolute paths, traversal, symlink/reparse escapes and special files before content reads. Bound each input path to 256 characters; output uses eight fixed slots rather than arbitrary path labels. The design must settle opened-file identity/containment and changing-file handling, and may not claim general hostile-filesystem race protection from a pre-open path check.
+- A file over 16 MiB must be rejected deterministically rather than successfully hashing a truncated prefix. Specify bounded size verification (including a sentinel or equivalent) and detect changes during hashing. Synthetic escape, link, special-file, path-size, input-cap and oversized-file tests are mandatory; platform-specific cases must run on Linux CI, with Windows skips disclosed.
+- META receives its own explicit stdlib import allowlist including `hashlib` and the chosen safe filesystem APIs; the reducer import allowlist does not apply verbatim. Both scripts remain spawn-nothing and read-only.
 
-**Consumer rule as code.** `usable_envelope(line: bytes) -> tuple[bool, str]` in the Linux round-trip test module: newline-terminated, fixed 17 keys, `status == "OK"`, `dropped == 0`, `output` decodes, decoded line is one newline-terminated JSON line with the reducer's fixed keys and `status == "OK"`. Every other case returns false with a fixed reason. This exists to make the handoff's usability rule executable, not to authorize its use.
+**Consumer rule as code.** `usable_envelope(returncode: int, line: bytes) -> tuple[bool, str]` in the round-trip test module rejects any actual supervisor process return code other than zero (including report-write exit 11), even when the text looks successful. It requires exactly one newline-terminated line within the supervisor line cap; duplicate-key-rejecting JSON in both layers; exact envelope keys with strict types (booleans are not integers); consistent `status == "OK"`, `exit_code == 0`, `inner_exit == 0`, `cleanup_proof is True`, `dropped == 0`, `overflow is False`, and the remaining success invariants enumerated by the design. Strict base64 decoding must produce exactly one bounded newline-terminated inner JSON line with the selected reducer or META success schema and `status == "OK"`. The design must specify schema selection without accepting arbitrary keys. Every other case returns false with a fixed reason. Synthetic negative oracle tests cover actual nonzero return code, duplicate keys in each layer, invalid base64, extra/incomplete lines, wrong types and inconsistent success fields. Parser-only tests run cross-platform; only supervisor execution is Linux-only. This executable test oracle does not authorize collection.
 
 ## Files
 
@@ -110,9 +113,9 @@ The existing supervisor, fault runner, harness, contract tests and CI workflow a
 7. Exactly 2,097,152 bytes parsed versus 2,097,153 bytes `OVERFLOW` with no counts; a subprocess run with more than the cap on stdin still exits within the test timeout.
 8. 200 records `saturated` versus 201 `RECORD_CAP` with no counts.
 9. Forced exception through a monkeypatched parser: only `{"status":"INTERNAL_ERROR"}` printed, exactly one line.
-10. Output bound: with 200 records that each hit every allowlisted event and key, the serialized line is at most 4,096 bytes and is exactly one newline-terminated line.
-11. Fixed keys: the output key set equals the constant, for every status.
-12. Seeded stdlib `random` fuzz, bounded iterations: random nesting, random key collisions, random bytes; no exception escapes `main`, output is one line under the bound, and no input substring of eight or more bytes appears in the output unless it is an allowlisted name.
+10. Output bound: distribute 200 records across all 13 allowlisted events, with every presence key in each record; use the largest permitted counters and timestamp encodings to justify the worst-case bound. Require that the serialized line is at most 4,096 bytes and is exactly one newline-terminated line.
+11. Fixed keys: the output key set equals its status-specific schema; count-free failures and singleton INTERNAL_ERROR are tested independently of OK.
+12. Seeded stdlib `random` fuzz, bounded iterations: random nesting, random key collisions, random bytes; no exception escapes `main`, output is one line under the bound, and unique injected secret canaries never appear in output. Legitimate fixed schema names, counts and permitted timestamps may coincide with input; shared substrings alone are not leakage.
 13. Static contracts: import allowlist, no write-mode `open`, no forbidden calls, no production literals, `main` guarded by `__name__`.
 
 **META set (Windows-runnable).**
@@ -120,7 +123,7 @@ The existing supervisor, fault runner, harness, contract tests and CI workflow a
 2. Uppercase, short, long and non-hex HEAD: fixed status, HEAD not echoed.
 3. Unknown `ActiveState` and `StandardOutput` values, missing lines, extra lines, duplicate keys: fixed status, values not echoed.
 4. Missing file, empty file, file above 16 MiB (sparse or generated): the design's fixed per-file or whole-run status; no path outside the explicit list is read (tested with a canary file present in the root but not in the list).
-5. Output bound 4,096 bytes; fixed keys; static contracts as for the reducer.
+5. Output bound 4,096 bytes; status-specific fixed keys; META-specific import contract plus shared spawn/write prohibitions.
 
 **Linux envelope round trip (skipped on Windows, not cleanup proof).**
 1. Spawn the merged supervisor with `--pgid-file` in `tmp_path` and the exact wrapper shape `timeout -k 2 10 bash --noprofile --norc -o pipefail +m -c` around `cat FIXTURE | head -c 2097153 | python3 -I -S scripts/receipt_inventory_reducer.py ARGS`, where FIXTURE is a synthetic journal file written by the test. Assert supervisor status `OK`, `dropped` 0, `cleanup_proof` true, `pgrep -g G` returns 1 afterwards, and `usable_envelope` returns true with the expected counts.
@@ -134,10 +137,10 @@ The existing supervisor, fault runner, harness, contract tests and CI workflow a
 
 1. **Plan gate.** Two independent parallel plan reviews on this file. No design until both are terminal and folds are applied.
 2. **Design gate.** Separate design file; two independent parallel design reviews; the design settles every item under Remaining decisions with a stated reason.
-3. **Local gate (Windows, this workstation).** `python -m py_compile` on both scripts; `python -m unittest discover -s tests -p "test_receipt_inventory_*.py" -v` with the envelope module skipping; `git diff --check` clean; LF endings verified on the new `.py` files; the six scanning lints listed under Drift check run and pass.
+3. **Local gate (Windows, this workstation).** `python -m py_compile` on both scripts; `python -m unittest discover -s tests -p "test_receipt_inventory_*.py" -v` with Linux supervisor execution cases skipping and pure envelope-parser cases still running; `git diff --check` clean; LF endings verified on the new `.py` files; the six scanning lints listed under Drift check run and pass.
 4. **Linux gate (GitHub CI, exact head).** Full `test` job green including the envelope round trip; test-count baseline satisfied; `receipt-inventory-timeout` job unchanged and green; no workflow edit.
 5. **Review barrier.** Two independent PR reviews on the final candidate; mutation checklist complete; four-vector clearances recorded in a new `.reviewers/<PR>.toml` on the exact final SHA; any code change after a review creates a new candidate and re-runs the affected reviewers.
-6. **Merge.** Per-PR recorded operator approval. Merging changes nothing on any host.
+6. **Merge.** Standing production-push permission allows this low-risk scripts/tests or docs-only PR after focused verification, two independent terminal PR reviews/folds and exact-head green CI. No additional operator approval is required for this scoped merge. Merging causes no production deployment.
 7. **Not a gate here.** Collection. Green on every gate above leaves collection blocked behind the integration design and identity preflight below.
 
 ## Integration prerequisites for a future, separately reviewed design
@@ -150,7 +153,7 @@ Recorded so the next design cannot omit them. None is resolved by this plan, and
 - Caps: reducer and META lines bounded at 4,096 bytes here against the 65,536 capture cap and 131,072 line cap.
 - Transport: how multi-kilobyte script source reaches the host over SSH without an oversized argv or an unlicensed file write is unspecified and belongs to the integration design.
 - Identity: the supervisor must be present on the host and its hash, plus the reducer and META hashes, should be pinned by the identity preflight. META in this plan accepts an explicit file list so that pin is possible.
-- Window source identity: expected source hashes must be pinned to the revision running during the collection window, not the HEAD at collection time. The pinned 2026-09-14 window predates the supervisor deploy, and journal retention is unknown.
+- Window source identity: expected source hashes must be pinned to the revision running during the collection window, not the HEAD at collection time. The pinned 2026-09-14 window predates the supervisor implementation (no supervisor deployment is claimed), and journal retention is unknown.
 - Budget text: the supervisor's report deadline is `T0+15.5` plus interpreter startup, not fifteen seconds.
 
 ## Remaining decisions for the design and reviewers
@@ -159,7 +162,7 @@ Recorded so the next design cannot omit them. None is resolved by this plan, and
 2. **Byte cap and `pipefail`.** With `head -c` upstream, an over-cap journal makes `journalctl` take SIGPIPE and the pipeline exit nonzero, masking `OVERFLOW` as `COMMAND_FAILED`. Whether the reducer drains stdin past its cap, and whether `head` stays in the pipeline, is a transport decision; the envelope test 2 pins observed behavior either way.
 3. **Partial tail and CRLF.** Whether an unterminated last line is a record counted as `malformed`, or a separate fixed counter; whether a trailing `\r` is stripped or makes the record `malformed`. Plan default: count the partial tail as a record and as `malformed`; treat `\r` as malformed, since journald `-o json` emits LF.
 4. **Window input form.** Two epoch-microsecond integers on argv versus ISO strings parsed in-script. Plan default: integers, validated as 1 to 19 digits, `start < end` required.
-5. **META file list and missing files.** Per-file status inside a fixed map versus whole-run failure. Plan default: per-file fixed status, bounded to eight paths, whole run `OK` only if every file hashed.
+5. **META file list and missing files.** Per-file status inside a fixed map versus whole-run failure. Plan default: per-file fixed status in at most eight fixed slots, whole run `OK` only if every regular file safely hashed within the input/path/content bounds above. The design settles the precise opened-file identity and error schema.
 6. **`MESSAGE` list-of-bytes form.** Keep the approved rule that a non-string `MESSAGE` is `message_nonstr` and not decoded, even though the in-repo backfill script decodes it. Plan default: keep the approved rule; decoding widens what can be printed by mistake.
 7. **Test framework.** `unittest` for consistency with the sibling contract module and so the Windows run works without the project venv, versus pytest style. Plan default: `unittest`, which pytest collects under `testpaths`.
 8. **Envelope test placement.** In the full-suite job only, versus also in the dedicated timeout job. Plan default: full suite only; the dedicated job's shape stays unchanged per the approved supervisor design.
