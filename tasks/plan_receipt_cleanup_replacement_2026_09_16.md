@@ -1,85 +1,70 @@
-I have what I need. The plan file could not be created because the Write tool is not available in this session, so the plan is delivered inline below. This is read-only: nothing was edited, run, or committed.
+# Plan: receipt wrapper replacement supervision (final)
 
-## Replacement supervision plan
+**New primitives introduced:** one proposed stdlib-only host supervisor script, added synthetic falsifier cases, one harness flag for the raw-wrapper leak control. Implementation not authorized. No production collector, reducer, dependency or CI secret.
 
-**Outcome first.** The PR589 wrapper fails because GNU timeout supervises one process, bash, not the process group. When TERM ends bash at ten seconds, timeout exits 124 and never sends the delayed KILL. Anything that ignored TERM stays alive in the group with no supervisor left. The confirmed CI evidence shows exactly this: the TERM-ignoring producer and the pipe-holding descendant survived, both in sleeping state, while the silent and stderr-flood producers died because they honored TERM. Exit 124 is therefore not cleanup proof. It is positive evidence that the KILL phase never ran.
+## Hermes-first analysis
 
-**New primitives introduced:** one stdlib-only host supervisor script, proposed and not yet written. Two added synthetic falsifier cases and one harness flag for a raw-wrapper negative control. No collector, no reducer, no dependency, no CI secret.
-
-**Smallest residual fix.** Supervise the group, not the child. Keep the exact PR589 argv unchanged as the inner time bound and wrap it in a small Python supervisor that does the following.
-
-- Enable child-subreaper on itself before spawning, then launch the unchanged wrapper argv with a new session so the wrapper PID is the group ID. This mirrors the existing worker in the harness.
-- Wait for the wrapper with an outer deadline. On exit for any reason, including early normal exit, sweep the group: KILL, reap with group-scoped waitpid, repeat until no child of ours remains, all bounded.
-- Emit one fixed JSON status line with the exit code, elapsed time, sweep count, and a status of OK, OUTER_TIMEOUT, SURVIVORS, or FOREIGN_GROUP. A nonzero sweep count on a normal exit is an anomaly, not a success.
-- Handle HUP and TERM to the supervisor itself by running the same sweep before exiting, so an SSH disconnect cannot recreate the orphan class.
-
-The harness helpers already encode the oracle. The `guarded_group`, `assert_empty`, `kill_group` and `reap_group` functions in tests/test_receipt_inventory_timeout.py stay as the independent detector, and the supervisor is what they now judge.
-
-**Alternatives considered and not recommended.**
-
-- Adding a TERM trap inside the bash command so timeout keeps supervising into the KILL phase. One line, but it does not cover a shell that exits early with a detached grandchild alive, and bash exec-optimization behavior would need verification.
-- Sending KILL directly at ten seconds with no grace. Closes the tested cases but adds no post-exit verification and leaves the fork-versus-group-signal window open with no retry.
-- A transient systemd scope or service with a runtime maximum. Cgroup kill is the only truly atomic primitive, but it creates a transient unit on the host, diverges from the CI runner shape, and is unverified here.
-- A shell-only outer loop using a background job and group kill. No subreaper, so zombies and reaping depend on PID 1, and the design explicitly forbade background jobs.
-
-**Process group identity and reuse risks.**
-
-- Identity is the wrapper PID in both CI and production, but by different mechanisms: Python setsid in the harness, timeout's own setpgid in production. Keep the existing assertion that fixture PGIDs equal the wrapper PID.
-- A group outlives its leader while any member lives, and the kernel cannot reuse that PID number while the group is non-empty. Reuse becomes possible only once the group is empty.
-- Rule for the supervisor: signal the group only immediately after a positive live-child observation from group-scoped waitpid. Never signal after observing no children. This closes the reuse hazard.
-- Foreign-group detector: members visible to pgrep but no children of ours means a reused PID from another session. Report it, do not kill.
-- Reap before checking, because pgrep counts zombies. Accept negative nine and one-thirty-seven as timeout outcomes, since timeout's group KILL also kills timeout itself.
-- Uninterruptible members and the fork race are bounded by the repeat-until-empty loop and reported honestly as SURVIVORS.
-
-**Falsifiers.** All five existing cases keep their assertions unchanged and run against the supervisor: silent producer, TERM-ignoring producer, pipe-holding TERM-ignoring descendant, stderr flood, and the detector negative control. Two additions, neither weakening anything:
-
-- Early-exit orphan: the producer forks a TERM-ignoring child with stdout detached, then exits successfully so the pipeline finishes well before the bound. The raw wrapper leaves that child alive. The supervisor must sweep it and report a nonzero sweep count with a non-OK status.
-- Raw-wrapper leak control: run the original wrapper with the sweep disabled against the TERM-ignoring cases and assert the detector still fires, with cleanup afterward. This encodes the delete-the-guard lesson permanently and preserves the failing characterization as a positive assertion rather than an xfail.
-
-**Acceptance gates, in order.**
-
-1. Commit this plan as a gated file under tasks with the primitives marker and Hermes-first section, then two independent parallel plan reviews: logic and test validity, and ops safety and concurrency.
-2. Separate design document, then two independent parallel design reviews. Design must settle script placement, the exact status schema, timing constants, and the exec-optimization question.
-3. Implementation on this branch, stacked on PR590. Open a new PR that supersedes PR590; keep PR590 as the draft red record until the replacement merges.
-4. Linux CI job green on all seven cases with survivor assertions before fallback cleanup, exit and elapsed bounds intact, plus full pytest and the test-count baseline on the exact head.
-5. All four reviewer vectors recorded on the final SHA. The current clearance table for PR590 is deliberately empty.
-6. Even after green, collection stays blocked until reducer and META adversarial tests pass and a fresh source identity preflight is separately approved. No production commands are part of this plan.
-
-**Hermes-first analysis.**
-
-| Surface | Status | Result |
+| Domain | Hermes skill found? | Decision |
 |---|---|---|
-| Hermes skills hub | Checked by prior session on 2026-09-16, not re-checked here | Catalog stayed loading, no skill verified |
-| awesome-hermes-agent | Checked by prior session on 2026-09-16, not re-checked here | No orchestration listing replaces host process supervision |
-| Deployed VPS Hermes surface | Last snapshot 2026-05-23, not re-checked, requires production access | Twenty-four bundled skill categories, none load-bearing for process control |
-| hermes-agent-self-evolution | Not checked in any session on record | Required fold before design approval |
-| In-repo primitives | Checked this session | Harness oracle helpers and backup-script killpg pattern exist; no group verification exists anywhere |
+| Deployed VPS skills | Read-only 2026-09-16T03:32:34Z at revision 77751890: bounded first 100 installed SKILL.md paths across both Hermes homes show workflow, delegation and debugging skill names. Filenames cannot prove none addresses cleanup; no candidate verified | No verified candidate; not an exhaustive audit |
+| Public hub | Fetched 2026-09-16, catalog still loading: https://hermes-agent.nousresearch.com/docs/skills | No skill verified |
+| Ecosystem | https://github.com/0xNyk/awesome-hermes-agent lists general orchestration; https://github.com/NousResearch/hermes-agent-self-evolution README describes DSPy/GEPA prompt optimization | Neither is a verified cleanup implementation |
+| Test oracle | In-repo helpers in tests/test_receipt_inventory_timeout.py and killpg pattern in tests/test_backup_create_script.py | Reuse as independent detector |
 
-Verdict: group supervision is a kernel mechanism a skill cannot substitute. The two unchecked ecosystem items are cheap fetches the plan reviewers should complete rather than assume.
+Verdict: bounded, no global absence claim. No verified Hermes candidate supervises a host process group for this wrapper. Custom implementation remains unauthorized until plan and design reviews clear.
 
-## Exact file evidence
+**Failure being fixed.** GNU timeout 9.4 waits only on bash. In the failed CI cases, observed timing near ten seconds plus live sleeping survivors in the leaderless group show TERM ended bash and no escalation reached the survivors. Exit 124 alone proves nothing about escalation; the evidence is timing and survivors.
+
+## Design obligations
+
+The plan sets obligations. The design must choose and prove algorithms; none below is settled.
+
+**Supervision scope.** Supervise the group, not the child. Keep the exact PR589 inner argv as the inner bound. A stdlib-only supervisor sets child-subreaper before spawning, launches the wrapper in a new session, publishes the inner PGID to a file immediately, waits under an outer deadline, and on wrapper exit for any reason performs one teardown: signal, reap, verify, within one monotonic shared teardown budget.
+
+**Identity lifetime.** The design must prove the inner PGID identity remains valid from first signal through final reaping, so no signal can reach a reused PID. It must not assume a held leader zombie, which conflicts with an empty pgrep result and may be reaped by group-scoped waitpid. Any anchor mechanism must be demonstrated, not asserted.
+
+**Reaper invariants.** Single reaper: only the supervisor waits on members. SIGCHLD keeps default disposition. waitpid semantics stated exactly: positive return reaps one dead child; zero with WNOHANG means a child exists but is not yet waitable; ECHILD means no children in scope. Reap before checking, since pgrep counts zombies. Whether a members-present-but-no-children observation means a foreign group is a design question to prove, not a fact.
+
+**No group escape.** The pipeline contains no setsid, setpgid, nohup, disown or background job. A member leaving the group is a design defect.
+
+**Output ownership.** The supervisor owns all inner stdout and stderr with bounded capture. Incomplete output on any non-success status is discarded. Exactly one bounded status line is emitted. Inner failure never yields success.
+
+**Status contract.** Exit zero only for verified complete normal output: inner exit zero, no sweep, group verified empty. Distinct nonzero statuses, exact names a design choice: INNER_TIMEOUT, OUTER_TIMEOUT, COMMAND_FAILED, ORPHANS_SWEPT, INTERRUPTED, and cleanup failure. ORPHANS_SWEPT is an anomaly, never success.
+
+**Signal handling.** HUP and TERM handlers set a flag; the main loop runs teardown once under the shared budget. Repeated signals during startup or teardown are recorded, not re-entered. Catchable handling does not guarantee cleanup on SIGKILL, host failure, or every SSH disconnect. The design must state that residual boundary explicitly.
+
+## Harness, falsifiers and gates
+
+**Harness.** The harness launches the supervisor and reads the inner PGID from the published file, confirming it independently against fixture readiness records and ps output for the timeout process. Supervisor Popen.pid is never the group ID. It asserts separately on supervisor exit and inner exit from the status line. Existing checks keep their meanings: inner exit in 124, negative nine or 137 for timeout cases, elapsed within nine to sixteen seconds, assert_empty before fallback cleanup, guarded helpers as fallback only.
+
+**Falsifiers.** Assertion meanings of all five existing cases are preserved. The negative control keeps its independent raw path and does not run through the supervisor. Added cases, count set by design:
+
+- Clean early success: pipeline finishes early, expect exit zero, no sweep, empty group.
+- Ordinary nonzero exit: inner command fails normally, expect COMMAND_FAILED, output discarded, empty group.
+- Early-exit orphan: TERM-ignoring detached child, expect ORPHANS_SWEPT.
+- HUP and TERM mid-run, plus repeated signals during startup and teardown, expect INTERRUPTED and one teardown.
+- Outer deadline: inner wrapper forced past the supervisor deadline, expect OUTER_TIMEOUT, empty group.
+- Raw-wrapper leak control: harness flag runs the original wrapper without sweep, asserts survivors detected as an explicit positive characterization, then fallback cleanup proves empty. Not xfail, not skip.
+
+**Gates.**
+
+1. Commit plan under tasks with the marker; two independent parallel plan reviews.
+2. Separate design proving identity lifetime, reaper invariants, output ownership and status contract; two independent parallel design reviews.
+3. Implementation only after authorized review, updating existing draft PR590. No second PR.
+4. Linux CI green for every enumerated case with survivor assertions before fallback cleanup; full pytest and test-count baseline on the exact head.
+5. All four reviewer vectors recorded on the final SHA; .reviewers/590.toml clearances currently empty by design.
+6. Collection stays blocked until reducer and META adversarial tests pass and a separately approved identity preflight runs. No production commands here.
 
 | Claim | Location |
 |---|---|
-| Two failed cases, PIDs, sleeping state, coreutils version | tasks/review_receipt_timeout_ci_2026_09_16.md:20, 25-35 |
-| Mechanism and disposition, no skips or xfails | tasks/review_receipt_timeout_ci_2026_09_16.md:37-41 |
-| Wrapper declared failed, criteria unmet | tasks/design_receipt_timeout_ci_2026_09_16.md:5 |
-| Harness worker, subreaper, exact argv | tests/test_receipt_inventory_timeout.py:109-123 |
+| Failed cases, timing, survivors, disposition | tasks/review_receipt_timeout_ci_2026_09_16.md:20, 25-41 |
+| Wrapper declared failed | tasks/design_receipt_timeout_ci_2026_09_16.md:5 |
+| Harness worker and argv | tests/test_receipt_inventory_timeout.py:109-123 |
 | Assertion before fallback cleanup | tests/test_receipt_inventory_timeout.py:146-159 |
-| Oracle helpers to reuse | tests/test_receipt_inventory_timeout.py:24-73 |
-| Five current cases | tests/test_receipt_inventory_timeout.py:202-215 |
-| Disproved single-group assumption | tasks/design_suppression_receipt_inventory_2026_09_14.md:5, 18-23 |
-| Session-escape fold that produced that assumption | tasks/findings_suppression_receipt_inventory_2026_09_14.md:42-43 |
-| Dedicated CI job | .github/workflows/test.yml:10-23 |
-| Empty clearances on PR590 | .reviewers/590.toml:3-7 |
-| Existing killpg pattern without verification | tests/test_backup_create_script.py:448-473 |
-| Review barrier and primitives marker rules | CLAUDE.md:50-74, 76-94 |
-| Hermes-first required shape | docs/gecko-alpha-alignment.md:172-197 |
-| Hermes-first scope includes self-evolution repo | tasks/lessons.md:164-166 |
-| Discriminating evidence and delete-the-guard lessons | tasks/lessons.md:383-439 |
-| Deployed Hermes surface snapshot | docs/hermes_deployed_surface_2026_05_23.md:47-56 |
-| Active todo entry | tasks/todo.md:1-8 |
-
-## What is left
-
-Nothing was written to disk. The next action is to commit this plan as a gated tasks file and dispatch the two parallel plan reviews. Design, implementation, and any production step remain behind their own gates.
+| Oracle helpers | tests/test_receipt_inventory_timeout.py:24-73 |
+| Existing cases | tests/test_receipt_inventory_timeout.py:202-215 |
+| Disproved group assumption | tasks/design_suppression_receipt_inventory_2026_09_14.md:5, 18-23 |
+| CI job | .github/workflows/test.yml:10-23 |
+| Empty clearances | .reviewers/590.toml:3-7 |
+| Review barrier, marker | CLAUDE.md:50-94 |
+| Hermes-first shape and scope | docs/gecko-alpha-alignment.md:172-197; tasks/lessons.md:164-166 |
