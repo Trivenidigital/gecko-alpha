@@ -3,8 +3,9 @@
 - [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
 - [x] Configured Claude drafts separate design; preserve32842337.
 - [x] Two parallel design reviews completed; both request correctness and filesystem-test folds.
-- [ ] Configured author folds; both reviewers approve amended design before any build.
-- [ ] Implementation, adversarial validation, PR reviews and exact-head CI remain separate.
+- [x] Configured author folds; both reviewers approve fa032eea design and bounded schema amendment.
+- [x] Implementation and local adversarial validation; both PR reviewers APPROVE08063e64 after folds.
+- [ ] PR592 exact-head Linux CI and merge; four Linux mutation proofs remain pending.
 - Review: tasks/review_receipt_reducer_meta_design_2026_09_16.md.
 - Production collection remains outside this local/synthetic slice.
 

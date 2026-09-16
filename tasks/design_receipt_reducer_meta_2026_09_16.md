@@ -1,4 +1,4 @@
-**New primitives introduced:** two stdlib-only offline scripts, three test modules and a pure usable_envelope helper, as approved in PR591. DESIGN DRAFT ONLY; no implementation or collection authorization.
+**New primitives introduced:** two stdlib-only offline scripts, three test modules and a pure usable_envelope helper, as approved in PR591. Design approved atfa032eea; implementation reviewed at08063e64. No production collection authorization.
 
 # Design: receipt reducer and META — review draft, revision 2
 
@@ -260,3 +260,7 @@ Linux-only cases under `skipUnless(sys.platform == "linux")`, with the prerequis
 **Verification for the build run**, local Windows, in order: `py_compile` on both scripts; `python -m unittest discover -s tests -p "test_receipt_inventory_*.py" -v` with Linux cases skipping; pytest on the three new modules plus the contract module and the six scanning lints named in the plan; `git diff --check`. New files must be created with `Path.write_bytes` to keep LF, per the 2026-05-13 tooling lesson. Then the full Linux `test` job on the PR head with the count baseline, two independent PR reviews, the mutation table completed in the review file, and a new clearance file in the shape of `.reviewers/590.toml` on the final SHA.
 
 **Not in this design.** No production command, transport, host write licence, identity preflight, unit name, host path, window value, schedule, flag, account or vendor. No change to the supervisor, fault runner, harness, contract tests or CI workflow. If the build finds it must touch any of those, that is a plan amendment. Build does not start until both design reviewers return terminal approval, including explicit acceptance of the Fold 7 schema amendment.
+
+## Accepted implementation review amendments
+
+Both PR reviewers approved08063e64. META additionally imports stdlib errno as stated above. Consumer elapsed integers are limited to [-2^53,2^53] to avoid implicit float conversion overflow; finite floats retain normal invariant checks. Four Linux-only mutation proofs run against temporary source copies in the existing META test module, requiring passing controls and expected assertion failures with bounded group cleanup. These amend only portable constants and local synthetic validation; no production or workflow scope expands.
