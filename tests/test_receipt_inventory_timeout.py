@@ -529,12 +529,14 @@ class Output:
             if not data:
                 return False
         if self.line_open:
-            # Defensive: every write above ends with a newline, but an unfinished
-            # line must never be allowed to prefix the next record.
+            # An unfinished line on the pipe must never prefix the next record.
             data = b"\n" + data
         deadline = self.deadline if self.deadline is not None else time.monotonic() + 1.0
         complete = relay(data, deadline, self.fd)
-        self.line_open = not data.endswith(b"\n")
+        # Conservative: an incomplete relay may have left a partial line on the
+        # pipe even though the intended buffer ended with a newline, so the line
+        # stays open until a relay completes.
+        self.line_open = (not complete) or not data.endswith(b"\n")
         if not complete:
             self.incomplete = True
         return complete

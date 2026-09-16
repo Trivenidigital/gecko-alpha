@@ -213,12 +213,30 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(stream, b"abc\nWORKER {}\n")
         self.assertEqual(harness.parse_marker(stream.decode(), "WORKER"), {})
 
-    def test_unfinished_line_is_terminated_before_the_next_record(self):
+    def test_partial_relay_leaves_the_line_open_until_a_relay_completes(self):
+        # Ops residual reproduction (review of e99e121d): the first relay accepts
+        # only b"abc" of b"abc\n" and reports incomplete; the next WORKER write
+        # then produced b"abcWORKER {}\n" and parse_marker returned None.
+        pipe = bytearray()
+        outcomes = iter([(3, False), (None, True), (None, True)])
+
+        def partial_relay(data, deadline, fd=1):
+            accepted, complete = next(outcomes)
+            pipe.extend(data if accepted is None else data[:accepted])
+            return complete
+
+        harness.relay = partial_relay
         out = harness.Output(fd=7, budget=64)
-        out.line_open = True  # defensive path: cannot arise from write(), pinned anyway
-        out.write("WORKER {}", budgeted=False)
-        self.assertEqual([data for data, _, _ in self.relayed], [b"\nWORKER {}\n"])
+        self.assertFalse(out.write("abc"))
+        self.assertTrue(out.line_open)
+        self.assertTrue(out.incomplete)
+        self.assertTrue(out.write("WORKER {}", budgeted=False))
+        self.assertEqual(bytes(pipe), b"abc\nWORKER {}\n")
+        self.assertEqual(harness.parse_marker(bytes(pipe).decode(), "WORKER"), {})
         self.assertFalse(out.line_open)
+        # A later complete write is not prefixed again.
+        self.assertTrue(out.write("tail"))
+        self.assertEqual(bytes(pipe), b"abc\nWORKER {}\ntail\n")
 
     def test_diagnostics_share_one_budget_and_drop_beyond_it(self):
         out = harness.Output(fd=7, budget=10)

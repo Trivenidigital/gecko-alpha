@@ -317,3 +317,22 @@ focused modules → 48 passed, 29 skipped; `py_compile` passes; `git diff
 --check` clean; LF preserved. Linux CI run35104829851 on c72e6e55 was left to
 complete; no duplicate full suite was run here. The new head needs exact-head
 Linux CI and a terminal ops re-review before any clearance.
+
+### Candidate e99e121d: ops re-review, one P2 framing residual folded
+
+Ownership/structural approval intact. Ops reopened on one P2: `Output.write`
+derived `line_open` from the intended buffer, which always ends with a
+newline, not from relay completion. Reproduced on e99e121d with a simulated
+partial relay: the first relay accepts only `abc` of `abc\n` and returns
+False; the next WORKER write then produced `abcWORKER {}\n` and `parse_marker`
+returned None. Fold: `line_open = (not complete) or not data.endswith(b"\n")`,
+so the line stays open after any incomplete relay until a relay completes.
+The manually seeded flag test is replaced by
+`test_partial_relay_leaves_the_line_open_until_a_relay_completes`, which
+simulates the partial relay through the writer's real path and asserts the
+pipe reads `abc\nWORKER {}\n`, `parse_marker` returns the record, and a later
+complete write is not prefixed again. Both the corrupted stream on e99e121d
+and the fixed stream on the working tree were reproduced before commit.
+Same boundaries: not pushed, no clearance, no merge, no production, paid,
+account or trading action; falsifiers, oracle, supervisor and fault runner
+untouched.
