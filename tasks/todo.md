@@ -1,3 +1,48 @@
+## Active Work: 2026-09-16 — Receipt cleanup implementation, findings folded
+
+- [x] Refresh origin/master b5daecfc and current PR590; retain approved plan and combined revision7 design.
+- [x] Configured Claude author drafted supervisor, fault runner and expanded 29-case harness; preserved candidate 9db77514 on draft PR590.
+- [x] Two independent implementation reviews completed on 9db77514: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
+- [x] Linux CI on 9db77514: 29-case job passed; full suite 1 failure (round8 subprocess lint rejects Popen without a timeout kwarg Popen cannot take), 8151 passed, 14 skipped.
+- [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Subsequently pushed to PR590.
+- [x] Review of c72e6e55: structural/concurrency APPROVE; ops REQUEST CHANGES on two reproduced residuals (clipped diagnostic prefixing the WORKER line; lint missing `with Popen` exit and annotated bindings). Both folded with exact discriminating tests; Windows: 48 passed, 29 skipped.
+- [x] Structural re-review of e99e121d: one P2 (line_open derived from the intended buffer, not relay completion) folded with a simulated partial-relay regression; ownership review intact.
+- [x] Push reviewed implementation and clearance evidence to existing draft PR590.
+- [ ] Final-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
+- [x] Both independent reviewers terminal APPROVE on9fa1f4ce; all findings folded; four-vector clearances recorded.
+- [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
+
+Windows skips are not cleanup proof. Independent code-review clearances are recorded; final-head CI remains separate. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
+## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
+
+- [x] Refresh current master, canonical memory, backlog and current draft PR590.
+- [x] Configured author returned revision4; two parallel design reviews completed.
+- [x] Fold scan completeness, recovery budgets, event records and deterministic faults; revision7 received two design approvals at0e632d9c.
+- [ ] Build only after design approval; retain Linux falsifiers, two PR reviews and final-head green CI.
+- Existing approved plan retained. No production re-attestation or implementation clearance.
+- Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md.
+## Historical: 2026-09-16 — Receipt cleanup replacement (superseded by revision7 above)
+
+- [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.
+- [x] Claude authored replacement plan; two parallel reviews returned required folds.
+- [x] Fold identity/oracle, shared budget, output/status and falsifier findings.
+- [x] Both plan_logic and plan_ops approve amended plan e2790e8d; no residual plan blockers.
+- [x] Separate design and three paired review rounds; folds retained. Design6eb94b4f NOT APPROVED.
+- [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
+- [ ] Final-head CI and clearance gate; no production collection or deployment.
+
+Historical review state: tasks/review_receipt_cleanup_replacement_2026_09_16.md. Parent fallback/publication findings below were superseded by the revision7 approvals above; implementation and Linux verification remain outstanding. Initial plan031a943f was not approved. The amended plan specifies proof
+obligations; it does not establish a safe cleanup algorithm. Prior raw wrapper
+remains unsafe. Plan: tasks/plan_receipt_cleanup_replacement_2026_09_16.md.
+## Active Work: 2026-09-16 — Receipt timeout CI validation
+
+- [x] Fresh master, drift/Hermes checks and identity-only production preflight.
+- [x] Plan and design: two parallel reviews at each gate.
+- [x] Synthetic Linux cleanup harness, draft PR590, two initial PR reviews and two final findings reviews at95bc8efd.
+- [ ] Cleanup gate FAILED in Linux CI: TERM-resistant producer/descendant remained; do not collect production receipts with this wrapper.
+- Plan: tasks/plan_receipt_timeout_ci_2026_09_16.md.
+- Scope: test-only prerequisite; no receipt collection or deployment.
+
 ## Active Work: 2026-09-14 — Bounded suppression receipt inventory
 
 - [x] Refresh master, canonical memory/backlog/source drift and initial production identity.

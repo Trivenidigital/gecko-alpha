@@ -7,6 +7,21 @@ on:
     branches: [master]
 
 jobs:
+  receipt-inventory-timeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prove synthetic receipt wrapper cleanup on Linux
+        run: python -m unittest discover -s tests -p test_receipt_inventory_timeout.py -v
+
   frontend-dist-parity:
     runs-on: ubuntu-latest
     timeout-minutes: 10
