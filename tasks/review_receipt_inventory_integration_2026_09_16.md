@@ -42,3 +42,16 @@ Two independent DESIGN reviews rejected0821bad3 (checklist missing actual rc/imm
 
 Fresh read-only runtime19:50:31Z remains selective77751890 trackedclean; pipeline/dashboard/Hermesactive, registryHTTP200. Newworkerprestartattempt19:22:35Z authguardexit21, timeractive. Operator restore intendedVPSOAuth; this is separate from integrationengineering. No account/service changes.
 
+
+## 2026-09-16 23:50 UTC — Amendment review, not design approval
+
+Configured author ee1f8219-ef8c-4049-8de5-1189922eae4c recovered after availability probe succeeded. Amendment candidate a578266220d9ae40bf2af6dbc16d61c9a045cebc was reviewed by two independent parallel agents. Both REQUEST CHANGES.
+
+| Reviewer/vector | Required folds |
+|---|---|
+| plan_structure / structural | OpenSSH security-key helper invalidates exhaustive childlessness claim; remote head does not bound login/interpreter diagnostics; buffered truncation may exit0 so reject sentinel regardless of rc; clear IN_FLIGHT atomically with next/verdict/permanent attempt ledger and durable state |
+| plan_operations / operational | Binary-safe Windows git object materialization; disclose whole-capture bound unproved; manual busy removal only after verified owner and transport termination; qualify build permission with separate design reviews |
+
+Configured author received all folds; no plan/design/build approval is inferred. Physical whole-capture bounds and local descendant containment must remain prerequisites unless proved by a separately reviewed design. Fresh source of SSH helper finding: https://github.com/openssh/openssh-portable/blob/master/sshconnect2.c and https://github.com/openssh/openssh-portable/blob/master/ssh-sk-client.c.
+
+Independent ci_diagnostic confirmed no ready non-production local Linux runtime: Docker engine unavailable, only internal docker-desktop WSL without Python/uv. Existing CI has no manual subset trigger. Actual failed CI merge SHA94b87a4ebe24dc6da1c3f2e86366224e0eb0d32b; firewall118tests took57.07s versus16.50s in green35143596029, same Ubuntu24.04 image20260907.300.1/CPython3.12.14. Broad slowdown observed; cause unproven. A five-minute verbose firewall subset is the next diagnostic once a reviewed execution route exists; no third full-suite retry requested.
