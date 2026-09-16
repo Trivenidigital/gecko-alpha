@@ -1,3 +1,11 @@
+## Recovery: 2026-09-16 20:44 UTC — PR593 remains design blocked
+
+- [x] Recover interrupted owner and verify current master/PR state.
+- [x] Two independent findings reviews; production zero-porcelain preflight fails on 11 untracked entries.
+- [x] Configured author recovery attempted; session-limit error, no edits (reported reset23:30 UTC).
+- [ ] Resume design folds and two reviews; no build or collection authorized yet.
+- Review/result: tasks/closeout_recovery_2026_09_16_2044.md. No cleanup or deployment.
+
 ## Active Work: 2026-09-16 — Receipt inventory integration
 
 - [x] Drift/Hermes assessment; preserve existing primitives and production boundary.
@@ -2667,3 +2675,4 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
