@@ -79,3 +79,11 @@ final-head CI before considering merge. Reducer/META tests and a fresh bounded
 runtime preflight remain separate gates before any receipt inventory. No operator
 account action, Docker repair, paid call or trading approval is needed for the
 next engineering design step. D1-D4 remain UNKNOWN; D5-D6 untouched.
+
+## Draft evidence review closeout
+
+Candidatec18741ae: plan_logic and plan_ops independently approved draft evidence
+retention only. Both verified the four-document diff and clean whitespace check;
+no factual corrections. Neither grants design, implementation, runtime cleanup,
+merge or production approval. This final note records their terminal verdicts;
+.reviewers/590.toml stays unchanged and empty.
