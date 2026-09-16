@@ -1,91 +1,89 @@
-# Plan amendment 1: production read-only receipt inventory integration
+**New primitives introduced:** NONE beyond the two disposable artifacts the approved plan already names (`scripts/receipt_inventory_sequence.py`, `tests/test_receipt_inventory_sequence.py`). This amendment removes one tool (`scp`), scopes two unresolved prerequisites that block production execution (local transport containment, aggregate physical local-storage bound), and binds ownership, provenance and quoting. It introduces no containment mechanism, no dependency, schema, secret, config, host write outside the licensed temp directory, or persistent coordinator. If a prerequisite later needs machinery, that machinery is declared in its own separately reviewed amendment, not here.
 
-Amends `tasks/plan_receipt_inventory_integration_2026_09_16.md` (approved at 035cd914). Design PR593 at b3fe776a (revision 15216a1f) stays REJECTED and is not amended here. This amendment needs two independent plan reviews before design revision 3. No build, staging, runtime execution, cleanup, commit or PR is authorized by this text.
+# Plan amendment 1, revision 2: production read-only receipt inventory integration
 
-**New primitives introduced:** NONE beyond the two disposable artifacts the approved plan already names (`scripts/receipt_inventory_sequence.py`, `tests/test_receipt_inventory_sequence.py`). This amendment removes one tool (`scp`) and binds the driver to stdlib mechanisms already used in `scripts/receipt_inventory_supervisor.py`: `start_new_session`, temp-file plus `os.replace`, `os.open(O_CREAT|O_EXCL)`, and the `/proc` stat scan (`read_stat`). No dependency, schema, secret, config, host write outside the licensed temp directory, or persistent coordinator.
+Amends `tasks/plan_receipt_inventory_integration_2026_09_16.md` (approved at 035cd914). Design PR593 at b3fe776a (revision 15216a1f) stays REJECTED and is not amended. Revision 1 of this amendment received REQUEST CHANGES from both plan reviewers; this revision folds all six findings. Approval of this amendment is **prerequisite-scoping only**: it does not claim that transport containment or the physical storage bound is proven. No build, staging, runtime execution, cleanup, commit or PR is authorized by this text.
 
 ## Context
 
-Both design reviews rejected revision 2 on five points: local transport containment (killing only the direct `ssh`/`scp` child does not prove descendant cleanup), the capture bound (file-size polling is not a physical bound), ownership and pre-spawn IN_FLIGHT state for every operation, staged-script provenance (digests computed from working-tree files, not the approved revision), and nested shell quoting (double-quoted `bash -c` bodies containing `$(...)` and `$d` are expanded by the login shell before the inner bash runs). The closeout at 20:44 UTC added that production preflight currently fails the zero-porcelain gate.
-
-## Does the approved plan suffice?
-
-| Finding | Approved plan today | Resolution level |
-|---|---|---|
-| Transport containment | Names `scp`; silent on local descendants | **Amend**: ssh-only, fixed option set (section A) |
-| Capture bound | States byte limits without saying where they are physically enforced | **Amend** wording; mechanism is existing remote `head -c` (section B) |
-| Ownership, IN_FLIGHT | ATTEMPTED record for observations only | **Amend**: every operation, plus exclusive run lock (section C) |
-| Script provenance | "values recorded from merged PR592 master" (correct intent) | **Clarify** the procedure so design cannot deviate (section D) |
-| Nested quoting | Not addressed | **Bound** at plan level; exact strings stay a design obligation (section E) |
-| Zero porcelain | Op 2 gate exists | **Retain** unchanged (section F) |
+Design revision 2 was rejected on transport containment, capture bound, ownership and IN_FLIGHT state, staged-script provenance and nested quoting. Revision 1 of this amendment overclaimed on the first two: it asserted an exhaustive list of OpenSSH client children (omitting at least `ssh-sk-helper`) and treated remote `head -c` as a physical bound although login-shell output, interpreter and supervisor startup stderr, and client diagnostics bypass it. Both claims are withdrawn below.
 
 ## Hermes-first analysis
 
 | Domain | Evidence | Date limit and verdict |
 |---|---|---|
-| Journal reduction, host metadata validation | Skills hub `hermes-agent.nousresearch.com/docs/skills`: catalog stayed Loading, nothing verified | Checked 2026-09-14 (`plan_suppression_receipt_inventory_2026_09_14.md`) and 2026-09-16 19:30 UTC (plan revision 3). No fresh check for this amendment; not an exhaustive absence claim |
-| Ecosystem | `github.com/0xNyk/awesome-hermes-agent`: general orchestration listings | Same two dates. Not a replacement |
-| Deployed VPS Hermes surface | `hermes-gateway` active at 20:39:46 UTC 2026-09-16 (closeout). Installed skills and plugins were NOT inventoried for SSH transport or journal reduction | Open per `tasks/lessons.md` "Hermes-first review scope"; a names-only listing may ride a future routine read-only runtime read. Not required to approve this amendment |
-| Hermes cron `no_agent` shell mode as on-host executor | Exists on the host (lessons 2026-05-20) | Rejected: needs a write to `~/.hermes/cron/jobs.json`, which the no-host-write licence forbids, and creates a persistent coordinator |
+| Journal reduction, host metadata validation | Skills hub `hermes-agent.nousresearch.com/docs/skills` | Checked 2026-09-14, 2026-09-16 19:30 UTC and fresh coordinator check 2026-09-16 23:43 UTC: catalog still Loading, no matching skill verified. Not an exhaustive absence claim |
+| Ecosystem | `github.com/0xNyk/awesome-hermes-agent` | Same dates, latest 23:43 UTC: general orchestration listings, not a replacement |
+| Deployed VPS Hermes surface | `hermes-gateway` active (23:42:36 UTC). Installed skills and plugins not inventoried for SSH transport or journal reduction | Open per `tasks/lessons.md` "Hermes-first review scope"; not required to approve this amendment |
+| Hermes cron `no_agent` shell mode as on-host executor | Exists on the host (lessons 2026-05-20) | Rejected: requires a host write to `~/.hermes/cron/jobs.json` and creates a persistent coordinator |
 | Remote execution and staging | Stock OpenSSH client, coreutils `head`, `sha256sum`, `mktemp`, `stat`, `pgrep` | Reuse. `scp` dropped in favour of `ssh` with `head -c` on stdin; both stock |
-| Local process control | Python stdlib; patterns already in the merged supervisor | Reuse unchanged |
+| Local process control | Python stdlib only | Reuse; no custom transport expansion |
 
-Verdict: no Hermes replacement is verified for any domain; the amendment adds no dependency and removes one tool.
+Verdict: no Hermes replacement verified for any domain; the amendment adds no dependency and removes one tool.
 
-## A. Transport containment: ssh only, no local descendants by construction
+## Current runtime note (dated)
 
-1. Every operation is one fresh `ssh` process. `scp` is removed. Ops 5 to 7 become `ssh ... 'head -c 32768 > TMP/NAME'` with the driver's stdin for that process opened read-only on the staged file; every other operation uses `stdin=DEVNULL`. This is raw bytes, not a framing protocol: the plan's "no custom stdin framing or acknowledgement" clause is unchanged. A short, truncated or altered transfer fails op 8 `HASH_MISMATCH`, so no new gate is needed.
-2. Fixed client options, asserted by a static test on the rendered argv: `-F none -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ProxyCommand=none -o ProxyJump=none -o PermitLocalCommand=no -o HostbasedAuthentication=no -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR`, optionally `-i IDENTITY -o IdentitiesOnly=yes` where `IDENTITY` obeys the local-path grammar. `-F none` disables config-driven `ProxyCommand`, `LocalCommand` and `Match exec`; `BatchMode` disables askpass; `HostbasedAuthentication=no` disables `ssh-keysign`. These are the only ways the OpenSSH client spawns a local child, so the driver's child has no descendants and `kill()` of `child.pid` is complete containment.
-3. On POSIX the child is spawned with `start_new_session=True` (lemma L7: pid equals pgid), and after any kill the driver records `local_group_empty` by scanning `/proc` with the supervisor's `read_stat` pattern, bounded by `SURVIVOR_SCAN_CAP`. `false` is `FATAL LOCAL_ORPHAN`. On Windows the field is `null` and the claim rests on item 2 alone. Residual stated: no live `sshd` exists in CI, so the real client is verified by configuration and static assertion, not by a process-tree probe.
-4. Connection budget unchanged: 18 sequence operations, one recovery, one post-recovery removal, hard cap 20.
+Fresh read-only production read at 2026-09-16 23:42:36 UTC: deployed HEAD 77751890c9f1f51ed348c365d4e7a5985ea2827d; full `git status --porcelain` still 11 entries; pipeline, dashboard and hermes-gateway active; worker ExecStartPre auth-guard last attempt 19:22:35 UTC exit 21, timer active. Nothing was changed. Op 2's zero-porcelain gate therefore still FAILS.
 
-## B. Actual capture bound: physical on the host, acceptance locally
+## A. Transport: ssh only; containment is an unresolved prerequisite
 
-1. The physical bound is remote `head -c N` under `set -o pipefail`, applied to every operation including observations: control `N = 4097`, staging output `N = 4097`, observation `N = 131073`. Bytes past `N` never leave the host. The supervisor writes exactly one line of at most 131,072 bytes and never writes stderr, so `head` never truncates a valid envelope; if it does, the producer dies of `SIGPIPE` (rc 141) or the supervisor's `bounded_write` fails (rc 11), both already unusable.
-2. Locally, `opNN.out` is read with `read(N + 1)`; a file larger than `N` is `FATAL TRANSPORT_ANOMALY` because it contradicts item 1. The design's size-polling kill stays as defense in depth only and may not appear in any proof sentence.
-3. `opNN.err` holds only the local client's diagnostics under `LogLevel=ERROR` (remote stderr is folded into `head` for control ops and is `DEVNULL` under the supervisor). Its 65,536-byte figure is an acceptance limit, stated as such in findings, not a physical bound.
+1. Every operation is one fresh `ssh` process; `scp` is removed. Ops 5 to 7 become `ssh ... 'head -c 32768 > TMP/NAME'` with stdin opened read-only on the staged file; all other operations use `stdin=DEVNULL`. Raw bytes, no framing. A short, truncated or altered transfer fails op 8 `HASH_MISMATCH`.
+2. Fixed client options, asserted by a static test on the rendered argv: `-F none -o BatchMode=yes -o ControlMaster=no -o ControlPath=none -o ProxyCommand=none -o ProxyJump=none -o PermitLocalCommand=no -o HostbasedAuthentication=no -o StrictHostKeyChecking=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR`, optionally `-i IDENTITY -o IdentitiesOnly=yes`. These options **reduce** the client's local child surface. They are not claimed to eliminate it: `ssh-sk-helper` and any helper this list does not name may still be spawned. No exhaustive childlessness claim is made.
+3. The driver's `kill()` of its direct child is therefore best effort, not containment proof. Revision 1's `/proc` group scan and `LOCAL_ORPHAN` verdict are withdrawn; they were containment machinery presented as none.
+4. **PREREQ-1, local transport containment.** Production execution is blocked until a separately reviewed amendment establishes, for the local machine that runs the driver, that after a wall-clock or oversize kill no descendant of the transport process survives, verified by an oracle independent of the driver. Its scope must fit one page, prefer stdlib or OS-native primitives, declare its own primitives honestly, and may conclude "run the driver only from Linux under the existing group-ownership harness" if that is the narrowest proof. This amendment does not choose.
+5. Connection budget unchanged: 18 sequence operations, one recovery, one removal, hard cap 20.
 
-## C. Ownership and pre-spawn IN_FLIGHT for every operation
+## B. Capture bound: sentinel rejection now; physical bound is an unresolved prerequisite
 
-1. Exclusive run ownership: every subcommand creates `RUNDIR/busy` with `O_CREAT|O_EXCL` on entry and removes it on exit. A pre-existing file is `FATAL BUSY_OR_CRASHED`; the driver never reclaims it. Operator disposition is to inspect `state.json` and delete the file by hand, which is recorded in findings.
-2. Before `Popen` of any operation (not only observations) the driver writes `in_flight = {op, attempt, connection_index, started_at}` into `state.json` by temp-file, `os.replace` and `fsync`, and increments `connections_used`. `in_flight` is cleared only after `opNN.rc` is persisted. The counted connection is consumed whether or not the spawn happened.
-3. Any subcommand that starts with `in_flight` non-null treats that operation as `AMBIGUOUS`: control operations are `FATAL`; observation operations become an attempted observation with no envelope, so cleanup is `UNPROVEN` and `next` is `R`. Recovery quantifies over every IN_FLIGHT record, superseding the plan's "ATTEMPTED locally before starting its SSH invocation" wording, which covered observations only.
+1. Remote `head -c N` under `set -o pipefail` is applied to every operation (control 4,097; staging 4,097; observation 131,073). It bounds the **intended payload only**. Login-shell output, interpreter and supervisor startup stderr, and client diagnostics bypass it. The aggregate physical bound on local storage per operation is **not established** by this amendment.
+2. Sentinel rejection is mandatory and independent of rc: any `opNN.out` of size at least `N` (sentinel byte present) is rejected even at rc 0. Control operations: `FATAL REMOTE_OVERSIZE`. Observation operations: `UNPROVEN`. No reliance on `SIGPIPE`; a buffered write can complete before truncation is observed.
+3. The design's size-polling kill remains defense in depth and may not appear in any proof sentence. `opNN.err` limits are acceptance limits, labelled as such in findings.
+4. **PREREQ-2, physical local-storage bound.** Production execution is blocked until either design revision 3 establishes the plan's original requirement (a hard bound on bytes written to local storage per operation, on stdout and stderr, enforced before the write and not by observation after it) or a separately reviewed scope amendment explicitly weakens the contract. Silent weakening is not permitted.
 
-## D. Script provenance bound to the approved revision
+## C. Ownership and IN_FLIGHT
 
-1. `MERGED_SHA` is the origin/master commit whose tree the run stages. The three script pins are produced by the same documented local procedure as the five source pins: `git show MERGED_SHA:scripts/<name> | sha256sum`. The staged files themselves are materialized by `git show MERGED_SHA:scripts/<name> > RUNDIR/staged/<name>`, never copied from a working tree.
-2. `init` verifies each staged file's sha256 equals its pin and records the pins-file digest; op 8 and op 12 compare against the same pins. The driver runs no git command; the operator records `git merge-base --is-ancestor MERGED_SHA origin/master` in the findings, and a reviewer can re-derive all three digests from `MERGED_SHA` alone.
+1. Every subcommand creates `RUNDIR/busy` with `O_CREAT|O_EXCL` holding `{pid, started_at, run_id}` and removes it on exit. A pre-existing file is `FATAL BUSY_OR_CRASHED`; the driver never reclaims it.
+2. Manual lock removal is permitted only after the operator verifies **both** that the recorded driver pid is not running and that no transport process it spawned is running. If either is uncertain, the lock is retained and findings record `OWNERSHIP_UNCERTAIN`.
+3. Before `Popen` of any operation the driver persists `in_flight = {op, attempt, connection_index, started_at}` and increments `connections_used` (temp-file, `os.replace`, `fsync`). Flush and fsync the temporary file before replacement; persist the containing directory after replacement where supported. Unsupported durability is an explicit design prerequisite, not an assumed guarantee. Fault tests must cover each persistence boundary. The connection is consumed whether or not the spawn happens.
+4. `in_flight` is cleared only in the single atomic state write that also records the `opNN.rc` reference, the verdict, `next`, and the ledger entry. A crash before that write leaves `in_flight` set; every later subcommand treats the operation as `AMBIGUOUS` (control: `FATAL`; observation: attempted with no envelope, `UNPROVEN`, `next` is `R`). No operation is ever re-run: replay of an in-flight or evaluated operation is `REPLAY_REJECTED`.
 
-## E. Quoting bound: two parse levels, single-quoted payload
+## D. Provenance bound to reviewed trees, byte-exact
 
-1. Every remote string has exactly two shell parse levels: the login shell (proven bash at op 1) and one inner `bash --noprofile --norc -o pipefail -c`. The level-1 payload is single-quoted. The parameter grammar already forbids `'`, so substitution cannot close the quote. The rejected design's double-quoted `C(body)` was wrong because level 1 expanded `$(mktemp ...)` and `$d` before the inner bash ran; single quotes deliver `$(...)`, `$f`, `$g`, `$?` to level 2 intact, which is the intent.
-2. Level-2 content contains no quote of either kind. Control template: `set -o pipefail; timeout -k 2 10 bash --noprofile --norc -o pipefail -c 'BODY' 2>&1 | head -c 4097`. Observation template: `set -o pipefail; python3 -I -S TMP/receipt_inventory_supervisor.py --pgid-file TMP/wrapper.pgid.N -- timeout -k 2 10 bash --noprofile --norc -o pipefail +m -c 'PAYLOAD' | head -c 131073`. Exact bodies and payloads remain a design obligation.
-3. Test bound replacing the design's "no single quote anywhere": `shlex.split(remote)` equals the intended argv list, the single-quoted argument equals the template payload byte for byte, single quotes occur only as the two delimiters, and the Linux synthetic executor runs the identical string under `bash -c REMOTE`, the same parse `sshd` applies.
+1. Materialization is byte-exact by construction: a Python `subprocess.run(["git", "show", "SHA:PATH"], stdout=<binary file handle>, timeout=...)` with argv, no shell, no text mode. Shell pipes or redirection are not permitted unless a test first proves the shell binary-safe by round-tripping a fixture containing 0x00, 0x0A, 0x0D and 0xFF. Digests are computed with `hashlib` over the exact materialized bytes.
+2. Source pins (five files) are materialized at `expected_head` (77751890…), which op 9 verifies against the host. Script pins (three files) and the staged bytes are materialized at `MERGED_SHA`, the approved PR592 master tree; never from a working tree.
+3. `MERGED_SHA` must be verified as an ancestor of freshly fetched `origin/master` and its three script blob ids must equal those of the reviewed merge commit 5281f047346a951acb05926a27fe0489bc3cafd4. Both checks are recorded in findings with their outputs. Whether the driver's `init` performs them or a documented step precedes it is a design decision.
 
-## F. Production zero-porcelain gate retained
+## E. Quoting bound
 
-Op 2 keeps `git status --porcelain | wc -l` over the full tree, and the gate stays "line count is 0, nonzero is fatal". Last observation: 11 untracked entries at 20:39:46 UTC 2026-09-16 on the repository-documented Gecko host at HEAD 77751890c9f1f51ed348c365d4e7a5985ea2827d. This amendment authorizes no cleanup, no `-uno`, no ignore rule, no tracked-only bypass and no definition of acceptable runtime artifacts. Design revision 3, the build and the synthetic exercise may proceed; the production sequence stays blocked until the operator disposes of the artifacts or a separate reviewed amendment defines acceptable artifacts.
+1. Exactly two shell parse levels per remote string: the login shell (bash, proven at op 1) and one inner `bash --noprofile --norc -o pipefail -c`. The level-1 payload is single-quoted; the grammar forbids `'` in every parameter. Revision 2's double-quoted `C(body)` is rejected because level 1 expands `$(...)` and `$d` before the inner bash runs.
+2. Level-2 content contains no quote of either kind. Control template: `set -o pipefail; timeout -k 2 10 bash --noprofile --norc -o pipefail -c 'BODY' 2>&1 | head -c 4097`. Observation template: `set -o pipefail; python3 -I -S TMP/receipt_inventory_supervisor.py --pgid-file TMP/wrapper.pgid.N -- timeout -k 2 10 bash --noprofile --norc -o pipefail +m -c 'PAYLOAD' | head -c 131073`. Exact bodies remain a design obligation.
+3. Tests: `shlex.split(remote)` equals the intended argv; the quoted argument equals the payload byte for byte; single quotes occur only as the two delimiters; the Linux synthetic executor runs the identical string under `bash -c REMOTE`.
+
+## F. Zero-porcelain gate retained
+
+Op 2 keeps full `git status --porcelain | wc -l` with "0 or fatal". Last two observations (20:39:46 and 23:42:36 UTC, 2026-09-16) both show 11 entries. This amendment authorizes no cleanup, no `-uno`, no ignore rule, no tracked-only bypass and no definition of acceptable runtime artifacts. Production execution stays blocked on this gate independently of PREREQ-1 and PREREQ-2.
 
 ## G. Superseded plan sentences
 
-| Location in approved plan | Change |
+| Location | Change |
 |---|---|
-| Operation model, bullet 1 | "one fresh `ssh` or `scp` invocation" becomes "one fresh `ssh` invocation" with the section A option set |
-| Operation model, bullet 3 | `scp` row becomes "staging 30 s, stdin one local file, remote `head -c 32768`"; every byte limit is labelled physical (remote `head`) or acceptance (local read) |
+| Operation model, bullet 1 | "`ssh` or `scp`" becomes "`ssh`" with section A options, stated as reduction not proof |
+| Operation model, bullet 3 | `scp` row becomes "staging 30 s, stdin one local file, remote `head -c 32768`"; limits labelled payload-bound or acceptance; sentinel rejection at any rc |
 | Exact sequence, ops 5 to 7 | Tool column `ssh` |
-| Op 8 gate | "values recorded from merged PR592 master" becomes "pins derived from `MERGED_SHA` by `git show`" |
-| Final cleanup-safety fold, sentence 1 | "records each observation as ATTEMPTED" becomes "records every operation IN_FLIGHT before spawn" |
-| Obligations for the design | Add: section A argv, section B labels, section C state fields, section D pins procedure, section E templates and tests |
+| Op 8 gate | "recorded from merged PR592 master" becomes section D procedure |
+| Final cleanup-safety fold, sentence 1 | "each observation ATTEMPTED" becomes "every operation IN_FLIGHT before spawn, cleared only atomically with its verdict" |
+| Gates | Add PREREQ-1 and PREREQ-2 as production blockers; build only after two design approvals |
+| Obligations for the design | Add sections A to E as stated |
 
-Unchanged: cleanup proof, recovery, interpretation contract, stops, per-operation wall clocks, licensed write phase, and the design-level items already accepted in revision 2 (test-owned process identities, deterministic publication failure, saturation means completeness unknown).
+Unchanged: cleanup proof, recovery, interpretation contract, stops, wall clocks, licensed write phase, and the accepted design-level items (test-owned process identities, deterministic publication failure, saturation means completeness unknown).
 
 ## Gates and next steps
 
-1. Two independent plan reviews of this amendment (docs-only; no runtime).
-2. Configured author folds the amendment into design revision 3; two independent design reviews.
+1. Two independent plan reviews of this revision. Approval means the prerequisites are correctly scoped, not resolved.
+2. Design revision 3 folds this amendment; two independent design reviews. **No build and no synthetic exercise before both design approvals.**
 3. Build under TDD, two PR reviews, exact-head Linux CI green including the synthetic exercise.
-4. Production sequence only after the zero-porcelain gate passes under the operator's disposition, with recorded approval.
+4. Production execution only when all of: PREREQ-1 approved and satisfied, PREREQ-2 approved and satisfied, zero-porcelain gate passes under operator disposition, recorded approval.
 
 ## Verification of this amendment
 
-Docs-only: `git diff --check` on the plan file; reviewers confirm every superseded sentence in section G maps to a live sentence in the approved plan; no application tests are needed.
+Docs-only: `git diff --check`; reviewers confirm each section G row maps to a live sentence in the approved plan and that no sentence claims containment or a physical storage bound as complete.
