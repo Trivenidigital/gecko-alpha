@@ -7,6 +7,7 @@ Base: b5daecfc3ca39ca4719ce4f20d4f9a32d4660ac6. Selected residual: synthetic Lin
 | Plan 4736f19b | blocker_review approved | timeout_ops approved | Readiness, group ownership, bounded reaping and failure cleanup moved into design |
 | Design 4be827cf | blocker_review approved | timeout_ops approved | No blocking findings; implementation must guard PGIDs and clean group before worker termination |
 | Initial PR590 f972e992 | blocker_review approved logic/silent-failure | timeout_ops approved ops/concurrency | Code inspection only; later Linux failure prevents merge or cleanup-readiness claims |
+| Draft findings 95bc8efd | blocker_review approved evidence/reproducer accuracy | timeout_ops independently verified logs and approved evidence/reproducer accuracy | No required corrections; explicitly NO merge clearance or cleanup readiness; clearances remain empty |
 
 ## State checked
 Current origin/master b5daecfc includes PR589, merged 2026-09-14T22:40:38Z. Prior automation memory omitted this closeout; fresh repo/GitHub evidence supersedes memory. AGENTS.md is absent in this checkout; supplied AGENTS rules, CLAUDE.md, lessons, todo and top backlog snapshot/reconciliation were read.

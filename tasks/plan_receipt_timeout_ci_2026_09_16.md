@@ -20,7 +20,7 @@ Identity-only production preflight 2026-09-16T00:23:29Z: 77751890c9f1f51ed348c36
 - [x] Two parallel plan reviews and folds.
 - [x] Separate design, two parallel design reviews and folds.
 - [x] Add Linux synthetic cleanup tests and an explicit short CI job.
-- [ ] Open PR, two parallel PR reviews, fold findings and record clearances.
+- [x] Open draft PR590, two parallel PR reviews and final findings re-reviews; retain empty merge clearances because cleanup failed.
 - [ ] Verify focused Linux CI; FAILED: producer and descendant survivors detected. Draft PR590 must not merge; full CI remains required.
 
 ## Acceptance and boundaries
