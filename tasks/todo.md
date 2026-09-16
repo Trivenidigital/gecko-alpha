@@ -1,3 +1,13 @@
+## Active Work: 2026-09-16 16:35 UTC — Receipt reducer/META, local and synthetic only
+
+- [x] Refresh master f5bc54ba (PR590 merged, Linux cleanup tests green); read AGENTS/CLAUDE/lessons/queue, receipt inventory plan/design/findings, cleanup design revision 7, handoff assessment.
+- [x] Drift check: no reducer/META/journal script exists; 13 allowlisted events still present; two extra `ledger_record_failed` sites in scout/trading/engine.py noted; supervisor caps read from source.
+- [x] Plan written: tasks/plan_receipt_reducer_meta_2026_09_16.md (files, tests, gates, rollback, integration prerequisites, eight open decisions).
+- [x] Two independent parallel plan reviews; all folds approved at ddb185b6.
+- [ ] Separate design; two independent parallel design reviews; settle the eight decisions.
+- [ ] Implement reducer, META and three test modules; Windows local gate; Linux full-suite CI on exact head.
+- [ ] New PR; two PR reviews; mutation checklist; four-vector clearances in a new .reviewers file.
+- Passing every gate does NOT authorize collection. No production command, host write, transport, deploy, SSH, DB, config, account, policy or vendor action in this slice.
 ## Active Work: 2026-09-16 — Receipt cleanup implementation, findings folded
 
 - [x] Refresh origin/master b5daecfc and current PR590; retain approved plan and combined revision7 design.
