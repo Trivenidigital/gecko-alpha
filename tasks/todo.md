@@ -1,3 +1,11 @@
+## Active Work: 2026-09-16 23:40 UTC — Integration plan amendment
+
+- [x] Refresh master5281f047, recover PR593b3fe776a, read instructions/queue/memories and fresh runtime.
+- [x] Configured author available; drafted transport/state/pinning amendment.
+- [ ] Two parallel plan reviews and folds; separate design and two design reviews before build.
+- [ ] Resolve CI diagnostic route; no blind full-suite retry.
+- Production zero-porcelain gate fails (11 entries); no cleanup or collection.
+
 ## Recovery: 2026-09-16 20:44 UTC — PR593 remains design blocked
 
 - [x] Recover interrupted owner and verify current master/PR state.
