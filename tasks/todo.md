@@ -1,10 +1,12 @@
 ## Active Work: 2026-09-16 — Receipt timeout CI validation
 
 - [x] Fresh master, drift/Hermes checks and identity-only production preflight.
-- [ ] Plan and design: two parallel reviews at each gate.
-- [ ] Synthetic Linux cleanup harness, PR, two PR reviews and CI evidence.
+- [x] Plan and design: two parallel reviews at each gate.
+- [x] Synthetic Linux cleanup harness, draft PR590 and two initial PR reviews.
+- [ ] Cleanup gate FAILED in Linux CI: TERM-resistant producer/descendant remained; do not collect production receipts with this wrapper.
 - Plan: tasks/plan_receipt_timeout_ci_2026_09_16.md.
 - Scope: test-only prerequisite; no receipt collection or deployment.
+
 ## Active Work: 2026-09-14 — Bounded suppression receipt inventory
 
 - [x] Refresh master, canonical memory/backlog/source drift and initial production identity.

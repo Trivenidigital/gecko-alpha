@@ -2,6 +2,8 @@
 
 **New primitives introduced:** test-only worker and unittest cases, no collector.
 
+**Experimental result:** the wrapper under test FAILED Linux cleanup checks in PR590. This is a retained failing characterization, not a validated collection recipe. See review_receipt_timeout_ci_2026_09_16.md. The acceptance criteria below remain unmet.
+
 ## Hermes-first analysis
 | Domain | Hermes skill found? | Decision |
 |---|---|---|

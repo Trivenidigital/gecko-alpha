@@ -2,6 +2,8 @@
 
 **New primitives introduced:** NONE. Nothing was written or run.
 
+**2026-09-16 validation failure:** PR590's synthetic Linux tests found live TERM-ignoring descendants after this wrapper returned. The process-group cleanup assumption below is disproved for the tested fixtures; do not execute production collection with this design. See `review_receipt_timeout_ci_2026_09_16.md` for evidence and the required replacement-design gate. The original design is retained below as historical intent.
+
 ## Hermes-first analysis
 | Domain | Hermes skill found? | Decision |
 |---|---|---|
