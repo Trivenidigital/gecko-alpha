@@ -4,14 +4,15 @@
 - [x] Configured Claude author drafted supervisor, fault runner and expanded 29-case harness; preserved candidate 9db77514 on draft PR590.
 - [x] Two independent implementation reviews completed on 9db77514: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
 - [x] Linux CI on 9db77514: 29-case job passed; full suite 1 failure (round8 subprocess lint rejects Popen without a timeout kwarg Popen cannot take), 8151 passed, 14 skipped.
-- [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Not pushed.
+- [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Subsequently pushed to PR590.
 - [x] Review of c72e6e55: structural/concurrency APPROVE; ops REQUEST CHANGES on two reproduced residuals (clipped diagnostic prefixing the WORKER line; lint missing `with Popen` exit and annotated bindings). Both folded with exact discriminating tests; Windows: 48 passed, 29 skipped.
-- [x] Ops re-review of e99e121d: one P2 (line_open derived from the intended buffer, not relay completion) folded with a simulated partial-relay regression; ownership review intact.
-- [ ] Push, exact-head Linux 29-case job and full suite green in GitHub CI (no local Linux available; run35104829851 on c72e6e55 in flight).
-- [ ] Terminal ops re-review on the new head; record clearances only then.
+- [x] Structural re-review of e99e121d: one P2 (line_open derived from the intended buffer, not relay completion) folded with a simulated partial-relay regression; ownership review intact.
+- [x] Push reviewed implementation and clearance evidence to existing draft PR590.
+- [ ] Final-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
+- [x] Both independent reviewers terminal APPROVE on9fa1f4ce; all findings folded; four-vector clearances recorded.
 - [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
 
-Windows skips are not cleanup proof. No reviewer clearance is recorded. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
+Windows skips are not cleanup proof. Independent code-review clearances are recorded; final-head CI remains separate. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
 ## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
 
 - [x] Refresh current master, canonical memory, backlog and current draft PR590.
