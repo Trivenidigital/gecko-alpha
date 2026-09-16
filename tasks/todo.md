@@ -6,7 +6,7 @@
 - [ ] Build only after design approval; retain Linux falsifiers, two PR reviews and final-head green CI.
 - Existing approved plan retained. No production re-attestation or implementation clearance.
 - Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md.
-## Active Work: 2026-09-16 — Receipt cleanup replacement
+## Historical: 2026-09-16 — Receipt cleanup replacement (superseded by revision7 above)
 
 - [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.
 - [x] Claude authored replacement plan; two parallel reviews returned required folds.
@@ -16,7 +16,7 @@
 - [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
 - [ ] Final-head CI and clearance gate; no production collection or deployment.
 
-Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md. NO BUILD; parent fallback/publication-gap proof remains unresolved. Initial plan031a943f was not approved. The amended plan specifies proof
+Historical review state: tasks/review_receipt_cleanup_replacement_2026_09_16.md. Parent fallback/publication findings below were superseded by the revision7 approvals above; implementation and Linux verification remain outstanding. Initial plan031a943f was not approved. The amended plan specifies proof
 obligations; it does not establish a safe cleanup algorithm. Prior raw wrapper
 remains unsafe. Plan: tasks/plan_receipt_cleanup_replacement_2026_09_16.md.
 ## Active Work: 2026-09-16 — Receipt timeout CI validation

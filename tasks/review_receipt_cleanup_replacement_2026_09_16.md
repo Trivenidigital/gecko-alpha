@@ -144,3 +144,9 @@ retains original Linux leak falsifiers, and verifies every enumerated case.
 Then two independent implementation/PR reviews and green final-head CI are
 required before merge. Reducer/META and fresh runtime preflight remain later
 gates before receipt inventory. No operator action is required to start build.
+
+Draft documentation review of abeab8ef: design_logic approved; design_ops
+required marking the older Active Work paragraph in todo as historical because
+it still described the now-closed design findings as unresolved. That paragraph
+is now explicitly superseded; implementation/Linux gates remain outstanding.
+No design, source, test or runtime changes accompanied this evidence fold.
