@@ -33,6 +33,17 @@ def assert_empty(pgid):
         ["pgrep", "-g", str(pgid)], capture_output=True, text=True, timeout=2
     )
     if result.returncode == 0:
+        try:
+            diagnostic = subprocess.run(
+                ["ps", "-o", "pid,ppid,pgid,stat,comm", "-g", str(pgid)],
+                capture_output=True, text=True, timeout=2,
+            )
+            print(
+                f"survivor diagnostic (ps exit={diagnostic.returncode}):\n"
+                f"{diagnostic.stdout}{diagnostic.stderr}", flush=True,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            print(f"survivor diagnostic unavailable: {error}", flush=True)
         raise AssertionError(f"survivors in group {pgid}: {result.stdout.strip()}")
     if result.returncode != 1:
         raise RuntimeError(f"pgrep failed: {result.returncode}: {result.stderr}")
@@ -134,6 +145,7 @@ def worker(case, directory):
         else:
             result = process.wait(timeout=max(0.01, 16 - (time.monotonic() - started)))
             elapsed = time.monotonic() - started
+            print(f"{case}: wrapper exit={result} elapsed={elapsed:.3f}s group={pgid}", flush=True)
             if result not in (124, -9, 137) or not 9 <= elapsed <= 16:
                 raise AssertionError(f"unexpected timeout result={result}, elapsed={elapsed:.3f}s")
             reap_group(pgid)
