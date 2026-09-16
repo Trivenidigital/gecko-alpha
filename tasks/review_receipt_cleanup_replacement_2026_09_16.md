@@ -115,3 +115,32 @@ identity-verified acknowledgment before live-identity faults fire. design_ops
 also requires capture_fault to use the timeout deadline class because capture
 failure leaves the TERM-ignoring workload running until the inner timeout.
 A targeted amendment was requested from the same author; no build clearance.
+
+## Revision7 design approval — 08:54 UTC run closeout
+
+Revision6 candidate335acb94: both reviewers accepted identity acknowledgment
+and capture timeout classification; both rejected the new stall_cleanup live
+survivor discriminator because the supervisor had already sent SIGKILL.
+The same author supplied the surgical post-kill reaping correction. Candidate
+0e632d9c0339e3c423c085651edaebb0202f1254 received terminal APPROVE from both
+independent reviewers, design_logic (ownership/races) and design_ops
+(deadlines/fault validity). All retained design findings are closed.
+
+The authoritative revision7 design comprises the revision5 parent document
+plus design_receipt_cleanup_amendment_2026_09_16.md, which explicitly replaces
+named paragraphs and rows. Consolidate them when implementing; this approval
+is for their combined semantics. The approved replacement plan remains unchanged.
+No implementation, cleanup proof, CI, merge or deployment clearance is implied.
+
+This run advances PR590 with design evidence only. Four Markdown files differ
+from its starting b1cf85d5; scripts/tests/.github/.reviewers are unchanged.
+Whitespace validation passes and the worktree is clean after commits. No new
+Linux test execution, production query, paid call, DB/config/account/trading
+mutation or runtime re-attestation occurred. Existing Linux failures remain
+valid evidence against the old wrapper.
+
+Next engineering gate: the configured author implements the approved design,
+retains original Linux leak falsifiers, and verifies every enumerated case.
+Then two independent implementation/PR reviews and green final-head CI are
+required before merge. Reducer/META and fresh runtime preflight remain later
+gates before receipt inventory. No operator action is required to start build.

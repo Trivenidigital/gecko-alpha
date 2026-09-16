@@ -2,7 +2,7 @@
 
 - [x] Refresh current master, canonical memory, backlog and current draft PR590.
 - [x] Configured author returned revision4; two parallel design reviews completed.
-- [ ] Fold scan completeness, recovery budgets, event records and deterministic faults; obtain two design approvals.
+- [x] Fold scan completeness, recovery budgets, event records and deterministic faults; revision7 received two design approvals at0e632d9c.
 - [ ] Build only after design approval; retain Linux falsifiers, two PR reviews and final-head green CI.
 - Existing approved plan retained. No production re-attestation or implementation clearance.
 - Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md.
