@@ -1,3 +1,12 @@
+## Active Work: 2026-09-16 — Receipt inventory integration
+
+- [x] Drift/Hermes assessment; preserve existing primitives and production boundary.
+- [x] Configured author plan and folds; two parallel plan approvals on035cd914.
+- [ ] Separate design and two reviews; no build or production execution yet.
+- [ ] PR592 merged/green, synthetic transport validation, fresh runtime preflight.
+- [ ] Bounded collection only after gates; sanitized findings and independent PR reviews.
+- Review: tasks/review_receipt_inventory_integration_2026_09_16.md.
+
 ## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
 
 - [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
