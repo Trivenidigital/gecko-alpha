@@ -2675,4 +2675,3 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
-
