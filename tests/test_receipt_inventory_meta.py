@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,14 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-META_PATH = ROOT / "scripts" / "receipt_inventory_meta.py"
+CANONICAL_META_PATH = ROOT / "scripts" / "receipt_inventory_meta.py"
+# Mutation self-check (review fold, candidate 406ed010): a child unittest run may
+# point this module at a temporary mutated copy of the script so the named
+# discriminators are exercised against the mutant. The production script has
+# no such switch; only this test module reads the variable.
+META_SOURCE_OVERRIDE = "RECEIPT_META_SOURCE"
+META_SELF_CHECK_NESTED = "RECEIPT_META_SELF_CHECK_NESTED"
+META_PATH = Path(os.environ.get(META_SOURCE_OVERRIDE) or CANONICAL_META_PATH)
 
 
 def load(name, path):
@@ -625,6 +633,151 @@ class SchemaTests(TempRootCase):
         self.assertEqual(meta.main([self.root, "a.txt"], stdin=io.BytesIO(metadata()), stdout=Broken()), 1)
         self.assertEqual(run_main([self.root, "a.txt"])[0], 0)
         self.assertEqual(run_main([])[0], 0)
+
+
+# ---------------------------------------------------------------------------
+# Mutation self-check: the four open-time and containment guards can only be
+# discriminated on Linux, so the proof that their tests kill the mutants runs
+# inside this module on Linux CI rather than in a manual checklist. Each case
+# copies the script source with exactly one guard removed into a temporary
+# directory, then runs the named discriminating test in a bounded child
+# unittest process against that copy. The verdict must be an assertion
+# failure: an import error, a skip, an unexpected error or an outer timeout all
+# fail the self-check. A control run against the unmodified source must pass.
+
+MUTANTS = {
+    "realpath_comparison_removed": (
+        '    if real != full:\n        return _slot("LINK")\n',
+        "",
+        "SlotTests.test_directory_symlink_component_is_link",
+        "linux",
+    ),
+    "o_nofollow_dropped": (
+        '    | getattr(os, "O_NOFOLLOW", 0)\n',
+        "",
+        "OpenTimeGuardTests.test_o_nofollow_rejects_leaf_symlink_when_pre_checks_pass",
+        "linux",
+    ),
+    "o_nonblock_dropped": (
+        '    | getattr(os, "O_NONBLOCK", 0)\n',
+        "",
+        "OpenTimeGuardTests.test_o_nonblock_returns_on_fifo_when_pre_checks_pass",
+        "linux",
+    ),
+    "post_open_s_isreg_removed": (
+        '    if not stat.S_ISREG(st.st_mode):\n        return _slot("NOT_REGULAR")\n    if st.st_size > FILE_CAP:',
+        "    if st.st_size > FILE_CAP:",
+        "OpenTimeGuardTests.test_post_open_fstat_rejects_nonregular",
+        "linux",
+    ),
+    # Cross-platform control of the mechanism itself: proves on Windows that the
+    # child run, the source override and the verdict parsing work.
+    "sentinel_removed": (
+        "    limit = FILE_CAP + 1\n",
+        "    limit = FILE_CAP\n",
+        "ObservedChangeTests.test_growth_past_cap_is_too_large",
+        "any",
+    ),
+}
+SELF_CHECK_TIMEOUT = 60.0
+
+
+@unittest.skipIf(os.environ.get(META_SELF_CHECK_NESTED), "nested self-check child never recurses")
+class MutationSelfCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="receipt-meta-mutant-")
+        self.directory = Path(self.temporary.name)
+        self.addCleanup(self.temporary.cleanup)
+
+    def mutant_source(self, name):
+        old, new, _, _ = MUTANTS[name]
+        source = CANONICAL_META_PATH.read_text(encoding="utf-8")
+        self.assertEqual(source.count(old), 1, "mutation site must exist exactly once: %s" % name)
+        path = self.directory / ("mutant_%s.py" % name)
+        path.write_bytes(source.replace(old, new).encode("utf-8"))
+        return path
+
+    def run_child(self, source_path, test_name):
+        env = dict(os.environ)
+        env[META_SOURCE_OVERRIDE] = str(source_path)
+        env[META_SELF_CHECK_NESTED] = "1"
+        argv = [sys.executable, "-m", "unittest", "-v", "test_receipt_inventory_meta.%s" % test_name]
+        posix = sys.platform != "win32"
+        child = subprocess.Popen(
+            argv, cwd=str(ROOT / "tests"), env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=posix,
+        )
+        try:
+            out, _ = child.communicate(timeout=SELF_CHECK_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            if posix:
+                try:
+                    real_os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            child.kill()
+            child.communicate(timeout=5)
+            self.fail("SELF_CHECK_OUTER_TIMEOUT: %s did not finish within %ss" % (test_name, SELF_CHECK_TIMEOUT))
+        text = out.decode("utf-8", "replace")
+        if posix:
+            self.assert_no_descendants(child.pid)
+        return child.returncode, text
+
+    def assert_no_descendants(self, session):
+        """With start_new_session the child's pid is its session and group id."""
+        survivors = subprocess.run(["pgrep", "-g", str(session)], capture_output=True, text=True, timeout=5)
+        self.assertEqual(survivors.returncode, 1, "leaked descendants in group %s: %r" % (session, survivors.stdout))
+
+    def assert_control_passes(self, name):
+        _, _, test_name, _ = MUTANTS[name]
+        code, text = self.run_child(CANONICAL_META_PATH, test_name)
+        self.assertEqual(code, 0, text)
+        self.assertIn("Ran 1 test", text)
+        self.assertIn("\nOK", text)
+        self.assertNotIn("skipped", text)
+
+    def assert_mutant_killed(self, name, expected_fragments):
+        """The child must report exactly one assertion failure whose message
+        names the expected status and the status the mutant produced."""
+        _, _, test_name, platform = MUTANTS[name]
+        if platform == "linux" and sys.platform != "linux":
+            self.skipTest("Linux-only discriminator; Windows skip is disclosed")
+        self.assert_control_passes(name)
+        code, text = self.run_child(self.mutant_source(name), test_name)
+        self.assertEqual(code, 1, text)
+        self.assertIn("Ran 1 test", text)
+        self.assertIn("FAILED (failures=1)", text)
+        self.assertIn("AssertionError", text)
+        self.assertNotIn("errors=", text)
+        self.assertNotIn("skipped", text)
+        self.assertNotIn("ImportError", text)
+        self.assertNotIn("ModuleNotFoundError", text)
+        self.assertNotIn("SELF_CHECK_OUTER_TIMEOUT", text)
+        for fragment in expected_fragments:
+            self.assertIn(fragment, text)
+
+    def test_mechanism_control_sentinel_removed(self):
+        # Mutant stops reading at the cap, so the grown file is reported CHANGED
+        # by the post-read fstat instead of TOO_LARGE by the sentinel byte.
+        self.assert_mutant_killed("sentinel_removed", ("'status': 'TOO_LARGE'", "'status': 'CHANGED'"))
+
+    def test_kill_realpath_comparison_removed(self):
+        # Mutant hashes through the symlinked directory component: OK, not LINK.
+        self.assert_mutant_killed("realpath_comparison_removed", ("'status': 'LINK'", "'status': 'OK'"))
+
+    def test_kill_o_nofollow_dropped(self):
+        # Mutant follows the leaf symlink at open time and hashes the target: OK, not LINK.
+        self.assert_mutant_killed("o_nofollow_dropped", ("'status': 'LINK'", "'status': 'OK'"))
+
+    def test_kill_o_nonblock_dropped(self):
+        # Mutant blocks in os.open on the writer-less FIFO; the inner test kills
+        # and reaps its driver after its own 5 s budget and fails with a fixed message.
+        self.assert_mutant_killed("o_nonblock_dropped", ("FIFO_OPEN_BLOCKED",))
+
+    def test_kill_post_open_s_isreg_removed(self):
+        # Mutant proceeds past the FIFO fstat; the identity compare against the
+        # shimmed regular-file lstat then reports CHANGED, not NOT_REGULAR.
+        self.assert_mutant_killed("post_open_s_isreg_removed", ("'status': 'NOT_REGULAR'", "'status': 'CHANGED'"))
 
 
 FORBIDDEN_NAMES = {"open", "print", "eval", "exec", "compile", "__import__", "input", "breakpoint"}

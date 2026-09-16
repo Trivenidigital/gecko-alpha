@@ -75,6 +75,11 @@ RECORD_CAP = 200
 FILE_CAP = 16 * 1024 * 1024
 OUTER_LINE_CAP = 131_072
 INNER_LINE_CAP = 4_096
+# Elapsed seconds arrive as ``round(monotonic delta, 3)`` floats; an integer is
+# accepted only inside the exactly-representable float range so every later
+# int/float comparison is total. Anything larger is contradictory for a
+# sub-minute supervisor budget and is rejected at the type check.
+ELAPSED_INT_BOUND = 2 ** 53
 ISO = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -106,7 +111,12 @@ def _is_int(value):
 
 
 def _is_number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    """Total: never raises. Finite floats; ints only inside ELAPSED_INT_BOUND."""
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is int:
+        return -ELAPSED_INT_BOUND <= value <= ELAPSED_INT_BOUND
+    return False
 
 
 def _reducer_inner(inner):
@@ -448,6 +458,41 @@ class OracleNegativeTests(unittest.TestCase):
             ("output_null", 0, with_outer("reducer", output=None)),
             ("dropped_bool", 0, with_outer("reducer", dropped=False)),
         ])
+
+    def test_elapsed_totality_huge_ints(self):
+        """Review fold (candidate 406ed010): math.isfinite(10**400) raised
+        OverflowError out of the helper. The helper must be total: a huge
+        elapsed integer is contradictory and is rejected as OUTER_TYPES without
+        any exception escaping, including when inner_elapsed > total_elapsed."""
+        huge = 10 ** 400
+        cases = [
+            ("inner_huge", with_outer("reducer", inner_elapsed=huge)),
+            ("total_huge", with_outer("reducer", total_elapsed=huge)),
+            ("both_huge_inner_greater", with_outer("reducer", inner_elapsed=huge + 1, total_elapsed=huge)),
+            ("both_huge_ordered", with_outer("reducer", inner_elapsed=huge, total_elapsed=huge + 1)),
+            ("inner_huge_total_small", with_outer("reducer", inner_elapsed=huge, total_elapsed=0.1)),
+            ("negative_huge", with_outer("reducer", inner_elapsed=-huge)),
+            ("just_over_bound", with_outer("reducer", total_elapsed=ELAPSED_INT_BOUND + 1)),
+        ]
+        for label, line in cases:
+            with self.subTest(case=label):
+                self.assertLess(len(line), OUTER_LINE_CAP)
+                self.assertEqual(usable_envelope(0, line, "reducer"), (False, "OUTER_TYPES"))
+        # Bounded but contradictory integers reach the invariant check, not the type check.
+        self.assertEqual(
+            usable_envelope(0, with_outer("reducer", inner_elapsed=ELAPSED_INT_BOUND, total_elapsed=0.1), "reducer"),
+            (False, "OUTER_INVARIANTS"),
+        )
+        self.assertEqual(
+            usable_envelope(0, with_outer("reducer", inner_elapsed=2, total_elapsed=1), "reducer"),
+            (False, "OUTER_INVARIANTS"),
+        )
+        # Actual ints and finite floats are preserved; bools are not ints.
+        self.assertEqual(usable_envelope(0, with_outer("reducer", inner_elapsed=0, total_elapsed=1), "reducer"), (True, "OK"))
+        self.assertEqual(usable_envelope(0, with_outer("reducer", inner_elapsed=0.0, total_elapsed=1.5e300), "reducer"), (True, "OK"))
+        self.assertEqual(usable_envelope(0, with_outer("reducer", inner_elapsed=ELAPSED_INT_BOUND, total_elapsed=ELAPSED_INT_BOUND), "reducer"), (True, "OK"))
+        self.assertEqual(usable_envelope(0, with_outer("reducer", inner_elapsed=True), "reducer"), (False, "OUTER_TYPES"))
+        self.assertEqual(usable_envelope(0, with_outer("reducer", total_elapsed=False), "reducer"), (False, "OUTER_TYPES"))
 
     def test_outer_invariants(self):
         self.check("OUTER_INVARIANTS", [
