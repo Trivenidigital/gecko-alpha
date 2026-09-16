@@ -1,3 +1,16 @@
+## Active Work: 2026-09-16 — Receipt cleanup replacement
+
+- [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.
+- [x] Claude authored replacement plan; two parallel reviews returned required folds.
+- [x] Fold identity/oracle, shared budget, output/status and falsifier findings.
+- [ ] Two reviewers approve amended plan e2790e8d.
+- [ ] Separate design and two parallel reviews/folds.
+- [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
+- [ ] Final-head CI and clearance gate; no production collection or deployment.
+
+Review: initial plan031a943f was not approved. The amended plan specifies proof
+obligations; it does not establish a safe cleanup algorithm. Prior raw wrapper
+remains unsafe. Plan: tasks/plan_receipt_cleanup_replacement_2026_09_16.md.
 ## Active Work: 2026-09-16 — Receipt timeout CI validation
 
 - [x] Fresh master, drift/Hermes checks and identity-only production preflight.
@@ -2601,3 +2614,4 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
