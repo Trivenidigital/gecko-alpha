@@ -1,4 +1,4 @@
-**New primitives introduced:** NONE. This plan reuses the merged supervisor (`scripts/receipt_inventory_supervisor.py`), the reducer and META from PR592 (`scripts/receipt_inventory_reducer.py`, `scripts/receipt_inventory_meta.py`), and the `usable_envelope` oracle in `tests/test_receipt_inventory_envelope.py`. It proposes no collector, API, script, supervisor change, workflow change, dependency, schema, secret or writer. Contingent on PR592 merging on exact-head green Linux CI; nothing here runs before that. Revision 2 folds both plan reviews of f5a356a7; folds are marked **F1** to **F10**.
+**New primitives introduced:** no new collector, supervisor, API, transport coordinator, dependency, schema, secret or persistent writer. Two **candidate disposable artifacts** are named provisionally and are not authorized by this plan: a fixed-sequence driver `scripts/receipt_inventory_sequence.py` that runs the standard `ssh`/`scp` operation table below with per-operation limits, and its synthetic exercise `tests/test_receipt_inventory_sequence.py`. Whether they are built, or the sequence is executed operation by operation from a checklist, is a design decision requiring two design reviews before any build. This plan reuses the merged supervisor (`scripts/receipt_inventory_supervisor.py`), the reducer and META from PR592 (`scripts/receipt_inventory_reducer.py`, `scripts/receipt_inventory_meta.py`), and the `usable_envelope` oracle in `tests/test_receipt_inventory_envelope.py`. Contingent on PR592 merging on exact-head green Linux CI. Revision 3 folds both plan reviews of 446d91af.
 
 # Plan: production read-only receipt inventory integration
 
@@ -8,100 +8,88 @@
 |---|---|---|
 | Journal reduction, host metadata validation | https://hermes-agent.nousresearch.com/docs/skills : catalog still Loading; no verified matching skill | No skill verified; not an exhaustive absence claim |
 | Ecosystem | https://github.com/0xNyk/awesome-hermes-agent : general orchestration tools; no verified Gecko receipt-inventory replacement | Not a replacement |
+| Remote execution and file staging | Stock OpenSSH `ssh` and `scp` with local `timeout` and byte caps | Reuse standard tools; no custom protocol |
 | Process ownership, reduction, validation, usability rule | In-repo primitives above, merged or pending in PR592 | Reuse unchanged |
 
-Verdict: the residual is integration prose plus one findings file. No custom code.
+Verdict: the residual is a fixed sequence of standard operations plus one findings file, and possibly one disposable driver with its synthetic test, scoped by the design.
 
 ## Scope in one sentence
 
-One bounded SSH session that stages three already-reviewed scripts into one private temp directory, independently verifies all three by hash before anything executes, runs four supervised read-only commands, verifies every result locally with `usable_envelope`, records sanitized findings under `tasks/`, and removes the temp directory under a stated cleanup policy.
+A fixed, finite sequence of standard `ssh` and `scp` operations that stages three already-reviewed scripts into one private temp directory, verifies all three by hash before anything executes, runs four supervised read-only observations with an independent cleanup check gating each next one, verifies every envelope locally with `usable_envelope`, records sanitized findings under `tasks/`, and removes the temp directory only when every group's cleanup is proven.
 
 ## Not in scope, stated once
 
-No D5 or D6 analysis, no ranking, no collection retry, no window widening, no second collection session, no DB, config, env, settings or repo write, no raw journal or MESSAGE text leaving the host, no secret reads, no deployment, no supervisor or script edit. One recovery-only reconnection is permitted under section "Recovery connection" and nothing else. If any other item becomes necessary, this plan is amended and re-reviewed.
+No D5 or D6 analysis, no ranking, no collection retry, no window widening, no DB, config, env, settings or repo write, no raw journal or MESSAGE text leaving the host, no secret reads, no deployment, no supervisor or script edit, no custom stdin framing or acknowledgement protocol, no persistent transport coordinator. One recovery-only connection is permitted under "Recovery" and nothing else.
 
-## Session protocol (F3)
+## Operation model
 
-The design must make one session realizable, not assumed:
+- Every operation is one fresh `ssh` or `scp` invocation to the explicit hostname (never an alias), with multiplexing disabled (`ControlMaster=no`, `ControlPath=none`), `BatchMode=yes`, a connect timeout, and a local `timeout` around the whole invocation. No remote shell session persists between operations.
+- The existing SSH output discipline holds: every operation's stdout is captured to a bounded local artifact first, then parsed and gated in a separate local step. Nothing is interpreted from a live stream.
+- Per-operation limits: control operations 10 s and 4,096 output bytes; `scp` operations 30 s and one file under 32 KiB; supervised operations 40 s (T0 plus 15.5 s plus interpreter and connection) and 131,073 output bytes, the supervisor line cap plus one sentinel byte. Any operation exceeding a limit is a fatal stop.
+- Finite connections: at most 18 sequence operations plus 1 recovery connection; hard cap 20. Nothing is repeated.
 
-- One SSH connection, one remote non-interactive shell, commands delivered as a fixed numbered sequence on the shell's stdin. Because stdin carries both commands and staged script bytes, each staged file is delivered as a length-prefixed block read by `head -c N` into the target file, followed by a host `sha256sum` of that file. No heredoc delimiter is relied on for framing; the byte count is the frame.
-- Every step ends with exactly one control acknowledgement line of a fixed form, `ACK <step> <exit>`, so the step's exit code is transported explicitly. A missing, malformed or duplicated acknowledgement is a protocol stop (fatal, section "Stops").
-- Byte limits: each supervisor envelope at most 131,073 bytes; each control line at most 4,096 bytes; each staged file under 32 KiB; total staged bytes under 40 KB. Time limits: each supervised step at most T0 plus 15.5 seconds plus interpreter start; each control step at most 5 seconds; whole session at most 5 minutes wall clock, after which only cleanup runs.
-- The design must synthesize an end-to-end transport test on Linux CI that drives the exact stdin stream through a stand-in shell (local `bash` reading the same stream, or a loopback sshd where available), staging real files, checking hashes and parsing acknowledgements. A `shlex` parse of pipelines is not sufficient and is not the test.
-- No implementation of the stream exists yet; this plan authorizes designing it, not writing it.
+## Exact sequence (18 operations)
 
-## Host assumptions (enumerated, checked read-only before any write)
+| Op | Tool | Purpose | Local gate before the next op |
+|---|---|---|---|
+| 1 | ssh | P1 `hostname` | equals intended host |
+| 2 | ssh | P2 `git rev-parse HEAD`, porcelain line count; P3 `systemctl show` fields; P4 reflog SHAs and timestamps only | revision expected; **porcelain count is 0** (nonzero is fatal); unit active, output journal |
+| 3 | ssh | P5 tool versions and presence; P6 `journalctl --disk-usage`; P7 temp-root `stat` | assumptions hold |
+| 4 | ssh | `mktemp -d` under the default temp root, then `stat` of it | path exported once; mode 0700 and owner uid match |
+| 5 to 7 | scp | stage supervisor, reducer, META, one file each | transfer exit 0 |
+| 8 | ssh | `sha256sum` of all three staged files | all three equal the values recorded from merged PR592 master; **no staged file executes before this gate** |
+| 9 | ssh | observation 1: META, repository root (five source slots) | envelope captured |
+| 10 | ssh | cleanup check for observation 1 | cleanup PROVEN (see below) and `usable_envelope` true |
+| 11 | ssh | observation 2: META, temp root (three script slots) | envelope captured |
+| 12 | ssh | cleanup check for observation 2 | cleanup PROVEN and `usable_envelope` true |
+| 13 | ssh | observation 3: retention floor probe | envelope captured |
+| 14 | ssh | cleanup check for observation 3 | cleanup PROVEN; floor result recorded, non-fatal either way |
+| 15 | ssh | observation 4: main reducer | envelope captured |
+| 16 | ssh | cleanup check for observation 4 | cleanup PROVEN; envelope result recorded, non-fatal either way |
+| 17 | ssh | directory listing: names must be a subset of the permitted set, count exported; re-check every published group empty | all groups PROVEN |
+| 18 | ssh | remove the exact `mktemp` path, verify absent | `REMOVED` |
 
-Linux; GNU coreutils `timeout`, `head`, `cat`, `sha256sum`, `stat`, `mktemp`; `bash`, `journalctl`, `systemctl`, `git`; `python3` at least 3.10 with `-I -S` usable; `prctl` subreaper permitted for the invoking user; journald `-o json` places the structlog JSON in `MESSAGE` as a string; the host's default temp root exists and is a directory. Nothing is passed as `-c` source, so no per-argument limit is relied on.
+Observation commands are unchanged from revision 2: each is `python3 -I -S TMP/receipt_inventory_supervisor.py --pgid-file TMP/wrapper.pgid.N -- timeout -k 2 10 bash --noprofile --norc -o pipefail +m -c PIPELINE`, with the four pipelines (META repo root with `scout/main.py`, `scout/outcome_ledger.py`, `scout/trading/decision_events.py`, `scout/trading/signals.py`, `scout/trading/engine.py`; META temp root with the three scripts; `journalctl -u UNIT --until WINDOW_START -n 1 -o json --no-pager -q | head -c 2097153 | reducer 0 START_US`; `journalctl -u UNIT --since WINDOW_START --until WINDOW_END -n 200 -o json --no-pager -q | head -c 2097153 | reducer START_US END_US`). Concrete REPO, UNIT and window values come from the design; the scripts contain none of them.
 
-## Read-only preflight, before any write (F4, F10)
+## Cleanup proof per observation
 
-Only sanitized, bounded values leave the host in this phase. Each control below names its exact export; everything else is discarded on the host.
+A cleanup check (ops 10, 12, 14, 16) reads `wrapper.pgid.N`, requires an integer greater than 1, and runs an independent emptiness check on that group (`pgrep -g G` returning no members; zombies count as members). Cleanup is **PROVEN** only when both hold: the captured envelope parses with the fixed 17 keys and `cleanup_proof` is true with the same `pgid`, and the independent check shows the group empty. A leader that is already gone is consistent with PROVEN under these two conditions. Any other combination, including a missing or unparseable envelope with an empty group, is **UNPROVEN**. UNPROVEN is fatal and stops the sequence immediately, before the next observation; in particular no cleanup uncertainty from observations 1 to 3 may be carried into observation 4. Reuse of the integer G by an unrelated process can only make a check read non-empty, which fails safe toward UNPROVEN; nothing is ever signalled on the strength of that integer.
 
-| Control | Export | Bound |
-|---|---|---|
-| P1 host identity | `hostname` compared locally to the intended name; export is `MATCH` or `MISMATCH` | fixed token |
-| P2 current checkout | `git rev-parse HEAD` as 40-hex; porcelain cleanliness as a line count only, never filenames | 40 hex, one integer |
-| P3 current process | `ExecMainPID`, `ExecMainStartTimestamp`, `ActiveState`, `StandardOutput` from `systemctl show` | integers, one timestamp, two set members |
-| P4 checkout history | reflog entries newer than P3's start: count, each 40-hex SHA and timestamp; never subjects or messages | integer plus (hex, timestamp) pairs, at most 10 |
-| P5 toolchain | versions of `python3`, `timeout`, `bash` matched against fixed patterns; presence of the other tools | fixed tokens |
-| P6 retention metadata | `journalctl --disk-usage` figure; no journal record of any kind is read before staging | one size figure |
-| P7 temp root | existence, directory type and mode of the default temp root via `stat`; no `mktemp` in this phase | one mode |
+## Read-only preflight exports (before any write)
 
-The sanitized retention probe (command 3) runs only after staging because the reducer must be present to sanitize it; a raw pre-window record is never exported.
+Only these sanitized values leave the host: P1 match token; P2 40-hex HEAD and one porcelain line count, never filenames; P3 `ExecMainPID`, `ExecMainStartTimestamp`, `ActiveState`, `StandardOutput`; P4 count and at most ten (40-hex, timestamp) reflog pairs newer than the process start, never subjects; P5 fixed tokens; P6 one disk-usage figure; P7 one mode. No journal record of any kind is read before staging; the sanitized floor probe runs only after the reducer is staged and verified.
 
-## Licensed write phase, in order (F1, F2)
+## Licensed write phase
 
-The old no-host-write rule in `plan_suppression_receipt_inventory_2026_09_14.md:21` stands except for exactly this licence, which the design states verbatim:
+The old no-host-write rule in `plan_suppression_receipt_inventory_2026_09_14.md:21` stands except for exactly this licence, which the design states verbatim: one `mktemp -d` directory under the default temp root, mode 0700, owned by the invoking user, verified by `stat` immediately after creation; permitted contents for the whole session are the three staged scripts, up to four final pgid files `wrapper.pgid.1` to `.4`, and up to four publish remnants `wrapper.pgid.N.tmp`; total staged bytes under 40 KB; nothing written anywhere else on the host. Removal happens at op 18 only after op 17 proves every published group empty, and is recorded `REMOVED`, `RETAINED` with a fixed reason, or `UNPROVEN`. Reversible temp staging under standing permissions needs no operator approval; it needs this plan's two reviews and the design's two reviews.
 
-1. `mktemp -d` under the default temp root, mode 0700, owned by the invoking user. Mode and ownership are verified here, immediately after creation and before any staging, by `stat`; a mismatch is fatal and the directory is removed.
-2. Stage the three scripts by length-prefixed blocks. After all three are staged and **before any of them executes**, the host reports `sha256sum` of all three files. All three are verified locally against the values recorded from the merged PR592 master SHA. Only after all three match does any execution begin. No script is trusted on the strength of another script's report: the supervisor is not run to check META, and META's self-report of the scripts (command 2) is a second, later confirmation, never the first.
-3. Contents permitted in the directory for the whole session: the three staged scripts; up to four final pgid files `wrapper.pgid.1` to `.4`; up to four publish remnants `wrapper.pgid.N.tmp` that the supervisor's temp-then-rename publish can leave behind on a failed rename. Nothing else, ever. Nothing is written anywhere else on the host: not the repository, `/etc`, unit files, env files, caches or the journal.
-4. Cleanup policy: list the directory; the entry set must be a subset of the permitted names above, and the count is the only export; any other entry is fatal and the directory is retained. For every published group (each `wrapper.pgid.N` that exists), verify emptiness under the recovery rules below before removal. Remove the exact `mktemp` path only, then verify it is absent. Removal is recorded as `REMOVED`, `RETAINED` with a fixed reason, or `UNPROVEN`.
+## Recovery
 
-Reversible temp staging under standing permissions needs no operator approval. It does need this plan's two reviews and the design's two reviews; that is not an approval bypass.
+If a connection is lost after op 4, exactly one recovery connection is permitted. It is read-only: it lists the directory, reads the pgid files, and runs the emptiness check on each published group. It never signals any process, because no pinned start-tick association exists for these groups and a start-time or command-shape heuristic is not an identity. If every published group is empty and every corresponding envelope was captured with `cleanup_proof` true, the directory may be removed and cleanup recorded `REMOVED`; otherwise the directory is retained, cleanup is `UNPROVEN`, the findings status is fatal, and the exact path and pgids are reported for operator disposition. Live group members found this way are evidence and are left running. No collection command runs on the recovery connection.
 
-## The four supervised commands
-
-Every command runs as `python3 -I -S TMP/receipt_inventory_supervisor.py --pgid-file TMP/wrapper.pgid.N -- timeout -k 2 10 bash --noprofile --norc -o pipefail +m -c PIPELINE`. Each has its own pgid file. Stdout is one captured line; stderr is discarded on the host.
-
-1. **META, repository root.** `{ git -C REPO rev-parse HEAD; systemctl show UNIT -p ActiveState -p StandardOutput; } | head -c 4097 | python3 -I -S TMP/receipt_inventory_meta.py REPO scout/main.py scout/outcome_ledger.py scout/trading/decision_events.py scout/trading/signals.py scout/trading/engine.py`. Five slots pin the current checkout's event-site sources, including the four extra `ledger_record_failed` sites.
-2. **META, temp root.** Same metadata pipeline, `python3 -I -S TMP/receipt_inventory_meta.py TMP receipt_inventory_supervisor.py receipt_inventory_reducer.py receipt_inventory_meta.py`. Three slots confirm the staged scripts a second time. Two META runs are required because META accepts one root; scripts are never copied under the repository.
-3. **Retention floor probe (F7).** `journalctl -u UNIT --until "WINDOW_START" -n 1 -o json --no-pager -q | head -c 2097153 | python3 -I -S TMP/receipt_inventory_reducer.py 0 START_US`. `--until` is inclusive, so an entry at exactly WINDOW_START may be returned and will be `out_of_window` under the reducer's half-open window. A **positive floor** requires all of: a usable envelope; `observed_span.first` and `observed_span.last` both non-null; and both strictly before START_US when parsed. `records == 1` with `out_of_window == 0` is not sufficient, because a malformed record satisfies it. A positive floor proves exactly one retained pre-window record and nothing about continuity across the window; the findings never say the retained span covers the window.
-4. **Main reducer.** `journalctl -u UNIT --since "WINDOW_START" --until "WINDOW_END" -n 200 -o json --no-pager -q | head -c 2097153 | python3 -I -S TMP/receipt_inventory_reducer.py START_US END_US`. Run once, whatever command 3 showed.
-
-Concrete REPO, UNIT, WINDOW_START and WINDOW_END come from the design; the scripts contain none of them (enforced by their static tests).
-
-## Interpretation contract (F8, F9)
+## Interpretation contract
 
 - D1 to D4 stay `UNKNOWN` whatever the counts show, per `design_suppression_receipt_inventory_2026_09_14.md`. Counts are positive presence evidence only.
-- Only a **usable** command 4 envelope with zero allowlisted event counts supports the sentence "no allowlisted event observed in the window at an unknown effective log level". An unusable, truncated, saturated-and-capped, `OVERFLOW`, `RECORD_CAP`, `COMMAND_FAILED` or missing result is recorded as `OBSERVATION_UNAVAILABLE` with the fixed reason, and supports no sentence about the window.
-- Three identities are reported separately and never merged: **current checkout** (P2 plus command 1 hashes); **current process** (P3, which may postdate the window entirely); **historical window producer** (the process that wrote the window's journal entries, whose identity this plan does not establish). Reflog and process start time are correlation, not proof, of what any process loaded; the findings do not prescribe an inferred loaded identity. If no evidence ties the window producer to a revision, the findings state "window producer identity: not established".
+- Positive retention floor requires a usable observation 3 envelope with `observed_span.first` and `last` both non-null and both strictly before START_US when parsed; `records` 1 with `out_of_window` 0 is insufficient because a malformed record satisfies it; `--until` is inclusive. A positive floor proves one retained pre-window record and nothing about continuity across the window.
+- Only a usable observation 4 envelope with zero allowlisted event counts supports "no allowlisted event observed in the window at an unknown effective log level". Anything unusable, truncated, capped or missing is `OBSERVATION_UNAVAILABLE` and supports no sentence about the window.
+- Current checkout (P2 plus observation 1 hashes), current process (P3, which may postdate the window), and historical window producer are reported separately. Reflog and start time are correlation, not proof, of loaded code; when no evidence ties the window producer to a revision the findings say "window producer identity: not established".
 
-## Recovery connection (F5)
+## Stops
 
-If the session is lost after the write phase began, exactly one reconnection is permitted, for cleanup and evidence retrieval only. It runs no collection command and no retry. Signalling is permitted only when ownership of a group is verified independently: the published integer in `wrapper.pgid.N` alone, or a `.tmp` remnant alone, licenses nothing. Verification requires, for the candidate pgid, that `/proc/<pgid>/stat` shows session id and process group id equal to the pgid, that its start time falls inside this session's window, and that its command line matches the supervisor or wrapper shape. If any check fails or the process is gone, nothing is signalled, the directory is retained, and cleanup is recorded `UNPROVEN`. The recovery connection exports only the same sanitized controls as cleanup.
+Fatal, ending collection and proceeding only to cleanup: any per-operation limit exceeded; P1 mismatch; P2 revision unexpected or porcelain count nonzero; P3 unit not active or output not journal; P5 assumption failing; temp directory mode or owner mismatch; any staged hash mismatch; observation 1 or 2 envelope unusable; any cleanup UNPROVEN; an unexpected entry in the directory; final cleanup `RETAINED` or `UNPROVEN`. Non-fatal, recorded and continued: floor probe unusable, empty or invalid; observation 4 unusable. Nothing triggers a retry.
 
-## Stops (F6)
+## Synthetic exercise before production
 
-**Fatal** stops end collection; cleanup is still attempted, and the findings status is the stop reason: P1 mismatch; P2 revision unexpected; P3 unit not active or output not journal; P5 assumption failing; temp directory mode or ownership mismatch; any staged hash mismatch; protocol acknowledgement failure; command 1 or 2 envelope unusable; an unexpected entry in the temp directory; cleanup `UNPROVEN` or `RETAINED`. Unresolved cleanup is always fatal for the findings status, even when every envelope was usable.
-
-**Non-fatal** evidence outcomes are recorded and the session continues in order: floor probe unusable, empty or invalid (recorded "retention floor unproven"); command 4 unusable (recorded `OBSERVATION_UNAVAILABLE`). Neither triggers a retry.
+The exact operation table, with the exact remote command strings and the same local gates, must be exercised end to end on Linux CI against a synthetic target before any production run: real staging of the three real scripts into a temp directory, real supervised execution of the four pipeline shapes against fixture data, real cleanup checks and real removal, with `ssh`/`scp` replaced by a local executor that runs the identical remote strings under `bash` on the same machine. This is where the design must be honest: executing 18 gated operations reproducibly requires either the disposable driver named in the header or a manually followed checklist, and the synthetic exercise requires a test module. If the design chooses the driver, it scopes the two filenames, their import and spawn contracts, and their tests, and receives two design reviews before any build. If the design finds that standard tools cannot satisfy the per-observation cleanup gate on the target (for example no `pgrep`), it stops and states that exact residual rather than adding mechanism.
 
 ## Obligations for the design
 
-- Realizable session protocol per section "Session protocol", with the end-to-end transport test.
-- Bounded outer SSH loss: what the caller knows at each step, how the temp directory and any live group are found on the recovery connection, and the hard cap of one recovery connection.
-- Pgid file identity per the supervisor's lemmas; four distinct names so no run reads another's.
-- Evidence preservation: never delete the directory while a published group may be live; removal only after emptiness is verified or explicitly `UNPROVEN` with retention.
-- Independent bootstrap hash of all three scripts before any execution.
-- No secrets, no raw journal text, no reflog subjects, no porcelain filenames; the only host exports are the P1 to P7 controls, the four envelopes, the staged hashes and the cleanup controls.
-- Exact host values, the supervisor exit table against `EXIT_CODES`, the findings file layout, and the fixed uncertainty statements above.
+Exact remote command strings for all 18 operations; the executor abstraction for the synthetic exercise; the supervisor exit table against `EXIT_CODES`; the permitted-entry set and cleanup states; the findings file layout with the fixed uncertainty statements; the choice between driver and checklist with its artifact names; concrete REPO, UNIT and window values.
 
 ## Tests, smokes and rollback
 
-Local, before the session: PR592 modules green on the merged SHA; the transport test from the design green on Linux CI; `usable_envelope` run against synthetic envelopes for each planned schema. On host, before writes: P1 to P7. After staging: three bootstrap hashes. After each command: local `usable_envelope`. Rollback is the cleanup policy; nothing else changes on the host. The findings PR is docs-only and reverts cleanly.
+Local before the session: PR592 modules green on the merged SHA; the synthetic exercise green on Linux CI; `usable_envelope` against synthetic envelopes for both schemas. On host: ops 1 to 3 before any write; op 8 before any execution; cleanup checks between observations. Rollback is op 18 or, on failure, operator disposition of one retained temp directory; nothing else changes on the host. The findings PR is docs-only and reverts cleanly.
 
 ## Gates
 
-Two independent parallel plan reviews on this file; separate design with two reviews resolving every obligation above; PR592 merged on exact-head green CI; then one session; then a findings PR with two reviews and a clearance file. Passing this plan's reviews authorizes design work only.
+Two independent parallel plan reviews on this revision; separate design with two reviews resolving every obligation and scoping any disposable artifact; PR592 merged on exact-head green CI; synthetic exercise green; then one sequence run; then a findings PR with two reviews and a clearance file. Passing this plan's reviews authorizes design work only.
