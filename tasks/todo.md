@@ -8,8 +8,9 @@
 - [x] Review of c72e6e55: structural/concurrency APPROVE; ops REQUEST CHANGES on two reproduced residuals (clipped diagnostic prefixing the WORKER line; lint missing `with Popen` exit and annotated bindings). Both folded with exact discriminating tests; Windows: 48 passed, 29 skipped.
 - [x] Structural re-review of e99e121d: one P2 (line_open derived from the intended buffer, not relay completion) folded with a simulated partial-relay regression; ownership review intact.
 - [x] Push reviewed implementation and clearance evidence to existing draft PR590.
-- [ ] Final-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
+- [x] Final-head Linux 29-case job and full suite green in GitHub CI (run 35109809750 conclusion success); merged at 2026-09-16T14:37:30Z.
 - [x] Both independent reviewers terminal APPROVE on9fa1f4ce; all findings folded; four-vector clearances recorded.
+- [x] PR#590 merged after exact-head CI confirmed green (conclusion success).
 - [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
 
 Windows skips are not cleanup proof. Independent code-review clearances are recorded; final-head CI remains separate. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
