@@ -1,3 +1,13 @@
+## Active Work: 2026-09-16 09:30 UTC — Receipt cleanup implementation WIP
+
+- [x] Refresh origin/master b5daecfc and current PR590; retain approved plan and combined revision7 design.
+- [x] Configured Claude author drafted supervisor, fault runner and expanded 29-case harness; preserved candidate 9db77514 on draft PR590.
+- [ ] Complete author verification and design consolidation: author hit HTTP429 session limit before tests/commits; reported reset 13:20 UTC.
+- [x] Two independent implementation reviews completed: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
+- [ ] Fold open findings and Linux CI failures; obtain renewed approvals and final-head green checks.
+- [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
+
+Syntax compilation passes. All29 Windows tests skip, which is not cleanup proof. No reviewer clearance is recorded. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
 ## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
 
 - [x] Refresh current master, canonical memory, backlog and current draft PR590.

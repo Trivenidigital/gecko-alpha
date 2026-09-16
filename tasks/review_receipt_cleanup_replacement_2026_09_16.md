@@ -150,3 +150,55 @@ required marking the older Active Work paragraph in todo as historical because
 it still described the now-closed design findings as unresolved. That paragraph
 is now explicitly superseded; implementation/Linux gates remain outstanding.
 No design, source, test or runtime changes accompanied this evidence fold.
+
+## 09:30 UTC run — partial implementation preserved
+
+Current master b5daecfc refreshed before creating the isolated continuation
+branch. PR590 started at3da5852f with timeout/test/clearances failed and frontend
+parity passed. Existing plan and combined revision7 design approvals retained;
+no new custom scope or runtime re-attestation.
+
+Claude safe-mode session08d22646-ab3e-454d-9f07-28b2e3a8bf4b wrote the supervisor,
+fault runner and expanded harness, then ended with HTTP429/session limit,
+reported reset13:20 UTC. It did not complete verification, design consolidation
+or commits. Codex preserved the three files as WIP candidate9db77514 and pushed
+to existing draft PR590. No merge/deploy or production call.
+
+Native Python syntax compilation passes; unittest discovers29 cases, all skip
+on Windows. These skips provide no Linux cleanup proof. Initial uv environment
+sync failed on PyPI UnknownIssuer; stdlib syntax/discovery used the created
+Python executable without resolving project dependencies. git diff --check
+passes. Existing .reviewers/590.toml remains empty. Independent ownership/logic
+and deadline/falsifier reviews were dispatched in parallel on9db77514.
+Linux CI run35081632057 was started for that exact code candidate.
+
+### Candidate9db77514: two independent terminal reviews, NOT CLEARED
+
+Ownership/logic reviewer and ops-safety/silent-failure reviewer both request
+changes. No findings were fixed in code after the author limit; the disposition
+is OPEN, not waived. Both permit preservation as an explicitly incomplete draft.
+
+1. P1, harness632-636 (both reviewers): raw_path finally signals G after the
+   leader and all group members have been reaped and emptiness proved. G is no
+   longer reserved; unanchored kill_group can reach a reused foreign group.
+   Replace that fallback with ownership-anchored cleanup, never after ECHILD.
+2. P2, harness710-711/754-755 (logic): closed_reader releases clean_success
+   before closing S's stdout reader. S can report and exit0 first. Close reader
+   before releasing the fixture, preserving the intended exit11 discriminator.
+3. P2, harness907-910 and560 (ops): W recovery obtains report deadlines but logs
+   and emits through blocking print, bypassing its TR+9 bounded relay contract.
+4. P2, supervisor343-345 and harness416-418 (ops): expired report budgets return
+   without the approved single nonblocking diagnostic write attempt.
+5. Design residual (ops): direct-child enumeration232-238 and per-child recovery
+   loops310-338 lack deadline checks. This partially follows approved pseudocode;
+   reconcile the absolute-bound requirement explicitly before claiming it.
+
+Positive static checks: original five case names and survivor-oracle meanings
+are retained; raw controls bypass S; supervised emptiness checks precede fallback;
+capture timeout class and identity acknowledgment order match the amendment.
+No reviewer executed Linux tests. No .reviewers clearances were written.
+Author session is no longer active (CLI process inventory verified). Next:
+resume same author after reported13:20 UTC reset, fold findings and CI results,
+finish design consolidation, then obtain renewed two-vector review and green
+exact-head Linux/full-suite checks. Reducer/META and fresh runtime preflight
+remain separate downstream gates; D1-D4 UNKNOWN and D5-D6 untouched.
