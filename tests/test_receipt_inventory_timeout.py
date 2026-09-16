@@ -173,6 +173,7 @@ class ReceiptInventoryTimeoutTests(unittest.TestCase):
         )
         if "GNU coreutils" not in version.stdout:
             raise RuntimeError("these tests require GNU coreutils timeout")
+        print(version.stdout.splitlines()[0], flush=True)
 
     def run_case(self, case):
         with tempfile.TemporaryDirectory(prefix="receipt-timeout-") as temporary:
