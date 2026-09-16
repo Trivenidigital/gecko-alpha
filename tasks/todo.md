@@ -1,3 +1,11 @@
+## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
+
+- [x] Refresh current master, canonical memory, backlog and current draft PR590.
+- [x] Configured author returned revision4; two parallel design reviews completed.
+- [ ] Fold scan completeness, recovery budgets, event records and deterministic faults; obtain two design approvals.
+- [ ] Build only after design approval; retain Linux falsifiers, two PR reviews and final-head green CI.
+- Existing approved plan retained. No production re-attestation or implementation clearance.
+- Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md.
 ## Active Work: 2026-09-16 — Receipt cleanup replacement
 
 - [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.

@@ -87,3 +87,23 @@ retention only. Both verified the four-document diff and clean whitespace check;
 no factual corrections. Neither grants design, implementation, runtime cleanup,
 merge or production approval. This final note records their terminal verdicts;
 .reviewers/590.toml stays unchanged and empty.
+
+## 08:30 UTC run — revision 4 review
+
+Refreshed origin/master b5daecfc and verified PR590 remains draft at b1cf85d5,
+with timeout/test/clearances failed and frontend parity passed. No fresh
+production query or runtime re-attestation. Existing plan approvals retained.
+Claude safe-mode author completed session171d929a-1615-437d-abdb-fb6088a30a7f;
+revision4 was committed as7baeae95. No implementation was authorized.
+
+Both independent parallel design reviewers returned CHANGES REQUIRED:
+- design_logic accepts core single-reaper ownership proof but requires explicit
+  scan completeness before emptiness certification and consistent accounting
+  for the direct child killed before recovery starts.
+- design_ops requires absolute recovery/oracle/report budgets, readiness-gated
+  capture fault injection, consistent parent termination records and a reachable
+  pre-spawn startup-signal injection point.
+
+These findings were sent to the same author for revision5, together with a
+bounded continuous pipe-drain/relay clarification. Revision4 is not build
+clearance. scripts/tests/CI and reviewer clearance records remain unchanged.
