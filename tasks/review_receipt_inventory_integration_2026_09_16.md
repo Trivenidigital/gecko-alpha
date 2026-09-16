@@ -31,3 +31,14 @@ validation. No implementation or runtime authorization is inferred from the plan
 D1–D4 remain UNKNOWN. Retaining one pre-window journal record does not establish
 continuous retention, independent attempts, cross-store identity or price lineage.
 Current process identity does not establish historical loaded source bytes.
+
+## Dependency completed
+
+PR592 merged2026-09-16T19:45:45Z as5281f047346a951acb05926a27fe0489bc3cafd4. Exacthead65d93065 CI35140345937 passed8302tests/14skips, allfourjobsSUCCESS including Linux mutation self-checks. No deployment or collection.
+
+## Design review findings — no build
+
+Two independent DESIGN reviews rejected0821bad3 (checklist missing actual rc/immutablestate/enforceablelimits/sourcepins and safequoting). Configured author revision15216a1f selects the plan-permitted fixedsequence driver with output-to-file then evaluate. Both reviewers REQUEST CHANGES again: correct nested shell quoting; distinguish parser acceptance limit from physical storage bound; prove local transport descendant cleanup; persist in-flight state for everyoperation and exclusive run ownership; bind stagedscripts to approved revision; use test-owned process identities; deterministic publicationfailure; saturation means completenessunknown. Revision3 requested from configuredauthor. DESIGN REMAINS UNAPPROVED; no source/test implementation, staging or receiptcollection.
+
+Fresh read-only runtime19:50:31Z remains selective77751890 trackedclean; pipeline/dashboard/Hermesactive, registryHTTP200. Newworkerprestartattempt19:22:35Z authguardexit21, timeractive. Operator restore intendedVPSOAuth; this is separate from integrationengineering. No account/service changes.
+
