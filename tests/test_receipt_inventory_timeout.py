@@ -43,6 +43,9 @@ DRAIN_BYTES_PER_TICK = 65_536
 WORKER_RETAIN = 131_073
 RUNNER_RETAIN = 1_048_576
 RELAY_INCOMPLETE_EXIT = 12
+DIAGNOSTIC_BUDGET = 65_536  # design 5.4: W's own diagnostic prints are bounded to 64 KiB
+WRITE_RETRY_SECONDS = 0.005
+PROC = "/proc"
 STATUS_KEYS = (
     "status", "exit_code", "pgid", "inner_exit", "inner_elapsed", "total_elapsed",
     "reaped", "kills", "signals_received", "signal_phase", "teardowns",
@@ -127,23 +130,21 @@ def assert_empty(pgid, deadline=None):
                 capture_output=True, text=True,
                 timeout=max(0.05, deadline - time.monotonic()),
             )
-            print(
+            emit_diagnostic(
                 f"survivor diagnostic (ps exit={diagnostic.returncode}):\n"
-                f"{diagnostic.stdout}{diagnostic.stderr}", flush=True,
+                f"{diagnostic.stdout}{diagnostic.stderr}"
             )
         except (OSError, subprocess.TimeoutExpired) as error:
-            print(f"survivor diagnostic unavailable: {error}", flush=True)
+            emit_diagnostic(f"survivor diagnostic unavailable: {error}")
         raise AssertionError(f"survivors in group {pgid}: {result.stdout.strip()}")
     if result.returncode != 1:
         raise RuntimeError(f"pgrep failed: {result.returncode}: {result.stderr}")
 
 
-def kill_group(pgid):
-    guarded_group(pgid)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+# There is deliberately no unanchored kill helper in this harness. Every
+# os.killpg in this file lives inside recover_descendants, immediately after
+# waitpid(-G, WNOHANG) returned 0 (lemma L3); tests/test_receipt_supervisor_contracts.py
+# pins that statically.
 
 
 def reap_group(pgid):
@@ -191,7 +192,7 @@ def wait_ready(directory, names, pgid, pump=None):
         record = json.loads((directory / name).read_text())
         if record["pid"] <= 1 or record["pgid"] != pgid:
             raise AssertionError(f"fixture escaped wrapper group: {record}, expected {pgid}")
-        print(f"{name}: pid={record['pid']} pgid={record['pgid']} ready", flush=True)
+        emit_diagnostic(f"{name}: pid={record['pid']} pgid={record['pgid']} ready")
         records[name] = record
     return records
 
@@ -202,9 +203,9 @@ def wait_ready(directory, names, pgid, pump=None):
 Stat = namedtuple("Stat", "pid state ppid pgrp session")
 
 
-def read_stat(pid):
+def read_stat(pid, proc=PROC):
     try:
-        raw = Path(f"/proc/{pid}/stat").read_bytes()
+        raw = Path(f"{proc}/{pid}/stat").read_bytes()
     except OSError:
         return None
     tail = raw[raw.rfind(b")") + 2:].split()
@@ -219,9 +220,15 @@ def set_subreaper(role):
         raise OSError(ctypes.get_errno(), f"could not enable {role} subreaper")
 
 
-def scan_children(me, until):
-    """Return (kids, complete, method, reason); emptiness needs complete=True."""
-    path = Path(f"/proc/{me}/task/{me}/children")
+def scan_children(me, until, proc=PROC):
+    """Return (kids, complete, method, reason); emptiness needs complete=True.
+
+    Both enumeration paths check the absolute ``until`` instant at the top of
+    every iteration (design 5.1 absolute-bound clarification): a listing that
+    cannot be finished before the deadline is returned incomplete as
+    ``SCAN_DEADLINE`` and therefore never licenses an emptiness claim.
+    """
+    path = Path(f"{proc}/{me}/task/{me}/children")
     try:
         listed = path.read_text().split()
         method = "proc_children"
@@ -231,19 +238,21 @@ def scan_children(me, until):
     if listed is not None:
         kids = []
         for pid in listed:
-            stat = read_stat(pid)
+            if time.monotonic() >= until:
+                return kids, False, method, "SCAN_DEADLINE"
+            stat = read_stat(pid, proc)
             if stat is None:  # a listed child cannot vanish unless we reaped it
                 return kids, False, method, "CHILD_STAT_UNREADABLE"
             kids.append(stat)
         return kids, True, method, None
     for _attempt in range(3):
         kids, incomplete = [], False
-        for entry in os.listdir("/proc"):
+        for entry in os.listdir(proc):
             if time.monotonic() >= until:
                 return kids, False, method, "SCAN_DEADLINE"
             if not entry.isdigit():
                 continue
-            stat = read_stat(entry)
+            stat = read_stat(entry, proc)
             if stat is None:
                 incomplete = True
                 continue
@@ -275,10 +284,37 @@ def kill_pid(pid):
         pass
 
 
+def stop_adopted_children(kids, my_sid, until, record):
+    """Phase 1: kill and reap by pid (lemma L4) every child that is not a member of a foreign session group.
+
+    Checks the absolute ``until`` instant before acting on each child; returns
+    False as soon as the recover partition has ended so the caller records
+    RECOVERY_BUDGET_EXCEEDED instead of continuing past its bound.
+    """
+    for kid in kids:
+        if kid.session == my_sid or kid.pgrp != kid.session:  # S, W leftovers, escapees
+            if time.monotonic() >= until:
+                return False
+            kill_pid(kid.pid)
+            record["pid_kills"].append({"pid": kid.pid, "role": "adopted", "state_at_scan": kid.state})
+            reap_by_pid(kid.pid, until)
+    return True
+
+
 def recover_descendants(direct, trigger, expect_groups):
-    """Shared ancestor recovery (design 5.3). Caller fails the case if failures is non-empty."""
+    """Shared ancestor recovery (design 5.3). Caller fails the case if failures is non-empty.
+
+    Absolute bound: phase 0 is bounded by ``stop_end``; every loop in phases 1
+    and 2, including the direct-children listing inside ``scan_children``, the
+    per-child kill/reap loop and the per-group anchored loop, checks
+    ``recover_end`` at the top of each iteration; every ``reap_by_pid`` is
+    bounded by the same absolute instant; the oracle is bounded by
+    ``oracle_end``. Diagnostics emitted from here on are bounded by
+    ``report_end`` through the shared non-blocking writer.
+    """
     me, my_sid = os.getpid(), os.getsid(0)
     stop_end, recover_end, oracle_end, report_end = trigger + 2, trigger + 6, trigger + 8, trigger + 9
+    OUTPUT.deadline = report_end
     record = {
         "pid_kills": [], "groups": {}, "escape": [], "live_before_signal": 0,
         "scan": {"method": None, "complete": False, "reason": None}, "failures": [],
@@ -307,15 +343,15 @@ def recover_descendants(direct, trigger, expect_groups):
             record["groups"].setdefault(
                 str(kid.session), {"kills": 0, "reaped": 0, "proof": False, "live_seen": False}
             )
-        for kid in kids:
-            if kid.session == my_sid or kid.pgrp != kid.session:  # S, W leftovers, escapees
-                kill_pid(kid.pid)
-                record["pid_kills"].append({"pid": kid.pid, "role": "adopted", "state_at_scan": kid.state})
-                reap_by_pid(kid.pid, recover_end)
-        progress = False
+        if not stop_adopted_children(kids, my_sid, recover_end, record):
+            continue  # partition ended: the while condition is now false and records the overrun
+        progress, expired = False, False
         for group_key, group in record["groups"].items():
             if group["proof"]:
                 continue
+            if time.monotonic() >= recover_end:
+                expired = True
+                break
             group_id = int(group_key)
             if not group["kills"] and not group["live_seen"] and any(
                 kid.state in "SRDT" for kid in foreign if kid.session == group_id
@@ -337,6 +373,8 @@ def recover_descendants(direct, trigger, expect_groups):
                     pass
                 group["kills"] += 1
             progress = True
+        if expired:
+            continue  # partition ended: the while condition is now false and records the overrun
         if complete and not kids and all(group["proof"] for group in record["groups"].values()):
             break
         if not progress:
@@ -406,27 +444,94 @@ class Drain:
             self.fd = None
 
 
-def relay(data, deadline):
-    """Non-blocking bounded write of bytes to our stdout; False if incomplete."""
-    fd = 1
-    blocking = os.get_blocking(fd)
-    os.set_blocking(fd, False)
+def bounded_write(fd, data, deadline, write=os.write, sleep=time.sleep, now=time.monotonic):
+    """Write all of ``data`` to a non-blocking ``fd`` with at least one attempt.
+
+    The deadline is checked only before a *retry*: an already expired budget
+    still gets exactly one non-blocking write attempt (design 5.1, "the report
+    is attempted once non-blocking if nothing remains"). True only if complete.
+    """
     view = memoryview(data)
+    attempts = 0
+    while view:
+        if attempts and now() >= deadline:
+            return False
+        attempts += 1
+        try:
+            written = write(fd, view)
+        except BlockingIOError:
+            if now() >= deadline:
+                return False
+            sleep(WRITE_RETRY_SECONDS)
+            continue
+        except OSError:
+            return False
+        view = view[written:]
+    return True
+
+
+def relay(data, deadline, fd=1):
+    """Non-blocking bounded write of bytes to our stdout; False if incomplete."""
     try:
-        while view:
-            if time.monotonic() >= deadline:
-                return False
-            try:
-                written = os.write(fd, view)
-            except BlockingIOError:
-                time.sleep(0.005)
-                continue
-            except OSError:
-                return False
-            view = view[written:]
-        return True
+        blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+    except OSError:
+        return False
+    try:
+        return bounded_write(fd, data, deadline)
     finally:
-        os.set_blocking(fd, blocking)
+        try:
+            os.set_blocking(fd, blocking)
+        except OSError:
+            pass
+
+
+def clip_output(data, remaining):
+    """Return (kept, dropped) with len(kept) <= max(remaining, 0)."""
+    room = max(remaining, 0)
+    if len(data) <= room:
+        return data, 0
+    return data[:room], len(data) - room
+
+
+class Output:
+    """Bounded non-blocking writer for a harness process's own stdout (design 5.4).
+
+    Diagnostics share one 64 KiB budget; the report line is exempt from the
+    byte budget but, like every write, is bounded by ``deadline`` (the report
+    partition once a recovery has been triggered, otherwise one second).
+    Nothing in W or P writes to stdout through blocking ``print``.
+    """
+
+    def __init__(self, fd=1, budget=DIAGNOSTIC_BUDGET):
+        self.fd = fd
+        self.remaining = budget
+        self.dropped = 0
+        self.incomplete = False
+        self.deadline = None
+
+    def write(self, text, budgeted=True):
+        data = text.encode("utf-8", "replace")
+        if not data.endswith(b"\n"):
+            data += b"\n"
+        if budgeted:
+            data, dropped = clip_output(data, self.remaining)
+            self.remaining -= len(data)
+            self.dropped += dropped
+            if not data:
+                return False
+        deadline = self.deadline if self.deadline is not None else time.monotonic() + 1.0
+        complete = relay(data, deadline, self.fd)
+        if not complete:
+            self.incomplete = True
+        return complete
+
+
+OUTPUT = Output()
+
+
+def emit_diagnostic(text):
+    return OUTPUT.write(text)
 
 
 def complete_status_line(buffer):
@@ -554,10 +659,25 @@ class Worker:
             self.drain.pump()
 
     def note(self, message):
-        print(f"{self.case}: {message}", flush=True)
+        """Bounded diagnostic: shares the 64 KiB budget, never blocks (design 5.4)."""
+        OUTPUT.write(f"{self.case}: {message}")
 
     def emit(self):
-        print("WORKER " + json.dumps(self.report, sort_keys=True), flush=True)
+        """The one WORKER report line, bounded by the current output deadline."""
+        self.report["diagnostics"] = {"dropped": OUTPUT.dropped, "incomplete": OUTPUT.incomplete}
+        OUTPUT.write("WORKER " + json.dumps(self.report, sort_keys=True), budgeted=False)
+
+    def release_fixture(self):
+        """Run the case's pre-release action, then release the fixture.
+
+        closed_reader must close S's stdout reader BEFORE release. Releasing
+        first lets S report into a still-open pipe and exit 0, which erases the
+        exit 11 discriminator the case exists to prove.
+        """
+        if self.case == "closed_reader":
+            self.drain.close()
+            self.note("closed the supervisor stdout reader before release")
+        atomic_touch(self.directory / "release")
 
     # -- entry -------------------------------------------------------------
 
@@ -584,6 +704,7 @@ class Worker:
         )
         pgid = process.pid
         self.report["group"] = pgid
+        failure = None  # not named `error`: the except clauses below unbind that name
         try:
             guarded_group(pgid)
             # Publish immediately so the parent can clean up on its own deadline.
@@ -629,14 +750,27 @@ class Worker:
                     raise AssertionError(f"raw leak recovery incomplete: {record}")
                 assert_empty(pgid)
                 self.note(f"group={pgid} empty after recovery")
-        finally:
-            kill_group(pgid)
-            process.wait(timeout=2)
-            reap_group(pgid)
+        except BaseException as caught:  # noqa: BLE001 - recorded; anchored cleanup still runs
+            failure = caught
+            self.note(f"FAILURE {type(caught).__name__}: {caught}")
+        # Final cleanup is ownership-anchored (lemmas L3/L4): killpg is issued
+        # only right after waitpid(-G, WNOHANG) returned 0 and never after
+        # ECHILD, so a group id whose reservation has lapsed is never signaled.
+        # On the leak path recovery already proved G empty, so this must act on
+        # nothing; on the negative control it is the explicit cleanup.
+        final = recover_descendants(None, time.monotonic(), 1)
+        self.report["final_cleanup"] = final
+        try:
+            if final["failures"]:
+                raise AssertionError(f"final anchored cleanup failed: {final['failures']}")
             assert_empty(pgid)
-        if negative:
-            self.note(f"group={pgid} empty after explicit cleanup")
+        except BaseException as caught:  # noqa: BLE001 - do not mask the primary failure
+            failure = failure or caught
+        if negative and failure is None:
+            self.note(f"group={pgid} empty after explicit anchored cleanup")
         self.emit()
+        if failure is not None:
+            raise failure
 
     # -- foreign group refusal ---------------------------------------------
 
@@ -708,7 +842,7 @@ class Worker:
             self.readiness = wait_ready(directory, names, group, pump=self.pump)
             self.group = group
             atomic_touch(directory / "identity.ready")
-            atomic_touch(directory / "release")
+            self.release_fixture()
             self.note(f"identity verified: group={group} leader={stat} supervisor={supervisor_pid}")
             if gated:
                 wait_for(directory, ["fault.fired"], "FAULT_NOT_FIRED", pump=self.pump)
@@ -751,8 +885,7 @@ class Worker:
             os.kill(self.supervisor.pid, signal.SIGHUP)
         elif case == "term_mid_run":
             os.kill(self.supervisor.pid, signal.SIGTERM)
-        elif case == "closed_reader":
-            self.drain.close()
+        # closed_reader closed its reader inside release_fixture, before release.
         supervisor_deadline = deadlines(case, False)[0]
         trigger, supervisor_exit = self.main_loop(supervisor_deadline)
         if trigger is not None:
@@ -904,10 +1037,13 @@ class Worker:
             raise AssertionError(f"outer deadline should have killed the leader: {status}")
 
     def worker_recovery(self, trigger):
+        # recover_descendants bounds OUTPUT by its report partition (TR+9), so
+        # every note and the final WORKER line below go through the bounded
+        # non-blocking relay; the full record travels in the WORKER line only.
         record = recover_descendants(self.supervisor.pid, time.monotonic(), 1)
         self.supervisor_reaped = True
         self.report.update({"trigger": trigger, "recovery": record})
-        self.note(f"recovery after {trigger}: {json.dumps(record, sort_keys=True)}")
+        self.note(f"recovery after {trigger}: failures={record['failures']} scan={record['scan']}")
         case = self.case
         if case not in WORKER_RECOVERY_CASES:
             raise AssertionError(f"unexpected recovery trigger {trigger}")
@@ -1187,8 +1323,16 @@ class ReceiptInventoryTimeoutTests(unittest.TestCase):
         self.assertTrue(9 <= report["elapsed"] <= 16, report)
 
     def test_survivor_detector_negative_control(self):
-        runner, _ = self.run_case("negative_control")
+        runner, report = self.run_case("negative_control")
         self.assert_clean_exit(runner)
+        # The explicit cleanup is ownership-anchored: it found the live producer
+        # and signaled its group only after waitpid(-G) proved ownership.
+        final = report["final_cleanup"]
+        self.assertEqual(final["pid_kills"], [])
+        self.assertGreaterEqual(final["live_before_signal"], 1)
+        self.assertGreaterEqual(final["groups"][str(report["group"])]["kills"], 1)
+        self.assertTrue(final["scan"]["complete"])
+        self.assertEqual(final["failures"], [])
 
     # -- raw wrapper leak controls: positive characterization, not xfail ----
 
@@ -1202,6 +1346,12 @@ class ReceiptInventoryTimeoutTests(unittest.TestCase):
         self.assertGreaterEqual(recovery["groups"][str(report["group"])]["kills"], 1)
         self.assertTrue(recovery["scan"]["complete"])
         self.assertEqual(recovery["failures"], [])
+        # After recovery proved G empty, the final anchored cleanup must find
+        # nothing to own and therefore issue no signal at all (never after ECHILD).
+        final = report["final_cleanup"]
+        self.assertEqual(final["pid_kills"], [])
+        self.assertEqual(final["groups"], {})
+        self.assertEqual(final["failures"], [])
 
     def test_raw_wrapper_leak_term_ignoring_producer(self):
         self.assert_raw_leak("ignore_term")

@@ -330,6 +330,33 @@ def _serialize(state, status):
     return line.encode("utf-8"), record["exit_code"]
 
 
+def bounded_write(fd, data, deadline, write=os.write, sleep=time.sleep, now=time.monotonic):
+    """Write all of ``data`` to a non-blocking ``fd`` with at least one attempt.
+
+    The deadline is checked only before a *retry*. An already expired budget
+    still gets exactly one non-blocking write attempt (design section 4:
+    "attempted once non-blocking if nothing remains"); it is never skipped.
+    Returns True only when every byte was written.
+    """
+    view = memoryview(data)
+    attempts = 0
+    while view:
+        if attempts and now() >= deadline:
+            return False
+        attempts += 1
+        try:
+            written = write(fd, view)
+        except BlockingIOError:
+            if now() >= deadline:
+                return False
+            sleep(WRITE_RETRY_SECONDS)
+            continue
+        except OSError:
+            return False
+        view = view[written:]
+    return True
+
+
 def _write_report(line, deadline):
     """Non-blocking bounded write of the one status line; False if incomplete."""
     fd = 1
@@ -338,20 +365,8 @@ def _write_report(line, deadline):
         os.set_blocking(fd, False)
     except OSError:
         return False
-    view = memoryview(line)
     try:
-        while view:
-            if time.monotonic() >= deadline:
-                return False
-            try:
-                written = os.write(fd, view)
-            except BlockingIOError:
-                time.sleep(WRITE_RETRY_SECONDS)
-                continue
-            except OSError:
-                return False
-            view = view[written:]
-        return True
+        return bounded_write(fd, line, deadline)
     finally:
         try:
             os.set_blocking(fd, flags)
@@ -419,6 +434,10 @@ def main(argv):
     try:
         # Single reaper: Popen.poll/wait/communicate are never called on this
         # object; every reap below is an explicit waitpid by pid or by -G.
+        # Popen has no timeout parameter. The bound on this child is the
+        # absolute wait partition (t0 + --wait) enforced by _wait_phase, then
+        # the cleanup partition; tests/test_round8_subprocess_timeouts.py
+        # checks that no Popen result here is waited on without a timeout.
         leader = subprocess.Popen(  # noqa: S603 - exact wrapper argv, never inspected
             command, start_new_session=True, stdin=subprocess.DEVNULL,
             stdout=write_end, stderr=subprocess.DEVNULL,
