@@ -93,4 +93,3 @@ Exit 11 overrides on incomplete report. Fixed keys: `status`, `exit_code`, `inne
 **Unresolved, stated plainly.** Pipe writes above PIPE_BUF are not atomic; exit 11 and the consumer rule cover partial lines without proving atomicity. The `/proc` survivor scan is diagnostic. Python signal latency during long C calls is bounded by caps, not measured. Parent identity validation rests on the construction noted above.
 
 **Gates.** Two independent parallel design reviews before any change under `scripts/` or `tests/`. Implementation updates draft PR590 only. Collection stays blocked behind reducer and META tests and a separately approved identity preflight.
-
