@@ -487,11 +487,18 @@ def relay(data, deadline, fd=1):
 
 
 def clip_output(data, remaining):
-    """Return (kept, dropped) with len(kept) <= max(remaining, 0)."""
+    """Return (kept, dropped) with len(kept) <= max(remaining, 0), preserving line boundaries.
+
+    A clipped diagnostic always ends with a newline: its last kept byte is
+    replaced by one, so the next write, in particular the authoritative WORKER
+    line, always starts a fresh line and parse_marker can still find it. With
+    no room the diagnostic is dropped whole.
+    """
     room = max(remaining, 0)
     if len(data) <= room:
         return data, 0
-    return data[:room], len(data) - room
+    kept = data[:room - 1] + b"\n" if room > 0 else b""
+    return kept, len(data) - len(kept)
 
 
 class Output:
@@ -509,6 +516,7 @@ class Output:
         self.dropped = 0
         self.incomplete = False
         self.deadline = None
+        self.line_open = False
 
     def write(self, text, budgeted=True):
         data = text.encode("utf-8", "replace")
@@ -520,8 +528,13 @@ class Output:
             self.dropped += dropped
             if not data:
                 return False
+        if self.line_open:
+            # Defensive: every write above ends with a newline, but an unfinished
+            # line must never be allowed to prefix the next record.
+            data = b"\n" + data
         deadline = self.deadline if self.deadline is not None else time.monotonic() + 1.0
         complete = relay(data, deadline, self.fd)
+        self.line_open = not data.endswith(b"\n")
         if not complete:
             self.incomplete = True
         return complete

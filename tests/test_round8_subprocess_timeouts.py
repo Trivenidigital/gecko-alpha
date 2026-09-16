@@ -23,6 +23,15 @@ Rule, per primitive (the place a caller can actually block):
   result is never waited on through those methods is bounded by its caller's
   own loop (e.g. scripts/receipt_inventory_supervisor.py waits with
   ``os.waitpid(WNOHANG)`` under an absolute deadline).
+- ``with subprocess.Popen(...)`` is always an offender: ``Popen.__exit__``
+  calls ``wait()`` with no timeout, so the context exit is an implicit
+  unbounded wait that no kwarg can bound.
+
+Coverage is deliberately narrow and syntactic, not a dataflow proof. Names are
+recognised when bound by plain assignment, annotated assignment or
+``with ... as name`` in the same module or function scope, plus calls chained
+directly on the constructor. Aliases through containers, attributes, returns
+or parameters are not tracked.
 
 Before 2026-09-16 this lint demanded ``timeout=`` on Popen calls, a condition
 no Popen call can satisfy at runtime; scripts/ had no Popen site, so the
@@ -77,6 +86,9 @@ def _popen_bound_names(scope: ast.AST) -> set[str]:
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Call):
+            if _subprocess_callee(node.value) == "Popen" and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
         elif isinstance(node, ast.With):
             for item in node.items:
                 if (
@@ -92,6 +104,11 @@ def find_unbounded_subprocess_sites(tree: ast.AST) -> list[tuple[int, str]]:
     """Return (lineno, reason) for every unbounded or invalid subprocess site."""
     offenders: list[tuple[int, str]] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.With):
+            for item in node.items:
+                if isinstance(item.context_expr, ast.Call) and _subprocess_callee(item.context_expr) == "Popen":
+                    offenders.append((item.context_expr.lineno, "with subprocess.Popen(...): __exit__ waits without timeout="))
+            continue
         if not isinstance(node, ast.Call):
             continue
         callee = _subprocess_callee(node)
@@ -161,7 +178,33 @@ def test_popen_communicate_with_timeout_is_clean():
 
 def test_popen_context_manager_wait_without_timeout_is_an_offender():
     source = "import subprocess\nwith subprocess.Popen(['x']) as p:\n    p.wait()\n"
+    assert _offenders_in(source) == [
+        "with subprocess.Popen(...): __exit__ waits without timeout=",
+        "Popen.wait() without timeout=",
+    ]
+
+
+def test_popen_context_manager_exit_is_an_implicit_unbounded_wait():
+    # Ops residual reproduction (review of c72e6e55): previously no offender.
+    source = "import subprocess\nwith subprocess.Popen(['sleep', '999']) as p:\n    pass\n"
+    assert _offenders_in(source) == ["with subprocess.Popen(...): __exit__ waits without timeout="]
+
+
+def test_popen_context_manager_with_bounded_wait_is_still_an_offender():
+    # A bounded wait inside the block does not bound __exit__ after TimeoutExpired.
+    source = "import subprocess\nwith subprocess.Popen(['x']) as p:\n    p.wait(timeout=1)\n"
+    assert _offenders_in(source) == ["with subprocess.Popen(...): __exit__ waits without timeout="]
+
+
+def test_annotated_popen_binding_wait_without_timeout_is_an_offender():
+    # Ops residual reproduction (review of c72e6e55): previously no offender.
+    source = "import subprocess\ndef f():\n    p: object = subprocess.Popen(['x'])\n    p.wait()\n"
     assert _offenders_in(source) == ["Popen.wait() without timeout="]
+
+
+def test_annotated_popen_binding_with_bounded_wait_is_clean():
+    source = "import subprocess\ndef f():\n    p: object = subprocess.Popen(['x'])\n    p.wait(timeout=2)\n"
+    assert _offenders_in(source) == []
 
 
 def test_chained_popen_wait_without_timeout_is_an_offender():

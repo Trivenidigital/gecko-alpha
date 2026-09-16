@@ -285,3 +285,35 @@ so the full pytest suite was not run locally. The fault runner is unchanged.
 The section11 clarifications, the harness changes and the lint correction need
 the renewed two-vector implementation review before any clearance;
 .reviewers/590.toml remains empty.
+
+### Candidate c72e6e55: two independent reviews, ops residuals folded
+
+Structural/concurrency reviewer: APPROVE. Ops reviewer: REQUEST CHANGES with
+two reproduced residuals, both folded by the same author in the next commit.
+Same boundaries: not pushed, no clearance, no merge, no production, paid,
+account or trading action. Original falsifiers and oracle are untouched.
+
+1. Clipped diagnostic could prefix the WORKER line. Reproduced on c72e6e55:
+   `Output(budget=4).write("abcdef")` then the unbudgeted WORKER write yielded
+   `abcdWORKER {}\n` and `parse_marker` returned None. Fold: `clip_output`
+   preserves line boundaries (a clipped diagnostic ends with a newline, its
+   last kept byte replaced; no room drops it whole) and `Output` terminates any
+   unfinished line before the next record. Exact discriminating test
+   `test_clipped_diagnostic_never_corrupts_the_worker_line` asserts the stream
+   is `abc\nWORKER {}\n` and `parse_marker` returns the record; the fixed
+   stream on the working tree and the corrupted stream on c72e6e55 were both
+   reproduced before commit.
+2. Lint accepted `with subprocess.Popen([...]) as p: pass` and
+   `p: object = subprocess.Popen(...); p.wait()`. Reproduced on c72e6e55: both
+   returned no offenders. Fold: any `with subprocess.Popen(...)` is an offender
+   because `__exit__` waits without a timeout no kwarg can bound; annotated
+   assignment now binds the name. Five discriminating snippet tests added,
+   including the bounded-wait-inside-`with` case, which stays an offender. The
+   lint docstring states the coverage is narrow and syntactic (plain and
+   annotated assignment, `with ... as`, chained calls), not a dataflow proof.
+
+Verification on Windows (system Python3.14.3, pytest9.0.2): the same three
+focused modules → 48 passed, 29 skipped; `py_compile` passes; `git diff
+--check` clean; LF preserved. Linux CI run35104829851 on c72e6e55 was left to
+complete; no duplicate full suite was run here. The new head needs exact-head
+Linux CI and a terminal ops re-review before any clearance.

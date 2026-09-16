@@ -5,8 +5,9 @@
 - [x] Two independent implementation reviews completed on 9db77514: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
 - [x] Linux CI on 9db77514: 29-case job passed; full suite 1 failure (round8 subprocess lint rejects Popen without a timeout kwarg Popen cannot take), 8151 passed, 14 skipped.
 - [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Not pushed.
-- [ ] Push, exact-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
-- [ ] Renewed two-vector implementation review on the new head; record clearances only then.
+- [x] Review of c72e6e55: structural/concurrency APPROVE; ops REQUEST CHANGES on two reproduced residuals (clipped diagnostic prefixing the WORKER line; lint missing `with Popen` exit and annotated bindings). Both folded with exact discriminating tests; Windows: 48 passed, 29 skipped.
+- [ ] Push, exact-head Linux 29-case job and full suite green in GitHub CI (no local Linux available; run35104829851 on c72e6e55 in flight).
+- [ ] Terminal ops re-review on the new head; record clearances only then.
 - [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
 
 Windows skips are not cleanup proof. No reviewer clearance is recorded. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.

@@ -195,21 +195,40 @@ class OutputTests(unittest.TestCase):
     def tearDown(self):
         harness.relay = self.original_relay
 
-    def test_clip_output(self):
-        self.assertEqual(harness.clip_output(b"abcdef", 4), (b"abcd", 2))
-        self.assertEqual(harness.clip_output(b"abc", 3), (b"abc", 0))
-        self.assertEqual(harness.clip_output(b"abc", 0), (b"", 3))
-        self.assertEqual(harness.clip_output(b"abc", -5), (b"", 3))
+    def test_clip_output_preserves_line_boundaries(self):
+        # A clipped diagnostic ends with a newline; the newline byte counts against the room.
+        self.assertEqual(harness.clip_output(b"abcdef\n", 4), (b"abc\n", 3))
+        self.assertEqual(harness.clip_output(b"abc\n", 4), (b"abc\n", 0))
+        self.assertEqual(harness.clip_output(b"abcdef\n", 1), (b"\n", 6))
+        self.assertEqual(harness.clip_output(b"abc\n", 0), (b"", 4))
+        self.assertEqual(harness.clip_output(b"abc\n", -5), (b"", 4))
+
+    def test_clipped_diagnostic_never_corrupts_the_worker_line(self):
+        # Ops residual reproduction (review of c72e6e55): with the old clipping the
+        # stream was b"abcdWORKER {}\n" and parse_marker returned None.
+        out = harness.Output(fd=7, budget=4)
+        out.write("abcdef")
+        self.assertTrue(out.write("WORKER {}", budgeted=False))
+        stream = b"".join(data for data, _, _ in self.relayed)
+        self.assertEqual(stream, b"abc\nWORKER {}\n")
+        self.assertEqual(harness.parse_marker(stream.decode(), "WORKER"), {})
+
+    def test_unfinished_line_is_terminated_before_the_next_record(self):
+        out = harness.Output(fd=7, budget=64)
+        out.line_open = True  # defensive path: cannot arise from write(), pinned anyway
+        out.write("WORKER {}", budgeted=False)
+        self.assertEqual([data for data, _, _ in self.relayed], [b"\nWORKER {}\n"])
+        self.assertFalse(out.line_open)
 
     def test_diagnostics_share_one_budget_and_drop_beyond_it(self):
         out = harness.Output(fd=7, budget=10)
         self.assertTrue(out.write("12345"))  # 6 bytes with newline
-        self.assertTrue(out.write("abcdefghij"))  # clipped to the remaining 4 bytes, relayed completely
+        self.assertTrue(out.write("abcdefghij"))  # clipped to the remaining 4 bytes, newline-terminated
         self.assertEqual(out.remaining, 0)
         self.assertEqual(out.dropped, 7)
         self.assertFalse(out.write("more"))  # budget exhausted: nothing written, counted as dropped
         self.assertEqual(out.dropped, 12)
-        self.assertEqual([data for data, _, _ in self.relayed], [b"12345\n", b"abcd"])
+        self.assertEqual([data for data, _, _ in self.relayed], [b"12345\n", b"abc\n"])
         self.assertFalse(out.incomplete)  # clipping is not a relay failure
 
     def test_report_line_is_exempt_from_the_byte_budget_but_uses_the_deadline(self):
