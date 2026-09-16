@@ -107,3 +107,11 @@ Both independent parallel design reviewers returned CHANGES REQUIRED:
 These findings were sent to the same author for revision5, together with a
 bounded continuous pipe-drain/relay clarification. Revision4 is not build
 clearance. scripts/tests/CI and reviewer clearance records remain unchanged.
+
+Revision5 (38dd5cca): both reviewers confirmed prior scan completeness and
+termination accounting folds; ops also accepted deadline partitions, startup
+rendezvous and continuous drain/relay. Both still require an explicit W
+identity-verified acknowledgment before live-identity faults fire. design_ops
+also requires capture_fault to use the timeout deadline class because capture
+failure leaves the TERM-ignoring workload running until the inner timeout.
+A targeted amendment was requested from the same author; no build clearance.
