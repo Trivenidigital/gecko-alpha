@@ -3,7 +3,7 @@
 - [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.
 - [x] Claude authored replacement plan; two parallel reviews returned required folds.
 - [x] Fold identity/oracle, shared budget, output/status and falsifier findings.
-- [ ] Two reviewers approve amended plan e2790e8d.
+- [x] Both plan_logic and plan_ops approve amended plan e2790e8d; no residual plan blockers.
 - [ ] Separate design and two parallel reviews/folds.
 - [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
 - [ ] Final-head CI and clearance gate; no production collection or deployment.
@@ -2614,4 +2614,5 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
 
