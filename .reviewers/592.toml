@@ -1,0 +1,8 @@
+pr = 592
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
+# Docs-only PR ownership: no watched delta. Independent PR reviewers:
+# design_logic (logic/concurrency); design_ops (ops-safety/silent-failure).
+# Both terminal verdicts are still required before merge; empty clearances do not waive them.
+[clearances]
