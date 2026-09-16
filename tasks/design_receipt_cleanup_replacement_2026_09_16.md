@@ -1,3 +1,8 @@
+> **NOT APPROVED — NO BUILD.** Both independent reviewers rejected design
+> candidate6eb94b4f. Parent fallback can skip adopted descendants when the
+> supervisor is dead/absent, and publication-gap recovery remains unproven.
+> The text below is the reviewed proposal, not an implementation contract.
+> See tasks/review_receipt_cleanup_replacement_2026_09_16.md for disposition.
 # Design: receipt inventory supervisor (revision 3)
 
 **New primitives introduced:** `scripts/receipt_inventory_supervisor.py`, stdlib-only, Linux-only, plus harness cases and a harness-only raw-wrapper flag in `tests/test_receipt_inventory_timeout.py`. No collector, reducer, dependency or production command. Build waits on two independent design reviews.
@@ -88,3 +93,4 @@ Exit 11 overrides on incomplete report. Fixed keys: `status`, `exit_code`, `inne
 **Unresolved, stated plainly.** Pipe writes above PIPE_BUF are not atomic; exit 11 and the consumer rule cover partial lines without proving atomicity. The `/proc` survivor scan is diagnostic. Python signal latency during long C calls is bounded by caps, not measured. Parent identity validation rests on the construction noted above.
 
 **Gates.** Two independent parallel design reviews before any change under `scripts/` or `tests/`. Implementation updates draft PR590 only. Collection stays blocked behind reducer and META tests and a separately approved identity preflight.
+

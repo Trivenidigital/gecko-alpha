@@ -4,11 +4,11 @@
 - [x] Claude authored replacement plan; two parallel reviews returned required folds.
 - [x] Fold identity/oracle, shared budget, output/status and falsifier findings.
 - [x] Both plan_logic and plan_ops approve amended plan e2790e8d; no residual plan blockers.
-- [ ] Separate design and two parallel reviews/folds.
+- [x] Separate design and three paired review rounds; folds retained. Design6eb94b4f NOT APPROVED.
 - [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
 - [ ] Final-head CI and clearance gate; no production collection or deployment.
 
-Review: initial plan031a943f was not approved. The amended plan specifies proof
+Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md. NO BUILD; parent fallback/publication-gap proof remains unresolved. Initial plan031a943f was not approved. The amended plan specifies proof
 obligations; it does not establish a safe cleanup algorithm. Prior raw wrapper
 remains unsafe. Plan: tasks/plan_receipt_cleanup_replacement_2026_09_16.md.
 ## Active Work: 2026-09-16 — Receipt timeout CI validation
@@ -2614,5 +2614,6 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
 
 
