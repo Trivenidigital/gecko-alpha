@@ -4,7 +4,7 @@
 
 ## Hermes-first analysis
 
-| Domain | Checked (coordinator, 2026-09-16 19:30 UTC) | Limited verdict |
+| Domain | Checked (coordinator, 2026-09-16) | Limited verdict |
 |---|---|---|
 | Journal reduction, host metadata validation | https://hermes-agent.nousresearch.com/docs/skills : catalog still Loading; no verified matching skill | No skill verified; not an exhaustive absence claim |
 | Ecosystem | https://github.com/0xNyk/awesome-hermes-agent : general orchestration tools; no verified Gecko receipt-inventory replacement | Not a replacement |
@@ -93,3 +93,7 @@ Local before the session: PR592 modules green on the merged SHA; the synthetic e
 ## Gates
 
 Two independent parallel plan reviews on this revision; separate design with two reviews resolving every obligation and scoping any disposable artifact; PR592 merged on exact-head green CI; synthetic exercise green; then one sequence run; then a findings PR with two reviews and a clearance file. Passing this plan's reviews authorizes design work only.
+
+## Final cleanup-safety fold
+
+The caller durably records each observation as ATTEMPTED locally before starting its SSH invocation. Normal cleanup and recovery quantify over every attempted observation, never only the published files. Directory removal requires, for each attempted observation, a valid captured cleanup envelope, the matching published identity, and an independent empty-group check. Missing publication, missing envelope, ambiguous transport outcome, or any failed predicate means UNPROVEN and retention; no vacuous success is allowed. Before any observation is attempted, cleanup may remove the validated owned staging directory after permitted-content verification. Recovery permits inspection plus only this conditionally licensed directory removal; it is not strictly read-only. It never signals a process, retries collection, or starts an observation. This clause supersedes any narrower published-group-only or read-only recovery wording above.
