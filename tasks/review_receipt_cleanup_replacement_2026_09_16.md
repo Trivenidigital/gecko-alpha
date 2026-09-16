@@ -202,3 +202,86 @@ resume same author after reported13:20 UTC reset, fold findings and CI results,
 finish design consolidation, then obtain renewed two-vector review and green
 exact-head Linux/full-suite checks. Reducer/META and fresh runtime preflight
 remain separate downstream gates; D1-D4 UNKNOWN and D5-D6 untouched.
+
+Linux CI on 9db77514 (run35081632057, folded here from the handoff): the
+29-case receipt-inventory-timeout job passed; the full suite had 1 failure,
+8151 passed, 14 skipped. The failure was tests/test_round8_subprocess_timeouts.py
+rejecting the supervisor's Popen for lacking `timeout=`, a kwarg Popen does not
+accept. That job result does not close the five static findings above.
+
+## Post-reset run — five findings and the lint conflict folded
+
+Resumed by the configured Claude author after the reported reset, on the
+assigned isolated worktree at486e7e32. Not pushed, not merged, no clearance
+written, no deployment, no production, account, config, vendor or trading
+action. The approved plan e2790e8d and the combined revision7 design approvals
+are retained; the design file is now the consolidated revision7 text with the
+amendment applied verbatim in place and a new section 11 that records
+implementation clarifications only. The amendment file is marked folded and
+retained for provenance. No reviewer was dispatched in this run.
+
+Folds, one per OPEN finding on 9db77514:
+
+1. P1 unanchored killpg. `kill_group` is deleted. The raw path (negative
+   control and `--raw-wrapper` leak controls) ends with
+   `recover_descendants(None, now, 1)` and records it as `final_cleanup` in the
+   WORKER line. Asserted: on the negative control the anchored routine finds
+   the live group and kills it under L3 (`live_before_signal ≥ 1`, `kills ≥ 1`,
+   `pid_kills == []`); on the leak controls, where recovery already proved G
+   empty, it finds nothing to own and issues no signal (`groups == {}`). A
+   pending failure is preserved across the cleanup and re-raised after emit.
+2. closed_reader ordering. `Worker.release_fixture` closes S's stdout reader
+   before writing `release`; the old post-release close is removed.
+3. W bounded output. One `Output` writer: diagnostics share a 64 KiB budget and
+   are clipped beyond it (reported as `diagnostics.dropped`), the WORKER line is
+   exempt from the byte budget, every write is non-blocking through the bounded
+   relay, and `recover_descendants` sets the deadline to its TR+9 report
+   partition on entry. `Worker.note`, `Worker.emit`, `assert_empty` and
+   `wait_ready` no longer use blocking print; the full recovery record travels
+   only in the WORKER line.
+4. Single report attempt. `bounded_write` (S and harness) checks the deadline
+   only before a retry, so an expired budget still gets exactly one
+   non-blocking write; partial or EAGAIN at an expired deadline is incomplete
+   (exit 11 in S, exit 12 in P).
+5. Deadline residual. `scan_children` checks `until` before each listed child
+   (incomplete `SCAN_DEADLINE`); `stop_adopted_children` checks `recover_end`
+   before each child; the per-group loop checks `recover_end`. Documented as
+   design section 11.5, a clarification of the 5.1 absolute-bound requirement
+   with unchanged values, not a semantic change.
+
+Lint conflict. The round8 rule is corrected at the point a caller can block:
+`subprocess.run` needs `timeout=`; `subprocess.Popen(timeout=...)` is itself an
+offender because it raises TypeError; `.wait()`/`.communicate()` on a
+Popen-bound name in the same scope needs `timeout=`. The supervisor calls
+neither method and is bounded by its wait partition. Nine snippet unit tests
+cover each branch; there is no exemption comment or path allow-list.
+
+Discriminating tests. New `tests/test_receipt_supervisor_contracts.py` runs on
+every platform (not cleanup proof): static checks that every `os.killpg` in the
+harness is inside `recover_descendants` and in S inside `_cleanup_phase`, that
+no `kill_group` exists, that only the pytest layer prints; unit checks for
+`bounded_write` (both copies), `Output`/`clip_output`, `release_fixture`
+ordering with a fake drain, `scan_children` against a fake `/proc` tree, and
+`stop_adopted_children` with fake kill/reap. Checked against the 9db77514
+sources: the killpg owner set there also contains `kill_group`; the print
+owner set also contains `note`, `emit`, `assert_empty`, `wait_ready`; the old
+listing path returned complete on an expired deadline; the old `_write_report`
+returned False with zero write attempts; the old lint flagged the supervisor's
+Popen line and the corrected lint reports no offender.
+
+Verification on Windows (system Python3.14.3, pytest9.0.2; CI uses3.12):
+`pytest tests/test_receipt_supervisor_contracts.py
+tests/test_round8_subprocess_timeouts.py tests/test_receipt_inventory_timeout.py`
+→ 42 passed, 29 skipped. `python -m unittest discover -s tests -p
+test_receipt_inventory_timeout.py` → 29 skipped (Windows discovery only).
+`py_compile` on the five touched Python files passes; `git diff --check` is
+clean; LF line endings preserved.
+
+Limitations. No nonproduction Linux is configured on this host (WSL lists only
+docker-desktop), so the 29-case Linux job and the full suite must run in
+GitHub CI on the exact head after handoff; the Windows skips prove nothing
+about cleanup. The main checkout's3.12 venv exits1 silently under this shell,
+so the full pytest suite was not run locally. The fault runner is unchanged.
+The section11 clarifications, the harness changes and the lint correction need
+the renewed two-vector implementation review before any clearance;
+.reviewers/590.toml remains empty.

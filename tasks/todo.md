@@ -1,13 +1,15 @@
-## Active Work: 2026-09-16 09:30 UTC — Receipt cleanup implementation WIP
+## Active Work: 2026-09-16 — Receipt cleanup implementation, findings folded
 
 - [x] Refresh origin/master b5daecfc and current PR590; retain approved plan and combined revision7 design.
 - [x] Configured Claude author drafted supervisor, fault runner and expanded 29-case harness; preserved candidate 9db77514 on draft PR590.
-- [ ] Complete author verification and design consolidation: author hit HTTP429 session limit before tests/commits; reported reset 13:20 UTC.
-- [x] Two independent implementation reviews completed: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
-- [ ] Fold open findings and Linux CI failures; obtain renewed approvals and final-head green checks.
+- [x] Two independent implementation reviews completed on 9db77514: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
+- [x] Linux CI on 9db77514: 29-case job passed; full suite 1 failure (round8 subprocess lint rejects Popen without a timeout kwarg Popen cannot take), 8151 passed, 14 skipped.
+- [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Not pushed.
+- [ ] Push, exact-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
+- [ ] Renewed two-vector implementation review on the new head; record clearances only then.
 - [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
 
-Syntax compilation passes. All29 Windows tests skip, which is not cleanup proof. No reviewer clearance is recorded. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
+Windows skips are not cleanup proof. No reviewer clearance is recorded. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
 ## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
 
 - [x] Refresh current master, canonical memory, backlog and current draft PR590.

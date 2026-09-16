@@ -1,8 +1,8 @@
-**New primitives introduced:** `scripts/receipt_inventory_supervisor.py` (stdlib-only, Linux-only), `tests/receipt_supervisor_faults.py` (test-only fault runner that imports the supervisor module), a per-case subreaper runner and one shared ancestor-recovery routine inside `tests/test_receipt_inventory_timeout.py`, added harness cases, and a harness-only `--raw-wrapper` flag. No collector, reducer, dependency, CI secret or production command. Build waits on two independent parallel design reviews.
+**New primitives introduced:** `scripts/receipt_inventory_supervisor.py` (stdlib-only, Linux-only), `tests/receipt_supervisor_faults.py` (test-only fault runner that imports the supervisor module), a per-case subreaper runner and one shared ancestor-recovery routine inside `tests/test_receipt_inventory_timeout.py`, added harness cases, a harness-only `--raw-wrapper` flag, and a cross-platform contract test module `tests/test_receipt_supervisor_contracts.py` (static and unit discriminators, not cleanup proof). No collector, reducer, dependency, CI secret or production command.
 
-# Design: receipt inventory supervisor (revision 5)
+# Design: receipt inventory supervisor (revision 7, consolidated)
 
-> **Candidate for review, NO BUILD.** Supersedes revision 4 (7baeae95, rejected on six minimal folds). Kernel ownership proofs, existing Linux falsifiers and fail-closed boundaries are unchanged. Plan e2790e8d guarantees are preserved.
+> **Approved design, consolidated 2026-09-16.** This is the revision 5 text (38dd5cca) with the approved amendment `design_receipt_cleanup_amendment_2026_09_16.md` applied in place: the paragraphs and rows the amendment named are replaced verbatim below, nothing else in sections 1 to 10 changed, and the combined semantics are exactly those approved by design_logic and design_ops at 0e632d9c. Section 11 records implementation clarifications folded on 2026-09-16 after the two independent implementation reviews of candidate 9db77514; they narrow how already-stated bounds are enforced and do not change any approved status, deadline value, lemma or case meaning. Kernel ownership proofs, existing Linux falsifiers and fail-closed boundaries are unchanged. Plan e2790e8d guarantees are preserved.
 
 ## Hermes-first analysis (historical, not re-run)
 
@@ -122,6 +122,8 @@ Outer deadlines derive from these partitions. `TW0` is W's spawn of S; `TP0` is 
 | fast classes | 8 s | `TW0+17` | 18 s | `TP0+27` | 29 s |
 | recovery classes | marker or 8 s | `TW0+17` | 18 s | `TP0+27` | 29 s |
 
+Timeout classes: silent, stderr_flood, ignore_term, descendant, continuous_flood, raw_wrapper_leak_*, and `capture_fault`. Fast classes: every remaining non-recovery case. `capture_fault` is a timeout class because the accepted capture-fault semantics keep the lifecycle unchanged: a capture-side defect must not shorten the inner bound or abort a workload whose output may still complete, so S runs the ignore_term fixture to the inner timeout near `T0+10`, cleans up by `T0+12`, and reports before `T0+15.5`. Under `D_S` 8 W would kill a healthy S before `SUPERVISOR_ERROR` could be reported; under `D_S` 17 the existing 9 to 16 s external check applies unchanged. Cleanup faults instead use the `early_exit_orphan` fixture so the cleanup phase begins immediately after release rather than at the inner timeout, keeping them fast class while retaining a live TERM-ignoring member for `killpg` to act on.
+
 Green-path timing is unchanged: S reports by `T0+15.5`, W asserts and exits near `TW0+16.5`, and the existing external 9 to 16 s check is measured by W exactly as today. The worst-case columns apply only on failure paths. Green-path job time is roughly 150 s across all cases; the CI job's five-minute limit stays as the last backstop and would only truncate a run in which several cases fail at their worst-case bound, which unittest `-v` per-case output still attributes.
 
 On the normal path (no trigger), W's `assert_empty` keeps its existing two-second behaviour through `deadline=now+2`; `reap_group`'s internal two-second bound is unchanged and applies only on the raw path.
@@ -236,23 +238,29 @@ P and W each hold one `O_NONBLOCK` read pipe from their child. Every 20 ms loop 
 
 ## 6. Worker W and fixtures
 
-**Identity acquisition, normal path.** After readiness records appear, W reads `DIR/wrapper.pgid` (retry until present, 4 s bound), asserts `/proc/<G>/stat` has `pid == pgrp == session == G` and `ppid == S.pid`, and that every readiness record's `pgid == G`. S's `Popen.pid` is never a group id. Only then does W write `DIR/release`.
+**Identity acquisition and acknowledgment, normal path.** After readiness records appear, W reads `DIR/wrapper.pgid` (retry until present, 4 s bound), asserts `/proc/<G>/stat` has `pid == pgrp == session == G` and `ppid == S.pid`, and that every readiness record's `pgid == G`. S's `Popen.pid` is never a group id. Only after all three checks pass does W write `DIR/identity.ready` by atomic rename, then `DIR/release`. W waits for exactly one supervisor-side file before writing `identity.ready`: `wrapper.pgid`, which S publishes before any gated fault can act. W never waits for `fault.fired` before writing `identity.ready`, and every identity-gated fault waits for `identity.ready` before writing `fault.fired`, so the dependency order is acyclic. For gated faults W then waits for `DIR/fault.fired` (4 s bound, failure `FAULT_NOT_FIRED`) while continuing to drain, and later asserts `fault.fired` `st_mtime_ns` is not earlier than `identity.ready`'s. Because `release` follows `identity.ready`, no release-gated fixture can let L exit, and therefore no cleanup phase can begin, before W holds verified identity.
 
-**Release handshake.** Every fixture that can finish quickly (`clean_success`, `command_failed`, `early_exit_orphan`, `output_flood`) blocks after readiness until `DIR/release` exists.
+**Publication-free path.** `publish_error` and `die_before_publish` never produce `wrapper.pgid`, so W performs no live `/proc` acquisition and writes no `identity.ready`. W waits for `producer.json` (4 s), then for `fault.fired` (4 s), asserts `wrapper.pgid` absent, and takes identity from the readiness record, cross-checked against status `pgid` (`publish_error`) or the kernel-derived group from recovery (`die_before_publish`). S-side these faults gate only on `producer.json`, written by the fixture independently of W, so neither side waits on the other.
+
+**Release handshake.** Every fixture that can finish quickly (`clean_success`, `command_failed`, `early_exit_orphan`, `output_flood`) blocks after readiness until `DIR/release` exists. Release is written by W's `release_fixture` step, which runs the case's pre-release action first (section 11, clarification 2).
 
 **Fault runner.** `python3 -I -S tests/receipt_supervisor_faults.py --fault NAME --pgid-file DIR/wrapper.pgid -- ARGV`. The runner inserts the repository root into `sys.path` explicitly because `-I` drops the script directory, imports `scripts.receipt_inventory_supervisor` as a module, replaces `publish`, `read_capture` or `tick` on the module, and calls `main`. It derives `DIR` from `--pgid-file`. Every fault writes `DIR/fault.fired` by atomic rename immediately before performing its fault. No production hooks exist; the production script has no fault switch. Recovery uses L4, so the invocation shape has no bearing on identity.
 
 Faults, all unconditional once their gate is met:
 
-| Fault | Gate | Behavior |
+| Fault | Gate (bounded 4 s, failure exit 13) | Behavior |
 |---|---|---|
-| `stall_wait` | `wrapper.pgid` present | `tick("wait")` writes `supervisor.stalled`, then sleeps forever |
-| `stall_cleanup` | first killpg done | `tick("cleanup")` sleeps forever |
-| `publish_error` | `producer.json` present (4 s) | `publish` raises `OSError` without writing |
-| `die_before_publish` | `producer.json` present (4 s) | `publish` self-SIGKILLs without writing |
-| `die_after_ready` | published and `producer.json` present (4 s) | `tick("wait")` self-SIGKILLs |
-| `capture_error` | `producer.json` present (4 s) | first `read_capture` call raises; no later call occurs because capture is disabled |
-| `inject_signal:<phase>:<n>` | phase reached | `tick(<phase>)` raises the real signal in-process, n times; `startup` uses the rendezvous |
+| `stall_wait` | `identity.ready` present | `tick("wait")` writes `fault.fired`, then `supervisor.stalled`, then sleeps forever |
+| `stall_cleanup` | `identity.ready` present, checked in `tick("wait")` before any cleanup | first `tick("cleanup")` writes `fault.fired`, then `supervisor.stalled`, then sleeps forever |
+| `publish_error` | `producer.json` present | `publish` writes `fault.fired`, raises `OSError`, writes nothing else |
+| `die_before_publish` | `producer.json` present | `publish` writes `fault.fired`, self-SIGKILLs, writes nothing else |
+| `die_after_ready` | `identity.ready` present | `tick("wait")` writes `fault.fired`, self-SIGKILLs |
+| `capture_error` | `identity.ready` present, awaited inside the first `read_capture` call | writes `fault.fired`, raises; no later call occurs because capture is disabled |
+| `inject_signal:startup:<n>` | none | rendezvous writes `fault.fired`, raises the signal n times |
+| `inject_signal:wait:<n>` | `identity.ready` present | `tick("wait")` writes `fault.fired`, raises n times |
+| `inject_signal:cleanup:<n>` | `identity.ready` present, checked in `tick("wait")` before any cleanup | first `tick("cleanup")` writes `fault.fired`, raises n times |
+
+Gate ordering is therefore `producer.json` → `identity.ready` → `fault.fired` → action for every identity-gated fault. A gate wait blocks S for at most 4 s, inside S's 13 s wait partition; `capture_error`'s gate sits in `read_capture`, which S calls after publication and before the first `tick("wait")`, so W can acquire identity while S waits.
 
 Gate timeouts are failures of the fault runner (exit 13), never silent fallthrough.
 
@@ -260,9 +268,9 @@ Gate timeouts are failures of the fault runner (exit 13), never silent fallthrou
 
 | Faults | W identity flow |
 |---|---|
-| `stall_wait`, `stall_cleanup`, `die_after_ready`, `capture_error`, `inject_signal:wait`, `inject_signal:cleanup` | normal path: `wrapper.pgid`, `/proc` fields, readiness records; then assert `fault.fired` exists and its `st_mtime_ns` is not earlier than `producer.json`'s |
-| `publish_error`, `die_before_publish` | readiness record is the identity source; after `fault.fired` exists assert `wrapper.pgid` is absent; on `publish_error` also assert status `pgid` equals the readiness `pgid`; on `die_before_publish` assert the kernel-derived group from recovery equals it |
-| `inject_signal:startup` | no identity: assert `wrapper.pgid` absent, `fault.fired` present, no readiness record, status `teardowns` 0 |
+| `stall_wait`, `stall_cleanup`, `die_after_ready`, `capture_error`, `inject_signal:wait`, `inject_signal:cleanup` | normal path; write `identity.ready`; write `release`; wait `fault.fired`; assert `fault.fired` not earlier than `identity.ready` |
+| `publish_error`, `die_before_publish` | publication-free path above; no `identity.ready` written |
+| `inject_signal:startup` | no identity: assert `wrapper.pgid`, `identity.ready` and readiness records absent, `fault.fired` present, `teardowns` 0 |
 
 **Worker behaviors for recovery cases.**
 
@@ -273,7 +281,7 @@ Gate timeouts are failures of the fault runner (exit 13), never silent fallthrou
 | `parent_reaped_supervisor` | S with `die_after_ready`; poll to `Z`; `waitpid(S.pid)`; write marker; hang | no S, workload adopted by W |
 | `parent_missing_supervisor` | write marker before spawning anything; hang | W only, no G |
 
-W-level recovery cases use the same routine with `direct=S`: W triggers on `supervisor.stalled`, on pipe EOF without a complete status line, or on `D_S`.
+W-level recovery cases use the same routine with `direct=S`: W triggers on `supervisor.stalled` (written by `stall_wait` and `stall_cleanup`), on pipe EOF without a complete status line, or on `D_S`.
 
 ## 7. Cases
 
@@ -293,13 +301,15 @@ Existing assertion meanings preserved. Existing cases keep their test names. The
 | closed_reader | exit 11 | W closes its read end before report; empty |
 | publish_error | SUPERVISOR_ERROR, `error` publish | `fault.fired` present; `wrapper.pgid` absent; status `pgid` equals readiness `pgid`; `cleanup_proof` true; `kills ≥ 1` (ignore_term fixture); empty |
 | die_before_publish | W recovery | S exits -9, no status line; `wrapper.pgid` absent; `pid_kills == [direct S, state Z]`; kernel-derived G equals readiness `pgid`; `live_before_signal ≥ 1`; `kills ≥ 1`; empty |
-| capture_fault | SUPERVISOR_ERROR, `error` capture | ignore_term fixture; `fault.fired` not earlier than `producer.json`; `dropped` 0 and frozen; `output` null; inner exit in timeout set; `kills ≥ 1`; `cleanup_proof` true; empty |
+| capture_fault (timeout class) | SUPERVISOR_ERROR, `error` capture | ignore_term fixture; `identity.ready` written before `fault.fired`; external 9 to 16 s; inner exit in timeout set; `dropped` 0 and frozen; `output` null; `kills ≥ 1`; `cleanup_proof` true; empty |
 | injected_startup | INTERRUPTED, exit 8 | `inject_signal:startup:1` fires inside the startup rendezvous; `signal_phase` startup; `teardowns` 0; no `wrapper.pgid`; no readiness record; P scan complete and empty |
-| injected_cleanup_repeat | INTERRUPTED | `teardowns` 1; `signals_received` 2; empty |
+| injected_cleanup_repeat | INTERRUPTED | `early_exit_orphan` fixture; `inject_signal:cleanup:2`; `fault.fired` not earlier than `identity.ready`; `teardowns` 1; `signals_received` 2; `signal_phase` cleanup; empty |
 | hup_mid_run, term_mid_run | INTERRUPTED | real signal from W after identity acquisition; `teardowns` 1; empty |
 | outer_deadline | OUTER_TIMEOUT | `--wait 3`, ignore_term; inner exit -9; empty |
-| stalled_supervisor | W recovery | `stall_wait`; `pid_kills == [direct S, state S or R]`; `live_before_signal ≥ 1`; `kills ≥ 1`; G equals published and readiness pgid; empty |
-| parent_live_supervisor | P recovery | `pid_kills == [direct W, adopted S with state S or R]`; `live_before_signal ≥ 1`; `kills ≥ 1`; one group; `scan.complete` true; empty |
+| stalled_supervisor | W recovery | `stall_wait`; `pid_kills == [direct S, state S or R]`; `live_before_signal ≥ 1`; `kills ≥ 1`; G equals published and readiness pgid; empty; additionally `fault.fired` not earlier than `identity.ready` |
+| stall_cleanup | W post-kill reaping recovery | `early_exit_orphan` fixture; `identity.ready` precedes `release` precedes `fault.fired`; S's cleanup loop issues `killpg` under L3 once, then the first `tick("cleanup")` writes `fault.fired`, `supervisor.stalled`, and hangs before S reaps. W triggers on the marker: `pid_kills == [direct S, state S or R]`; the killed members reparent to W and are reaped through the anchored loop, so `reaped ≥ 1`; `kills` may be 0 and `live_before_signal` may be 0; `scan.complete` true; G equals published and readiness pgid; empty oracle. This proves recovery of a group already signaled but unreaped by a stalled supervisor. Pre-kill live recovery is proved independently by `stalled_supervisor` and `parent_live_supervisor`, whose `live_before_signal ≥ 1` and `kills ≥ 1` requirements are unchanged |
+| die_after_ready (used by parent_zombie_supervisor, parent_reaped_supervisor) | as below | additionally `fault.fired` not earlier than `identity.ready`, so W held verified identity before S died and the workload was never signaled by S |
+| parent_live_supervisor | P recovery | `pid_kills == [direct W, adopted S with state S or R]`; `live_before_signal ≥ 1`; `kills ≥ 1`; one group; `scan.complete` true; empty; additionally `fault.fired` not earlier than `identity.ready` |
 | parent_zombie_supervisor | P recovery | `pid_kills == [direct W, adopted S with state Z]`; `kills ≥ 1`; one group; empty |
 | parent_reaped_supervisor | P recovery | `pid_kills == [direct W]`; `kills ≥ 1`; one group; empty |
 | parent_missing_supervisor | P recovery | `pid_kills == [direct W]`; zero groups; no killpg issued; `scan.complete` true |
@@ -329,8 +339,11 @@ Every fixture synchronizes on readiness or marker files written by atomic rename
 | 4. `capture_fault` raced readiness | `capture_error` gated on `producer.json`, writes `fault.fired` first; W fault-specific identity flow table; `fault.fired` ordering asserted | section 6; section 7 |
 | 5. `injected_startup` unreachable | Explicit `tick("startup")` rendezvous after handlers and prctl, before pipe and spawn, followed by the signal check | section 4 Startup |
 | 6. Pipe backpressure at P and W | Continuous non-blocking per-tick drain with caps at both levels; bounded final relay with exit 12; W single pipe only | 2; 5.4; 5.5 |
+| 7. Identity-gated faults could act before W acquired identity; `stall_wait` ordering; `capture_fault` misclassified | `identity.ready` acknowledgment written by W only after live `/proc` and readiness checks; every identity-gated fault waits for it before `fault.fired` and action; cleanup faults gate in `tick("wait")` and use the release-gated `early_exit_orphan` fixture so cleanup cannot precede identity; publication-free faults gate only on `producer.json` with no W-side ack, avoiding circular waits; `capture_fault` assigned timeout class `D_S` 17 | sections 5.1, 6, 7 |
 
 ## 9. Residual boundary, stated plainly
+
+- The 4 s fault gates are harness synchronization only and do not exist in the production script; a gate timeout is exit 13 from the fault runner and fails the case, never a silent fallthrough.
 
 - Pipe writes above `PIPE_BUF` are not atomic; exit 11 and the consumer rule cover partial lines without proving atomicity.
 - The `/proc` survivor scan in S is diagnostic only.
@@ -344,3 +357,16 @@ Every fixture synchronizes on readiness or marker files written by atomic rename
 ## 10. Gates, CI and rollback
 
 Two independent parallel design reviews before any change under `scripts/` or `tests/`. Implementation updates draft PR590 only, no second PR. The existing `receipt-inventory-timeout` job in `.github/workflows/test.yml` runs the harness unchanged in shape; every enumerated case must run green on Linux with survivor assertions before any harness cleanup, plus full pytest and the test-count baseline on the exact head. All four reviewer vectors are recorded on the final SHA; `.reviewers/590.toml` stays empty until then. Collection remains blocked behind reducer and META adversarial tests and a separately approved identity preflight. Rollback is reverting the script, fault runner and test file; no deployment.
+
+## 11. Implementation clarifications (2026-09-16 fold of the 9db77514 reviews)
+
+Each clarification enforces a bound or ordering already required above. None changes an approved status, deadline value, lemma or case meaning.
+
+1. **Raw-path final cleanup is ownership-anchored (P1 fold).** The harness's raw path (negative control and `--raw-wrapper` leak controls) ends with `recover_descendants(None, now, 1)`; the unanchored `kill_group` helper is deleted. Every `os.killpg` in the harness therefore lives inside the anchored group loop under L3, immediately after `waitpid(-G, WNOHANG)` returned 0, and none is ever issued after ECHILD. On the leak path, where recovery already proved G empty, this final cleanup must act on nothing (`groups == {}`, `pid_kills == []`); on the negative control it is the explicit cleanup (`live_before_signal ≥ 1`, `kills ≥ 1`). Both are asserted from the `final_cleanup` record in the WORKER line. Section 7's "explicit cleanup proves empty" means this anchored routine.
+2. **`closed_reader` ordering.** W closes S's stdout reader before writing `release`, inside one `release_fixture` step that runs the case's pre-release action first. Releasing first would let S report into a still-open pipe and exit 0, erasing the exit 11 discriminator.
+3. **W output contract (5.4).** W and P never write to stdout through blocking `print`. One bounded writer serves both: diagnostics share a 64 KiB budget and are clipped beyond it (the count is reported as `diagnostics.dropped` in the WORKER line); the WORKER report line is exempt from the byte budget; every write is non-blocking and bounded by the current output deadline, which `recover_descendants` sets to its report partition `TR+9` on entry and which is one second otherwise. The full recovery record travels only in the WORKER line.
+4. **Single report attempt.** "Attempted once non-blocking if nothing remains" is implemented as: the deadline is checked only before a retry, so an already expired budget still receives exactly one non-blocking write; a partial write or EAGAIN at an expired deadline is incomplete (exit 11 in S, exit 12 in P). One pure helper, `bounded_write`, implements this in S and in the harness relay.
+5. **Absolute-bound deadline clarification (5.1, 5.2, 5.3).** Reconciling the ops residual: every loop inside `recover_descendants` checks its absolute partition end at the top of each iteration, including the direct-children listing in `scan_children` (which returns incomplete `SCAN_DEADLINE`, never an emptiness claim), the per-child kill/reap loop (`stop_adopted_children`, which returns without acting once `recover_end` has passed) and the per-group anchored loop; every `reap_by_pid` is bounded by the same instant; phase 0 by `stop_end`; the oracle by `oracle_end`. Leaving on any deadline records `RECOVERY_BUDGET_EXCEEDED` or `SCAN_INCOMPLETE`, never a pass. The revision 5 pseudocode checked the deadline only in the `/proc` fallback scan and in the outer `while`; the absolute-bound requirement stated in 5.1 now holds for every inner loop as well. Deadline values are unchanged.
+6. **Subprocess lint reconciliation.** `tests/test_round8_subprocess_timeouts.py` previously demanded `timeout=` on `subprocess.Popen` calls, which `Popen` does not accept; scripts/ had no Popen site until S, so the branch was never exercised. The rule now states the bound at the point a caller can block: `subprocess.run` needs `timeout=`; `Popen(timeout=...)` is itself an offender; `.wait()` or `.communicate()` on a Popen-bound name in the same scope needs `timeout=`. S never calls those methods; its bound is the wait partition enforced by `os.waitpid(WNOHANG)` under `T0+13`. The lint gained unit tests for each branch and no exemption mechanism.
+
+Cross-platform discriminators for 1 to 5 live in `tests/test_receipt_supervisor_contracts.py`; they run in the Windows discovery run but are not cleanup proof, which remains the Linux harness.

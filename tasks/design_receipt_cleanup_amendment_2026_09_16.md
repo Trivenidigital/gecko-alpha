@@ -1,6 +1,11 @@
 **New primitives introduced:** NONE beyond the revision5 design.
 
-# Receipt cleanup revision7 amendment — candidate, NO BUILD
+# Receipt cleanup revision7 amendment — approved at 0e632d9c, folded
+
+> **Folded 2026-09-16.** Every replacement below was applied verbatim into
+> `design_receipt_cleanup_replacement_2026_09_16.md` (revision 7,
+> consolidated), which is now the authoritative text. This file is retained
+> unchanged below for review provenance only.
 
 ## Hermes-first analysis
 
