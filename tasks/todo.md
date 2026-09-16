@@ -2,9 +2,12 @@
 
 - [x] Refresh master5281f047, recover PR593b3fe776a, read instructions/queue/memories and fresh runtime.
 - [x] Configured author available; drafted transport/state/pinning amendment.
-- [ ] Two parallel plan reviews and folds; separate design and two design reviews before build.
-- [ ] Resolve CI diagnostic route; no blind full-suite retry.
+- [x] Two parallel plan reviews and folds approved ccbbab34 (prerequisite-scoping only).
+- [x] Diagnose CI route; no ready local Linux runtime. No blind full-suite retry.
+- [x] Record no-build transport findings and explicit engineering handoff; design remains unapproved.
+- [ ] Separate native-containment/file-caps plan, design, two reviews at each stage before build.
 - Production zero-porcelain gate fails (11 entries); no cleanup or collection.
+- Review/results: tasks/findings_receipt_transport_prerequisites_2026_09_16.md.
 
 ## Recovery: 2026-09-16 20:44 UTC — PR593 remains design blocked
 
