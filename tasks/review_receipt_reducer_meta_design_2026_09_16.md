@@ -62,3 +62,12 @@ Configured author revision2 folded the findings at5284e6ee. Both reviewers accep
 
 Both design_logic and design_ops returned terminal APPROVE on fa032eea, explicitly accepting Fold7. No design findings remain. This supersedes the pending design status above only; implementation tests and independent PR reviews remain pending. No production collection is authorized.
 
+
+## Implementation candidate and first PR reviews
+
+Configured author completed five files at406ed0109b840f1fabcb12ba1acaae0ad2e4eba5. Coordinator independently reproduced153 passed/10 skipped/93 subtests (Python3.14); author recorded126 unittest cases/39 Linux/platform skips on3.12. Author mutation report:33 killed,4 Linux-only skipped, no claimed Linux proof. Source restored after each local mutation. An initial uv probe attempted dependency sync and failed TLS; no installation success or production change is claimed.
+
+Both independent PR reviewers returned REQUEST CHANGES. design_logic reproduced math.isfinite on a400-digit JSON elapsed integer raising OverflowError in the consumer oracle instead of fixed rejection. design_ops found no META source defect but requires four actual Linux mutant kills (realpath, O_NOFOLLOW, O_NONBLOCK, post-open regular-file check). Both explicitly accepted the portable errno import amendment.
+
+Configured author owns only the two affected test modules for the fold. Ops explicitly accepts a Linux-only temporary-copy mutation proof in the existing META module, with bounded subprocesses and expected assertion failures rather than skips/import errors/timeouts. No workflow or production changes. Final PR approvals and exact-head CI remain pending.
+
