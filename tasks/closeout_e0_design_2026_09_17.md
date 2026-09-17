@@ -44,3 +44,14 @@ Engineering: terminal D1a reviews, identified target and PRECHECK_OK; then separ
 Permanent prompt adjustment recommended, configuration unchanged: use the tracked queue and both memories; distinguish actual active ownership from historical ACTIVE entries; separate plan/publication/design approval and CI from runtime proof; reconcile hourly triggers with six-hour missions using an explicit overlap rule.
 
 Raw author, production and reporter artifacts are retained in `C:/Users/srini/.codex/automations/gecko-overnight-autonomous-closeout/` (`e0-author-20260917-1438.json`, `e0-fold-20260917.json`, `prod-20260917-1442.txt`, `status-20260917-1440.md`). Filename suffixes are labels; embedded timestamps govern the observations.
+
+## Publication review and verification
+
+Both e0_structure and e0_ops independently returned terminal **APPROVE DOCS PUBLICATION at d6ca4c2f** after inspecting delta26119c04..d6ca4c2f and retained evidence. No required folds. These are publication-only verdicts: PR593 stays OPEN/DRAFT, with no integration-design or merge clearance.
+
+- Commits:628ada68 draft;73503099 design folds;d6ca4c2f reviewed contract/closeout.
+- Remote PR head d6ca4c2f was verified after push. A credential-storage-lock warning did not prevent the successful verified push.
+- `git diff --check` passes; previous todo body preserved; three Markdown files only; working tree clean after commit.
+- `python scripts/check_reviewer_clearances.py HEAD origin/master --pr 593` passes with no watched-path delta. This mechanical result does not replace the two actual independent verdicts.
+- No local application tests were run for documentation-only changes. CI35235751048 on d6ca4c2f had frontend-dist-parity and reviewer-clearances SUCCESS; full test and receipt job were running at14:46UTC. Later publication metadata needs its own exact-head CI; no green claim is carried forward.
+- No new PR, merge, deploy, endpoint smoke, E0 execution or production write. Existing PR593 retains codex and codex-automation labels.

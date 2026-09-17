@@ -5,7 +5,7 @@
 - [x] Fresh read-only production14:37:32UTC: selective77751890, 11 untracked entries; three services active; worker13:33:39 authguard21, timer active.
 - [x] Configured Claude drafted D1a E0 design; draft628ada68 reviewed.
 - [x] Both independent design reviews terminal APPROVE73503099 after evidence/resource/authority folds.
-- [ ] Publish documentation to existing draft PR593; two publication reviews, exact-head CI status.
+- [x] Published D1a docs to draft PR593; both independent publication reviews APPROVE d6ca4c2f. No merge clearance; final metadata CI remains separate.
 - [ ] E0 execution waits for identified non-production Linux target; no synthetic build, production collection or deployment in this slice.
 
 ## Active Work: 2026-09-17 - Containment prerequisite recovery
