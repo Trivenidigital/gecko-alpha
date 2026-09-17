@@ -14,7 +14,7 @@
 | OS facilities | The kernel PID namespace, rlimits, and util-linux `unshare` and `prlimit`. | Reuse these. Custom code is glue only. |
 
 # Plan: Linux-only synthetic containment and caps prerequisite, scoped and contingent, 2026-09-17
-**Status: REVISED after two REQUEST CHANGES at b1dd1b44. Awaiting two independent re-reviews.** Approval, if given, covers this as a *scoped contingent plan* only. It does not approve a design, a build, or any exercise.
+**Status: two independent APPROVE PLAN verdicts at db8d6595 after folds of b1dd1b44 findings.** Approval covers this as a *scoped contingent plan* only. It does not approve a design, a build, or any exercise.
 
 **Current condition: NO BUILD.** PREREQ-1 and PREREQ-2 remain **open and unmet**, and nothing here claims otherwise. This plan covers only this slice and makes no statement about other backlog items.
 

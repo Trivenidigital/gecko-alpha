@@ -24,7 +24,7 @@ Two parallel independent plan reviews returned REQUEST CHANGES:
 | Structural, containment_review | Bare namespace-inode equality omits launch registration, hidden processes and nested namespace membership | Positive launch identity before release, complete visibility, recursive teardown proof; uncertainty fails closed |
 | Operational, caps_review | Launcher may write before it installs caps; unavailable driver gate depended circularly on building the probe | Cover startup output explicitly; distinguish partial per-file evidence; verify environment before build |
 
-No synthetic process, application code or workflow was changed. Configured Claude fold session `27420186-0cef-4f88-b98c-a378b959e1a7` returned successfully. Coordinator clarified launcher/init identities and labelled environment results PRECHECK_OK (suitability, not execution proof). Final folded-plan review is pending; no approval is claimed yet.
+No synthetic process, application code or workflow was changed. Configured Claude fold session `27420186-0cef-4f88-b98c-a378b959e1a7` returned successfully. Coordinator clarified launcher/init identities and labelled environment results PRECHECK_OK (suitability, not execution proof). Both containment_review (structural) and caps_review (operational/storage) returned terminal APPROVE PLAN and APPROVE DOCS PUBLICATION at `db8d6595`; all three findings folded. These are not integration-design, build, execution or merge approvals.
 
 ## Verification and disposition
 
@@ -43,3 +43,7 @@ Operator: restore the intended VPS worker login and verify a successful startup/
 Prompt adjustment recommended, not applied: consult the tracked queue and both automation memories; verify actual ownership rather than ACTIVE memory labels; distinguish failed invocation, completion, CI, plan/publication/design approvals and worker authentication. Reconcile hourly scheduling with six-hour missions and an explicit overlap policy.
 
 Raw read-only runtime, author responses and status artifacts are retained under `C:/Users/srini/.codex/automations/gecko-overnight-autonomous-closeout/` with this run's 20260917T1258 filenames (actual observation times above).
+
+## Publication record
+
+Commits: `b1dd1b44` draft and `db8d6595` folded plan/findings; this metadata commit records approvals. `git diff 56a41933..HEAD --check` passed on the reviewed candidate; worktree was clean. No configured author remains active. PR593 remains draft; this run updates that existing PR rather than opening a competing one. New-head CI status is recorded in automation memory after the push; no final-head green claim here.
