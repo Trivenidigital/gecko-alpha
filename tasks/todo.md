@@ -1,3 +1,49 @@
+## Active Work: 2026-09-17 — E0 read-only environment design
+
+- [x] Refresh master5281f047, recover PR59326119c04, read both automation memories and tracked queue; no current Gecko author before claim.
+- [x] Exact-head PR593 four CI checks SUCCESS; this does not clear rejected integration design.
+- [x] Fresh read-only production14:37:32UTC: selective77751890, 11 untracked entries; three services active; worker13:33:39 authguard21, timer active.
+- [x] Configured Claude drafted D1a E0 design; draft628ada68 reviewed.
+- [x] Both independent design reviews terminal APPROVE73503099 after evidence/resource/authority folds.
+- [x] Published D1a docs to draft PR593; both independent publication reviews APPROVE d6ca4c2f. No merge clearance; final metadata CI remains separate.
+- [ ] E0 execution waits for identified non-production Linux target; no synthetic build, production collection or deployment in this slice.
+
+## Active Work: 2026-09-17 - Containment prerequisite recovery
+
+- [x] Refresh master and recover PR593; verify inactive previous owner and fresh runtime.
+- [x] Configured Claude returns draft containment/caps plan.
+- [x] Two parallel plan reviews and folds; both APPROVE scoped plan/publication at db8d6595.
+- [ ] Separate design/two reviews before any build; no verified Linux driver available.
+- [x] Record reviewed findings and exact next gate in tasks/closeout_containment_prerequisite_2026_09_17.md; PR593 design remains rejected.
+
+## Active Work: 2026-09-16 23:40 UTC — Integration plan amendment
+
+- [x] Refresh master5281f047, recover PR593b3fe776a, read instructions/queue/memories and fresh runtime.
+- [x] Configured author available; drafted transport/state/pinning amendment.
+- [x] Two parallel plan reviews and folds approved ccbbab34 (prerequisite-scoping only).
+- [x] Diagnose CI route; no ready local Linux runtime. No blind full-suite retry.
+- [x] Record no-build transport findings and explicit engineering handoff; design remains unapproved.
+- [ ] Separate native-containment/file-caps plan, design, two reviews at each stage before build.
+- Production zero-porcelain gate fails (11 entries); no cleanup or collection.
+- Review/results: tasks/findings_receipt_transport_prerequisites_2026_09_16.md.
+
+## Recovery: 2026-09-16 20:44 UTC — PR593 remains design blocked
+
+- [x] Recover interrupted owner and verify current master/PR state.
+- [x] Two independent findings reviews; production zero-porcelain preflight fails on 11 untracked entries.
+- [x] Configured author recovery attempted; session-limit error, no edits (reported reset23:30 UTC).
+- [ ] Resume design folds and two reviews; no build or collection authorized yet.
+- Review/result: tasks/closeout_recovery_2026_09_16_2044.md. No cleanup or deployment.
+
+## Active Work: 2026-09-16 — Receipt inventory integration
+
+- [x] Drift/Hermes assessment; preserve existing primitives and production boundary.
+- [x] Configured author plan and folds; two parallel plan approvals on035cd914.
+- [ ] Separate design and two reviews; no build or production execution yet.
+- [ ] PR592 merged/green, synthetic transport validation, fresh runtime preflight.
+- [ ] Bounded collection only after gates; sanitized findings and independent PR reviews.
+- Review: tasks/review_receipt_inventory_integration_2026_09_16.md.
+
 ## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
 
 - [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
