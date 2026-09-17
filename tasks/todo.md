@@ -1,3 +1,11 @@
+## Active Work: 2026-09-17 - Containment prerequisite recovery
+
+- [x] Refresh master and recover PR593; verify inactive previous owner and fresh runtime.
+- [x] Configured Claude returns draft containment/caps plan.
+- [ ] Two parallel plan reviews and folds.
+- [ ] Separate design/two reviews before any build; no verified Linux driver available.
+- [ ] Publish reviewed findings and exact next gate; PR593 design remains rejected.
+
 ## Active Work: 2026-09-16 23:40 UTC — Integration plan amendment
 
 - [x] Refresh master5281f047, recover PR593b3fe776a, read instructions/queue/memories and fresh runtime.
