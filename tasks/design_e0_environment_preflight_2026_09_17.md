@@ -15,7 +15,7 @@ The coordinator reported these checks at 14:39 on 2026-09-17. They are attribute
 | OS facilities | procfs, coreutils, and the distro package database. | Reuse these. E0 contains no custom code. |
 
 # Design D1a: E0 read-only environment preflight, revision 2, 2026-09-17
-**Status: DRAFT. This revision folds two REQUEST CHANGES verdicts at 628ada68. It is not approved.**
+**Status: two independent terminal APPROVE DESIGN verdicts at 73503099, after folds of 628ada68. Approval is for the target-contingent observational E0 contract only.**
 - This design sits under `tasks/plan_containment_caps_prerequisite_2026_09_17.md`, Environment gate, item E0.
 - It can be approved only as a **target-contingent contract**. Such an approval is not execution proof and not build authorization.
 - **No target has been supplied, so nothing is executed.**
@@ -92,7 +92,7 @@ Notes on the checks:
   - A mismatch disqualifies the target. A match only means the target is not disqualified.
   - The positive basis is the operator's item 4 statement. That is provenance, not E0 proof.
   - Reviewers should confirm the two inode values against the kernel source.
-- **C3.** `NSpid` is not used. Read through the reader's own procfs, it shows the same value whether or not the process is nested, which is the lessons.md non-discriminating-evidence case.
+- **C3.** `NSpid` is not used. Read through the reader's own procfs, it can contain a single field whether or not the process is nested, which is the lessons.md non-discriminating-evidence case.
 - **C8 and C9.**
   - A manual read cannot distinguish an absent file from an access failure without interpreting error text. Absence is therefore never scored as satisfied.
   - **Consequence, disclosed:** `PRECHECK_OK` is reachable only on targets that expose both files. On any other target the result is unknown and NO BUILD.
@@ -204,4 +204,4 @@ Consider the lines whose mount point is `/proc` or starts with `/proc/`.
   - The zero-porcelain gate is unchanged.
   - The rejection of PR593 is unchanged.
   - The branch-protection gates are unchanged.
-- This document claims no approval, no implementation and no execution.
+- The recorded approval covers this E0 design only. No implementation, execution, integration-design clearance or merge approval is claimed.

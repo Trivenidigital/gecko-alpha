@@ -3,8 +3,8 @@
 - [x] Refresh master5281f047, recover PR59326119c04, read both automation memories and tracked queue; no current Gecko author before claim.
 - [x] Exact-head PR593 four CI checks SUCCESS; this does not clear rejected integration design.
 - [x] Fresh read-only production14:37:32UTC: selective77751890, 11 untracked entries; three services active; worker13:33:39 authguard21, timer active.
-- [ ] Configured Claude drafts separate D1a E0 design under approved containment plan.
-- [ ] Two parallel independent design reviews and required folds.
+- [x] Configured Claude drafted D1a E0 design; draft628ada68 reviewed.
+- [x] Both independent design reviews terminal APPROVE73503099 after evidence/resource/authority folds.
 - [ ] Publish documentation to existing draft PR593; two publication reviews, exact-head CI status.
 - [ ] E0 execution waits for identified non-production Linux target; no synthetic build, production collection or deployment in this slice.
 
