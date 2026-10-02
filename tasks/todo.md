@@ -21,19 +21,17 @@ is justified for this reconciliation.
   use that checkout as source/revision proof.
 - [x] Get two independent plan reviews covering stale-state evidence and
   operational scope; fold required corrections before changing records.
-- [x] Reclassify only the stale PR592 CI/merge portion after separate merge and
-  exact-head check-run evidence; preserve the separate four-Linux-mutation-proofs
-  and no-production-collection gates. Record remaining worker/account and
-  receipt-collection gates without inventing a new child scope.
-- [x] Get two independent final reviews and run focused documentation verification.
+- [x] Reclassify the stale PR592 CI/merge and four-Linux-synthetic-mutation-proof
+  portions after separate merge and exact-head check-run evidence; retain the
+  separate no-production-collection gate. Record remaining worker/account and
+  future named non-production target gates without inventing a new child scope.
+- [ ] Get two independent final reviews, record their SHA/vector/folds durably,
+  and run focused documentation verification.
 - [ ] Commit/push/open a docs-only PR, and merge only after exact-head CI/clearance.
 
-**Review record:** plan reviews (factual/drift; operational safety) required
-template-count, CI-receipt, scheduler-lifecycle, and raw-status-count folds;
-both final plan reviews approved. Design reviews (evidence model; operational
-scope) approved `tasks/design_overnight_closeout_reconciliation_2026_10_02.md`.
-Final PR-style reviews (factual/source; operational safety) approved the exact
-documentation diff with no additional folds.
+**Review record:** `tasks/review_overnight_closeout_reconciliation_2026_10_02.md`
+is the durable review/fold record. It distinguishes pre-amend findings from
+final approvals and records each reviewed SHA and attack vector.
 
 ## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
 
@@ -43,8 +41,9 @@ documentation diff with no additional folds.
 - [x] Configured author folds; both reviewers approve fa032eea design and bounded schema amendment.
 - [x] Implementation and local adversarial validation; both PR reviewers APPROVE08063e64 after folds.
 - [x] PR592 merged (`5281f047`, 2026-09-16); its exact-head `test` check for
-  `65d93065` succeeded at 19:43:55Z (run `35140345937`). Four Linux mutation
-  proofs remain pending before any production collection scope.
+  `65d93065` succeeded at 19:43:55Z (run `35140345937`). Its four synthetic
+  Linux mutation proofs completed in that exact-head CI; this does not
+  authorize production receipt collection.
 - Review: tasks/review_receipt_reducer_meta_design_2026_09_16.md.
 - Production collection remains outside this local/synthetic slice.
 

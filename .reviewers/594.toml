@@ -2,7 +2,7 @@ pr = 594
 record_version = 1
 required = ["concurrency", "logic", "ops-safety", "silent-failure"]
 watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
-# Docs-only PR: no watched delta. Independent final reviews on 6390b636 covered
-# factual/source (logic/concurrency) and operational safety (ops-safety/silent-failure).
-# Empty clearances do not waive the completed reviews or exact-head CI requirement.
+# Docs-only PR: no watched delta. Pre-amend reviews requested provenance folds;
+# amended-head approvals are recorded in the durable review record before merge.
+# Empty clearances do not waive the final-review or exact-head CI requirements.
 [clearances]

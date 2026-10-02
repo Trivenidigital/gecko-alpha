@@ -36,13 +36,17 @@ provenance evidence; add no dependency or custom primitive.
 
 ## Change and safety
 
-Change only `tasks/todo.md`:
+Change only the durable closeout records:
 
-- Add this run's evidence-only plan/status record.
+- Add this design and the evidence-only plan/status record.
 - Mark the stale PR #592 CI/merge task complete with its distinct merge and CI
   receipts.
-- Leave four Linux mutation proofs, production receipt collection, account/OAuth
-  recovery, and all operator-only actions explicitly open.
+- Add the PR #594 reviewer-clearance declaration and a durable reviewer/fold
+  record; neither changes runtime behavior.
+- Mark PR #592's four Linux synthetic mutation proofs complete: the exact-head
+  CI receipt completed successfully. Leave production receipt collection,
+  account/OAuth recovery, a named non-production Linux target for later
+  collection work, and all operator-only actions explicitly open.
 
 No test behavior, runtime configuration, service, data, or public API changes.
 Rollback is a normal documentation revert; no production restore is needed.
@@ -51,9 +55,11 @@ Rollback is a normal documentation revert; no production restore is needed.
 
 - Two plan reviews use factual/drift and operational-safety attack vectors.
 - Two design reviews verify evidence separation and scope containment.
-- Two final reviews verify the exact resulting diff and claims.
+- Two final reviews verify the exact resulting diff and claims; retain their
+  reviewer/vector, SHA, finding, fold, and verdict in the durable review record.
 - Run `git diff --check` and a focused text assertion that the stale unchecked
-  PR #592 line is absent while the four-proof gate remains.
+  PR #592 four-proof line is absent while the no-production-collection gate
+  remains.
 
 ## Operator-only gates retained
 
