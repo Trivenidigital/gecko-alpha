@@ -55,20 +55,73 @@ by the watchpoint added directly above it.)
 `scripts/check_reviewer_clearances.py` is a **lapse detector**, not an
 enforcement gate, and the difference is not a caveat — it is the whole security
 model. Two things are required to make an unreviewed merge actually impossible,
-and **neither can be done from inside the repository**:
+and **neither can be done from inside the repository. One of the two has since
+been done** — see item 1 — which is why this sentence no longer means what it
+did when it was written: "cannot be done from inside the repository" describes
+where the action lives, not whether it has happened.
 
-**1. Branch protection is OFF.** Verified:
+**1. Branch protection — ENABLED 2026-08-28.** This section said "OFF" until
+then, and printed a `404 Branch not protected` as its proof. Re-run the same
+command today:
 
 ```bash
-gh api repos/Trivenidigital/gecko-alpha/branches/master/protection   # 404 Branch not protected
-gh api repos/Trivenidigital/gecko-alpha/rulesets                     # []
+gh api repos/Trivenidigital/gecko-alpha/branches/master/protection
+#   strict: true   contexts: ["test", "reviewer-clearances"]
+#   enforce_admins: true   required_approving_review_count: 0
+#   allow_force_pushes: false   allow_deletions: false
+gh api repos/Trivenidigital/gecko-alpha/rulesets                     # [] (still)
 ```
 
-With no protection, `mergeStateStatus` reads `UNSTABLE` (checks red, merge
-permitted) rather than `BLOCKED` — so **no CI check in this repo can block
-anything.** PR #560 was mergeable while its own clearance check was failing.
-Until an operator enables protection with the checks marked required, every
-gate here is advisory text in a log.
+**A document whose own stated verification returns the opposite of what the
+document records is worse than one with no evidence in it**, because the
+evidence is what makes it persuasive. That is why the command stays here: the
+next reader should run it rather than believe this paragraph.
+
+So a failing check now blocks. `required_approving_review_count` is **0 on
+purpose** — every PR in this repo has zero GitHub reviews, so requiring one
+would make every PR permanently unmergeable. Requiring the PR *path* is
+enforcement; requiring an *approval* would wedge the repo and would not create
+item 2 either. **Do not "harden" it to 1.**
+
+Two live consequences an operator needs:
+
+* `strict: true` means a branch must be up to date before merging, and that
+  update **does** lapse clearances even when the PR's own diff is untouched.
+  **Measured, not reasoned** — this paragraph asserted it from the mechanism
+  until 2026-08-29, which is the same unverified-claim shape this document was
+  just rewritten for. A PR that moves `scout/`, fully cleared at its own head;
+  then one unrelated commit lands on master also touching `scout/`; then the
+  branch does exactly what `strict: true` mandates before merging:
+
+  ```
+  STEP 1 - cleared at its own head, before master moves
+  exit=0
+    concurrency      HOLDS at 415f30c8
+    ... all required vectors hold at this head.
+
+  STEP 3 - after the branch update `strict: true` MANDATES
+           (the PR's own diff is unchanged throughout)
+  exit=1
+    concurrency      LAPSED -- scout moved since 415f30c8
+    logic            LAPSED -- scout moved since 415f30c8
+    ops-safety       LAPSED -- scout moved since 415f30c8
+    silent-failure   LAPSED -- scout moved since 415f30c8
+  ```
+
+  All four lapse on a delta the PR never introduced. The cause is an **anchor
+  mismatch**: the requirement is anchored to `diff(merge-base, head)` — this
+  script's own stated question is *"does the delta THIS pull request
+  introduces carry a clearance?"* — while the lapse is anchored to the
+  clearance's own tree. Defensible under the strict reading (the reviewer
+  cleared tree T, head is now T'), and it means the churn is not purely
+  `MANDATORY_WATCH` breadth. **Serialize merges while any PR has clearances
+  recorded.** The constraint on any future relief valve: **never allow a merge on
+  a check computed by an older version of the gate** — which rules out override
+  labels, admin bypasses, and reusing a prior green.
+* `enforce_admins: true` plus `allow_force_pushes: false` closes the escape
+  used once before (the authorized direct push `87604f44`). **Recovery from a
+  wedged state is now an out-of-band protection-disable by the repo owner.**
+  Worth knowing before it is needed.
 
 **2. The clearance record sits on the author's writable surface.**
 `.reviewers/<PR>.toml` is committed, so repointing all four clearances at the
