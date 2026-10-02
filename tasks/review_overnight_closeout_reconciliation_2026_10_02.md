@@ -24,7 +24,8 @@
 
 ## Final-review gate
 
-Pending: two independent reviewers must approve the amended exact head. Their
-SHA, vectors, and verdicts will be appended before merge. No runtime, account,
-production collection, policy, vendor, or trading action is authorized by this
-documentation reconciliation.
+No approval is inferred by this file. Before merge, two independent reviewers
+must record their exact reviewed SHA, vector, findings/folds, and verdict as PR
+#594 review artifacts; the merge gate also requires exact-head CI. No runtime,
+account, production collection, policy, vendor, or trading action is authorized
+by this documentation reconciliation.
