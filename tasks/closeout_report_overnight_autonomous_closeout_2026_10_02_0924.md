@@ -48,6 +48,19 @@ artifact, PR/CI completion, or any source-content identity. It is also distinct
 from the historical 05:19Z and 06:21Z observations and does not overwrite them.
 No raw auth output, host receipt, or secret is retained here.
 
+## Retained-artifact / first-run distinction
+
+The first retained Gecko autonomous work-loop artifact is Codex task
+`019e522b-4bad-7ae1-aa5c-f50b32739693`. It was re-read on 2026-10-02 and its
+only recorded turn is completed, with a completion timestamp of 2026-05-23;
+the in-tree corroboration is
+`tasks/review_receipt_reducer_meta_2026_09_16.md:31-33`. This establishes a
+historical completed run, not successful execution by the current systemd
+timer. Conversely, the 2026-10-02 pre-start OAuth failure establishes neither
+a later retained artifact nor a completed outcome. The required status model is
+therefore: retained May completion; current timer invocation; current
+pre-start failure; no current main-process/retained-result completion evidence.
+
 ## Blocked and parked
 
 - Restore the intended `/root` Codex OAuth login **without bypassing the
