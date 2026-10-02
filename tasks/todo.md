@@ -1,3 +1,40 @@
+## Active Work: 2026-10-02 05:20 UTC — Overnight autonomous closeout reconciliation
+
+**Scope:** evidence-only reconciliation of the current closeout queue. No
+receipt collection, production deployment, DB/config/account mutation, vendor
+call, signal-policy change, or trading action.
+
+**Hermes-first analysis:** drift-check first found the existing Hermes/Codex
+operating model, six requested reusable session templates (plus a closeout
+report template), local status reporter, and
+read-only cockpit/trust surfaces. Existing orchestration remains the intended
+Hermes role; no additional Hermes dependency or custom orchestration primitive
+is justified for this reconciliation.
+
+- [x] Refresh `origin/master` (`5281f047`), create an isolated branch, read
+  automation memory, instructions, lessons, backlog snapshot, and current queue.
+- [x] Verify runtime state read-only at 2026-10-02T05:19:57Z: pipeline,
+  dashboard, Hermes gateway, and timer active; its recorded trigger is
+  2026-10-02T01:24:20Z and worker service is failed with no main-process start
+  timestamp. This is scheduler/unit state, not completion evidence. The raw
+  production `git status --porcelain` count is 11; do not infer entry type or
+  use that checkout as source/revision proof.
+- [x] Get two independent plan reviews covering stale-state evidence and
+  operational scope; fold required corrections before changing records.
+- [x] Reclassify only the stale PR592 CI/merge portion after separate merge and
+  exact-head check-run evidence; preserve the separate four-Linux-mutation-proofs
+  and no-production-collection gates. Record remaining worker/account and
+  receipt-collection gates without inventing a new child scope.
+- [x] Get two independent final reviews and run focused documentation verification.
+- [ ] Commit/push/open a docs-only PR, and merge only after exact-head CI/clearance.
+
+**Review record:** plan reviews (factual/drift; operational safety) required
+template-count, CI-receipt, scheduler-lifecycle, and raw-status-count folds;
+both final plan reviews approved. Design reviews (evidence model; operational
+scope) approved `tasks/design_overnight_closeout_reconciliation_2026_10_02.md`.
+Final PR-style reviews (factual/source; operational safety) approved the exact
+documentation diff with no additional folds.
+
 ## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
 
 - [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
@@ -5,7 +42,9 @@
 - [x] Two parallel design reviews completed; both request correctness and filesystem-test folds.
 - [x] Configured author folds; both reviewers approve fa032eea design and bounded schema amendment.
 - [x] Implementation and local adversarial validation; both PR reviewers APPROVE08063e64 after folds.
-- [ ] PR592 exact-head Linux CI and merge; four Linux mutation proofs remain pending.
+- [x] PR592 merged (`5281f047`, 2026-09-16); its exact-head `test` check for
+  `65d93065` succeeded at 19:43:55Z (run `35140345937`). Four Linux mutation
+  proofs remain pending before any production collection scope.
 - Review: tasks/review_receipt_reducer_meta_design_2026_09_16.md.
 - Production collection remains outside this local/synthetic slice.
 
