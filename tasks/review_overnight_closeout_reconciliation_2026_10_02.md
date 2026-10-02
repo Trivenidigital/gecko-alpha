@@ -1,7 +1,7 @@
 # Review record: overnight closeout reconciliation — 2026-10-02
 
-**PR:** #594  
-**Base:** `5281f047`  
+**PR:** #594
+**Base:** `5281f047`
 **Initial reviewed head:** `e920877f`
 
 ## Pre-amend final reviews — REQUEST CHANGES
