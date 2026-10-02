@@ -1,4 +1,35 @@
-## Active Work: 2026-10-02 05:20 UTC — Overnight autonomous closeout reconciliation
+## Active Work: 2026-10-02 09:24 UTC — Overnight autonomous closeout no-build verification
+
+**Plan (evidence-only):**
+
+- [x] Refresh the source baseline to `origin/master` before this plan edit and
+  verify the prior reconciliation PR's merge and exact reviewed head.
+- [x] Run a bounded, read-only production check of reported revision, service
+  state, timer invocation, and worker main-process evidence.
+- [x] Obtain two orthogonal reviews of the proposed no-build disposition and
+  fold the merge-versus-reviewed-head, pre-edit-cleanliness, and runtime-SHA
+  provenance corrections.
+- [x] Write a durable closeout report that distinguishes complete PR #594,
+  worker pre-start failure, operator-only gates, and parked work; focused
+  status-reporter tests and syntax checks pass.
+- [ ] Commit and publish the docs-only closeout after final PR review. No deploy,
+  database/config/account mutation, vendor call, policy change, or trading
+  action is in scope.
+
+**Current evidence:** PR #594 merged into `origin/master` at `f5b2154a`; its
+reviewed head `9390a6ec` has all four checks green. At 2026-10-02T09:24:43Z,
+production reported revision `7775189` as unit-status evidence only, not a
+source-content attestation; pipeline/dashboard/Hermes gateway and the worker
+timer are active.
+`codex-autonomous-dev-srilu.timer` invoked
+`codex-autonomous-dev-srilu.service` at 07:33:34Z, whose
+`ExecStartPre` auth guard exited 21 before `ExecStart` began. This is an
+operator account gate, not an autonomous-run completion or a safe trigger for
+a new product child.
+
+---
+
+## Completed Work: 2026-10-02 05:20 UTC — Overnight autonomous closeout reconciliation
 
 **Scope:** evidence-only reconciliation of the current closeout queue. No
 receipt collection, production deployment, DB/config/account mutation, vendor
@@ -25,9 +56,9 @@ is justified for this reconciliation.
   portions after separate merge and exact-head check-run evidence; retain the
   separate no-production-collection gate. Record remaining worker/account and
   future named non-production target gates without inventing a new child scope.
-- [ ] Get two independent final reviews, record their SHA/vector/folds durably,
-  and run focused documentation verification.
-- [ ] Commit/push/open a docs-only PR, and merge only after exact-head CI/clearance.
+- [x] Two independent final reviews, durable SHA/vector/fold record, focused
+  documentation verification, exact-head CI and clearance completed; PR #594
+  merged at `f5b2154a` on 2026-10-02T08:26:18Z.
 
 **Review record:** `tasks/review_overnight_closeout_reconciliation_2026_10_02.md`
 is the durable review/fold record. It distinguishes pre-amend findings from
