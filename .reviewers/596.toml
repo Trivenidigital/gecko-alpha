@@ -2,7 +2,6 @@ pr = 596
 record_version = 1
 required = ["concurrency", "logic", "ops-safety", "silent-failure"]
 watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
-# Docs-only PR: no watched delta. Two independent factual-provenance and
-# operations/silent-failure reviewers approved the exact documentation diff
-# after their record-accuracy folds. CI remains an independent merge gate.
+# Docs-only PR: no watched delta. CI and independently recorded final reviews
+# remain merge gates; do not infer either from this skeleton clearance file.
 [clearances]

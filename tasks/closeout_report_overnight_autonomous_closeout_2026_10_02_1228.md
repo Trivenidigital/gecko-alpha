@@ -66,7 +66,7 @@ does not prove that the current systemd timer completed a later run.
 | State | Item | Disposition |
 |---|---|---|
 | Done | Templates, role map, reporter, bounded DASH-08/DASH-11 visibility | Already shipped; no duplicate surface created. |
-| Blocked | Current worker run | Restore the intended `/root` Codex OAuth login without bypassing the guard, then observe a later invocation, correlated main-process start and retained result. |
+| Blocked | 2026-10-02 worker observation | Restore the intended `/root` Codex OAuth login without bypassing the guard, then observe a later invocation, correlated main-process start and retained result. |
 | Parked | Historical price coverage/pool selection | Path 2 requires paid-vendor approval; Path 3 activation requires a named operator decision and fresh runtime verification. |
 | No action | Parent cockpit / Signal Trust backlog items | Parent scopes are archived/superseded; current queue supplies no fresh child. |
 
