@@ -86,6 +86,10 @@ def iso_plus(ts: str, days: int) -> str:
     return (parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class ReturnAlreadyMeasured(ValueError):
+    """``set_return`` found no unmeasured row: missing, or already finalized."""
+
+
 @dataclass
 class Observation:
     token_id: str
@@ -306,8 +310,8 @@ class Store:
         retryable later, so the row must stay unmeasured. A missing or zero
         ``entry_price`` is allowed and finalizes the row with ``ret`` and
         ``ret_vs_btc`` NULL, because an entry price that never existed cannot
-        appear later. Raises ``ValueError`` if the row does not exist or was
-        already measured.
+        appear later. Raises ``ReturnAlreadyMeasured`` (a ``ValueError``) if
+        the row does not exist or was already measured.
         """
         if price is None or btc_entry is None or btc_price is None:
             raise ValueError(
@@ -339,7 +343,7 @@ class Store:
             ),
         )
         if cur.rowcount == 0:
-            raise ValueError(
+            raise ReturnAlreadyMeasured(
                 f"set_return {token_id} h={horizon_days}: row missing or already measured"
             )
         await self.conn.commit()

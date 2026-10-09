@@ -216,6 +216,66 @@ async def test_btc_gap_skips_row_without_bumping(store, settings):
     assert st == ("active",)
 
 
+LATER = "2026-10-08T01:00:00Z"  # h=1 and h=7 both due
+
+
+async def test_btc_gap_at_entry_only_skips_without_bumping(store, settings):
+    await seed(store, btc=False)
+    # BTC at now present; nothing within 36h of entry
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-08T00:30:00Z", {"price_usd": 70000.0}
+    )
+    assert await btc_price_at(store, LATER) == 70000.0
+    assert await btc_price_at(store, E) is None
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(
+                DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}], repeat=True
+            )
+            r = await measure_due(store, settings, s, LATER)
+            assert not m.requests
+    assert (r.measured, r.failed, r.total_loss, r.skipped) == (0, 0, 0, 2)
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, attempts, measured_at FROM forward_returns "
+            "WHERE horizon_days IN (1, 7) ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(1, 0, None), (7, 0, None)]
+
+
+async def test_btc_gap_at_now_only_skips_without_bumping(store, settings):
+    await seed(store, btc=False)
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-01T01:00:00Z", {"price_usd": 60000.0}
+    )
+    assert await btc_price_at(store, E) == 60000.0
+    assert await btc_price_at(store, LATER) is None
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(
+                DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}], repeat=True
+            )
+            r = await measure_due(store, settings, s, LATER)
+            assert not m.requests
+    assert (r.measured, r.failed, r.skipped) == (0, 0, 2)
+    assert (await one(store, "SELECT SUM(attempts) FROM forward_returns")) == (0,)
+
+
+async def test_set_return_input_error_is_not_swallowed(store, settings, monkeypatch):
+    await seed(store)
+
+    async def bad(*a, **k):
+        raise ValueError("price/btc_entry/btc_price required")
+
+    monkeypatch.setattr(store, "set_return", bad)
+    with aioresponses() as m:
+        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(ValueError, match="required"):
+                await measure_due(store, settings, s, NOW)
+
+
 async def test_missing_entry_price_finalizes_unmeasurable(store, settings):
     await seed(store, token_obs=False)
     with aioresponses() as m:
@@ -296,7 +356,7 @@ async def test_definite_4xx_counts_as_missing_price(store, settings):
     await seed(store)
     with aioresponses() as m:
         for _ in range(MAX_ATTEMPTS):
-            m.get(DS, status=403)
+            m.get(DS, status=410)
         async with aiohttp.ClientSession() as s:
             r = await measure_due(store, settings, s, NOW)
             assert (r.measured, r.failed, r.skipped) == (0, 1, 0)
@@ -314,7 +374,7 @@ async def test_definite_4xx_counts_as_missing_price(store, settings):
     assert row == (-1.0, 0.0)
 
 
-@pytest.mark.parametrize("status", [0, 429, 500, 503])
+@pytest.mark.parametrize("status", [0, 403, 429, 500, 503])
 async def test_transient_upstream_error_skips_without_bumping(
     store, settings, monkeypatch, status
 ):

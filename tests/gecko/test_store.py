@@ -1,7 +1,7 @@
 import json
 import pytest
 
-from gecko.store import canon_ts
+from gecko.store import ReturnAlreadyMeasured, canon_ts
 
 
 async def test_schema_has_seven_tables(store):
@@ -149,10 +149,11 @@ async def test_set_return_arithmetic(store):
 
 async def test_set_return_raises_on_missing_btc_and_leaves_row_due(store):
     await _token_with_returns(store)
-    with pytest.raises(ValueError, match="required"):
+    with pytest.raises(ValueError, match="required") as ei:
         await store.set_return(
             "solana:abc", 1, 1.0, 1.5, 60000.0, None, "2026-10-02T01:00:00Z"
         )
+    assert not isinstance(ei.value, ReturnAlreadyMeasured)
     due = await store.due_returns("2026-10-09T00:00:00Z")
     assert [r.horizon_days for r in due] == [1, 7]
 
@@ -162,7 +163,7 @@ async def test_set_return_is_write_once(store):
     await store.set_return(
         "solana:abc", 1, 1.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
     )
-    with pytest.raises(ValueError, match="already measured"):
+    with pytest.raises(ReturnAlreadyMeasured, match="already measured"):
         await store.set_return(
             "solana:abc", 1, 1.0, 9.0, 60000.0, 61000.0, "2026-10-03T01:00:00Z"
         )
@@ -176,7 +177,7 @@ async def test_set_return_is_write_once(store):
 
 async def test_set_return_missing_row_raises(store):
     await _token_with_returns(store)
-    with pytest.raises(ValueError, match="row missing"):
+    with pytest.raises(ReturnAlreadyMeasured, match="row missing"):
         await store.set_return(
             "solana:abc", 2, 1.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
         )

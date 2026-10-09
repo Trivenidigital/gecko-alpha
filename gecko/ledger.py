@@ -13,13 +13,15 @@ from gecko.http import UpstreamError, get_json
 from gecko.jobs import register
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, parse_utc, utcnow
+from gecko.store import ReturnAlreadyMeasured, Store, canon_ts, parse_utc, utcnow
 
 log = structlog.get_logger("gecko.ledger")
 MAX_ATTEMPTS = 3
 BTC_WINDOW_HOURS = 6
 BTC_FALLBACK_WINDOW_HOURS = 36
 BTC_TOKEN_ID = "benchmark:btc"
+# UpstreamError statuses that spend no attempt (plus every 5xx); 0 = transport.
+TRANSIENT_STATUSES = frozenset({0, 403, 429})
 DEXSCREENER_TOKENS = "https://api.dexscreener.com/tokens/v1/{chain}/{address}"
 
 
@@ -187,8 +189,9 @@ async def measure_due(
         try:
             price = await fetch_price(session, settings, chain, address)
         except UpstreamError as exc:
-            if exc.status == 0 or exc.status == 429 or exc.status >= 500:
-                # Transient: not evidence the token is gone; spend no attempt.
+            if exc.status in TRANSIENT_STATUSES or exc.status >= 500:
+                # Transient (incl. 403, which DexScreener can return for a
+                # whole region or IP block): not evidence the token is gone.
                 log.warning(
                     "ledger_fetch_transient",
                     token_id=tid,
@@ -223,7 +226,7 @@ async def measure_due(
                 btc_now,
                 now,
             )
-        except ValueError as exc:
+        except ReturnAlreadyMeasured as exc:
             log.warning(
                 "ledger_row_already_measured",
                 token_id=tid,
