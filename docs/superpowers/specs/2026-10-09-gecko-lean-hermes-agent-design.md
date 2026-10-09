@@ -179,14 +179,14 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 - Long-running units: `hermes-gateway.service`, `gecko-telegram-reader.service`. All other old units/timers/crontab lines are removed at cutover.
 - `freshness` job (script): per-table SLO (`observations` ≤ 30 min, `source_calls` ≤ 6 h when channels active, `watchlist` ≤ 2 h, `forward_returns` ≤ 26 h, `research_notes` ≤ 26 h); breach ⇒ one plain-text Telegram message to the health chat, de-duplicated per table per 6 h. This is the §12a minimum.
-- Hermes cron incidents (`hermes cron incidents`) cover job crashes and retries; the freshness job covers "ran but wrote nothing".
+- Hermes cron incidents (`hermes cron incidents`) cover job crashes and retries; the freshness job covers "ran but wrote nothing": per-source observation SLOs (dexscreener 30 min, geckoterminal 60 min, coingecko 26 h, OHLCV-with-candles 26 h), a `benchmark:btc` SLO of 3 h, and a forward-returns backlog breach when any row is more than 72 h past due and unmeasured. The ledger prices a per-chain canary (WSOL, WETH, WBNB) each run; an unpriced canary marks every missing price on that chain transient and fails the run, so a DexScreener schema or route change cannot be booked as per-token losses (amended 2026-10-09).
 - Backup: nightly `sqlite3 gecko.db ".backup"` + existing off-host transport script retained (only ops script carried over).
 - Logs: structlog JSON to journald as today.
 
 ## 13. Security
 
 - Read-only everything: no execution tools installed; GMGN execution skills excluded; solana/evm skills remain under the existing read-only rulings.
-- Keys in `~/.hermes/.env` and `/root/gecko-alpha/.env` only; never in argv, prompts, PRs or chat. Telethon `*.session` mode 0600, outside the repo, never committed.
+- Keys in `~/.hermes/.env` and `/root/gecko-alpha/.env.gecko` only (NEVER in the legacy `/root/gecko-alpha/.env`: the frozen `scout` settings use `extra="forbid"` and would crash-loop on any `GECKO_*` line — amended 2026-10-09); never in argv, prompts, PRs or chat. Transport-error logs record the exception type and status only, never its repr (aiohttp embeds request headers). Telethon `*.session` mode 0600, outside the repo, never committed.
 - LLM output is untrusted: agent writes only `research_notes` through `python -m gecko.note`, which validates against the JSON schema; ranking never reads `research_notes`.
 - Prompt-injection: digest/research prompts treat all token names, descriptions and social text as data; `parse_mode=None` on every Telegram send.
 

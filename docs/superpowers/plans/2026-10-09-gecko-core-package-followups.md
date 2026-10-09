@@ -49,3 +49,13 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Refresh queue: targets with no DexScreener pair sort NULL-first every run until aging removes them; order open-watchlist rows, then actives, ahead of the NULL-first key — Plan 2.
 - Candidate aging keys on `first_seen_at`, so a token can be demoted mid-way through a legitimate 24 h survival window that started late; key on the last in-band reading instead — Plan 2.
 - Structural probe in the session scratchpad uses an invalid address fixture and no longer runs — scratch only, no action.
+
+## Plan 3 deployment checklist items (from the ops-safety and concurrency vectors)
+- `GECKO_*` variables live in `/root/gecko-alpha/.env.gecko` (or the Hermes job env); NEVER in the legacy `.env` (scout `extra="forbid"` crash-loop).
+- Set `GECKO_DB_PATH` absolute for every job; include `gecko.db` in the backup set; check srilu disk headroom before cutover (observations grow up to ~86k rows/day until pruning exists).
+- During coexistence with the legacy pipeline (which polls GeckoTerminal every 60 s), set `GECKO_GT_MIN_INTERVAL_SEC=3.0` and schedule `geckoterminal-ohlcv` off the :00/:15/:30/:45 pool-job slots; stagger `coingecko-markets` away from `coingecko-hourly`.
+- Hermes script timeout for `coingecko-markets` ≥ 20 min (normal run ≈ 11 min); credits are recorded only when a run ends.
+- Wire Hermes cron incidents to the health chat; a `coingecko-markets` budget stop exits 0 by design (warning log only).
+- Add a per-job `flock` (or Hermes `max_parallel_jobs`/no-overlap) so the same job never overlaps itself; rank-rank overlap can exceed the cap.
+- Configure structlog JSON rendering for journald (spec §12) and add `gecko check` (config/Telegram/key self-test) before the soak.
+- The agent-side CoinGecko MCP must use a separate Demo key or share the `runs` ledger; MCP spend is invisible to the cap.
