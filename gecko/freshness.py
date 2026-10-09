@@ -26,6 +26,7 @@ WRITER_JOBS = {
     "observations": (
         "dexscreener",
         "geckoterminal",
+        "geckoterminal-ohlcv",
         "coingecko-markets",
         "coingecko-hourly",
         "enrich",
