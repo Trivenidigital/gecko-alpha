@@ -207,21 +207,44 @@ def test_study_vol_ratio_matches_study_definition():
     assert study_vol_ratio([], t0) is None
 
 
-def test_live_definition_divergence_counted(tmp_path, settings):
+def test_live_definition_matches_study_on_sparse_pools(tmp_path, settings):
     write_study(
         tmp_path,
         {
             "full": coin(20, 1.0, 2.0),
-            # 10 candles: study ratio 1500/700 >= 2; live needs 14 -> None
+            # 10 candles: no candle minimum in the prereg, so both compute
             "sparse": coin(22, 1.0, 2.0, vols=[100] * 7 + [500] * 3),
         },
     )
     coins = load_study(str(tmp_path), str(tmp_path / "scout.db"))
     sparse = next(c for c in coins if c.cid == "sparse")
     assert sparse.vol_ratio == pytest.approx(1500 / 700)
-    assert sparse.live_vol_ratio is None
+    assert sparse.live_vol_ratio == pytest.approx(1500 / 700)
     assert {c.cid for c in apply_rule(coins, "F4", settings)} == {"full", "sparse"}
-    assert f4_divergence(coins, settings) == 1
+    assert f4_divergence(coins, settings) == 0
+
+
+def test_f4_divergence_counts_verdict_flips(settings):
+    from gecko.backtest.study import Coin
+
+    def mk(cid, vr, live, age=30.0):
+        return Coin(
+            cid,
+            "2026-05-01T00:00:00",
+            False,
+            age_days=age,
+            vol_ratio=vr,
+            live_vol_ratio=live,
+        )
+
+    coins = [
+        mk("same", 3.0, 3.0),
+        mk("live_none", 3.0, None),
+        mk("live_only", 1.0, 2.5),
+        mk("both_fail", 1.0, None),
+        mk("old", 3.0, None, age=200.0),  # fails F1 either way: no F4 change
+    ]
+    assert f4_divergence(coins, settings) == 2
 
 
 def test_dead_and_unverifiable_coins(tmp_path):

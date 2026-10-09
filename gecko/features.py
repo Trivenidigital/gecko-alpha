@@ -21,7 +21,6 @@ ENRICH_SOURCE = "enrich"
 YOUNG_CHAIN_DAYS = 180
 BUNDLE_DD_BELOW = 60
 BUNDLE_TOP10_ABOVE = 40
-MIN_CANDLES = 14
 DAY_SEC = 86400
 THEN_SLACK = timedelta(days=2)  # a "week ago" value may be up to 9 days old
 NOW_MAX_AGE = timedelta(days=3)  # a "now" value for growth must be this fresh
@@ -105,23 +104,26 @@ def _valid_candles(candles) -> list:
 def vol_ratio_from_candles(candles: list, as_of: datetime) -> float | None:
     """Last-7-day over prior-7-day volume from daily candles.
 
+    This is the registered F4 definition (prereg ``f7d38fa2``):
+    ``last = sum(vol, [as_of - 7d, as_of))`` over
+    ``prior = sum(vol, [as_of - 14d, as_of - 7d))``. There is no minimum
+    candle count; any stricter minimum requires a new prereg.
+
     ``candles`` is ``[[ts_sec, o, h, l, c, vol_usd], ...]``. A candle is usable
     only if it is a list of exactly 6 elements whose timestamp and volume are
-    finite numbers and whose timestamp lies in ``[as_of - 14d, as_of)``.
-    Duplicate timestamps collapse to the last one. Returns None when fewer than
-    14 usable candles exist or the prior-week volume is zero.
+    finite numbers. Duplicate timestamps collapse to the last one. Returns None
+    when the prior-week volume is zero or no usable candle lies in the last
+    week.
     """
     t = as_of.timestamp()
     lo = t - 14 * DAY_SEC
+    mid = t - 7 * DAY_SEC
     by_ts = {c[0]: c for c in _valid_candles(candles) if lo <= c[0] < t}
-    if len(by_ts) < MIN_CANDLES:
+    recent = [c for c in by_ts.values() if c[0] >= mid]
+    prior = sum(c[5] for c in by_ts.values() if c[0] < mid)
+    if prior <= 0 or not recent:
         return None
-    usable = by_ts.values()
-    last = sum(c[5] for c in usable if c[0] >= t - 7 * DAY_SEC)
-    prior = sum(c[5] for c in usable if c[0] < t - 7 * DAY_SEC)
-    if prior <= 0:
-        return None
-    return last / prior
+    return sum(c[5] for c in recent) / prior
 
 
 def _liq_key(o: Observation) -> float:

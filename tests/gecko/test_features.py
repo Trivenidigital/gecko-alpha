@@ -72,7 +72,9 @@ async def test_vol_ratio_from_ohlcv(store, settings):
     assert f.vol_7d_ratio == pytest.approx(2.5)
 
 
-async def test_vol_ratio_missing_when_short_history(store, settings):
+async def test_vol_ratio_computed_from_short_history(store, settings):
+    # Ruling 2026-10-09: prereg f7d38fa2 has no candle minimum. 10 candles from
+    # t-10d: prior window holds t-10..t-8 (3 x 100), last window 7 x 100.
     await seed(store)
     start = int((AS_OF_DT - dt.timedelta(days=10)).timestamp())
     await store.add_observation(
@@ -82,7 +84,7 @@ async def test_vol_ratio_missing_when_short_history(store, settings):
         {"pool_address": "p", "candles": candles(start, [100] * 10)},
     )
     f = await compute_features(store, settings, "solana:abc", "2026-10-15T00:00:00Z")
-    assert f.vol_7d_ratio is None
+    assert f.vol_7d_ratio == pytest.approx(700 / 300)
 
 
 async def test_vol_ratio_missing_when_prior_zero(store, settings):
@@ -136,7 +138,8 @@ def test_vol_ratio_skips_malformed_candles():
     ]
     assert len(good + bad) == 16
     assert vol_ratio_from_candles(good + bad, AS_OF_DT) == pytest.approx(2.5)
-    assert vol_ratio_from_candles(good[1:] + bad, AS_OF_DT) is None  # 13 usable
+    # 13 usable candles still compute (no minimum); the malformed ones add nothing
+    assert vol_ratio_from_candles(good[1:] + bad, AS_OF_DT) == pytest.approx(1750 / 600)
 
 
 def test_vol_ratio_skips_non_finite_timestamp_and_non_numeric():
@@ -148,7 +151,8 @@ def test_vol_ratio_skips_non_finite_timestamp_and_non_numeric():
         "not-a-candle",
     ]
     assert vol_ratio_from_candles(good + bad, AS_OF_DT) == pytest.approx(2.5)
-    assert vol_ratio_from_candles(good[1:] + bad, AS_OF_DT) is None
+    # the "500" and True volumes would land in the prior week if counted
+    assert vol_ratio_from_candles(good[1:] + bad, AS_OF_DT) == pytest.approx(1750 / 600)
 
 
 async def test_vol_ratio_survives_malformed_candle_in_store(store, settings):
@@ -345,23 +349,34 @@ T_SEC = int(AS_OF_DT.timestamp())
 
 
 def test_vol_ratio_none_when_candles_end_before_window():
-    # 30 candles, the last one 11 days before as_of: only 4 fall in [t-14d, t)
+    # 30 candles, the last one 11 days before as_of: 4 fall in the prior week
+    # and none in the last week -> None by the at-least-one-recent-candle rule
     assert (
         vol_ratio_from_candles(candles(T_SEC - 40 * DAY, [100] * 30), AS_OF_DT) is None
     )
 
 
-def test_vol_ratio_none_when_old_history_pads_the_count():
+def test_vol_ratio_ignores_old_history_and_has_no_minimum():
+    # Ruling 2026-10-09: prereg f7d38fa2 defines vol_ratio as plain sums over the
+    # two 7-day windows with no candle minimum, so one candle per week computes.
+    # Old history outside [t-14d, t) contributes nothing.
     old = candles(T_SEC - 80 * DAY, [100] * 50)
     recent = [[T_SEC - 10 * DAY, 1, 1, 1, 1, 100], [T_SEC - 3 * DAY, 1, 1, 1, 1, 250]]
-    assert vol_ratio_from_candles(old + recent, AS_OF_DT) is None
+    assert vol_ratio_from_candles(old + recent, AS_OF_DT) == pytest.approx(2.5)
+
+
+def test_vol_ratio_excludes_candle_stamped_at_as_of():
+    # [t-7d, t): a candle stamped exactly at as_of is lookahead and must not count
+    good = candles(START_14, [100] * 7 + [250] * 7)
+    at_t = [T_SEC, 1, 1, 1, 1, 10_000]
+    assert vol_ratio_from_candles(good + [at_t], AS_OF_DT) == pytest.approx(2.5)
 
 
 def test_vol_ratio_duplicate_timestamps_do_not_inflate():
     good = candles(START_14, [100] * 7 + [250] * 7)
     dups = [list(c) for c in good[7:]]  # 7 duplicated last-week timestamps
     assert vol_ratio_from_candles(good + dups, AS_OF_DT) == pytest.approx(2.5)
-    # 7 unique timestamps, each twice: still only 7 usable candles
+    # 7 unique last-week timestamps, each twice, no prior week -> None
     assert vol_ratio_from_candles(good[7:] + dups, AS_OF_DT) is None
 
 
