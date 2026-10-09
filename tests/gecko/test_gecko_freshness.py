@@ -1,3 +1,6 @@
+# Aggregate-observation tests seed the "enrich" writer, which feeds only the
+# aggregate check, so per-source SLOs do not add breaches here.
+import pytest
 from aioresponses import aioresponses
 from structlog.testing import capture_logs
 from gecko.freshness import check_freshness, SLO_MINUTES, alert_breaches
@@ -7,7 +10,7 @@ TG_URL = "https://api.telegram.org/bottok/sendMessage"
 
 async def test_fresh_table_no_breach(store):
     await store.record_run(
-        "dexscreener",
+        "enrich",
         "2026-10-09T00:00:00Z",
         "2026-10-09T00:00:10Z",
         True,
@@ -17,14 +20,14 @@ async def test_fresh_table_no_breach(store):
         "solana:a", "solana", "A", "A", "A", "2026-10-09T00:00:00Z", "dexscreener"
     )
     await store.add_observation(
-        "solana:a", "dexscreener", "2026-10-09T00:00:00Z", {"price": 1}
+        "solana:a", "enrich", "2026-10-09T00:00:00Z", {"price": 1}
     )
     assert await check_freshness(store, "2026-10-09T00:20:00Z") == []
 
 
 async def test_stale_table_breaches(store):
     await store.record_run(
-        "dexscreener",
+        "enrich",
         "2026-10-09T00:00:00Z",
         "2026-10-09T00:00:10Z",
         True,
@@ -34,7 +37,7 @@ async def test_stale_table_breaches(store):
         "solana:a", "solana", "A", "A", "A", "2026-10-09T00:00:00Z", "dexscreener"
     )
     await store.add_observation(
-        "solana:a", "dexscreener", "2026-10-09T00:00:00Z", {"price": 1}
+        "solana:a", "enrich", "2026-10-09T00:00:00Z", {"price": 1}
     )
     b = await check_freshness(store, "2026-10-09T01:00:00Z")
     assert [x.table for x in b] == ["observations"]
@@ -51,7 +54,7 @@ async def test_alert_dedup_6h(store, settings):
     settings.telegram_bot_token = SecretStr("tok")
     settings.telegram_health_chat_id = "1"
     await store.record_run(
-        "dexscreener",
+        "enrich",
         "2026-10-09T00:00:00Z",
         "2026-10-09T00:00:10Z",
         True,
@@ -61,7 +64,7 @@ async def test_alert_dedup_6h(store, settings):
         "solana:a", "solana", "A", "A", "A", "2026-10-09T00:00:00Z", "dexscreener"
     )
     await store.add_observation(
-        "solana:a", "dexscreener", "2026-10-09T00:00:00Z", {"price": 1}
+        "solana:a", "enrich", "2026-10-09T00:00:00Z", {"price": 1}
     )
     import aiohttp
 
@@ -87,7 +90,7 @@ async def test_alert_dedup_6h(store, settings):
 
 async def _seed_stale_observations(store):
     await store.record_run(
-        "dexscreener",
+        "enrich",
         "2026-10-09T00:00:00Z",
         "2026-10-09T00:00:10Z",
         True,
@@ -97,7 +100,7 @@ async def _seed_stale_observations(store):
         "solana:a", "solana", "A", "A", "A", "2026-10-09T00:00:00Z", "dexscreener"
     )
     await store.add_observation(
-        "solana:a", "dexscreener", "2026-10-09T00:00:00Z", {"price": 1}
+        "solana:a", "enrich", "2026-10-09T00:00:00Z", {"price": 1}
     )
 
 
@@ -261,17 +264,17 @@ async def test_check_freshness_naive_now_is_utc(store):
 
 async def test_empty_table_within_slo_of_first_writer_run_no_breach(store):
     await store.record_run(
-        "dexscreener", "2026-10-09T00:55:00Z", "2026-10-09T00:55:10Z", True
+        "enrich", "2026-10-09T00:55:00Z", "2026-10-09T00:55:10Z", True
     )
     assert await check_freshness(store, "2026-10-09T01:00:00Z") == []
 
 
 async def test_empty_table_past_slo_of_first_writer_run_breaches(store):
     await store.record_run(
-        "dexscreener", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", True
+        "enrich", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", True
     )
     await store.record_run(
-        "dexscreener", "2026-10-09T00:58:00Z", "2026-10-09T00:58:10Z", True
+        "enrich", "2026-10-09T00:58:00Z", "2026-10-09T00:58:10Z", True
     )  # a recent run must not reset the clock: MIN(finished_at) is the anchor
     b = await check_freshness(store, "2026-10-09T01:00:00Z")
     assert [x.table for x in b] == ["observations"]
@@ -280,7 +283,7 @@ async def test_empty_table_past_slo_of_first_writer_run_breaches(store):
 
 async def test_failed_writer_run_does_not_start_the_clock(store):
     await store.record_run(
-        "dexscreener", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", False
+        "enrich", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", False
     )
     assert await check_freshness(store, "2026-10-09T01:00:00Z") == []
 
@@ -312,3 +315,90 @@ async def test_ledger_with_nothing_due_does_not_page(store):
         "ledger", "2026-10-09T02:00:00Z", "2026-10-09T02:00:05Z", True
     )
     assert await check_freshness(store, "2026-10-09T03:00:00Z") == []
+
+
+PER_SOURCE = [
+    # key, writer job, token, source, features
+    ("observations:dexscreener", "dexscreener", "solana:a", "dexscreener", {"p": 1}),
+    ("observations:geckoterminal", "geckoterminal", "solana:a", "geckoterminal", {}),
+    ("observations:coingecko", "coingecko-markets", "solana:a", "coingecko", {}),
+    (
+        "observations:geckoterminal_ohlcv",
+        "geckoterminal-ohlcv",
+        "solana:a",
+        "geckoterminal_ohlcv",
+        {"candles": [[1, 1, 1, 1, 1, 1]]},
+    ),
+    (
+        "benchmark:btc",
+        "coingecko-hourly",
+        "benchmark:btc",
+        "coingecko",
+        {"price_usd": 1},
+    ),
+]
+T_OBS = "2026-10-09T00:00:00Z"
+
+
+def _plus(minutes: float) -> str:
+    import datetime as dt
+
+    t = dt.datetime(2026, 10, 9, tzinfo=dt.timezone.utc) + dt.timedelta(minutes=minutes)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize("key,job,tid,source,features", PER_SOURCE)
+async def test_per_source_slo(store, key, job, tid, source, features):
+    slo = SLO_MINUTES[key]
+    # stale before the writer ever succeeded: bootstrapping, no breach
+    await store.add_observation(tid, source, T_OBS, features)
+    assert key not in [b.table for b in await check_freshness(store, _plus(slo + 5))]
+    await store.record_run(job, T_OBS, T_OBS, True)
+    assert key not in [b.table for b in await check_freshness(store, _plus(slo - 1))]
+    breached = [
+        b for b in await check_freshness(store, _plus(slo + 1)) if b.table == key
+    ]
+    assert len(breached) == 1 and breached[0].last_write == T_OBS
+
+
+async def test_ohlcv_status_markers_do_not_count_as_fresh(store):
+    await store.record_run("geckoterminal-ohlcv", T_OBS, T_OBS, True)
+    await store.add_observation(
+        "solana:a", "geckoterminal_ohlcv", T_OBS, {"candles": [[1, 1, 1, 1, 1, 1]]}
+    )
+    await store.add_observation(
+        "solana:a",
+        "geckoterminal_ohlcv",
+        _plus(1500),
+        {"candles": [], "status": "error"},
+    )
+    b = [x for x in await check_freshness(store, _plus(1600)) if "ohlcv" in x.table]
+    assert [(x.table, x.last_write) for x in b] == [
+        ("observations:geckoterminal_ohlcv", T_OBS)
+    ]
+
+
+async def test_one_live_source_does_not_hide_a_dead_one(store):
+    await store.record_run("dexscreener", T_OBS, T_OBS, True)
+    await store.record_run("geckoterminal", T_OBS, T_OBS, True)
+    await store.add_observation("solana:a", "geckoterminal", T_OBS, {})
+    await store.add_observation("solana:a", "dexscreener", _plus(55), {})
+    tables = [b.table for b in await check_freshness(store, _plus(70))]
+    assert "observations" not in tables
+    assert "observations:geckoterminal" in tables
+
+
+async def test_forward_returns_backlog(store):
+    await store.schedule_returns("solana:a", "2026-10-01T00:00:00Z", horizons=(1,))
+    due = "2026-10-02T00:00:00Z"
+    ok = [b.table for b in await check_freshness(store, "2026-10-04T23:00:00Z")]
+    assert "forward_returns_backlog" not in ok  # 71 h overdue
+    b = [
+        x
+        for x in await check_freshness(store, "2026-10-05T01:00:00Z")
+        if x.table == "forward_returns_backlog"
+    ]
+    assert len(b) == 1 and b[0].last_write == due  # 73 h overdue
+    await store.set_return("solana:a", 1, 1.0, 1.0, 1.0, 1.0, "2026-10-05T02:00:00Z")
+    tables = [x.table for x in await check_freshness(store, "2026-10-05T03:00:00Z")]
+    assert "forward_returns_backlog" not in tables

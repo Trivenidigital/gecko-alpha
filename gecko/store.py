@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS observations (
   observed_at TEXT NOT NULL, features_json TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_obs_token_time ON observations(token_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_obs_time ON observations(observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_source_time ON observations(source, observed_at);
 CREATE TABLE IF NOT EXISTS source_calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT, source_type TEXT NOT NULL
     CHECK (source_type IN ('telegram','x')), source_id TEXT NOT NULL,

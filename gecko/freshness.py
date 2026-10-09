@@ -20,7 +20,16 @@ SLO_MINUTES = {
     "watchlist": 120,
     "forward_returns": 1560,
     "research_notes": 1560,
+    # per source, so one dead collector cannot hide behind a live one
+    "observations:dexscreener": 30,
+    "observations:geckoterminal": 60,
+    "observations:coingecko": 1560,
+    "observations:geckoterminal_ohlcv": 1560,  # rows that carry candles only
+    "benchmark:btc": 180,  # the ledger cannot measure without it
 }
+BTC_TOKEN_ID = "benchmark:btc"
+BACKLOG = "forward_returns_backlog"
+BACKLOG_HOURS = 72  # a due return this overdue means the ledger is not keeping up
 # which job writes which table; a table is "bootstrapping" until its writer has one ok run
 WRITER_JOBS = {
     "observations": (
@@ -35,6 +44,11 @@ WRITER_JOBS = {
     "watchlist": ("rank",),
     "forward_returns": ("ledger",),
     "research_notes": ("research",),
+    "observations:dexscreener": ("dexscreener",),
+    "observations:geckoterminal": ("geckoterminal",),
+    "observations:coingecko": ("coingecko-markets", "coingecko-hourly"),
+    "observations:geckoterminal_ohlcv": ("geckoterminal-ohlcv",),
+    "benchmark:btc": ("coingecko-hourly",),
 }
 # Tables whose writer may legitimately write 0 rows; judged by its last ok run.
 RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
@@ -67,6 +81,39 @@ async def _writer_run(store: Store, table: str, agg: str) -> str | None:
     return row[0]
 
 
+async def _last_write(store: Store, key: str) -> str | None:
+    """Newest write for a table, or for a per-source / benchmark check."""
+    if key == BTC_TOKEN_ID:
+        where, args = "token_id=?", (BTC_TOKEN_ID,)
+    elif key.startswith("observations:"):
+        src = key.split(":", 1)[1]
+        where, args = "source=?", (src,)
+        if src == "geckoterminal_ohlcv":  # status markers are not data
+            where += " AND json_array_length(features_json, '$.candles') > 0"
+    else:
+        return await store.last_write(key)
+    row = await (
+        await store.conn.execute(
+            f"SELECT observed_at FROM observations WHERE {where} "
+            "ORDER BY observed_at DESC LIMIT 1",
+            args,
+        )
+    ).fetchone()
+    return row[0] if row else None
+
+
+async def _oldest_overdue(store: Store, now: str) -> str | None:
+    cutoff = canon_ts((parse_utc(now) - timedelta(hours=BACKLOG_HOURS)).isoformat())
+    row = await (
+        await store.conn.execute(
+            "SELECT MIN(due_at) FROM forward_returns "
+            "WHERE measured_at IS NULL AND due_at<?",
+            (cutoff,),
+        )
+    ).fetchone()
+    return row[0]
+
+
 async def check_freshness(store: Store, now: str) -> list[Breach]:
     out: list[Breach] = []
     now_dt = parse_utc(now)
@@ -79,12 +126,17 @@ async def check_freshness(store: Store, now: str) -> list[Breach]:
             # staleness is the writer's last ok run, not the table's last row.
             last = anchor = await _writer_run(store, table, "MAX")
         else:
-            last = await store.last_write(table)
+            last = await _last_write(store, table)
             # An empty table is measured from the writer's first ok run, so a
             # writer that just started gets one SLO window to produce rows.
             anchor = last if last is not None else first_run
         if now_dt - parse_utc(anchor) > timedelta(minutes=slo):
             out.append(Breach(table, last, slo))
+    # Needs no bootstrap: no scheduled row, no backlog. A ledger that never
+    # succeeds is exactly what this catches. last_write is the oldest due_at.
+    overdue = await _oldest_overdue(store, now)
+    if overdue is not None:
+        out.append(Breach(BACKLOG, overdue, BACKLOG_HOURS * 60))
     return out
 
 
