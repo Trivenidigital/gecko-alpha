@@ -185,8 +185,12 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
         await store.watchlist_upsert(
             tid, as_of, RULE_ID, rank, scores[tid], feats[tid].as_dict()
         )
-    for tid in entering:
-        await store.schedule_returns(tid, as_of)
+    # Every ranked row, not only entrants: INSERT OR IGNORE makes it idempotent,
+    # and it repairs an entrant whose scheduling a crash cut off last run.
+    for tid in final:
+        await store.schedule_returns(
+            tid, current[tid].entered_at if tid in current else as_of
+        )
     log.info(
         "rank_done",
         as_of=as_of,

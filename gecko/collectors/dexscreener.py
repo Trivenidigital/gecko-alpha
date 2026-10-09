@@ -196,7 +196,7 @@ async def collect(
     targets = await _refresh_targets(store, settings)
     known = set(targets)
     found, invalid = await _discover(session, settings, pacer, feeds)
-    written = skipped = refreshed = missing = 0
+    written = skipped = refreshed = missing = revived = 0
     for chain, addrs in found.items():
         async for addr, p in _pairs(session, settings, pacer, batches, chain, addrs):
             if p is None:
@@ -229,6 +229,8 @@ async def collect(
                 "dexscreener",
                 pool_created_at=f["pair_created_at"],
             )
+            # An aged-out candidate back in band starts a fresh candidacy.
+            revived += await store.revive_candidate(tid, now)
             await store.add_observation(tid, "dexscreener", now, f)
             written += 1
     eligible = [t for t in targets if t[1] not in found.get(t[0], set())]
@@ -260,6 +262,7 @@ async def collect(
         skipped=skipped,
         invalid=invalid,
         promoted=promoted,
+        revived=revived,
         batches=batches["total"],
         batches_failed=batches["failed"],
         feeds_failed=feeds["failed"],

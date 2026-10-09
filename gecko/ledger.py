@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta
 import aiohttp
 import structlog
 
-from gecko.http import UpstreamError, get_json
+from gecko.http import Pacer, UpstreamError, get_json
 from gecko.jobs import register
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
@@ -31,6 +32,15 @@ BTC_TOKEN_ID = "benchmark:btc"
 # UpstreamError statuses that spend no attempt (plus every 5xx); 0 = transport.
 TRANSIENT_STATUSES = frozenset({0, 403, 429})
 DEXSCREENER_TOKENS = "https://api.dexscreener.com/tokens/v1/{chain}/{address}"
+ATTEMPT_SPACING = timedelta(hours=20)  # attempts are days apart, not runs apart
+# Deep, permanent pairs per chain (wrapped native tokens). If one prices as
+# None the route or schema broke, so missing prices this run prove nothing.
+CANARY_TOKENS = {
+    "solana": "So11111111111111111111111111111111111111112",
+    "base": "0x4200000000000000000000000000000000000006",
+    "ethereum": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "bsc": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+}
 
 
 def _price(value) -> float | None:
@@ -214,15 +224,38 @@ async def _finalize_no_entry(
     return len(rows)
 
 
+async def _canary_ok(
+    session: aiohttp.ClientSession, settings: GeckoSettings, chain: str, pacer: Pacer
+) -> bool:
+    """Whether the price route works on ``chain`` this run (its canary prices)."""
+    addr = CANARY_TOKENS.get(chain)
+    if addr is None:
+        return True
+    await pacer.wait()
+    try:
+        ok = await fetch_price(session, settings, chain, addr) is not None
+    except UpstreamError as exc:
+        ok, status = False, exc.status
+    else:
+        status = None
+    if not ok:
+        log.warning("ledger_canary_failed", chain=chain, status=status)
+    return ok
+
+
 async def measure_due(
     store: Store,
     settings: GeckoSettings,
     session: aiohttp.ClientSession,
     now: str,
+    *,
+    sleep=asyncio.sleep,
 ) -> LedgerReport:
     now = canon_ts(now)
     rep = LedgerReport()
     closed: set[str] = set()
+    pacer = Pacer(settings.ds_min_interval_sec, sleep)
+    canary: dict[str, bool] = {}
     for due in await store.due_returns(now):
         tid, h = due.token_id, due.horizon_days
         if tid in closed:
@@ -270,6 +303,9 @@ async def measure_due(
                 log.info("ledger_entry_price_pending", token_id=tid, horizon_days=h)
                 rep.skipped += 1
             continue
+        if chain not in canary:
+            canary[chain] = await _canary_ok(session, settings, chain, pacer)
+        await pacer.wait()
         try:
             price = await fetch_price(session, settings, chain, address)
         except UpstreamError as exc:
@@ -297,7 +333,18 @@ async def measure_due(
                 await store.set_return(tid, h, ep, price, btc_entry, btc_now, now)
                 rep.measured += 1
                 continue
-            attempts = await store.bump_return_attempt(tid, h)
+            if not canary[chain]:
+                # The route is broken, not the token: spend no attempt.
+                log.warning(
+                    "ledger_price_missing_canary_down", token_id=tid, chain=chain
+                )
+                rep.skipped += 1
+                continue
+            last = due.last_attempt_at
+            if last and parse_utc(now) - parse_utc(last) < ATTEMPT_SPACING:
+                rep.skipped += 1  # attempted within 20 h: one attempt per day
+                continue
+            attempts = await store.bump_return_attempt(tid, h, attempted_at=now)
             if attempts < MAX_ATTEMPTS:
                 rep.failed += 1
                 continue
@@ -321,6 +368,9 @@ async def measure_due(
             attempts=attempts,
         )
     log.info("ledger_done", **asdict(rep))
+    down = sorted(c for c, ok in canary.items() if not ok)
+    if down:
+        raise RuntimeError(f"ledger canary failed: {','.join(down)}")
     return rep
 
 

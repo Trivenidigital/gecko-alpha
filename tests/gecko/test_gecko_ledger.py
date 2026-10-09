@@ -21,6 +21,23 @@ DS = "https://api.dexscreener.com/tokens/v1/solana/abc"
 NOW = "2026-10-02T02:00:00Z"
 
 
+@pytest.fixture
+def real_canary():
+    """Request this to run the real canary fetch instead of the healthy stub."""
+
+
+@pytest.fixture(autouse=True)
+def _healthy_canary(request, monkeypatch):
+    # Every other test mocks only its token's URL; the canary gets its own tests.
+    if "real_canary" in request.fixturenames:
+        return
+
+    async def ok(*a, **k):
+        return True
+
+    monkeypatch.setattr(gecko.ledger, "_canary_ok", ok)
+
+
 async def seed(store, *, btc=True, token_obs=True):
     await store.upsert_token(
         "solana:abc",
@@ -177,15 +194,24 @@ async def test_measure_due_writes_return_vs_btc(store, settings):
     ) == (1,)
 
 
+# Attempts are spaced >= 20 h apart; BTC is observed near each run.
+RUNS = ("2026-10-02T02:00:00Z", "2026-10-02T22:00:00Z", "2026-10-03T18:00:00Z")
+
+
+async def _btc_near_runs(store):
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-03T17:00:00Z", {"price_usd": 66000.0}
+    )
+
+
 async def test_missing_price_counts_as_total_loss(store, settings):
     await seed(store)
+    await _btc_near_runs(store)
     with aioresponses() as m:
         for _ in range(MAX_ATTEMPTS):
             m.get(DS, status=404)
         async with aiohttp.ClientSession() as s:
-            reports = [
-                await measure_due(store, settings, s, NOW) for _ in range(MAX_ATTEMPTS)
-            ]
+            reports = [await measure_due(store, settings, s, run) for run in RUNS]
     assert [r.failed for r in reports] == [1, 1, 0] and reports[-1].total_loss == 1
     row = await one(
         store,
@@ -384,6 +410,7 @@ async def test_already_measured_row_is_logged_and_skipped(store, settings, monke
 
 async def test_definite_4xx_counts_as_missing_price(store, settings):
     await seed(store)
+    await _btc_near_runs(store)
     with aioresponses() as m:
         for _ in range(MAX_ATTEMPTS):
             m.get(DS, status=410)
@@ -395,8 +422,8 @@ async def test_definite_4xx_counts_as_missing_price(store, settings):
                     store, "SELECT attempts FROM forward_returns WHERE horizon_days=1"
                 )
             ) == (1,)
-            for _ in range(MAX_ATTEMPTS - 1):
-                r = await measure_due(store, settings, s, NOW)
+            for run in RUNS[1:]:
+                r = await measure_due(store, settings, s, run)
     assert r.total_loss == 1
     row = await one(
         store, "SELECT ret, price FROM forward_returns WHERE horizon_days=1"
@@ -559,3 +586,94 @@ async def test_entry_price_falls_back_to_coingecko_without_dex_rows(store):
         "solana:abc", "coingecko", "2026-10-01T00:05:00Z", {"price_usd": 7.0}
     )
     assert await entry_price(store, "solana:abc", E) == 7.0
+
+
+CANARY = "https://api.dexscreener.com/tokens/v1/solana/" + (
+    gecko.ledger.CANARY_TOKENS["solana"]
+)
+
+
+async def _attempts(store):
+    return await one(store, "SELECT SUM(attempts) FROM forward_returns")
+
+
+async def test_canary_with_renamed_price_field_spends_no_attempt(
+    store, settings, real_canary
+):
+    await seed(store)
+    renamed = [{"price_usd": "2.0", "liquidity": {"usd": 5}}]  # upstream schema drift
+    with aioresponses() as m:
+        m.get(CANARY, payload=[{"price_usd": "150", "liquidity": {"usd": 1e8}}])
+        m.get(DS, payload=renamed)
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                with pytest.raises(RuntimeError, match="ledger canary failed: solana"):
+                    await measure_due(store, settings, s, NOW)
+    assert await _attempts(store) == (0,)
+    assert [d.horizon_days for d in await store.due_returns(NOW)] == [1]
+    assert [e["chain"] for e in logs if e["event"] == "ledger_canary_failed"] == [
+        "solana"
+    ]
+
+
+async def test_canary_404_route_spends_no_attempt_and_job_exits_1(
+    settings, real_canary
+):
+    from gecko.store import Store
+
+    s0 = await Store.open(settings.db_path)
+    await seed(s0)
+    await s0.close()
+    with aioresponses() as m:
+        m.get(CANARY, status=404)
+        m.get(DS, status=404)
+        rc = await gecko.ledger.ledger_job(settings, argparse.Namespace(as_of=NOW))
+    assert rc == 1
+    s1 = await Store.open(settings.db_path)
+    try:
+        assert await _attempts(s1) == (0,)
+        assert await one(s1, "SELECT job, ok FROM runs") == ("ledger", 0)
+    finally:
+        await s1.close()
+
+
+async def test_healthy_canary_keeps_existing_behaviour(store, settings, real_canary):
+    await seed(store)
+    with aioresponses() as m:
+        m.get(CANARY, payload=[{"priceUsd": "150", "liquidity": {"usd": 1e8}}])
+        m.get(DS, status=404)
+        async with aiohttp.ClientSession() as s:
+            r = await measure_due(store, settings, s, NOW)
+    assert (r.failed, r.skipped) == (1, 0)
+    assert await _attempts(store) == (1,)
+
+
+async def test_attempts_are_spaced_twenty_hours(store, settings):
+    await seed(store)
+    with aioresponses() as m:
+        m.get(DS, status=404, repeat=True)
+        async with aiohttp.ClientSession() as s:
+            r1 = await measure_due(store, settings, s, NOW)
+            r2 = await measure_due(store, settings, s, "2026-10-02T03:00:00Z")
+    assert (r1.failed, r2.failed, r2.skipped) == (1, 0, 1)
+    assert await one(
+        store,
+        "SELECT attempts, last_attempt_at FROM forward_returns WHERE horizon_days=1",
+    ) == (1, NOW)
+
+
+async def test_ledger_paces_every_dexscreener_fetch(store, settings, real_canary):
+    class Rec:
+        calls: list = []
+
+        async def __call__(self, d):
+            self.calls.append(d)
+
+    rec = Rec()
+    await seed(store)
+    with aioresponses() as m:
+        m.get(CANARY, payload=[{"priceUsd": "150", "liquidity": {"usd": 1e8}}])
+        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
+        async with aiohttp.ClientSession() as s:
+            await measure_due(store, settings, s, NOW, sleep=rec)
+    assert len(rec.calls) == 1  # two fetches, one wait between them

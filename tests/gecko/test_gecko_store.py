@@ -394,3 +394,90 @@ async def test_open_adds_entry_price_to_an_old_watchlist(tmp_path):
         ).fetchone()
         assert row == (2.0,)
         await s.close()
+
+
+async def test_set_return_refusal_leaves_no_open_transaction(store):
+    await store.schedule_returns("solana:a", "2026-10-01T00:00:00Z")
+    await store.set_return("solana:a", 1, 1.0, 2.0, 1.0, 1.0, "2026-10-02T00:00:00Z")
+    with pytest.raises(ReturnAlreadyMeasured):
+        await store.set_return(
+            "solana:a", 1, 1.0, 3.0, 1.0, 1.0, "2026-10-02T01:00:00Z"
+        )
+    assert store.conn.in_transaction is False
+
+
+async def test_open_sets_busy_timeout_and_tolerates_a_racing_alter(
+    tmp_path, monkeypatch
+):
+    import sqlite3
+
+    import aiosqlite
+
+    from gecko.store import Store
+
+    path = str(tmp_path / "race.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(OLD_WATCHLIST)
+        await c.commit()
+    real_execute = aiosqlite.Connection.execute
+
+    async def racing(self, sql, *a, **k):
+        if sql.startswith("ALTER TABLE watchlist"):
+            await real_execute(self, sql, *a, **k)  # another opener won the race
+            raise sqlite3.OperationalError("duplicate column name: entry_price")
+        return await real_execute(self, sql, *a, **k)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", racing)
+    s = await Store.open(path)
+    try:
+        row = await (await s.conn.execute("PRAGMA busy_timeout")).fetchone()
+        assert row == (30000,)
+        info = await (
+            await s.conn.execute("PRAGMA table_info(forward_returns)")
+        ).fetchall()
+        assert "last_attempt_at" in {r[1] for r in info}
+    finally:
+        await s.close()
+
+
+async def test_open_reraises_other_alter_errors(tmp_path, monkeypatch):
+    import sqlite3
+
+    import aiosqlite
+
+    from gecko.store import Store
+
+    path = str(tmp_path / "bad.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(OLD_WATCHLIST)
+        await c.commit()
+    real_execute = aiosqlite.Connection.execute
+
+    async def broken(self, sql, *a, **k):
+        if sql.startswith("ALTER TABLE"):
+            raise sqlite3.OperationalError("database is locked")
+        return await real_execute(self, sql, *a, **k)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", broken)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await Store.open(path)
+
+
+async def test_revive_candidate_only_touches_stale_candidates(store):
+    for tid, reason in (("s:a", "stale_candidate"), ("s:b", "liquidity")):
+        await store.upsert_token(
+            tid, "solana", tid, "A", "A", "2026-09-01T00:00:00Z", "x"
+        )
+        await store.set_token_status(tid, "disqualified", reason)
+    assert await store.revive_candidate("s:a", "2026-10-09T00:00:00Z") is True
+    assert await store.revive_candidate("s:b", "2026-10-09T00:00:00Z") is False
+    rows = await (
+        await store.conn.execute(
+            "SELECT token_id, status, disqualify_reason, first_seen_at FROM tokens "
+            "ORDER BY token_id"
+        )
+    ).fetchall()
+    assert rows == [
+        ("s:a", "candidate", None, "2026-10-09T00:00:00Z"),
+        ("s:b", "disqualified", "liquidity", "2026-09-01T00:00:00Z"),
+    ]

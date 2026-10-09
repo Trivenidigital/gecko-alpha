@@ -12,7 +12,7 @@ import pytest
 from aioresponses import aioresponses
 
 from gecko.collectors import coingecko, dexscreener, geckoterminal
-from gecko.ledger import measure_due
+from gecko.ledger import CANARY_TOKENS, measure_due
 from gecko.rank import rank_once
 
 MINT = "GeckoSeamMint1111111111111111111111111111111"  # 44-char base58
@@ -111,8 +111,14 @@ async def test_discovery_to_measured_return_to_exit(store, settings):
     await btc_run(store, settings, entry_h + 24, 66_000.0)
     with aioresponses() as m:
         m.get(TOKENS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 300_000}}])
+        m.get(
+            dexscreener.TOKENS_URL.format(
+                chain="solana", addresses=CANARY_TOKENS["solana"]
+            ),
+            payload=[{"priceUsd": "150", "liquidity": {"usd": 1e8}}],
+        )
         async with aiohttp.ClientSession() as s:
-            rep = await measure_due(store, settings, s, at(entry_h + 24))
+            rep = await measure_due(store, settings, s, at(entry_h + 24), sleep=nosleep)
     assert rep.measured == 1
     row = await (
         await store.conn.execute(

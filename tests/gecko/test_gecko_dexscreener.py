@@ -578,3 +578,24 @@ async def test_stale_candidates_are_aged_out_and_not_refreshed(store, settings):
         (f"base:{A40}", "disqualified", "stale_candidate"),  # 15 days old
         (f"base:{B40}", "candidate", None),  # 13 days old
     ]
+
+
+async def test_stale_candidate_back_in_band_is_revived(store, settings):
+    tid = f"base:{A40}"
+    await store.upsert_token(tid, "base", A40, "K", "K", "2026-09-01T00:00:00Z", "x")
+    await store.set_token_status(tid, "disqualified", "stale_candidate")
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": A40}])
+        m.get(PROFILES_URL, payload=[])
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), payload=[pair(addr=A40)])
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                await collect(store, settings, s, NOW, sleep=nosleep)
+    row = await (
+        await store.conn.execute(
+            "SELECT status, disqualify_reason, first_seen_at FROM tokens"
+        )
+    ).fetchone()
+    assert row == ("candidate", None, NOW)
+    done = [e for e in logs if e["event"] == "dexscreener_done"][0]
+    assert done["revived"] == 1

@@ -540,3 +540,27 @@ async def test_exit_reason_falls_back_to_stored_disqualify_reason(store, setting
         store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
     )
     assert row == ("no_price",)
+
+
+async def test_crash_before_scheduling_is_repaired_next_run(
+    store, settings, monkeypatch
+):
+    await seed_token(store, "solana:good")
+    real = store.schedule_returns
+
+    async def boom(*a, **k):
+        raise RuntimeError("crash between upsert and scheduling")
+
+    monkeypatch.setattr(store, "schedule_returns", boom)
+    with pytest.raises(RuntimeError, match="crash between"):
+        await rank_once(store, settings, A)
+    monkeypatch.setattr(store, "schedule_returns", real)
+    assert (await one(store, "SELECT COUNT(*) FROM forward_returns")) == (0,)
+    await rank_once(store, settings, "2026-10-15T00:30:00Z")
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, due_at FROM forward_returns ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
+    assert rows[0][1] == "2026-10-16T00:00:00Z"  # from the stored entered_at

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
 CREATE TABLE IF NOT EXISTS forward_returns (
   token_id TEXT NOT NULL, horizon_days INTEGER NOT NULL, due_at TEXT NOT NULL,
   entry_price REAL, price REAL, btc_entry REAL, btc_price REAL, ret REAL, ret_vs_btc REAL,
-  attempts INTEGER NOT NULL DEFAULT 0, measured_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0, measured_at TEXT, last_attempt_at TEXT,
   PRIMARY KEY (token_id, horizon_days));
 CREATE TABLE IF NOT EXISTS research_notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -50,6 +51,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
 # Sources whose observations carry a market price (and maybe liquidity).
 MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
 DEX_SOURCES = ("dexscreener", "geckoterminal")  # market sources with liquidity
+
+# Columns added after the first schema; Store.open adds them when missing.
+LATE_COLUMNS = (
+    ("watchlist", "entry_price", "REAL"),
+    ("forward_returns", "last_attempt_at", "TEXT"),
+)
 
 TIME_COLUMN = {
     "tokens": "updated_at",
@@ -118,6 +125,7 @@ class ReturnRow:
     horizon_days: int
     due_at: str
     attempts: int
+    last_attempt_at: str | None = None
 
 
 class Store:
@@ -127,18 +135,26 @@ class Store:
     @classmethod
     async def open(cls, path: str) -> "Store":
         conn = await aiosqlite.connect(path)
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute("PRAGMA foreign_keys=ON")
-        await conn.executescript(SCHEMA)
-        cols = {
-            r[1]
-            for r in await (
-                await conn.execute("PRAGMA table_info(watchlist)")
-            ).fetchall()
-        }
-        if "entry_price" not in cols:  # databases created before the column existed
-            await conn.execute("ALTER TABLE watchlist ADD COLUMN entry_price REAL")
-        await conn.commit()
+        try:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            await conn.execute("PRAGMA busy_timeout=30000")
+            await conn.executescript(SCHEMA)
+            for table, col, decl in LATE_COLUMNS:
+                info = await (
+                    await conn.execute(f"PRAGMA table_info({table})")
+                ).fetchall()
+                if col in {r[1] for r in info}:
+                    continue
+                try:  # databases created before the column existed
+                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise  # a concurrent opener added it first: fine; else real
+            await conn.commit()
+        except BaseException:
+            await conn.close()
+            raise
         return cls(conn)
 
     async def close(self) -> None:
@@ -179,6 +195,17 @@ class Store:
             ),
         )
         await self.conn.commit()
+
+    async def revive_candidate(self, token_id, now) -> bool:
+        """An aged-out candidate seen in band again restarts as a fresh candidate."""
+        cur = await self.conn.execute(
+            "UPDATE tokens SET status='candidate', disqualify_reason=NULL, "
+            "first_seen_at=?, updated_at=? WHERE token_id=? AND status='disqualified' "
+            "AND disqualify_reason='stale_candidate'",
+            (canon_ts(now), utcnow(), token_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
 
     async def set_token_status(self, token_id, status, reason=None) -> None:
         await self.conn.execute(
@@ -308,7 +335,7 @@ class Store:
     async def due_returns(self, now: str) -> list[ReturnRow]:
         rows = await (
             await self.conn.execute(
-                "SELECT token_id,horizon_days,due_at,attempts FROM forward_returns "
+                "SELECT token_id,horizon_days,due_at,attempts,last_attempt_at FROM forward_returns "
                 "WHERE measured_at IS NULL AND due_at<=? ORDER BY due_at, horizon_days",
                 (canon_ts(now),),
             )
@@ -365,15 +392,20 @@ class Store:
             ),
         )
         if cur.rowcount == 0:
+            # No open write transaction may outlive the refusal on a shared conn.
+            await self.conn.rollback()
             raise ReturnAlreadyMeasured(
                 f"set_return {token_id} h={horizon_days}: row missing or already measured"
             )
         await self.conn.commit()
 
-    async def bump_return_attempt(self, token_id, horizon_days) -> int:
+    async def bump_return_attempt(
+        self, token_id, horizon_days, *, attempted_at: str | None = None
+    ) -> int:
         await self.conn.execute(
-            "UPDATE forward_returns SET attempts=attempts+1 WHERE token_id=? AND horizon_days=?",
-            (token_id, horizon_days),
+            "UPDATE forward_returns SET attempts=attempts+1, last_attempt_at=? "
+            "WHERE token_id=? AND horizon_days=?",
+            (canon_ts(attempted_at) or utcnow(), token_id, horizon_days),
         )
         await self.conn.commit()
         row = await (
