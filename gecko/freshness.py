@@ -1,4 +1,4 @@
-from gecko.__main__ import register
+from gecko.jobs import register
 
 
 @register("freshness")

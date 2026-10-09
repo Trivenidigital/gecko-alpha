@@ -21,6 +21,10 @@ build/
 dashboard/frontend/node_modules/
 *.ssh_out*
 _*.py
+!gecko/_*.py
+!gecko/**/_*.py
+!tests/gecko/_*.py
+!tests/gecko/**/_*.py
 
 # Local TLS MITM debug artifacts (never commit)
 __*.cer

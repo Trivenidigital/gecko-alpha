@@ -29,3 +29,10 @@ def test_python_dash_m_entry_sees_registered_jobs():
     )
     assert r.returncode == 0, r.stderr
     assert "freshness" in r.stdout.split()
+
+
+def test_single_job_registry():
+    import gecko.__main__
+    import gecko.jobs
+
+    assert gecko.__main__.JOBS is gecko.jobs.JOBS
