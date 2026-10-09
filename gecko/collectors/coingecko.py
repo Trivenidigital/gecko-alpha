@@ -35,6 +35,17 @@ COIN_PARAMS = {
 }
 
 
+QUOTA_EXHAUSTED_CODE = 10006
+
+
+def _quota_exhausted(body: Any) -> bool:
+    if not isinstance(body, dict):
+        return False
+    status = body.get("status")
+    code = status.get("error_code") if isinstance(status, dict) else None
+    return QUOTA_EXHAUSTED_CODE in (code, body.get("error_code"))
+
+
 class CGClient:
     """Demo-tier client: adds the API key header, paces requests, counts calls."""
 
@@ -73,6 +84,10 @@ class CGClient:
                     sleep=self.sleep,
                 )
             except UpstreamError as exc:
+                if exc.status == 429 and _quota_exhausted(exc.body):
+                    # Monthly credits are gone; retrying only burns more attempts.
+                    log.warning("cg_quota_exhausted", path=path, calls=self.calls)
+                    raise
                 retryable = exc.status == 0 or _retryable(exc.status)
                 if not retryable or attempt == len(RETRY_BACKOFF):
                     raise

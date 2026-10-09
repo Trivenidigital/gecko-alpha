@@ -139,3 +139,35 @@ async def test_pacer_after_interval_does_not_sleep(monkeypatch):
     c.t += 2.5
     await p.wait()
     assert c.slept == []
+
+
+async def test_upstream_error_carries_parsed_json_body(settings):
+    body = {"status": {"error_code": 10002, "error_message": "bad key"}}
+    with aioresponses() as m:
+        m.get("https://x.test/a", status=401, payload=body)
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(UpstreamError) as ei:
+                await get_json(s, "https://x.test/a", settings=settings)
+    assert ei.value.status == 401 and ei.value.body == body
+
+
+async def test_upstream_error_body_text_truncated_or_none(settings):
+    async def nosleep(_):
+        return None
+
+    with aioresponses() as m:
+        m.get("https://x.test/a", status=503, body="<html>" + "x" * 900)
+        m.get("https://x.test/b", status=503, body="")
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(UpstreamError) as text_err:
+                await get_json(s, "https://x.test/a", settings=settings, retries=0)
+            with pytest.raises(UpstreamError) as empty_err:
+                await get_json(
+                    s, "https://x.test/b", settings=settings, retries=0, sleep=nosleep
+                )
+    assert text_err.value.body == ("<html>" + "x" * 900)[:500]
+    assert empty_err.value.body is None
+
+
+def test_upstream_error_body_defaults_none():
+    assert UpstreamError(500, "u").body is None

@@ -18,10 +18,25 @@ def _retryable(status: int) -> bool:
 
 
 class UpstreamError(Exception):
-    def __init__(self, status: int, url: str):
+    def __init__(self, status: int, url: str, body: Any = None):
         super().__init__(f"upstream {status} for {url}")
         self.status = status
         self.url = url
+        # Last error response: parsed JSON, else text (<=500 chars), else None.
+        self.body = body
+
+
+async def _error_body(resp: aiohttp.ClientResponse) -> Any:
+    try:
+        text = await resp.text()
+    except (aiohttp.ClientError, UnicodeDecodeError, asyncio.TimeoutError):
+        return None
+    if not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text[:500]
 
 
 class Pacer:
@@ -53,6 +68,7 @@ async def get_json(
     sleep=asyncio.sleep,
 ) -> Any:
     last = 0
+    last_body: Any = None
     for attempt in range(retries + 1):
         try:
             async with session.get(
@@ -65,13 +81,15 @@ async def get_json(
                 if resp.status in ok_statuses:
                     text = await resp.text()
                     return json.loads(text) if text.strip() else None
+                last_body = await _error_body(resp)
                 if not _retryable(resp.status):
-                    raise UpstreamError(resp.status, url)
+                    raise UpstreamError(resp.status, url, last_body)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last = 0
+            last_body = None
             log.warning("http_transport_error", url=url, error=repr(exc))
         if attempt < retries:
             delay = backoff[min(attempt, len(backoff) - 1)]
             log.warning("http_retry", url=url, status=last, delay=delay)
             await sleep(delay)
-    raise UpstreamError(last, url)
+    raise UpstreamError(last, url, last_body)

@@ -408,3 +408,66 @@ async def test_calls_this_month_is_bounded_to_one_month(store):
     assert await calls_this_month(store, "2026-10-09T00:00:00Z") == 5
     assert await calls_this_month(store, "2026-11-20T00:00:00Z") == 11
     assert await calls_this_month(store, "2026-12-01T00:00:00Z") == 13
+
+
+async def test_quota_exhausted_429_is_not_retried(store, cg_settings):
+    from structlog.testing import capture_logs
+
+    sleep = RecordingSleep()
+    with aioresponses() as m:
+        m.get(MARKETS, status=429, payload={"status": {"error_code": 10006}})
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                with pytest.raises(PartialFailure) as ei:
+                    await markets_sweep(store, cg_settings, s, NOW, sleep=sleep)
+    assert ei.value.cause.status == 429 and ei.value.credits_used == 1
+    assert sleep.calls == []
+    assert [e["event"] for e in logs].count("cg_quota_exhausted") == 1
+    assert "cg_retry" not in [e["event"] for e in logs]
+
+
+async def test_quota_code_at_top_level_is_not_retried(cg_settings):
+    from gecko.collectors.coingecko import CGClient
+
+    sleep = RecordingSleep()
+    with aioresponses() as m:
+        m.get(MARKETS, status=429, payload={"error_code": 10006})
+        async with aiohttp.ClientSession() as s:
+            cg = CGClient(s, cg_settings, sleep)
+            with pytest.raises(UpstreamError):
+                await cg.get("/coins/markets", {"page": 1})
+    assert cg.calls == 1 and sleep.calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "<html>Too Many Requests</html>",
+        '{"status": {"error_code": 429}}',
+    ],
+)
+async def test_plain_429_is_still_retried(cg_settings, body):
+    from gecko.collectors.coingecko import CGClient
+
+    sleep = RecordingSleep()
+    with aioresponses() as m:
+        m.get(MARKETS, status=429, body=body)
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            cg = CGClient(s, cg_settings, sleep)
+            assert await cg.get("/coins/markets", {"page": 1}) == []
+    assert cg.calls == 2 and 2.0 in sleep.calls
+
+
+async def test_quota_code_on_non_429_is_still_retried(cg_settings):
+    from gecko.collectors.coingecko import CGClient
+
+    sleep = RecordingSleep()
+    with aioresponses() as m:
+        m.get(MARKETS, status=503, payload={"status": {"error_code": 10006}})
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            cg = CGClient(s, cg_settings, sleep)
+            assert await cg.get("/coins/markets", {"page": 1}) == []
+    assert cg.calls == 2
