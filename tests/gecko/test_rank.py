@@ -89,9 +89,11 @@ STATS = {
 
 
 def test_score_missing_contributes_zero_and_bundle_penalty():
-    s1 = score(feat(vol_7d_ratio=3.0), STATS)  # z=1, rest missing -> 1.0
+    # vol z=1 (w1.0); holder/smart missing -> 0; zero callers is a real
+    # caller_signal 0 -> z=-1 (w0.5)
+    s1 = score(feat(vol_7d_ratio=3.0), STATS)
     s2 = score(feat(vol_7d_ratio=3.0, bundle_flag=True), STATS)
-    assert s1 == pytest.approx(1.0) and s2 == pytest.approx(0.0)
+    assert s1 == pytest.approx(1.0 - 0.5) and s2 == pytest.approx(1.0 - 0.5 - 1.0)
 
 
 def test_score_weights_and_caller_signal():
@@ -107,9 +109,12 @@ def test_score_weights_and_caller_signal():
     # caller_quality None counts as 0 -> caller_signal 0 -> z=-1 (w0.5)
     g = feat(vol_7d_ratio=None, callers_7d=3, caller_quality=None)
     assert score(g, STATS) == pytest.approx(-0.5)
-    # zero std contributes nothing
+    # zero callers is a real 0 too, not missing: same -0.5
+    z = feat(vol_7d_ratio=None, callers_7d=0)
+    assert score(z, STATS) == pytest.approx(-0.5)
+    # zero std contributes nothing (only the zero-callers -0.5 term remains)
     flat = dict(STATS, vol_7d_ratio=(2.0, 0.0))
-    assert score(feat(vol_7d_ratio=9.0), flat) == pytest.approx(0.0)
+    assert score(feat(vol_7d_ratio=9.0), flat) == pytest.approx(-0.5)
 
 
 async def seed_token(store, tid, *, age_days=30, liq=300_000.0, vols=None):
@@ -371,5 +376,81 @@ async def test_rank_job_runs_and_records(settings):
         assert [w.entered_at for w in wl] == ["2026-10-15T00:00:00Z"]
         row = await one(s, "SELECT job, ok, rows_written FROM runs")
         assert row == ("rank", 1, 1)
+    finally:
+        await s.close()
+
+
+def test_unknown_quality_callers_do_not_rank_below_zero_callers():
+    # both have caller_signal 0, so the caller term contributes equally
+    some = feat(token_id="solana:some", callers_7d=3, caller_quality=None)
+    none_ = feat(token_id="solana:none", callers_7d=0)
+    assert score(some, STATS) == pytest.approx(score(none_, STATS))
+
+
+async def test_rank_refuses_as_of_rewind_of_last_ranked(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    before = await one(store, "SELECT rank, score, last_ranked_at FROM watchlist")
+    # an active token the rewound run WOULD disqualify: the refusal must
+    # come before any status write
+    await seed_token(store, "solana:thin", liq=1000.0)
+    with pytest.raises(ValueError, match="as_of rewinds ranking state"):
+        await rank_once(store, settings, "2026-10-14T23:00:00Z")
+    thin = "SELECT status, disqualify_reason FROM tokens WHERE token_id='solana:thin'"
+    assert await one(store, thin) == ("active", None)
+    # equal as_of (any offset spelling) is allowed and idempotent
+    r = await rank_once(store, settings, "2026-10-15T00:00:00+00:00")
+    assert r.entered == [] and r.exited == [] and r.ranked == 1
+    assert await one(store, thin) == ("disqualified", "liquidity")
+    assert (
+        await one(store, "SELECT rank, score, last_ranked_at FROM watchlist") == before
+    )
+    due = await store.due_returns("2028-01-01T00:00:00Z")
+    assert len(due) == 5
+
+
+async def test_rank_refuses_as_of_rewind_of_exit(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "dexscreener",
+        "2026-10-15T06:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 10.0},
+    )
+    await rank_once(store, settings, "2026-10-15T07:00:00Z")
+    # last_ranked_at stays at A (the exited row is not re-ranked); exited_at is 07:00
+    assert await one(store, "SELECT last_ranked_at, exited_at FROM watchlist") == (
+        A,
+        "2026-10-15T07:00:00Z",
+    )
+    status_before = await one(store, "SELECT status, disqualify_reason FROM tokens")
+    with pytest.raises(ValueError, match="as_of rewinds ranking state"):
+        await rank_once(store, settings, "2026-10-15T06:59:59Z")
+    # refused before any write
+    assert (
+        await one(store, "SELECT status, disqualify_reason FROM tokens")
+        == status_before
+    )
+
+
+async def test_rank_job_exits_1_on_rewind(settings):
+    from gecko.__main__ import _load_jobs
+    from gecko.jobs import JOBS
+    from gecko.store import Store
+
+    _load_jobs()
+    s = await Store.open(settings.db_path)
+    try:
+        await seed_token(s, "solana:good")
+        await rank_once(s, settings, A)
+    finally:
+        await s.close()
+    rc = await JOBS["rank"](settings, argparse.Namespace(as_of="2026-10-14T00:00:00Z"))
+    assert rc == 1
+    s = await Store.open(settings.db_path)
+    try:
+        row = await one(s, "SELECT ok, error FROM runs WHERE job='rank'")
+        assert row[0] == 0 and "as_of rewinds ranking state" in row[1]
     finally:
         await s.close()

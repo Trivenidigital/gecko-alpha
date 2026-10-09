@@ -61,7 +61,7 @@ def _raw(f: Features) -> dict[str, float | None]:
         "holder_growth_7d": f.holder_growth_7d,
         "smart_money_wallets": f.smart_money_wallets,
         "caller_signal": (
-            (f.callers_7d * (f.caller_quality or 0.0)) if f.callers_7d else None
+            None if f.callers_7d is None else f.callers_7d * (f.caller_quality or 0.0)
         ),
     }
 
@@ -104,6 +104,17 @@ async def _column(store: Store, sql: str) -> list[str]:
 
 
 async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankReport:
+    as_of = canon_ts(as_of)
+    # Watchlist state is not point-in-time: ranking at an earlier as_of than
+    # state already written would mix futures into the past. Refuse, before
+    # any write.
+    latest = await (
+        await store.conn.execute(
+            "SELECT MAX(last_ranked_at), MAX(exited_at) FROM watchlist"
+        )
+    ).fetchone()
+    if any(ts is not None and as_of < ts for ts in latest):
+        raise ValueError("as_of rewinds ranking state")
     feats: dict[str, Features] = {}
     for tid in await _column(
         store, "SELECT token_id FROM tokens WHERE status='active'"
