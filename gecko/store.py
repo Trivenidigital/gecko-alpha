@@ -137,9 +137,10 @@ class Store:
     async def open(cls, path: str) -> "Store":
         conn = await aiosqlite.connect(path)
         try:
+            # busy_timeout first: switching to WAL itself needs the lock.
+            await conn.execute("PRAGMA busy_timeout=30000")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA foreign_keys=ON")
-            await conn.execute("PRAGMA busy_timeout=30000")
             await conn.executescript(SCHEMA)
             for table, col, decl in LATE_COLUMNS:
                 info = await (
@@ -333,6 +334,25 @@ class Store:
         )
         await self.conn.commit()
 
+    async def repair_schedules(self, horizons=(1, 7, 30, 90, 180)) -> int:
+        """Schedule any missing horizon of every watchlist entry, exited ones
+        included, at its stored ``entered_at``. Returns rows inserted.
+
+        Table-driven, so a crash between a watchlist write and its scheduling
+        is repaired whatever has happened to the entry since.
+        """
+        rows = await (
+            await self.conn.execute("SELECT token_id, entered_at FROM watchlist")
+        ).fetchall()
+        before = self.conn.total_changes
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO forward_returns(token_id,horizon_days,due_at) "
+            "VALUES(?,?,?)",
+            [(tid, h, iso_plus(at, h)) for tid, at in rows for h in horizons],
+        )
+        await self.conn.commit()
+        return self.conn.total_changes - before
+
     async def due_returns(self, now: str) -> list[ReturnRow]:
         rows = await (
             await self.conn.execute(
@@ -401,14 +421,30 @@ class Store:
         await self.conn.commit()
 
     async def bump_return_attempt(
-        self, token_id, horizon_days, *, attempted_at: str | None = None
-    ) -> int:
-        await self.conn.execute(
+        self,
+        token_id,
+        horizon_days,
+        *,
+        attempted_at: str | None = None,
+        min_gap_hours: float = 20,
+    ) -> int | None:
+        """Spend one attempt, unless one was spent within ``min_gap_hours``.
+
+        The gap is enforced in the UPDATE itself, so two overlapping runs that
+        both passed an in-memory check still spend only one. Returns the new
+        attempt count, or None when gated.
+        """
+        at = canon_ts(attempted_at) or utcnow()
+        floor = canon_ts((parse_utc(at) - timedelta(hours=min_gap_hours)).isoformat())
+        cur = await self.conn.execute(
             "UPDATE forward_returns SET attempts=attempts+1, last_attempt_at=? "
-            "WHERE token_id=? AND horizon_days=?",
-            (canon_ts(attempted_at) or utcnow(), token_id, horizon_days),
+            "WHERE token_id=? AND horizon_days=? "
+            "AND (last_attempt_at IS NULL OR last_attempt_at<=?)",
+            (at, token_id, horizon_days, floor),
         )
         await self.conn.commit()
+        if cur.rowcount == 0:
+            return None
         row = await (
             await self.conn.execute(
                 "SELECT attempts FROM forward_returns WHERE token_id=? AND horizon_days=?",

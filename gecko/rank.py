@@ -185,17 +185,15 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
         await store.watchlist_upsert(
             tid, as_of, RULE_ID, rank, scores[tid], feats[tid].as_dict()
         )
-    # Every ranked row, not only entrants: INSERT OR IGNORE makes it idempotent,
-    # and it repairs an entrant whose scheduling a crash cut off last run.
-    for tid in final:
-        await store.schedule_returns(
-            tid, current[tid].entered_at if tid in current else as_of
-        )
+    # Table-driven: schedules this run's entrants and repairs any entry (even
+    # one exited since) whose scheduling an earlier crash cut off.
+    repaired = await store.repair_schedules()
     log.info(
         "rank_done",
         as_of=as_of,
         ranked=len(final),
         entered=len(entering),
+        scheduled=repaired,
         exited=len(exited),
     )
     return RankReport(entering, exited, len(final))

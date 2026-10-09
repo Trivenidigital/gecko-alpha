@@ -46,12 +46,15 @@ WRITER_JOBS = {
     "research_notes": ("research",),
     "observations:dexscreener": ("dexscreener",),
     "observations:geckoterminal": ("geckoterminal",),
-    "observations:coingecko": ("coingecko-markets", "coingecko-hourly"),
+    "observations:coingecko": ("coingecko-markets",),
     "observations:geckoterminal_ohlcv": ("geckoterminal-ohlcv",),
     "benchmark:btc": ("coingecko-hourly",),
 }
 # Tables whose writer may legitimately write 0 rows; judged by its last ok run.
-RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
+# observations:geckoterminal too: an hour with no in-band pool is legitimate.
+RUN_ANCHORED = frozenset(
+    {"watchlist", "forward_returns", "research_notes", "observations:geckoterminal"}
+)
 DEDUP_HOURS = 6
 
 
@@ -90,6 +93,13 @@ async def _last_write(store: Store, key: str) -> str | None:
         where, args = "source=?", (src,)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
+        elif (
+            src == "coingecko"
+        ):  # markets rows only: hourly BTC/trending mask a dead sweep
+            where += (
+                " AND token_id!='benchmark:btc'"
+                " AND json_extract(features_json, '$.trending_rank') IS NULL"
+            )
     else:
         return await store.last_write(key)
     row = await (

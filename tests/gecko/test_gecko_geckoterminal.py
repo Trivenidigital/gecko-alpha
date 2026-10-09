@@ -507,3 +507,31 @@ async def test_every_list_failing_fails_the_run(store, settings, monkeypatch):
     async with aiohttp.ClientSession() as s:
         with pytest.raises(RuntimeError, match="all 2 geckoterminal pool lists"):
             await collect_pools(store, settings, s, NOW, sleep=nosleep)
+
+
+async def test_stale_candidate_back_in_band_pool_is_revived(store, settings):
+    settings.chains = ["solana"]
+    addr = "So1anaTokenAddr" + "1" * 20
+    tid = f"solana:{addr}"
+    await store.upsert_token(tid, "solana", addr, "A", "A", "2026-09-01T00:00:00Z", "x")
+    await store.set_token_status(tid, "disqualified", "stale_candidate")
+    with aioresponses() as m:
+        m.get(
+            POOLS_URL.format(network="solana", list="new_pools"),
+            payload={"data": [pool()]},
+        )
+        m.get(
+            POOLS_URL.format(network="solana", list="trending_pools"),
+            payload={"data": []},
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                await collect_pools(store, settings, s, NOW, sleep=nosleep)
+    row = await (
+        await store.conn.execute(
+            "SELECT status, disqualify_reason, first_seen_at FROM tokens"
+        )
+    ).fetchone()
+    assert row == ("candidate", None, NOW)
+    done = [e for e in logs if e["event"] == "geckoterminal_pools_done"][0]
+    assert done["revived"] == 1

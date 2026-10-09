@@ -423,3 +423,42 @@ async def test_benchmark_check_reads_only_the_benchmark(store):
         if x.table == "benchmark:btc"
     ]
     assert len(b) == 1 and b[0].last_write == T_OBS
+
+
+@pytest.mark.parametrize("with_btc", [True, False])
+async def test_coingecko_slo_counts_only_markets_rows(store, with_btc):
+    await store.record_run("coingecko-markets", T_OBS, T_OBS, True)
+    await store.add_observation("solana:a", "coingecko", T_OBS, {"mcap_usd": 1e6})
+    later = _plus(int(3.5 * 1440))
+    await store.add_observation("solana:a", "coingecko", later, {"trending_rank": 1})
+    if with_btc:  # the hourly job keeps writing: it must not mask a dead sweep
+        await store.add_observation(
+            "benchmark:btc", "coingecko", later, {"price_usd": 60000.0}
+        )
+    b = [
+        x
+        for x in await check_freshness(store, later)
+        if x.table == "observations:coingecko"
+    ]
+    assert len(b) == 1 and b[0].last_write == T_OBS
+
+
+async def test_hourly_run_does_not_bootstrap_the_markets_slo(store):
+    await store.record_run("coingecko-hourly", T_OBS, T_OBS, True)
+    await store.add_observation("solana:a", "coingecko", T_OBS, {"mcap_usd": 1e6})
+    tables = [b.table for b in await check_freshness(store, _plus(3000))]
+    assert "observations:coingecko" not in tables
+
+
+async def test_geckoterminal_slo_is_anchored_on_its_last_ok_run(store):
+    # an hour with no in-band pool writes no row: the writer is still alive
+    await store.record_run("geckoterminal", T_OBS, T_OBS, True)
+    await store.record_run("geckoterminal", _plus(100), _plus(100), True)
+    tables = [b.table for b in await check_freshness(store, _plus(130))]
+    assert "observations:geckoterminal" not in tables
+    b = [
+        x
+        for x in await check_freshness(store, _plus(170))
+        if x.table == "observations:geckoterminal"
+    ]
+    assert len(b) == 1 and b[0].last_write == _plus(100)

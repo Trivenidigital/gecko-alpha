@@ -655,7 +655,9 @@ async def test_attempts_are_spaced_twenty_hours(store, settings):
         async with aiohttp.ClientSession() as s:
             r1 = await measure_due(store, settings, s, NOW)
             r2 = await measure_due(store, settings, s, "2026-10-02T03:00:00Z")
-    assert (r1.failed, r2.failed, r2.skipped) == (1, 0, 1)
+        # the gated run spends no request at all
+        assert sum(len(v) for v in m.requests.values()) == 1
+    assert (r1.failed, r2.failed, r2.gated, r2.skipped) == (1, 0, 1, 0)
     assert await one(
         store,
         "SELECT attempts, last_attempt_at FROM forward_returns WHERE horizon_days=1",
@@ -691,3 +693,39 @@ async def test_canary_upstream_error_counts_as_failed(store, settings, real_cana
     assert await _attempts(store) == (0,)
     (e,) = [e for e in logs if e["event"] == "ledger_canary_failed"]
     assert e["status"] == 410
+
+
+async def test_overlapping_bumps_spend_one_attempt(store):
+    await seed(store)
+    # both callers read last_attempt_at=None (each passed the in-memory gate)
+    assert [d.last_attempt_at for d in await store.due_returns(NOW)] == [None]
+    first = await store.bump_return_attempt("solana:abc", 1, attempted_at=NOW)
+    second = await store.bump_return_attempt(
+        "solana:abc", 1, attempted_at="2026-10-02T03:00:00Z"
+    )
+    assert (first, second) == (1, None)
+    assert await one(
+        store, "SELECT attempts FROM forward_returns WHERE horizon_days=1"
+    ) == (1,)
+    # 20 h later the next attempt is allowed
+    assert (
+        await store.bump_return_attempt(
+            "solana:abc", 1, attempted_at="2026-10-02T22:00:00Z"
+        )
+        == 2
+    )
+
+
+async def test_ledger_run_repairs_missing_schedules_first(store, settings):
+    await seed(store)
+    await store.conn.execute("DELETE FROM forward_returns")
+    await store.conn.commit()
+    with aioresponses() as m:
+        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await measure_due(store, settings, s, NOW)
+    assert r.measured == 1  # the repaired h=1 row was due and measured this run
+    assert await one(store, "SELECT COUNT(*) FROM forward_returns") == (5,)
+    (e,) = [e for e in logs if e["event"] == "ledger_schedules_repaired"]
+    assert e["rows"] == 5

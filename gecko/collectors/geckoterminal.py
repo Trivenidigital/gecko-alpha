@@ -74,7 +74,7 @@ async def collect_pools(
 ) -> JobResult:
     now = canon_ts(now)
     pacer = Pacer(settings.gt_min_interval_sec, sleep)
-    written = skipped = invalid = lists = failed = 0
+    written = skipped = invalid = lists = failed = revived = 0
     for chain in settings.chains:
         network = NETWORK_MAP[chain]
         for list_name in LISTS:
@@ -136,6 +136,8 @@ async def collect_pools(
                     "geckoterminal",
                     pool_created_at=created,
                 )
+                # An aged-out candidate back in band starts a fresh candidacy.
+                revived += await store.revive_candidate(tid, now)
                 await store.add_observation(tid, "geckoterminal", now, f)
                 written += 1
     promoted = await admit_survivors(store, settings, now)
@@ -145,6 +147,7 @@ async def collect_pools(
         skipped=skipped,
         invalid=invalid,
         promoted=promoted,
+        revived=revived,
         lists=lists,
         lists_failed=failed,
     )

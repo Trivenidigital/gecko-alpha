@@ -546,15 +546,15 @@ async def test_crash_before_scheduling_is_repaired_next_run(
     store, settings, monkeypatch
 ):
     await seed_token(store, "solana:good")
-    real = store.schedule_returns
+    real = store.repair_schedules
 
     async def boom(*a, **k):
         raise RuntimeError("crash between upsert and scheduling")
 
-    monkeypatch.setattr(store, "schedule_returns", boom)
+    monkeypatch.setattr(store, "repair_schedules", boom)
     with pytest.raises(RuntimeError, match="crash between"):
         await rank_once(store, settings, A)
-    monkeypatch.setattr(store, "schedule_returns", real)
+    monkeypatch.setattr(store, "repair_schedules", real)
     assert (await one(store, "SELECT COUNT(*) FROM forward_returns")) == (0,)
     await rank_once(store, settings, "2026-10-15T00:30:00Z")
     rows = await (
@@ -564,3 +564,34 @@ async def test_crash_before_scheduling_is_repaired_next_run(
     ).fetchall()
     assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
     assert rows[0][1] == "2026-10-16T00:00:00Z"  # from the stored entered_at
+
+
+async def test_crashed_entrant_that_exits_next_run_is_still_scheduled(
+    store, settings, monkeypatch
+):
+    await seed_token(store, "solana:good")
+    real = store.repair_schedules
+
+    async def boom(*a, **k):
+        raise RuntimeError("crash between upsert and scheduling")
+
+    monkeypatch.setattr(store, "repair_schedules", boom)
+    with pytest.raises(RuntimeError, match="crash between"):
+        await rank_once(store, settings, A)
+    monkeypatch.setattr(store, "repair_schedules", real)
+    # liquidity collapses before the next rank: the entrant exits that run
+    await store.add_observation(
+        "solana:good",
+        "dexscreener",
+        "2026-10-15T00:20:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 10.0},
+    )
+    r = await rank_once(store, settings, "2026-10-15T00:30:00Z")
+    assert r.exited == ["solana:good"]
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, due_at FROM forward_returns ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
+    assert rows[0][1] == "2026-10-16T00:00:00Z"

@@ -536,3 +536,42 @@ async def test_failed_open_closes_its_connection(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         await Store.open(path)
     assert closed == [True]
+
+
+async def test_busy_timeout_is_set_before_wal(tmp_path, monkeypatch):
+    import aiosqlite
+
+    from gecko.store import Store
+
+    real_execute = aiosqlite.Connection.execute
+    seen: list[str] = []
+
+    async def spy(self, sql, *a, **k):
+        seen.append(sql)
+        return await real_execute(self, sql, *a, **k)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", spy)
+    s = await Store.open(str(tmp_path / "order.db"))
+    await s.close()
+    assert seen.index("PRAGMA busy_timeout=30000") < seen.index(
+        "PRAGMA journal_mode=WAL"
+    )
+
+
+async def test_repair_schedules_covers_exited_entries_and_is_idempotent(store):
+    await store.watchlist_upsert("s:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.watchlist_upsert("s:b", "2026-10-02T00:00:00Z", "F4", 2, 1.0, {})
+    await store.watchlist_exit("s:b", "2026-10-03T00:00:00Z", "liquidity")
+    await store.schedule_returns("s:a", "2026-10-01T00:00:00Z", horizons=(1,))
+    assert await store.repair_schedules() == 9
+    assert await store.repair_schedules() == 0
+    rows = await (
+        await store.conn.execute(
+            "SELECT token_id, horizon_days, due_at FROM forward_returns "
+            "WHERE horizon_days=1 ORDER BY token_id"
+        )
+    ).fetchall()
+    assert rows == [
+        ("s:a", 1, "2026-10-02T00:00:00Z"),
+        ("s:b", 1, "2026-10-03T00:00:00Z"),
+    ]

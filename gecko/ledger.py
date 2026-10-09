@@ -179,6 +179,7 @@ class LedgerReport:
     total_loss: int = 0
     unmeasurable: int = 0
     skipped: int = 0
+    gated: int = 0
 
 
 async def _resolve_entry(
@@ -256,6 +257,8 @@ async def measure_due(
     closed: set[str] = set()
     pacer = Pacer(settings.ds_min_interval_sec, sleep)
     canary: dict[str, bool] = {}
+    if repaired := await store.repair_schedules():
+        log.warning("ledger_schedules_repaired", rows=repaired)
     for due in await store.due_returns(now):
         tid, h = due.token_id, due.horizon_days
         if tid in closed:
@@ -303,6 +306,10 @@ async def measure_due(
                 log.info("ledger_entry_price_pending", token_id=tid, horizon_days=h)
                 rep.skipped += 1
             continue
+        last = due.last_attempt_at
+        if last and parse_utc(now) - parse_utc(last) < ATTEMPT_SPACING:
+            rep.gated += 1  # attempted within 20 h: no request, one attempt a day
+            continue
         if chain not in canary:
             canary[chain] = await _canary_ok(session, settings, chain, pacer)
         await pacer.wait()
@@ -340,11 +347,15 @@ async def measure_due(
                 )
                 rep.skipped += 1
                 continue
-            last = due.last_attempt_at
-            if last and parse_utc(now) - parse_utc(last) < ATTEMPT_SPACING:
-                rep.skipped += 1  # attempted within 20 h: one attempt per day
+            attempts = await store.bump_return_attempt(
+                tid,
+                h,
+                attempted_at=now,
+                min_gap_hours=ATTEMPT_SPACING.total_seconds() / 3600,
+            )
+            if attempts is None:  # an overlapping run spent today's attempt
+                rep.gated += 1
                 continue
-            attempts = await store.bump_return_attempt(tid, h, attempted_at=now)
             if attempts < MAX_ATTEMPTS:
                 rep.failed += 1
                 continue
