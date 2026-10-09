@@ -39,27 +39,25 @@ async def admit_survivors(store: Store, settings: GeckoSettings, now: str) -> in
             (*MARKET_SOURCES, now),
         )
     ).fetchall()
-    by_token: dict[str, list[tuple[str, float | None]]] = {}
+    by_token: dict[str, list[tuple[str, float]]] = {}
     for tid, obs_at, fj in rows:
-        by_token.setdefault(tid, []).append(
-            (obs_at, json.loads(fj).get("liquidity_usd"))
-        )
+        liq = json.loads(fj).get("liquidity_usd")
+        if liq is None:
+            continue  # e.g. coingecko rows: no liquidity, cannot decide admission
+        by_token.setdefault(tid, []).append((obs_at, liq))
+    floor = settings.min_liquidity_usd
     promoted = 0
     for tid, obs in by_token.items():
         latest_at, latest_liq = obs[-1]
-        if (
-            latest_at < since
-            or latest_liq is None
-            or latest_liq < settings.min_liquidity_usd
-        ):
+        if latest_at < since or latest_liq < floor:
             continue
+        # The survival window must be contiguous: anchors only after the last dip.
+        start = 0
+        for i, (_, liq) in enumerate(obs):
+            if liq < floor:
+                start = i + 1
         cutoff = parse_utc(latest_at) - timedelta(hours=settings.survivor_hours)
-        if any(
-            liq is not None
-            and liq >= settings.min_liquidity_usd
-            and parse_utc(at) <= cutoff
-            for at, liq in obs[:-1]
-        ):
+        if any(parse_utc(at) <= cutoff for at, _ in obs[start:-1]):
             await store.set_token_status(tid, "active")
             promoted += 1
     return promoted

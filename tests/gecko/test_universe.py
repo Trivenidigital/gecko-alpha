@@ -15,7 +15,14 @@ async def seed(store):
     )
 
 
-async def test_admit_requires_24h_survival(store, settings):
+async def status(store):
+    row = await (
+        await store.conn.execute("SELECT status FROM tokens WHERE token_id='solana:a'")
+    ).fetchone()
+    return row[0]
+
+
+async def test_admit_requires_contiguous_24h_survival(store, settings):
     await seed(store)
     await store.add_observation(
         "solana:a", "dexscreener", "2026-10-01T00:00:00Z", {"liquidity_usd": 300_000}
@@ -29,15 +36,47 @@ async def test_admit_requires_24h_survival(store, settings):
     )
     assert (
         await admit_survivors(store, settings, "2026-10-02T02:00:00Z") == 0
-    )  # later obs below floor
+    )  # latest below floor
     await store.add_observation(
         "solana:a", "dexscreener", "2026-10-02T03:00:00Z", {"liquidity_usd": 300_000}
     )
-    assert await admit_survivors(store, settings, "2026-10-02T04:00:00Z") == 1
-    row = await (
-        await store.conn.execute("SELECT status FROM tokens WHERE token_id='solana:a'")
-    ).fetchone()
-    assert row[0] == "active"
     assert (
-        await admit_survivors(store, settings, "2026-10-02T05:00:00Z") == 0
+        await admit_survivors(store, settings, "2026-10-02T04:00:00Z") == 0
+    )  # anchor reset by dip
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-03T04:00:00Z", {"liquidity_usd": 300_000}
+    )
+    assert await admit_survivors(store, settings, "2026-10-03T05:00:00Z") == 1
+    assert await status(store) == "active"
+    assert (
+        await admit_survivors(store, settings, "2026-10-03T06:00:00Z") == 0
     )  # idempotent
+
+
+async def test_trailing_observation_without_liquidity_is_ignored(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-01T00:00:00Z", {"liquidity_usd": 300_000}
+    )
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-02T01:00:00Z", {"liquidity_usd": 300_000}
+    )
+    await store.add_observation(
+        "solana:a", "coingecko", "2026-10-02T02:00:00Z", {"mcap_usd": 1e6}
+    )
+    assert await admit_survivors(store, settings, "2026-10-02T03:00:00Z") == 1
+    assert await status(store) == "active"
+
+
+async def test_stale_latest_observation_never_admits(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-01T00:00:00Z", {"liquidity_usd": 300_000}
+    )
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-02T01:00:00Z", {"liquidity_usd": 300_000}
+    )
+    assert (
+        await admit_survivors(store, settings, "2026-10-04T02:00:00Z") == 0
+    )  # latest is 49h old
+    assert await status(store) == "candidate"

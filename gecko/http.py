@@ -10,7 +10,10 @@ import structlog
 from gecko.settings import GeckoSettings
 
 log = structlog.get_logger("gecko.http")
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _retryable(status: int) -> bool:
+    return status == 429 or 500 <= status <= 599
 
 
 class UpstreamError(Exception):
@@ -34,18 +37,22 @@ async def get_json(
 ) -> Any:
     last = 0
     for attempt in range(retries + 1):
-        async with session.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=settings.http_timeout_sec),
-        ) as resp:
-            last = resp.status
-            if resp.status in ok_statuses:
-                text = await resp.text()
-                return json.loads(text) if text.strip() else None
-            if resp.status not in RETRY_STATUSES:
-                raise UpstreamError(resp.status, url)
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=settings.http_timeout_sec),
+            ) as resp:
+                last = resp.status
+                if resp.status in ok_statuses:
+                    text = await resp.text()
+                    return json.loads(text) if text.strip() else None
+                if not _retryable(resp.status):
+                    raise UpstreamError(resp.status, url)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last = 0
+            log.warning("http_transport_error", url=url, error=repr(exc))
         if attempt < retries:
             delay = backoff[min(attempt, len(backoff) - 1)]
             log.warning("http_retry", url=url, status=last, delay=delay)
