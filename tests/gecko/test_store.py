@@ -1,6 +1,8 @@
 import json
 import pytest
 
+from gecko.store import canon_ts
+
 
 async def test_schema_has_seven_tables(store):
     rows = await (
@@ -114,3 +116,192 @@ async def test_last_write(store):
     assert await store.last_write("observations") is None
     await store.record_run("x", "2026-10-01T00:00:00Z", "2026-10-01T00:00:05Z", True)
     assert await store.last_write("runs") == "2026-10-01T00:00:05Z"
+
+
+async def _token_with_returns(store):
+    await store.upsert_token(
+        "solana:abc",
+        "solana",
+        "ABC",
+        "ABC",
+        "Abc",
+        "2026-10-01T00:00:00Z",
+        "dexscreener",
+    )
+    await store.schedule_returns("solana:abc", "2026-10-01T00:00:00Z")
+
+
+async def test_set_return_arithmetic(store):
+    await _token_with_returns(store)
+    await store.set_return(
+        "solana:abc", 1, 1.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
+    )
+    ret, ret_vs_btc, measured_at = await (
+        await store.conn.execute(
+            "SELECT ret, ret_vs_btc, measured_at FROM forward_returns "
+            "WHERE horizon_days=1"
+        )
+    ).fetchone()
+    assert ret == pytest.approx(0.5)
+    assert ret_vs_btc == pytest.approx(0.5 - (61000 / 60000 - 1))
+    assert measured_at == "2026-10-02T01:00:00Z"
+
+
+async def test_set_return_raises_on_missing_btc_and_leaves_row_due(store):
+    await _token_with_returns(store)
+    with pytest.raises(ValueError, match="required"):
+        await store.set_return(
+            "solana:abc", 1, 1.0, 1.5, 60000.0, None, "2026-10-02T01:00:00Z"
+        )
+    due = await store.due_returns("2026-10-09T00:00:00Z")
+    assert [r.horizon_days for r in due] == [1, 7]
+
+
+async def test_set_return_is_write_once(store):
+    await _token_with_returns(store)
+    await store.set_return(
+        "solana:abc", 1, 1.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
+    )
+    with pytest.raises(ValueError, match="already measured"):
+        await store.set_return(
+            "solana:abc", 1, 1.0, 9.0, 60000.0, 61000.0, "2026-10-03T01:00:00Z"
+        )
+    row = await (
+        await store.conn.execute(
+            "SELECT price, measured_at FROM forward_returns WHERE horizon_days=1"
+        )
+    ).fetchone()
+    assert row == (1.5, "2026-10-02T01:00:00Z")
+
+
+async def test_set_return_missing_row_raises(store):
+    await _token_with_returns(store)
+    with pytest.raises(ValueError, match="row missing"):
+        await store.set_return(
+            "solana:abc", 2, 1.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
+        )
+
+
+async def test_set_return_zero_entry_price_finalizes_with_null_ret(store):
+    await _token_with_returns(store)
+    await store.set_return(
+        "solana:abc", 1, 0.0, 1.5, 60000.0, 61000.0, "2026-10-02T01:00:00Z"
+    )
+    row = await (
+        await store.conn.execute(
+            "SELECT ret, ret_vs_btc, measured_at FROM forward_returns "
+            "WHERE horizon_days=1"
+        )
+    ).fetchone()
+    assert row == (None, None, "2026-10-02T01:00:00Z")
+    due = await store.due_returns("2026-10-09T00:00:00Z")
+    assert [r.horizon_days for r in due] == [7]
+
+
+def test_canon_ts_forms():
+    assert canon_ts(None) is None
+    assert canon_ts("2026-10-02T00:00:00Z") == "2026-10-02T00:00:00Z"
+    assert canon_ts("2026-10-02T00:00:00+00:00") == "2026-10-02T00:00:00Z"
+    assert canon_ts("2026-10-01T22:00:00-02:00") == "2026-10-02T00:00:00Z"
+    assert canon_ts("2026-10-02T00:00:01.500Z") == "2026-10-02T00:00:01Z"
+    assert canon_ts("2026-10-02T00:00:00") == "2026-10-02T00:00:00Z"
+
+
+async def test_observations_as_of_with_mixed_iso_formats(store):
+    await store.upsert_token(
+        "solana:abc",
+        "solana",
+        "ABC",
+        "ABC",
+        "Abc",
+        "2026-10-01T00:00:00Z",
+        "dexscreener",
+    )
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-02T00:00:01.500Z", {"n": "late"}
+    )
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-02T00:00:00+00:00", {"n": "utc"}
+    )
+    await store.add_observation(
+        "solana:abc", "geckoterminal", "2026-10-01T22:00:00-02:00", {"n": "offset"}
+    )
+    obs = await store.observations("solana:abc", as_of="2026-10-02T00:00:00Z")
+    assert sorted(o.features["n"] for o in obs) == ["offset", "utc"]
+    stored = await (
+        await store.conn.execute("SELECT observed_at FROM observations ORDER BY id")
+    ).fetchall()
+    assert [r[0] for r in stored] == [
+        "2026-10-02T00:00:01Z",
+        "2026-10-02T00:00:00Z",
+        "2026-10-02T00:00:00Z",
+    ]
+    # an offset-form as_of is canonicalized too
+    obs = await store.observations("solana:abc", as_of="2026-10-01T21:00:00-03:00")
+    assert sorted(o.features["n"] for o in obs) == ["offset", "utc"]
+
+
+async def test_stored_timestamps_are_canonical(store):
+    await store.upsert_token(
+        "solana:abc",
+        "solana",
+        "ABC",
+        "ABC",
+        "Abc",
+        "2026-10-01T00:00:00.250+00:00",
+        "dexscreener",
+        pool_created_at="2026-09-30T20:00:00-04:00",
+    )
+    await store.record_run(
+        "x", "2026-10-01T00:00:00+00:00", "2026-10-01T02:00:05+02:00", True
+    )
+    await store.watchlist_upsert(
+        "solana:abc", "2026-10-01T00:00:00.9+00:00", "F4", 1, 2.5, {}
+    )
+    await store.watchlist_exit("solana:abc", "2026-10-03T00:00:00+00:00", "x")
+    await store.schedule_returns("solana:abc", "2026-10-01T00:00:00+00:00")
+    tok = await (
+        await store.conn.execute("SELECT first_seen_at, pool_created_at FROM tokens")
+    ).fetchone()
+    assert tok == ("2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z")
+    run = await (
+        await store.conn.execute("SELECT started_at, finished_at FROM runs")
+    ).fetchone()
+    assert run == ("2026-10-01T00:00:00Z", "2026-10-01T00:00:05Z")
+    wl = await (
+        await store.conn.execute(
+            "SELECT entered_at, last_ranked_at, exited_at FROM watchlist"
+        )
+    ).fetchone()
+    assert wl == (
+        "2026-10-01T00:00:00Z",
+        "2026-10-01T00:00:00Z",
+        "2026-10-03T00:00:00Z",
+    )
+    due = await store.due_returns("2026-10-02T02:00:00+02:00")
+    assert [(r.horizon_days, r.due_at) for r in due] == [(1, "2026-10-02T00:00:00Z")]
+
+
+async def test_observations_source_filter(store):
+    await store.upsert_token(
+        "solana:abc",
+        "solana",
+        "ABC",
+        "ABC",
+        "Abc",
+        "2026-10-01T00:00:00Z",
+        "dexscreener",
+    )
+    await store.add_observation("solana:abc", "dexscreener", "2026-10-01T00:00:00Z", {})
+    await store.add_observation(
+        "solana:abc", "geckoterminal", "2026-10-01T00:00:00Z", {}
+    )
+    obs = await store.observations(
+        "solana:abc", as_of="2026-10-02T00:00:00Z", source="geckoterminal"
+    )
+    assert [o.source for o in obs] == ["geckoterminal"]
+
+
+async def test_journal_mode_is_wal(store):
+    row = await (await store.conn.execute("PRAGMA journal_mode")).fetchone()
+    assert row[0] == "wal"

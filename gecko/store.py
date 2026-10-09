@@ -61,9 +61,28 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_utc(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def canon_ts(ts: str | None) -> str | None:
+    """Canonical UTC ``%Y-%m-%dT%H:%M:%SZ`` form of any ISO-8601 string.
+
+    Accepts a trailing ``Z``, ``+00:00`` or any other offset, and fractional
+    seconds (truncated). A naive timestamp is taken as UTC. ``None`` passes
+    through. Every stored timestamp and every comparison parameter goes
+    through this so that lexical SQL comparisons are chronological.
+    """
+    if ts is None:
+        return None
+    return _parse_utc(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def iso_plus(ts: str, days: int) -> str:
-    base = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return (base + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (_parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass
@@ -134,9 +153,9 @@ class Store:
                 symbol,
                 name,
                 cg_id,
-                first_seen_at,
+                canon_ts(first_seen_at),
                 first_source,
-                pool_created_at,
+                canon_ts(pool_created_at),
                 utcnow(),
             ),
         )
@@ -154,7 +173,12 @@ class Store:
     ) -> int:
         cur = await self.conn.execute(
             "INSERT INTO observations(token_id,source,observed_at,features_json) VALUES(?,?,?,?)",
-            (token_id, source, observed_at, json.dumps(features, sort_keys=True)),
+            (
+                token_id,
+                source,
+                canon_ts(observed_at),
+                json.dumps(features, sort_keys=True),
+            ),
         )
         await self.conn.commit()
         return cur.lastrowid
@@ -166,8 +190,8 @@ class Store:
             "SELECT token_id,source,observed_at,features_json FROM observations "
             "WHERE token_id=? AND observed_at<=?"
         )
-        args: list = [token_id, as_of]
-        if source:
+        args: list = [token_id, canon_ts(as_of)]
+        if source is not None:
             sql += " AND source=?"
             args.append(source)
         sql += " ORDER BY observed_at DESC LIMIT ?"
@@ -190,8 +214,8 @@ class Store:
             "VALUES(?,?,?,?,?,?,?)",
             (
                 job,
-                started_at,
-                finished_at,
+                canon_ts(started_at),
+                canon_ts(finished_at),
                 1 if ok else 0,
                 rows_written,
                 credits_used,
@@ -211,6 +235,7 @@ class Store:
     async def watchlist_upsert(
         self, token_id, entered_at, rule_id, rank, score, features_at_entry: dict
     ) -> None:
+        entered_at = canon_ts(entered_at)
         await self.conn.execute(
             "INSERT INTO watchlist(token_id,entered_at,rule_id,rank,score,"
             "features_at_entry_json,last_ranked_at) VALUES(?,?,?,?,?,?,?) "
@@ -231,7 +256,7 @@ class Store:
     async def watchlist_exit(self, token_id, exited_at, reason) -> None:
         await self.conn.execute(
             "UPDATE watchlist SET exited_at=?, exit_reason=? WHERE token_id=? AND exited_at IS NULL",
-            (exited_at, reason, token_id),
+            (canon_ts(exited_at), reason, token_id),
         )
         await self.conn.commit()
 
@@ -258,7 +283,7 @@ class Store:
             await self.conn.execute(
                 "SELECT token_id,horizon_days,due_at,attempts FROM forward_returns "
                 "WHERE measured_at IS NULL AND due_at<=? ORDER BY due_at, horizon_days",
-                (now,),
+                (canon_ts(now),),
             )
         ).fetchall()
         return [ReturnRow(*r) for r in rows]
@@ -273,18 +298,33 @@ class Store:
         btc_price,
         measured_at,
     ) -> None:
-        ret = (price / entry_price - 1.0) if entry_price and price is not None else None
-        btc_ret = (
-            (btc_price / btc_entry - 1.0)
-            if btc_entry and btc_price is not None
-            else None
-        )
-        ret_vs_btc = (
-            (ret - btc_ret) if ret is not None and btc_ret is not None else None
-        )
-        await self.conn.execute(
+        """Finalize one forward-return row. Write-once.
+
+        Raises ``ValueError`` when ``price``, ``btc_entry`` or ``btc_price`` is
+        missing (a ``btc_entry`` of 0 counts as missing): the measurement is
+        retryable later, so the row must stay unmeasured. A missing or zero
+        ``entry_price`` is allowed and finalizes the row with ``ret`` and
+        ``ret_vs_btc`` NULL, because an entry price that never existed cannot
+        appear later. Raises ``ValueError`` if the row does not exist or was
+        already measured.
+        """
+        if price is None or btc_entry is None or btc_price is None:
+            raise ValueError(
+                f"set_return {token_id} h={horizon_days}: "
+                "price/btc_entry/btc_price required"
+            )
+        if btc_entry == 0:
+            raise ValueError(f"set_return {token_id} h={horizon_days}: btc_entry is 0")
+        if entry_price:
+            ret = price / entry_price - 1.0
+            ret_vs_btc = ret - (btc_price / btc_entry - 1.0)
+        else:
+            ret = None
+            ret_vs_btc = None
+        cur = await self.conn.execute(
             "UPDATE forward_returns SET entry_price=?,price=?,btc_entry=?,btc_price=?,ret=?,"
-            "ret_vs_btc=?,measured_at=? WHERE token_id=? AND horizon_days=?",
+            "ret_vs_btc=?,measured_at=? WHERE token_id=? AND horizon_days=? "
+            "AND measured_at IS NULL",
             (
                 entry_price,
                 price,
@@ -292,11 +332,15 @@ class Store:
                 btc_price,
                 ret,
                 ret_vs_btc,
-                measured_at,
+                canon_ts(measured_at),
                 token_id,
                 horizon_days,
             ),
         )
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"set_return {token_id} h={horizon_days}: row missing or already measured"
+            )
         await self.conn.commit()
 
     async def bump_return_attempt(self, token_id, horizon_days) -> int:
