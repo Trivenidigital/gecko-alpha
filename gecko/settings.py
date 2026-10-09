@@ -26,6 +26,9 @@ class GeckoSettings(BaseSettings):
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
     gt_min_interval_sec: float = 2.1
+    cg_min_interval_sec: float = 2.1  # Demo tier: 30 requests/min
+    cg_first_page: int = 2  # page 1 is the top-250 mega caps
+    cg_max_pages: int = 14
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
