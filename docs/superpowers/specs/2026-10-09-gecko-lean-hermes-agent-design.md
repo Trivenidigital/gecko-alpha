@@ -44,7 +44,7 @@ Companion evidence: `docs/audit_structural_2026_10_09.md`, `docs/research_hermes
 
 | # | Criterion | Target |
 |---|---|---|
-| S1 | Custom code | `gecko/` ≤ 2,500 LOC excluding tests; tests ≤ 2× that |
+| S1 | Custom code | `gecko/` ≤ 2,800 LOC excluding tests (raised from 2,500 on 2026-10-09: the per-token refresh pass, frozen entry price and address validation required by the final review were missing from the original estimate); tests ≤ 5,000 LOC |
 | S2 | Discovery breadth | ≥ 3 independent discovery sources alive (DexScreener, GeckoTerminal, CoinGecko new/trending, GMGN trenches, Telegram callers) with per-table freshness within SLO for 14 consecutive days |
 | S3 | Delivery | Daily digest delivered to Telegram 14 consecutive days; `[SILENT]` days count as delivered |
 | S4 | Track record | Forward returns at 1/7/30/90/180 d recorded for 100% of watchlist entrants; weekly cohort scorecard vs BTC |
