@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS source_calls (
   cashtags_json TEXT NOT NULL DEFAULT '[]', addresses_json TEXT NOT NULL DEFAULT '[]',
   resolved_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_calls_token ON source_calls(token_id, posted_at);
+CREATE INDEX IF NOT EXISTS idx_calls_source_time ON source_calls(source_id, posted_at);
 CREATE TABLE IF NOT EXISTS watchlist (
   token_id TEXT PRIMARY KEY, entered_at TEXT NOT NULL, rule_id TEXT NOT NULL,
   rank INTEGER NOT NULL, score REAL NOT NULL, features_at_entry_json TEXT NOT NULL,

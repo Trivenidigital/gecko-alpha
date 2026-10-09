@@ -336,3 +336,175 @@ async def test_unknown_token_returns_empty_features(store, settings):
     f = await compute_features(store, settings, "solana:nope", "2026-10-05T00:00:00Z")
     assert f.token_id == "solana:nope" and f.price_usd is None and f.age_days is None
     assert f.as_dict()["callers_7d"] == 0
+
+
+# --- review round 1 ---------------------------------------------------------
+
+DAY = 86400
+T_SEC = int(AS_OF_DT.timestamp())
+
+
+def test_vol_ratio_none_when_candles_end_before_window():
+    # 30 candles, the last one 11 days before as_of: only 4 fall in [t-14d, t)
+    assert (
+        vol_ratio_from_candles(candles(T_SEC - 40 * DAY, [100] * 30), AS_OF_DT) is None
+    )
+
+
+def test_vol_ratio_none_when_old_history_pads_the_count():
+    old = candles(T_SEC - 80 * DAY, [100] * 50)
+    recent = [[T_SEC - 10 * DAY, 1, 1, 1, 1, 100], [T_SEC - 3 * DAY, 1, 1, 1, 1, 250]]
+    assert vol_ratio_from_candles(old + recent, AS_OF_DT) is None
+
+
+def test_vol_ratio_duplicate_timestamps_do_not_inflate():
+    good = candles(START_14, [100] * 7 + [250] * 7)
+    dups = [list(c) for c in good[7:]]  # 7 duplicated last-week timestamps
+    assert vol_ratio_from_candles(good + dups, AS_OF_DT) == pytest.approx(2.5)
+    # 7 unique timestamps, each twice: still only 7 usable candles
+    assert vol_ratio_from_candles(good[7:] + dups, AS_OF_DT) is None
+
+
+async def test_vol_ratio_scan_skips_all_malformed_candle_obs(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "geckoterminal_ohlcv",
+        "2026-10-14T00:00:00Z",
+        {"pool_address": "p", "candles": candles(START_14, [100] * 7 + [250] * 7)},
+    )
+    await store.add_observation(
+        "solana:abc",
+        "geckoterminal_ohlcv",
+        "2026-10-14T06:00:00Z",
+        {"pool_address": "p", "candles": [[1, 2], [T_SEC - DAY, 1, 1, 1, 1, "x"]]},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-15T00:00:00Z")
+    assert f.vol_7d_ratio == pytest.approx(2.5)
+
+
+async def test_holder_growth_none_when_then_value_too_old(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-08-09T06:00:00Z", {"holders": 1000}
+    )
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-10-08T00:00:00Z", {"holders": 1500}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-08T06:00:00Z")
+    assert f.holders == 1500 and f.holder_growth_7d is None
+
+
+async def test_holder_growth_computed_from_eight_day_old_value(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-09-30T06:00:00Z", {"holders": 1000}
+    )
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-10-08T00:00:00Z", {"holders": 1500}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-08T06:00:00Z")
+    assert f.holder_growth_7d == pytest.approx(0.5)
+
+
+async def test_holder_growth_none_when_now_value_stale(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-10-01T00:00:00Z", {"holders": 1000}
+    )
+    await store.add_observation(
+        "solana:abc", "enrich", "2026-10-05T00:00:00Z", {"holders": 1500}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-08T06:00:00Z")
+    assert f.holders == 1500 and f.holder_growth_7d is None
+
+
+async def test_momentum_ctx_none_when_then_price_too_old(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-08-09T00:00:00Z", {"price_usd": 1.0}
+    )
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-08T00:00:00Z", {"price_usd": 3.0}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-08T06:00:00Z")
+    assert f.price_usd == 3.0 and f.momentum_ctx is None
+
+
+async def test_deepest_pool_represents_token_at_same_timestamp(store, settings):
+    await seed(store)
+    ts = "2026-10-05T00:00:00Z"
+    for liq, price in ((1e3, 9.0), (3e5, 2.0)):
+        await store.add_observation(
+            "solana:abc",
+            "geckoterminal",
+            ts,
+            {"liquidity_usd": liq, "price_usd": price, "mcap_usd": liq * 10},
+        )
+    await store.add_observation(
+        "solana:abc", "geckoterminal", ts, {"price_usd": 5.0}
+    )  # no liquidity: sorts last
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T12:00:00Z")
+    assert f.liquidity_usd == 3e5 and f.price_usd == 2.0 and f.mcap_usd == 3e6
+
+
+async def test_caller_quality_excludes_the_scored_token(store, settings):
+    await seed(store)
+    await store.conn.execute(
+        CALL_SQL, ("solana:abc", "telegram", "c1", "e1", "2026-08-01T00:00:00Z", "h")
+    )
+    await store.schedule_returns("solana:abc", "2026-08-01T00:00:00Z")
+    await store.set_return(
+        "solana:abc", 30, 1.0, 2.0, 100.0, 100.0, "2026-08-31T00:00:00Z"
+    )
+    await store.conn.execute(
+        CALL_SQL, ("solana:abc", "telegram", "c1", "e2", "2026-10-03T00:00:00Z", "h")
+    )
+    await store.conn.commit()
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T00:00:00Z")
+    assert f.callers_7d == 1 and f.caller_quality is None
+
+
+async def test_age_clamped_and_young_chain_false_before_launch(store, settings):
+    settings.young_chain_launch_dates = {"solana": "2026-10-01"}
+    await seed(store)  # first_seen 10-01, pool created 09-10
+    f = await compute_features(store, settings, "solana:abc", "2026-09-05T00:00:00Z")
+    assert f.age_days == 0.0
+    assert f.young_chain is False
+
+
+async def test_security_ok_only_from_real_bools(store, settings):
+    await seed(store)
+    for i, val in enumerate(["false", 1]):
+        await store.add_observation(
+            "solana:abc", "enrich", f"2026-10-0{i + 1}T00:00:00Z", {"security_ok": val}
+        )
+        f = await compute_features(
+            store, settings, "solana:abc", f"2026-10-0{i + 1}T06:00:00Z"
+        )
+        assert f.security_ok is None
+
+
+async def test_unparseable_numbers_become_none(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T00:00:00Z",
+        {"price_usd": "abc", "mcap_usd": None, "liquidity_usd": [1], "vol_24h_usd": 7},
+    )
+    await store.add_observation(
+        "solana:abc",
+        "enrich",
+        "2026-10-05T00:00:00Z",
+        {
+            "holders": "lots",
+            "top10_pct": "x",
+            "dd_score": {},
+            "smart_money_wallets": "n",
+        },
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.price_usd is None and f.liquidity_usd is None and f.vol_24h_usd == 7.0
+    assert f.holders is None and f.top10_pct is None and f.smart_money_wallets is None
+    assert f.bundle_flag is False

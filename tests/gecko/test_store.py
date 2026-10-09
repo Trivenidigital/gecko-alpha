@@ -305,3 +305,14 @@ async def test_observations_source_filter(store):
 async def test_journal_mode_is_wal(store):
     row = await (await store.conn.execute("PRAGMA journal_mode")).fetchone()
     assert row[0] == "wal"
+
+
+async def test_source_calls_has_caller_time_index(store):
+    rows = await (
+        await store.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type=? AND name=?",
+            ("index", "idx_calls_source_time"),
+        )
+    ).fetchall()
+    assert len(rows) == 1
+    assert "source_calls(source_id, posted_at)" in rows[0][0]
