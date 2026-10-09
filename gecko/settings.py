@@ -27,6 +27,9 @@ class GeckoSettings(BaseSettings):
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
     gt_min_interval_sec: float = 2.1
+    ds_min_interval_sec: float = 0.25  # spacing of every DexScreener request
+    ds_refresh_max_per_run: int = 600  # known tokens re-read per run, oldest first
+    candidate_max_age_days: int = 14  # unadmitted candidates then stop being read
     cg_min_interval_sec: float = 2.1  # Demo tier: 30 requests/min
     cg_first_page: int = 2  # page 1 is the top-250 mega caps
     cg_max_pages: int = 14

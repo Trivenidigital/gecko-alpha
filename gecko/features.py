@@ -14,7 +14,14 @@ from datetime import datetime, timedelta
 
 from gecko.numeric import as_int, finite, num
 from gecko.settings import GeckoSettings
-from gecko.store import MARKET_SOURCES, Observation, Store, canon_ts, parse_utc
+from gecko.store import (
+    DEX_SOURCES,
+    MARKET_SOURCES,
+    Observation,
+    Store,
+    canon_ts,
+    parse_utc,
+)
 
 OHLCV_SOURCE = "geckoterminal_ohlcv"
 ENRICH_SOURCE = "enrich"
@@ -24,6 +31,7 @@ BUNDLE_TOP10_ABOVE = 40
 DAY_SEC = 86400
 THEN_SLACK = timedelta(days=2)  # a "week ago" value may be up to 9 days old
 NOW_MAX_AGE = timedelta(days=3)  # a "now" value for growth must be this fresh
+GATE_MAX_AGE = timedelta(hours=6)  # a DEX reading older than this cannot pass the gate
 
 
 def _iso(d: datetime) -> str:
@@ -38,6 +46,7 @@ class Features:
     price_usd: float | None = None
     mcap_usd: float | None = None
     liquidity_usd: float | None = None
+    liquidity_gate_usd: float | None = None  # what the liquidity disqualifier reads
     vol_24h_usd: float | None = None
     age_days: float | None = None
     vol_7d_ratio: float | None = None
@@ -138,8 +147,28 @@ def _gate_row(market: list[Observation]) -> Observation | None:
     last DEX read would fail every DEX token on ``liquidity``.
     """
     priced = _priced(market)
-    dex = [o for o in priced if o.source != "coingecko"]
+    dex = [o for o in priced if o.source in DEX_SOURCES]
     return (dex or priced or [None])[0]
+
+
+def _liquidity_gate(market: list[Observation], as_of_dt: datetime) -> float | None:
+    """Max over DEX sources of each one's latest priced liquidity reading no
+    older than 6 h; None when no source has one.
+
+    One source's thin pair (a DexScreener pair just below the floor) cannot
+    fail a token another source reads deep at about the same time, and no
+    stale reading can pass it.
+    """
+    floor = _iso(as_of_dt - GATE_MAX_AGE)
+    best: float | None = None
+    for src in DEX_SOURCES:
+        rows = _priced([o for o in market if o.source == src])
+        if not rows or rows[0].observed_at < floor:
+            continue
+        liq = num(rows[0].features.get("liquidity_usd"))
+        if liq is not None and (best is None or liq > best):
+            best = liq
+    return best
 
 
 async def _latest_candles(store: Store, token_id: str, as_of: str) -> list:
@@ -189,6 +218,8 @@ async def compute_features(
                 [o for o in market if o.source == "coingecko"], "mcap_usd"
             )
             f.mcap_usd = num(cg_mcap)
+
+    f.liquidity_gate_usd = _liquidity_gate(market, as_of_dt)
 
     # Prereg F1 parity: pool age only; no pool, no age (so F4 cannot admit).
     if pool_created is not None:

@@ -34,7 +34,8 @@ def disqualify(f: Features, settings: GeckoSettings) -> str | None:
         return "security_fail"
     if f.top10_pct is not None and f.top10_pct > settings.top10_disqualify_pct:
         return "concentration"
-    if f.liquidity_usd is None or f.liquidity_usd < settings.min_liquidity_usd:
+    gate = f.liquidity_gate_usd
+    if gate is None or gate < settings.min_liquidity_usd:
         return "liquidity"
     if f.observed_at is None or parse_utc(f.as_of) - parse_utc(
         f.observed_at

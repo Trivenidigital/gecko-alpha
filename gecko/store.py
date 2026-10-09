@@ -49,6 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
 
 # Sources whose observations carry a market price (and maybe liquidity).
 MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
+DEX_SOURCES = ("dexscreener", "geckoterminal")  # market sources with liquidity
 
 TIME_COLUMN = {
     "tokens": "updated_at",
@@ -129,6 +130,14 @@ class Store:
         await conn.execute("PRAGMA journal_mode=WAL")
         await conn.execute("PRAGMA foreign_keys=ON")
         await conn.executescript(SCHEMA)
+        cols = {
+            r[1]
+            for r in await (
+                await conn.execute("PRAGMA table_info(watchlist)")
+            ).fetchall()
+        }
+        if "entry_price" not in cols:  # databases created before the column existed
+            await conn.execute("ALTER TABLE watchlist ADD COLUMN entry_price REAL")
         await conn.commit()
         return cls(conn)
 

@@ -14,6 +14,7 @@ def feat(**kw) -> Features:
         as_of=A,
         observed_at=A,
         liquidity_usd=300_000.0,
+        liquidity_gate_usd=300_000.0,
         age_days=30.0,
         vol_7d_ratio=2.5,
         security_ok=True,
@@ -26,8 +27,8 @@ def feat(**kw) -> Features:
 def test_disqualify_which_gate(settings):
     assert disqualify(feat(security_ok=False), settings) == "security_fail"
     assert disqualify(feat(top10_pct=61.0), settings) == "concentration"
-    assert disqualify(feat(liquidity_usd=100.0), settings) == "liquidity"
-    assert disqualify(feat(liquidity_usd=None), settings) == "liquidity"
+    assert disqualify(feat(liquidity_gate_usd=100.0), settings) == "liquidity"
+    assert disqualify(feat(liquidity_gate_usd=None), settings) == "liquidity"
     assert disqualify(feat(observed_at="2026-10-01T00:00:00Z"), settings) == "dead"
     assert disqualify(feat(observed_at=None), settings) == "dead"
     assert disqualify(feat(), settings) is None
@@ -35,7 +36,7 @@ def test_disqualify_which_gate(settings):
 
 def test_disqualify_boundaries(settings):
     assert disqualify(feat(top10_pct=60.0), settings) is None
-    assert disqualify(feat(liquidity_usd=250_000.0), settings) is None
+    assert disqualify(feat(liquidity_gate_usd=250_000.0), settings) is None
     assert disqualify(feat(observed_at="2026-10-08T00:00:00Z"), settings) is None
     assert disqualify(feat(observed_at="2026-10-07T23:59:59Z"), settings) == "dead"
 
@@ -44,7 +45,7 @@ def test_disqualify_precedence(settings):
     everything = dict(
         security_ok=False,
         top10_pct=99.0,
-        liquidity_usd=1.0,
+        liquidity_gate_usd=1.0,
         observed_at="2026-09-01T00:00:00Z",
     )
     assert disqualify(feat(**everything), settings) == "security_fail"
@@ -52,7 +53,7 @@ def test_disqualify_precedence(settings):
     assert disqualify(feat(**everything), settings) == "concentration"
     everything["top10_pct"] = None
     assert disqualify(feat(**everything), settings) == "liquidity"
-    everything["liquidity_usd"] = 300_000.0
+    everything["liquidity_gate_usd"] = 300_000.0
     assert disqualify(feat(**everything), settings) == "dead"
 
 
@@ -182,7 +183,9 @@ async def test_rank_once_enters_schedules_and_exits(store, settings):
     assert row[0] == "liquidity"
 
 
-async def test_dead_token_gets_dead_status_and_exit_reason(store, settings):
+async def test_unread_token_fails_the_fresh_liquidity_gate(store, settings):
+    # No DEX reading within 6 h fails the liquidity gate, which is checked
+    # before "dead"; a token unread for 7 days therefore exits on liquidity.
     await seed_token(store, "solana:good")
     await rank_once(store, settings, A)
     r = await rank_once(store, settings, "2026-10-25T00:00:00Z")
@@ -191,11 +194,11 @@ async def test_dead_token_gets_dead_status_and_exit_reason(store, settings):
         store,
         "SELECT status, disqualify_reason FROM tokens WHERE token_id='solana:good'",
     )
-    assert row == ("dead", "dead")
+    assert row == ("disqualified", "liquidity")
     row = await one(
         store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
     )
-    assert row[0] == "dead"
+    assert row[0] == "liquidity"
 
 
 async def test_rank_is_sticky_when_rule_lapses(store, settings):

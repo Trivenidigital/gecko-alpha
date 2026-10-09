@@ -533,3 +533,29 @@ async def test_measure_due_ignores_entry_observations_after_now(store, settings)
             r = await measure_due(store, settings, s, NOW)
         assert not m.requests
     assert (r.measured, r.failed, r.skipped) == (0, 0, 1)
+
+
+async def test_entry_price_prefers_dex_rows_and_deepest_at_a_timestamp(store):
+    await seed(store, token_obs=False)
+    await store.add_observation(
+        "solana:abc", "coingecko", "2026-10-01T00:05:00Z", {"price_usd": 7.0}
+    )
+    for liq, price in ((1e3, 9.0), (3e5, 2.0)):
+        await store.add_observation(
+            "solana:abc",
+            "geckoterminal",
+            "2026-10-01T00:10:00Z",
+            {"price_usd": price, "liquidity_usd": liq},
+        )
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-01T00:30:00Z", {"price_usd": 1.0}
+    )
+    assert await entry_price(store, "solana:abc", E) == 2.0
+
+
+async def test_entry_price_falls_back_to_coingecko_without_dex_rows(store):
+    await seed(store, token_obs=False)
+    await store.add_observation(
+        "solana:abc", "coingecko", "2026-10-01T00:05:00Z", {"price_usd": 7.0}
+    )
+    assert await entry_price(store, "solana:abc", E) == 7.0

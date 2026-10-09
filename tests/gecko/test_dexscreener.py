@@ -107,7 +107,7 @@ async def test_collect_writes_tokens_and_observations(store, settings):
             ],
         )  # below floor
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     tok = await (
         await store.conn.execute(
@@ -153,7 +153,7 @@ async def test_collect_preserves_solana_address_case(store, settings):
             ],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     tok = await (
         await store.conn.execute("SELECT token_id, address FROM tokens")
@@ -182,7 +182,7 @@ async def test_collect_batches_thirty(store, settings):
             payload=[pair(addr=addrs[30])],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 31
 
 
@@ -237,7 +237,7 @@ async def test_collect_skips_unpriced_pair_without_raising(store, settings):
             ],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     tok = await (await store.conn.execute("SELECT token_id FROM tokens")).fetchall()
     assert tok == [("base:0xbbb0000000000000000000000000000000000000",)]
@@ -263,7 +263,7 @@ async def test_collect_zero_mcap_not_replaced_by_fdv(store, settings):
             payload=[pair(mcap=0.0)],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 0
 
 
@@ -308,7 +308,7 @@ async def test_refresh_reobserves_known_tokens_off_feed_below_floor(store, setti
         )
         async with aiohttp.ClientSession() as s:
             with capture_logs() as logs:
-                r = await collect(store, settings, s, NOW)
+                r = await collect(store, settings, s, NOW, sleep=nosleep)
         assert len(m.requests) == 3  # boosts, profiles, one refresh batch
     assert r.rows_written == 3
     for tid, liq in ((cand, 10_000), (act, 300_000), (held, 5)):
@@ -347,7 +347,7 @@ async def test_known_token_in_feed_below_floor_is_kept_and_fetched_once(
             payload=[pair(liq=50_000)],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
         assert len(m.requests) == 3
     assert r.rows_written == 1
     (o,) = await store.observations(tid, as_of=NOW)
@@ -372,7 +372,7 @@ async def test_refresh_batches_thirty_and_skips_other_chains(store, settings):
             payload=[pair(addr=addrs[30])],
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect(store, settings, s, NOW)
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 31
 
 
@@ -393,8 +393,131 @@ async def test_malformed_feed_addresses_never_reach_a_url(store, settings):
         )
         async with aiohttp.ClientSession() as s:
             with capture_logs() as logs:
-                r = await collect(store, settings, s, NOW)
+                r = await collect(store, settings, s, NOW, sleep=nosleep)
         assert len(m.requests) == 3
     assert r.rows_written == 1
     done = [e for e in logs if e["event"] == "dexscreener_done"]
     assert done[0]["invalid"] == 2
+
+
+async def nosleep(_):
+    return None
+
+
+class RecordingSleep:
+    def __init__(self):
+        self.calls: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.calls.append(delay)
+
+
+A40 = "0x" + "1" * 40
+B40 = "0x" + "2" * 40
+C40 = "0x" + "3" * 40
+
+
+async def test_every_request_is_paced(store, settings):
+    settings.ds_min_interval_sec = 0.25
+    await _known(store, B40)
+    sleep = RecordingSleep()
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": A40}])
+        m.get(PROFILES_URL, payload=[])
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), payload=[pair(addr=A40)])
+        m.get(TOKENS_URL.format(chain="base", addresses=B40), payload=[pair(addr=B40)])
+        async with aiohttp.ClientSession() as s:
+            await collect(store, settings, s, NOW, sleep=sleep)
+        n = sum(len(v) for v in m.requests.values())
+    assert n == 4 and len(sleep.calls) == n - 1
+    assert all(0 < d <= 0.25 for d in sleep.calls)
+
+
+async def test_refresh_cap_takes_oldest_reading_first(store, settings):
+    settings.ds_refresh_max_per_run = 2
+    for a in (A40, B40, C40):
+        await _known(store, a)
+    await store.add_observation(
+        f"base:{A40}", "dexscreener", "2026-10-01T00:00:00Z", {}
+    )
+    await store.add_observation(
+        f"base:{C40}", "dexscreener", "2026-10-08T00:00:00Z", {}
+    )
+    # B was never read: first; then A (oldest); C (newest) is deferred
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=f"{A40},{B40}"),
+            payload=[pair(addr=A40), pair(addr=B40)],
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect(store, settings, s, NOW, sleep=nosleep)
+        assert len(m.requests) == 3
+    assert r.rows_written == 2
+    done = [e for e in logs if e["event"] == "dexscreener_refresh_done"][0]
+    assert done["planned"] == 2 and done["deferred"] == 1
+    assert len(await store.observations(f"base:{C40}", as_of=NOW)) == 1  # untouched
+
+
+async def test_failed_batch_does_not_stop_next_batch_or_admission(store, settings):
+    addrs = [f"0x{i:040x}" for i in range(31)]
+    for a in addrs:
+        await _known(store, a)
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=",".join(addrs[:30])), status=400
+        )
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=addrs[30]),
+            payload=[pair(addr=addrs[30])],
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 1
+    failed = [e["status"] for e in logs if e["event"] == "dexscreener_batch_failed"]
+    assert failed == [400]
+    done = [e for e in logs if e["event"] == "dexscreener_done"][0]
+    assert (done["batches"], done["batches_failed"]) == (2, 1)
+    assert "promoted" in done  # admission ran
+
+
+async def test_run_fails_only_when_every_batch_failed(store, settings):
+    import pytest
+
+    await _known(store, A40)
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), status=400)
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                with pytest.raises(RuntimeError, match="all 1 dexscreener batches"):
+                    await collect(store, settings, s, NOW, sleep=nosleep)
+    assert [e for e in logs if e["event"] == "dexscreener_done"]  # admission ran first
+
+
+async def test_stale_candidates_are_aged_out_and_not_refreshed(store, settings):
+    for a, seen in ((A40, "2026-09-24T00:00:00Z"), (B40, "2026-09-26T00:00:00Z")):
+        await store.upsert_token(f"base:{a}", "base", a, "K", "K", seen, "dexscreener")
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(TOKENS_URL.format(chain="base", addresses=B40), payload=[pair(addr=B40)])
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
+        assert len(m.requests) == 3
+    assert r.rows_written == 1
+    rows = await (
+        await store.conn.execute(
+            "SELECT token_id, status, disqualify_reason FROM tokens ORDER BY token_id"
+        )
+    ).fetchall()
+    assert rows == [
+        (f"base:{A40}", "disqualified", "stale_candidate"),  # 15 days old
+        (f"base:{B40}", "candidate", None),  # 13 days old
+    ]

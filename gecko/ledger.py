@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
@@ -13,7 +14,7 @@ from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
 from gecko.numeric import num
 from gecko.store import (
-    MARKET_SOURCES,
+    DEX_SOURCES,
     ReturnAlreadyMeasured,
     Store,
     canon_ts,
@@ -38,31 +39,53 @@ def _price(value) -> float | None:
     return p if p is not None and p > 0 else None
 
 
-async def entry_price(
-    store: Store, token_id: str, entered_at: str, *, as_of: str | None = None
+async def _first_priced(
+    store: Store, token_id: str, sources, entered_at: str, as_of: str | None
 ) -> float | None:
-    """Price of the earliest market observation at or after ``entered_at``.
-
-    Observations without a usable ``price_usd`` are passed over; a later
-    observation is never preferred to an earlier priced one. ``as_of`` bounds
-    the search so a point-in-time run cannot read observations from its future.
-    """
-    q = ",".join("?" * len(MARKET_SOURCES))
+    """Price of the earliest priced row from ``sources`` at or after
+    ``entered_at`` (bounded by ``as_of``); deepest pool among rows that share
+    that earliest timestamp."""
+    q = ",".join("?" * len(sources))
     sql = (
-        f"SELECT features_json FROM observations WHERE token_id=? AND source IN ({q}) "
-        "AND observed_at>=?"
+        f"SELECT observed_at, features_json FROM observations WHERE token_id=? "
+        f"AND source IN ({q}) AND observed_at>=?"
     )
-    args: list = [token_id, *MARKET_SOURCES, canon_ts(entered_at)]
+    args: list = [token_id, *sources, canon_ts(entered_at)]
     if as_of is not None:
         sql += " AND observed_at<=?"
         args.append(canon_ts(as_of))
     sql += " ORDER BY observed_at ASC, id ASC"
+    best: tuple[float, float] | None = None
+    best_at: str | None = None
     async with store.conn.execute(sql, args) as cur:
-        async for (fj,) in cur:
-            p = _price(json.loads(fj).get("price_usd"))
-            if p is not None:
-                return p
-    return None
+        async for obs_at, fj in cur:
+            if best_at is not None and obs_at != best_at:
+                break
+            f = json.loads(fj)
+            p = _price(f.get("price_usd"))
+            if p is None:
+                continue
+            liq = num(f.get("liquidity_usd"))
+            liq = -math.inf if liq is None else liq
+            if best is None or liq > best[0]:
+                best, best_at = (liq, p), obs_at
+    return best[1] if best else None
+
+
+async def entry_price(
+    store: Store, token_id: str, entered_at: str, *, as_of: str | None = None
+) -> float | None:
+    """Price of the earliest priced DEX observation at or after ``entered_at``.
+
+    DEX rows (the ledger's own price source) win; a CoinGecko row is used only
+    when no priced DEX row exists in the window. Unpriced rows are passed
+    over, and a later row is never preferred to an earlier priced one.
+    ``as_of`` bounds the search so a run cannot read its own future.
+    """
+    p = await _first_priced(store, token_id, DEX_SOURCES, entered_at, as_of)
+    if p is None:
+        p = await _first_priced(store, token_id, ("coingecko",), entered_at, as_of)
+    return p
 
 
 async def _nearest_btc(

@@ -626,3 +626,52 @@ async def test_age_none_without_pool(store, settings):
     await store.upsert_token("solana:abc", "solana", "abc", "A", "A", T0, "coingecko")
     f = await compute_features(store, settings, "solana:abc", "2026-10-05T00:00:00Z")
     assert f.age_days is None
+
+
+async def test_liquidity_gate_takes_max_of_fresh_dex_readings(store, settings):
+    from gecko.rank import disqualify
+
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T11:55:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 1e4},
+    )
+    await store.add_observation(
+        "solana:abc",
+        "geckoterminal",
+        "2026-10-05T09:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 3e5},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T12:00:00Z")
+    assert f.liquidity_gate_usd == 3e5 and f.liquidity_usd == 1e4
+    assert disqualify(f, settings) is None
+    # the same GT reading 7 h old no longer counts
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T16:00:00Z")
+    assert f.liquidity_gate_usd == 1e4
+    assert disqualify(f, settings) == "liquidity"
+    # nothing within 6 h: None
+    f = await compute_features(store, settings, "solana:abc", "2026-10-06T00:00:00Z")
+    assert f.liquidity_gate_usd is None
+
+
+async def test_liquidity_gate_reads_each_sources_latest_priced_row(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T10:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 9e5},
+    )
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T11:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 1e4},
+    )
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-05T11:30:00Z", {"liquidity_usd": 8e5}
+    )  # unpriced: ignored
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T12:00:00Z")
+    assert f.liquidity_gate_usd == 1e4

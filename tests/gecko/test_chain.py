@@ -55,7 +55,7 @@ async def dex_run(store, settings, hours, liq, *, in_feed, price=1.0):
         m.get(dexscreener.PROFILES_URL, payload=[])
         m.get(TOKENS, payload=[pair(liq, price)])
         async with aiohttp.ClientSession() as s:
-            await dexscreener.collect(store, settings, s, at(hours))
+            await dexscreener.collect(store, settings, s, at(hours), sleep=nosleep)
 
 
 async def btc_run(store, settings, hours, usd):

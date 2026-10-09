@@ -351,3 +351,46 @@ async def test_set_entry_price_is_write_once(store):
         await store.conn.execute("SELECT entry_price FROM watchlist")
     ).fetchone()
     assert row == (1.5,)
+
+
+OLD_WATCHLIST = (
+    "CREATE TABLE watchlist (token_id TEXT PRIMARY KEY, entered_at TEXT NOT NULL, "
+    "rule_id TEXT NOT NULL, rank INTEGER NOT NULL, score REAL NOT NULL, "
+    "features_at_entry_json TEXT NOT NULL, last_ranked_at TEXT NOT NULL, "
+    "exited_at TEXT, exit_reason TEXT)"
+)
+
+
+async def test_open_adds_entry_price_to_an_old_watchlist(tmp_path):
+    import aiosqlite
+
+    from gecko.store import Store
+
+    path = str(tmp_path / "old.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(OLD_WATCHLIST)
+        await c.execute(
+            "INSERT INTO watchlist VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "s:a",
+                "2026-10-01T00:00:00Z",
+                "F4",
+                1,
+                1.0,
+                "{}",
+                "2026-10-01",
+                None,
+                None,
+            ),
+        )
+        await c.commit()
+    for _ in range(2):  # idempotent
+        s = await Store.open(path)
+        info = await (await s.conn.execute("PRAGMA table_info(watchlist)")).fetchall()
+        assert [r[1] for r in info].count("entry_price") == 1
+        await s.set_entry_price("s:a", 2.0)
+        row = await (
+            await s.conn.execute("SELECT entry_price FROM watchlist")
+        ).fetchone()
+        assert row == (2.0,)
+        await s.close()

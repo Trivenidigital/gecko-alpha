@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import structlog
 
-from gecko.http import get_json
+from gecko.http import Pacer, UpstreamError, get_json
 from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
 from gecko.numeric import num
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, utcnow
+from gecko.store import Store, canon_ts, parse_utc, utcnow
 from gecko.universe import admit_survivors, in_band
 
 log = structlog.get_logger("gecko.dexscreener")
@@ -70,12 +71,13 @@ def pair_features(p: dict) -> dict:
 
 
 async def _discover(
-    session: aiohttp.ClientSession, settings: GeckoSettings
+    session: aiohttp.ClientSession, settings: GeckoSettings, pacer: Pacer
 ) -> tuple[dict[str, set[str]], int]:
     """Feed addresses per configured chain, and how many were malformed."""
     found: dict[str, set[str]] = {}
     invalid = 0
     for url in (BOOSTS_URL, PROFILES_URL):
+        await pacer.wait()
         items = await get_json(session, url, settings=settings)
         for it in items or []:
             chain = CHAIN_MAP.get(str(it.get("chainId", "")).lower())
@@ -90,36 +92,74 @@ async def _discover(
 
 
 async def _pairs(
-    session: aiohttp.ClientSession, settings: GeckoSettings, chain: str, addrs
+    session: aiohttp.ClientSession,
+    settings: GeckoSettings,
+    pacer: Pacer,
+    batches: dict[str, int],
+    chain: str,
+    addrs,
 ):
-    """(address, best pair or None) for ``addrs``, one tokens/v1 call per 30."""
+    """(address, best pair or None) for ``addrs``, one paced tokens/v1 call per 30.
+
+    A failed batch is logged and counted in ``batches`` and yields nothing, so
+    one bad batch cannot stop the rest of the run.
+    """
     ordered = sorted(addrs)
     for i in range(0, len(ordered), BATCH):
         batch = ordered[i : i + BATCH]
-        pairs = await get_json(
-            session,
-            TOKENS_URL.format(chain=chain, addresses=",".join(batch)),
-            settings=settings,
-        )
+        await pacer.wait()
+        batches["total"] += 1
+        try:
+            pairs = await get_json(
+                session,
+                TOKENS_URL.format(chain=chain, addresses=",".join(batch)),
+                settings=settings,
+            )
+        except UpstreamError as exc:
+            batches["failed"] += 1
+            log.warning(
+                "dexscreener_batch_failed",
+                chain=chain,
+                size=len(batch),
+                status=exc.status,
+            )
+            continue
         for addr in batch:
             yield addr, best_pair(pairs or [], addr, chain)
 
 
-async def _refresh_targets(store: Store, settings: GeckoSettings) -> dict[str, set]:
-    """Known tokens to re-observe every run, whether or not a feed lists them:
-    candidates and actives, plus every token with an open watchlist row."""
+async def _age_out_candidates(store: Store, settings: GeckoSettings, now: str) -> int:
+    """Candidates never admitted within ``candidate_max_age_days`` stop being
+    refreshed or considered for admission."""
+    cutoff = canon_ts(
+        (parse_utc(now) - timedelta(days=settings.candidate_max_age_days)).isoformat()
+    )
+    cur = await store.conn.execute(
+        "UPDATE tokens SET status='disqualified', disqualify_reason='stale_candidate', "
+        "updated_at=? WHERE status='candidate' AND first_seen_at<?",
+        (utcnow(), cutoff),
+    )
+    await store.conn.commit()
+    return cur.rowcount
+
+
+async def _refresh_targets(
+    store: Store, settings: GeckoSettings
+) -> list[tuple[str, str]]:
+    """Known tokens to re-observe whether or not a feed lists them: candidates
+    and actives, plus every token with an open watchlist row. Ordered by the
+    oldest DexScreener reading first (never read first)."""
     rows = await (
         await store.conn.execute(
-            "SELECT chain, address FROM tokens WHERE chain!='cg' "
-            "AND token_id!='benchmark:btc' AND (status IN ('candidate','active') "
-            "OR token_id IN (SELECT token_id FROM watchlist WHERE exited_at IS NULL))"
+            "SELECT t.chain, t.address, (SELECT MAX(o.observed_at) FROM observations o "
+            "WHERE o.token_id=t.token_id AND o.source='dexscreener') AS last "
+            "FROM tokens t WHERE t.chain!='cg' AND t.token_id!='benchmark:btc' "
+            "AND (t.status IN ('candidate','active') OR t.token_id IN "
+            "(SELECT token_id FROM watchlist WHERE exited_at IS NULL)) "
+            "ORDER BY last IS NOT NULL, last, t.token_id"
         )
     ).fetchall()
-    out: dict[str, set] = {}
-    for chain, addr in rows:
-        if chain in settings.chains:
-            out.setdefault(chain, set()).add(addr)
-    return out
+    return [(c, a) for c, a, _ in rows if c in settings.chains]
 
 
 def _refresh_row(p: dict) -> dict:
@@ -133,13 +173,18 @@ async def collect(
     settings: GeckoSettings,
     session: aiohttp.ClientSession,
     now: str,
+    *,
+    sleep=asyncio.sleep,
 ) -> JobResult:
+    pacer = Pacer(settings.ds_min_interval_sec, sleep)
+    batches = {"total": 0, "failed": 0}
+    aged = await _age_out_candidates(store, settings, now)
     targets = await _refresh_targets(store, settings)
-    found, invalid = await _discover(session, settings)
+    known = set(targets)
+    found, invalid = await _discover(session, settings, pacer)
     written = skipped = refreshed = missing = 0
     for chain, addrs in found.items():
-        known = targets.get(chain, set())
-        async for addr, p in _pairs(session, settings, chain, addrs):
+        async for addr, p in _pairs(session, settings, pacer, batches, chain, addrs):
             if p is None:
                 skipped += 1
                 continue
@@ -150,7 +195,7 @@ async def collect(
                 liquidity_usd=f["liquidity_usd"],
                 chain=chain,
             ):
-                if addr in known:  # fetched already: keep the out-of-band reading
+                if (chain, addr) in known:  # fetched already: keep the reading
                     await store.add_observation(
                         token_id(chain, addr), "dexscreener", now, _refresh_row(p)
                     )
@@ -172,9 +217,13 @@ async def collect(
             )
             await store.add_observation(tid, "dexscreener", now, f)
             written += 1
-    for chain, addrs in targets.items():
-        todo = addrs - found.get(chain, set())
-        async for addr, p in _pairs(session, settings, chain, todo):
+    eligible = [t for t in targets if t[1] not in found.get(t[0], set())]
+    todo = eligible[: settings.ds_refresh_max_per_run]  # oldest reading first
+    by_chain: dict[str, list[str]] = {}
+    for chain, addr in todo:
+        by_chain.setdefault(chain, []).append(addr)
+    for chain, addrs in by_chain.items():
+        async for addr, p in _pairs(session, settings, pacer, batches, chain, addrs):
             if p is None:
                 missing += 1
                 continue
@@ -182,7 +231,14 @@ async def collect(
                 token_id(chain, addr), "dexscreener", now, _refresh_row(p)
             )
             refreshed += 1
-    log.info("dexscreener_refresh_done", refreshed=refreshed, missing=missing)
+    log.info(
+        "dexscreener_refresh_done",
+        refreshed=refreshed,
+        missing=missing,
+        planned=len(todo),
+        deferred=len(eligible) - len(todo),
+        aged_out=aged,
+    )
     promoted = await admit_survivors(store, settings, now)
     log.info(
         "dexscreener_done",
@@ -190,7 +246,11 @@ async def collect(
         skipped=skipped,
         invalid=invalid,
         promoted=promoted,
+        batches=batches["total"],
+        batches_failed=batches["failed"],
     )
+    if batches["total"] and batches["failed"] == batches["total"]:
+        raise RuntimeError(f"all {batches['total']} dexscreener batches failed")
     return JobResult(rows_written=written + refreshed)
 
 
