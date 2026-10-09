@@ -516,3 +516,16 @@ async def test_rank_job_exits_1_on_rewind(settings):
         assert row[0] == 0 and "as_of rewinds ranking state" in row[1]
     finally:
         await s.close()
+
+
+async def test_exit_reason_falls_back_to_stored_disqualify_reason(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    # the ledger finalized a total loss between ranks
+    await store.set_token_status("solana:good", "dead", "no_price")
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"]
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("no_price",)

@@ -19,6 +19,7 @@ log = structlog.get_logger("gecko.ledger")
 MAX_ATTEMPTS = 3
 BTC_WINDOW_HOURS = 6
 BTC_FALLBACK_WINDOW_HOURS = 36
+ENTRY_WINDOW_HOURS = 48  # no priced read this soon after entry: unmeasurable
 BTC_TOKEN_ID = "benchmark:btc"
 # UpstreamError statuses that spend no attempt (plus every 5xx); 0 = transport.
 TRANSIENT_STATUSES = frozenset({0, 403, 429})
@@ -144,6 +145,49 @@ class LedgerReport:
     skipped: int = 0
 
 
+async def _resolve_entry(
+    store: Store, tid: str, entered_at: str, stored: float | None, now: str
+) -> tuple[float | None, bool]:
+    """(entry price, whether its search window has closed at ``now``).
+
+    The entry price is the first priced market observation in
+    ``[entered_at, entered_at + 48h]``, read no later than ``now``. It is
+    resolved once: when found it is frozen on the watchlist row and every
+    horizon reuses it.
+    """
+    if stored is not None:
+        return stored, True
+    deadline = canon_ts(
+        (parse_utc(entered_at) + timedelta(hours=ENTRY_WINDOW_HOURS)).isoformat()
+    )
+    ep = await entry_price(store, tid, entered_at, as_of=min(now, deadline))
+    if ep is not None:
+        await store.set_entry_price(tid, ep)
+    return ep, now > deadline
+
+
+async def _finalize_no_entry(
+    store: Store, tid: str, btc_entry: float, btc_now: float, now: str
+) -> int:
+    """No entry price exists: every open horizon is unmeasurable (ret NULL).
+
+    The token is not marked dead: a missing price at entry says nothing
+    about whether it trades now.
+    """
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days FROM forward_returns "
+            "WHERE token_id=? AND measured_at IS NULL",
+            (tid,),
+        )
+    ).fetchall()
+    for (h,) in rows:
+        await store.set_return(tid, h, None, 0.0, btc_entry, btc_now, now)
+    await store.watchlist_exit(tid, now, "no_entry_price")
+    log.info("ledger_entry_unmeasurable", token_id=tid, horizons=len(rows))
+    return len(rows)
+
+
 async def measure_due(
     store: Store,
     settings: GeckoSettings,
@@ -152,8 +196,11 @@ async def measure_due(
 ) -> LedgerReport:
     now = canon_ts(now)
     rep = LedgerReport()
+    closed: set[str] = set()
     for due in await store.due_returns(now):
         tid, h = due.token_id, due.horizon_days
+        if tid in closed:
+            continue  # finalized whole this run
         trow = await (
             await store.conn.execute(
                 "SELECT chain, address FROM tokens WHERE token_id=?", (tid,)
@@ -161,7 +208,8 @@ async def measure_due(
         ).fetchone()
         wrow = await (
             await store.conn.execute(
-                "SELECT entered_at FROM watchlist WHERE token_id=?", (tid,)
+                "SELECT entered_at, entry_price FROM watchlist WHERE token_id=?",
+                (tid,),
             )
         ).fetchone()
         if not trow or not wrow:
@@ -185,7 +233,17 @@ async def measure_due(
             )
             rep.skipped += 1
             continue
-        ep = await entry_price(store, tid, entered_at, as_of=now)
+        ep, window_closed = await _resolve_entry(store, tid, entered_at, wrow[1], now)
+        if ep is None:
+            if window_closed:
+                rep.unmeasurable += await _finalize_no_entry(
+                    store, tid, btc_entry, btc_now, now
+                )
+                closed.add(tid)
+            else:
+                log.info("ledger_entry_price_pending", token_id=tid, horizon_days=h)
+                rep.skipped += 1
+            continue
         try:
             price = await fetch_price(session, settings, chain, address)
         except UpstreamError as exc:
@@ -209,7 +267,7 @@ async def measure_due(
             )
             price = None
         try:
-            if ep is not None and price is not None:
+            if price is not None:
                 await store.set_return(tid, h, ep, price, btc_entry, btc_now, now)
                 rep.measured += 1
                 continue
@@ -217,15 +275,7 @@ async def measure_due(
             if attempts < MAX_ATTEMPTS:
                 rep.failed += 1
                 continue
-            await store.set_return(
-                tid,
-                h,
-                ep,
-                price if price is not None else 0.0,
-                btc_entry,
-                btc_now,
-                now,
-            )
+            await store.set_return(tid, h, ep, 0.0, btc_entry, btc_now, now)
         except ReturnAlreadyMeasured as exc:
             log.warning(
                 "ledger_row_already_measured",
@@ -235,17 +285,13 @@ async def measure_due(
             )
             rep.skipped += 1
             continue
-        reason = "no_price" if price is None else "no_entry_price"
-        await store.set_token_status(tid, "dead", reason)
-        if ep is None:
-            rep.unmeasurable += 1
-        else:
-            rep.total_loss += 1
+        await store.set_token_status(tid, "dead", "no_price")
+        rep.total_loss += 1
         log.info(
             "ledger_row_finalized_dead",
             token_id=tid,
             horizon_days=h,
-            reason=reason,
+            reason="no_price",
             attempts=attempts,
         )
     log.info("ledger_done", **asdict(rep))

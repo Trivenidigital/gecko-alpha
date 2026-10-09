@@ -30,7 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_calls_source_time ON source_calls(source_id, post
 CREATE TABLE IF NOT EXISTS watchlist (
   token_id TEXT PRIMARY KEY, entered_at TEXT NOT NULL, rule_id TEXT NOT NULL,
   rank INTEGER NOT NULL, score REAL NOT NULL, features_at_entry_json TEXT NOT NULL,
-  last_ranked_at TEXT NOT NULL, exited_at TEXT, exit_reason TEXT);
+  last_ranked_at TEXT NOT NULL, exited_at TEXT, exit_reason TEXT, entry_price REAL);
 CREATE TABLE IF NOT EXISTS forward_returns (
   token_id TEXT NOT NULL, horizon_days INTEGER NOT NULL, due_at TEXT NOT NULL,
   entry_price REAL, price REAL, btc_entry REAL, btc_price REAL, ret REAL, ret_vs_btc REAL,
@@ -149,7 +149,9 @@ class Store:
             "first_source,pool_created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(token_id) DO UPDATE SET "
             "cg_id=COALESCE(tokens.cg_id, excluded.cg_id), "
-            "pool_created_at=COALESCE(tokens.pool_created_at, excluded.pool_created_at), "
+            # Earliest pool wins; canonical strings, so MIN is chronological.
+            "pool_created_at=MIN(COALESCE(tokens.pool_created_at, excluded.pool_created_at),"
+            " COALESCE(excluded.pool_created_at, tokens.pool_created_at)), "
             "updated_at=excluded.updated_at",
             (
                 token_id,
@@ -255,6 +257,14 @@ class Store:
                 json.dumps(features_at_entry, sort_keys=True),
                 entered_at,
             ),
+        )
+        await self.conn.commit()
+
+    async def set_entry_price(self, token_id, price: float) -> None:
+        """Freeze a watchlist entry's price; a stored one is never replaced."""
+        await self.conn.execute(
+            "UPDATE watchlist SET entry_price=? WHERE token_id=? AND entry_price IS NULL",
+            (price, token_id),
         )
         await self.conn.commit()
 

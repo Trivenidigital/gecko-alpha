@@ -317,3 +317,37 @@ async def test_source_calls_has_caller_time_index(store):
     ).fetchall()
     assert len(rows) == 1
     assert "source_calls(source_id, posted_at)" in rows[0][0]
+
+
+async def test_upsert_token_keeps_earliest_pool_created_at(store):
+    async def put(pool):
+        await store.upsert_token(
+            "solana:a",
+            "solana",
+            "a",
+            "A",
+            "A",
+            "2026-10-01T00:00:00Z",
+            "x",
+            pool_created_at=pool,
+        )
+        row = await (
+            await store.conn.execute("SELECT pool_created_at FROM tokens")
+        ).fetchone()
+        return row[0]
+
+    assert await put(None) is None
+    assert await put("2026-09-10T00:00:00Z") == "2026-09-10T00:00:00Z"
+    assert await put("2026-09-01T00:00:00+00:00") == "2026-09-01T00:00:00Z"
+    assert await put("2026-09-20T00:00:00Z") == "2026-09-01T00:00:00Z"
+    assert await put(None) == "2026-09-01T00:00:00Z"
+
+
+async def test_set_entry_price_is_write_once(store):
+    await store.watchlist_upsert("solana:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.set_entry_price("solana:a", 1.5)
+    await store.set_entry_price("solana:a", 9.0)
+    row = await (
+        await store.conn.execute("SELECT entry_price FROM watchlist")
+    ).fetchone()
+    assert row == (1.5,)

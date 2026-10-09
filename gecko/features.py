@@ -185,13 +185,13 @@ async def compute_features(
     as_of_dt = parse_utc(as_of)
     trow = await (
         await store.conn.execute(
-            "SELECT chain, first_seen_at, pool_created_at FROM tokens WHERE token_id=?",
+            "SELECT chain, pool_created_at FROM tokens WHERE token_id=?",
             (token_id,),
         )
     ).fetchone()
     if trow is None:
         return f
-    chain, first_seen, pool_created = trow
+    chain, pool_created = trow
     week_ago_dt = as_of_dt - timedelta(days=7)
     week_ago = _iso(week_ago_dt)
     then_floor = _iso(week_ago_dt - THEN_SLACK)
@@ -210,8 +210,10 @@ async def compute_features(
             )
             f.mcap_usd = _num(cg_mcap)
 
-    birth = min(d for d in (first_seen, pool_created) if d)
-    f.age_days = max(0.0, (as_of_dt - parse_utc(birth)).total_seconds() / DAY_SEC)
+    # Prereg F1 parity: pool age only; no pool, no age (so F4 cannot admit).
+    if pool_created is not None:
+        age_sec = (as_of_dt - parse_utc(pool_created)).total_seconds()
+        f.age_days = max(0.0, age_sec / DAY_SEC)
 
     f.vol_7d_ratio = vol_ratio_from_candles(
         await _latest_candles(store, token_id, as_of), as_of_dt

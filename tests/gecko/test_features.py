@@ -605,3 +605,24 @@ async def test_cg_only_token_described_by_cg_row(store, settings):
     )
     f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
     assert f.price_usd == 1.2 and f.mcap_usd == 4e6 and f.liquidity_usd is None
+
+
+async def test_age_is_pool_age_only(store, settings):
+    await store.upsert_token(
+        "solana:abc",
+        "solana",
+        "abc",
+        "A",
+        "A",
+        "2026-08-01T00:00:00Z",  # first seen before the pool: ignored (prereg F1)
+        "dexscreener",
+        pool_created_at="2026-09-10T00:00:00Z",
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-09-20T00:00:00Z")
+    assert f.age_days == pytest.approx(10.0)
+
+
+async def test_age_none_without_pool(store, settings):
+    await store.upsert_token("solana:abc", "solana", "abc", "A", "A", T0, "coingecko")
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T00:00:00Z")
+    assert f.age_days is None

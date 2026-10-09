@@ -103,6 +103,18 @@ async def _column(store: Store, sql: str) -> list[str]:
     return [r[0] for r in await (await store.conn.execute(sql)).fetchall()]
 
 
+async def _exit_reason(store: Store, tid: str, reasons: dict[str, str]) -> str:
+    """This run's disqualifier, else the token's stored one, else a default."""
+    if tid in reasons:
+        return reasons[tid]
+    row = await (
+        await store.conn.execute(
+            "SELECT disqualify_reason FROM tokens WHERE token_id=?", (tid,)
+        )
+    ).fetchone()
+    return (row[0] if row else None) or "disqualified"
+
+
 async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankReport:
     as_of = canon_ts(as_of)
     # Watchlist state is not point-in-time: ranking at an earlier as_of than
@@ -134,8 +146,10 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
     for tid, w in current.items():
         if tid not in feats:
             # Not active this run: this run's disqualifier, or left `active`
-            # some other way.
-            await store.watchlist_exit(tid, as_of, reasons.get(tid, "disqualified"))
+            # some other way (the ledger's dead/no_price).
+            await store.watchlist_exit(
+                tid, as_of, await _exit_reason(store, tid, reasons)
+            )
             exited.append(tid)
         elif parse_utc(as_of) - parse_utc(w.entered_at) > timedelta(
             days=settings.watchlist_max_age_days

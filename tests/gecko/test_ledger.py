@@ -276,51 +276,37 @@ async def test_set_return_input_error_is_not_swallowed(store, settings, monkeypa
                 await measure_due(store, settings, s, NOW)
 
 
-async def test_missing_entry_price_finalizes_unmeasurable(store, settings):
+async def test_missing_entry_price_waits_then_finalizes_all_horizons(store, settings):
     await seed(store, token_obs=False)
-    with aioresponses() as m:
-        for _ in range(MAX_ATTEMPTS):
-            m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
-        async with aiohttp.ClientSession() as s:
-            reports = [
-                await measure_due(store, settings, s, NOW) for _ in range(MAX_ATTEMPTS)
-            ]
-    assert [r.failed for r in reports] == [1, 1, 0]
-    assert [r.measured for r in reports] == [0, 0, 0]
-    assert reports[-1].unmeasurable == 1 and reports[-1].total_loss == 0
-    row = await one(
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            r = await measure_due(store, settings, s, NOW)  # E+26h: still pending
+            assert not m.requests
+        assert (r.skipped, r.failed, r.unmeasurable) == (1, 0, 0)
+        late = "2026-10-03T01:00:00Z"  # E+49h: the 48h window has closed
+        with aioresponses() as m:
+            r = await measure_due(store, settings, s, late)
+            assert not m.requests
+    assert (r.unmeasurable, r.total_loss, r.measured) == (5, 0, 0)
+    rows = await (
+        await store.conn.execute(
+            "SELECT entry_price, price, ret, ret_vs_btc, measured_at, attempts "
+            "FROM forward_returns ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(None, 0.0, None, None, late, 0)] * 5
+    assert await one(
         store,
-        "SELECT entry_price, price, ret, ret_vs_btc, measured_at, attempts "
-        "FROM forward_returns WHERE horizon_days=1",
-    )
-    assert row == (None, 2.0, None, None, NOW, MAX_ATTEMPTS)
-    st = await one(
-        store,
-        "SELECT status, disqualify_reason FROM tokens WHERE token_id='solana:abc'",
-    )
-    assert st == ("dead", "no_entry_price")
-
-
-async def test_missing_entry_and_price_finalizes_with_zero_price(store, settings):
-    await seed(store, token_obs=False)
-    with aioresponses() as m:
-        for _ in range(MAX_ATTEMPTS):
-            m.get(DS, status=404)
-        async with aiohttp.ClientSession() as s:
-            for _ in range(MAX_ATTEMPTS):
-                r = await measure_due(store, settings, s, NOW)
-    assert r.unmeasurable == 1 and r.total_loss == 0
-    row = await one(
-        store,
-        "SELECT entry_price, price, ret, measured_at FROM forward_returns WHERE horizon_days=1",
-    )
-    assert row == (None, 0.0, None, NOW)
+        "SELECT exit_reason, entry_price FROM watchlist WHERE token_id='solana:abc'",
+    ) == ("no_entry_price", None)
+    # an absent entry price is no evidence the token is dead
+    st = await one(store, "SELECT status FROM tokens WHERE token_id='solana:abc'")
+    assert st == ("active",)
 
 
 async def test_entry_price_appearing_later_is_used(store, settings):
     await seed(store, token_obs=False)
     with aioresponses() as m:
-        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
         m.get(DS, payload=[{"priceUsd": "3.0", "liquidity": {"usd": 5}}])
         async with aiohttp.ClientSession() as s:
             r1 = await measure_due(store, settings, s, NOW)
@@ -328,11 +314,55 @@ async def test_entry_price_appearing_later_is_used(store, settings):
                 "solana:abc", "dexscreener", "2026-10-01T00:30:00Z", {"price_usd": 1.5}
             )
             r2 = await measure_due(store, settings, s, NOW)
-    assert (r1.failed, r2.measured) == (1, 1)
+    assert (r1.skipped, r2.measured) == (1, 1)
     row = await one(
         store, "SELECT entry_price, price FROM forward_returns WHERE horizon_days=1"
     )
     assert row == (1.5, 3.0)
+
+
+async def test_all_horizons_share_one_frozen_entry_price(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-08T00:30:00Z", {"price_usd": 70000.0}
+    )
+    with aioresponses() as m:
+        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}], repeat=True)
+        async with aiohttp.ClientSession() as s:
+            await measure_due(store, settings, s, NOW)
+            # an earlier-observed row arrives late; the frozen price must hold
+            await store.add_observation(
+                "solana:abc",
+                "geckoterminal",
+                "2026-10-01T00:10:00Z",
+                {"price_usd": 0.9},
+            )
+            r = await measure_due(store, settings, s, LATER)
+    assert r.measured == 1
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, entry_price FROM forward_returns "
+            "WHERE measured_at IS NOT NULL ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(1, 1.0), (7, 1.0)]
+    assert await one(
+        store, "SELECT entry_price FROM watchlist WHERE token_id='solana:abc'"
+    ) == (1.0,)
+
+
+async def test_entry_price_after_the_48h_window_is_not_used(store, settings):
+    await seed(store, token_obs=False)
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-03T02:00:00Z", {"price_usd": 1.0}
+    )  # E+50h
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-03T12:00:00Z", {"price_usd": 61000.0}
+    )
+    async with aiohttp.ClientSession() as s:
+        with aioresponses():
+            r = await measure_due(store, settings, s, "2026-10-03T12:00:00Z")
+    assert r.unmeasurable == 5 and r.measured == 0
 
 
 async def test_already_measured_row_is_logged_and_skipped(store, settings, monkeypatch):
@@ -499,7 +529,7 @@ async def test_measure_due_ignores_entry_observations_after_now(store, settings)
         "solana:abc", "dexscreener", "2026-10-02T03:00:00Z", {"price_usd": 1.0}
     )
     with aioresponses() as m:
-        m.get(DS, payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}])
         async with aiohttp.ClientSession() as s:
             r = await measure_due(store, settings, s, NOW)
-    assert (r.measured, r.failed) == (0, 1)
+        assert not m.requests
+    assert (r.measured, r.failed, r.skipped) == (0, 0, 1)
