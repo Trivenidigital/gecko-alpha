@@ -74,17 +74,29 @@ async def collect_pools(
 ) -> JobResult:
     now = canon_ts(now)
     pacer = Pacer(settings.gt_min_interval_sec, sleep)
-    written = skipped = invalid = 0
+    written = skipped = invalid = lists = failed = 0
     for chain in settings.chains:
         network = NETWORK_MAP[chain]
         for list_name in LISTS:
             await pacer.wait()
-            body = await get_json(
-                session,
-                POOLS_URL.format(network=network, list=list_name),
-                settings=settings,
-                headers=HEADERS,
-            )
+            lists += 1
+            try:
+                body = await get_json(
+                    session,
+                    POOLS_URL.format(network=network, list=list_name),
+                    settings=settings,
+                    headers=HEADERS,
+                )
+            except UpstreamError as exc:
+                # One network's outage must not cost the others their reads.
+                failed += 1
+                log.warning(
+                    "geckoterminal_list_failed",
+                    network=network,
+                    list=list_name,
+                    status=exc.status,
+                )
+                continue
             for item in (body or {}).get("data") or []:
                 attrs = item.get("attributes") or {}
                 f = pool_features(attrs, list_name)
@@ -133,7 +145,11 @@ async def collect_pools(
         skipped=skipped,
         invalid=invalid,
         promoted=promoted,
+        lists=lists,
+        lists_failed=failed,
     )
+    if lists and failed == lists:
+        raise RuntimeError(f"all {lists} geckoterminal pool lists failed")
     return JobResult(rows_written=written)
 
 

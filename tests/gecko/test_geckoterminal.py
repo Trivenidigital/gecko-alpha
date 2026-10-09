@@ -450,3 +450,47 @@ async def test_collect_pools_skips_invalid_address_and_bad_pool_timestamp(
     assert [e["value"] for e in logs if e["event"] == "gt_pool_created_at_invalid"] == [
         "'yesterday'"
     ]
+
+
+def _failing_network(monkeypatch, network, status=500):
+    import gecko.collectors.geckoterminal as gt
+    from gecko.http import UpstreamError
+
+    real = gt.get_json
+
+    async def stub(session, url, **kw):
+        if f"/networks/{network}/" in url:
+            raise UpstreamError(status, url)
+        return await real(session, url, **kw)
+
+    monkeypatch.setattr(gt, "get_json", stub)
+
+
+async def test_one_network_down_does_not_stop_the_others(store, settings, monkeypatch):
+    settings.chains = ["solana", "ethereum"]
+    _failing_network(monkeypatch, "solana")
+    evm = "0x" + "e" * 40
+    with aioresponses() as m:
+        m.get(POOLS_URL.format(network="eth", list="new_pools"), payload={"data": []})
+        m.get(
+            POOLS_URL.format(network="eth", list="trending_pools"),
+            payload={"data": [pool(addr=evm, network="eth", pool_addr="0xpool")]},
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect_pools(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 1
+    failed = [e for e in logs if e["event"] == "geckoterminal_list_failed"]
+    assert [(e["network"], e["status"]) for e in failed] == [("solana", 500)] * 2
+    done = [e for e in logs if e["event"] == "geckoterminal_pools_done"][0]
+    assert (done["lists"], done["lists_failed"]) == (4, 2)
+
+
+async def test_every_list_failing_fails_the_run(store, settings, monkeypatch):
+    import pytest
+
+    settings.chains = ["solana"]
+    _failing_network(monkeypatch, "solana")
+    async with aiohttp.ClientSession() as s:
+        with pytest.raises(RuntimeError, match="all 2 geckoterminal pool lists"):
+            await collect_pools(store, settings, s, NOW, sleep=nosleep)

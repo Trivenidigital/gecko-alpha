@@ -28,7 +28,8 @@ def test_disqualify_which_gate(settings):
     assert disqualify(feat(security_ok=False), settings) == "security_fail"
     assert disqualify(feat(top10_pct=61.0), settings) == "concentration"
     assert disqualify(feat(liquidity_gate_usd=100.0), settings) == "liquidity"
-    assert disqualify(feat(liquidity_gate_usd=None), settings) == "liquidity"
+    # no fresh reading is absence, judged by "dead" only
+    assert disqualify(feat(liquidity_gate_usd=None), settings) is None
     assert disqualify(feat(observed_at="2026-10-01T00:00:00Z"), settings) == "dead"
     assert disqualify(feat(observed_at=None), settings) == "dead"
     assert disqualify(feat(), settings) is None
@@ -183,22 +184,29 @@ async def test_rank_once_enters_schedules_and_exits(store, settings):
     assert row[0] == "liquidity"
 
 
-async def test_unread_token_fails_the_fresh_liquidity_gate(store, settings):
-    # No DEX reading within 6 h fails the liquidity gate, which is checked
-    # before "dead"; a token unread for 7 days therefore exits on liquidity.
-    await seed_token(store, "solana:good")
+async def test_dead_token(store, settings):
+    await seed_token(store, "solana:good")  # last DEX reading 2026-10-14T23:00Z
     await rank_once(store, settings, A)
+    # 13 h without a DEX reading, inside dead_after_days: stays, not disqualified
+    r = await rank_once(store, settings, "2026-10-15T12:00:00Z")
+    assert r.exited == [] and r.ranked == 1
+    row = await one(
+        store,
+        "SELECT status, disqualify_reason FROM tokens WHERE token_id='solana:good'",
+    )
+    assert row == ("active", None)
+    # nothing within 7 days: dead
     r = await rank_once(store, settings, "2026-10-25T00:00:00Z")
     assert r.exited == ["solana:good"]
     row = await one(
         store,
         "SELECT status, disqualify_reason FROM tokens WHERE token_id='solana:good'",
     )
-    assert row == ("disqualified", "liquidity")
+    assert row == ("dead", "dead")
     row = await one(
         store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
     )
-    assert row[0] == "liquidity"
+    assert row[0] == "dead"
 
 
 async def test_rank_is_sticky_when_rule_lapses(store, settings):

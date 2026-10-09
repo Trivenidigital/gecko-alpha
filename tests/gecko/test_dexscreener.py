@@ -486,19 +486,76 @@ async def test_failed_batch_does_not_stop_next_batch_or_admission(store, setting
     assert "promoted" in done  # admission ran
 
 
-async def test_run_fails_only_when_every_batch_failed(store, settings):
-    import pytest
+def _failing_feeds(monkeypatch, urls, status=503):
+    import gecko.collectors.dexscreener as ds
+    from gecko.http import UpstreamError
 
+    real = ds.get_json
+
+    async def stub(session, url, **kw):
+        if url in urls:
+            raise UpstreamError(status, url)
+        return await real(session, url, **kw)
+
+    monkeypatch.setattr(ds, "get_json", stub)
+
+
+async def test_all_batches_failing_with_feeds_up_does_not_fail_the_run(store, settings):
     await _known(store, A40)
     with aioresponses() as m:
         m.get(BOOSTS_URL, payload=[])
         m.get(PROFILES_URL, payload=[])
         m.get(TOKENS_URL.format(chain="base", addresses=A40), status=400)
         async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 0
+
+
+async def test_run_fails_only_when_every_feed_and_batch_failed(
+    store, settings, monkeypatch
+):
+    import pytest
+
+    _failing_feeds(monkeypatch, {BOOSTS_URL, PROFILES_URL})
+    await _known(store, A40)
+    with aioresponses() as m:
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), status=400)
+        async with aiohttp.ClientSession() as s:
             with capture_logs() as logs:
-                with pytest.raises(RuntimeError, match="all 1 dexscreener batches"):
+                with pytest.raises(RuntimeError, match="every dexscreener feed"):
                     await collect(store, settings, s, NOW, sleep=nosleep)
     assert [e for e in logs if e["event"] == "dexscreener_done"]  # admission ran first
+
+
+async def test_both_feeds_down_still_refreshes(store, settings, monkeypatch):
+    _failing_feeds(monkeypatch, {BOOSTS_URL, PROFILES_URL})
+    await _known(store, A40)
+    with aioresponses() as m:
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), payload=[pair(addr=A40)])
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 1
+
+
+async def test_failed_boosts_feed_still_discovers_profiles_and_refreshes(
+    store, settings, monkeypatch
+):
+    _failing_feeds(monkeypatch, {BOOSTS_URL})
+    await _known(store, B40)
+    with aioresponses() as m:
+        m.get(PROFILES_URL, payload=[{"chainId": "base", "tokenAddress": A40}])
+        m.get(TOKENS_URL.format(chain="base", addresses=A40), payload=[pair(addr=A40)])
+        m.get(TOKENS_URL.format(chain="base", addresses=B40), payload=[pair(addr=B40)])
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 2
+    failed = [e for e in logs if e["event"] == "dexscreener_feed_failed"]
+    assert [(e["url"], e["status"]) for e in failed] == [(BOOSTS_URL, 503)]
+    done = [e for e in logs if e["event"] == "dexscreener_done"][0]
+    assert done["feeds_failed"] == 1
+    (o,) = await store.observations(f"base:{B40}", as_of=NOW)
+    assert o.features["refresh"] is True
 
 
 async def test_stale_candidates_are_aged_out_and_not_refreshed(store, settings):

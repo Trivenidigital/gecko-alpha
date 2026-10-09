@@ -71,14 +71,27 @@ def pair_features(p: dict) -> dict:
 
 
 async def _discover(
-    session: aiohttp.ClientSession, settings: GeckoSettings, pacer: Pacer
+    session: aiohttp.ClientSession,
+    settings: GeckoSettings,
+    pacer: Pacer,
+    calls: dict[str, int],
 ) -> tuple[dict[str, set[str]], int]:
-    """Feed addresses per configured chain, and how many were malformed."""
+    """Feed addresses per configured chain, and how many were malformed.
+
+    A failed feed is logged and counted in ``calls``; the other feed and the
+    refresh pass still run.
+    """
     found: dict[str, set[str]] = {}
     invalid = 0
     for url in (BOOSTS_URL, PROFILES_URL):
         await pacer.wait()
-        items = await get_json(session, url, settings=settings)
+        calls["total"] += 1
+        try:
+            items = await get_json(session, url, settings=settings)
+        except UpstreamError as exc:
+            calls["failed"] += 1
+            log.warning("dexscreener_feed_failed", url=url, status=exc.status)
+            continue
         for it in items or []:
             chain = CHAIN_MAP.get(str(it.get("chainId", "")).lower())
             addr = str(it.get("tokenAddress") or "").strip()
@@ -178,10 +191,11 @@ async def collect(
 ) -> JobResult:
     pacer = Pacer(settings.ds_min_interval_sec, sleep)
     batches = {"total": 0, "failed": 0}
+    feeds = {"total": 0, "failed": 0}
     aged = await _age_out_candidates(store, settings, now)
     targets = await _refresh_targets(store, settings)
     known = set(targets)
-    found, invalid = await _discover(session, settings, pacer)
+    found, invalid = await _discover(session, settings, pacer, feeds)
     written = skipped = refreshed = missing = 0
     for chain, addrs in found.items():
         async for addr, p in _pairs(session, settings, pacer, batches, chain, addrs):
@@ -248,9 +262,10 @@ async def collect(
         promoted=promoted,
         batches=batches["total"],
         batches_failed=batches["failed"],
+        feeds_failed=feeds["failed"],
     )
-    if batches["total"] and batches["failed"] == batches["total"]:
-        raise RuntimeError(f"all {batches['total']} dexscreener batches failed")
+    if feeds["failed"] == feeds["total"] and batches["failed"] == batches["total"]:
+        raise RuntimeError("every dexscreener feed and refresh batch failed")
     return JobResult(rows_written=written + refreshed)
 
 
