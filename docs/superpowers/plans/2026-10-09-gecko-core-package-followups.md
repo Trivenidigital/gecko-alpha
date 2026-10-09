@@ -43,3 +43,9 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - gecko tests also run inside the legacy `test` job (redundant) — accepted.
 - No boundary test at exactly 5,000 test lines; no gecko-missing-dir guard test — Plan 2.
 - Notify tests lack timeout and non-200+ok:true cases; `--as-of` freshness backfill writes past-dated dedup rows — Plan 2.
+
+## From the final fix-wave re-review (ticketed, not blocking)
+- Ledger: `_resolve_entry` may freeze a CoinGecko fallback price before the 48 h window closes (1 d horizon resolves at ~24 h); take the CoinGecko fallback only after the deadline — Plan 2.
+- Refresh queue: targets with no DexScreener pair sort NULL-first every run until aging removes them; order open-watchlist rows, then actives, ahead of the NULL-first key — Plan 2.
+- Candidate aging keys on `first_seen_at`, so a token can be demoted mid-way through a legitimate 24 h survival window that started late; key on the last in-band reading instead — Plan 2.
+- Structural probe in the session scratchpad uses an invalid address fixture and no longer runs — scratch only, no action.
