@@ -7,6 +7,7 @@ from pydantic import SecretStr
 
 from gecko.collectors.coingecko import BASE, calls_this_month, hourly, markets_sweep
 from gecko.http import UpstreamError
+from gecko.runs import PartialFailure
 
 NOW = "2026-10-09T00:00:00Z"
 MARKETS = re.compile(re.escape(BASE + "/coins/markets") + r"\?.*")
@@ -151,9 +152,33 @@ async def test_markets_401_fails_run(store, cg_settings):
     with aioresponses() as m:
         m.get(MARKETS, status=401, payload={"status": {"error_code": 10004}})
         async with aiohttp.ClientSession() as s:
-            with pytest.raises(UpstreamError) as ei:
+            with pytest.raises(PartialFailure) as ei:
                 await markets_sweep(store, cg_settings, s, NOW)
-    assert ei.value.status == 401
+    assert isinstance(ei.value.cause, UpstreamError)
+    assert ei.value.cause.status == 401
+    assert ei.value.credits_used == 1 and ei.value.rows_written == 0
+
+
+async def test_hourly_failure_reports_spent_credits(store, cg_settings):
+    with aioresponses() as m:
+        m.get(re.compile(re.escape(BASE + "/search/trending")), payload={"coins": []})
+        m.get(re.compile(re.escape(BASE + "/simple/price") + r"\?.*"), status=401)
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(PartialFailure) as ei:
+                await hourly(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    assert ei.value.cause.status == 401 and ei.value.credits_used == 2
+
+
+async def test_calls_this_month_counts_failed_runs(store):
+    await store.record_run(
+        "coingecko-markets",
+        "2026-10-02T00:00:00Z",
+        "2026-10-02T00:01:00Z",
+        False,
+        credits_used=5,
+        error="PartialFailure",
+    )
+    assert await calls_this_month(store, NOW) == 5
 
 
 async def test_monthly_cap_stops_before_calling(store, cg_settings):

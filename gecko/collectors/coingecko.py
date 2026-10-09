@@ -9,7 +9,7 @@ import structlog
 from gecko.http import Pacer, UpstreamError, _retryable, get_json
 from gecko.identity import norm_address, token_id
 from gecko.jobs import register
-from gecko.runs import JobResult, run_job
+from gecko.runs import JobResult, PartialFailure, run_job
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, utcnow
 from gecko.universe import in_band
@@ -170,65 +170,68 @@ async def markets_sweep(
         return JobResult()
     cg = CGClient(session, settings, sleep)
     written = 0
-    budget_skipped = 0
-    for page in range(settings.cg_first_page, settings.cg_max_pages + 1):
-        rows = await cg.get(
-            "/coins/markets",
-            {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": 250,
-                "page": page,
-                "price_change_percentage": "24h,7d",
-            },
-        )
-        if not rows:
-            break
-        # Platform lookups may only spend what the remaining planned pages leave.
-        reserved = settings.cg_max_pages - page
-        for r in rows:
-            mcap = r.get("market_cap")
-            if mcap is None:
-                continue
-            # Liquidity floor passed through: the mcap band alone decides admission.
-            if not in_band(
-                settings,
-                mcap_usd=mcap,
-                liquidity_usd=settings.min_liquidity_usd,
-                chain=settings.chains[0],
-            ):
-                continue
-            cid = r["id"]
-            mapped = await _known_platform(store, cid, now)
-            if mapped is None:
-                if cg.calls + 1 + reserved > left:
-                    budget_skipped += 1
-                    continue
-                mapped = await _fetch_platform(store, cg, cid, now)
-            if not mapped:
-                continue
-            chain, addr = mapped
-            if chain not in settings.chains:
-                continue
-            tid = token_id(chain, addr)
-            await store.upsert_token(
-                tid,
-                chain,
-                norm_address(chain, addr),
-                (r.get("symbol") or "?").upper(),
-                r.get("name") or "?",
-                now,
-                "coingecko",
-                cg_id=cid,
+    try:
+        budget_skipped = 0
+        for page in range(settings.cg_first_page, settings.cg_max_pages + 1):
+            rows = await cg.get(
+                "/coins/markets",
+                {
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 250,
+                    "page": page,
+                    "price_change_percentage": "24h,7d",
+                },
             )
-            await store.add_observation(tid, "coingecko", now, _market_features(r))
-            written += 1
-        if (rows[-1].get("market_cap") or 0) < settings.min_mcap_usd:
-            break
-    if budget_skipped:
-        log.warning("cg_platform_lookups_deferred", count=budget_skipped, left=left)
-    log.info("coingecko_markets_done", written=written, calls=cg.calls)
-    return JobResult(rows_written=written, credits_used=cg.calls)
+            if not rows:
+                break
+            # Platform lookups may only spend what the remaining planned pages leave.
+            reserved = settings.cg_max_pages - page
+            for r in rows:
+                mcap = r.get("market_cap")
+                if mcap is None:
+                    continue
+                # Liquidity floor passed through: the mcap band alone decides admission.
+                if not in_band(
+                    settings,
+                    mcap_usd=mcap,
+                    liquidity_usd=settings.min_liquidity_usd,
+                    chain=settings.chains[0],
+                ):
+                    continue
+                cid = r["id"]
+                mapped = await _known_platform(store, cid, now)
+                if mapped is None:
+                    if cg.calls + 1 + reserved > left:
+                        budget_skipped += 1
+                        continue
+                    mapped = await _fetch_platform(store, cg, cid, now)
+                if not mapped:
+                    continue
+                chain, addr = mapped
+                if chain not in settings.chains:
+                    continue
+                tid = token_id(chain, addr)
+                await store.upsert_token(
+                    tid,
+                    chain,
+                    norm_address(chain, addr),
+                    (r.get("symbol") or "?").upper(),
+                    r.get("name") or "?",
+                    now,
+                    "coingecko",
+                    cg_id=cid,
+                )
+                await store.add_observation(tid, "coingecko", now, _market_features(r))
+                written += 1
+            if (rows[-1].get("market_cap") or 0) < settings.min_mcap_usd:
+                break
+        if budget_skipped:
+            log.warning("cg_platform_lookups_deferred", count=budget_skipped, left=left)
+        log.info("coingecko_markets_done", written=written, calls=cg.calls)
+        return JobResult(rows_written=written, credits_used=cg.calls)
+    except Exception as exc:
+        raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc
 
 
 async def hourly(
@@ -243,39 +246,46 @@ async def hourly(
         return JobResult()
     cg = CGClient(session, settings, sleep)
     written = 0
-    trending = await cg.get("/search/trending")
-    for rank, entry in enumerate(((trending or {}).get("coins") or []), start=1):
-        item = (entry or {}).get("item") or {}
-        row = await (
-            await store.conn.execute(
-                "SELECT token_id FROM tokens WHERE cg_id=? AND chain!='cg'",
-                (item.get("id"),),
-            )
-        ).fetchone()
-        if row:
-            await store.add_observation(
-                row[0],
-                "coingecko",
+    try:
+        trending = await cg.get("/search/trending")
+        for rank, entry in enumerate(((trending or {}).get("coins") or []), start=1):
+            item = (entry or {}).get("item") or {}
+            row = await (
+                await store.conn.execute(
+                    "SELECT token_id FROM tokens WHERE cg_id=? AND chain!='cg'",
+                    (item.get("id"),),
+                )
+            ).fetchone()
+            if row:
+                await store.add_observation(
+                    row[0],
+                    "coingecko",
+                    now,
+                    {"trending_rank": rank, "mcap_rank": item.get("market_cap_rank")},
+                )
+                written += 1
+        price = await cg.get(
+            "/simple/price", {"ids": "bitcoin", "vs_currencies": "usd"}
+        )
+        btc = ((price or {}).get("bitcoin") or {}).get("usd")
+        if btc:
+            await store.upsert_token(
+                BTC_ID,
+                "benchmark",
+                "btc",
+                "BTC",
+                "Bitcoin",
                 now,
-                {"trending_rank": rank, "mcap_rank": item.get("market_cap_rank")},
+                "coingecko",
+                cg_id="bitcoin",
+            )
+            await store.add_observation(
+                BTC_ID, "coingecko", now, {"price_usd": float(btc)}
             )
             written += 1
-    price = await cg.get("/simple/price", {"ids": "bitcoin", "vs_currencies": "usd"})
-    btc = ((price or {}).get("bitcoin") or {}).get("usd")
-    if btc:
-        await store.upsert_token(
-            BTC_ID,
-            "benchmark",
-            "btc",
-            "BTC",
-            "Bitcoin",
-            now,
-            "coingecko",
-            cg_id="bitcoin",
-        )
-        await store.add_observation(BTC_ID, "coingecko", now, {"price_usd": float(btc)})
-        written += 1
-    return JobResult(rows_written=written, credits_used=cg.calls)
+        return JobResult(rows_written=written, credits_used=cg.calls)
+    except Exception as exc:
+        raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc
 
 
 @register("coingecko-markets")
