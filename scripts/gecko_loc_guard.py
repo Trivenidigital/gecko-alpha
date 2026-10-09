@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-LIMITS = {"gecko": 3000, "tests/gecko": 5000}
+LIMITS = {"gecko": 3000, "tests/gecko": 6000}
 
 
 def count(root: Path, rel: str) -> int:

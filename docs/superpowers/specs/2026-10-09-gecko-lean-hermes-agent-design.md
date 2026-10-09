@@ -44,7 +44,7 @@ Companion evidence: `docs/audit_structural_2026_10_09.md`, `docs/research_hermes
 
 | # | Criterion | Target |
 |---|---|---|
-| S1 | Custom code | `gecko/` ≤ 3,000 LOC excluding tests (raised from 2,500 → 2,800 → 3,000 on 2026-10-09: the per-token refresh pass, frozen entry price, address validation, ledger canary, per-source freshness SLOs and concurrency repairs required by the independent reviews were missing from the original estimate; still ~36× smaller than `scout/`); tests ≤ 5,000 LOC |
+| S1 | Custom code | `gecko/` ≤ 3,000 LOC excluding tests (raised from 2,500 → 2,800 → 3,000 on 2026-10-09: the per-token refresh pass, frozen entry price, address validation, ledger canary, per-source freshness SLOs and concurrency repairs required by the independent reviews were missing from the original estimate; still ~36× smaller than `scout/`); tests ≤ 6,000 LOC (raised from 5,000 on 2026-10-09 for the falsifier tests the vector reviews required) |
 | S2 | Discovery breadth | ≥ 3 independent discovery sources alive (DexScreener, GeckoTerminal, CoinGecko new/trending, GMGN trenches, Telegram callers) with per-table freshness within SLO for 14 consecutive days |
 | S3 | Delivery | Daily digest delivered to Telegram 14 consecutive days; `[SILENT]` days count as delivered |
 | S4 | Track record | Forward returns at 1/7/30/90/180 d recorded for 100% of watchlist entrants; weekly cohort scorecard vs BTC |
@@ -179,7 +179,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 - Long-running units: `hermes-gateway.service`, `gecko-telegram-reader.service`. All other old units/timers/crontab lines are removed at cutover.
 - `freshness` job (script): per-table SLO (`observations` ≤ 30 min, `source_calls` ≤ 6 h when channels active, `watchlist` ≤ 2 h, `forward_returns` ≤ 26 h, `research_notes` ≤ 26 h); breach ⇒ one plain-text Telegram message to the health chat, de-duplicated per table per 6 h. This is the §12a minimum.
-- Hermes cron incidents (`hermes cron incidents`) cover job crashes and retries; the freshness job covers "ran but wrote nothing": per-source observation SLOs (dexscreener 30 min, geckoterminal 60 min, coingecko 26 h, OHLCV-with-candles 26 h), a `benchmark:btc` SLO of 3 h, and a forward-returns backlog breach when any row is more than 72 h past due and unmeasured. The ledger prices a per-chain canary (WSOL, WETH, WBNB) each run; an unpriced canary marks every missing price on that chain transient and fails the run, so a DexScreener schema or route change cannot be booked as per-token losses (amended 2026-10-09).
+- Hermes cron incidents (`hermes cron incidents`) cover job crashes and retries; the freshness job covers "ran but wrote nothing": per-source observation SLOs on written rows (dexscreener 30 min, geckoterminal 360 min, coingecko 26 h, OHLCV-with-candles 26 h), a `benchmark:btc` SLO of 3 h, and a forward-returns backlog breach when any row is more than 72 h past due and unmeasured. The ledger prices a per-chain canary (WSOL, WETH, WBNB) each run; an unpriced canary marks every missing price on that chain transient and fails the run, so a DexScreener schema or route change cannot be booked as per-token losses (amended 2026-10-09).
 - Backup: nightly `sqlite3 gecko.db ".backup"` + existing off-host transport script retained (only ops script carried over).
 - Logs: structlog JSON to journald as today.
 
