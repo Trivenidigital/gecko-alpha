@@ -54,7 +54,10 @@ async def test_sweep_maps_platforms_and_counts_calls(store, cg_settings):
             payload=[row("abc-coin", 5e6), row("mega", 9e9), row("nochain", 2e6)],
         )
         m.get(MARKETS, payload=[row("tail", 100.0)])  # last mcap below floor -> stop
-        m.get(COIN, payload={"platforms": {"solana": "So1Addr"}})
+        m.get(
+            COIN,
+            payload={"platforms": {"solana": "So1Addr111111111111111111111111111111"}},
+        )
         m.get(COIN, payload={"platforms": {"tron": "T1"}})
         async with aiohttp.ClientSession() as s:
             r = await markets_sweep(store, cg_settings, s, NOW, sleep=sleep)
@@ -67,8 +70,16 @@ async def test_sweep_maps_platforms_and_counts_calls(store, cg_settings):
             "SELECT token_id, address, cg_id FROM tokens WHERE chain='solana'"
         )
     ).fetchall()
-    assert tok == [("solana:So1Addr", "So1Addr", "abc-coin")]
-    obs = await store.observations("solana:So1Addr", as_of=NOW, source="coingecko")
+    assert tok == [
+        (
+            "solana:So1Addr111111111111111111111111111111",
+            "So1Addr111111111111111111111111111111",
+            "abc-coin",
+        )
+    ]
+    obs = await store.observations(
+        "solana:So1Addr111111111111111111111111111111", as_of=NOW, source="coingecko"
+    )
     assert obs[0].features["mcap_usd"] == 5e6
     assert obs[0].features["price_change_7d_pct"] == 10.0
     assert "liquidity_usd" not in obs[0].features
@@ -89,7 +100,12 @@ async def test_sweep_maps_platforms_and_counts_calls(store, cg_settings):
 async def test_sweep_lowercases_evm_platform_address(store, cg_settings):
     with aioresponses() as m:
         m.get(MARKETS, payload=[row("evm-coin", 5e6)])
-        m.get(COIN, payload={"platforms": {"base": " 0xAbCdEf "}})
+        m.get(
+            COIN,
+            payload={
+                "platforms": {"base": " 0xAbCdEf0000000000000000000000000000000000 "}
+            },
+        )
         m.get(MARKETS, payload=[])
         async with aiohttp.ClientSession() as s:
             await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
@@ -98,14 +114,19 @@ async def test_sweep_lowercases_evm_platform_address(store, cg_settings):
             "SELECT token_id, address FROM tokens WHERE cg_id='evm-coin'"
         )
     ).fetchall()
-    assert tok == [("base:0xabcdef", "0xabcdef")]
+    assert tok == [
+        (
+            "base:0xabcdef0000000000000000000000000000000000",
+            "0xabcdef0000000000000000000000000000000000",
+        )
+    ]
 
 
 async def test_sweep_does_not_refetch_known_platforms(store, cg_settings):
     await store.upsert_token(
-        "solana:So1Addr",
+        "solana:So1Addr111111111111111111111111111111",
         "solana",
-        "So1Addr",
+        "So1Addr111111111111111111111111111111",
         "ABC",
         "Abc",
         NOW,
@@ -204,9 +225,9 @@ async def test_monthly_cap_stops_before_calling(store, cg_settings):
     with aioresponses() as m:
         async with aiohttp.ClientSession() as s:
             r = await markets_sweep(store, cg_settings, s, NOW, budget_now=NOW)
-            h = await hourly(store, cg_settings, s, NOW, budget_now=NOW)
+            with pytest.raises(RuntimeError, match="cg budget exhausted"):
+                await hourly(store, cg_settings, s, NOW, budget_now=NOW)
     assert r.credits_used == 0 and r.rows_written == 0
-    assert h.credits_used == 0 and h.rows_written == 0
     assert m.requests == {}
 
 
@@ -219,7 +240,10 @@ async def test_platform_lookups_never_overshoot_monthly_cap(store, cg_settings):
             MARKETS,
             payload=[row("a-coin", 5e6), row("b-coin", 5e6), row("c-coin", 5e6)],
         )
-        m.get(COIN, payload={"platforms": {"solana": "AaaMint"}})
+        m.get(
+            COIN,
+            payload={"platforms": {"solana": "AaaMint111111111111111111111111111111"}},
+        )
         m.get(MARKETS, payload=[])
         async with aiohttp.ClientSession() as s:
             r = await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
@@ -234,9 +258,9 @@ async def test_platform_lookups_never_overshoot_monthly_cap(store, cg_settings):
 
 async def test_hourly_btc_and_trending(store, cg_settings):
     await store.upsert_token(
-        "solana:So1Addr",
+        "solana:So1Addr111111111111111111111111111111",
         "solana",
-        "So1Addr",
+        "So1Addr111111111111111111111111111111",
         "ABC",
         "Abc",
         NOW,
@@ -276,7 +300,9 @@ async def test_hourly_btc_and_trending(store, cg_settings):
     assert len(sleep.calls) == 1
     btc = await store.observations("benchmark:btc", as_of=NOW, source="coingecko")
     assert btc[0].features["price_usd"] == 61234.5
-    tr = await store.observations("solana:So1Addr", as_of=NOW, source="coingecko")
+    tr = await store.observations(
+        "solana:So1Addr111111111111111111111111111111", as_of=NOW, source="coingecko"
+    )
     assert tr[0].features["trending_rank"] == 1
     assert await store.observations("cg:unknown", as_of=NOW) == []
 
@@ -324,14 +350,15 @@ async def test_budget_uses_real_clock_not_as_of(store, cg_settings):
                 "2026-09-15T00:00:00Z",
                 budget_now="2026-10-09T12:00:00Z",
             )
-            h = await hourly(
-                store,
-                cg_settings,
-                s,
-                "2026-09-15T00:00:00Z",
-                budget_now="2026-10-09T12:00:00Z",
-            )
-    assert r.credits_used == 0 and h.credits_used == 0
+            with pytest.raises(RuntimeError, match="cg budget exhausted"):
+                await hourly(
+                    store,
+                    cg_settings,
+                    s,
+                    "2026-09-15T00:00:00Z",
+                    budget_now="2026-10-09T12:00:00Z",
+                )
+    assert r.credits_used == 0
     assert m.requests == {}
 
 
@@ -339,8 +366,21 @@ async def test_platform_choice_prefers_configured_chain(store, cg_settings):
     cg_settings.chains = ["solana", "base"]
     with aioresponses() as m:
         m.get(MARKETS, payload=[row("multi", 5e6), row("ethonly", 5e6)])
-        m.get(COIN, payload={"platforms": {"ethereum": "0xA", "base": "0xB"}})
-        m.get(COIN, payload={"platforms": {"ethereum": "0xC"}})
+        m.get(
+            COIN,
+            payload={
+                "platforms": {
+                    "ethereum": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "base": "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                }
+            },
+        )
+        m.get(
+            COIN,
+            payload={
+                "platforms": {"ethereum": "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"}
+            },
+        )
         m.get(MARKETS, payload=[])
         m.get(MARKETS, payload=[row("multi", 5e6), row("ethonly", 5e6)])
         m.get(MARKETS, payload=[])
@@ -357,7 +397,7 @@ async def test_platform_choice_prefers_configured_chain(store, cg_settings):
         )
     ).fetchall()
     assert toks == [
-        ("base:0xb", "multi", "candidate"),
+        ("base:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "multi", "candidate"),
         ("cg:ethonly", "ethonly", "disqualified"),
     ]
     assert first.credits_used == 4 and first.rows_written == 1
@@ -371,7 +411,10 @@ async def test_sweep_leaves_hourly_reserve(store, cg_settings):
     cg_settings.cg_max_pages = 1
     with aioresponses() as m:
         m.get(MARKETS, payload=[row("a-coin", 5e6), row("b-coin", 5e6)])
-        m.get(COIN, payload={"platforms": {"solana": "AaaMint"}})
+        m.get(
+            COIN,
+            payload={"platforms": {"solana": "AaaMint111111111111111111111111111111"}},
+        )
         async with aiohttp.ClientSession() as s:
             r = await markets_sweep(
                 store, cg_settings, s, NOW, sleep=RecordingSleep(), budget_now=NOW
@@ -471,3 +514,90 @@ async def test_quota_code_on_non_429_is_still_retried(cg_settings):
             cg = CGClient(s, cg_settings, sleep)
             assert await cg.get("/coins/markets", {"page": 1}) == []
     assert cg.calls == 2
+
+
+async def test_hourly_job_budget_stop_exits_1_markets_job_exits_0(cg_settings):
+    import argparse
+
+    from structlog.testing import capture_logs
+
+    from gecko.collectors.coingecko import hourly_job, markets_job
+    from gecko.store import Store, utcnow
+
+    cg_settings.coingecko_monthly_cap = 1
+    st = await Store.open(cg_settings.db_path)
+    await st.record_run("prior", utcnow(), utcnow(), True)
+    await st.conn.execute(  # the month is the real clock's: spend it all now
+        "UPDATE runs SET job='coingecko-markets', credits_used=1"
+    )
+    await st.conn.commit()
+    await st.close()
+    ns = argparse.Namespace(as_of=None)
+    with aioresponses() as m:
+        with capture_logs() as logs:
+            assert await markets_job(cg_settings, ns) == 0
+            assert await hourly_job(cg_settings, ns) == 1
+        assert m.requests == {}
+    stop = [e for e in logs if e["event"] == "cg_budget_exhausted"]
+    assert len(stop) == 2 and all(e["log_level"] == "warning" for e in stop)
+    st = await Store.open(cg_settings.db_path)
+    rows = await (
+        await st.conn.execute(
+            "SELECT job, ok, error LIKE '%cg budget exhausted%' FROM runs WHERE id>1 "
+            "ORDER BY id"
+        )
+    ).fetchall()
+    await st.close()
+    assert rows == [("coingecko-markets", 1, None), ("coingecko-hourly", 0, 1)]
+
+
+async def test_platform_lookups_capped_per_run(store, cg_settings):
+    cg_settings.cg_max_lookups_per_run = 1
+    cg_settings.cg_max_pages = 1
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("a-coin", 5e6), row("b-coin", 5e6)])
+        m.get(COIN, payload={"platforms": {"solana": "AaaMint" + "1" * 30}})
+        async with aiohttp.ClientSession() as s:
+            r = await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    assert r.credits_used == 2 and r.rows_written == 1
+    # the deferred coin is not marked unmapped: it retries next sweep
+    n = await (
+        await store.conn.execute("SELECT COUNT(*) FROM tokens WHERE chain='cg'")
+    ).fetchone()
+    assert n == (0,)
+
+
+async def test_invalid_platform_address_is_skipped_and_counted(store, cg_settings):
+    from structlog.testing import capture_logs
+
+    cg_settings.cg_max_pages = 1
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("bad-coin", 5e6)])
+        m.get(
+            COIN,
+            payload={"platforms": {"solana": "not/a/mint", "base": "0x" + "c" * 40}},
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await markets_sweep(
+                    store, cg_settings, s, NOW, sleep=RecordingSleep()
+                )
+    assert r.rows_written == 1
+    toks = await (await store.conn.execute("SELECT token_id FROM tokens")).fetchall()
+    assert toks == [("base:0x" + "c" * 40,)]
+    done = [e for e in logs if e["event"] == "coingecko_markets_done"]
+    assert done[0]["invalid_addresses"] == 1
+
+
+async def test_benchmark_btc_is_never_a_candidate(store, cg_settings):
+    with aioresponses() as m:
+        m.get(TRENDING, payload={"coins": []})
+        m.get(PRICE, payload={"bitcoin": {"usd": 60000}})
+        async with aiohttp.ClientSession() as s:
+            await hourly(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    st = await (
+        await store.conn.execute(
+            "SELECT status, disqualify_reason FROM tokens WHERE token_id='benchmark:btc'"
+        )
+    ).fetchone()
+    assert st == ("disqualified", "benchmark")

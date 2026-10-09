@@ -22,9 +22,8 @@ async def send_telegram(
             status = resp.status
             body = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        log.warning(
-            "telegram_failed", status=None, reason=f"{type(exc).__name__}: {exc}"
-        )
+        # Type name only: aiohttp messages can embed the URL, i.e. the bot token.
+        log.warning("telegram_failed", status=None, reason=type(exc).__name__)
         return False
     except (json.JSONDecodeError, ValueError) as exc:
         log.warning(

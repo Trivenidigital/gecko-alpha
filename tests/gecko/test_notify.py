@@ -37,3 +37,18 @@ async def test_send_telegram_connection_error_returns_false():
         m.post(URL, exception=aiohttp.ClientConnectionError())
         async with aiohttp.ClientSession() as session:
             assert await send_telegram(session, "tok", "1", "hi") is False
+
+
+async def test_send_telegram_failure_log_never_carries_the_token():
+    from structlog.testing import capture_logs
+
+    secret = "123456:SECRET-bot-token"
+    url = f"https://api.telegram.org/bot{secret}/sendMessage"
+    with aioresponses() as m:
+        m.post(url, exception=aiohttp.ClientConnectionError(f"cannot connect {url}"))
+        async with aiohttp.ClientSession() as session:
+            with capture_logs() as logs:
+                assert await send_telegram(session, secret, "1", "hi") is False
+    (e,) = [e for e in logs if e["event"] == "telegram_failed"]
+    assert e["reason"] == "ClientConnectionError"
+    assert "SECRET" not in repr(logs)

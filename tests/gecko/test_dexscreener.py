@@ -14,7 +14,7 @@ NOW = "2026-10-09T00:00:00Z"
 
 
 def pair(
-    addr="0xAbC",
+    addr="0xAbC0000000000000000000000000000000000000",
     chain="base",
     price="1.25",
     liq=400_000,
@@ -40,14 +40,19 @@ def pair(
 
 def test_best_pair_picks_deepest_matching_base():
     pairs = [pair(liq=10), pair(liq=500_000), pair(addr="0xother", liq=9e9)]
-    assert best_pair(pairs, "0xabc", "base")["liquidity"]["usd"] == 500_000
+    assert (
+        best_pair(pairs, "0xabc0000000000000000000000000000000000000", "base")[
+            "liquidity"
+        ]["usd"]
+        == 500_000
+    )
 
 
 def test_pair_missing_fields_skipped():
     p = pair()
     p["priceUsd"] = None
     p["liquidity"] = None
-    assert best_pair([p], "0xabc", "base") is None
+    assert best_pair([p], "0xabc0000000000000000000000000000000000000", "base") is None
     q = pair()
     del q["marketCap"]
     q["volume"] = {}
@@ -64,22 +69,42 @@ async def test_collect_writes_tokens_and_observations(store, settings):
         m.get(
             BOOSTS_URL,
             payload=[
-                {"chainId": "base", "tokenAddress": "0xAbC"},
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xAbC0000000000000000000000000000000000000",
+                },
                 {"chainId": "tron", "tokenAddress": "Txyz"},
             ],
         )
         m.get(
             PROFILES_URL,
             payload=[
-                {"chainId": "base", "tokenAddress": "0xabc"},
-                {"chainId": "solana", "tokenAddress": "So1ana"},
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xabc0000000000000000000000000000000000000",
+                },
+                {
+                    "chainId": "solana",
+                    "tokenAddress": "So1ana111111111111111111111111111111",
+                },
             ],
         )
-        m.get(TOKENS_URL.format(chain="base", addresses="0xabc"), payload=[pair()])
+        m.get(
+            TOKENS_URL.format(
+                chain="base", addresses="0xabc0000000000000000000000000000000000000"
+            ),
+            payload=[pair()],
+        )
         # Solana base58 addresses are case-sensitive: requested verbatim, not lowercased.
         m.get(
-            TOKENS_URL.format(chain="solana", addresses="So1ana"),
-            payload=[pair(addr="So1ana", chain="solana", liq=100)],
+            TOKENS_URL.format(
+                chain="solana", addresses="So1ana111111111111111111111111111111"
+            ),
+            payload=[
+                pair(
+                    addr="So1ana111111111111111111111111111111", chain="solana", liq=100
+                )
+            ],
         )  # below floor
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
@@ -89,8 +114,18 @@ async def test_collect_writes_tokens_and_observations(store, settings):
             "SELECT token_id, chain, symbol, status, pool_created_at FROM tokens"
         )
     ).fetchall()
-    assert tok == [("base:0xabc", "base", "ABC", "candidate", "2025-09-27T19:06:40Z")]
-    obs = await store.observations("base:0xabc", as_of=NOW)
+    assert tok == [
+        (
+            "base:0xabc0000000000000000000000000000000000000",
+            "base",
+            "ABC",
+            "candidate",
+            "2025-09-27T19:06:40Z",
+        )
+    ]
+    obs = await store.observations(
+        "base:0xabc0000000000000000000000000000000000000", as_of=NOW
+    )
     assert (
         obs[0].features["liquidity_usd"] == 400_000
         and obs[0].features["buys_24h"] == 120
@@ -99,11 +134,23 @@ async def test_collect_writes_tokens_and_observations(store, settings):
 
 async def test_collect_preserves_solana_address_case(store, settings):
     with aioresponses() as m:
-        m.get(BOOSTS_URL, payload=[{"chainId": "solana", "tokenAddress": "So1anaMint"}])
+        m.get(
+            BOOSTS_URL,
+            payload=[
+                {
+                    "chainId": "solana",
+                    "tokenAddress": "So1ana111111111111111111111111111111Mint",
+                }
+            ],
+        )
         m.get(PROFILES_URL, payload=[])
         m.get(
-            TOKENS_URL.format(chain="solana", addresses="So1anaMint"),
-            payload=[pair(addr="So1anaMint", chain="solana")],
+            TOKENS_URL.format(
+                chain="solana", addresses="So1ana111111111111111111111111111111Mint"
+            ),
+            payload=[
+                pair(addr="So1ana111111111111111111111111111111Mint", chain="solana")
+            ],
         )
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
@@ -111,7 +158,12 @@ async def test_collect_preserves_solana_address_case(store, settings):
     tok = await (
         await store.conn.execute("SELECT token_id, address FROM tokens")
     ).fetchall()
-    assert tok == [("solana:So1anaMint", "So1anaMint")]
+    assert tok == [
+        (
+            "solana:So1ana111111111111111111111111111111Mint",
+            "So1ana111111111111111111111111111111Mint",
+        )
+    ]
 
 
 async def test_collect_batches_thirty(store, settings):
@@ -136,15 +188,26 @@ async def test_collect_batches_thirty(store, settings):
 
 def test_best_pair_solana_is_case_exact():
     p = pair(addr="so1anamint", chain="solana")
-    assert best_pair([p], "So1anaMint", "solana") is None
+    assert best_pair([p], "So1ana111111111111111111111111111111Mint", "solana") is None
     assert (
-        best_pair([pair(addr="So1anaMint", chain="solana")], "So1anaMint", "solana")
+        best_pair(
+            [pair(addr="So1ana111111111111111111111111111111Mint", chain="solana")],
+            "So1ana111111111111111111111111111111Mint",
+            "solana",
+        )
         is not None
     )
 
 
 def test_best_pair_evm_is_case_insensitive():
-    assert best_pair([pair(addr="0xABC")], "0xabc", "base") is not None
+    assert (
+        best_pair(
+            [pair(addr="0xABC0000000000000000000000000000000000000")],
+            "0xabc0000000000000000000000000000000000000",
+            "base",
+        )
+        is not None
+    )
 
 
 async def test_collect_skips_unpriced_pair_without_raising(store, settings):
@@ -152,29 +215,52 @@ async def test_collect_skips_unpriced_pair_without_raising(store, settings):
         m.get(
             BOOSTS_URL,
             payload=[
-                {"chainId": "base", "tokenAddress": "0xaaa"},
-                {"chainId": "base", "tokenAddress": "0xbbb"},
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xaaa0000000000000000000000000000000000000",
+                },
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xbbb0000000000000000000000000000000000000",
+                },
             ],
         )
         m.get(PROFILES_URL, payload=[])
         m.get(
-            TOKENS_URL.format(chain="base", addresses="0xaaa,0xbbb"),
-            payload=[pair(addr="0xaaa", price=None), pair(addr="0xbbb")],
+            TOKENS_URL.format(
+                chain="base",
+                addresses="0xaaa0000000000000000000000000000000000000,0xbbb0000000000000000000000000000000000000",
+            ),
+            payload=[
+                pair(addr="0xaaa0000000000000000000000000000000000000", price=None),
+                pair(addr="0xbbb0000000000000000000000000000000000000"),
+            ],
         )
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
     assert r.rows_written == 1
     tok = await (await store.conn.execute("SELECT token_id FROM tokens")).fetchall()
-    assert tok == [("base:0xbbb",)]
+    assert tok == [("base:0xbbb0000000000000000000000000000000000000",)]
 
 
 async def test_collect_zero_mcap_not_replaced_by_fdv(store, settings):
     # mcap 0.0 is out of band; an `or` fallback would wrongly admit it via fdv.
     with aioresponses() as m:
-        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": "0xabc"}])
+        m.get(
+            BOOSTS_URL,
+            payload=[
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xabc0000000000000000000000000000000000000",
+                }
+            ],
+        )
         m.get(PROFILES_URL, payload=[])
         m.get(
-            TOKENS_URL.format(chain="base", addresses="0xabc"), payload=[pair(mcap=0.0)]
+            TOKENS_URL.format(
+                chain="base", addresses="0xabc0000000000000000000000000000000000000"
+            ),
+            payload=[pair(mcap=0.0)],
         )
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
@@ -190,8 +276,10 @@ async def _known(store, addr, chain="base", status="candidate"):
 
 
 async def test_refresh_reobserves_known_tokens_off_feed_below_floor(store, settings):
-    cand = await _known(store, "0xaaa")
-    act = await _known(store, "0xbbb", status="active")
+    cand = await _known(store, "0xaaa0000000000000000000000000000000000000")
+    act = await _known(
+        store, "0xbbb0000000000000000000000000000000000000", status="active"
+    )
     held = await _known(store, "0xccc", status="disqualified")
     await store.watchlist_upsert(held, NOW, "F4", 1, 1.0, {})
     await _known(store, "0xddd", status="dead")  # not refreshed
@@ -204,10 +292,17 @@ async def test_refresh_reobserves_known_tokens_off_feed_below_floor(store, setti
         m.get(BOOSTS_URL, payload=[])
         m.get(PROFILES_URL, payload=[])
         m.get(
-            TOKENS_URL.format(chain="base", addresses="0xaaa,0xbbb,0xccc,0xeee"),
+            TOKENS_URL.format(
+                chain="base",
+                addresses="0xaaa0000000000000000000000000000000000000,0xbbb0000000000000000000000000000000000000,0xccc,0xeee",
+            ),
             payload=[
-                pair(addr="0xaaa", liq=10_000),
-                pair(addr="0xbbb", liq=300_000, mcap=9e9),
+                pair(addr="0xaaa0000000000000000000000000000000000000", liq=10_000),
+                pair(
+                    addr="0xbbb0000000000000000000000000000000000000",
+                    liq=300_000,
+                    mcap=9e9,
+                ),
                 pair(addr="0xccc", liq=5),
             ],
         )
@@ -233,12 +328,22 @@ async def test_refresh_reobserves_known_tokens_off_feed_below_floor(store, setti
 async def test_known_token_in_feed_below_floor_is_kept_and_fetched_once(
     store, settings
 ):
-    tid = await _known(store, "0xabc")
+    tid = await _known(store, "0xabc0000000000000000000000000000000000000")
     with aioresponses() as m:
-        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": "0xAbC"}])
+        m.get(
+            BOOSTS_URL,
+            payload=[
+                {
+                    "chainId": "base",
+                    "tokenAddress": "0xAbC0000000000000000000000000000000000000",
+                }
+            ],
+        )
         m.get(PROFILES_URL, payload=[])
         m.get(
-            TOKENS_URL.format(chain="base", addresses="0xabc"),
+            TOKENS_URL.format(
+                chain="base", addresses="0xabc0000000000000000000000000000000000000"
+            ),
             payload=[pair(liq=50_000)],
         )
         async with aiohttp.ClientSession() as s:
@@ -269,3 +374,27 @@ async def test_refresh_batches_thirty_and_skips_other_chains(store, settings):
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
     assert r.rows_written == 31
+
+
+async def test_malformed_feed_addresses_never_reach_a_url(store, settings):
+    good = "0x" + "a" * 40
+    with aioresponses() as m:
+        m.get(
+            BOOSTS_URL,
+            payload=[
+                {"chainId": "base", "tokenAddress": "0xabc/../x"},
+                {"chainId": "solana", "tokenAddress": "bad?mint=1"},
+                {"chainId": "base", "tokenAddress": good},
+            ],
+        )
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=good), payload=[pair(addr=good)]
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect(store, settings, s, NOW)
+        assert len(m.requests) == 3
+    assert r.rows_written == 1
+    done = [e for e in logs if e["event"] == "dexscreener_done"]
+    assert done[0]["invalid"] == 2

@@ -6,8 +6,9 @@ import aiohttp
 import structlog
 
 from gecko.http import get_json
-from gecko.identity import norm_address, token_id
+from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
+from gecko.numeric import num
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, utcnow
@@ -26,15 +27,8 @@ CHAIN_MAP: dict[str, str] = {
 BATCH = 30
 
 
-def _num(v) -> float | None:
-    try:
-        return float(v) if v is not None and v != "" else None
-    except (TypeError, ValueError):
-        return None
-
-
 def _iso_ms(ms) -> str | None:
-    n = _num(ms)
+    n = num(ms)
     if n is None:
         return None
     return datetime.fromtimestamp(n / 1000, tz=timezone.utc).strftime(
@@ -50,8 +44,8 @@ def best_pair(pairs: list[dict], address: str, chain: str) -> dict | None:
         base_addr = str((p.get("baseToken") or {}).get("address", ""))
         if norm_address(chain, base_addr) != want:
             continue
-        price = _num(p.get("priceUsd"))
-        liq = _num((p.get("liquidity") or {}).get("usd"))
+        price = num(p.get("priceUsd"))
+        liq = num((p.get("liquidity") or {}).get("usd"))
         if price is None or liq is None:
             continue
         if best is None or liq > best_liq:
@@ -62,11 +56,11 @@ def best_pair(pairs: list[dict], address: str, chain: str) -> dict | None:
 def pair_features(p: dict) -> dict:
     tx = (p.get("txns") or {}).get("h24") or {}
     return {
-        "price_usd": _num(p.get("priceUsd")),
-        "liquidity_usd": _num((p.get("liquidity") or {}).get("usd")),
-        "fdv_usd": _num(p.get("fdv")),
-        "mcap_usd": _num(p.get("marketCap")),
-        "vol_24h_usd": _num((p.get("volume") or {}).get("h24")),
+        "price_usd": num(p.get("priceUsd")),
+        "liquidity_usd": num((p.get("liquidity") or {}).get("usd")),
+        "fdv_usd": num(p.get("fdv")),
+        "mcap_usd": num(p.get("marketCap")),
+        "vol_24h_usd": num((p.get("volume") or {}).get("h24")),
         "buys_24h": tx.get("buys"),
         "sells_24h": tx.get("sells"),
         "pair_created_at": _iso_ms(p.get("pairCreatedAt")),
@@ -77,16 +71,22 @@ def pair_features(p: dict) -> dict:
 
 async def _discover(
     session: aiohttp.ClientSession, settings: GeckoSettings
-) -> dict[str, set[str]]:
+) -> tuple[dict[str, set[str]], int]:
+    """Feed addresses per configured chain, and how many were malformed."""
     found: dict[str, set[str]] = {}
+    invalid = 0
     for url in (BOOSTS_URL, PROFILES_URL):
         items = await get_json(session, url, settings=settings)
         for it in items or []:
             chain = CHAIN_MAP.get(str(it.get("chainId", "")).lower())
-            addr = str(it.get("tokenAddress") or "")
-            if chain in settings.chains and addr:
-                found.setdefault(chain, set()).add(norm_address(chain, addr))
-    return found
+            addr = str(it.get("tokenAddress") or "").strip()
+            if chain not in settings.chains or not addr:
+                continue
+            if not is_valid_address(chain, addr):
+                invalid += 1  # never reaches a URL or the store
+                continue
+            found.setdefault(chain, set()).add(norm_address(chain, addr))
+    return found, invalid
 
 
 async def _pairs(
@@ -135,7 +135,7 @@ async def collect(
     now: str,
 ) -> JobResult:
     targets = await _refresh_targets(store, settings)
-    found = await _discover(session, settings)
+    found, invalid = await _discover(session, settings)
     written = skipped = refreshed = missing = 0
     for chain, addrs in found.items():
         known = targets.get(chain, set())
@@ -184,7 +184,13 @@ async def collect(
             refreshed += 1
     log.info("dexscreener_refresh_done", refreshed=refreshed, missing=missing)
     promoted = await admit_survivors(store, settings, now)
-    log.info("dexscreener_done", written=written, skipped=skipped, promoted=promoted)
+    log.info(
+        "dexscreener_done",
+        written=written,
+        skipped=skipped,
+        invalid=invalid,
+        promoted=promoted,
+    )
     return JobResult(rows_written=written + refreshed)
 
 

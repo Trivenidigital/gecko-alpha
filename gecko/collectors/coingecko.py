@@ -7,7 +7,7 @@ import aiohttp
 import structlog
 
 from gecko.http import Pacer, UpstreamError, _retryable, get_json
-from gecko.identity import norm_address, token_id
+from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
 from gecko.runs import JobResult, PartialFailure, run_job
 from gecko.settings import GeckoSettings
@@ -61,6 +61,7 @@ class CGClient:
             sleep,
             0,
         )
+        self.invalid_addresses = 0
         self.pacer = Pacer(settings.cg_min_interval_sec, sleep)
 
     def _headers(self) -> dict:
@@ -164,8 +165,13 @@ async def _fetch_platform(
     platforms = (body or {}).get("platforms") or {}
     for platform, addr in platforms.items():
         chain = PLATFORM_MAP.get(platform)
-        if chain in settings.chains and addr and str(addr).strip():
-            return chain, str(addr)
+        if chain not in settings.chains or not addr or not str(addr).strip():
+            continue
+        addr = str(addr).strip()
+        if is_valid_address(chain, addr):
+            return chain, addr
+        cg.invalid_addresses += 1
+        log.warning("cg_platform_address_invalid", cg_id=cid, chain=chain)
     pseudo = f"cg:{cid}"
     await store.upsert_token(pseudo, "cg", cid, cid, cid, now, "coingecko", cg_id=cid)
     await store.set_token_status(pseudo, "disqualified", "no_supported_platform")
@@ -210,7 +216,7 @@ async def markets_sweep(
     cg = CGClient(session, settings, sleep)
     written = 0
     try:
-        budget_skipped = 0
+        budget_skipped = lookups = 0
         for page in range(settings.cg_first_page, settings.cg_max_pages + 1):
             rows = await cg.get(
                 "/coins/markets",
@@ -241,9 +247,13 @@ async def markets_sweep(
                 cid = r["id"]
                 mapped = await _known_platform(store, cid, now)
                 if mapped is None:
-                    if cg.calls + 1 + reserved > left:
-                        budget_skipped += 1
+                    if (
+                        cg.calls + 1 + reserved > left
+                        or lookups >= settings.cg_max_lookups_per_run
+                    ):
+                        budget_skipped += 1  # deferred: retried next sweep
                         continue
+                    lookups += 1
                     mapped = await _fetch_platform(store, settings, cg, cid, now)
                 if not mapped:
                     continue
@@ -267,7 +277,13 @@ async def markets_sweep(
                 break
         if budget_skipped:
             log.warning("cg_platform_lookups_deferred", count=budget_skipped, left=left)
-        log.info("coingecko_markets_done", written=written, calls=cg.calls)
+        log.info(
+            "coingecko_markets_done",
+            written=written,
+            calls=cg.calls,
+            lookups=lookups,
+            invalid_addresses=cg.invalid_addresses,
+        )
         return JobResult(rows_written=written, credits_used=cg.calls)
     except Exception as exc:
         raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc
@@ -284,7 +300,9 @@ async def hourly(
 ) -> JobResult:
     now = canon_ts(now)
     if await _budget_left(store, settings, 2, budget_now=budget_now) is None:
-        return JobResult()
+        # Unlike the sweep, a skipped hourly run starves the BTC benchmark the
+        # ledger needs: fail the run so it is visible (ok=0, exit 1).
+        raise RuntimeError("cg budget exhausted")
     cg = CGClient(session, settings, sleep)
     written = 0
     try:
@@ -320,6 +338,8 @@ async def hourly(
                 "coingecko",
                 cg_id="bitcoin",
             )
+            # Never a candidate: admission, OHLCV and rank scans skip it.
+            await store.set_token_status(BTC_ID, "disqualified", "benchmark")
             await store.add_observation(
                 BTC_ID, "coingecko", now, {"price_usd": float(btc)}
             )

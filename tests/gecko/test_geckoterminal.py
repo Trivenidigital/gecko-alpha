@@ -1,5 +1,6 @@
 import aiohttp
 from aioresponses import aioresponses
+from structlog.testing import capture_logs
 from gecko.collectors.geckoterminal import (
     pool_features,
     token_address_from,
@@ -23,7 +24,10 @@ def ohlcv(rows):
 
 
 def pool(
-    addr="So1anaTokenAddr", network="solana", reserve="350000.5", pool_addr="PoolAddr1"
+    addr="So1anaTokenAddr11111111111111111111",
+    network="solana",
+    reserve="350000.5",
+    pool_addr="PoolAddr1",
 ):
     return {
         "id": f"{network}_{pool_addr}",
@@ -50,7 +54,10 @@ def test_network_map_covers_supported_chains():
 
 def test_token_address_from():
     # raw (case-preserved) address; normalization is gecko.identity's job
-    assert token_address_from("solana_So1anaTokenAddr", "solana") == "So1anaTokenAddr"
+    assert (
+        token_address_from("solana_So1anaTokenAddr11111111111111111111", "solana")
+        == "So1anaTokenAddr11111111111111111111"
+    )
     assert token_address_from("eth_0xAbC_weird", "eth") == "0xAbC_weird"
 
 
@@ -98,7 +105,15 @@ async def test_collect_pools_all_chains_and_band(store, settings):
         m.get(POOLS_URL.format(network="eth", list="new_pools"), payload={"data": []})
         m.get(
             POOLS_URL.format(network="eth", list="trending_pools"),
-            payload={"data": [pool(addr="0xEEE", network="eth", pool_addr="0xpool")]},
+            payload={
+                "data": [
+                    pool(
+                        addr="0xEEE0000000000000000000000000000000000000",
+                        network="eth",
+                        pool_addr="0xpool",
+                    )
+                ]
+            },
         )
         async with aiohttp.ClientSession() as s:
             r = await collect_pools(store, settings, s, NOW, sleep=nosleep)
@@ -109,8 +124,16 @@ async def test_collect_pools_all_chains_and_band(store, settings):
         )
     ).fetchall()
     assert rows == [
-        ("ethereum:0xeee", "ethereum", "2026-09-20T10:00:00Z"),
-        ("solana:So1anaTokenAddr", "solana", "2026-09-20T10:00:00Z"),
+        (
+            "ethereum:0xeee0000000000000000000000000000000000000",
+            "ethereum",
+            "2026-09-20T10:00:00Z",
+        ),
+        (
+            "solana:So1anaTokenAddr11111111111111111111",
+            "solana",
+            "2026-09-20T10:00:00Z",
+        ),
     ]
 
 
@@ -399,3 +422,31 @@ async def test_ohlcv_malformed_candle_skipped_not_fatal(store, settings):
     obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
     assert obs[0].features["candles"] == [[50, 1, 1, 1, 1, 4.0], [300, 1, 1, 1, 1, 2.0]]
     assert obs[0].features["status"] == "ok"
+
+
+async def test_collect_pools_skips_invalid_address_and_bad_pool_timestamp(
+    store, settings
+):
+    settings.chains = ["solana"]
+    bad_ts = pool(addr="So1anaSecond" + "1" * 30)
+    bad_ts["attributes"]["pool_created_at"] = "yesterday"
+    with aioresponses() as m:
+        m.get(
+            POOLS_URL.format(network="solana", list="new_pools"),
+            payload={"data": [pool(addr="not/valid"), bad_ts, pool()]},
+        )
+        m.get(
+            POOLS_URL.format(network="solana", list="trending_pools"),
+            payload={"data": []},
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect_pools(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 1
+    toks = await (await store.conn.execute("SELECT token_id FROM tokens")).fetchall()
+    assert toks == [("solana:So1anaTokenAddr" + "1" * 20,)]
+    done = [e for e in logs if e["event"] == "geckoterminal_pools_done"]
+    assert done[0]["invalid"] == 1 and done[0]["skipped"] == 2
+    assert [e["value"] for e in logs if e["event"] == "gt_pool_created_at_invalid"] == [
+        "'yesterday'"
+    ]

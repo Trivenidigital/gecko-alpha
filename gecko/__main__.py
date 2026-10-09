@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 import structlog
@@ -41,7 +42,23 @@ def main(argv: list[str] | None = None) -> int:
     if ns.job not in JOBS:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
+    if ns.job == "ledger" and ns.as_of:
+        # Prices are fetched live, so a replayed "now" would mislabel them.
+        print("ledger is live-only: --as-of is refused", file=sys.stderr)
+        return 2
     settings = GeckoSettings()
+    if not os.path.isabs(settings.db_path):
+        log.warning(
+            "gecko_relative_db_path",
+            db_path=settings.db_path,
+            resolved=os.path.abspath(settings.db_path),
+        )
+    if ns.job.startswith("coingecko") and settings.coingecko_demo_api_key is None:
+        print(
+            f"job {ns.job!r} needs GECKO_COINGECKO_DEMO_API_KEY; refusing to run keyless",
+            file=sys.stderr,
+        )
+        return 1
     try:
         return asyncio.run(JOBS[ns.job](settings, ns))
     except Exception as exc:  # noqa: BLE001 — a crash outside run_job still exits 1

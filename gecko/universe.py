@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from gecko.features import _num
+from gecko.numeric import num
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, parse_utc
+from gecko.store import MARKET_SOURCES, Store, canon_ts, parse_utc
 
-MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
 SCAN_DAYS = 7  # admission looks back this far; older rows cannot matter
 
 
@@ -45,7 +44,7 @@ async def admit_survivors(store: Store, settings: GeckoSettings, now: str) -> in
     ).fetchall()
     by_token: dict[str, list[tuple[str, float]]] = {}
     for tid, obs_at, fj in rows:
-        liq = _num(json.loads(fj).get("liquidity_usd"))
+        liq = num(json.loads(fj).get("liquidity_usd"))
         if liq is None:
             continue  # e.g. coingecko rows: no liquidity, cannot decide admission
         obs = by_token.setdefault(tid, [])

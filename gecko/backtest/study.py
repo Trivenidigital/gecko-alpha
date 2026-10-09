@@ -72,9 +72,11 @@ def _at(series: list, times: list, t: float):
 def study_vol_ratio(ohlcv: list, t0: datetime) -> float | None:
     """The study's vol ratio: sum(v, [t0-7d, t0)) / sum(v, [t0-14d, t0-7d)).
 
-    No candle minimum and no timestamp dedupe, unlike
-    ``gecko.features.vol_ratio_from_candles``; None when the prior week sums
-    to zero.
+    Same windows as ``gecko.features.vol_ratio_from_candles``, and neither
+    has a candle minimum. They differ only in hardening and one edge: the
+    live one collapses duplicate timestamps, skips malformed candles, and
+    returns None when the last week holds no candle (this returns 0.0).
+    Both return None when the prior week sums to zero.
     """
     t = t0.timestamp()
     a = sum(c[5] for c in ohlcv if t - 7 * DAY_SEC <= c[0] < t)
@@ -109,15 +111,19 @@ def load_study(
 ) -> list[Coin]:
     """Live (charted, priced) study coins after the chart/stored exclusion.
 
-    ``stats``, when given, receives counts: universe, stored, excluded, dead.
+    ``stats``, when given, receives counts: universe, stored, excluded, rejected
+    (path-like ids), dead.
     """
     ev = _read_json(os.path.join(study_dir, "events.json"))
     btc = _read_json(os.path.join(study_dir, "btc.json"))["prices"]
     bt = [p[0] for p in btc]
     stored = _stored_prices(history_db)
     coins: list[Coin] = []
-    excluded = 0
+    excluded = rejected = 0
     for cid, e in ev.items():
+        if os.path.basename(cid) != cid:
+            rejected += 1  # a path-like id would read outside charts/ or v2/coins/
+            continue
         f = os.path.join(study_dir, "charts", f"{cid}.json")
         if not os.path.exists(f):
             continue
@@ -169,6 +175,7 @@ def load_study(
             universe=len(ev),
             stored=len(stored),
             excluded=excluded,
+            rejected=rejected,
             dead=len(coins) - len(live),
         )
     return live

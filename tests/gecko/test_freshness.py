@@ -242,7 +242,7 @@ async def test_freshness_job_accepts_naive_and_offset_as_of(store, settings):
     from gecko.freshness import freshness_job
 
     await _seed_stale_observations(store)
-    # naive is UTC; +02:00 is 01:00Z. Both breach observations and must deliver.
+    # naive is UTC; 09:00+02:00 is 07:00Z. Both breach observations and must deliver.
     for as_of in ("2026-10-09T01:00:00", "2026-10-09T09:00:00+02:00"):
         with aioresponses() as m:
             m.post(TG_URL, payload={"ok": True})
@@ -283,3 +283,32 @@ async def test_failed_writer_run_does_not_start_the_clock(store):
         "dexscreener", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", False
     )
     assert await check_freshness(store, "2026-10-09T01:00:00Z") == []
+
+
+async def test_rank_ran_recently_with_empty_watchlist_no_breach(store):
+    await store.record_run("rank", "2026-10-09T00:00:00Z", "2026-10-09T00:00:05Z", True)
+    await store.record_run("rank", "2026-10-09T02:50:00Z", "2026-10-09T02:50:05Z", True)
+    # watchlist has never had a row; the writer is alive
+    assert await check_freshness(store, "2026-10-09T03:00:00Z") == []
+
+
+async def test_rank_last_ran_3h_ago_breaches_despite_fresh_rows(store):
+    await store.record_run("rank", "2026-10-09T00:00:00Z", "2026-10-09T00:00:05Z", True)
+    await store.watchlist_upsert("solana:a", "2026-10-09T02:59:00Z", "F4", 1, 1.0, {})
+    # a later failed run does not count as activity
+    await store.record_run(
+        "rank", "2026-10-09T02:00:00Z", "2026-10-09T02:00:05Z", False
+    )
+    b = await check_freshness(store, "2026-10-09T03:00:05Z")
+    assert [x.table for x in b] == ["watchlist"]
+    assert b[0].last_write == "2026-10-09T00:00:05Z"
+
+
+async def test_ledger_with_nothing_due_does_not_page(store):
+    await store.record_run(
+        "ledger", "2026-10-08T00:00:00Z", "2026-10-08T00:00:05Z", True
+    )
+    await store.record_run(
+        "ledger", "2026-10-09T02:00:00Z", "2026-10-09T02:00:05Z", True
+    )
+    assert await check_freshness(store, "2026-10-09T03:00:00Z") == []

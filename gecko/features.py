@@ -12,10 +12,10 @@ import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
+from gecko.numeric import as_int, finite, num
 from gecko.settings import GeckoSettings
-from gecko.store import Observation, Store, canon_ts, parse_utc
+from gecko.store import MARKET_SOURCES, Observation, Store, canon_ts, parse_utc
 
-MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
 OHLCV_SOURCE = "geckoterminal_ohlcv"
 ENRICH_SOURCE = "enrich"
 YOUNG_CHAIN_DAYS = 180
@@ -70,26 +70,6 @@ def _first(obs: list[Observation], key: str):
     return _first_obs(obs, key)[0]
 
 
-def _finite(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-
-
-def _num(v) -> float | None:
-    """Finite float from a number or numeric string; anything else is None."""
-    if isinstance(v, bool):
-        return None
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return None
-    return x if math.isfinite(x) else None
-
-
-def _int(v) -> int | None:
-    x = _num(v)
-    return int(x) if x is not None else None
-
-
 def _valid_candles(candles) -> list:
     """Candles that are 6-element lists with finite timestamp and volume."""
     if not isinstance(candles, list):
@@ -97,7 +77,7 @@ def _valid_candles(candles) -> list:
     return [
         c
         for c in candles
-        if isinstance(c, list) and len(c) == 6 and _finite(c[0]) and _finite(c[5])
+        if isinstance(c, list) and len(c) == 6 and finite(c[0]) and finite(c[5])
     ]
 
 
@@ -127,7 +107,7 @@ def vol_ratio_from_candles(candles: list, as_of: datetime) -> float | None:
 
 
 def _liq_key(o: Observation) -> float:
-    liq = _num(o.features.get("liquidity_usd"))
+    liq = num(o.features.get("liquidity_usd"))
     return liq if liq is not None else -math.inf
 
 
@@ -143,7 +123,7 @@ async def _market_obs(store: Store, token_id: str, as_of: str) -> list[Observati
 
 
 def _priced(obs: list[Observation]) -> list[Observation]:
-    return [o for o in obs if _num(o.features.get("price_usd")) is not None]
+    return [o for o in obs if num(o.features.get("price_usd")) is not None]
 
 
 def _gate_row(market: list[Observation]) -> Observation | None:
@@ -201,14 +181,14 @@ async def compute_features(
     if row is not None:
         f.observed_at = row.observed_at
         for key in ("price_usd", "mcap_usd", "liquidity_usd", "vol_24h_usd"):
-            setattr(f, key, _num(row.features.get(key)))
+            setattr(f, key, num(row.features.get(key)))
         if f.mcap_usd is None:
             # The one cross-row read: DEX pairs often lack market cap, so take
             # the newest CoinGecko mcap. Never price, liquidity or volume.
             cg_mcap, _ = _first_obs(
                 [o for o in market if o.source == "coingecko"], "mcap_usd"
             )
-            f.mcap_usd = _num(cg_mcap)
+            f.mcap_usd = num(cg_mcap)
 
     # Prereg F1 parity: pool age only; no pool, no age (so F4 cannot admit).
     if pool_created is not None:
@@ -225,7 +205,7 @@ async def compute_features(
     p_obs = _priced(await _market_obs(store, token_id, week_ago))
     p_obs = p_obs[0] if p_obs else None
     p_then = (
-        _num(p_obs.features.get("price_usd"))
+        num(p_obs.features.get("price_usd"))
         if p_obs and p_obs.observed_at >= then_floor
         else None
     )
@@ -237,19 +217,19 @@ async def compute_features(
     )
     if enrich:
         h, h_obs = _first_obs(enrich, "holders")
-        f.holders = _int(h)
-        f.top10_pct = _num(_first(enrich, "top10_pct"))
-        f.smart_money_wallets = _int(_first(enrich, "smart_money_wallets"))
+        f.holders = as_int(h)
+        f.top10_pct = num(_first(enrich, "top10_pct"))
+        f.smart_money_wallets = as_int(_first(enrich, "smart_money_wallets"))
         sec = _first(enrich, "security_ok")
         f.security_ok = sec if isinstance(sec, bool) else None
-        dd = _num(_first(enrich, "dd_score"))
+        dd = num(_first(enrich, "dd_score"))
         old = await store.observations(
             token_id, as_of=week_ago, source=ENRICH_SOURCE, limit=30
         )
         h_then, h_then_obs = _first_obs(old, "holders")
         if h_then_obs is None or h_then_obs.observed_at < then_floor:
             h_then = None
-        h_then = _int(h_then)
+        h_then = as_int(h_then)
         now_floor = _iso(as_of_dt - NOW_MAX_AGE)
         now_fresh = h_obs is not None and h_obs.observed_at >= now_floor
         if f.holders is not None and h_then and now_fresh:

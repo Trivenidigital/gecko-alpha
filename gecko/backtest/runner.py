@@ -35,7 +35,7 @@ async def backtest_job(settings: GeckoSettings, ns: argparse.Namespace) -> int:
     print(
         f"universe {stats['universe']} | live {len(coins)} | dead {stats['dead']} | "
         f"stored prices {stats['stored']} | excluded chart/stored >2x "
-        f"{stats['excluded']}"
+        f"{stats['excluded']} | rejected ids {stats['rejected']}"
     )
     print(HEADER)
     print(

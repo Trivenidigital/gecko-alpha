@@ -36,6 +36,8 @@ WRITER_JOBS = {
     "forward_returns": ("ledger",),
     "research_notes": ("research",),
 }
+# Tables whose writer may legitimately write 0 rows; judged by its last ok run.
+RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
 DEDUP_HOURS = 6
 
 
@@ -53,12 +55,12 @@ class AlertReport:
     skipped: int = 0
 
 
-async def _first_writer_run(store: Store, table: str) -> str | None:
-    """finished_at of the earliest ok run of any job that writes ``table``."""
+async def _writer_run(store: Store, table: str, agg: str) -> str | None:
+    """MIN or MAX finished_at over the ok runs of the jobs that write ``table``."""
     q = ",".join("?" * len(WRITER_JOBS[table]))
     row = await (
         await store.conn.execute(
-            f"SELECT MIN(finished_at) FROM runs WHERE ok=1 AND job IN ({q})",
+            f"SELECT {agg}(finished_at) FROM runs WHERE ok=1 AND job IN ({q})",
             WRITER_JOBS[table],
         )
     ).fetchone()
@@ -69,13 +71,18 @@ async def check_freshness(store: Store, now: str) -> list[Breach]:
     out: list[Breach] = []
     now_dt = parse_utc(now)
     for table, slo in SLO_MINUTES.items():
-        first_run = await _first_writer_run(store, table)
+        first_run = await _writer_run(store, table, "MIN")
         if first_run is None:
             continue  # bootstrapping: no writer has succeeded yet
-        last = await store.last_write(table)
-        # An empty table is measured from the writer's first ok run, so a
-        # writer that just started gets one SLO window to produce rows.
-        anchor = last if last is not None else first_run
+        if table in RUN_ANCHORED:
+            # Legitimately row-less runs (an empty watchlist, nothing due):
+            # staleness is the writer's last ok run, not the table's last row.
+            last = anchor = await _writer_run(store, table, "MAX")
+        else:
+            last = await store.last_write(table)
+            # An empty table is measured from the writer's first ok run, so a
+            # writer that just started gets one SLO window to produce rows.
+            anchor = last if last is not None else first_run
         if now_dt - parse_utc(anchor) > timedelta(minutes=slo):
             out.append(Breach(table, last, slo))
     return out
@@ -108,7 +115,7 @@ async def alert_breaches(
             report.skipped += 1
             continue
         text = (
-            f"gecko freshness breach: table {b.table} last write {b.last_write or 'never'} "
+            f"gecko freshness breach: table {b.table} last activity {b.last_write or 'never'} "
             f"exceeds SLO {b.slo_minutes} min (checked {now})"
         )
         log.info(

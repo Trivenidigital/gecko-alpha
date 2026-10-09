@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
 """
 
+# Sources whose observations carry a market price (and maybe liquidity).
+MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
+
 TIME_COLUMN = {
     "tokens": "updated_at",
     "observations": "observed_at",

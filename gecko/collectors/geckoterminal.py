@@ -6,8 +6,9 @@ import aiohttp
 import structlog
 
 from gecko.http import Pacer, UpstreamError, get_json
-from gecko.identity import norm_address, token_id
+from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
+from gecko.numeric import num
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, utcnow
@@ -28,13 +29,6 @@ NETWORK_MAP: dict[str, str] = {
 LISTS = ("new_pools", "trending_pools")
 
 
-def _num(v) -> float | None:
-    try:
-        return float(v) if v is not None and v != "" else None
-    except (TypeError, ValueError):
-        return None
-
-
 def token_address_from(rel_id: str, network: str) -> str:
     """Raw base-token address from a ``<network>_<address>`` relationship id.
 
@@ -52,11 +46,11 @@ def token_address_from(rel_id: str, network: str) -> str:
 def pool_features(attrs: dict, list_name: str) -> dict:
     tx = (attrs.get("transactions") or {}).get("h24") or {}
     return {
-        "price_usd": _num(attrs.get("base_token_price_usd")),
-        "liquidity_usd": _num(attrs.get("reserve_in_usd")),
-        "fdv_usd": _num(attrs.get("fdv_usd")),
-        "mcap_usd": _num(attrs.get("market_cap_usd")),
-        "vol_24h_usd": _num((attrs.get("volume_usd") or {}).get("h24")),
+        "price_usd": num(attrs.get("base_token_price_usd")),
+        "liquidity_usd": num(attrs.get("reserve_in_usd")),
+        "fdv_usd": num(attrs.get("fdv_usd")),
+        "mcap_usd": num(attrs.get("market_cap_usd")),
+        "vol_24h_usd": num((attrs.get("volume_usd") or {}).get("h24")),
         "buys_24h": tx.get("buys"),
         "sells_24h": tx.get("sells"),
         "pool_created_at": attrs.get("pool_created_at"),
@@ -80,7 +74,7 @@ async def collect_pools(
 ) -> JobResult:
     now = canon_ts(now)
     pacer = Pacer(settings.gt_min_interval_sec, sleep)
-    written = skipped = 0
+    written = skipped = invalid = 0
     for chain in settings.chains:
         network = NETWORK_MAP[chain]
         for list_name in LISTS:
@@ -104,7 +98,18 @@ async def collect_pools(
                     continue
                 rel = _base_token_rel(item)
                 addr = token_address_from(rel, network) if rel else ""
-                if not addr:
+                if not addr or not is_valid_address(chain, addr):
+                    invalid += bool(addr)
+                    skipped += 1
+                    continue
+                try:
+                    created = canon_ts(f["pool_created_at"])
+                except (AttributeError, TypeError, ValueError):
+                    log.warning(
+                        "gt_pool_created_at_invalid",
+                        pool=f["pool_address"],
+                        value=repr(f["pool_created_at"])[:64],
+                    )
                     skipped += 1
                     continue
                 tid = token_id(chain, addr)
@@ -117,13 +122,17 @@ async def collect_pools(
                     symbol,
                     now,
                     "geckoterminal",
-                    pool_created_at=canon_ts(f["pool_created_at"]),
+                    pool_created_at=created,
                 )
                 await store.add_observation(tid, "geckoterminal", now, f)
                 written += 1
     promoted = await admit_survivors(store, settings, now)
     log.info(
-        "geckoterminal_pools_done", written=written, skipped=skipped, promoted=promoted
+        "geckoterminal_pools_done",
+        written=written,
+        skipped=skipped,
+        invalid=invalid,
+        promoted=promoted,
     )
     return JobResult(rows_written=written)
 

@@ -31,6 +31,7 @@ class GeckoSettings(BaseSettings):
     cg_first_page: int = 2  # page 1 is the top-250 mega caps
     cg_max_pages: int = 14
     cg_hourly_reserve: int = 100  # monthly calls the markets sweep leaves for hourly
+    cg_max_lookups_per_run: int = 300  # /coins/{id} platform lookups per sweep
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None

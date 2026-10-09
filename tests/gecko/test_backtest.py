@@ -305,3 +305,19 @@ def test_backtest_job_load_error_exits_1(tmp_path, capsys):
     rc = main(["backtest", "--study-dir", str(tmp_path / "missing")])
     assert rc == 1
     assert "cannot load study" in capsys.readouterr().out
+
+
+def test_path_like_coin_ids_are_rejected_and_counted(tmp_path):
+    write_study(tmp_path, {"a": coin(10, 1.0, 2.0)})
+    ev = json.loads((tmp_path / "events.json").read_text())
+    ev["../escape"] = ev["a"]
+    _dump(ev, tmp_path / "events.json")
+    # the file the traversal would read, if it were allowed
+    _dump(
+        json.loads((tmp_path / "charts" / "a.json").read_text()),
+        tmp_path / "escape.json",
+    )
+    stats: dict = {}
+    coins = load_study(str(tmp_path), None, stats)
+    assert [c.cid for c in coins] == ["a"]
+    assert stats["rejected"] == 1

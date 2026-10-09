@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
 import aiohttp
 import structlog
 
-from gecko.features import MARKET_SOURCES
 from gecko.http import UpstreamError, get_json
 from gecko.jobs import register
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import ReturnAlreadyMeasured, Store, canon_ts, parse_utc, utcnow
+from gecko.numeric import num
+from gecko.store import (
+    MARKET_SOURCES,
+    ReturnAlreadyMeasured,
+    Store,
+    canon_ts,
+    parse_utc,
+    utcnow,
+)
 
 log = structlog.get_logger("gecko.ledger")
 MAX_ATTEMPTS = 3
@@ -28,11 +34,8 @@ DEXSCREENER_TOKENS = "https://api.dexscreener.com/tokens/v1/{chain}/{address}"
 
 def _price(value) -> float | None:
     """A usable positive finite price, else None."""
-    try:
-        p = float(value)
-    except (TypeError, ValueError):
-        return None
-    return p if math.isfinite(p) and p > 0 else None
+    p = num(value)
+    return p if p is not None and p > 0 else None
 
 
 async def entry_price(
