@@ -83,31 +83,45 @@ class CGClient:
 
 
 async def calls_this_month(store: Store, now: str) -> int:
-    month_start = canon_ts(now)[:7] + "-01T00:00:00Z"
+    year, month = int(canon_ts(now)[:4]), int(canon_ts(now)[5:7])
+    nxt_year, nxt_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    month_start = f"{year:04d}-{month:02d}-01T00:00:00Z"
+    month_end = f"{nxt_year:04d}-{nxt_month:02d}-01T00:00:00Z"
     row = await (
         await store.conn.execute(
             "SELECT COALESCE(SUM(credits_used),0) FROM runs "
-            "WHERE job LIKE 'coingecko%' AND started_at>=?",
-            (month_start,),
+            "WHERE job LIKE 'coingecko%' AND started_at>=? AND started_at<?",
+            (month_start, month_end),
         )
     ).fetchone()
     return int(row[0])
 
 
 async def _budget_left(
-    store: Store, settings: GeckoSettings, now: str, planned: int
+    store: Store,
+    settings: GeckoSettings,
+    planned: int,
+    *,
+    reserve: int = 0,
+    budget_now: str | None = None,
 ) -> int | None:
-    """Calls still available this month, or None if ``planned`` does not fit."""
-    used = await calls_this_month(store, now)
-    if used + planned > settings.coingecko_monthly_cap:
+    """Calls still available this month, or None if ``planned`` does not fit.
+
+    The month is always the real one (``budget_now`` is a test seam): an
+    ``--as-of`` replay spends real credits in the current month.
+    """
+    used = await calls_this_month(store, canon_ts(budget_now) or utcnow())
+    cap = settings.coingecko_monthly_cap - reserve
+    if used + planned > cap:
         log.warning(
             "cg_budget_exhausted",
             used=used,
             planned=planned,
             cap=settings.coingecko_monthly_cap,
+            reserve=reserve,
         )
         return None
-    return settings.coingecko_monthly_cap - used
+    return cap - used
 
 
 async def _known_platform(
@@ -128,13 +142,14 @@ async def _known_platform(
 
 
 async def _fetch_platform(
-    store: Store, cg: CGClient, cid: str, now: str
+    store: Store, settings: GeckoSettings, cg: CGClient, cid: str, now: str
 ) -> tuple[str, str] | None:
+    """First platform on a configured chain; otherwise mark the coin unmapped."""
     body = await cg.get(f"/coins/{cid}", COIN_PARAMS)
     platforms = (body or {}).get("platforms") or {}
     for platform, addr in platforms.items():
         chain = PLATFORM_MAP.get(platform)
-        if chain and addr and str(addr).strip():
+        if chain in settings.chains and addr and str(addr).strip():
             return chain, str(addr)
     pseudo = f"cg:{cid}"
     await store.upsert_token(pseudo, "cg", cid, cid, cid, now, "coingecko", cg_id=cid)
@@ -162,10 +177,19 @@ async def markets_sweep(
     session: aiohttp.ClientSession,
     now: str,
     sleep=asyncio.sleep,
+    *,
+    budget_now: str | None = None,
 ) -> JobResult:
     now = canon_ts(now)
     planned = settings.cg_max_pages - settings.cg_first_page + 1
-    left = await _budget_left(store, settings, now, planned)
+    # The hourly BTC/trending job keeps cg_hourly_reserve calls of the month.
+    left = await _budget_left(
+        store,
+        settings,
+        planned,
+        reserve=settings.cg_hourly_reserve,
+        budget_now=budget_now,
+    )
     if left is None:
         return JobResult()
     cg = CGClient(session, settings, sleep)
@@ -205,7 +229,7 @@ async def markets_sweep(
                     if cg.calls + 1 + reserved > left:
                         budget_skipped += 1
                         continue
-                    mapped = await _fetch_platform(store, cg, cid, now)
+                    mapped = await _fetch_platform(store, settings, cg, cid, now)
                 if not mapped:
                     continue
                 chain, addr = mapped
@@ -240,9 +264,11 @@ async def hourly(
     session: aiohttp.ClientSession,
     now: str,
     sleep=asyncio.sleep,
+    *,
+    budget_now: str | None = None,
 ) -> JobResult:
     now = canon_ts(now)
-    if await _budget_left(store, settings, now, 2) is None:
+    if await _budget_left(store, settings, 2, budget_now=budget_now) is None:
         return JobResult()
     cg = CGClient(session, settings, sleep)
     written = 0
@@ -283,6 +309,8 @@ async def hourly(
                 BTC_ID, "coingecko", now, {"price_usd": float(btc)}
             )
             written += 1
+        else:
+            log.warning("cg_btc_price_missing", body=price)
         return JobResult(rows_written=written, credits_used=cg.calls)
     except Exception as exc:
         raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc

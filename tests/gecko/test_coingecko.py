@@ -12,6 +12,8 @@ from gecko.runs import PartialFailure
 NOW = "2026-10-09T00:00:00Z"
 MARKETS = re.compile(re.escape(BASE + "/coins/markets") + r"\?.*")
 COIN = re.compile(re.escape(BASE + "/coins/") + r"(?!markets)[a-z0-9-]+\?.*")
+TRENDING = re.compile(re.escape(BASE + "/search/trending"))
+PRICE = re.compile(re.escape(BASE + "/simple/price") + r"\?.*")
 
 
 def row(cid, mcap, price=1.0):
@@ -201,8 +203,8 @@ async def test_monthly_cap_stops_before_calling(store, cg_settings):
     assert await calls_this_month(store, NOW) == 9
     with aioresponses() as m:
         async with aiohttp.ClientSession() as s:
-            r = await markets_sweep(store, cg_settings, s, NOW)
-            h = await hourly(store, cg_settings, s, NOW)
+            r = await markets_sweep(store, cg_settings, s, NOW, budget_now=NOW)
+            h = await hourly(store, cg_settings, s, NOW, budget_now=NOW)
     assert r.credits_used == 0 and r.rows_written == 0
     assert h.credits_used == 0 and h.rows_written == 0
     assert m.requests == {}
@@ -211,6 +213,7 @@ async def test_monthly_cap_stops_before_calling(store, cg_settings):
 async def test_platform_lookups_never_overshoot_monthly_cap(store, cg_settings):
     # 3 market pages planned; the cap leaves room for exactly 1 platform lookup.
     cg_settings.coingecko_monthly_cap = 4
+    cg_settings.cg_hourly_reserve = 0
     with aioresponses() as m:
         m.get(
             MARKETS,
@@ -301,3 +304,107 @@ async def test_client_counts_every_attempt_and_raises_after_retries(cg_settings)
     assert cg.calls == 4
     assert [d for d in sleep.calls if d in (2.0, 4.0, 8.0)] == [2.0, 4.0, 8.0]
     assert len(sleep.calls) == 6  # 3 backoffs + 3 pacer waits between 4 attempts
+
+
+async def test_budget_uses_real_clock_not_as_of(store, cg_settings):
+    cg_settings.coingecko_monthly_cap = 10
+    await store.record_run(
+        "coingecko-markets",
+        "2026-10-02T00:00:00Z",
+        "2026-10-02T00:01:00Z",
+        False,
+        credits_used=10,
+    )
+    with aioresponses() as m:
+        async with aiohttp.ClientSession() as s:
+            r = await markets_sweep(
+                store,
+                cg_settings,
+                s,
+                "2026-09-15T00:00:00Z",
+                budget_now="2026-10-09T12:00:00Z",
+            )
+            h = await hourly(
+                store,
+                cg_settings,
+                s,
+                "2026-09-15T00:00:00Z",
+                budget_now="2026-10-09T12:00:00Z",
+            )
+    assert r.credits_used == 0 and h.credits_used == 0
+    assert m.requests == {}
+
+
+async def test_platform_choice_prefers_configured_chain(store, cg_settings):
+    cg_settings.chains = ["solana", "base"]
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("multi", 5e6), row("ethonly", 5e6)])
+        m.get(COIN, payload={"platforms": {"ethereum": "0xA", "base": "0xB"}})
+        m.get(COIN, payload={"platforms": {"ethereum": "0xC"}})
+        m.get(MARKETS, payload=[])
+        m.get(MARKETS, payload=[row("multi", 5e6), row("ethonly", 5e6)])
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            first = await markets_sweep(
+                store, cg_settings, s, NOW, sleep=RecordingSleep()
+            )
+            second = await markets_sweep(
+                store, cg_settings, s, NOW, sleep=RecordingSleep()
+            )
+    toks = await (
+        await store.conn.execute(
+            "SELECT token_id, cg_id, status FROM tokens ORDER BY token_id"
+        )
+    ).fetchall()
+    assert toks == [
+        ("base:0xb", "multi", "candidate"),
+        ("cg:ethonly", "ethonly", "disqualified"),
+    ]
+    assert first.credits_used == 4 and first.rows_written == 1
+    # Second sweep: two market pages, zero /coins/{id} lookups.
+    assert second.credits_used == 2 and second.rows_written == 1
+
+
+async def test_sweep_leaves_hourly_reserve(store, cg_settings):
+    cg_settings.coingecko_monthly_cap = 4
+    cg_settings.cg_hourly_reserve = 2
+    cg_settings.cg_max_pages = 1
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("a-coin", 5e6), row("b-coin", 5e6)])
+        m.get(COIN, payload={"platforms": {"solana": "AaaMint"}})
+        async with aiohttp.ClientSession() as s:
+            r = await markets_sweep(
+                store, cg_settings, s, NOW, sleep=RecordingSleep(), budget_now=NOW
+            )
+    assert r.credits_used == 2 and r.rows_written == 1
+
+
+async def test_hourly_logs_missing_btc_price(store, cg_settings):
+    from structlog.testing import capture_logs
+
+    with aioresponses() as m:
+        m.get(TRENDING, payload={"coins": []})
+        m.get(PRICE, payload={})
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await hourly(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    assert r.credits_used == 2 and r.rows_written == 0
+    missing = [e for e in logs if e["event"] == "cg_btc_price_missing"]
+    assert len(missing) == 1 and missing[0]["log_level"] == "warning"
+    assert await store.observations("benchmark:btc", as_of=NOW) == []
+
+
+async def test_calls_this_month_is_bounded_to_one_month(store):
+    for started, credits in (
+        ("2026-09-30T23:59:59Z", 7),
+        ("2026-10-31T23:59:59Z", 5),
+        ("2026-11-01T00:00:00Z", 11),
+        ("2026-12-31T23:00:00Z", 13),
+        ("2027-01-01T00:00:00Z", 17),
+    ):
+        await store.record_run(
+            "coingecko-hourly", started, started, True, credits_used=credits
+        )
+    assert await calls_this_month(store, "2026-10-09T00:00:00Z") == 5
+    assert await calls_this_month(store, "2026-11-20T00:00:00Z") == 11
+    assert await calls_this_month(store, "2026-12-01T00:00:00Z") == 13
