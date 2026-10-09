@@ -6,6 +6,7 @@ import aiohttp
 import structlog
 
 from gecko.http import get_json
+from gecko.identity import norm_address, token_id
 from gecko.jobs import register
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
@@ -22,15 +23,13 @@ CHAIN_MAP: dict[str, str] = {
     "ethereum": "ethereum",
     "bsc": "bsc",
 }
-# Hex addresses are case-insensitive; Solana base58 mints are case-sensitive.
-CASE_INSENSITIVE_CHAINS = frozenset({"base", "ethereum", "bsc"})
 BATCH = 30
 
 
 def _num(v) -> float | None:
     try:
         return float(v) if v is not None and v != "" else None
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
 
 
@@ -43,16 +42,13 @@ def _iso_ms(ms) -> str | None:
     )
 
 
-def _norm_addr(chain: str, addr: str) -> str:
-    return addr.lower() if chain in CASE_INSENSITIVE_CHAINS else addr
-
-
-def best_pair(pairs: list[dict], address: str) -> dict | None:
+def best_pair(pairs: list[dict], address: str, chain: str) -> dict | None:
+    want = norm_address(chain, address)
     best = None
     best_liq = 0.0
     for p in pairs:
         base_addr = str((p.get("baseToken") or {}).get("address", ""))
-        if base_addr.lower() != address.lower():
+        if norm_address(chain, base_addr) != want:
             continue
         price = _num(p.get("priceUsd"))
         liq = _num((p.get("liquidity") or {}).get("usd"))
@@ -89,7 +85,7 @@ async def _discover(
             chain = CHAIN_MAP.get(str(it.get("chainId", "")).lower())
             addr = str(it.get("tokenAddress") or "")
             if chain in settings.chains and addr:
-                found.setdefault(chain, set()).add(_norm_addr(chain, addr))
+                found.setdefault(chain, set()).add(norm_address(chain, addr))
     return found
 
 
@@ -111,21 +107,21 @@ async def collect(
                 settings=settings,
             )
             for addr in batch:
-                p = best_pair(pairs or [], addr)
+                p = best_pair(pairs or [], addr, chain)
                 if p is None:
                     skipped += 1
                     continue
                 f = pair_features(p)
                 if not in_band(
                     settings,
-                    mcap_usd=f["mcap_usd"] or f["fdv_usd"],
+                    mcap_usd=(f["fdv_usd"] if f["mcap_usd"] is None else f["mcap_usd"]),
                     liquidity_usd=f["liquidity_usd"],
                     chain=chain,
                 ):
                     skipped += 1
                     continue
                 base = p.get("baseToken") or {}
-                tid = f"{chain}:{addr}"
+                tid = token_id(chain, addr)
                 await store.upsert_token(
                     tid,
                     chain,

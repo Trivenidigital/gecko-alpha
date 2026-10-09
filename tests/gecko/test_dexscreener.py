@@ -39,14 +39,14 @@ def pair(
 
 def test_best_pair_picks_deepest_matching_base():
     pairs = [pair(liq=10), pair(liq=500_000), pair(addr="0xother", liq=9e9)]
-    assert best_pair(pairs, "0xabc")["liquidity"]["usd"] == 500_000
+    assert best_pair(pairs, "0xabc", "base")["liquidity"]["usd"] == 500_000
 
 
 def test_pair_missing_fields_skipped():
     p = pair()
     p["priceUsd"] = None
     p["liquidity"] = None
-    assert best_pair([p], "0xabc") is None
+    assert best_pair([p], "0xabc", "base") is None
     q = pair()
     del q["marketCap"]
     q["volume"] = {}
@@ -131,3 +131,50 @@ async def test_collect_batches_thirty(store, settings):
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
     assert r.rows_written == 31
+
+
+def test_best_pair_solana_is_case_exact():
+    p = pair(addr="so1anamint", chain="solana")
+    assert best_pair([p], "So1anaMint", "solana") is None
+    assert (
+        best_pair([pair(addr="So1anaMint", chain="solana")], "So1anaMint", "solana")
+        is not None
+    )
+
+
+def test_best_pair_evm_is_case_insensitive():
+    assert best_pair([pair(addr="0xABC")], "0xabc", "base") is not None
+
+
+async def test_collect_skips_unpriced_pair_without_raising(store, settings):
+    with aioresponses() as m:
+        m.get(
+            BOOSTS_URL,
+            payload=[
+                {"chainId": "base", "tokenAddress": "0xaaa"},
+                {"chainId": "base", "tokenAddress": "0xbbb"},
+            ],
+        )
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses="0xaaa,0xbbb"),
+            payload=[pair(addr="0xaaa", price=None), pair(addr="0xbbb")],
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW)
+    assert r.rows_written == 1
+    tok = await (await store.conn.execute("SELECT token_id FROM tokens")).fetchall()
+    assert tok == [("base:0xbbb",)]
+
+
+async def test_collect_zero_mcap_not_replaced_by_fdv(store, settings):
+    # mcap 0.0 is out of band; an `or` fallback would wrongly admit it via fdv.
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": "0xabc"}])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses="0xabc"), payload=[pair(mcap=0.0)]
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW)
+    assert r.rows_written == 0

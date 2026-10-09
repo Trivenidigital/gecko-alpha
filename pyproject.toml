@@ -73,3 +73,6 @@ testpaths = ["tests"]
 dev = [
     "black>=26.3.1",
 ]
+
+[tool.black]
+target-version = ["py312"]
