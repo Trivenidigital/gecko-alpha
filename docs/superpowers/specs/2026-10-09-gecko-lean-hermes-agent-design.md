@@ -125,7 +125,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 | Feature | Definition | Source |
 |---|---|---|
-| `age_days` | `as_of − min(pool_created_at, first_seen_at)` | GT / DexScreener |
+| `age_days` | `as_of − pool_created_at` (earliest pool seen; None when no pool is known — the registered F1 excludes coins without a resolvable pool, amended 2026-10-09) | GT / DexScreener |
 | `mcap_usd`, `liquidity_usd`, `vol_24h_usd` | latest | DexScreener / CG |
 | `vol_7d_ratio` | sum(vol for t−7d ≤ ts < t) / sum(vol for t−14d ≤ ts < t−7d) over the deepest pool's daily candles; NULL if the prior window has zero volume or the last window has no candle. This is EXACTLY the registered F4 definition (prereg f7d38fa2); any candle-count minimum requires a new prereg (amended 2026-10-09 — a 14-candle minimum was removed after the backtest showed it dropped 34 of the 101 F4 coins, the youngest pools averaging 2.47×) | GT OHLCV |
 | `holders`, `holder_growth_7d` | latest count; (now − 7 d ago)/7 d ago | Helius / Blockscout |
@@ -142,9 +142,9 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 **v1 live rule set** (the only rules active at launch):
 
-- `R-F4` (pre-registered 2026-09-18, hash f7d38fa2): `age_days ≤ 90 AND vol_7d_ratio ≥ 2.0 AND security_ok AND NOT bundle_flag`.
+- `R-F4` (pre-registered 2026-09-18, hash f7d38fa2): `age_days ≤ 90 AND vol_7d_ratio ≥ 2.0 AND security_ok AND NOT bundle_flag`. Plan 1 ruling: while no enrichment exists, `security_ok is None` is admitted (`require_security_known=False`); Plan 3 flips it to True at cutover. `security_ok is False` always rejects.
 - Hard disqualifiers (applied before any rule): `security_ok = false`, `top10_pct > 60`, liquidity < $250K, `status = dead` (no price for 7 d).
-- Score for ordering within the watchlist: `score = z(vol_7d_ratio) + z(holder_growth_7d) + 0.5·z(smart_money_wallets) + 0.5·z(callers_7d·caller_quality) − 1.0·bundle_flag`, z-scored over the current candidate set. Score orders; rules admit. Watchlist cap 50; exits when a disqualifier fires or 180 d elapse.
+- Score for ordering within the watchlist: `score = z(vol_7d_ratio) + z(holder_growth_7d) + 0.5·z(smart_money_wallets) + 0.5·z(callers_7d·caller_quality) − 1.0·bundle_flag`, z-scored over the current candidate set. Score orders; rules admit. Watchlist cap 50 applied to NEW entrants only (incumbents are never evicted by the cap; ties order by token_id); exits only when a disqualifier fires, the ledger finds no entry price, or 180 d elapse; re-entry after an exit is unsupported in v1.
 
 **Pre-registration protocol** for any new or changed rule: (1) write `docs/prereg/<rule>.md` with the rule, universe, horizon, benchmark and pass criteria; hash it; (2) run `python -m gecko.backtest --rule <rule>` against `/root/gecko-history/scout.db` + `/root/xs_study` charts; (3) rule activates only if the backtest meets its own criteria; (4) forward evaluation by the ledger; (5) rule retired if 90-d cohort underperforms BTC at n ≥ 30. Known F4 fragility (ex-top-3 0.75×, median 0.53×) is recorded in the prereg; F4 is a forward test, not a proven edge.
 
@@ -160,7 +160,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 ## 9. Forward-return ledger
 
-`python -m gecko.ledger` daily: for each `watchlist` row, schedule horizons at entry; when `due_at` passes, fetch price (DexScreener pairs for DEX tokens, CG `simple/price` for listed) and BTC; write `ret`, `ret_vs_btc`. Missing price (404, empty, non-JSON body, or a definite 4xx other than 403) after 3 attempts over 3 daily runs ⇒ `ret = −1.0` (treated as total loss, flagged `dead`). Transient upstream failures (connection errors, 403, 429, 5xx) and a missing BTC benchmark observation skip the row without spending an attempt; BTC is looked up within ±6 h of the timestamp, then ±36 h as a logged fallback. Entry price = first observation price after entry, never a later snapshot. This ledger is the sole input to the scorecard and to any future live-trading gate.
+`python -m gecko.ledger` daily (live-only; `--as-of` is refused): for each `watchlist` row, schedule horizons at entry; when `due_at` passes, fetch the price from DexScreener `tokens/v1` (deepest pair; the same source for listed and DEX-born tokens, amended 2026-10-09) and BTC from the hourly `benchmark:btc` observations; write `ret`, `ret_vs_btc`. Missing price (404, empty, non-JSON body, or a definite 4xx other than 403) after 3 attempts over 3 daily runs ⇒ `ret = −1.0` (treated as total loss, flagged `dead`). Transient upstream failures (connection errors, 403, 429, 5xx) and a missing BTC benchmark observation skip the row without spending an attempt; BTC is looked up within ±6 h of the timestamp, then ±36 h as a logged fallback. Entry price = the first priced market observation at or after entry, resolved ONCE per watchlist entry and stored in `watchlist.entry_price` so every horizon shares it; if none exists within 48 h of entry the whole entry is finalized as unmeasurable (`ret` NULL) and exits with reason `no_entry_price` (the token itself is not marked dead). The DexScreener collector refreshes every candidate, active and watchlisted token each run (unconditionally, below-floor readings included) so this observation exists for live tokens. This ledger is the sole input to the scorecard and to any future live-trading gate.
 
 ## 10. Backtest harness
 
