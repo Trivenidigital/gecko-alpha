@@ -26,6 +26,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
     root = Path(ap.parse_args().root)
+    missing = [rel for rel in LIMITS if not (root / rel).is_dir()]
+    if missing:
+        print(f"counted dir(s) missing under {root}: {missing}", file=sys.stderr)
+        return 2
     g, t = count(root, "gecko"), count(root, "tests/gecko")
     print(f"gecko={g}/{LIMITS['gecko']} tests={t}/{LIMITS['tests/gecko']}")
     return 1 if g > LIMITS["gecko"] or t > LIMITS["tests/gecko"] else 0
