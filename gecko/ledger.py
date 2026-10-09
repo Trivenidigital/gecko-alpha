@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import aiohttp
 import structlog
@@ -18,6 +18,7 @@ from gecko.store import Store, canon_ts, parse_utc, utcnow
 log = structlog.get_logger("gecko.ledger")
 MAX_ATTEMPTS = 3
 BTC_WINDOW_HOURS = 6
+BTC_FALLBACK_WINDOW_HOURS = 36
 BTC_TOKEN_ID = "benchmark:btc"
 DEXSCREENER_TOKENS = "https://api.dexscreener.com/tokens/v1/{chain}/{address}"
 
@@ -58,10 +59,11 @@ async def entry_price(
     return None
 
 
-async def btc_price_at(store: Store, ts: str) -> float | None:
-    """``benchmark:btc`` price observed nearest ``ts`` within ±6 h, else None."""
-    t = parse_utc(ts)
-    window = timedelta(hours=BTC_WINDOW_HOURS)
+async def _nearest_btc(
+    store: Store, t: datetime, hours: int
+) -> tuple[float, float] | None:
+    """(distance_sec, price) of the priced BTC observation nearest ``t``."""
+    window = timedelta(hours=hours)
     rows = await (
         await store.conn.execute(
             "SELECT observed_at, features_json FROM observations WHERE token_id=? "
@@ -81,6 +83,25 @@ async def btc_price_at(store: Store, ts: str) -> float | None:
         d = abs((parse_utc(obs_at) - t).total_seconds())
         if best is None or d < best[0]:
             best = (d, p)
+    return best
+
+
+async def btc_price_at(store: Store, ts: str) -> float | None:
+    """``benchmark:btc`` price observed nearest ``ts``.
+
+    Tries +/-6 h; if that window holds no priced observation, falls back to
+    +/-36 h (logged as ``ledger_btc_fallback_window``); else None.
+    """
+    t = parse_utc(ts)
+    best = await _nearest_btc(store, t, BTC_WINDOW_HOURS)
+    if best is None:
+        best = await _nearest_btc(store, t, BTC_FALLBACK_WINDOW_HOURS)
+        if best is not None:
+            log.warning(
+                "ledger_btc_fallback_window",
+                ts=canon_ts(ts),
+                distance_hours=round(best[0] / 3600, 2),
+            )
     return best[1] if best else None
 
 
@@ -91,12 +112,12 @@ async def fetch_price(
     address: str,
 ) -> float | None:
     """DexScreener price of the deepest-liquidity pair; None on 404/empty/unusable."""
-    data = await get_json(
-        session,
-        DEXSCREENER_TOKENS.format(chain=chain, address=address),
-        settings=settings,
-        ok_statuses=(200, 404),
-    )
+    url = DEXSCREENER_TOKENS.format(chain=chain, address=address)
+    try:
+        data = await get_json(session, url, settings=settings, ok_statuses=(200, 404))
+    except ValueError as exc:  # includes json.JSONDecodeError on a non-JSON body
+        log.warning("ledger_price_body_invalid", url=url, error=str(exc))
+        return None
     if not isinstance(data, list):
         return None
     best: tuple[float, float] | None = None
@@ -166,15 +187,24 @@ async def measure_due(
         try:
             price = await fetch_price(session, settings, chain, address)
         except UpstreamError as exc:
-            # Not evidence the token is gone: do not spend an attempt on it.
+            if exc.status == 0 or exc.status == 429 or exc.status >= 500:
+                # Transient: not evidence the token is gone; spend no attempt.
+                log.warning(
+                    "ledger_fetch_transient",
+                    token_id=tid,
+                    horizon_days=h,
+                    status=exc.status,
+                )
+                rep.skipped += 1
+                continue
+            # Any other 4xx is a definite refusal: count it as a missing price.
             log.warning(
-                "ledger_fetch_error",
+                "ledger_fetch_rejected",
                 token_id=tid,
                 horizon_days=h,
                 status=exc.status,
             )
-            rep.skipped += 1
-            continue
+            price = None
         try:
             if ep is not None and price is not None:
                 await store.set_return(tid, h, ep, price, btc_entry, btc_now, now)

@@ -3,6 +3,10 @@ import argparse
 import aiohttp
 import pytest
 from aioresponses import aioresponses
+from structlog.testing import capture_logs
+
+import gecko.ledger
+from gecko.http import UpstreamError
 
 from gecko.ledger import (
     MAX_ATTEMPTS,
@@ -96,10 +100,26 @@ async def test_btc_nearest_within_window(store):
 
 async def test_btc_nearest_either_side(store):
     await seed(store)
-    # 13:00 is 12h from both; 14:00 is 11h before the 10-02 01:00 obs -> outside 6h
-    assert await btc_price_at(store, "2026-10-01T14:00:00Z") is None
-    assert await btc_price_at(store, "2026-10-01T20:00:00Z") == 66000.0
-    assert await btc_price_at(store, "2026-10-01T06:00:00+00:00") == 60000.0
+    with capture_logs() as logs:
+        assert await btc_price_at(store, "2026-10-01T20:00:00Z") == 66000.0
+        assert await btc_price_at(store, "2026-10-01T06:00:00+00:00") == 60000.0
+    # inside the primary window: no fallback logged
+    assert not [e for e in logs if e["event"] == "ledger_btc_fallback_window"]
+
+
+async def test_btc_fallback_window_36h(store):
+    await seed(store)
+    # nearest obs (10-01 01:00) is 20h away; the 10-02 obs is 44h away
+    with capture_logs() as logs:
+        assert await btc_price_at(store, "2026-09-30T05:00:00Z") == 60000.0
+    fb = [e for e in logs if e["event"] == "ledger_btc_fallback_window"]
+    assert len(fb) == 1
+    assert fb[0]["ts"] == "2026-09-30T05:00:00Z" and fb[0]["distance_hours"] == 20.0
+    assert fb[0]["log_level"] == "warning"
+    # fallback still picks the nearest: 10-01 14:00 is 13h / 11h away
+    assert await btc_price_at(store, "2026-10-01T14:00:00Z") == 66000.0
+    # beyond 36h on both sides -> None
+    assert await btc_price_at(store, "2026-09-29T12:00:00Z") is None
 
 
 async def test_fetch_price_picks_deepest_pair(settings):
@@ -272,16 +292,93 @@ async def test_already_measured_row_is_logged_and_skipped(store, settings, monke
     assert r.skipped == 1
 
 
-async def test_upstream_error_skips_row_without_bumping(store, settings):
+async def test_definite_4xx_counts_as_missing_price(store, settings):
     await seed(store)
     with aioresponses() as m:
-        m.get(DS, status=403)
+        for _ in range(MAX_ATTEMPTS):
+            m.get(DS, status=403)
         async with aiohttp.ClientSession() as s:
             r = await measure_due(store, settings, s, NOW)
-    assert (r.measured, r.failed, r.skipped) == (0, 0, 1)
+            assert (r.measured, r.failed, r.skipped) == (0, 1, 0)
+            assert (
+                await one(
+                    store, "SELECT attempts FROM forward_returns WHERE horizon_days=1"
+                )
+            ) == (1,)
+            for _ in range(MAX_ATTEMPTS - 1):
+                r = await measure_due(store, settings, s, NOW)
+    assert r.total_loss == 1
+    row = await one(
+        store, "SELECT ret, price FROM forward_returns WHERE horizon_days=1"
+    )
+    assert row == (-1.0, 0.0)
+
+
+@pytest.mark.parametrize("status", [0, 429, 500, 503])
+async def test_transient_upstream_error_skips_without_bumping(
+    store, settings, monkeypatch, status
+):
+    await seed(store)
+
+    async def boom(session, url, **kw):
+        raise UpstreamError(status, url)
+
+    monkeypatch.setattr(gecko.ledger, "get_json", boom)
+    async with aiohttp.ClientSession() as s:
+        with capture_logs() as logs:
+            r = await measure_due(store, settings, s, NOW)
+    assert (r.measured, r.failed, r.total_loss, r.skipped) == (0, 0, 0, 1)
     assert (
         await one(store, "SELECT attempts FROM forward_returns WHERE horizon_days=1")
     ) == (0,)
+    assert [e["status"] for e in logs if e["event"] == "ledger_fetch_transient"] == [
+        status
+    ]
+
+
+async def test_fetch_price_none_on_non_json_body(settings):
+    with aioresponses() as m:
+        m.get(DS, status=200, body="<html>")
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                assert await fetch_price(s, settings, "solana", "abc") is None
+    assert [e["event"] for e in logs if e["event"] == "ledger_price_body_invalid"] == [
+        "ledger_price_body_invalid"
+    ]
+
+
+async def test_non_json_body_spends_attempt_and_later_rows_proceed(store, settings):
+    await seed(store)
+    await store.upsert_token(
+        "solana:def",
+        "solana",
+        "def",
+        "DEF",
+        "Def",
+        "2026-09-20T00:00:00Z",
+        "dexscreener",
+    )
+    await store.add_observation(
+        "solana:def", "dexscreener", "2026-10-01T00:30:00Z", {"price_usd": 1.0}
+    )
+    await store.watchlist_upsert("solana:def", E, "F4", 2, 0.5, {})
+    await store.schedule_returns("solana:def", E)
+    with aioresponses() as m:
+        m.get(DS, status=200, body="<html>")
+        m.get(
+            "https://api.dexscreener.com/tokens/v1/solana/def",
+            payload=[{"priceUsd": "2.0", "liquidity": {"usd": 5}}],
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await measure_due(store, settings, s, NOW)
+    assert (r.measured, r.failed, r.skipped) == (1, 1, 0)
+    rows = await (
+        await store.conn.execute(
+            "SELECT token_id, attempts, measured_at FROM forward_returns "
+            "WHERE horizon_days=1 ORDER BY token_id"
+        )
+    ).fetchall()
+    assert rows == [("solana:abc", 1, None), ("solana:def", 0, NOW)]
 
 
 async def test_ledger_job_registered_and_records(settings):
