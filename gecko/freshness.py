@@ -22,7 +22,9 @@ SLO_MINUTES = {
     "research_notes": 1560,
     # per source, so one dead collector cannot hide behind a live one
     "observations:dexscreener": 30,
-    "observations:geckoterminal": 60,
+    # Row-anchored on purpose: a run that writes nothing (every pool out of
+    # band after an upstream field rename) must still page.
+    "observations:geckoterminal": 360,
     "observations:coingecko": 1560,
     "observations:geckoterminal_ohlcv": 1560,  # rows that carry candles only
     "benchmark:btc": 180,  # the ledger cannot measure without it
@@ -51,10 +53,7 @@ WRITER_JOBS = {
     "benchmark:btc": ("coingecko-hourly",),
 }
 # Tables whose writer may legitimately write 0 rows; judged by its last ok run.
-# observations:geckoterminal too: an hour with no in-band pool is legitimate.
-RUN_ANCHORED = frozenset(
-    {"watchlist", "forward_returns", "research_notes", "observations:geckoterminal"}
-)
+RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
 DEDUP_HOURS = 6
 
 

@@ -382,8 +382,8 @@ async def test_one_live_source_does_not_hide_a_dead_one(store):
     await store.record_run("dexscreener", T_OBS, T_OBS, True)
     await store.record_run("geckoterminal", T_OBS, T_OBS, True)
     await store.add_observation("solana:a", "geckoterminal", T_OBS, {})
-    await store.add_observation("solana:a", "dexscreener", _plus(55), {})
-    tables = [b.table for b in await check_freshness(store, _plus(70))]
+    await store.add_observation("solana:a", "dexscreener", _plus(375), {})
+    tables = [b.table for b in await check_freshness(store, _plus(380))]
     assert "observations" not in tables
     assert "observations:geckoterminal" in tables
 
@@ -450,15 +450,17 @@ async def test_hourly_run_does_not_bootstrap_the_markets_slo(store):
     assert "observations:coingecko" not in tables
 
 
-async def test_geckoterminal_slo_is_anchored_on_its_last_ok_run(store):
-    # an hour with no in-band pool writes no row: the writer is still alive
-    await store.record_run("geckoterminal", T_OBS, T_OBS, True)
-    await store.record_run("geckoterminal", _plus(100), _plus(100), True)
-    tables = [b.table for b in await check_freshness(store, _plus(130))]
-    assert "observations:geckoterminal" not in tables
-    b = [
-        x
-        for x in await check_freshness(store, _plus(170))
-        if x.table == "observations:geckoterminal"
-    ]
-    assert len(b) == 1 and b[0].last_write == _plus(100)
+@pytest.mark.parametrize("row_age_h,breach", [(7, True), (5, False)])
+async def test_geckoterminal_ok_runs_writing_nothing_still_page(
+    store, row_age_h, breach
+):
+    # GT runs every 15 min and succeeds, but (say) a renamed reserve field puts
+    # every pool out of band: no rows. Only the newest row's age can tell.
+    now = _plus(8 * 60)
+    for m in range(0, 8 * 60 + 1, 15):
+        await store.record_run("geckoterminal", _plus(m), _plus(m), True)
+    await store.add_observation(
+        "solana:a", "geckoterminal", _plus(8 * 60 - row_age_h * 60), {}
+    )
+    tables = [x.table for x in await check_freshness(store, now)]
+    assert ("observations:geckoterminal" in tables) is breach
