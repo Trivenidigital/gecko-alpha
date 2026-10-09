@@ -14,7 +14,7 @@ FILES = sorted(
 
 def test_files_found():
     assert any(p.name == "dexscreener.py" for p in FILES)
-    assert any(p.name == "test_py312_syntax.py" for p in FILES)
+    assert any(p.name == "test_gecko_py312_syntax.py" for p in FILES)
 
 
 @pytest.mark.parametrize("path", FILES, ids=lambda p: str(p.relative_to(ROOT)))
