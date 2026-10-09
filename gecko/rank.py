@@ -116,6 +116,7 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
     if any(ts is not None and as_of < ts for ts in latest):
         raise ValueError("as_of rewinds ranking state")
     feats: dict[str, Features] = {}
+    reasons: dict[str, str] = {}
     for tid in await _column(
         store, "SELECT token_id FROM tokens WHERE status='active'"
     ):
@@ -124,6 +125,7 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
         if why:
             status = "dead" if why == "dead" else "disqualified"
             await store.set_token_status(tid, status, why)
+            reasons[tid] = why
             continue
         feats[tid] = f
 
@@ -131,16 +133,13 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
     exited: list[str] = []
     for tid, w in current.items():
         if tid not in feats:
-            row = await (
-                await store.conn.execute(
-                    "SELECT disqualify_reason FROM tokens WHERE token_id=?", (tid,)
-                )
-            ).fetchone()
-            await store.watchlist_exit(tid, as_of, (row and row[0]) or "disqualified")
+            # Not active this run: this run's disqualifier, or left `active`
+            # some other way.
+            await store.watchlist_exit(tid, as_of, reasons.get(tid, "disqualified"))
             exited.append(tid)
-        elif (
-            parse_utc(as_of) - parse_utc(w.entered_at)
-        ).days > settings.watchlist_max_age_days:
+        elif parse_utc(as_of) - parse_utc(w.entered_at) > timedelta(
+            days=settings.watchlist_max_age_days
+        ):
             await store.watchlist_exit(tid, as_of, "max_age")
             exited.append(tid)
     for tid in exited:

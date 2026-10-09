@@ -219,9 +219,18 @@ async def test_rank_is_sticky_when_rule_lapses(store, settings):
         "2026-10-21T23:00:00Z",
         {"price_usd": 1.0, "liquidity_usd": 300_000.0},
     )
+    from gecko.features import compute_features
+
+    entry_sql = "SELECT entered_at, features_at_entry_json FROM watchlist"
+    entry_before = await one(store, entry_sql)
+    # negative control: F4 really has lapsed at the re-rank time
+    f = await compute_features(store, settings, "solana:good", "2026-10-22T00:00:00Z")
+    assert disqualify(f, settings) is None and rule_f4(f, settings) is False
     r = await rank_once(store, settings, "2026-10-22T00:00:00Z")
-    assert r.exited == [] and r.entered == []
+    assert r.exited == [] and r.entered == [] and r.ranked == 1
     assert [w.token_id for w in await store.active_watchlist()] == ["solana:good"]
+    assert await one(store, entry_sql) == entry_before
+    assert entry_before[0] == A
 
 
 async def test_max_age_exit(store, settings):
@@ -254,6 +263,36 @@ async def test_max_age_boundary_stays(store, settings):
     )
     r = await rank_once(store, settings, "2026-10-18T00:00:00Z")  # exactly 3 days
     assert r.exited == []
+
+
+async def test_max_age_sub_day_excess_exits(store, settings):
+    settings.watchlist_max_age_days = 3
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "dexscreener",
+        "2026-10-18T11:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 300_000.0},
+    )
+    r = await rank_once(store, settings, "2026-10-18T12:00:00Z")  # 3 d 12 h
+    assert r.exited == ["solana:good"]
+    row = await one(store, "SELECT exit_reason FROM watchlist")
+    assert row[0] == "max_age"
+
+
+async def test_max_age_one_second_over_exits(store, settings):
+    settings.watchlist_max_age_days = 3
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "dexscreener",
+        "2026-10-18T00:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 300_000.0},
+    )
+    r = await rank_once(store, settings, "2026-10-18T00:00:01Z")
+    assert r.exited == ["solana:good"]
 
 
 async def test_exited_token_is_not_reentered(store, settings):
@@ -329,6 +368,29 @@ async def test_cap_counts_existing_members_and_reranks_them(store, settings):
     wl = await store.active_watchlist()
     assert [(w.token_id, w.rank) for w in wl] == [("solana:n2", 1), ("solana:old", 2)]
     assert r.ranked == 2
+
+
+async def test_cap_below_incumbent_count_admits_none_and_reranks_all(store, settings):
+    for i in range(3):
+        await seed_token(store, f"solana:i{i}", vols=[100] * 7 + [300 + i] * 7)
+    r = await rank_once(store, settings, A)
+    assert len(r.entered) == 3
+    settings.watchlist_cap = 2  # below the incumbent count: slots <= 0
+    # two eligible newcomers: an unclamped negative slot count would slice
+    # [:-1] and admit one of them
+    await seed_token(store, "solana:new", vols=[100] * 7 + [900] * 7)
+    await seed_token(store, "solana:new2", vols=[100] * 7 + [800] * 7)
+    r2 = await rank_once(store, settings, A)
+    assert r2.entered == [] and r2.exited == [] and r2.ranked == 3
+    wl = await store.active_watchlist()
+    assert [(w.token_id, w.rank) for w in wl] == [
+        ("solana:i2", 1),
+        ("solana:i1", 2),
+        ("solana:i0", 3),
+    ]
+    assert await one(
+        store, "SELECT COUNT(*) FROM watchlist WHERE token_id LIKE 'solana:new%'"
+    ) == (0,)
 
 
 async def test_score_ties_break_by_token_id(store, settings):
