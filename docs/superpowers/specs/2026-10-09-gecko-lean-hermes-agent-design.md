@@ -210,7 +210,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 - Freshness: a table with no writes past SLO produces exactly one alert; a second run within 6 h produces none.
 - Collectors: a 429 then 200 sequence succeeds with backoff; a persistent failure exits 1 and writes `runs.ok = 0`.
 - Backtest: reproduces the 09-18 F4 cohort statistics within tolerance on the frozen study data (regression anchor).
-- Target: `tests/gecko` ≤ 5,000 LOC.
+- Target: `tests/gecko` ≤ 6,000 LOC (see S1).
 
 ## 16. Budget
 
