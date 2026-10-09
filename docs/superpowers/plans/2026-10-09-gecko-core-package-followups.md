@@ -65,3 +65,4 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 ## From the vector re-clears (ticketed)
 - Freshness: put the overdue-row count in the `forward_returns_backlog` text so a new stall changes the page; per-source SLOs are silent while a writer has never run (a never-scheduled OHLCV/GT job is invisible — Plan 3 must verify every job has run once after deploy); OHLCV partial failures (error markers) keep the run green — add an error-ratio warning/breach.
 - Ledger: canary is sampled once per run before token fetches; mid-run degradation can still spend attempts (bounded by the 20 h spacing).
+- Ledger runbook: a watchlist entry whose BTC benchmark is missing for more than 36 h around `entered_at` stays due and pages via `forward_returns_backlog` every 6 h; remediation today is a manual `set_return` with a backfilled BTC price or an exit with reason `no_benchmark` — add an automatic finalizer (Plan 2).
