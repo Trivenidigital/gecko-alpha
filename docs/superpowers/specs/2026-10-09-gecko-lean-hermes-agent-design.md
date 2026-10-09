@@ -87,7 +87,7 @@ Collectors are Python modules invoked as `python -m gecko.collect <source>` by H
 
 ## 4. Store (`gecko.db`)
 
-SQLite, WAL mode, single writer per table per process. Keyed on canonical identity `(chain, contract_address)`; CoinGecko ids are stored separately (the old store put CG slugs in `contract_address`; this is not repeated).
+SQLite, WAL mode, single writer per table per process. Keyed on canonical identity `(chain, address)` where the address is lowercased ONLY for EVM chains (base, ethereum, bsc) and kept case-exact for Solana (base58 is case-sensitive) — implemented once in `gecko/identity.py` (amended 2026-10-09 from "lowercase always"). CoinGecko ids are stored separately (the old store put CG slugs in `contract_address`; this is not repeated). Every stored timestamp is canonicalized to UTC `%Y-%m-%dT%H:%M:%SZ` by the store so lexical comparisons are chronological.
 
 | Table | Key columns | Purpose |
 |---|---|---|
@@ -117,7 +117,7 @@ All collectors: aiohttp, explicit timeouts, exponential backoff on 429/5xx, writ
 | Telegram callers | Telethon user session over configured channels (migrated from `tg_social_channels`) | long-running | Telegram limits | `source_calls` with cashtags/addresses; caller quality from history | all |
 | X / KOL | existing Hermes skills (`kol_watcher` → `narrative_classifier` → `coin_resolver`) re-pointed to write `source_calls` via `python -m gecko.ingest_call` | hourly, agent mode | X API tier (owner) | narrative mentions | all |
 
-Token admission into `tokens` requires: in universe band, security result not failed, liquidity ≥ $250K for ≥ 24 h (survivor filter — most rugs manifest within 1 h per the research).
+Token admission into `tokens` requires: in universe band, security result not failed, liquidity ≥ $250K for ≥ 24 h CONTIGUOUS (the qualifying anchor observation must be later than the most recent below-floor observation; only observations carrying `liquidity_usd` count) — the survivor filter; most rugs manifest within 1 h per the research.
 
 ## 6. Features (point-in-time, computed hourly from `observations`)
 
@@ -127,7 +127,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 |---|---|---|
 | `age_days` | `as_of − min(pool_created_at, first_seen_at)` | GT / DexScreener |
 | `mcap_usd`, `liquidity_usd`, `vol_24h_usd` | latest | DexScreener / CG |
-| `vol_7d_ratio` | sum(vol last 7 d) / sum(vol prior 7 d); NULL if < 14 d of data | GT OHLCV / CG |
+| `vol_7d_ratio` | sum(vol for t−7d ≤ ts < t) / sum(vol for t−14d ≤ ts < t−7d) over the deepest pool's daily candles; NULL if the prior window has zero volume or the last window has no candle. This is EXACTLY the registered F4 definition (prereg f7d38fa2); any candle-count minimum requires a new prereg (amended 2026-10-09 — a 14-candle minimum was removed after the backtest showed it dropped 34 of the 101 F4 coins, the youngest pools averaging 2.47×) | GT OHLCV |
 | `holders`, `holder_growth_7d` | latest count; (now − 7 d ago)/7 d ago | Helius / Blockscout |
 | `top10_pct` | top-10 holder share excl. LP/burn | Helius / Blockscout |
 | `bundle_flag` | GMGN DD score < 60 OR top10_pct > 40 | GMGN / holders |
@@ -160,7 +160,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 
 ## 9. Forward-return ledger
 
-`python -m gecko.ledger` daily: for each `watchlist` row, schedule horizons at entry; when `due_at` passes, fetch price (DexScreener pairs for DEX tokens, CG `simple/price` for listed) and BTC; write `ret`, `ret_vs_btc`. Missing price after 3 attempts over 3 days ⇒ `ret = −1.0` (treated as total loss, flagged `dead`). Entry price = first observation price after entry, never a later snapshot. This ledger is the sole input to the scorecard and to any future live-trading gate.
+`python -m gecko.ledger` daily: for each `watchlist` row, schedule horizons at entry; when `due_at` passes, fetch price (DexScreener pairs for DEX tokens, CG `simple/price` for listed) and BTC; write `ret`, `ret_vs_btc`. Missing price (404, empty, non-JSON body, or a definite 4xx other than 403) after 3 attempts over 3 daily runs ⇒ `ret = −1.0` (treated as total loss, flagged `dead`). Transient upstream failures (connection errors, 403, 429, 5xx) and a missing BTC benchmark observation skip the row without spending an attempt; BTC is looked up within ±6 h of the timestamp, then ±36 h as a logged fallback. Entry price = first observation price after entry, never a later snapshot. This ledger is the sole input to the scorecard and to any future live-trading gate.
 
 ## 10. Backtest harness
 
