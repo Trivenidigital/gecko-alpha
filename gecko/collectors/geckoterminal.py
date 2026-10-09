@@ -211,7 +211,7 @@ async def collect_ohlcv(
             (now,),
         )
     ).fetchall()
-    written = fetched = 0
+    written = fetched = errors = 0
     for tid, chain, _ in rows:
         # The budget counts upstream fetches only: pool-less tokens never gain an
         # OHLCV row, so they would sort first forever and starve every later token.
@@ -230,9 +230,11 @@ async def collect_ohlcv(
                 headers=HEADERS,
             )
         except UpstreamError as exc:
-            if exc.status != 404:
-                raise
-            body, status = None, "not_found"
+            # One pool's failure is that pool's marker, not the run's end.
+            body, status = None, "not_found" if exc.status == 404 else "error"
+            if status == "error":
+                errors += 1
+                log.warning("ohlcv_fetch_failed", token_id=tid, status=exc.status)
         else:
             status = "ok"
         attrs = ((body or {}).get("data") or {}).get("attributes") or {}
@@ -252,8 +254,11 @@ async def collect_ohlcv(
         "geckoterminal_ohlcv_done",
         written=written,
         fetched=fetched,
+        errors=errors,
         considered=len(rows),
     )
+    if fetched and errors == fetched:
+        raise RuntimeError(f"all {fetched} geckoterminal ohlcv fetches failed")
     return JobResult(rows_written=written)
 
 

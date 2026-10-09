@@ -7,8 +7,15 @@ SUPPORTED_CHAINS = ("solana", "base", "ethereum", "bsc")
 
 
 class GeckoSettings(BaseSettings):
+    """Settings from ``GECKO_*`` environment variables and ``.env.gecko``.
+
+    Never ``.env``: the legacy pipeline owns that file and validates it with
+    ``extra="forbid"``, so GECKO_ keys there would break it, and its keys
+    must not leak in here.
+    """
+
     model_config = SettingsConfigDict(
-        env_prefix="GECKO_", env_file=".env", extra="ignore"
+        env_prefix="GECKO_", env_file=".env.gecko", extra="ignore"
     )
 
     db_path: str = "gecko.db"

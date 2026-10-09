@@ -87,7 +87,14 @@ async def get_json(
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last = 0
             last_body = None
-            log.warning("http_transport_error", url=url, error=repr(exc))
+            # Type and status only: an aiohttp error's repr carries the request
+            # headers, i.e. the CoinGecko API key.
+            log.warning(
+                "http_transport_error",
+                url=url,
+                error=type(exc).__name__,
+                status=getattr(exc, "status", None),
+            )
         if attempt < retries:
             delay = backoff[min(attempt, len(backoff) - 1)]
             log.warning("http_retry", url=url, status=last, delay=delay)

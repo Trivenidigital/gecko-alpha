@@ -337,24 +337,37 @@ async def test_ohlcv_empty_list_writes_empty_marker(store, settings):
     ]
 
 
-async def test_ohlcv_non_404_upstream_error_still_raises(store, settings):
-    import pytest
-    from gecko.http import UpstreamError
-
-    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
-    await store.add_observation(
-        "solana:a", "geckoterminal", NOW, {"pool_address": "pa", "liquidity_usd": 3e5}
-    )
+async def test_ohlcv_error_writes_marker_and_continues(store, settings):
+    await _two_pooled_tokens(store)
     with aioresponses() as m:
         m.get(OHLCV_URL.format(network="solana", pool="pa"), status=401)
+        m.get(
+            OHLCV_URL.format(network="solana", pool="pb"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 5]]),
+        )
         async with aiohttp.ClientSession() as s:
-            with pytest.raises(UpstreamError) as ei:
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 2
+    (a,) = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+    assert a.features == {"pool_address": "pa", "candles": [], "status": "error"}
+    (b,) = await store.observations("solana:b", as_of=NOW, source="geckoterminal_ohlcv")
+    assert b.features["status"] == "ok"
+
+
+async def test_ohlcv_run_fails_only_when_every_fetch_failed(store, settings):
+    import pytest
+
+    await _two_pooled_tokens(store)
+    with aioresponses() as m:
+        m.get(OHLCV_URL.format(network="solana", pool="pa"), status=401)
+        m.get(OHLCV_URL.format(network="solana", pool="pb"), status=403)
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(RuntimeError, match="all 2 geckoterminal ohlcv"):
                 await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
-    assert ei.value.status == 401
-    assert (
-        await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
-        == []
-    )
+    # markers were still written, so both tokens rotate to the back
+    for tid in ("solana:a", "solana:b"):
+        obs = await store.observations(tid, as_of=NOW, source="geckoterminal_ohlcv")
+        assert obs[0].features["status"] == "error"
 
 
 async def test_ohlcv_picks_deepest_pool_in_latest_snapshot(store, settings):

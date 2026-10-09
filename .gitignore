@@ -10,6 +10,7 @@ __pycache__/
 .pytest_out.txt
 .env
 scout.db
+gecko.db
 *.db-shm
 *.db-wal
 .pytest_cache/

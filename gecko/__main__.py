@@ -26,7 +26,13 @@ def _load_jobs() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _load_jobs()
-    p = argparse.ArgumentParser(prog="gecko")
+    p = argparse.ArgumentParser(
+        prog="gecko",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="jobs:\n  "
+        + "\n  ".join(sorted(JOBS))
+        + "\n\nexit codes: 0 ok, 1 failure, 2 usage",
+    )
     p.add_argument("job", nargs="?")
     p.add_argument("--list", action="store_true")
     p.add_argument(
@@ -48,11 +54,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     settings = GeckoSettings()
     if not os.path.isabs(settings.db_path):
-        log.warning(
-            "gecko_relative_db_path",
-            db_path=settings.db_path,
-            resolved=os.path.abspath(settings.db_path),
+        # A relative path silently forks the database per working directory.
+        print(
+            f"GECKO_DB_PATH must be absolute (got {settings.db_path!r})",
+            file=sys.stderr,
         )
+        return 2
     if ns.job.startswith("coingecko") and settings.coingecko_demo_api_key is None:
         print(
             f"job {ns.job!r} needs GECKO_COINGECKO_DEMO_API_KEY; refusing to run keyless",

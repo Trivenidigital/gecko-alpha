@@ -278,8 +278,10 @@ def test_stored_price_is_earliest_across_tables(tmp_path):
     assert load_study(str(tmp_path), str(tmp_path / "scout.db")) == []
 
 
-def test_backtest_job_prints_row_and_divergence(tmp_path, capsys):
+def test_backtest_job_prints_row_and_divergence(tmp_path, capsys, monkeypatch):
     from gecko.__main__ import main
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
 
     write_study(tmp_path, {"a": coin(10, 1.0, 8.0), "b": coin(12, 1.0, 0.4)})
     rc = main(
@@ -299,8 +301,10 @@ def test_backtest_job_prints_row_and_divergence(tmp_path, capsys):
     assert "live-definition divergence: 0 coins change F4 verdict" in out
 
 
-def test_backtest_job_load_error_exits_1(tmp_path, capsys):
+def test_backtest_job_load_error_exits_1(tmp_path, capsys, monkeypatch):
     from gecko.__main__ import main
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
 
     rc = main(["backtest", "--study-dir", str(tmp_path / "missing")])
     assert rc == 1

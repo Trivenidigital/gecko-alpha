@@ -171,3 +171,41 @@ async def test_upstream_error_body_text_truncated_or_none(settings):
 
 def test_upstream_error_body_defaults_none():
     assert UpstreamError(500, "u").body is None
+
+
+async def test_transport_error_log_never_carries_request_headers(settings):
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from structlog.testing import capture_logs
+    from yarl import URL
+
+    from gecko.http import UpstreamError, get_json
+
+    url = "https://api.coingecko.com/api/v3/ping"
+    info = aiohttp.RequestInfo(
+        URL(url),
+        "GET",
+        CIMultiDictProxy(CIMultiDict({"x-cg-demo-api-key": "CG-SECRET"})),
+        URL(url),
+    )
+    exc = aiohttp.ClientResponseError(info, (), status=502, message="bad gateway")
+    assert "CG-SECRET" in repr(exc)  # the leak this guards against
+
+    class Boom:
+        async def __aenter__(self):
+            raise exc
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def get(self, *a, **k):
+            return Boom()
+
+    with capture_logs() as logs:
+        try:
+            await get_json(Session(), url, settings=settings, retries=0)
+        except UpstreamError:
+            pass
+    (e,) = [e for e in logs if e["event"] == "http_transport_error"]
+    assert e["error"] == "ClientResponseError" and e["status"] == 502
+    assert "CG-SECRET" not in repr(logs)

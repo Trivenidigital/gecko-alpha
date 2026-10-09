@@ -38,8 +38,10 @@ def test_single_job_registry():
     assert gecko.__main__.JOBS is gecko.jobs.JOBS
 
 
-def test_job_crash_before_run_job_exits_1(monkeypatch, capsys):
+def test_job_crash_before_run_job_exits_1(monkeypatch, capsys, tmp_path):
     from gecko.jobs import JOBS
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
 
     async def boom(settings, ns):
         raise RuntimeError("crashed before run_job")
@@ -90,18 +92,23 @@ def test_coingecko_jobs_refuse_without_key(monkeypatch, settings, capsys):
     assert main(["coingecko-hourly"]) == 0 and ran == ["coingecko-hourly"]
 
 
-def test_relative_db_path_is_logged_with_resolved_path(monkeypatch, settings):
-    import os
-
-    from structlog.testing import capture_logs
-
+def test_relative_db_path_is_a_usage_error(monkeypatch, settings, capsys):
     _patch_settings(monkeypatch, settings)
-    _noop_job(monkeypatch, "rank")
-    with capture_logs() as logs:
-        assert main(["rank"]) == 0
-    assert not [e for e in logs if e["event"] == "gecko_relative_db_path"]
+    ran = _noop_job(monkeypatch, "rank")
+    assert main(["rank"]) == 0 and ran == ["rank"]
     settings.db_path = "gecko.db"
-    with capture_logs() as logs:
-        assert main(["rank"]) == 0
-    (e,) = [e for e in logs if e["event"] == "gecko_relative_db_path"]
-    assert e["log_level"] == "warning" and e["resolved"] == os.path.abspath("gecko.db")
+    assert main(["rank"]) == 2
+    assert "GECKO_DB_PATH must be absolute" in capsys.readouterr().err
+    assert ran == ["rank"]
+
+
+def test_help_epilog_lists_jobs_and_exit_codes(capsys):
+    import pytest
+
+    with pytest.raises(SystemExit) as ei:
+        main(["--help"])
+    assert ei.value.code == 0
+    out = capsys.readouterr().out
+    assert "exit codes: 0 ok, 1 failure, 2 usage" in out
+    for job in ("dexscreener", "ledger", "rank", "freshness", "coingecko-hourly"):
+        assert f"\n  {job}" in out

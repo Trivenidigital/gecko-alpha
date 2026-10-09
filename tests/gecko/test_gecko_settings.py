@@ -27,3 +27,12 @@ def test_chain_validation(tmp_path):
 
     with pytest.raises(ValueError):
         GeckoSettings(db_path=str(tmp_path / "g.db"), chains=["tron"], _env_file=None)
+
+
+def test_env_file_is_dot_env_gecko_never_dot_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GECKO_MIN_LIQUIDITY_USD", raising=False)
+    (tmp_path / ".env").write_text("GECKO_MIN_LIQUIDITY_USD=1\n")
+    assert GeckoSettings().min_liquidity_usd == 250_000  # .env ignored
+    (tmp_path / ".env.gecko").write_text("GECKO_MIN_LIQUIDITY_USD=2\n")
+    assert GeckoSettings().min_liquidity_usd == 2
