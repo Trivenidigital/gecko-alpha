@@ -142,6 +142,26 @@ async def _market_obs(store: Store, token_id: str, as_of: str) -> list[Observati
     return obs
 
 
+def _priced(obs: list[Observation]) -> list[Observation]:
+    return [o for o in obs if _num(o.features.get("price_usd")) is not None]
+
+
+def _gate_row(market: list[Observation]) -> Observation | None:
+    """The one market row that gates and describes the token: the newest priced
+    row, deepest pool first at a shared timestamp (``market`` is pre-sorted).
+
+    Price, liquidity, mcap, volume and ``observed_at`` all come from this row,
+    so a newer below-floor reading can never be masked by an older healthy
+    one. Unpriced rows (CoinGecko trending) never refresh ``observed_at``.
+    CoinGecko markets rows are priced but carry no liquidity; they stand in
+    only for a token with no priced DEX row, else a CG sweep newer than the
+    last DEX read would fail every DEX token on ``liquidity``.
+    """
+    priced = _priced(market)
+    dex = [o for o in priced if o.source != "coingecko"]
+    return (dex or priced or [None])[0]
+
+
 async def _latest_candles(store: Store, token_id: str, as_of: str) -> list:
     """Valid candles of the newest OHLCV observation that has any.
 
@@ -177,10 +197,18 @@ async def compute_features(
     then_floor = _iso(week_ago_dt - THEN_SLACK)
 
     market = await _market_obs(store, token_id, as_of)
-    if market:
-        f.observed_at = market[0].observed_at
-    for key in ("price_usd", "mcap_usd", "liquidity_usd", "vol_24h_usd"):
-        setattr(f, key, _num(_first(market, key)))
+    row = _gate_row(market)
+    if row is not None:
+        f.observed_at = row.observed_at
+        for key in ("price_usd", "mcap_usd", "liquidity_usd", "vol_24h_usd"):
+            setattr(f, key, _num(row.features.get(key)))
+        if f.mcap_usd is None:
+            # The one cross-row read: DEX pairs often lack market cap, so take
+            # the newest CoinGecko mcap. Never price, liquidity or volume.
+            cg_mcap, _ = _first_obs(
+                [o for o in market if o.source == "coingecko"], "mcap_usd"
+            )
+            f.mcap_usd = _num(cg_mcap)
 
     birth = min(d for d in (first_seen, pool_created) if d)
     f.age_days = max(0.0, (as_of_dt - parse_utc(birth)).total_seconds() / DAY_SEC)
@@ -192,10 +220,13 @@ async def compute_features(
     # Separate query at week_ago: dense recent observations must not push the
     # week-old price out of a row-capped window.
     # The week-old value must lie in [week_ago - 2d, week_ago].
-    p_then, p_obs = _first_obs(
-        await _market_obs(store, token_id, week_ago), "price_usd"
+    p_obs = _priced(await _market_obs(store, token_id, week_ago))
+    p_obs = p_obs[0] if p_obs else None
+    p_then = (
+        _num(p_obs.features.get("price_usd"))
+        if p_obs and p_obs.observed_at >= then_floor
+        else None
     )
-    p_then = _num(p_then) if p_obs and p_obs.observed_at >= then_floor else None
     if f.price_usd and p_then:
         f.momentum_ctx = f.price_usd / p_then - 1.0
 

@@ -89,54 +89,103 @@ async def _discover(
     return found
 
 
+async def _pairs(
+    session: aiohttp.ClientSession, settings: GeckoSettings, chain: str, addrs
+):
+    """(address, best pair or None) for ``addrs``, one tokens/v1 call per 30."""
+    ordered = sorted(addrs)
+    for i in range(0, len(ordered), BATCH):
+        batch = ordered[i : i + BATCH]
+        pairs = await get_json(
+            session,
+            TOKENS_URL.format(chain=chain, addresses=",".join(batch)),
+            settings=settings,
+        )
+        for addr in batch:
+            yield addr, best_pair(pairs or [], addr, chain)
+
+
+async def _refresh_targets(store: Store, settings: GeckoSettings) -> dict[str, set]:
+    """Known tokens to re-observe every run, whether or not a feed lists them:
+    candidates and actives, plus every token with an open watchlist row."""
+    rows = await (
+        await store.conn.execute(
+            "SELECT chain, address FROM tokens WHERE chain!='cg' "
+            "AND token_id!='benchmark:btc' AND (status IN ('candidate','active') "
+            "OR token_id IN (SELECT token_id FROM watchlist WHERE exited_at IS NULL))"
+        )
+    ).fetchall()
+    out: dict[str, set] = {}
+    for chain, addr in rows:
+        if chain in settings.chains:
+            out.setdefault(chain, set()).add(addr)
+    return out
+
+
+def _refresh_row(p: dict) -> dict:
+    # Written whatever the liquidity: a below-floor reading is what lets the
+    # survivor window reset and the liquidity disqualifier fire.
+    return {**pair_features(p), "refresh": True}
+
+
 async def collect(
     store: Store,
     settings: GeckoSettings,
     session: aiohttp.ClientSession,
     now: str,
 ) -> JobResult:
+    targets = await _refresh_targets(store, settings)
     found = await _discover(session, settings)
-    written = skipped = 0
+    written = skipped = refreshed = missing = 0
     for chain, addrs in found.items():
-        ordered = sorted(addrs)
-        for i in range(0, len(ordered), BATCH):
-            batch = ordered[i : i + BATCH]
-            pairs = await get_json(
-                session,
-                TOKENS_URL.format(chain=chain, addresses=",".join(batch)),
-                settings=settings,
+        known = targets.get(chain, set())
+        async for addr, p in _pairs(session, settings, chain, addrs):
+            if p is None:
+                skipped += 1
+                continue
+            f = pair_features(p)
+            if not in_band(
+                settings,
+                mcap_usd=(f["fdv_usd"] if f["mcap_usd"] is None else f["mcap_usd"]),
+                liquidity_usd=f["liquidity_usd"],
+                chain=chain,
+            ):
+                if addr in known:  # fetched already: keep the out-of-band reading
+                    await store.add_observation(
+                        token_id(chain, addr), "dexscreener", now, _refresh_row(p)
+                    )
+                    refreshed += 1
+                else:
+                    skipped += 1
+                continue
+            base = p.get("baseToken") or {}
+            tid = token_id(chain, addr)
+            await store.upsert_token(
+                tid,
+                chain,
+                addr,
+                base.get("symbol") or "?",
+                base.get("name") or "?",
+                now,
+                "dexscreener",
+                pool_created_at=f["pair_created_at"],
             )
-            for addr in batch:
-                p = best_pair(pairs or [], addr, chain)
-                if p is None:
-                    skipped += 1
-                    continue
-                f = pair_features(p)
-                if not in_band(
-                    settings,
-                    mcap_usd=(f["fdv_usd"] if f["mcap_usd"] is None else f["mcap_usd"]),
-                    liquidity_usd=f["liquidity_usd"],
-                    chain=chain,
-                ):
-                    skipped += 1
-                    continue
-                base = p.get("baseToken") or {}
-                tid = token_id(chain, addr)
-                await store.upsert_token(
-                    tid,
-                    chain,
-                    addr,
-                    base.get("symbol") or "?",
-                    base.get("name") or "?",
-                    now,
-                    "dexscreener",
-                    pool_created_at=f["pair_created_at"],
-                )
-                await store.add_observation(tid, "dexscreener", now, f)
-                written += 1
+            await store.add_observation(tid, "dexscreener", now, f)
+            written += 1
+    for chain, addrs in targets.items():
+        todo = addrs - found.get(chain, set())
+        async for addr, p in _pairs(session, settings, chain, todo):
+            if p is None:
+                missing += 1
+                continue
+            await store.add_observation(
+                token_id(chain, addr), "dexscreener", now, _refresh_row(p)
+            )
+            refreshed += 1
+    log.info("dexscreener_refresh_done", refreshed=refreshed, missing=missing)
     promoted = await admit_survivors(store, settings, now)
     log.info("dexscreener_done", written=written, skipped=skipped, promoted=promoted)
-    return JobResult(rows_written=written)
+    return JobResult(rows_written=written + refreshed)
 
 
 @register("dexscreener")

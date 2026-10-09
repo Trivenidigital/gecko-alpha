@@ -520,6 +520,88 @@ async def test_unparseable_numbers_become_none(store, settings):
         },
     )
     f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
-    assert f.price_usd is None and f.liquidity_usd is None and f.vol_24h_usd == 7.0
+    # an unparseable price leaves the row unpriced: it describes nothing
+    assert f.observed_at is None and f.price_usd is None and f.vol_24h_usd is None
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T01:00:00Z",
+        {"price_usd": "1.5", "mcap_usd": "x", "liquidity_usd": [1], "vol_24h_usd": 7},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.price_usd == 1.5 and f.liquidity_usd is None and f.vol_24h_usd == 7.0
+    assert f.mcap_usd is None
     assert f.holders is None and f.top10_pct is None and f.smart_money_wallets is None
     assert f.bundle_flag is False
+
+
+async def test_gates_read_one_priced_row_not_per_key_fallthrough(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-04T00:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 3e5, "mcap_usd": 1e6, "vol_24h_usd": 9e4},
+    )
+    # newest priced row lacks liquidity: an older healthy reading must not fill it
+    await store.add_observation(
+        "solana:abc", "geckoterminal", "2026-10-05T00:00:00Z", {"price_usd": 1.1}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.observed_at == "2026-10-05T00:00:00Z" and f.price_usd == 1.1
+    assert f.liquidity_usd is None and f.vol_24h_usd is None
+
+
+async def test_trending_row_does_not_refresh_observed_at(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-01T00:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 3e5},
+    )
+    await store.add_observation(
+        "solana:abc", "coingecko", "2026-10-09T00:00:00Z", {"trending_rank": 1}
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-09T06:00:00Z")
+    assert f.observed_at == "2026-10-01T00:00:00Z" and f.liquidity_usd == 3e5
+
+
+async def test_cg_markets_row_never_gates_a_dex_token(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T00:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 3e5},
+    )
+    await store.add_observation(
+        "solana:abc",
+        "coingecko",
+        "2026-10-05T01:00:00Z",
+        {"price_usd": 1.2, "mcap_usd": 4e6, "vol_24h_usd": 1.0},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.observed_at == "2026-10-05T00:00:00Z" and f.liquidity_usd == 3e5
+    assert f.price_usd == 1.0 and f.vol_24h_usd is None
+    assert f.mcap_usd == 4e6  # mcap alone falls back to CoinGecko
+    await store.add_observation(
+        "solana:abc",
+        "dexscreener",
+        "2026-10-05T02:00:00Z",
+        {"price_usd": 1.0, "liquidity_usd": 3e5, "mcap_usd": 2e6},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.mcap_usd == 2e6  # the priced row's own mcap wins
+
+
+async def test_cg_only_token_described_by_cg_row(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:abc",
+        "coingecko",
+        "2026-10-05T00:00:00Z",
+        {"price_usd": 1.2, "mcap_usd": 4e6},
+    )
+    f = await compute_features(store, settings, "solana:abc", "2026-10-05T06:00:00Z")
+    assert f.price_usd == 1.2 and f.mcap_usd == 4e6 and f.liquidity_usd is None

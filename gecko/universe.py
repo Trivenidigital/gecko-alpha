@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
+from gecko.features import _num
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, parse_utc
 
 MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
+SCAN_DAYS = 7  # admission looks back this far; older rows cannot matter
 
 
 def in_band(
@@ -31,20 +33,27 @@ async def admit_survivors(store: Store, settings: GeckoSettings, now: str) -> in
     now = canon_ts(now)
     q = ",".join("?" * len(MARKET_SOURCES))
     since = canon_ts((parse_utc(now) - timedelta(hours=48)).isoformat())
+    scan_from = canon_ts((parse_utc(now) - timedelta(days=SCAN_DAYS)).isoformat())
     rows = await (
         await store.conn.execute(
             f"SELECT o.token_id, o.observed_at, o.features_json FROM observations o "
             f"JOIN tokens t ON t.token_id=o.token_id WHERE t.status='candidate' "
-            f"AND o.source IN ({q}) AND o.observed_at<=? ORDER BY o.token_id, o.observed_at",
-            (*MARKET_SOURCES, now),
+            f"AND o.source IN ({q}) AND o.observed_at>=? AND o.observed_at<=? "
+            f"ORDER BY o.token_id, o.observed_at, o.id",
+            (*MARKET_SOURCES, scan_from, now),
         )
     ).fetchall()
     by_token: dict[str, list[tuple[str, float]]] = {}
     for tid, obs_at, fj in rows:
-        liq = json.loads(fj).get("liquidity_usd")
+        liq = _num(json.loads(fj).get("liquidity_usd"))
         if liq is None:
             continue  # e.g. coingecko rows: no liquidity, cannot decide admission
-        by_token.setdefault(tid, []).append((obs_at, liq))
+        obs = by_token.setdefault(tid, [])
+        if obs and obs[-1][0] == obs_at:
+            # Several pools read at one instant: the deepest represents the token.
+            obs[-1] = (obs_at, max(obs[-1][1], liq))
+        else:
+            obs.append((obs_at, liq))
     floor = settings.min_liquidity_usd
     promoted = 0
     for tid, obs in by_token.items():

@@ -1,5 +1,6 @@
 import aiohttp
 from aioresponses import aioresponses
+from structlog.testing import capture_logs
 from gecko.collectors.dexscreener import (
     best_pair,
     pair_features,
@@ -178,3 +179,93 @@ async def test_collect_zero_mcap_not_replaced_by_fdv(store, settings):
         async with aiohttp.ClientSession() as s:
             r = await collect(store, settings, s, NOW)
     assert r.rows_written == 0
+
+
+async def _known(store, addr, chain="base", status="candidate"):
+    tid = f"{chain}:{addr}"
+    await store.upsert_token(tid, chain, addr, "K", "K", NOW, "dexscreener")
+    if status != "candidate":
+        await store.set_token_status(tid, status, "x")
+    return tid
+
+
+async def test_refresh_reobserves_known_tokens_off_feed_below_floor(store, settings):
+    cand = await _known(store, "0xaaa")
+    act = await _known(store, "0xbbb", status="active")
+    held = await _known(store, "0xccc", status="disqualified")
+    await store.watchlist_upsert(held, NOW, "F4", 1, 1.0, {})
+    await _known(store, "0xddd", status="dead")  # not refreshed
+    await _known(store, "0xeee")  # no pair returned: nothing written
+    await store.upsert_token("cg:x", "cg", "x", "X", "X", NOW, "coingecko")
+    await store.upsert_token(
+        "benchmark:btc", "benchmark", "btc", "BTC", "B", NOW, "coingecko"
+    )
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses="0xaaa,0xbbb,0xccc,0xeee"),
+            payload=[
+                pair(addr="0xaaa", liq=10_000),
+                pair(addr="0xbbb", liq=300_000, mcap=9e9),
+                pair(addr="0xccc", liq=5),
+            ],
+        )
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                r = await collect(store, settings, s, NOW)
+        assert len(m.requests) == 3  # boosts, profiles, one refresh batch
+    assert r.rows_written == 3
+    for tid, liq in ((cand, 10_000), (act, 300_000), (held, 5)):
+        (o,) = await store.observations(tid, as_of=NOW)
+        assert o.features["refresh"] is True and o.features["liquidity_usd"] == liq
+    assert await store.observations("base:0xeee", as_of=NOW) == []
+    assert await store.observations("base:0xddd", as_of=NOW) == []
+    done = [e for e in logs if e["event"] == "dexscreener_refresh_done"]
+    assert done[0]["refreshed"] == 3 and done[0]["missing"] == 1
+    # refresh never re-upserts identity
+    st = await (
+        await store.conn.execute("SELECT status FROM tokens WHERE token_id=?", (held,))
+    ).fetchone()
+    assert st == ("disqualified",)
+
+
+async def test_known_token_in_feed_below_floor_is_kept_and_fetched_once(
+    store, settings
+):
+    tid = await _known(store, "0xabc")
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": "0xAbC"}])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses="0xabc"),
+            payload=[pair(liq=50_000)],
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW)
+        assert len(m.requests) == 3
+    assert r.rows_written == 1
+    (o,) = await store.observations(tid, as_of=NOW)
+    assert o.features["refresh"] is True and o.features["liquidity_usd"] == 50_000
+
+
+async def test_refresh_batches_thirty_and_skips_other_chains(store, settings):
+    settings.chains = ["base"]
+    addrs = [f"0x{i:040x}" for i in range(31)]
+    for a in addrs:
+        await _known(store, a)
+    await _known(store, "So1", chain="solana")
+    with aioresponses() as m:
+        m.get(BOOSTS_URL, payload=[])
+        m.get(PROFILES_URL, payload=[])
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=",".join(addrs[:30])),
+            payload=[pair(addr=a) for a in addrs[:30]],
+        )
+        m.get(
+            TOKENS_URL.format(chain="base", addresses=addrs[30]),
+            payload=[pair(addr=addrs[30])],
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await collect(store, settings, s, NOW)
+    assert r.rows_written == 31

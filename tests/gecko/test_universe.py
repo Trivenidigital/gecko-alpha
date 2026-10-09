@@ -80,3 +80,33 @@ async def test_stale_latest_observation_never_admits(store, settings):
         await admit_survivors(store, settings, "2026-10-04T02:00:00Z") == 0
     )  # latest is 49h old
     assert await status(store) == "candidate"
+
+
+async def test_deepest_row_at_a_shared_timestamp_is_not_a_dip(store, settings):
+    await seed(store)
+    for liq in (300_000, 1_000):  # a thin second pool read at the same instant
+        await store.add_observation(
+            "solana:a", "dexscreener", "2026-10-01T00:00:00Z", {"liquidity_usd": liq}
+        )
+    await store.add_observation(
+        "solana:a", "geckoterminal", "2026-10-01T12:00:00Z", {"liquidity_usd": 1_000}
+    )
+    await store.add_observation(
+        "solana:a", "geckoterminal", "2026-10-01T12:00:00Z", {"liquidity_usd": 400_000}
+    )
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-02T01:00:00Z", {"liquidity_usd": 300_000}
+    )
+    assert await admit_survivors(store, settings, "2026-10-02T02:00:00Z") == 1
+
+
+async def test_anchor_older_than_scan_window_does_not_admit(store, settings):
+    await seed(store)
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-01T00:00:00Z", {"liquidity_usd": 300_000}
+    )
+    await store.add_observation(
+        "solana:a", "dexscreener", "2026-10-08T12:00:00Z", {"liquidity_usd": 300_000}
+    )
+    assert await admit_survivors(store, settings, "2026-10-08T13:00:00Z") == 0
+    assert await status(store) == "candidate"
