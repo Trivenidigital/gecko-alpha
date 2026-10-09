@@ -59,3 +59,7 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Add a per-job `flock` (or Hermes `max_parallel_jobs`/no-overlap) so the same job never overlaps itself; rank-rank overlap can exceed the cap.
 - Configure structlog JSON rendering for journald (spec §12) and add `gecko check` (config/Telegram/key self-test) before the soak.
 - The agent-side CoinGecko MCP must use a separate Demo key or share the `runs` ledger; MCP spend is invisible to the cap.
+
+## From the vector re-clears (ticketed)
+- Freshness: put the overdue-row count in the `forward_returns_backlog` text so a new stall changes the page; per-source SLOs are silent while a writer has never run (a never-scheduled OHLCV/GT job is invisible — Plan 3 must verify every job has run once after deploy); OHLCV partial failures (error markers) keep the run green — add an error-ratio warning/breach.
+- Ledger: canary is sampled once per run before token fetches; mid-run degradation can still spend attempts (bounded by the 20 h spacing).
