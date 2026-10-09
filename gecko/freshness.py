@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import aiohttp
+import structlog
 
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store
+from gecko.store import Store, canon_ts, utcnow
+
+log = structlog.get_logger("gecko.freshness")
 
 SLO_MINUTES = {
     "observations": 30,
@@ -40,6 +43,13 @@ class Breach:
     table: str
     last_write: str | None
     slo_minutes: int
+
+
+@dataclass
+class AlertReport:
+    sent: int = 0
+    failed: int = 0
+    skipped: int = 0
 
 
 def _parse(ts: str) -> datetime:
@@ -82,33 +92,53 @@ async def _recently_alerted(store: Store, table: str, now: str) -> bool:
 
 async def alert_breaches(
     store: Store, settings: GeckoSettings, session: aiohttp.ClientSession, now: str
-) -> int:
-    sent = 0
+) -> AlertReport:
+    report = AlertReport()
+    has_channel = bool(settings.telegram_bot_token and settings.telegram_health_chat_id)
     for b in await check_freshness(store, now):
         if await _recently_alerted(store, b.table, now):
+            continue
+        if not has_channel:
+            # No dedup row: the alert retries once a channel is configured.
+            log.warning("freshness_alert_skipped_no_channel", table=b.table)
+            report.skipped += 1
             continue
         text = (
             f"gecko freshness breach: table {b.table} last write {b.last_write or 'never'} "
             f"exceeds SLO {b.slo_minutes} min (checked {now})"
         )
-        if settings.telegram_bot_token and settings.telegram_health_chat_id:
-            await send_telegram(
-                session,
-                settings.telegram_bot_token.get_secret_value(),
-                settings.telegram_health_chat_id,
-                text,
-            )
-        await store.record_run(f"freshness-alert:{b.table}", now, now, True)
-        sent += 1
-    return sent
+        log.info(
+            "freshness_alert_dispatched",
+            table=b.table,
+            slo=b.slo_minutes,
+            last_write=b.last_write,
+        )
+        delivered = await send_telegram(
+            session,
+            settings.telegram_bot_token.get_secret_value(),
+            settings.telegram_health_chat_id,
+            text,
+        )
+        log.info("freshness_alert_delivered", table=b.table, delivered=delivered)
+        if delivered:
+            # Dedup only on confirmed delivery, so a failed page retries next pass.
+            await store.record_run(f"freshness-alert:{b.table}", now, now, True)
+            report.sent += 1
+        else:
+            report.failed += 1
+    return report
 
 
 @register("freshness")
 async def freshness_job(settings: GeckoSettings, ns) -> int:
-    now = ns.as_of or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = canon_ts(ns.as_of) if ns.as_of else utcnow()
 
     async def body(store: Store, session: aiohttp.ClientSession) -> JobResult:
-        n = await alert_breaches(store, settings, session, now)
-        return JobResult(rows_written=n)
+        report = await alert_breaches(store, settings, session, now)
+        if report.failed > 0:
+            raise RuntimeError(
+                f"freshness alert delivery failed for {report.failed} table(s)"
+            )
+        return JobResult(rows_written=report.sent)
 
     return await run_job("freshness", settings, body)
