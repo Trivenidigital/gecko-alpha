@@ -481,3 +481,58 @@ async def test_revive_candidate_only_touches_stale_candidates(store):
         ("s:a", "candidate", None, "2026-10-09T00:00:00Z"),
         ("s:b", "disqualified", "liquidity", "2026-09-01T00:00:00Z"),
     ]
+
+
+async def test_open_adds_last_attempt_at_to_an_old_forward_returns(tmp_path):
+    import aiosqlite
+
+    from gecko.store import Store
+
+    path = str(tmp_path / "old_fr.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(
+            "CREATE TABLE forward_returns (token_id TEXT NOT NULL, "
+            "horizon_days INTEGER NOT NULL, due_at TEXT NOT NULL, entry_price REAL, "
+            "price REAL, btc_entry REAL, btc_price REAL, ret REAL, ret_vs_btc REAL, "
+            "attempts INTEGER NOT NULL DEFAULT 0, measured_at TEXT, "
+            "PRIMARY KEY (token_id, horizon_days))"
+        )
+        await c.commit()
+    s = await Store.open(path)
+    try:
+        await s.schedule_returns("s:a", "2026-10-01T00:00:00Z", horizons=(1,))
+        await s.bump_return_attempt("s:a", 1, attempted_at="2026-10-02T00:00:00Z")
+        (due,) = await s.due_returns("2026-10-03T00:00:00Z")
+        assert due.last_attempt_at == "2026-10-02T00:00:00Z"
+    finally:
+        await s.close()
+
+
+async def test_failed_open_closes_its_connection(tmp_path, monkeypatch):
+    import sqlite3
+
+    import aiosqlite
+
+    from gecko.store import Store
+
+    path = str(tmp_path / "closed.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(OLD_WATCHLIST)
+        await c.commit()
+    real_execute, real_close = aiosqlite.Connection.execute, aiosqlite.Connection.close
+    closed = []
+
+    async def broken(self, sql, *a, **k):
+        if sql.startswith("ALTER TABLE"):
+            raise sqlite3.OperationalError("database is locked")
+        return await real_execute(self, sql, *a, **k)
+
+    async def spy_close(self):
+        closed.append(True)
+        await real_close(self)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", broken)
+    monkeypatch.setattr(aiosqlite.Connection, "close", spy_close)
+    with pytest.raises(sqlite3.OperationalError):
+        await Store.open(path)
+    assert closed == [True]

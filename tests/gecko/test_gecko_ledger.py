@@ -677,3 +677,17 @@ async def test_ledger_paces_every_dexscreener_fetch(store, settings, real_canary
         async with aiohttp.ClientSession() as s:
             await measure_due(store, settings, s, NOW, sleep=rec)
     assert len(rec.calls) == 1  # two fetches, one wait between them
+
+
+async def test_canary_upstream_error_counts_as_failed(store, settings, real_canary):
+    await seed(store)
+    with aioresponses() as m:
+        m.get(CANARY, status=410)  # a definite refusal of the canary route itself
+        m.get(DS, status=404)
+        async with aiohttp.ClientSession() as s:
+            with capture_logs() as logs:
+                with pytest.raises(RuntimeError, match="ledger canary failed"):
+                    await measure_due(store, settings, s, NOW)
+    assert await _attempts(store) == (0,)
+    (e,) = [e for e in logs if e["event"] == "ledger_canary_failed"]
+    assert e["status"] == 410

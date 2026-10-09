@@ -402,3 +402,24 @@ async def test_forward_returns_backlog(store):
     await store.set_return("solana:a", 1, 1.0, 1.0, 1.0, 1.0, "2026-10-05T02:00:00Z")
     tables = [x.table for x in await check_freshness(store, "2026-10-05T03:00:00Z")]
     assert "forward_returns_backlog" not in tables
+
+
+async def test_per_source_check_bootstraps_on_its_own_writer_only(store):
+    # dexscreener has run; geckoterminal never has, so its stale row is not a breach
+    await store.record_run("dexscreener", T_OBS, T_OBS, True)
+    await store.add_observation("solana:a", "dexscreener", _plus(100), {})
+    await store.add_observation("solana:a", "geckoterminal", T_OBS, {})
+    tables = [b.table for b in await check_freshness(store, _plus(110))]
+    assert "observations:geckoterminal" not in tables
+
+
+async def test_benchmark_check_reads_only_the_benchmark(store):
+    await store.record_run("coingecko-hourly", T_OBS, T_OBS, True)
+    await store.add_observation("benchmark:btc", "coingecko", T_OBS, {"price_usd": 1})
+    await store.add_observation("solana:a", "coingecko", _plus(200), {"mcap_usd": 1})
+    b = [
+        x
+        for x in await check_freshness(store, _plus(200))
+        if x.table == "benchmark:btc"
+    ]
+    assert len(b) == 1 and b[0].last_write == T_OBS
