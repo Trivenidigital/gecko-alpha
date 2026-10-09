@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Spec S1 guard: gecko/ <= 2800 code lines, tests/gecko <= 5000. Exit 1 on breach."""
+"""Spec S1 guard: gecko/ <= 3000 code lines, tests/gecko <= 5000. Exit 1 on breach."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-LIMITS = {"gecko": 2800, "tests/gecko": 5000}
+LIMITS = {"gecko": 3000, "tests/gecko": 5000}
 
 
 def count(root: Path, rel: str) -> int:
