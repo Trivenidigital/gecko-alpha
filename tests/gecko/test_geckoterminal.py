@@ -11,6 +11,15 @@ from gecko.collectors.geckoterminal import (
 )
 
 NOW = "2026-10-09T00:00:00Z"
+LATER = "2026-10-10T00:00:00Z"
+
+
+async def nosleep(_):
+    return None
+
+
+def ohlcv(rows):
+    return {"data": {"attributes": {"ohlcv_list": rows}}}
 
 
 def pool(
@@ -92,7 +101,7 @@ async def test_collect_pools_all_chains_and_band(store, settings):
             payload={"data": [pool(addr="0xEEE", network="eth", pool_addr="0xpool")]},
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect_pools(store, settings, s, NOW)
+            r = await collect_pools(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 2
     rows = await (
         await store.conn.execute(
@@ -119,7 +128,7 @@ async def test_collect_pools_zero_mcap_is_not_replaced_by_fdv(store, settings):
             payload={"data": []},
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect_pools(store, settings, s, NOW)
+            r = await collect_pools(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 0
 
 
@@ -142,7 +151,7 @@ async def test_collect_ohlcv_sorted_ascending_and_budgeted(store, settings):
             },
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect_ohlcv(store, settings, s, NOW)
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
     assert obs[0].features["candles"] == [
@@ -150,6 +159,7 @@ async def test_collect_ohlcv_sorted_ascending_and_budgeted(store, settings):
         [200, 1, 1, 1, 1, 5.0],
     ]
     assert obs[0].features["pool_address"] == "pa"
+    assert obs[0].features["status"] == "ok"
     assert (
         await store.observations("solana:b", as_of=NOW, source="geckoterminal_ohlcv")
         == []
@@ -171,12 +181,13 @@ async def test_collect_ohlcv_poolless_tokens_do_not_consume_budget(store, settin
             payload={"data": {"attributes": {"ohlcv_list": [[100, 1, 1, 1, 1, 3.0]]}}},
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect_ohlcv(store, settings, s, NOW)
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     obs = await store.observations("solana:b", as_of=NOW, source="geckoterminal_ohlcv")
     assert obs[0].features == {
         "pool_address": "pb",
         "candles": [[100.0, 1.0, 1.0, 1.0, 1.0, 3.0]],
+        "status": "ok",
     }
 
 
@@ -196,7 +207,7 @@ async def test_collect_ohlcv_oldest_first(store, settings):
             payload={"data": {"attributes": {"ohlcv_list": [[100, 1, 1, 1, 1, 3.0]]}}},
         )
         async with aiohttp.ClientSession() as s:
-            r = await collect_ohlcv(store, settings, s, NOW)
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
     assert r.rows_written == 1
     assert (
         len(
@@ -216,3 +227,175 @@ def test_jobs_registered_and_ohlcv_is_an_observation_writer():
     _load_jobs()
     assert {"geckoterminal", "geckoterminal-ohlcv"} <= set(JOBS)
     assert {"geckoterminal", "geckoterminal-ohlcv"} <= set(WRITER_JOBS["observations"])
+
+
+async def _two_pooled_tokens(store, pools=("pa", "pb")):
+    for tid, pa in zip(("solana:a", "solana:b"), pools):
+        await store.upsert_token(tid, "solana", tid[-1], "X", "X", NOW, "geckoterminal")
+        await store.add_observation(
+            tid, "geckoterminal", NOW, {"pool_address": pa, "liquidity_usd": 3e5}
+        )
+
+
+async def test_pools_paced_one_wait_between_each_request(store, settings):
+    settings.chains = ["solana", "ethereum"]
+    slept = []
+
+    async def rec(d):
+        slept.append(d)
+
+    with aioresponses() as m:
+        for net in ("solana", "eth"):
+            for lst in ("new_pools", "trending_pools"):
+                m.get(POOLS_URL.format(network=net, list=lst), payload={"data": []})
+        async with aiohttp.ClientSession() as s:
+            await collect_pools(store, settings, s, NOW, sleep=rec)
+    assert len(slept) == 3  # 4 requests -> 3 paced gaps
+    assert all(0 < d <= settings.gt_min_interval_sec for d in slept)
+
+
+async def test_ohlcv_paced_one_wait_between_each_request(store, settings):
+    await _two_pooled_tokens(store)
+    slept = []
+
+    async def rec(d):
+        slept.append(d)
+
+    with aioresponses() as m:
+        m.get(
+            OHLCV_URL.format(network="solana", pool="pa"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 1]]),
+        )
+        m.get(
+            OHLCV_URL.format(network="solana", pool="pb"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 1]]),
+        )
+        async with aiohttp.ClientSession() as s:
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=rec)
+    assert r.rows_written == 2 and len(slept) == 1
+
+
+async def test_ohlcv_dead_pool_rotates_instead_of_starving(store, settings):
+    settings.ohlcv_max_per_run = 1
+    await _two_pooled_tokens(store, pools=("dead", "pb"))
+    with aioresponses() as m:
+        m.get(OHLCV_URL.format(network="solana", pool="dead"), status=404)
+        m.get(
+            OHLCV_URL.format(network="solana", pool="pb"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 1]]),
+        )
+        async with aiohttp.ClientSession() as s:
+            await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+            await collect_ohlcv(store, settings, s, LATER, sleep=nosleep)
+    dead = await store.observations(
+        "solana:a", as_of=LATER, source="geckoterminal_ohlcv"
+    )
+    good = await store.observations(
+        "solana:b", as_of=LATER, source="geckoterminal_ohlcv"
+    )
+    assert [o.features for o in dead] == [
+        {"pool_address": "dead", "candles": [], "status": "not_found"}
+    ]
+    assert [(o.observed_at, o.features["status"]) for o in good] == [(LATER, "ok")]
+
+
+async def test_ohlcv_empty_list_writes_empty_marker(store, settings):
+    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
+    await store.add_observation(
+        "solana:a", "geckoterminal", NOW, {"pool_address": "pa", "liquidity_usd": 3e5}
+    )
+    with aioresponses() as m:
+        m.get(OHLCV_URL.format(network="solana", pool="pa"), payload=ohlcv([]))
+        async with aiohttp.ClientSession() as s:
+            await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+    assert [o.features for o in obs] == [
+        {"pool_address": "pa", "candles": [], "status": "empty"}
+    ]
+
+
+async def test_ohlcv_non_404_upstream_error_still_raises(store, settings):
+    import pytest
+    from gecko.http import UpstreamError
+
+    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
+    await store.add_observation(
+        "solana:a", "geckoterminal", NOW, {"pool_address": "pa", "liquidity_usd": 3e5}
+    )
+    with aioresponses() as m:
+        m.get(OHLCV_URL.format(network="solana", pool="pa"), status=401)
+        async with aiohttp.ClientSession() as s:
+            with pytest.raises(UpstreamError) as ei:
+                await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    assert ei.value.status == 401
+    assert (
+        await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+        == []
+    )
+
+
+async def test_ohlcv_picks_deepest_pool_in_latest_snapshot(store, settings):
+    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
+    older = "2026-10-08T00:00:00Z"
+    await store.add_observation(
+        "solana:a",
+        "geckoterminal",
+        older,
+        {"pool_address": "old", "liquidity_usd": 9e9},
+    )
+    # deep sits between two shallower pools, so neither a first-row nor a
+    # last-row pick (whatever the tie order of equal observed_at) can pass
+    for pa, liq in (("shallow1", 3e5), ("deep", 8e5), ("shallow2", 4e5)):
+        await store.add_observation(
+            "solana:a", "geckoterminal", NOW, {"pool_address": pa, "liquidity_usd": liq}
+        )
+    await store.add_observation(
+        "solana:a", "dexscreener", NOW, {"pair_address": "dspair", "liquidity_usd": 9e9}
+    )
+    with aioresponses() as m:
+        m.get(
+            OHLCV_URL.format(network="solana", pool="deep"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 1]]),
+        )
+        async with aiohttp.ClientSession() as s:
+            await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+    assert obs[0].features["pool_address"] == "deep"
+
+
+async def test_ohlcv_equal_liquidity_tiebreak_by_pool_address(store, settings):
+    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
+    for pa in ("zz", "mm"):
+        await store.add_observation(
+            "solana:a", "geckoterminal", NOW, {"pool_address": pa, "liquidity_usd": 3e5}
+        )
+    with aioresponses() as m:
+        m.get(
+            OHLCV_URL.format(network="solana", pool="mm"),
+            payload=ohlcv([[1, 1, 1, 1, 1, 1]]),
+        )
+        async with aiohttp.ClientSession() as s:
+            await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+    assert obs[0].features["pool_address"] == "mm"
+
+
+async def test_ohlcv_malformed_candle_skipped_not_fatal(store, settings):
+    await store.upsert_token("solana:a", "solana", "a", "X", "X", NOW, "geckoterminal")
+    await store.add_observation(
+        "solana:a", "geckoterminal", NOW, {"pool_address": "pa", "liquidity_usd": 3e5}
+    )
+    rows = [
+        [300, 1, 1, 1, 1, 2.0],
+        [200, None, 1, 1, 1, 1.0],
+        [100, 1, 1, 1, 1, "x"],
+        [50, 1, 1, 1, 1, 4.0],
+    ]
+    with aioresponses() as m:
+        m.get(OHLCV_URL.format(network="solana", pool="pa"), payload=ohlcv(rows))
+        async with aiohttp.ClientSession() as s:
+            r = await collect_ohlcv(store, settings, s, NOW, sleep=nosleep)
+    assert r.rows_written == 1
+    obs = await store.observations("solana:a", as_of=NOW, source="geckoterminal_ohlcv")
+    assert obs[0].features["candles"] == [[50, 1, 1, 1, 1, 4.0], [300, 1, 1, 1, 1, 2.0]]
+    assert obs[0].features["status"] == "ok"

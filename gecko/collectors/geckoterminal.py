@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 import structlog
 
-from gecko.http import get_json
+from gecko.http import Pacer, UpstreamError, get_json
 from gecko.identity import norm_address, token_id
 from gecko.jobs import register
 from gecko.runs import JobResult, run_job
@@ -73,11 +75,16 @@ async def collect_pools(
     settings: GeckoSettings,
     session: aiohttp.ClientSession,
     now: str,
+    *,
+    sleep=asyncio.sleep,
 ) -> JobResult:
+    now = canon_ts(now)
+    pacer = Pacer(settings.gt_min_interval_sec, sleep)
     written = skipped = 0
     for chain in settings.chains:
         network = NETWORK_MAP[chain]
         for list_name in LISTS:
+            await pacer.wait()
             body = await get_json(
                 session,
                 POOLS_URL.format(network=network, list=list_name),
@@ -110,7 +117,7 @@ async def collect_pools(
                     symbol,
                     now,
                     "geckoterminal",
-                    pool_created_at=f["pool_created_at"],
+                    pool_created_at=canon_ts(f["pool_created_at"]),
                 )
                 await store.add_observation(tid, "geckoterminal", now, f)
                 written += 1
@@ -122,14 +129,41 @@ async def collect_pools(
 
 
 async def _pool_for(store: Store, tid: str, now: str) -> str | None:
-    for src in ("geckoterminal", "dexscreener"):
-        obs = await store.observations(tid, as_of=now, source=src, limit=1)
-        if obs:
-            feats = obs[0].features
-            pa = feats.get("pool_address") or feats.get("pair_address")
-            if pa:
-                return pa
+    """Deepest pool among the latest geckoterminal snapshot; dexscreener fallback.
+
+    A token can appear in several pools at one ``observed_at`` (new and trending
+    lists, or several pairs); pick by highest liquidity, then pool address.
+    """
+    gt = await store.observations(tid, as_of=now, source="geckoterminal", limit=50)
+    if gt:
+        latest = [o for o in gt if o.observed_at == gt[0].observed_at]
+        pools = [
+            (o.features.get("liquidity_usd"), o.features["pool_address"])
+            for o in latest
+            if o.features.get("pool_address")
+        ]
+        if pools:
+            pools.sort(key=lambda p: (-(p[0] if p[0] is not None else -1.0), p[1]))
+            return pools[0][1]
+        return None
+    ds = await store.observations(tid, as_of=now, source="dexscreener", limit=1)
+    if ds:
+        return ds[0].features.get("pair_address") or None
     return None
+
+
+def _clean_candles(tid: str, raw) -> list[list[float]]:
+    out: list[list[float]] = []
+    for c in raw if isinstance(raw, list) else []:
+        try:
+            if not isinstance(c, (list, tuple)) or not c:
+                raise TypeError("candle is not a non-empty list")
+            out.append([float(x) for x in c])
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "ohlcv_candle_skipped", token_id=tid, candle=repr(c), error=str(exc)
+            )
+    return sorted(out, key=lambda c: c[0])
 
 
 async def collect_ohlcv(
@@ -137,8 +171,11 @@ async def collect_ohlcv(
     settings: GeckoSettings,
     session: aiohttp.ClientSession,
     now: str,
+    *,
+    sleep=asyncio.sleep,
 ) -> JobResult:
     now = canon_ts(now)
+    pacer = Pacer(settings.gt_min_interval_sec, sleep)
     rows = await (
         await store.conn.execute(
             "SELECT t.token_id, t.chain, (SELECT MAX(observed_at) FROM observations o "
@@ -159,20 +196,31 @@ async def collect_ohlcv(
         if not pool:
             continue
         fetched += 1
-        body = await get_json(
-            session,
-            OHLCV_URL.format(network=NETWORK_MAP[chain], pool=pool),
-            settings=settings,
-            headers=HEADERS,
-            ok_statuses=(200, 404),
-        )
+        await pacer.wait()
+        try:
+            body = await get_json(
+                session,
+                OHLCV_URL.format(network=NETWORK_MAP[chain], pool=pool),
+                settings=settings,
+                headers=HEADERS,
+            )
+        except UpstreamError as exc:
+            if exc.status != 404:
+                raise
+            body, status = None, "not_found"
+        else:
+            status = "ok"
         attrs = ((body or {}).get("data") or {}).get("attributes") or {}
-        candles = attrs.get("ohlcv_list") or []
-        if not candles:
-            continue
-        candles = sorted(([float(x) for x in c] for c in candles), key=lambda c: c[0])
+        candles = _clean_candles(tid, attrs.get("ohlcv_list"))
+        if status == "ok" and not candles:
+            status = "empty"
+        # Dead/empty pools still get a marker row so last_ohlcv advances and the
+        # token rotates to the back of the oldest-first queue.
         await store.add_observation(
-            tid, "geckoterminal_ohlcv", now, {"pool_address": pool, "candles": candles}
+            tid,
+            "geckoterminal_ohlcv",
+            now,
+            {"pool_address": pool, "candles": candles, "status": status},
         )
         written += 1
     log.info(

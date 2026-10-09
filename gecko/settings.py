@@ -25,6 +25,7 @@ class GeckoSettings(BaseSettings):
     dead_after_days: int = 7
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
+    gt_min_interval_sec: float = 2.1
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None

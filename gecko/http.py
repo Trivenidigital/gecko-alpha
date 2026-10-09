@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import aiohttp
@@ -21,6 +22,22 @@ class UpstreamError(Exception):
         super().__init__(f"upstream {status} for {url}")
         self.status = status
         self.url = url
+
+
+class Pacer:
+    """Spaces consecutive ``wait()`` returns at least ``min_interval_sec`` apart."""
+
+    def __init__(self, min_interval_sec: float, sleep=asyncio.sleep):
+        self.min_interval_sec = min_interval_sec
+        self._sleep = sleep
+        self._last: float | None = None
+
+    async def wait(self) -> None:
+        if self._last is not None:
+            delay = self._last + self.min_interval_sec - time.monotonic()
+            if delay > 0:
+                await self._sleep(delay)
+        self._last = time.monotonic()
 
 
 async def get_json(

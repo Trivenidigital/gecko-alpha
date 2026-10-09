@@ -1,7 +1,7 @@
 import aiohttp
 import pytest
 from aioresponses import aioresponses
-from gecko.http import get_json, UpstreamError
+from gecko.http import Pacer, get_json, UpstreamError
 
 URL = "https://example.test/x"
 
@@ -97,3 +97,45 @@ async def test_ok_statuses_passthrough(settings):
             assert await get_json(
                 s, URL, settings=settings, ok_statuses=(200, 404)
             ) == {"error": "nf"}
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+        self.slept = []
+
+    def monotonic(self):
+        return self.t
+
+    async def sleep(self, d):
+        self.slept.append(d)
+        self.t += d
+
+
+async def test_pacer_first_call_does_not_sleep(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr("gecko.http.time.monotonic", c.monotonic)
+    await Pacer(2.0, c.sleep).wait()
+    assert c.slept == []
+
+
+async def test_pacer_within_interval_sleeps_remainder(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr("gecko.http.time.monotonic", c.monotonic)
+    p = Pacer(2.0, c.sleep)
+    await p.wait()
+    c.t += 0.5
+    await p.wait()
+    assert c.slept == [1.5]
+    await p.wait()  # immediately again: a full interval since the previous return
+    assert c.slept == [1.5, 2.0]
+
+
+async def test_pacer_after_interval_does_not_sleep(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr("gecko.http.time.monotonic", c.monotonic)
+    p = Pacer(2.0, c.sleep)
+    await p.wait()
+    c.t += 2.5
+    await p.wait()
+    assert c.slept == []
