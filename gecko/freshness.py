@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import aiohttp
 import structlog
@@ -10,7 +10,7 @@ from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, utcnow
+from gecko.store import Store, canon_ts, parse_utc, utcnow
 
 log = structlog.get_logger("gecko.freshness")
 
@@ -52,35 +52,38 @@ class AlertReport:
     skipped: int = 0
 
 
-def _parse(ts: str) -> datetime:
-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-
-
-async def _writer_has_run(store: Store, table: str) -> bool:
+async def _first_writer_run(store: Store, table: str) -> str | None:
+    """finished_at of the earliest ok run of any job that writes ``table``."""
     q = ",".join("?" * len(WRITER_JOBS[table]))
     row = await (
         await store.conn.execute(
-            f"SELECT 1 FROM runs WHERE ok=1 AND job IN ({q}) LIMIT 1",
+            f"SELECT MIN(finished_at) FROM runs WHERE ok=1 AND job IN ({q})",
             WRITER_JOBS[table],
         )
     ).fetchone()
-    return row is not None
+    return row[0]
 
 
 async def check_freshness(store: Store, now: str) -> list[Breach]:
     out: list[Breach] = []
-    now_dt = _parse(now)
+    now_dt = parse_utc(now)
     for table, slo in SLO_MINUTES.items():
-        if not await _writer_has_run(store, table):
-            continue
+        first_run = await _first_writer_run(store, table)
+        if first_run is None:
+            continue  # bootstrapping: no writer has succeeded yet
         last = await store.last_write(table)
-        if last is None or now_dt - _parse(last) > timedelta(minutes=slo):
+        # An empty table is measured from the writer's first ok run, so a
+        # writer that just started gets one SLO window to produce rows.
+        anchor = last if last is not None else first_run
+        if now_dt - parse_utc(anchor) > timedelta(minutes=slo):
             out.append(Breach(table, last, slo))
     return out
 
 
 async def _recently_alerted(store: Store, table: str, now: str) -> bool:
-    cutoff = (_parse(now) - timedelta(hours=DEDUP_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff = (parse_utc(now) - timedelta(hours=DEDUP_HOURS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     row = await (
         await store.conn.execute(
             "SELECT 1 FROM runs WHERE job=? AND finished_at>? LIMIT 1",
@@ -138,6 +141,11 @@ async def freshness_job(settings: GeckoSettings, ns) -> int:
         if report.failed > 0:
             raise RuntimeError(
                 f"freshness alert delivery failed for {report.failed} table(s)"
+            )
+        if report.skipped > 0:
+            raise RuntimeError(
+                f"freshness breach on {report.skipped} table(s) but no alert channel "
+                "configured (telegram_bot_token / telegram_health_chat_id)"
             )
         return JobResult(rows_written=report.sent)
 

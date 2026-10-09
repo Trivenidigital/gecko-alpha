@@ -4,8 +4,12 @@ import argparse
 import asyncio
 import sys
 
+import structlog
+
 from gecko.jobs import JOBS, JobFn, register  # noqa: F401
 from gecko.settings import GeckoSettings
+
+log = structlog.get_logger("gecko.main")
 
 
 def _load_jobs() -> None:
@@ -32,7 +36,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
     settings = GeckoSettings()
-    return asyncio.run(JOBS[ns.job](settings, ns))
+    try:
+        return asyncio.run(JOBS[ns.job](settings, ns))
+    except Exception as exc:  # noqa: BLE001 — a crash outside run_job still exits 1
+        log.error("job_crashed", job=ns.job, error=f"{type(exc).__name__}: {exc}")
+        print(f"job {ns.job!r} crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -36,3 +36,14 @@ def test_single_job_registry():
     import gecko.jobs
 
     assert gecko.__main__.JOBS is gecko.jobs.JOBS
+
+
+def test_job_crash_before_run_job_exits_1(monkeypatch, capsys):
+    from gecko.jobs import JOBS
+
+    async def boom(settings, ns):
+        raise RuntimeError("crashed before run_job")
+
+    monkeypatch.setitem(JOBS, "boom", boom)
+    assert main(["boom"]) == 1
+    assert "crashed before run_job" in capsys.readouterr().err

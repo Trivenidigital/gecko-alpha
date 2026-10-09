@@ -61,7 +61,7 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_utc(ts: str) -> datetime:
+def parse_utc(ts: str) -> datetime:
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -78,11 +78,11 @@ def canon_ts(ts: str | None) -> str | None:
     """
     if ts is None:
         return None
-    return _parse_utc(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return parse_utc(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def iso_plus(ts: str, days: int) -> str:
-    return (_parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @dataclass

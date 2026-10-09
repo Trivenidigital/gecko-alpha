@@ -1,4 +1,5 @@
 from aioresponses import aioresponses
+from structlog.testing import capture_logs
 from gecko.freshness import check_freshness, SLO_MINUTES, alert_breaches
 
 TG_URL = "https://api.telegram.org/bottok/sendMessage"
@@ -126,8 +127,17 @@ async def test_delivery_failure_records_no_dedup_and_retries(store, settings):
         m.post(TG_URL, payload={"ok": False})
         m.post(TG_URL, payload={"ok": True})
         async with aiohttp.ClientSession() as session:
-            r1 = await alert_breaches(store, settings, session, "2026-10-09T01:00:00Z")
+            with capture_logs() as logs:
+                r1 = await alert_breaches(
+                    store, settings, session, "2026-10-09T01:00:00Z"
+                )
             assert (r1.sent, r1.failed, r1.skipped) == (0, 1, 0)
+            dispatched = [e for e in logs if e["event"] == "freshness_alert_dispatched"]
+            delivered = [e for e in logs if e["event"] == "freshness_alert_delivered"]
+            assert len(dispatched) == 1 and dispatched[0]["table"] == "observations"
+            assert len(delivered) == 1
+            assert delivered[0]["table"] == "observations"
+            assert delivered[0]["delivered"] is False
             assert await _dedup_rows(store) == 0
             r2 = await alert_breaches(store, settings, session, "2026-10-09T01:05:00Z")
     assert (r2.sent, r2.failed, r2.skipped) == (1, 0, 0)
@@ -140,8 +150,8 @@ async def test_failed_send_does_not_stop_other_tables(store, settings):
     _with_channel(settings)
     await _seed_stale_observations(store)
     await store.record_run(
-        "rank", "2026-10-09T00:00:00Z", "2026-10-09T00:00:10Z", True
-    )  # watchlist writer ran, table never written -> breach
+        "rank", "2026-10-08T22:00:00Z", "2026-10-08T22:00:10Z", True
+    )  # watchlist writer first ran 3h ago, table never written -> breach
     with aioresponses() as m:
         m.post(TG_URL, exception=aiohttp.ClientConnectionError())
         m.post(TG_URL, payload={"ok": True})
@@ -157,10 +167,30 @@ async def test_no_channel_skips_without_dedup_or_post(store, settings):
     await _seed_stale_observations(store)
     with aioresponses() as m:
         async with aiohttp.ClientSession() as session:
-            r = await alert_breaches(store, settings, session, "2026-10-09T01:00:00Z")
+            with capture_logs() as logs:
+                r = await alert_breaches(
+                    store, settings, session, "2026-10-09T01:00:00Z"
+                )
     assert (r.sent, r.failed, r.skipped) == (0, 0, 1)
     assert await _dedup_rows(store) == 0
     assert len(m.requests) == 0
+    skipped = [e for e in logs if e["event"] == "freshness_alert_skipped_no_channel"]
+    assert len(skipped) == 1 and skipped[0]["table"] == "observations"
+
+
+async def test_freshness_job_no_channel_with_breach_exits_1(store, settings):
+    import argparse
+
+    from gecko.freshness import freshness_job
+
+    await _seed_stale_observations(store)
+    rc = await freshness_job(settings, argparse.Namespace(as_of="2026-10-09T01:00:00Z"))
+    assert rc == 1
+    row = await (
+        await store.conn.execute("SELECT ok, error FROM runs WHERE job='freshness'")
+    ).fetchone()
+    assert row[0] == 0 and "no alert channel" in row[1]
+    assert await _dedup_rows(store) == 0
 
 
 async def test_freshness_job_delivery_failure_exits_1_and_records_failed_run(
@@ -212,6 +242,44 @@ async def test_freshness_job_accepts_naive_and_offset_as_of(store, settings):
     from gecko.freshness import freshness_job
 
     await _seed_stale_observations(store)
-    for as_of in ("2026-10-09T01:00:00", "2026-10-09T03:00:00+02:00"):
-        rc = await freshness_job(settings, argparse.Namespace(as_of=as_of))
+    # naive is UTC; +02:00 is 01:00Z. Both breach observations and must deliver.
+    for as_of in ("2026-10-09T01:00:00", "2026-10-09T09:00:00+02:00"):
+        with aioresponses() as m:
+            m.post(TG_URL, payload={"ok": True})
+            _with_channel(settings)
+            rc = await freshness_job(settings, argparse.Namespace(as_of=as_of))
         assert rc == 0
+        assert len(m.requests) == 1
+
+
+async def test_check_freshness_naive_now_is_utc(store):
+    await _seed_stale_observations(store)
+    b = await check_freshness(store, "2026-10-09T01:00:00")
+    assert [x.table for x in b] == ["observations"]
+    assert await check_freshness(store, "2026-10-09T00:20:00") == []
+
+
+async def test_empty_table_within_slo_of_first_writer_run_no_breach(store):
+    await store.record_run(
+        "dexscreener", "2026-10-09T00:55:00Z", "2026-10-09T00:55:10Z", True
+    )
+    assert await check_freshness(store, "2026-10-09T01:00:00Z") == []
+
+
+async def test_empty_table_past_slo_of_first_writer_run_breaches(store):
+    await store.record_run(
+        "dexscreener", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", True
+    )
+    await store.record_run(
+        "dexscreener", "2026-10-09T00:58:00Z", "2026-10-09T00:58:10Z", True
+    )  # a recent run must not reset the clock: MIN(finished_at) is the anchor
+    b = await check_freshness(store, "2026-10-09T01:00:00Z")
+    assert [x.table for x in b] == ["observations"]
+    assert b[0].last_write is None
+
+
+async def test_failed_writer_run_does_not_start_the_clock(store):
+    await store.record_run(
+        "dexscreener", "2026-10-08T23:00:00Z", "2026-10-08T23:00:10Z", False
+    )
+    assert await check_freshness(store, "2026-10-09T01:00:00Z") == []
