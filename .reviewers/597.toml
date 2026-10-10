@@ -1,0 +1,41 @@
+# PR #597 — feat(gecko): lean watchlist core package (Plan 1 of 3).
+#
+# Every mandatory vector was reviewed by an independent reviewer agent against
+# the LAST CODE COMMIT on the branch; later commits are docs-only (spec and
+# follow-up tickets), so no watched path moves after the named SHA.
+#
+# Review history (SDD ledger, session 2026-10-09): 12 per-task reviews with
+# scoped re-reviews; a two-lens whole-branch review (structure/data-flow and
+# spec/ops/security) followed by three fix rounds and a scoped re-review; then
+# four vector reviews (concurrency, silent-failure, ops-safety, logic) that
+# each BLOCKED on one defect, one vector fix round, and four scoped re-clears
+# at the SHA below.
+
+pr = 597
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "gecko",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "64fe5008583c68395f0dd97d682694c7aa5e8499"
+logic          = "64fe5008583c68395f0dd97d682694c7aa5e8499"
+ops-safety     = "64fe5008583c68395f0dd97d682694c7aa5e8499"
+silent-failure = "64fe5008583c68395f0dd97d682694c7aa5e8499"
