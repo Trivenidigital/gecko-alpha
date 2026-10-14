@@ -67,6 +67,17 @@ class GeckoSettings(BaseSettings):
     telegram_health_chat_id: str | None = None
     young_chain_launch_dates: dict[str, str] = {}  # chain -> ISO date
 
+    obs_retention_days: int = 180
+    runs_retention_days: int = 90
+
+    @field_validator("obs_retention_days", "runs_retention_days")
+    @classmethod
+    def _retention_floor(cls, v: int) -> int:
+        # features read <=16 d back, admission 7 d, entry price 48 h: 30 d is the floor
+        if v < 30:
+            raise ValueError("retention must be >= 30 days")
+        return v
+
     @field_validator("chains")
     @classmethod
     def _chains_supported(cls, v: list[str]) -> list[str]:
