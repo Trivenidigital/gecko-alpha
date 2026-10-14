@@ -99,7 +99,7 @@ SQLite, WAL mode, single writer per table per process. Keyed on canonical identi
 | `research_notes` | `id`, `token_id`, `created_at`, `model`, `schema_version`, `note_json`, `cost_usd` | agent dossiers (only table the agent writes) |
 | `runs` | `id`, `job`, `started_at`, `finished_at`, `ok`, `rows_written`, `credits_used`, `error` | freshness + cost accounting (§12a) |
 
-Retention: `observations` 180 days; everything else permanent. Historical `scout.db` is copied to `/root/gecko-history/scout.db` read-only before any cutover and is the backtest substrate.
+Retention: `observations` 180 days (configurable, floor 30) except `benchmark:btc`, which is never pruned (the 180-day horizon reads BTC at `entered_at`); `runs` 90 days, keeping the earliest ok run per job; everything else permanent (amended 2026-10-14). Historical `scout.db` is copied to `/root/gecko-history/scout.db` read-only before any cutover and is the backtest substrate.
 
 ## 5. Collectors
 
