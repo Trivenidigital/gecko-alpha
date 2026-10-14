@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from gecko.telegram_reader import initial_marks, poll_once, run_reader, session_problem
 
@@ -22,7 +23,7 @@ class FakeClient:
     def __init__(self, chans: dict[str, list], fail: set[str] = frozenset()):
         self.chans, self.fail = chans, set(fail)
         self.resolved: list[str] = []
-        self.requests: list[tuple[str, int, int]] = []
+        self.requests: list[tuple[str, int, int, bool]] = []
 
     async def get_input_entity(self, handle):
         self.resolved.append(handle)
@@ -30,12 +31,13 @@ class FakeClient:
             raise ValueError(f"No user has {handle} as username")
         return handle.lower()
 
-    async def get_messages(self, entity, limit, min_id):
-        self.requests.append((entity, limit, min_id))
+    async def get_messages(self, entity, limit, min_id, reverse=False):
+        # Telethon: newest-first by default; reverse=True is oldest-first above min_id
+        self.requests.append((entity, limit, min_id, reverse))
         if entity in self.fail:
             raise ConnectionError("boom")
         ms = [m for m in self.chans[entity] if m.id > min_id]
-        return sorted(ms, key=lambda m: -m.id)[:limit]
+        return sorted(ms, key=lambda m: m.id if reverse else -m.id)[:limit]
 
 
 async def _runs(store):
@@ -52,7 +54,54 @@ async def test_poll_ingests_calls_and_advances_marks(store, settings):
     written, failed = await poll_once(store, c, settings, {"@a": "@a"}, marks)
     assert (written, failed) == (2, 0) and marks == {"@a": 3}
     await poll_once(store, c, settings, {"@a": "@a"}, marks)
-    assert c.requests[-1] == ("@a", settings.tg_catchup_limit, 3)
+    assert c.requests == [
+        ("@a", settings.tg_catchup_limit, 0, False),  # first start: newest only
+        ("@a", settings.tg_catchup_limit, 3, True),  # resume: oldest above mark
+    ]
+
+
+async def test_catchup_beyond_limit_loses_no_call(store, settings):
+    settings.tg_catchup_limit = 2
+    c = FakeClient({"@a": [msg(i, f"${chr(64 + i) * 3}") for i in range(2, 9)]})
+    marks = {"@a": 1}  # resumed after downtime: 7 calls above the mark
+    with capture_logs() as logs:
+        for _ in range(4):
+            await poll_once(store, c, settings, {"@a": "@a"}, marks)
+    ids = await (
+        await store.conn.execute("SELECT event_id FROM source_calls ORDER BY event_id")
+    ).fetchall()
+    assert [r[0] for r in ids] == [f"tg:@a:{i}" for i in range(2, 9)]
+    assert marks == {"@a": 8}
+    assert sum(e["event"] == "tg_catchup_truncated" for e in logs) == 3
+
+
+async def test_tg_login_creates_session_under_umask_077(
+    tmp_path, settings, monkeypatch
+):
+    from pydantic import SecretStr
+
+    import gecko.telegram_reader as tr
+
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_channels, settings.tg_session_path = ["@a"], str(
+        tmp_path / "gk.session"
+    )
+    mask, seen = [0o022], []
+
+    def umask(m):  # a recorder: the Windows CRT keeps only the write bit
+        old, mask[0] = mask[0], m
+        return old
+
+    class Login:
+        async def start(self):
+            seen.append(mask[0])
+            raise RuntimeError("login aborted")
+
+    monkeypatch.setattr(tr.os, "umask", umask)
+    monkeypatch.setattr(tr, "_client", lambda s: Login())
+    with pytest.raises(RuntimeError):
+        await tr.tg_login_job(settings, None)
+    assert seen == [0o077] and mask == [0o022]
 
 
 async def test_failed_channel_marks_run_not_ok(store, settings):

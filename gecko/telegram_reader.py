@@ -72,9 +72,12 @@ async def poll_once(
 ) -> tuple[int, int]:
     written = failed = 0
     for handle, ent in entities.items():
+        mark, limit = marks.get(handle, 0), settings.tg_catchup_limit
         try:
+            # Resuming: oldest-first above the mark, so a backlog over `limit`
+            # drains across polls with no gap. First start: newest only.
             msgs = await client.get_messages(
-                ent, limit=settings.tg_catchup_limit, min_id=marks.get(handle, 0)
+                ent, limit=limit, min_id=mark, reverse=mark > 0
             )
         except (
             Exception
@@ -87,6 +90,8 @@ async def poll_once(
                 wait_sec=getattr(exc, "seconds", None),
             )
             continue
+        if len(msgs) >= limit:
+            log.warning("tg_catchup_truncated", channel=handle, limit=limit)
         for m in sorted(msgs, key=lambda m: m.id):
             marks[handle] = max(marks.get(handle, 0), m.id)
             if await insert_call(
@@ -169,9 +174,13 @@ async def tg_login_job(settings: GeckoSettings, ns) -> int:
     if problem := session_problem(settings, must_exist=False):
         print(problem, file=sys.stderr)
         return 2
-    client = _client(settings)
-    await client.start()  # prompts for phone and login code on this terminal
-    await client.disconnect()
+    old = os.umask(0o077)  # Telethon creates the session (and -journal) itself
+    try:
+        client = _client(settings)
+        await client.start()  # prompts for phone and login code on this terminal
+        await client.disconnect()
+    finally:
+        os.umask(old)
     os.chmod(settings.tg_session_path, 0o600)
     print(f"session written to {settings.tg_session_path} (0600)")
     return 0
