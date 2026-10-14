@@ -1,4 +1,7 @@
 import json
+import sqlite3
+
+import pytest
 
 from gecko.calls import call_seeds, event_id, insert_call, parse_call, resolve_calls
 
@@ -100,14 +103,31 @@ async def test_seeds_expand_evm_over_configured_chains(store, settings):
 
 
 async def test_seeds_skip_resolved_and_respect_cap(store, settings):
+    evm = "0x" + "d" * 40
+    kw = dict(source_type="telegram", source_id="@c")
+    await insert_call(
+        store, event_id="tg:@c:1", posted_at="2026-10-14T11:00:00Z", text=SOL, **kw
+    )
+    await insert_call(
+        store, event_id="tg:@c:2", posted_at="2026-10-14T10:00:00Z", text=evm, **kw
+    )
     settings.tg_seed_max = 1
-    kw = dict(source_type="telegram", source_id="@c", posted_at="2026-10-14T11:00:00Z")
-    await insert_call(store, event_id="tg:@c:1", text=SOL, **kw)
-    await insert_call(store, event_id="tg:@c:2", text="0x" + "d" * 40, **kw)
-    seeds = await call_seeds(store, settings, NOW)
-    assert sum(len(v) for v in seeds.values()) <= len(
-        settings.chains
-    )  # one address, expanded
+    assert await call_seeds(store, settings, NOW) == {"solana": {SOL}}  # newest only
+    settings.tg_seed_max = 60
     await _token(store, "solana", SOL)
     await resolve_calls(store, NOW, since=None)
-    assert SOL not in (await call_seeds(store, settings, NOW)).get("solana", set())
+    assert await call_seeds(store, settings, NOW) == {
+        c: {evm} for c in settings.chains if c != "solana"
+    }
+
+
+async def test_insert_constraint_violation_raises(store):
+    with pytest.raises(sqlite3.IntegrityError):
+        await insert_call(
+            store,
+            source_type="Telegram",
+            source_id="@c",
+            event_id="tg:@c:1",
+            posted_at="2026-10-14T11:00:00Z",
+            text=SOL,
+        )

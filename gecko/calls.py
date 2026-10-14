@@ -43,14 +43,22 @@ def event_id(handle: str, msg_id: int) -> str:
 
 
 async def insert_call(
-    store: Store, *, source_type, source_id, event_id, posted_at, text
+    store: Store,
+    *,
+    source_type: str,
+    source_id: str,
+    event_id: str,
+    posted_at: str,
+    text: str | None,
 ) -> bool:
     tags, addrs = parse_call(text)
     if not tags and not addrs:
         return False
     cur = await store.conn.execute(
-        "INSERT OR IGNORE INTO source_calls(source_type,source_id,event_id,posted_at,"
-        "text_hash,cashtags_json,addresses_json) VALUES(?,?,?,?,?,?,?)",
+        # Only a repeated event_id is ignored; CHECK / NOT NULL violations raise.
+        "INSERT INTO source_calls(source_type,source_id,event_id,posted_at,"
+        "text_hash,cashtags_json,addresses_json) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(event_id) DO NOTHING",
         (
             source_type,
             source_id,
