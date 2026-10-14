@@ -333,15 +333,6 @@ class Store:
         ).fetchall()
         return [WatchRow(r[0], r[1], r[2], r[3], r[4], json.loads(r[5])) for r in rows]
 
-    async def schedule_returns(
-        self, token_id, entered_at, horizons=(1, 7, 30, 90, 180)
-    ) -> None:
-        await self.conn.executemany(
-            "INSERT OR IGNORE INTO forward_returns(token_id,horizon_days,due_at) VALUES(?,?,?)",
-            [(token_id, h, iso_plus(entered_at, h)) for h in horizons],
-        )
-        await self.conn.commit()
-
     async def repair_schedules(self, horizons=(1, 7, 30, 90, 180)) -> int:
         """Schedule any missing horizon of every watchlist entry, exited ones
         included, at its stored ``entered_at``. Returns rows inserted.

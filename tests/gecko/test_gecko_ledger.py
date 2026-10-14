@@ -70,7 +70,7 @@ async def seed(store, *, btc=True, token_obs=True):
             "benchmark:btc", "coingecko", "2026-10-02T01:00:00Z", {"price_usd": 66000.0}
         )
     await store.watchlist_upsert("solana:abc", E, "F4", 1, 1.0, {})
-    await store.schedule_returns("solana:abc", E)
+    await store.repair_schedules()
 
 
 async def one(store, sql):
@@ -479,7 +479,7 @@ async def test_non_json_body_spends_attempt_and_later_rows_proceed(store, settin
         "solana:def", "dexscreener", "2026-10-01T00:30:00Z", {"price_usd": 1.0}
     )
     await store.watchlist_upsert("solana:def", E, "F4", 2, 0.5, {})
-    await store.schedule_returns("solana:def", E)
+    await store.repair_schedules()
     with aioresponses() as m:
         m.get(DS, status=200, body="<html>")
         m.get(

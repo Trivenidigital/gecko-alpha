@@ -253,7 +253,8 @@ async def test_callers_and_quality(store, settings):
         CALL_SQL,
         ("solana:old", "telegram", "c1", "e1", "2026-08-01T00:00:00Z", "h"),
     )
-    await store.schedule_returns("solana:old", "2026-08-01T00:00:00Z")
+    await store.watchlist_upsert("solana:old", "2026-08-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
     await store.set_return(
         "solana:old", 30, 1.0, 2.0, 100.0, 110.0, "2026-08-31T00:00:00Z"
     )
@@ -279,7 +280,8 @@ async def test_caller_quality_counts_each_called_token_once(store, settings):
         await store.upsert_token(
             tid, "solana", tid[7:], "X", "X", "2026-08-01T00:00:00Z", "telegram"
         )
-        await store.schedule_returns(tid, "2026-08-01T00:00:00Z")
+        await store.watchlist_upsert(tid, "2026-08-01T00:00:00Z", "F4", 1, 1.0, {})
+        await store.repair_schedules()
         await store.set_return(
             tid, 30, 1.0, price, 100.0, 100.0, "2026-08-31T00:00:00Z"
         )
@@ -304,7 +306,8 @@ async def test_callers_no_lookahead(store, settings):
     await store.conn.execute(
         CALL_SQL, ("solana:old", "telegram", "c1", "e1", "2026-08-01T00:00:00Z", "h")
     )
-    await store.schedule_returns("solana:old", "2026-08-01T00:00:00Z")
+    await store.watchlist_upsert("solana:old", "2026-08-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
     # measured after as_of: must not inform caller_quality
     await store.set_return(
         "solana:old", 30, 1.0, 2.0, 100.0, 100.0, "2026-10-06T00:00:00Z"
@@ -468,7 +471,8 @@ async def test_caller_quality_excludes_the_scored_token(store, settings):
     await store.conn.execute(
         CALL_SQL, ("solana:abc", "telegram", "c1", "e1", "2026-08-01T00:00:00Z", "h")
     )
-    await store.schedule_returns("solana:abc", "2026-08-01T00:00:00Z")
+    await store.watchlist_upsert("solana:abc", "2026-08-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
     await store.set_return(
         "solana:abc", 30, 1.0, 2.0, 100.0, 100.0, "2026-08-31T00:00:00Z"
     )

@@ -391,7 +391,8 @@ async def test_one_live_source_does_not_hide_a_dead_one(store):
 
 
 async def test_forward_returns_backlog(store):
-    await store.schedule_returns("solana:a", "2026-10-01T00:00:00Z", horizons=(1,))
+    await store.watchlist_upsert("solana:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1,))
     due = "2026-10-02T00:00:00Z"
     ok = [b.table for b in await check_freshness(store, "2026-10-04T23:00:00Z")]
     assert "forward_returns_backlog" not in ok  # 71 h overdue
