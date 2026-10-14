@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from structlog.testing import capture_logs
 
+from gecko.__main__ import main
 from gecko.telegram_reader import initial_marks, poll_once, run_reader, session_problem
 
 SOL = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
@@ -201,3 +203,50 @@ def test_session_readable_by_others_refused(tmp_path, settings):
 
 async def _nosleep(_):
     return None
+
+
+def _legacy_db(path):
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE tg_social_messages(id INTEGER PRIMARY KEY, channel_handle TEXT, msg_id INTEGER,"
+        " posted_at TEXT, sender TEXT, text TEXT, cashtags TEXT, contracts TEXT, urls TEXT, parsed_at TEXT)"
+    )
+    db.execute(
+        "CREATE TABLE tg_social_channels(id INTEGER PRIMARY KEY, channel_handle TEXT, display_name TEXT,"
+        " trade_eligible INTEGER, safety_required INTEGER, added_at TEXT, removed_at TEXT)"
+    )
+    db.executemany(
+        "INSERT INTO tg_social_messages(channel_handle,msg_id,posted_at,text,parsed_at) VALUES(?,?,?,?,?)",
+        [
+            ("@Gem", 7, "2026-08-01T00:00:00", f"ape {SOL}", "x"),
+            ("@Gem", 8, "2026-08-01T00:01:00", "gm", "x"),
+        ],
+    )
+    db.executemany(
+        "INSERT INTO tg_social_channels(channel_handle,display_name,added_at,removed_at) VALUES(?,?,?,?)",
+        [("@Gem", "g", "x", None), ("@Old", "o", "x", "2026-07-01")],
+    )
+    db.commit()
+    db.close()
+
+
+def test_migrate_calls_is_idempotent_and_read_only(tmp_path, monkeypatch, capsys):
+    legacy = tmp_path / "scout.db"
+    _legacy_db(legacy)
+    before = legacy.read_bytes()
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
+    assert main(["migrate-calls", "--history-db", str(legacy)]) == 0
+    out = capsys.readouterr().out
+    assert "migrated 1 call(s)" in out and 'GECKO_TG_CHANNELS=["@gem"]' in out
+    assert main(["migrate-calls", "--history-db", str(legacy)]) == 0
+    assert "migrated 0 call(s)" in capsys.readouterr().out
+    assert legacy.read_bytes() == before
+    db = sqlite3.connect(tmp_path / "gecko.db")
+    assert db.execute("SELECT event_id, posted_at FROM source_calls").fetchall() == [
+        ("tg:@gem:7", "2026-08-01T00:00:00Z")
+    ]
+
+
+def test_migrate_calls_missing_db_exits_1(tmp_path, monkeypatch):
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
+    assert main(["migrate-calls", "--history-db", str(tmp_path / "nope.db")]) == 1

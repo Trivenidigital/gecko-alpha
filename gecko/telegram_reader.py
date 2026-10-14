@@ -9,16 +9,19 @@ that cannot poll pages through freshness even when the channels are silent.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import stat
 import sys
 from datetime import timedelta
 from pathlib import Path
 
+import aiosqlite
 import structlog
 
 from gecko.calls import event_id, insert_call, resolve_calls
 from gecko.jobs import register
+from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, parse_utc, utcnow
 
@@ -184,3 +187,44 @@ async def tg_login_job(settings: GeckoSettings, ns) -> int:
     os.chmod(settings.tg_session_path, 0o600)
     print(f"session written to {settings.tg_session_path} (0600)")
     return 0
+
+
+@register("migrate-calls")
+async def migrate_calls_job(settings: GeckoSettings, ns) -> int:
+    path = Path(ns.history_db)
+    if not path.is_file():
+        print(f"history db not found: {path}", file=sys.stderr)
+        return 1
+
+    async def body(store: Store, session) -> JobResult:
+        n = 0
+        # mode=ro: the legacy database is evidence, never written or migrated.
+        async with aiosqlite.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True
+        ) as legacy:
+            async with legacy.execute(
+                "SELECT channel_handle, msg_id, posted_at, text FROM tg_social_messages ORDER BY id"
+            ) as cur:
+                async for handle, msg_id, posted_at, text in cur:
+                    n += await insert_call(
+                        store,
+                        source_type="telegram",
+                        source_id=handle.lower(),
+                        event_id=event_id(handle, msg_id),
+                        posted_at=posted_at,
+                        text=text,
+                    )
+            chans = [
+                r[0].lower()
+                for r in await (
+                    await legacy.execute(
+                        "SELECT channel_handle FROM tg_social_channels WHERE removed_at IS NULL ORDER BY channel_handle"
+                    )
+                ).fetchall()
+            ]
+        resolved = await resolve_calls(store, utcnow(), since=None)
+        print(f"migrated {n} call(s), resolved {resolved}")
+        print(f"GECKO_TG_CHANNELS={json.dumps(chans)}")
+        return JobResult(rows_written=n)
+
+    return await run_job("migrate-calls", settings, body)
