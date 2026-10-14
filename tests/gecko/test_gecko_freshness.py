@@ -5,7 +5,7 @@
 import pytest
 from aioresponses import aioresponses
 from structlog.testing import capture_logs
-from gecko.freshness import check_freshness, SLO_MINUTES, alert_breaches
+from gecko.freshness import Breach, check_freshness, SLO_MINUTES, alert_breaches
 
 TG_URL = "https://api.telegram.org/bottok/sendMessage"
 
@@ -516,3 +516,26 @@ async def test_source_calls_is_run_anchored_on_the_reader(store):
     assert "source_calls" in {
         b.table for b in await check_freshness(store, "2026-10-02T00:40:00Z")
     }
+
+
+@pytest.mark.parametrize(
+    "now,breach", [("2026-10-02T00:31:00Z", True), ("2026-10-02T00:29:00Z", False)]
+)
+async def test_writer_failing_since_deploy_pages(store, now, breach):
+    # no ok run ever, only failures: not "bootstrapping" once the SLO has passed
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", False
+    )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:20:00Z", "2026-10-02T00:20:00Z", False
+    )
+    hit = [b for b in await check_freshness(store, now) if b.table == "source_calls"]
+    assert hit == ([Breach("source_calls", None, 30)] if breach else [])
+
+
+async def test_failing_cron_writer_never_pages_from_freshness(store):
+    # cron failures page through Hermes incidents; freshness must not double-page
+    await store.record_run(
+        "rank", "2026-10-01T00:00:00Z", "2026-10-01T00:00:05Z", False
+    )
+    assert await check_freshness(store, "2026-10-02T00:00:00Z") == []

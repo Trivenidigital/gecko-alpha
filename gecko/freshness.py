@@ -54,6 +54,8 @@ WRITER_JOBS = {
     "observations:enrich": ("enrich",),
     "benchmark:btc": ("coingecko-hourly",),
 }
+# Writers outside Hermes cron: no incident path, so freshness pages their failures.
+NON_CRON_WRITERS = frozenset({"telegram-reader"})
 # Tables whose writer may legitimately write 0 rows (silent channels, an empty
 # watchlist, nothing due); judged by its last ok run.
 RUN_ANCHORED = frozenset(
@@ -83,6 +85,21 @@ async def _writer_run(store: Store, table: str, agg: str) -> str | None:
         await store.conn.execute(
             f"SELECT {agg}(finished_at) FROM runs WHERE ok=1 AND job IN ({q})",
             WRITER_JOBS[table],
+        )
+    ).fetchone()
+    return row[0]
+
+
+async def _non_cron_first_failure(store: Store, table: str) -> str | None:
+    """Earliest failed run of ``table``'s writers that no cron incident would page."""
+    jobs = [j for j in WRITER_JOBS[table] if j in NON_CRON_WRITERS]
+    if not jobs:
+        return None
+    row = await (
+        await store.conn.execute(
+            f"SELECT MIN(finished_at) FROM runs WHERE ok=0 AND job IN "
+            f"({','.join('?' * len(jobs))})",
+            jobs,
         )
     ).fetchone()
     return row[0]
@@ -136,7 +153,11 @@ async def check_freshness(store: Store, now: str) -> list[Breach]:
     for table, slo in SLO_MINUTES.items():
         first_run = await _writer_run(store, table, "MIN")
         if first_run is None:
-            continue  # bootstrapping: no writer has succeeded yet
+            # Bootstrapping, unless a non-cron writer has failed since deploy.
+            failed = await _non_cron_first_failure(store, table)
+            if failed and now_dt - parse_utc(failed) > timedelta(minutes=slo):
+                out.append(Breach(table, None, slo))
+            continue
         if table in RUN_ANCHORED:
             # Legitimately row-less runs (an empty watchlist, nothing due):
             # staleness is the writer's last ok run, not the table's last row.
