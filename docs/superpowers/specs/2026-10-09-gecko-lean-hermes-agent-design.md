@@ -17,8 +17,8 @@ Companion evidence: `docs/audit_structural_2026_10_09.md`, `docs/research_hermes
 | Scheduling / retries / incidents | yes — built-in cron (`hermes cron`, jobs.json, incidents, retries 5/15/30 min) https://hermes-agent.nousresearch.com/docs/user-guide/features/cron | use it; replaces main.py loop, 5 systemd timers, 19 cron lines |
 | Poll-and-dedupe JSON endpoints | yes — `official/devops/watchers` (`watch_http_json.py`, watermark state) | not used in v1: it emits new ids but does not persist feature rows, and running it beside the collectors would create two dedupe mechanisms; the Python collectors dedupe on `tokens.token_id`. Revisit only if collectors grow past budget |
 | Market data (listed coins, trending, new pools, holders) | yes — CoinGecko official remote MCP (keyless or Demo key) + `coingecko/skills` | use it; no Pro dependency |
-| Solana token / holders / tx | yes — Helius official MCP; `official/blockchain/solana` (authorities, top-5 holders) | use both; solana skill stays read-only per inventory ruling |
-| EVM explorer data | yes — Blockscout hosted MCP (free PRO key); `official/blockchain/evm` (reference only per inventory) | use Blockscout MCP |
+| Solana token / holders / tx | yes — Helius official MCP; `official/blockchain/solana` (authorities, top-5 holders) | agent-side MCP only (Plan 3); the deterministic write path uses GoPlus, which returns holders + top-10 on all four chains keyless (probed 2026-10-14; Blockscout base is Cloudflare-blocked and has no BSC instance) (amended 2026-10-14); solana skill stays read-only per inventory ruling |
+| EVM explorer data | yes — Blockscout hosted MCP (free PRO key); `official/blockchain/evm` (reference only per inventory) | agent-side MCP only (Plan 3); the deterministic write path uses GoPlus, which returns holders + top-10 on all four chains keyless (probed 2026-10-14; Blockscout base is Cloudflare-blocked and has no BSC instance) (amended 2026-10-14) |
 | Token security / honeypot | yes — GoPlus official MCP (thin wrapper, stable API) | use it |
 | Smart-money / launch trenches / contract DD | yes — GMGNAI/gmgn-skills (vendor SKILL.md, demo key read-only) | install read-only subset; execution skills excluded |
 | Holder-cluster / sybil / bundle analysis method | yes — agiprolabs/claude-trading-skills `token-holder-analysis`, `sybil-detection`, `pumpfun-mechanics` | install as method prompts for the research agent |
@@ -44,7 +44,7 @@ Companion evidence: `docs/audit_structural_2026_10_09.md`, `docs/research_hermes
 
 | # | Criterion | Target |
 |---|---|---|
-| S1 | Custom code | `gecko/` ≤ 3,000 LOC excluding tests (raised from 2,500 → 2,800 → 3,000 on 2026-10-09: the per-token refresh pass, frozen entry price, address validation, ledger canary, per-source freshness SLOs and concurrency repairs required by the independent reviews were missing from the original estimate; still ~36× smaller than `scout/`); tests ≤ 6,000 LOC (raised from 5,000 on 2026-10-09 for the falsifier tests the vector reviews required) |
+| S1 | Custom code | `gecko/` ≤ 3,000 LOC excluding tests (raised from 2,500 → 2,800 → 3,000 on 2026-10-09: the per-token refresh pass, frozen entry price, address validation, ledger canary, per-source freshness SLOs and concurrency repairs required by the independent reviews were missing from the original estimate; still ~36× smaller than `scout/`); tests ≤ 6,000 LOC (raised from 5,000 on 2026-10-09 for the falsifier tests the vector reviews required); raised 3,000 → 3,600 and tests 6,000 → 7,500 on 2026-10-14 (operator ruling: GoPlus enrichment, Telegram reader, prune and ledger tickets were in scope but not in the estimate) |
 | S2 | Discovery breadth | ≥ 3 independent discovery sources alive (DexScreener, GeckoTerminal, CoinGecko new/trending, GMGN trenches, Telegram callers) with per-table freshness within SLO for 14 consecutive days |
 | S3 | Delivery | Daily digest delivered to Telegram 14 consecutive days; `[SILENT]` days count as delivered |
 | S4 | Track record | Forward returns at 1/7/30/90/180 d recorded for 100% of watchlist entrants; weekly cohort scorecard vs BTC |
@@ -110,8 +110,7 @@ All collectors: aiohttp, explicit timeouts, exponential backoff on 429/5xx, writ
 | DexScreener | `token-boosts/latest`, `token-profiles/latest`, `tokens/v1/{chain}/{addrs}` | 10 min | free; 60 rpm boosts/profiles, 300 rpm pairs | discovery + price/liq/vol/buys-sells | chains ∈ {solana,base,ethereum,bsc}; liquidity ≥ $250K; pair age ≥ 24 h |
 | GeckoTerminal | `networks/{net}/new_pools`, `networks/{net}/trending_pools`, pool OHLCV daily | 15 min; OHLCV daily | keyless, backoff | discovery + `pool_created_at` + DEX 7d/prior-7d volume (F4 input) | same as above |
 | CoinGecko (REST, Demo key; MCP for the agent) | `coins/markets` (mcap desc, pages covering $200M→$500K), `coins/{id}` platforms (once per new coin), `search/trending`, `simple/price` (BTC benchmark hourly). `coins/list/new` is paid-only and NOT used; new listings come from GeckoTerminal/DexScreener | markets daily; trending + BTC hourly | Demo 10K credits/mo; plan ≈ 2.7K/mo; hard cap 8K enforced in `runs` | listed universe + benchmark | mcap $500K–$200M |
-| Helius (MCP) | DAS `getTokenAccounts` holder count, top holders | on first sight + daily for watchlist | 1M credits/mo, 2 rps DAS; plan ≈ 15K/mo | holders, top10 concentration, mint/freeze via solana skill | solana tokens in universe |
-| Blockscout (MCP, free PRO key) | token info, holders count, transfers, contract creator | on first sight + daily for watchlist | credit-metered free | EVM holders, deployer | base/ethereum/bsc tokens |
+| GoPlus (REST, keyless) | `token_security/{1,56,8453}`, `solana/token_security`, ONE address per call (free tier silently truncates batches) | hourly job; first sight for candidates, daily for active/watchlist, daily retry while GoPlus does not know the token | free 150 CU/min, 30K CU/day; `gp_daily_cap` enforced from `runs` | `security_ok`, holders, `top10_pct`, deployer | all |
 | GoPlus (MCP) | `token_security`, `solana_token_security` | on first sight; weekly re-check for watchlist | key by request | disqualifiers: honeypot, sell tax > 10%, mintable, proxy-upgradeable without lock, blacklist | all |
 | GMGN (SKILL.md, demo key) | `market trenches` (new_creation/near_completion), `gmgn-contract-dd`, `gmgn-track` smart money | 30 min trenches; DD on first sight | demo read-only; paid only after backtest shows value | smart-money wallet count, DD score | solana/base/bsc/eth |
 | Telegram callers | Telethon user session over configured channels (migrated from `tg_social_channels`) | long-running | Telegram limits | `source_calls` with cashtags/addresses; caller quality from history | all |
@@ -129,12 +128,12 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 | `mcap_usd`, `liquidity_usd`, `vol_24h_usd` | latest | DexScreener / CG |
 | `vol_7d_ratio` | sum(vol for t−7d ≤ ts < t) / sum(vol for t−14d ≤ ts < t−7d) over the deepest pool's daily candles; NULL if the prior window has zero volume or the last window has no candle. This is EXACTLY the registered F4 definition (prereg f7d38fa2); any candle-count minimum requires a new prereg (amended 2026-10-09 — a 14-candle minimum was removed after the backtest showed it dropped 34 of the 101 F4 coins, the youngest pools averaging 2.47×) | GT OHLCV |
 | `holders`, `holder_growth_7d` | latest count; (now − 7 d ago)/7 d ago | Helius / Blockscout |
-| `top10_pct` | top-10 holder share excl. LP/burn | Helius / Blockscout |
+| `top10_pct` | sum of the `percent` of GoPlus's top-10 holders, ×100, EXCLUDING locked balances, burn addresses, pool addresses (`dex[].pair`/`dex[].id`, `lp_holders`), EVM contracts (`is_contract=1`) and known Solana AMM authorities. Holders beyond the reported 10 are not backfilled, so this is a lower bound (amended 2026-10-14) | GoPlus |
 | `bundle_flag` | GMGN DD score < 60 OR top10_pct > 40 | GMGN / holders |
 | `smart_money_wallets` | distinct smart-money wallets holding (GMGN) | GMGN |
 | `callers_7d`, `caller_quality` | distinct `source_id` calling token in 7 d; mean historical 30-d hit rate of those callers (from forward_returns joined to source_calls) | source_calls |
 | `narrative_mentions_7d` | X items referencing token in 7 d | X skills |
-| `security_ok` | no GoPlus disqualifier; Solana mint+freeze authority revoked or recognised program | GoPlus / solana skill |
+| `security_ok` | False if any: EVM honeypot / cannot_sell_all / blacklist / buy or sell tax > 10% / mintable or proxy with a non-renounced owner; Solana mintable / freezable / balance-mutable authority / non-transferable / transfer hook (a `trusted_token` overrides to True). True only when the core flags are present and clean; None otherwise (unknown is never safe) (amended 2026-10-14) | GoPlus |
 | `young_chain` | chain launch date (config) within 180 d | config |
 | `momentum_ctx` | 7-d price change (context only, never a rule input in v1) | CG / DexScreener |
 
@@ -178,7 +177,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 ## 12. Operations and health
 
 - Long-running units: `hermes-gateway.service`, `gecko-telegram-reader.service`. All other old units/timers/crontab lines are removed at cutover.
-- `freshness` job (script): per-table SLO (`observations` ≤ 30 min, `source_calls` ≤ 6 h when channels active, `watchlist` ≤ 2 h, `forward_returns` ≤ 26 h, `research_notes` ≤ 26 h); breach ⇒ one plain-text Telegram message to the health chat, de-duplicated per table per 6 h. This is the §12a minimum.
+- `freshness` job (script): per-table SLO (`observations` ≤ 30 min, `source_calls` run-anchored on `telegram-reader` ok runs ≤ 30 min (channels may be legitimately silent for days; a reader that cannot poll writes `ok=0` runs and pages — amended 2026-10-14), `observations:enrich` ≤ 26 h (amended 2026-10-14), `watchlist` ≤ 2 h, `forward_returns` ≤ 26 h, `research_notes` ≤ 26 h); breach ⇒ one plain-text Telegram message to the health chat, de-duplicated per table per 6 h. This is the §12a minimum.
 - Hermes cron incidents (`hermes cron incidents`) cover job crashes and retries; the freshness job covers "ran but wrote nothing": per-source observation SLOs on written rows (dexscreener 30 min, geckoterminal 360 min, coingecko 26 h, OHLCV-with-candles 26 h), a `benchmark:btc` SLO of 3 h, and a forward-returns backlog breach when any row is more than 72 h past due and unmeasured. The ledger prices a per-chain canary (WSOL, WETH, WBNB) each run; an unpriced canary marks every missing price on that chain transient and fails the run, so a DexScreener schema or route change cannot be booked as per-token losses (amended 2026-10-09).
 - Backup: nightly `sqlite3 gecko.db ".backup"` + existing off-host transport script retained (only ops script carried over).
 - Logs: structlog JSON to journald as today.
@@ -195,7 +194,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 1. **Preserve**: copy `scout.db` to `/root/gecko-history/scout.db` (read-only, 0444) and verify `PRAGMA quick_check`; keep `/root/xs_study`.
 2. **Freeze `scout/`**: no further PRs except cutover; prod stays on its current side branch until retired (it is harmless; CG is already dark).
 3. **Build `gecko/`** on branch `feat/gecko-lean-agent` with CI; deploy to the VPS alongside the old pipeline (different DB file, different units).
-4. **Telethon handover**: set `TG_SOCIAL_ENABLED=false` in the old `.env` and restart `gecko-pipeline` the moment `gecko-telegram-reader` starts (one session file, one client). Migrate channel list and `source_calls` history into `gecko.db`.
+4. **Telethon session**: gecko uses its OWN Telethon session created by `python -m gecko tg-login` (a second device on the same account), so there is no session handover; the legacy listener is stopped at retirement (step 7) like every other unit (amended 2026-10-14). Migrate channel list and `source_calls` history into `gecko.db`.
 5. **Hermes**: upgrade, configure MCP/skills/cron, convert the X scanner cron to agent mode.
 6. **Soak**: S2 + S3 for 14 days; ledger accumulating.
 7. **Retire**: after 30 days of forward data, stop and disable `gecko-pipeline`, `gecko-dashboard`, `trade-alert-watcher`, all `gecko-*` timers, the crontab lines and watchdog units; one PR deletes `scout/`, `dashboard/`, `scripts/` (except backup transport), `systemd/`, `cron/`, `.reviewers/`, the receipt tooling and their tests; CI reduced to `pytest tests/gecko`.
