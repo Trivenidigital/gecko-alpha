@@ -23,6 +23,7 @@ def _load_jobs() -> None:
     import gecko.freshness  # noqa: F401
     import gecko.ledger  # noqa: F401
     import gecko.rank  # noqa: F401
+    import gecko.telegram_reader  # noqa: F401
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -496,3 +496,23 @@ async def test_enrich_slo_ignores_unknown_markers(store):
     assert "observations:enrich" not in {
         b.table for b in await check_freshness(store, late)
     }
+
+
+async def test_source_calls_is_run_anchored_on_the_reader(store):
+    # silent channels: reader polls fine, writes no calls -> no page
+    await store.record_run(
+        "telegram-reader", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", True
+    )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", True
+    )
+    assert "source_calls" not in {
+        b.table for b in await check_freshness(store, "2026-10-02T00:20:00Z")
+    }
+    # reader stopped polling (or every poll failed) -> page after 30 min
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:02:00Z", "2026-10-02T00:02:00Z", False
+    )
+    assert "source_calls" in {
+        b.table for b in await check_freshness(store, "2026-10-02T00:40:00Z")
+    }

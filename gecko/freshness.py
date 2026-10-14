@@ -16,7 +16,7 @@ log = structlog.get_logger("gecko.freshness")
 
 SLO_MINUTES = {
     "observations": 30,
-    "source_calls": 360,
+    "source_calls": 30,
     "watchlist": 120,
     "forward_returns": 1560,
     "research_notes": 1560,
@@ -54,8 +54,11 @@ WRITER_JOBS = {
     "observations:enrich": ("enrich",),
     "benchmark:btc": ("coingecko-hourly",),
 }
-# Tables whose writer may legitimately write 0 rows; judged by its last ok run.
-RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
+# Tables whose writer may legitimately write 0 rows (silent channels, an empty
+# watchlist, nothing due); judged by its last ok run.
+RUN_ANCHORED = frozenset(
+    {"watchlist", "forward_returns", "research_notes", "source_calls"}
+)
 DEDUP_HOURS = 6
 
 

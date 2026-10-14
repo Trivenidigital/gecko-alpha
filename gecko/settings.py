@@ -53,6 +53,14 @@ class GeckoSettings(BaseSettings):
         20  # active tokens re-read about daily (holder growth needs it)
     )
     tg_seed_max: int = 60  # called addresses offered to DexScreener per run
+    tg_api_id: int = 0
+    tg_api_hash: SecretStr | None = None
+    tg_session_path: str = (
+        ""  # absolute, outside the repo, mode 0600; gecko's OWN session
+    )
+    tg_channels: list[str] = []  # public @handles
+    tg_poll_interval_sec: int = 120
+    tg_catchup_limit: int = 200  # newest messages read per channel per poll
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
