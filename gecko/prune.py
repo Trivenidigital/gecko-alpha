@@ -36,20 +36,14 @@ async def _delete_batches(
 async def prune(
     store: Store, settings: GeckoSettings, now: str, *, batch: int = 5000
 ) -> tuple[int, int]:
-    obs = await _delete_batches(
-        store,
-        "observations",
-        "observed_at<? AND token_id!=?",
-        (_ago(now, settings.obs_retention_days), BTC),
-        batch,
+    obs_cut = _ago(now, settings.obs_retention_days)
+    runs_cut = _ago(now, settings.runs_retention_days)
+    obs_where = "observed_at<? AND token_id!=?"
+    runs_where = (
+        "finished_at<? AND id NOT IN (SELECT MIN(id) FROM runs WHERE ok=1 GROUP BY job)"
     )
-    runs = await _delete_batches(
-        store,
-        "runs",
-        "finished_at<? AND id NOT IN (SELECT MIN(id) FROM runs WHERE ok=1 GROUP BY job)",
-        (_ago(now, settings.runs_retention_days),),
-        batch,
-    )
+    obs = await _delete_batches(store, "observations", obs_where, (obs_cut, BTC), batch)
+    runs = await _delete_batches(store, "runs", runs_where, (runs_cut,), batch)
     log.info("prune_done", observations=obs, runs=runs)
     return obs, runs
 
