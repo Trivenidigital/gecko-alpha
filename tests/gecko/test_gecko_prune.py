@@ -1,8 +1,11 @@
+import asyncio
+
 import pytest
 from pydantic import ValidationError
 
 from gecko.prune import prune
 from gecko.settings import GeckoSettings
+from gecko.store import Store
 
 NOW = "2026-10-14T00:00:00Z"
 OLD = "2026-03-01T00:00:00Z"  # > 180 d
@@ -43,3 +46,20 @@ def test_retention_floor_validated():
         GeckoSettings(obs_retention_days=29, _env_file=None)
     with pytest.raises(ValidationError):
         GeckoSettings(runs_retention_days=10, _env_file=None)
+
+
+def test_prune_refuses_as_of(monkeypatch, settings):
+    import sqlite3
+
+    from gecko.__main__ import main
+
+    async def seed():
+        s = await Store.open(settings.db_path)
+        await s.add_observation("base:x", "dexscreener", MID, {"price_usd": 1})
+        await s.close()
+
+    monkeypatch.setenv("GECKO_DB_PATH", settings.db_path)
+    asyncio.run(seed())
+    assert main(["prune", "--as-of", "2027-01-01T00:00:00Z"]) == 2
+    with sqlite3.connect(settings.db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1

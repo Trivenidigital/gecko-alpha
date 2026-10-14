@@ -50,7 +50,7 @@ async def prune(
 
 @register("prune")
 async def prune_job(settings: GeckoSettings, ns) -> int:
-    now = canon_ts(ns.as_of) if ns.as_of else utcnow()
+    now = utcnow()  # live-only: __main__ refuses --as-of
 
     async def body(store: Store, session: aiohttp.ClientSession) -> JobResult:
         obs, runs = await prune(store, settings, now)

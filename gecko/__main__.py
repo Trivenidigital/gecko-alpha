@@ -51,9 +51,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.job not in JOBS:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
-    if ns.job == "ledger" and ns.as_of:
-        # Prices are fetched live, so a replayed "now" would mislabel them.
-        print("ledger is live-only: --as-of is refused", file=sys.stderr)
+    if ns.job in ("ledger", "prune") and ns.as_of:
+        # ledger fetches live prices; a future prune "now" deletes live rows.
+        print(f"{ns.job} is live-only: --as-of is refused", file=sys.stderr)
         return 2
     settings = GeckoSettings()
     if not os.path.isabs(settings.db_path):
