@@ -199,7 +199,8 @@ async def enrich_queue(
             "(SELECT MAX(observed_at) FROM observations o WHERE o.token_id=t.token_id "
             " AND o.source='enrich'), "
             "(SELECT COUNT(*) FROM observations o WHERE o.token_id=t.token_id "
-            " AND o.source='enrich' AND json_extract(o.features_json,'$.goplus_status')='ok') "
+            " AND o.source='enrich' AND json_extract(o.features_json,'$.goplus_status')='ok'), "
+            "t.first_seen_at "
             "FROM tokens t LEFT JOIN watchlist w ON w.token_id=t.token_id AND w.exited_at IS NULL "
             f"WHERE t.status IN ('candidate','active') AND t.chain IN ({q})",
             tuple(settings.chains),
@@ -210,8 +211,9 @@ async def enrich_queue(
         for r in rows
         if r[5] is None or (r[5] < stale and (r[3] == "active" or r[6] == 0))
     ]
+    # never-enriched first, FIFO by arrival; then oldest last row
     due.sort(
-        key=lambda r: (not r[4], r[3] != "active", r[5] is not None, r[5] or "", r[0])
+        key=lambda r: (not r[4], r[3] != "active", r[5] is not None, r[5] or r[7], r[0])
     )
     return [(r[0], r[1], r[2]) for r in due]
 

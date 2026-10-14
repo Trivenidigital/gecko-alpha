@@ -454,3 +454,11 @@ async def test_enrich_feeds_features(store, settings):
 
 async def _nosleep(_):
     return None
+
+
+async def test_queue_never_enriched_is_fifo_by_first_seen(store, settings):
+    late = await tok(store, "base", "0x" + "1" * 40, first="2026-10-12T00:00:00Z")
+    early = await tok(store, "base", "0x" + "9" * 40, first="2026-10-11T00:00:00Z")
+    assert late < early  # token_id order is the reverse of arrival order
+    q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+    assert q == [early, late]

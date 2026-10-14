@@ -1,5 +1,7 @@
-# Aggregate-observation tests seed the "enrich" writer, which feeds only the
-# aggregate check, so per-source SLOs do not add breaches here.
+# Aggregate-observation tests seed the "enrich" writer. Its own per-source SLO
+# (observations:enrich, 1560 min) counts only goplus_status="ok" rows, so those
+# seeded rows are invisible to it; it falls back to the writer's first ok run,
+# which these tests keep well inside 1560 min, so it adds no breaches here.
 import pytest
 from aioresponses import aioresponses
 from structlog.testing import capture_logs
@@ -479,4 +481,18 @@ async def test_enrich_source_slo(store):
     }
     assert "observations:enrich" not in {
         b.table for b in await check_freshness(store, "2026-10-01T20:00:00Z")
+    }
+
+
+async def test_enrich_slo_ignores_unknown_markers(store):
+    t0, late = "2026-10-01T00:00:00Z", "2026-10-02T03:00:00Z"  # 27 h apart
+    await store.record_run("enrich", t0, t0, True)
+    await store.add_observation("base:x", "enrich", t0, {"goplus_status": "ok"})
+    await store.add_observation("base:y", "enrich", late, {"goplus_status": "unknown"})
+    assert "observations:enrich" in {
+        b.table for b in await check_freshness(store, late)
+    }
+    await store.add_observation("base:z", "enrich", late, {"goplus_status": "ok"})
+    assert "observations:enrich" not in {
+        b.table for b in await check_freshness(store, late)
     }

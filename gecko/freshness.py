@@ -94,6 +94,8 @@ async def _last_write(store: Store, key: str) -> str | None:
         where, args = "source=?", (src,)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
+        elif src == "enrich":  # "unknown" markers are not data
+            where += " AND json_extract(features_json, '$.goplus_status')='ok'"
         elif (
             src == "coingecko"
         ):  # markets rows only: hourly BTC/trending mask a dead sweep
