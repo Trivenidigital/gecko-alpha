@@ -30,6 +30,7 @@ class GeckoSettings(BaseSettings):
     f4_min_vol_ratio: float = 2.0
     top10_disqualify_pct: float = 60.0
     dead_after_days: int = 7
+    ledger_max_overdue_days: int = 14  # open this long past due: closed unmeasured
     require_security_known: bool = False  # Plan 3 flips to True at cutover
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200

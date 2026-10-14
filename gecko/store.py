@@ -419,6 +419,16 @@ class Store:
             )
         await self.conn.commit()
 
+    async def close_unmeasured(self, token_id, horizon_days, measured_at) -> bool:
+        """Finalize an open row with no return (ret NULL). Write-once."""
+        cur = await self.conn.execute(
+            "UPDATE forward_returns SET measured_at=? WHERE token_id=? AND horizon_days=? "
+            "AND measured_at IS NULL",
+            (canon_ts(measured_at), token_id, horizon_days),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
     async def bump_return_attempt(
         self,
         token_id,
