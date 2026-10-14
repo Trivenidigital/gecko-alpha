@@ -132,7 +132,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 | `smart_money_wallets` | distinct smart-money wallets holding (GMGN) | GMGN |
 | `callers_7d`, `caller_quality` | distinct `source_id` calling token in 7 d; mean historical 30-d hit rate of those callers (from forward_returns joined to source_calls) | source_calls |
 | `narrative_mentions_7d` | X items referencing token in 7 d | X skills |
-| `security_ok` | False if any: EVM honeypot / cannot_sell_all / blacklist / buy or sell tax > 10% / mintable or proxy with a non-renounced owner; Solana mintable / freezable / balance-mutable authority / non-transferable / transfer hook (a `trusted_token` overrides to True). True only when the core flags are present and clean; None otherwise (unknown is never safe) (amended 2026-10-14) | GoPlus |
+| `security_ok` | False if any: EVM honeypot / cannot_sell_all / blacklist / buy or sell tax > 10% / mintable or proxy with a non-renounced owner; Solana mintable / freezable / balance-mutable authority / non-transferable / transfer hook (a `trusted_token` overrides to True). True only when the core flags are present and clean — core flags: EVM honeypot / cannot_sell_all / blacklist (taxes optional; `owner_address` required when mintable or proxy), Solana mintable / freezable / balance-mutable authority / non-transferable; None otherwise (unknown is never safe; any failing flag still gives False) (amended 2026-10-14) | GoPlus |
 | `young_chain` | chain launch date (config) within 180 d | config |
 | `momentum_ctx` | 7-d price change (context only, never a rule input in v1) | CG / DexScreener |
 
