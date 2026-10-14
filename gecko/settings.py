@@ -52,6 +52,7 @@ class GeckoSettings(BaseSettings):
     gp_refresh_hours: int = (
         20  # active tokens re-read about daily (holder growth needs it)
     )
+    tg_seed_max: int = 60  # called addresses offered to DexScreener per run
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
