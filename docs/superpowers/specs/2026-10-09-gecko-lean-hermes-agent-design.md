@@ -111,7 +111,6 @@ All collectors: aiohttp, explicit timeouts, exponential backoff on 429/5xx, writ
 | GeckoTerminal | `networks/{net}/new_pools`, `networks/{net}/trending_pools`, pool OHLCV daily | 15 min; OHLCV daily | keyless, backoff | discovery + `pool_created_at` + DEX 7d/prior-7d volume (F4 input) | same as above |
 | CoinGecko (REST, Demo key; MCP for the agent) | `coins/markets` (mcap desc, pages covering $200M→$500K), `coins/{id}` platforms (once per new coin), `search/trending`, `simple/price` (BTC benchmark hourly). `coins/list/new` is paid-only and NOT used; new listings come from GeckoTerminal/DexScreener | markets daily; trending + BTC hourly | Demo 10K credits/mo; plan ≈ 2.7K/mo; hard cap 8K enforced in `runs` | listed universe + benchmark | mcap $500K–$200M |
 | GoPlus (REST, keyless) | `token_security/{1,56,8453}`, `solana/token_security`, ONE address per call (free tier silently truncates batches) | hourly job; first sight for candidates, daily for active/watchlist, daily retry while GoPlus does not know the token | free 150 CU/min, 30K CU/day; `gp_daily_cap` enforced from `runs` | `security_ok`, holders, `top10_pct`, deployer | all |
-| GoPlus (MCP) | `token_security`, `solana_token_security` | on first sight; weekly re-check for watchlist | key by request | disqualifiers: honeypot, sell tax > 10%, mintable, proxy-upgradeable without lock, blacklist | all |
 | GMGN (SKILL.md, demo key) | `market trenches` (new_creation/near_completion), `gmgn-contract-dd`, `gmgn-track` smart money | 30 min trenches; DD on first sight | demo read-only; paid only after backtest shows value | smart-money wallet count, DD score | solana/base/bsc/eth |
 | Telegram callers | Telethon user session over configured channels (migrated from `tg_social_channels`) | long-running | Telegram limits | `source_calls` with cashtags/addresses; caller quality from history | all |
 | X / KOL | existing Hermes skills (`kol_watcher` → `narrative_classifier` → `coin_resolver`) re-pointed to write `source_calls` via `python -m gecko.ingest_call` | hourly, agent mode | X API tier (owner) | narrative mentions | all |
@@ -127,7 +126,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 | `age_days` | `as_of − pool_created_at` (earliest pool seen; None when no pool is known — the registered F1 excludes coins without a resolvable pool, amended 2026-10-09) | GT / DexScreener |
 | `mcap_usd`, `liquidity_usd`, `vol_24h_usd` | latest | DexScreener / CG |
 | `vol_7d_ratio` | sum(vol for t−7d ≤ ts < t) / sum(vol for t−14d ≤ ts < t−7d) over the deepest pool's daily candles; NULL if the prior window has zero volume or the last window has no candle. This is EXACTLY the registered F4 definition (prereg f7d38fa2); any candle-count minimum requires a new prereg (amended 2026-10-09 — a 14-candle minimum was removed after the backtest showed it dropped 34 of the 101 F4 coins, the youngest pools averaging 2.47×) | GT OHLCV |
-| `holders`, `holder_growth_7d` | latest count; (now − 7 d ago)/7 d ago | Helius / Blockscout |
+| `holders`, `holder_growth_7d` | latest count; (now − 7 d ago)/7 d ago | GoPlus (amended 2026-10-14) |
 | `top10_pct` | sum of the `percent` of GoPlus's top-10 holders, ×100, EXCLUDING locked balances, burn addresses, pool addresses (`dex[].pair`/`dex[].id`, `lp_holders`), EVM contracts (`is_contract=1`) and known Solana AMM authorities. Holders beyond the reported 10 are not backfilled, so this is a lower bound (amended 2026-10-14) | GoPlus |
 | `bundle_flag` | GMGN DD score < 60 OR top10_pct > 40 | GMGN / holders |
 | `smart_money_wallets` | distinct smart-money wallets holding (GMGN) | GMGN |
@@ -198,7 +197,7 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 5. **Hermes**: upgrade, configure MCP/skills/cron, convert the X scanner cron to agent mode.
 6. **Soak**: S2 + S3 for 14 days; ledger accumulating.
 7. **Retire**: after 30 days of forward data, stop and disable `gecko-pipeline`, `gecko-dashboard`, `trade-alert-watcher`, all `gecko-*` timers, the crontab lines and watchdog units; one PR deletes `scout/`, `dashboard/`, `scripts/` (except backup transport), `systemd/`, `cron/`, `.reviewers/`, the receipt tooling and their tests; CI reduced to `pytest tests/gecko`.
-8. **Owner actions required** (cannot be automated): create a free CoinGecko Demo API key; request GoPlus key/secret; Blockscout PRO key; GMGN demo key; decide on X API re-pairing; prune the ~180 stale local git worktrees.
+8. **Owner actions required** (cannot be automated): create a free CoinGecko Demo API key; GMGN demo key; optionally a Helius key (agent MCP only); run `python -m gecko tg-login` once (amended 2026-10-14: GoPlus is keyless, Blockscout dropped); decide on X API re-pairing; prune the ~180 stale local git worktrees.
 
 ## 15. Testing
 
@@ -209,15 +208,15 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 - Freshness: a table with no writes past SLO produces exactly one alert; a second run within 6 h produces none.
 - Collectors: a 429 then 200 sequence succeeds with backoff; a persistent failure exits 1 and writes `runs.ok = 0`.
 - Backtest: reproduces the 09-18 F4 cohort statistics within tolerance on the frozen study data (regression anchor).
-- Target: `tests/gecko` ≤ 6,000 LOC (see S1).
+- Target: `tests/gecko` ≤ 7,500 LOC (see S1; amended 2026-10-14).
 
 ## 16. Budget
 
 | Item | Monthly |
 |---|---|
 | CoinGecko Demo | $0 (≈ 2.7K of 10K credits) |
-| Helius free | $0 (≈ 15K of 1M credits) |
-| GoPlus, Blockscout, DexScreener, GeckoTerminal | $0 |
+| Helius free (agent MCP only, optional) | $0 |
+| GoPlus (keyless), DexScreener, GeckoTerminal | $0 |
 | GMGN | $0 demo; paid tier only after backtest evidence (price unverified) |
 | Research model (OpenRouter cheap model, ≤ 20 dossiers/day) | ≤ $30 |
 | Digest/scorecard/Q&A model | ≤ $10 |
@@ -232,10 +231,10 @@ Each feature uses only observations with `observed_at ≤ as_of`. Definitions:
 | Free tiers change or throttle | per-source `runs.credits_used`; hard caps; sources are independent so one outage degrades, not kills |
 | GMGN demo key may be insufficient for trenches | smart-money feature is NULL-tolerant; rule set does not depend on it |
 | X credentials remain unpaired | X lane optional; callers via Telegram remain |
-| Telethon session collision at handover | explicit step 14.4 |
+| Telethon session collision | separate gecko session via tg-login; no shared session file (step 14.4, amended 2026-10-14) |
 | Hermes patch regressions | pinned version; `~/.hermes` backup before upgrade |
 | Historical backtest substrate has gaps (CG dark since 09-19) | backtest window ends 2026-09-18; forward window starts at launch |
 
 ## 18. Deliverables order (for the implementation plan)
 
-1. Store + settings + freshness + runs (foundation). 2. DexScreener + GeckoTerminal collectors. 3. CoinGecko Demo collector + ledger. 4. Features + rank + F4 + tests. 5. Backtest harness + F4 regression anchor. 6. Helius/Blockscout/GoPlus enrichment. 7. Telethon collector fold + handover. 8. Hermes upgrade, MCP, skills, cron, digest/scorecard/research jobs, gecko-query skill. 9. Soak + cutover PR.
+1. Store + settings + freshness + runs (foundation). 2. DexScreener + GeckoTerminal collectors. 3. CoinGecko Demo collector + ledger. 4. Features + rank + F4 + tests. 5. Backtest harness + F4 regression anchor. 6. GoPlus enrichment. 7. Telethon reader on gecko's own session (amended 2026-10-14). 8. Hermes upgrade, MCP, skills, cron, digest/scorecard/research jobs, gecko-query skill. 9. Soak + cutover PR.
