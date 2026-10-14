@@ -44,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rule", default="F4")
     p.add_argument("--study-dir", default="/root/xs_study")
     p.add_argument("--history-db", default="/root/gecko-history/scout.db")
+    p.add_argument(
+        "--from", dest="date_from", default=None, help="backtest: first t0 (inclusive)"
+    )
+    p.add_argument(
+        "--to", dest="date_to", default=None, help="backtest: last t0 (exclusive)"
+    )
     ns = p.parse_args(argv)
     if ns.list:
         print("\n".join(sorted(JOBS)))

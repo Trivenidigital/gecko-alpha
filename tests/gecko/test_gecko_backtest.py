@@ -310,7 +310,8 @@ def test_backtest_job_prints_row_and_divergence(tmp_path, capsys, monkeypatch):
         ]
     )
     out = capsys.readouterr().out
-    assert rc == 0
+    # n=2 fails the battery: a FAIL verdict exits 1
+    assert rc == 1
     assert "\nF4 | 2 | 4.20x | " in out
     assert "live-definition divergence: 0 coins change F4 verdict" in out
 
@@ -339,3 +340,61 @@ def test_path_like_coin_ids_are_rejected_and_counted(tmp_path):
     coins = load_study(str(tmp_path), None, stats)
     assert [c.cid for c in coins] == ["a"]
     assert stats["rejected"] == 1
+
+
+def _run_backtest(tmp_path, monkeypatch, *extra):
+    from gecko.__main__ import main
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
+    return main(
+        [
+            "backtest",
+            "--rule",
+            "R0",
+            "--study-dir",
+            str(tmp_path),
+            "--history-db",
+            str(tmp_path / "scout.db"),
+            *extra,
+        ]
+    )
+
+
+def test_backtest_window_filters_coins(tmp_path, capsys, monkeypatch):
+    write_study(tmp_path, {"a": coin(10, 1.0, 8.0), "b": coin(12, 1.0, 0.4)})
+    _run_backtest(tmp_path, monkeypatch, "--from", "2026-04-12", "--to", "2026-04-14")
+    out = capsys.readouterr().out
+    assert (
+        "\nR0 | 1 | " in out
+        and "window 2026-04-12T00:00:00Z..2026-04-14T00:00:00Z" in out
+    )
+
+
+def test_backtest_pass_exits_0(tmp_path, capsys, monkeypatch):
+    # 24 young, volume-accelerating winners at 3.0x pass F4; 6 old losers at
+    # 0.5x are F4-rejected but sit in the same months, so the cohort beats its
+    # same-month baseline. t0 spread over ~4 months gives a median halves split.
+    # Verified PASS against the Plan 1 battery on 2026-10-14.
+    hot = [1] * 7 + [10] * 7  # prior week 7, last week 70: ratio 10
+    coins = {f"w{i}": coin(10 + 5 * i, 1.0, 3.0, vols=hot) for i in range(24)}
+    coins |= {
+        f"l{i}": coin(10 + 5 * i, 1.0, 0.5, age_days=200, vols=hot) for i in range(6)
+    }
+    write_study(tmp_path, coins)
+    from gecko.__main__ import main
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
+    rc = main(
+        [
+            "backtest",
+            "--rule",
+            "F4",
+            "--study-dir",
+            str(tmp_path),
+            "--history-db",
+            str(tmp_path / "scout.db"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "| PASS |" in out

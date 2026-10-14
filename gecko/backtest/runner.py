@@ -12,6 +12,7 @@ from gecko.backtest.study import (
 )
 from gecko.jobs import register
 from gecko.settings import GeckoSettings
+from gecko.store import canon_ts
 
 HEADER = (
     "rule | n | mean | median | BTC | ex-best | ex-top3 | same-month R0 | "
@@ -30,6 +31,15 @@ async def backtest_job(settings: GeckoSettings, ns: argparse.Namespace) -> int:
     except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
         print(f"backtest: cannot load study: {exc}")
         return 1
+    lo = canon_ts(ns.date_from) if getattr(ns, "date_from", None) else None
+    hi = canon_ts(ns.date_to) if getattr(ns, "date_to", None) else None
+    coins = [
+        c
+        for c in coins
+        if (lo is None or canon_ts(c.t0) >= lo) and (hi is None or canon_ts(c.t0) < hi)
+    ]
+    if lo or hi:
+        print(f"window {lo or '-'}..{hi or '-'}")
     b = battery(apply_rule(coins, ns.rule, settings), coins)
     failed = ",".join(str(i + 1) for i, p in enumerate(b.passes) if not p)
     print(
@@ -48,4 +58,4 @@ async def backtest_job(settings: GeckoSettings, ns: argparse.Namespace) -> int:
         f"live-definition divergence: {f4_divergence(coins, settings)} coins "
         f"change F4 verdict"
     )
-    return 0
+    return 0 if b.passed else 1
