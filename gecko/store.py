@@ -216,6 +216,14 @@ class Store:
         )
         await self.conn.commit()
 
+    async def set_deployer(self, token_id, deployer) -> None:
+        """Record a token's deployer; the first value recorded is kept."""
+        await self.conn.execute(
+            "UPDATE tokens SET deployer=COALESCE(deployer, ?), updated_at=? WHERE token_id=?",
+            (deployer, utcnow(), token_id),
+        )
+        await self.conn.commit()
+
     async def add_observation(
         self, token_id, source, observed_at, features: dict
     ) -> int:

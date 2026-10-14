@@ -7,8 +7,21 @@ handled here so "unknown" can never read as "safe".
 
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
+
+import aiohttp
+import structlog
+
+from gecko.http import Pacer, UpstreamError, get_json
 from gecko.identity import EVM_CHAINS, is_valid_address, norm_address
+from gecko.jobs import register
 from gecko.numeric import as_int, num
+from gecko.runs import JobResult, PartialFailure, run_job
+from gecko.settings import GeckoSettings
+from gecko.store import Store, canon_ts, parse_utc, utcnow
+
+log = structlog.get_logger("gecko.goplus")
 
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 GOPLUS_SOL_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
@@ -157,3 +170,134 @@ def goplus_features(chain: str, r: dict) -> dict:
         "top10_pct": _top10(chain, r),
         "deployer": deployer,
     }
+
+
+UNKNOWN = {"goplus_status": "unknown"}
+
+
+async def calls_today(store: Store, now: str) -> int:
+    day = canon_ts(now)[:10] + "T00:00:00Z"
+    row = await (
+        await store.conn.execute(
+            "SELECT COALESCE(SUM(credits_used),0) FROM runs WHERE job='enrich' AND started_at>=?",
+            (day,),
+        )
+    ).fetchone()
+    return int(row[0])
+
+
+async def enrich_queue(
+    store: Store, settings: GeckoSettings, now: str
+) -> list[tuple[str, str, str]]:
+    stale = canon_ts(
+        (parse_utc(now) - timedelta(hours=settings.gp_refresh_hours)).isoformat()
+    )
+    q = ",".join("?" * len(settings.chains))
+    rows = await (
+        await store.conn.execute(
+            "SELECT t.token_id, t.chain, t.address, t.status, w.token_id IS NOT NULL, "
+            "(SELECT MAX(observed_at) FROM observations o WHERE o.token_id=t.token_id "
+            " AND o.source='enrich'), "
+            "(SELECT COUNT(*) FROM observations o WHERE o.token_id=t.token_id "
+            " AND o.source='enrich' AND json_extract(o.features_json,'$.goplus_status')='ok') "
+            "FROM tokens t LEFT JOIN watchlist w ON w.token_id=t.token_id AND w.exited_at IS NULL "
+            f"WHERE t.status IN ('candidate','active') AND t.chain IN ({q})",
+            tuple(settings.chains),
+        )
+    ).fetchall()
+    due = [
+        r
+        for r in rows
+        if r[5] is None or (r[5] < stale and (r[3] == "active" or r[6] == 0))
+    ]
+    due.sort(
+        key=lambda r: (not r[4], r[3] != "active", r[5] is not None, r[5] or "", r[0])
+    )
+    return [(r[0], r[1], r[2]) for r in due]
+
+
+async def _fetch(session, settings, chain, address):
+    if chain in CHAIN_IDS:
+        url = GOPLUS_EVM_URL.format(chain_id=CHAIN_IDS[chain])
+    else:
+        url = GOPLUS_SOL_URL
+    body = await get_json(
+        session, url, settings=settings, params={"contract_addresses": address}
+    )
+    return pick_result(chain, address, body)
+
+
+async def enrich(
+    store: Store,
+    settings: GeckoSettings,
+    session: aiohttp.ClientSession,
+    now: str,
+    *,
+    sleep=asyncio.sleep,
+    budget_now: str | None = None,
+) -> JobResult:
+    # The budget day is always the real one (budget_now is a test seam), same
+    # ruling as the CoinGecko cap: an --as-of replay spends real calls today.
+    budget = max(
+        0, settings.gp_daily_cap - await calls_today(store, budget_now or utcnow())
+    )
+    todo = (await enrich_queue(store, settings, now))[
+        : min(settings.gp_max_per_run, budget)
+    ]
+    pacer = Pacer(settings.gp_min_interval_sec, sleep)
+    calls = written = failed = disq = 0
+    for tid, chain, address in todo:
+        await pacer.wait()
+        calls += 1
+        try:
+            r = await _fetch(session, settings, chain, address)
+        except (UpstreamError, GoPlusError) as exc:
+            failed += 1
+            log.warning(
+                "goplus_fetch_failed",
+                token_id=tid,
+                error=type(exc).__name__,
+                status=getattr(exc, "status", None),
+                code=getattr(exc, "code", None),
+            )
+            continue
+        except ValueError as exc:  # non-JSON body
+            failed += 1
+            log.warning("goplus_body_invalid", token_id=tid, error=type(exc).__name__)
+            continue
+        if r is None:
+            await store.add_observation(tid, "enrich", now, dict(UNKNOWN))
+            written += 1
+            continue
+        f = goplus_features(chain, r)
+        deployer = f.pop("deployer")
+        if deployer:
+            await store.set_deployer(tid, deployer)
+        await store.add_observation(tid, "enrich", now, f)
+        written += 1
+        if f["security_ok"] is False:
+            await store.set_token_status(tid, "disqualified", "security_fail")
+            disq += 1
+    log.info(
+        "enrich_done",
+        planned=len(todo),
+        written=written,
+        failed=failed,
+        disqualified=disq,
+        budget_left=budget - calls,
+    )
+    if todo and failed == len(todo):
+        raise PartialFailure(
+            RuntimeError("every GoPlus fetch failed"), credits_used=calls
+        )
+    return JobResult(rows_written=written, credits_used=calls)
+
+
+@register("enrich")
+async def enrich_job(settings: GeckoSettings, ns) -> int:
+    now = canon_ts(ns.as_of) if ns.as_of else utcnow()
+
+    async def body(store: Store, session: aiohttp.ClientSession) -> JobResult:
+        return await enrich(store, settings, session, now)
+
+    return await run_job("enrich", settings, body)

@@ -464,3 +464,19 @@ async def test_geckoterminal_ok_runs_writing_nothing_still_page(
     )
     tables = [x.table for x in await check_freshness(store, now)]
     assert ("observations:geckoterminal" in tables) is breach
+
+
+async def test_enrich_source_slo(store):
+    await store.record_run(
+        "enrich", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", True
+    )
+    await store.add_observation(
+        "base:x", "enrich", "2026-10-01T00:00:00Z", {"goplus_status": "ok"}
+    )
+    late = "2026-10-02T03:00:00Z"  # 27 h later
+    assert "observations:enrich" in {
+        b.table for b in await check_freshness(store, late)
+    }
+    assert "observations:enrich" not in {
+        b.table for b in await check_freshness(store, "2026-10-01T20:00:00Z")
+    }

@@ -19,6 +19,7 @@ def _load_jobs() -> None:
     import gecko.collectors.coingecko  # noqa: F401
     import gecko.collectors.dexscreener  # noqa: F401
     import gecko.collectors.geckoterminal  # noqa: F401
+    import gecko.collectors.goplus  # noqa: F401
     import gecko.freshness  # noqa: F401
     import gecko.ledger  # noqa: F401
     import gecko.rank  # noqa: F401

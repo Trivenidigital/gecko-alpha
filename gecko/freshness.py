@@ -27,6 +27,7 @@ SLO_MINUTES = {
     "observations:geckoterminal": 360,
     "observations:coingecko": 1560,
     "observations:geckoterminal_ohlcv": 1560,  # rows that carry candles only
+    "observations:enrich": 1560,
     "benchmark:btc": 180,  # the ledger cannot measure without it
 }
 BTC_TOKEN_ID = "benchmark:btc"
@@ -50,6 +51,7 @@ WRITER_JOBS = {
     "observations:geckoterminal": ("geckoterminal",),
     "observations:coingecko": ("coingecko-markets",),
     "observations:geckoterminal_ohlcv": ("geckoterminal-ohlcv",),
+    "observations:enrich": ("enrich",),
     "benchmark:btc": ("coingecko-hourly",),
 }
 # Tables whose writer may legitimately write 0 rows; judged by its last ok run.

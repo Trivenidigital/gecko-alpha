@@ -1,6 +1,17 @@
+import aiohttp
 import pytest
+from aioresponses import aioresponses
 
-from gecko.collectors.goplus import GoPlusError, goplus_features, pick_result
+from gecko.collectors.goplus import (
+    GoPlusError,
+    calls_today,
+    enrich,
+    enrich_queue,
+    goplus_features,
+    pick_result,
+)
+from gecko.features import compute_features
+from gecko.runs import PartialFailure
 
 BRETT = "0x532f27101965dd16442e59d40670faf5ebb142e4"
 POOL = "0x0ca6485b7e9cf814a3fd09d81672b07323535b64"
@@ -291,3 +302,155 @@ def test_code_2_partial_body_reads_unknown():
     partial = {k: v for k, v in evm().items() if k != "cannot_sell_all"}
     r = pick_result("base", BRETT, {"code": 2, "result": {BRETT: partial}})
     assert goplus_features("base", r)["security_ok"] is None
+
+
+NOW = "2026-10-14T12:00:00Z"
+SOL_URL = "https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses="
+BASE_URL = "https://api.gopluslabs.io/api/v1/token_security/8453?contract_addresses="
+A = "0x" + "a" * 40
+B = "0x" + "b" * 40
+
+
+async def tok(store, chain, addr, status="active", first="2026-10-10T00:00:00Z"):
+    tid = f"{chain}:{addr}"
+    await store.upsert_token(tid, chain, addr, "T", "T", first, "dexscreener")
+    await store.set_token_status(tid, status)
+    return tid
+
+
+async def enrich_rows(store, tid):
+    return await store.observations(tid, as_of=NOW, source="enrich")
+
+
+async def test_enrich_writes_features_and_deployer(store, settings):
+    tid = await tok(store, "base", A)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert r.rows_written == 1 and r.credits_used == 1
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["security_ok"] is True and "deployer" not in o.features
+    row = await (
+        await store.conn.execute("SELECT deployer FROM tokens WHERE token_id=?", (tid,))
+    ).fetchone()
+    assert row[0] == "0x3c12b77ae8b7dd1feb63d1d6a2a819acda0a41d2"
+
+
+async def test_empty_result_writes_unknown_marker(store, settings):
+    tid = await tok(store, "base", A)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {}})
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features == {"goplus_status": "unknown"}
+
+
+async def test_failed_security_disqualifies_candidate(store, settings):
+    tid = await tok(store, "base", A, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(
+                BASE_URL + A, payload={"code": 1, "result": {A: evm(is_honeypot="1")}}
+            )
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    row = await (
+        await store.conn.execute(
+            "SELECT status, disqualify_reason FROM tokens WHERE token_id=?", (tid,)
+        )
+    ).fetchone()
+    assert row == ("disqualified", "security_fail")
+
+
+async def test_queue_priority_and_refresh_rules(store, settings):
+    cand_new = await tok(store, "base", "0x" + "1" * 40, status="candidate")
+    cand_ok = await tok(store, "base", "0x" + "2" * 40, status="candidate")
+    cand_unknown = await tok(store, "base", "0x" + "3" * 40, status="candidate")
+    act_stale = await tok(store, "base", "0x" + "4" * 40)
+    act_fresh = await tok(store, "base", "0x" + "5" * 40)
+    wl = await tok(store, "base", "0x" + "6" * 40)
+    await store.watchlist_upsert(wl, "2026-10-13T00:00:00Z", "F4", 1, 1.0, {})
+    old, recent = "2026-10-13T10:00:00Z", "2026-10-14T06:00:00Z"
+    await store.add_observation(cand_ok, "enrich", old, {"goplus_status": "ok"})
+    await store.add_observation(
+        cand_unknown, "enrich", old, {"goplus_status": "unknown"}
+    )
+    await store.add_observation(act_stale, "enrich", old, {"goplus_status": "ok"})
+    await store.add_observation(act_fresh, "enrich", recent, {"goplus_status": "ok"})
+    q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+    assert q == [wl, act_stale, cand_new, cand_unknown]
+
+
+async def test_queue_skips_unconfigured_chain_and_benchmark(store, settings):
+    settings.chains = ["solana"]
+    await tok(store, "base", A)
+    await store.upsert_token(
+        "benchmark:btc", "benchmark", "btc", "BTC", "Bitcoin", NOW, "coingecko"
+    )
+    assert await enrich_queue(store, settings, NOW) == []
+
+
+async def test_run_cap_and_daily_cap(store, settings):
+    settings.gp_max_per_run = 1
+    await tok(store, "base", A)
+    await tok(store, "base", B)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert r.credits_used == 1
+    await store.record_run("enrich", NOW, NOW, True, credits_used=999)
+    assert await calls_today(store, NOW) == 999
+    settings.gp_daily_cap = 999
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep, budget_now=NOW)
+            assert not m.requests
+    assert r.credits_used == 0
+
+
+async def test_error_code_counts_failure_and_other_tokens_continue(store, settings):
+    await tok(store, "base", A)
+    tb = await tok(store, "base", B)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 4029, "message": "rate"})
+            m.get(BASE_URL + B, payload={"code": 1, "result": {B: evm()}})
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert r.rows_written == 1 and len(await enrich_rows(store, tb)) == 1
+
+
+async def test_every_fetch_failing_raises_partial_failure(store, settings):
+    await tok(store, "base", A)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, status=400)
+            with pytest.raises(PartialFailure) as ei:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert ei.value.credits_used == 1
+
+
+async def test_solana_uses_solana_endpoint(store, settings):
+    tid = await tok(store, "solana", WIF)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(SOL_URL + WIF, payload={"code": 1, "result": {WIF: sol()}})
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["top10_pct"] == pytest.approx(23.39)
+
+
+async def test_enrich_feeds_features(store, settings):
+    tid = await tok(store, "base", A)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    f = await compute_features(store, settings, tid, NOW)
+    assert f.security_ok is True and f.holders == 1182384
+    assert f.top10_pct == pytest.approx(10.92) and f.bundle_flag is False
+
+
+async def _nosleep(_):
+    return None

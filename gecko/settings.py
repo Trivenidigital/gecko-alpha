@@ -42,6 +42,16 @@ class GeckoSettings(BaseSettings):
     cg_max_pages: int = 14
     cg_hourly_reserve: int = 100  # monthly calls the markets sweep leaves for hourly
     cg_max_lookups_per_run: int = 300  # /coins/{id} platform lookups per sweep
+    gp_min_interval_sec: float = (
+        2.0  # keyless GoPlus: <=30 calls/min, well under 150 CU/min
+    )
+    gp_max_per_run: int = 40  # tokens enriched per hourly run
+    gp_daily_cap: int = (
+        1000  # calls/day; calibrate from the GoPlus dashboard in the soak
+    )
+    gp_refresh_hours: int = (
+        20  # active tokens re-read about daily (holder growth needs it)
+    )
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
