@@ -231,3 +231,63 @@ def test_pick_result_raises_on_error_code():
     assert ei.value.code == 4029
     with pytest.raises(GoPlusError):
         pick_result("base", BRETT, "not a dict")
+
+
+@pytest.mark.parametrize("result", [[{"is_honeypot": "0"}], "oops"])
+def test_pick_result_non_dict_result_raises_goplus_error(result):
+    with pytest.raises(GoPlusError) as ei:
+        pick_result("base", BRETT, {"code": 1, "result": result})
+    assert ei.value.code == 1
+
+
+def test_pick_result_empty_list_result_is_unknown():
+    assert pick_result("base", BRETT, {"code": 1, "result": []}) is None
+
+
+@pytest.mark.parametrize("over", [{"dex": 5}, {"lp_holders": "x"}])
+def test_top10_tolerates_malformed_dex_and_lp_holders(over):
+    # the malformed exclusion list is ignored; POOL then counts as a holder
+    assert goplus_features("base", evm(**over))["top10_pct"] is not None
+
+
+@pytest.mark.parametrize("key", ["is_honeypot", "cannot_sell_all", "is_blacklisted"])
+def test_evm_missing_core_flag_is_unknown(key):
+    r = evm()
+    del r[key]
+    assert goplus_features("base", r)["security_ok"] is None
+
+
+def test_evm_missing_taxes_are_not_required():
+    r = evm()
+    del r["buy_tax"], r["sell_tax"]
+    assert goplus_features("base", r)["security_ok"] is True
+
+
+@pytest.mark.parametrize("over", [{"is_mintable": "1"}, {"is_proxy": "1"}])
+def test_evm_mintable_or_proxy_without_owner_key_is_unknown(over):
+    r = evm(**over)
+    del r["owner_address"]
+    f = goplus_features("base", r)
+    assert f["security_ok"] is None and f["security_flags"] == []
+
+
+def test_evm_absent_owner_still_fails_on_another_flag():
+    r = evm(is_mintable="1", sell_tax="0.5")
+    del r["owner_address"]
+    f = goplus_features("base", r)
+    assert f["security_ok"] is False and f["security_flags"] == ["sell_tax"]
+
+
+@pytest.mark.parametrize(
+    "key", ["mintable", "freezable", "balance_mutable_authority", "non_transferable"]
+)
+def test_sol_missing_core_flag_is_unknown(key):
+    r = sol()
+    del r[key]
+    assert goplus_features("solana", r)["security_ok"] is None
+
+
+def test_code_2_partial_body_reads_unknown():
+    partial = {k: v for k, v in evm().items() if k != "cannot_sell_all"}
+    r = pick_result("base", BRETT, {"code": 2, "result": {BRETT: partial}})
+    assert goplus_features("base", r)["security_ok"] is None

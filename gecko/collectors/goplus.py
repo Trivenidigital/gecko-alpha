@@ -13,7 +13,10 @@ from gecko.numeric import as_int, num
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 GOPLUS_SOL_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 CHAIN_IDS = {"ethereum": "1", "bsc": "56", "base": "8453"}
-OK_CODES = (1, 2)  # 2 = partial data; still parsed, missing flags read as unknown
+OK_CODES = (
+    1,
+    2,
+)  # 2 = partial data: parsed, and any missing core flag reads as unknown
 MAX_TAX = 0.10
 RENOUNCED = {
     "",
@@ -38,8 +41,13 @@ def pick_result(chain: str, address: str, body) -> dict | None:
     """This token's entry, or None when GoPlus does not know the token."""
     if not isinstance(body, dict) or body.get("code") not in OK_CODES:
         raise GoPlusError(body.get("code") if isinstance(body, dict) else None)
+    res = body.get("result")
+    if res in (None, {}, []):
+        return None
+    if not isinstance(res, dict):
+        raise GoPlusError(body.get("code"))
     want = norm_address(chain, address)
-    for k, v in (body.get("result") or {}).items():
+    for k, v in res.items():
         if norm_address(chain, str(k)) == want and isinstance(v, dict):
             return v
     return None
@@ -56,7 +64,14 @@ def _status(v) -> bool | None:
 
 
 def _evm_security(r: dict) -> tuple[list[str], bool]:
+    """Core flags are honeypot/cannot_sell_all/blacklist; taxes are optional.
+
+    A mintable or proxy contract needs ``owner_address`` to be judged: when the
+    key is absent the result is unknown, never renounced.
+    """
     owned = str(r.get("owner_address") or "").lower() not in RENOUNCED
+    owner_needed = _flag(r.get("is_mintable")) or _flag(r.get("is_proxy"))
+    owner_known = not owner_needed or "owner_address" in r
     checks = {
         "honeypot": _flag(r.get("is_honeypot")),
         "cannot_sell_all": _flag(r.get("cannot_sell_all")),
@@ -67,11 +82,12 @@ def _evm_security(r: dict) -> tuple[list[str], bool]:
         tax = num(r.get(key))
         if tax is not None and tax > MAX_TAX:
             flags.append(key)
-    if owned and _flag(r.get("is_mintable")):
+    if owner_known and owned and _flag(r.get("is_mintable")):
         flags.append("mintable_owned")
-    if owned and _flag(r.get("is_proxy")):
+    if owner_known and owned and _flag(r.get("is_proxy")):
         flags.append("proxy_owned")
-    return flags, checks["honeypot"] is not None
+    known = owner_known and all(v is not None for v in checks.values())
+    return flags, known
 
 
 def _sol_security(r: dict) -> tuple[list[str], bool]:
@@ -85,8 +101,11 @@ def _sol_security(r: dict) -> tuple[list[str], bool]:
     hook = r.get("transfer_hook")
     if isinstance(hook, list) and hook:
         flags.append("transfer_hook")
-    known = checks["mintable"] is not None and checks["freezable"] is not None
-    return flags, known
+    return flags, all(v is not None for v in checks.values())
+
+
+def _list(v) -> list:
+    return v if isinstance(v, list) else []
 
 
 def _top10(chain: str, r: dict) -> float | None:
@@ -95,12 +114,12 @@ def _top10(chain: str, r: dict) -> float | None:
         return None
     skip = {
         norm_address(chain, str(d.get("pair") or d.get("id") or ""))
-        for d in r.get("dex") or []
+        for d in _list(r.get("dex"))
         if isinstance(d, dict)
     }
     skip |= {
         norm_address(chain, str(h.get("address") or ""))
-        for h in r.get("lp_holders") or []
+        for h in _list(r.get("lp_holders"))
         if isinstance(h, dict)
     }
     skip |= BURN | SOL_AMM_AUTHORITIES
