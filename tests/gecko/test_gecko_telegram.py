@@ -207,6 +207,7 @@ async def _nosleep(_):
 
 def _legacy_db(path):
     db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")  # as prod scout.db: ro-opens leave sidecars
     db.execute(
         "CREATE TABLE tg_social_messages(id INTEGER PRIMARY KEY, channel_handle TEXT, msg_id INTEGER,"
         " posted_at TEXT, sender TEXT, text TEXT, cashtags TEXT, contracts TEXT, urls TEXT, parsed_at TEXT)"
@@ -241,10 +242,12 @@ def test_migrate_calls_is_idempotent_and_read_only(tmp_path, monkeypatch, capsys
     assert main(["migrate-calls", "--history-db", str(legacy)]) == 0
     assert "migrated 0 call(s)" in capsys.readouterr().out
     assert legacy.read_bytes() == before
+    for ext in ("-wal", "-shm", "-journal"):
+        assert not (tmp_path / f"scout.db{ext}").exists()
     db = sqlite3.connect(tmp_path / "gecko.db")
-    assert db.execute("SELECT event_id, posted_at FROM source_calls").fetchall() == [
-        ("tg:@gem:7", "2026-08-01T00:00:00Z")
-    ]
+    assert db.execute(
+        "SELECT event_id, source_id, posted_at FROM source_calls"
+    ).fetchall() == [("tg:@gem:7", "@gem", "2026-08-01T00:00:00Z")]
 
 
 def test_migrate_calls_missing_db_exits_1(tmp_path, monkeypatch):

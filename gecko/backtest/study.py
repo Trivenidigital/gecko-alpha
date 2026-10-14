@@ -92,7 +92,9 @@ def _stored_prices(history_db: str | None) -> dict[str, tuple[str, float]]:
     if not os.path.exists(history_db):
         # A mistyped path would silently skip the chart/stored exclusion.
         raise FileNotFoundError(f"history db not found: {history_db}")
-    with closing(sqlite3.connect(f"file:{history_db}?mode=ro", uri=True)) as conn:
+    with closing(
+        sqlite3.connect(f"file:{history_db}?mode=ro&immutable=1", uri=True)
+    ) as conn:
         for q in STORED_QUERIES:
             try:
                 rows = conn.execute(q).fetchall()

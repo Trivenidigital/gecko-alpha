@@ -198,9 +198,9 @@ async def migrate_calls_job(settings: GeckoSettings, ns) -> int:
 
     async def body(store: Store, session) -> JobResult:
         n = 0
-        # mode=ro: the legacy database is evidence, never written or migrated.
+        # immutable: the frozen legacy db is evidence; even WAL sidecars must not appear.
         async with aiosqlite.connect(
-            path.resolve().as_uri() + "?mode=ro", uri=True
+            path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True
         ) as legacy:
             async with legacy.execute(
                 "SELECT channel_handle, msg_id, posted_at, text FROM tg_social_messages ORDER BY id"

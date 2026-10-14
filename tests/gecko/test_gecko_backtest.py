@@ -278,6 +278,20 @@ def test_stored_price_is_earliest_across_tables(tmp_path):
     assert load_study(str(tmp_path), str(tmp_path / "scout.db")) == []
 
 
+def test_history_db_open_leaves_no_sidecars(tmp_path):
+    write_study(tmp_path, {"a": coin(10, 1.0, 2.0)})
+    db = sqlite3.connect(tmp_path / "scout.db")
+    db.execute("PRAGMA journal_mode=WAL")  # as prod scout.db
+    db.close()
+    before = (tmp_path / "scout.db").read_bytes()
+    assert [c.cid for c in load_study(str(tmp_path), str(tmp_path / "scout.db"))] == [
+        "a"
+    ]
+    assert (tmp_path / "scout.db").read_bytes() == before
+    for ext in ("-wal", "-shm", "-journal"):
+        assert not (tmp_path / f"scout.db{ext}").exists()
+
+
 def test_backtest_job_prints_row_and_divergence(tmp_path, capsys, monkeypatch):
     from gecko.__main__ import main
 
