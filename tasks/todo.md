@@ -2727,3 +2727,39 @@ Review: PR583 built and independently approved; CI pending. Frozen selective rel
 - [ ] Exact CI before root merge/integration.
 
 WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
+## Selective dashboard release plan: 2026-09-14
+
+> Superseded (2026-10-15, PR #599 reconciliation): these three sections are the release branch's 09-14 snapshots. The release itself was deployed as 77751890 at 13:14:10Z — see tasks/closeout_recovery_2026_09_14.md; unchecked boxes below are historical, not open work.
+
+- [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
+- [x] Both plan reviewers approved bc4c5837 without folds; design-only artifact prepared with copy/lock/runtime bounds.
+- [x] Both design reviewers approved 38150404 without folds; local disposable harnesses prepared with boundary tests.
+- [x] All four features merged; selective old-core source assembled locally, focused tests and combined build parity recorded in release report.
+- [ ] Exact old-core release verification and two candidate reviews before conditional dashboard-only deploy.
+
+Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Merged-feature CI and exact selective-candidate local Linux validation remain distinct evidence.
+
+## Release retry after aborted stop (2026-09-14)
+- [x] Isolate from frozen07af and record retry plan.
+- [ ] Two plan reviews, design/two reviews, merged WS fix, assembly and exact verification.
+- [ ] Final candidate/helper reviews, fresh preflight, conditional dashboard-only rollout and recovery checks.
+- [x] Retry plan/design each received two approvals, sibling-baseline fold recorded.
+- [x] PR583 merged with reviews/green CI; exact two-file application delta applied to frozen07af;59local tests passed.
+- [ ] Exact new manifest/Linux/copy proofs, final candidate/helper reviews and conditional rollout remain.
+
+## Successor read-only health/lanes release (2026-09-14)
+- [x] Isolate from frozen5c; inspect current source, existing validators, prior Hermes evidence and available disk.
+- [x] Write plan separating immutable d2 core reference from actual deployed/rollback release.
+- [ ] Two plan reviews; separate design and two design reviews before assembly.
+- [ ] PR585 merged/CI green; exact seven-PR manifest, candidate source/Linux/copy/content evidence.
+- [ ] Two final candidate/helper reviews; root-owned fresh runtime preflight and conditional rollout.
+
+Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; no application assembly, helper changes, DB copies or deployment.
+- [x] Successor plan5e249634 approved by root and postmortem; concrete design audits core/runtime baseline separation, copy reuse and helper dependencies.
+- [ ] Two exact design approvals before implementation or archive/copy changes.
+- [x] Root/ops approved design f1a9250c and exact two-UI exception amendment ed680902 before implementation.
+- [x] Successor manifest red/green:25 local harness tests passed; original1358 proof preserved,1356 unchanged, two exact merged UI replacements, full runtime/candidate metadata mappings.
+- [ ] Assemble exact829d12b1 selected blobs, local regression/build proofs, then Linux/copy validation and two final reviews.
+- [x] Exact829d source assembled at4e677167;315 local regression tests plus25 manifest tests passed;84-module private frontend build matches all3 served merged blobs.
+- [ ] Root-owned exact archive/Linux/copy proofs and two final reviews remain; Windows aiosqlite warning recorded for comparison.
