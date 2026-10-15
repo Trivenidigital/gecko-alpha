@@ -47,3 +47,14 @@ def test_ledger_max_overdue_days_floor(tmp_path):
     assert GeckoSettings(db_path=db, ledger_max_overdue_days=7, _env_file=None)
     with pytest.raises(ValidationError):
         GeckoSettings(db_path=db, ledger_max_overdue_days=6, _env_file=None)
+
+
+def test_tg_catchup_limit_floor(tmp_path):
+    # 0 reads nothing while every poll stays ok (the legacy "dark" setting)
+    import pytest
+    from pydantic import ValidationError
+
+    db = str(tmp_path / "g.db")
+    assert GeckoSettings(db_path=db, tg_catchup_limit=1, _env_file=None)
+    with pytest.raises(ValidationError):
+        GeckoSettings(db_path=db, tg_catchup_limit=0, _env_file=None)

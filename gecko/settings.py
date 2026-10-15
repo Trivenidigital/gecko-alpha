@@ -63,7 +63,8 @@ class GeckoSettings(BaseSettings):
     )
     tg_channels: list[str] = []  # public @handles
     tg_poll_interval_sec: int = 120
-    tg_catchup_limit: int = 200  # newest messages read per channel per poll
+    # newest messages read per channel per poll; 0 would read nothing, ok forever
+    tg_catchup_limit: int = Field(200, ge=1)
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
