@@ -61,11 +61,12 @@ def test_tg_catchup_limit_floor(tmp_path):
 
 
 def test_tg_poll_interval_floor(tmp_path):
-    # 0 would spin the reader against Telegram's flood limits
+    # a fast poll invites FloodWait on gecko's own session
     import pytest
     from pydantic import ValidationError
 
     db = str(tmp_path / "g.db")
-    assert GeckoSettings(db_path=db, tg_poll_interval_sec=1, _env_file=None)
+    assert GeckoSettings(db_path=db, _env_file=None).tg_poll_interval_sec == 120
+    assert GeckoSettings(db_path=db, tg_poll_interval_sec=30, _env_file=None)
     with pytest.raises(ValidationError):
-        GeckoSettings(db_path=db, tg_poll_interval_sec=0, _env_file=None)
+        GeckoSettings(db_path=db, tg_poll_interval_sec=29, _env_file=None)
