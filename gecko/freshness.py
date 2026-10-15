@@ -43,7 +43,7 @@ WRITER_JOBS = {
         "coingecko-hourly",
         "enrich",
     ),
-    "source_calls": ("telegram-reader", "xkol"),
+    "source_calls": ("telegram-reader",),  # an X lane gets its own key, never this one
     "watchlist": ("rank",),
     "forward_returns": ("ledger",),
     "research_notes": ("research",),

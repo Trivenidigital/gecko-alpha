@@ -519,6 +519,24 @@ async def test_source_calls_is_run_anchored_on_the_reader(store):
     }
 
 
+async def test_other_ok_writer_does_not_mask_a_failing_reader(store):
+    # an ok run from any other job (e.g. a future xkol lane) must not keep
+    # source_calls fresh while the reader fails
+    for job in ("xkol", "dexscreener"):
+        await store.record_run(
+            job, "2026-10-02T00:30:00Z", "2026-10-02T00:30:00Z", True
+        )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", False
+    )
+    hit = [
+        b
+        for b in await check_freshness(store, "2026-10-02T00:40:00Z")
+        if b.table == "source_calls"
+    ]
+    assert hit == [Breach("source_calls", None, 30)]
+
+
 @pytest.mark.parametrize(
     "now,breach", [("2026-10-02T00:31:00Z", True), ("2026-10-02T00:29:00Z", False)]
 )
