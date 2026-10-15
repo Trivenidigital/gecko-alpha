@@ -474,7 +474,10 @@ async def test_enrich_source_slo(store):
         "enrich", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", True
     )
     await store.add_observation(
-        "base:x", "enrich", "2026-10-01T00:00:00Z", {"goplus_status": "ok"}
+        "base:x",
+        "enrich",
+        "2026-10-01T00:00:00Z",
+        {"goplus_status": "ok", "security_ok": True},
     )
     late = "2026-10-02T03:00:00Z"  # 27 h later
     assert "observations:enrich" in {
@@ -488,12 +491,16 @@ async def test_enrich_source_slo(store):
 async def test_enrich_slo_ignores_unknown_markers(store):
     t0, late = "2026-10-01T00:00:00Z", "2026-10-02T03:00:00Z"  # 27 h apart
     await store.record_run("enrich", t0, t0, True)
-    await store.add_observation("base:x", "enrich", t0, {"goplus_status": "ok"})
+    await store.add_observation(
+        "base:x", "enrich", t0, {"goplus_status": "ok", "security_ok": True}
+    )
     await store.add_observation("base:y", "enrich", late, {"goplus_status": "unknown"})
     assert "observations:enrich" in {
         b.table for b in await check_freshness(store, late)
     }
-    await store.add_observation("base:z", "enrich", late, {"goplus_status": "ok"})
+    await store.add_observation(
+        "base:z", "enrich", late, {"goplus_status": "ok", "security_ok": False}
+    )
     assert "observations:enrich" not in {
         b.table for b in await check_freshness(store, late)
     }

@@ -173,6 +173,11 @@ def goplus_features(chain: str, r: dict) -> dict:
 
 
 UNKNOWN = {"goplus_status": "unknown"}
+# An enrich row that carries a verdict; an ok read without one is not evidence.
+KNOWN_VERDICT = (
+    "json_extract(features_json,'$.goplus_status')='ok'"
+    " AND json_type(features_json,'$.security_ok') IN ('true','false')"
+)
 
 
 async def calls_today(store: Store, now: str) -> int:
@@ -199,7 +204,7 @@ async def enrich_queue(
             "(SELECT MAX(observed_at) FROM observations o WHERE o.token_id=t.token_id "
             " AND o.source='enrich'), "
             "(SELECT COUNT(*) FROM observations o WHERE o.token_id=t.token_id "
-            " AND o.source='enrich' AND json_extract(o.features_json,'$.goplus_status')='ok'), "
+            f" AND o.source='enrich' AND {KNOWN_VERDICT}), "
             "t.first_seen_at "
             "FROM tokens t LEFT JOIN watchlist w ON w.token_id=t.token_id AND w.exited_at IS NULL "
             f"WHERE t.status IN ('candidate','active') AND t.chain IN ({q})",
@@ -247,7 +252,7 @@ async def enrich(
         : min(settings.gp_max_per_run, budget)
     ]
     pacer = Pacer(settings.gp_min_interval_sec, sleep)
-    calls = written = failed = disq = 0
+    calls = written = failed = disq = unknown = 0
     for tid, chain, address in todo:
         await pacer.wait()
         calls += 1
@@ -269,14 +274,14 @@ async def enrich(
             continue
         if r is None:
             await store.add_observation(tid, "enrich", now, dict(UNKNOWN))
-            written += 1
+            written, unknown = written + 1, unknown + 1
             continue
         f = goplus_features(chain, r)
         deployer = f.pop("deployer")
         if deployer:
             await store.set_deployer(tid, deployer)
         await store.add_observation(tid, "enrich", now, f)
-        written += 1
+        written, unknown = written + 1, unknown + (f["security_ok"] is None)
         if f["security_ok"] is False:
             await store.set_token_status(tid, "disqualified", "security_fail")
             disq += 1
@@ -286,6 +291,7 @@ async def enrich(
         written=written,
         failed=failed,
         disqualified=disq,
+        unknown_security=unknown,
         budget_left=budget - calls,
     )
     if todo and failed == len(todo):

@@ -6,6 +6,7 @@ from datetime import timedelta
 import aiohttp
 import structlog
 
+from gecko.collectors.goplus import KNOWN_VERDICT
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.runs import JobResult, run_job
@@ -114,8 +115,8 @@ async def _last_write(store: Store, key: str) -> str | None:
         where, args = "source=?", (src,)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
-        elif src == "enrich":  # "unknown" markers are not data
-            where += " AND json_extract(features_json, '$.goplus_status')='ok'"
+        elif src == "enrich":  # unknown markers and verdict-less reads are not data
+            where += " AND " + KNOWN_VERDICT
         elif (
             src == "coingecko"
         ):  # markets rows only: hourly BTC/trending mask a dead sweep

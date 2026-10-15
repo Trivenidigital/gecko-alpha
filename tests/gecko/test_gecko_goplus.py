@@ -377,14 +377,21 @@ async def test_queue_priority_and_refresh_rules(store, settings):
     wl = await tok(store, "base", "0x" + "6" * 40)
     await store.watchlist_upsert(wl, "2026-10-13T00:00:00Z", "F4", 1, 1.0, {})
     old, recent = "2026-10-13T10:00:00Z", "2026-10-14T06:00:00Z"
-    await store.add_observation(cand_ok, "enrich", old, {"goplus_status": "ok"})
+    cand_partial = await tok(store, "base", "0x" + "7" * 40, status="candidate")
+    await store.add_observation(
+        cand_ok, "enrich", old, {"goplus_status": "ok", "security_ok": True}
+    )
     await store.add_observation(
         cand_unknown, "enrich", old, {"goplus_status": "unknown"}
+    )
+    # an ok read with no verdict (code 2 / missing core flag) still gets the daily retry
+    await store.add_observation(
+        cand_partial, "enrich", old, {"goplus_status": "ok", "security_ok": None}
     )
     await store.add_observation(act_stale, "enrich", old, {"goplus_status": "ok"})
     await store.add_observation(act_fresh, "enrich", recent, {"goplus_status": "ok"})
     q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
-    assert q == [wl, act_stale, cand_new, cand_unknown]
+    assert q == [wl, act_stale, cand_new, cand_unknown, cand_partial]
 
 
 async def test_queue_skips_unconfigured_chain_and_benchmark(store, settings):
@@ -467,3 +474,44 @@ async def test_queue_never_enriched_is_fifo_by_first_seen(store, settings):
     assert late < early  # token_id order is the reverse of arrival order
     q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
     assert q == [early, late]
+
+
+async def test_enrich_slo_needs_a_known_verdict_and_done_counts_unknowns(
+    store, settings
+):
+    # GoPlus drops a core flag: every row is goplus_status=ok with no verdict.
+    # Freshness must page, and enrich_done must say how many verdicts were unknown.
+    from datetime import timedelta
+
+    from structlog.testing import capture_logs
+
+    from gecko.freshness import check_freshness
+    from gecko.store import parse_utc
+
+    def at(h):
+        return (parse_utc(NOW) + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    await store.record_run("enrich", at(-25), at(-25), True)
+    a, b, c = A, "0x" + "b" * 40, "0x" + "c" * 40
+    for addr in (a, b, c):
+        await tok(store, "base", addr)
+    partial = evm()
+    del partial["is_honeypot"]
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + a, payload={"code": 1, "result": {a: partial}})
+            m.get(BASE_URL + b, payload={"code": 1, "result": {b: dict(partial)}})
+            m.get(BASE_URL + c, payload={"code": 1, "result": {}})
+            with capture_logs() as logs:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (done,) = [e for e in logs if e["event"] == "enrich_done"]
+    assert done["written"] == 3 and done["unknown_security"] == 3
+    tables = {x.table for x in await check_freshness(store, at(2))}
+    assert "observations:enrich" in tables
+    tid = await tok(store, "base", "0x" + "d" * 40)
+    await store.add_observation(
+        tid, "enrich", NOW, {"goplus_status": "ok", "security_ok": False}
+    )
+    assert "observations:enrich" not in {
+        x.table for x in await check_freshness(store, at(2))
+    }
