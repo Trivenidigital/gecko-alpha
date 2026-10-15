@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_CHAINS = ("solana", "base", "ethereum", "bsc")
@@ -30,7 +30,9 @@ class GeckoSettings(BaseSettings):
     f4_min_vol_ratio: float = 2.0
     top10_disqualify_pct: float = 60.0
     dead_after_days: int = 7
-    ledger_max_overdue_days: int = 14  # open this long past due: closed unmeasured
+    # open this long past due: closed unmeasured (irreversible). Floor 7 d, so the
+    # 72 h forward_returns_backlog page always fires first.
+    ledger_max_overdue_days: int = Field(14, ge=7)
     require_security_known: bool = False  # Plan 3 flips to True at cutover
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
