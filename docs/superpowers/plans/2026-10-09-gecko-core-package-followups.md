@@ -51,8 +51,8 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Structural probe in the session scratchpad uses an invalid address fixture and no longer runs — scratch only, no action.
 
 ## Plan 3 deployment checklist items (from the ops-safety and concurrency vectors)
-- **FIRST: `GECKO_DB_PATH` is already used by legacy scripts (`scripts/gecko-backup-create.sh`, `scripts/chain-anchor-health-watchdog.sh`, `cron/README.md`) to mean the path to `scout.db`.** Never export it globally; set it only in `/root/gecko-alpha/.env.gecko` or the Hermes per-job env. Ticket: rename the gecko env prefix (e.g. `GK_`) before cutover.
-- `.env.gecko` is resolved relative to the job's working directory: every Hermes job must run with `workdir=/root/gecko-alpha` (or an absolute `GECKO_ENV_FILE`).
+- **FIRST: `GECKO_DB_PATH` is already used by legacy scripts (`scripts/gecko-backup-create.sh`, `scripts/chain-anchor-health-watchdog.sh`, `cron/README.md`) to mean the path to `scout.db`.** The same collision holds for **`GECKO_ENV_FILE`**, which legacy code reads as the path to the legacy `.env` (`scripts/alert-channel-watchdog.sh`, `scripts/acceleration-heartbeat-watchdog.sh`, `scripts/audit_stop_loss_false_negatives.sh`, `scout/config_alert.py`); gecko does not read it at all. Never export either globally; set `GECKO_DB_PATH` only in `/root/gecko-alpha/.env.gecko` or the Hermes per-job env. Ticket: rename the gecko env prefix (e.g. `GK_`) before cutover.
+- `.env.gecko` is resolved relative to the job's working directory: every Hermes job must run with `workdir=/root/gecko-alpha`.
 - `GECKO_*` variables live in `/root/gecko-alpha/.env.gecko` (or the Hermes job env); NEVER in the legacy `.env` (scout `extra="forbid"` crash-loop).
 - Set `GECKO_DB_PATH` absolute for every job; include `gecko.db` in the backup set; check srilu disk headroom before cutover (observations grow up to ~86k rows/day until pruning exists).
 - During coexistence with the legacy pipeline (which polls GeckoTerminal every 60 s), set `GECKO_GT_MIN_INTERVAL_SEC=3.0` and schedule `geckoterminal-ohlcv` off the :00/:15/:30/:45 pool-job slots; stagger `coingecko-markets` away from `coingecko-hourly`.
@@ -101,3 +101,43 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Re-run the F4 backtest anchor on the VPS study data; expect PASS with rc 0. Backtest exit 1 means FAIL **or** a crash — read the output, not just the code.
 - Verify every job has run once after deploy: a never-run writer is invisible to freshness.
 - An X-lane writer must not share the `source_calls` freshness key with `telegram-reader` — give xkol its own key, or a live reader masks a dead X lane (and vice versa).
+
+## From the PR #598 vector reviews (2026-10-15)
+Format: area — finding — fix — owner plan. Items fixed in the PR are not listed.
+
+**Ops-safety (vec-ops)**
+- Reader — one handle that will not resolve kills the whole reader on every restart (`get_input_entity` in a dict comprehension); it now pages, but no channel is read — resolve handles one by one, skip and log the bad one — Plan 3.
+- Reader unit — a crash loop has no systemd-level alert — add `OnFailure=codex-systemd-failure-alert@%n.service` (template exists on prod) to `gecko-telegram-reader.service` — Plan 3.
+- `tg-login` — silently adopts an existing file at `GECKO_TG_SESSION_PATH`, so a COPY of the legacy session outside the repo runs as the legacy device — refuse when the file exists (force a fresh device) — Plan 3.
+- Store — `prune` is the first DELETE path and only a schema clash stops it on the wrong DB (a leaked legacy `GECKO_DB_PATH` would create gecko tables inside scout.db before failing) — stamp and check `PRAGMA application_id` in `Store.open`, refuse a foreign DB before any DDL; raises the priority of the prefix rename — Plan 3, before cutover.
+- Ledger — expiry is a silent automated closure (a warning log only) and expired rows leave the backlog count — put the `expired` count in the health page / digest — Plan 3.
+- Retention — at the 30 d floor plus a ledger outage over 14 d, a late entry-price resolution finds the 48 h window already pruned — size `GECKO_OBS_RETENTION_DAYS` well above `30 + ledger_max_overdue_days` — Plan 3 (sizing).
+- Checklist — Telethon does not create the session directory and `session_problem` checks only the file mode — `install -d -m 700 /root/.gecko` before `tg-login` — Plan 3.
+- Checklist — with `GECKO_TG_CHANNELS` set and the unit not yet installed, freshness pages `source_calls` every 6 h (intended) — set `GECKO_TG_CHANNELS` only when the unit goes live — Plan 3.
+
+**Silent-failure (vec-silent)**
+- Enrich — a token that fails GoPlus deterministically (error code, non-retryable 4xx) writes no row, stays at the FIFO head and burns a call every hour for 14 d; enough of them starve new candidates while the run stays ok — write a `{"goplus_status":"error","code":…}` marker (freshness/features already ignore non-ok rows) and log the full queue length — Plan 3.
+- Ledger — expired rows carry no durable reason (all value columns NULL, the cause only in journald), a survivorship risk for the scorecard denominator — a status/reason column or sentinel, or the scorecard reports the expired cohort; `rows_written` should not count expiries — Plan 3, before the scorecard.
+- Prune — nothing watches that `prune` keeps running (disk-cliff history on this VPS) — a run-anchored freshness key on `prune` at ~26 h — Plan 3.
+- Enrich — a per-token `security_fail` disqualification has no `token_id` log line — log it per token — later.
+- Enrich — `--as-of` stamps live GoPlus data at a past `observed_at` (replay lookahead) — refuse `--as-of` like `ledger`/`prune` — later.
+- Freshness — the never-started-reader anchor needs the freshness cron's env to carry `GECKO_TG_CHANNELS`; a separate unit EnvironmentFile or a different `GECKO_DB_PATH` silently disables it — ONE shared env file for cron and the unit, plus a deploy check that both resolve the same `db_path` and `tg_channels` — Plan 3 checklist.
+- Freshness — the never-started anchor is the first freshness run ever, so configuring channels on an existing DB pages at once with no 30 min grace (loud, not silent) — accept, or anchor on the config change — later.
+- Reader — if `fail()` itself raises (a lock), it replaces the original cause in `job_crashed` (the original is only on `__context__`) — log the original before recording — later.
+
+**Concurrency (vec-concurrency)**
+- Reader / `tg-login` — nothing stops a second Telethon client on the same session (`AUTH_KEY_DUPLICATED` can revoke it) — `fcntl.flock(LOCK_EX|LOCK_NB)` on `<session>.lock` in both jobs, exit 2 when held — Plan 3, before reader activation.
+- Enrich — the budget is checked before the run and spent with no hold: two overlapping runs each spend the full remainder; SIGKILL or a Hermes timeout records no credits — a per-job `flock` or Hermes no-overlap (Hermes overlap behaviour unverified) — Plan 3.
+- Runs — the failure-path `record_run` (run_job and the reader's `fail()`) can hit the same lock that caused the failure, losing the row and its credits — retry the failure row — later.
+- Reader unit — start the unit BEFORE adding channels to the freshness env (else one false page, deduped 6 h); consider `RestartPreventExitStatus=2` so a config error (rc 2) stops instead of looping — Plan 3 runbook.
+- Reader — any SQLite error crashes the process and recovery relies on `Restart=always` (no data loss: marks recompute from stored calls, inserts are idempotent) — accept, or catch per poll — later.
+- Reader — SIGTERM skips the `finally` cleanup (harmless for gecko.db; the Telethon session's update state is not saved) — `loop.add_signal_handler(SIGTERM, task.cancel)` — later.
+
+**Logic (vec-logic)**
+- Enrich — **OPERATOR RULING NEEDED before the soak writes rows:** a first-sight GoPlus read disqualifies a candidate permanently (`security_fail` is never re-read), and anti-snipe launch taxes over 10 % that drop to 0 within hours are common, so the early cohort the user targets is killed for good — re-read before disqualifying, or disqualify only on immutable flags (honeypot/blacklist) and leave taxes to the point-in-time feature — Plan 3, operator.
+- CoinGecko — prune deletes `cg_unmapped` markers at 180 d; the bulk initial sweep ages out together and every coin is re-looked-up via `/coins/{id}` (capped 300/run, draws on the 8000/month budget) — exempt `cg_unmapped` from prune, or document a 180 d re-check as intended — Plan 3.
+- GoPlus coverage gaps (all under-flag; spec §6 implemented as written) — EVM `is_open_source=0`, `can_take_back_ownership`, `hidden_owner`, `owner_change_balance` unchecked (a reclaimable "renounced" owner passes); a missing `is_mintable`/`is_proxy` reads clean; EVM concentration skips ALL contracts (team Safes, the 22.6 % BRETT holder); Solana Token-2022 `transfer_fee` (a sell tax) unchecked; non-Raydium Solana AMMs rely on GoPlus listing the pool in `dex[]` (unverified) — extend the flag set and verify AMM coverage — Plan 3 / later.
+- Ledger — the 1 d horizon can be measured at 30-48 h or later (the CG fallback waits for the 48 h deadline); spec-intended, but the `due_at`→`measured_at` delay is unflagged; no consumer today — flag or document — later.
+- Enrich queue — the comment says "never-enriched first" but watchlist then actives sort ahead; above ~800 actives due per 20 h, candidates are never enriched — fix the comment, monitor the queue — later.
+- Backtest — a malformed `--from`/`--to` crashes with a traceback (uncaught ValueError after `load_study`), rc 1 indistinguishable from FAIL — validate the dates up front, rc 2 — later.
+- Enrich — `--as-of` replay lookahead — see the silent-failure entry above.
