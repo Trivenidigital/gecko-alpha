@@ -125,15 +125,11 @@ def _top10(chain: str, r: dict) -> float | None:
     holders = r.get("holders")
     if not isinstance(holders, list) or not holders:
         return None
+    # Pools only, NOT lp_holders: those hold the LP token (often the deployer EOA).
     skip = {
         norm_address(chain, str(d.get("pair") or d.get("id") or ""))
         for d in _list(r.get("dex"))
         if isinstance(d, dict)
-    }
-    skip |= {
-        norm_address(chain, str(h.get("address") or ""))
-        for h in _list(r.get("lp_holders"))
-        if isinstance(h, dict)
     }
     skip |= BURN | SOL_AMM_AUTHORITIES
     total = 0.0
@@ -253,38 +249,44 @@ async def enrich(
     ]
     pacer = Pacer(settings.gp_min_interval_sec, sleep)
     calls = written = failed = disq = unknown = 0
-    for tid, chain, address in todo:
-        await pacer.wait()
-        calls += 1
-        try:
-            r = await _fetch(session, settings, chain, address)
-        except (UpstreamError, GoPlusError) as exc:
-            failed += 1
-            log.warning(
-                "goplus_fetch_failed",
-                token_id=tid,
-                error=type(exc).__name__,
-                status=getattr(exc, "status", None),
-                code=getattr(exc, "code", None),
-            )
-            continue
-        except ValueError as exc:  # non-JSON body
-            failed += 1
-            log.warning("goplus_body_invalid", token_id=tid, error=type(exc).__name__)
-            continue
-        if r is None:
-            await store.add_observation(tid, "enrich", now, dict(UNKNOWN))
-            written, unknown = written + 1, unknown + 1
-            continue
-        f = goplus_features(chain, r)
-        deployer = f.pop("deployer")
-        if deployer:
-            await store.set_deployer(tid, deployer)
-        await store.add_observation(tid, "enrich", now, f)
-        written, unknown = written + 1, unknown + (f["security_ok"] is None)
-        if f["security_ok"] is False:
-            await store.set_token_status(tid, "disqualified", "security_fail")
-            disq += 1
+    try:  # a crash (e.g. a lock timeout) still charges the calls already made
+        for tid, chain, address in todo:
+            await pacer.wait()
+            calls += 1
+            try:
+                r = await _fetch(session, settings, chain, address)
+            except (UpstreamError, GoPlusError) as exc:
+                failed += 1
+                log.warning(
+                    "goplus_fetch_failed",
+                    token_id=tid,
+                    error=type(exc).__name__,
+                    status=getattr(exc, "status", None),
+                    code=getattr(exc, "code", None),
+                )
+                continue
+            except ValueError as exc:  # non-JSON body
+                failed += 1
+                log.warning(
+                    "goplus_body_invalid", token_id=tid, error=type(exc).__name__
+                )
+                continue
+            if r is None:
+                await store.add_observation(tid, "enrich", now, dict(UNKNOWN))
+                written, unknown = written + 1, unknown + 1
+                continue
+            f = goplus_features(chain, r)
+            deployer = f.pop("deployer")
+            if deployer:
+                await store.set_deployer(tid, deployer)
+            await store.add_observation(tid, "enrich", now, f)
+            written, unknown = written + 1, unknown + (f["security_ok"] is None)
+            if f["security_ok"] is False:
+                await store.set_token_status(tid, "disqualified", "security_fail")
+                disq += 1
+    except Exception as exc:  # noqa: BLE001
+        raise PartialFailure(exc, credits_used=calls, rows_written=written) from exc
+
     log.info(
         "enrich_done",
         planned=len(todo),

@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import aiohttp
 import pytest
 from aioresponses import aioresponses
@@ -124,9 +126,20 @@ def test_evm_top10_excludes_contracts_locked_burn_and_pools():
     assert goplus_features("base", evm())["top10_pct"] == pytest.approx(10.92)
 
 
-def test_evm_top10_also_excludes_lp_holders():
-    r = evm(lp_holders=[{"address": "0x82d4cd9bf16017fd518511d8bbe6d0493af31a10"}])
-    assert goplus_features("base", r)["top10_pct"] == pytest.approx(5.30)
+def test_evm_top10_counts_an_eoa_that_also_holds_lp():
+    # lp_holders are LP-TOKEN holders (often the deployer EOA), not pools: a dev
+    # holding 65% of supply who also added liquidity must still be counted
+    dev = "0x" + "d" * 40
+    r = evm(
+        lp_holders=[{"address": dev, "percent": "1.0", "is_locked": 0}],
+        holders=[
+            {"address": dev, "percent": "0.65", "is_contract": 0, "is_locked": 0},
+            {"address": "0x" + "e" * 40, "percent": "0.02", "is_contract": 0},
+        ],
+    )
+    f = goplus_features("base", r)
+    assert f["top10_pct"] == pytest.approx(67.0)
+    assert f["top10_pct"] > 60  # concentration disqualifier threshold
 
 
 @pytest.mark.parametrize(
@@ -515,3 +528,57 @@ async def test_enrich_slo_needs_a_known_verdict_and_done_counts_unknowns(
     assert "observations:enrich" not in {
         x.table for x in await check_freshness(store, at(2))
     }
+
+
+async def test_security_ok_is_the_newest_read_not_the_newest_known(store, settings):
+    # day 1 reads True, day 2 loses a core flag: the token is unknown again
+    from datetime import timedelta
+
+    from gecko.store import parse_utc
+
+    tid = await tok(store, "base", A)
+    yday = (parse_utc(NOW) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    partial = evm()
+    del partial["cannot_sell_all"]
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: partial}})
+            await enrich(store, settings, s, yday, sleep=_nosleep, budget_now=yday)
+            assert (await compute_features(store, settings, tid, yday)).security_ok
+            await enrich(store, settings, s, NOW, sleep=_nosleep, budget_now=NOW)
+    assert (await compute_features(store, settings, tid, NOW)).security_ok is None
+
+
+async def test_crash_mid_run_records_the_goplus_calls_spent(
+    store, settings, monkeypatch
+):
+    # a lock timeout after N calls must still charge N against the daily cap
+    import sqlite3
+
+    from gecko.collectors.goplus import enrich_job
+    from gecko.store import Store
+
+    b, c = "0x" + "b" * 40, "0x" + "c" * 40
+    for addr in (A, b, c):
+        await tok(store, "base", addr)
+    real, seen = Store.add_observation, []
+
+    async def flaky(self, *a, **kw):
+        seen.append(a)
+        if len(seen) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return await real(self, *a, **kw)
+
+    monkeypatch.setattr(Store, "add_observation", flaky)
+    settings.gp_min_interval_sec = 0
+    with aioresponses() as m:
+        for addr in (A, b, c):
+            m.get(BASE_URL + addr, payload={"code": 1, "result": {addr: evm()}})
+        rc = await enrich_job(settings, SimpleNamespace(as_of=None))
+    row = await (
+        await store.conn.execute(
+            "SELECT ok, credits_used, rows_written FROM runs WHERE job='enrich'"
+        )
+    ).fetchone()
+    assert rc == 1 and row == (0, 2, 1)
