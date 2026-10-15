@@ -679,3 +679,17 @@ async def test_liquidity_gate_reads_each_sources_latest_priced_row(store, settin
     )  # unpriced: ignored
     f = await compute_features(store, settings, "solana:abc", "2026-10-05T12:00:00Z")
     assert f.liquidity_gate_usd == 1e4
+
+
+@pytest.mark.parametrize("first,last", [(True, None), (None, True), (False, True)])
+async def test_security_ok_tie_on_observed_at_takes_the_later_write(
+    store, settings, first, last
+):
+    # two enrich rows at the same second: the later write is the newest read
+    await seed(store)
+    for sec in (first, last):
+        await store.add_observation(
+            "solana:abc", "enrich", T0, {"goplus_status": "ok", "security_ok": sec}
+        )
+    f = await compute_features(store, settings, "solana:abc", T0)
+    assert f.security_ok is last

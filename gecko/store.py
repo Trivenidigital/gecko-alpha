@@ -251,7 +251,7 @@ class Store:
         if source is not None:
             sql += " AND source=?"
             args.append(source)
-        sql += " ORDER BY observed_at DESC LIMIT ?"
+        sql += " ORDER BY observed_at DESC, id DESC LIMIT ?"  # ties: later write first
         args.append(limit)
         rows = await (await self.conn.execute(sql, args)).fetchall()
         return [Observation(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
