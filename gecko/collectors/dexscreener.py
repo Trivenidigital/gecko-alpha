@@ -269,6 +269,7 @@ async def collect(
         invalid=invalid,
         promoted=promoted,
         revived=revived,
+        seeded=len(seeded),
         batches=batches["total"],
         batches_failed=batches["failed"],
         feeds_failed=feeds["failed"],

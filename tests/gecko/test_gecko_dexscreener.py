@@ -621,13 +621,16 @@ async def test_called_address_is_discovered_with_telegram_source(store, settings
                 TOKENS_URL.format(chain="base", addresses=addr),
                 payload=[pair(addr=addr)],
             )
-            await collect(store, settings, s, NOW, sleep=nosleep)
+            with capture_logs() as logs:
+                await collect(store, settings, s, NOW, sleep=nosleep)
     row = await (
         await store.conn.execute(
             "SELECT first_source FROM tokens WHERE token_id=?", (f"base:{addr}",)
         )
     ).fetchone()
     assert row == ("telegram",)
+    done = [e for e in logs if e["event"] == "dexscreener_done"]
+    assert len(done) == 1 and done[0]["seeded"] == 1
 
 
 async def test_seed_also_in_feed_keeps_dexscreener_source(store, settings):
