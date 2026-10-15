@@ -2730,6 +2730,8 @@ WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helpe
 
 ## Selective dashboard release plan: 2026-09-14
 
+> Superseded (2026-10-15, PR #599 reconciliation): these three sections are the release branch's 09-14 snapshots. The release itself was deployed as 77751890 at 13:14:10Z — see tasks/closeout_recovery_2026_09_14.md; unchecked boxes below are historical, not open work.
+
 - [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
 - [x] Both plan reviewers approved bc4c5837 without folds; design-only artifact prepared with copy/lock/runtime bounds.
 - [x] Both design reviewers approved 38150404 without folds; local disposable harnesses prepared with boundary tests.
