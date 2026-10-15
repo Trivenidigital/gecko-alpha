@@ -141,3 +141,4 @@ Format: area — finding — fix — owner plan. Items fixed in the PR are not l
 - Enrich queue — the comment says "never-enriched first" but watchlist then actives sort ahead; above ~800 actives due per 20 h, candidates are never enriched — fix the comment, monitor the queue — later.
 - Backtest — a malformed `--from`/`--to` crashes with a traceback (uncaught ValueError after `load_study`), rc 1 indistinguishable from FAIL — validate the dates up front, rc 2 — later.
 - Enrich — `--as-of` replay lookahead — see the silent-failure entry above.
+- Freshness — the never-started-reader anchor is the DB's FIRST ok freshness run, not the moment channels were configured, so setting `GECKO_TG_CHANNELS` before `tg-login` and the unit start pages within 30 min; `tg_channels` is read from the freshness job's env — runbook order: `tg-login`, start the unit, THEN set `GECKO_TG_CHANNELS`, in ONE env file shared by Hermes cron and the reader unit — Plan 3 runbook.
