@@ -274,10 +274,15 @@ def test_evm_missing_taxes_are_not_required():
     assert goplus_features("base", r)["security_ok"] is True
 
 
+@pytest.mark.parametrize("owner", ["absent", None])
 @pytest.mark.parametrize("over", [{"is_mintable": "1"}, {"is_proxy": "1"}])
-def test_evm_mintable_or_proxy_without_owner_key_is_unknown(over):
+def test_evm_mintable_or_proxy_without_owner_key_is_unknown(over, owner):
+    # GoPlus: no value = owner unknown; "" = no owner (renounced)
     r = evm(**over)
-    del r["owner_address"]
+    if owner == "absent":
+        del r["owner_address"]
+    else:
+        r["owner_address"] = owner
     f = goplus_features("base", r)
     assert f["security_ok"] is None and f["security_flags"] == []
 

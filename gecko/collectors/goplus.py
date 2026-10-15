@@ -80,11 +80,11 @@ def _evm_security(r: dict) -> tuple[list[str], bool]:
     """Core flags are honeypot/cannot_sell_all/blacklist; taxes are optional.
 
     A mintable or proxy contract needs ``owner_address`` to be judged: when the
-    key is absent the result is unknown, never renounced.
+    key is absent or null the result is unknown, never renounced ("" = no owner).
     """
     owned = str(r.get("owner_address") or "").lower() not in RENOUNCED
     owner_needed = _flag(r.get("is_mintable")) or _flag(r.get("is_proxy"))
-    owner_known = not owner_needed or "owner_address" in r
+    owner_known = not owner_needed or r.get("owner_address") is not None
     checks = {
         "honeypot": _flag(r.get("is_honeypot")),
         "cannot_sell_all": _flag(r.get("cannot_sell_all")),
