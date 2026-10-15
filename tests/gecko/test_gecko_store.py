@@ -579,3 +579,21 @@ async def test_repair_schedules_covers_exited_entries_and_is_idempotent(store):
         ("s:a", 1, "2026-10-02T00:00:00Z"),
         ("s:b", 1, "2026-10-03T00:00:00Z"),
     ]
+
+
+async def test_tokens_address_index_on_fresh_and_pre_index_db(tmp_path):
+    # call resolution looks tokens up by address; without the index each is a full scan
+    from gecko.store import Store
+
+    path = str(tmp_path / "g.db")
+    q = "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tokens_address'"
+    s = await Store.open(path)
+    assert await (await s.conn.execute(q)).fetchone() == (1,)
+    await s.conn.execute("DROP INDEX idx_tokens_address")  # the pre-index schema
+    await s.conn.commit()
+    await s.close()
+    s = await Store.open(path)
+    try:
+        assert await (await s.conn.execute(q)).fetchone() == (1,)
+    finally:
+        await s.close()

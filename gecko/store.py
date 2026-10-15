@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   status TEXT NOT NULL DEFAULT 'candidate'
     CHECK (status IN ('candidate','active','disqualified','dead')),
   disqualify_reason TEXT, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_tokens_address ON tokens(address);
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT NOT NULL, source TEXT NOT NULL,
   observed_at TEXT NOT NULL, features_json TEXT NOT NULL);
