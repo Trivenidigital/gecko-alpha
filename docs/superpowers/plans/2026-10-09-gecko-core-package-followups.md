@@ -74,6 +74,20 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Cashtag-only calls never resolve to a token — by design, v1.
 - A call resolved after `as_of` is visible to a replayed `as_of` (resolution is not point-in-time) — live-only ranking, accepted.
 - X `ingest-call` CLI — deferred to Plan 3 with the X lane.
+- `calls._matches` (`gecko/calls.py:76`) full-scans `tokens` (no index on `address`) every 120 s poll, for every address in 7 d of unresolved calls, and over the whole legacy history in `migrate-calls` (`since=None`) — switch to primary-key lookups (`token_id IN (token_id(c, a) for c in chains)`) — Plan 3, **before reader activation and before migrate-calls runs on the VPS**.
+- A `source_calls` parse regression stays green forever: run-anchored freshness accepts ok runs that write 0 rows, so "every message parsed as no-call" never pages — add a long row-anchored key (e.g. `source_calls:rows`, 72 h) active only when channels are configured — Plan 3.
+- Reader marks come only from stored calls: a channel with no stored call restarts newest-N only, so more than `tg_catchup_limit` messages during downtime are skipped under an ok run — persist per-channel marks (`tg_marks`) or document — Plan 3.
+- GoPlus budget: `credits_used` counts tokens, not HTTP attempts (`get_json` retries up to 3× on 429/5xx, so the cap can undercount 4×); code 4029 (rate limit inside a 200 body) does not stop the run; two overlapping `enrich` runs share no cap reservation — calibrate in the soak before relying on `gp_daily_cap` — Plan 3.
+- Handle normalization: `@foo`, `foo` and `t.me/foo` give different `source_id`/`event_id` — marks reset, calls duplicate, caller identity splits; consistent today only if the operator pastes the `migrate-calls` channel list — Plan 3.
+- Spec drift left after the 2026-10-15 fold: §11 `goplus` MCP args, line 22 Hermes row, decoys — docs, Plan 3.
+- GoPlus parsing: a malformed holder `percent` reads 0 %, and an all-excluded top 10 reads 0.0 — concentration fails open on malformed bodies only; the malformed-`dex` test is weak — later.
+- `enrich --as-of` stamps live GoPlus data at the replayed time — docstring — later.
+- DexScreener seeds: pair URLs posted as calls are offered as seeds (cap-bounded); `best_pair` trusts `chainId`; seed expansion of multi-chain addresses is untested — later.
+- Telegram reader: FloodWait `seconds` is logged, not honoured; resolution rescans 7 d every poll; `tg-login` requires channels configured; `tg_catchup_truncated` log naming — Plan 3.
+- `migrate-calls`: per-row commit fsync cost; removed channels untested; `study.py` URI escaping of the history path — later (run-after-ingestion is on the checklist).
+- Prune: a reader with only failed runs loses them at 90 d (then reads as never-run); floor/boundary tests and an end-to-end `prune_job` test — later.
+- Ledger: `close_unmeasured` docstring and expiry boundary tests — later.
+- Backtest: window-bound pins; `--from` > `--to` is silently empty (exit 1 ambiguity is on the checklist) — later.
 
 ### Plan 3 deployment checklist additions
 - Run `python -m gecko tg-login` once on the VPS as the gecko user with `GECKO_TG_SESSION_PATH=/root/.gecko/gecko_tg.session` (absolute, outside the repo); confirm mode 0600.
