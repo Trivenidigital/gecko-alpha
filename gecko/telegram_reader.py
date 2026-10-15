@@ -160,7 +160,7 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
             print(problem, file=sys.stderr)
             await fail("session_problem")
             return 2
-        client = _client(settings)
+        client = _client(settings)  # inside: an ImportError/corrupt session is recorded
         try:
             await client.connect()
             if not await client.is_user_authorized():
@@ -171,11 +171,11 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
                 await fail("not_authorized")
                 return 1
             await run_reader(store, client, settings)
-        except Exception as exc:
-            await fail(type(exc).__name__)
-            raise
         finally:
             await client.disconnect()
+    except Exception as exc:
+        await fail(type(exc).__name__)
+        raise
     finally:
         await store.close()
     return 0

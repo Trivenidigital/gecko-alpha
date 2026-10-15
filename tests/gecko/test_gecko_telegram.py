@@ -321,3 +321,37 @@ async def test_reader_failing_before_first_poll_records_run_and_pages(
         assert "source_calls" in {b.table for b in await check_freshness(store, later)}
     finally:
         await store.close()
+
+
+async def test_reader_client_construction_failure_records_run(
+    tmp_path, settings, monkeypatch
+):
+    # a broken venv (ImportError) or a corrupt session raises in the constructor
+    from pydantic import SecretStr
+
+    import gecko.telegram_reader as tr
+    from gecko.store import Store
+
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_channels = ["@a"]
+    sess = tmp_path / "gk.session"
+    sess.write_text("x")
+    os.chmod(sess, 0o600)
+    settings.tg_session_path = str(sess)
+
+    def broken(_settings):
+        raise ImportError("No module named 'telethon'")
+
+    monkeypatch.setattr(tr, "_client", broken)
+    with pytest.raises(ImportError):
+        await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    store = await Store.open(settings.db_path)
+    try:
+        rows = await (
+            await store.conn.execute(
+                "SELECT ok, error FROM runs WHERE job='telegram-reader'"
+            )
+        ).fetchall()
+    finally:
+        await store.close()
+    assert rows == [(0, "ImportError")]
