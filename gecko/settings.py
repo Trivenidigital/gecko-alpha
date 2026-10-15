@@ -62,7 +62,7 @@ class GeckoSettings(BaseSettings):
         ""  # absolute, outside the repo, mode 0600; gecko's OWN session
     )
     tg_channels: list[str] = []  # public @handles
-    tg_poll_interval_sec: int = 120
+    tg_poll_interval_sec: int = Field(120, ge=1)
     # newest messages read per channel per poll; 0 would read nothing, ok forever
     tg_catchup_limit: int = Field(200, ge=1)
     coingecko_demo_api_key: SecretStr | None = None
