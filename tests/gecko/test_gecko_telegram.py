@@ -253,3 +253,71 @@ def test_migrate_calls_is_idempotent_and_read_only(tmp_path, monkeypatch, capsys
 def test_migrate_calls_missing_db_exits_1(tmp_path, monkeypatch):
     monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
     assert main(["migrate-calls", "--history-db", str(tmp_path / "nope.db")]) == 1
+
+
+class EarlyFailClient:
+    def __init__(self, authorized=True):
+        self.authorized = authorized
+
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
+    async def is_user_authorized(self):
+        return self.authorized
+
+    async def get_input_entity(self, handle):
+        raise ValueError(f"No user has {handle} as username")
+
+
+@pytest.mark.parametrize(
+    "case,rc,error",
+    [
+        ("no_session", 2, "session_problem"),
+        ("unauthorized", 1, "not_authorized"),
+        ("bad_handle", ValueError, "ValueError"),
+    ],
+)
+async def test_reader_failing_before_first_poll_records_run_and_pages(
+    tmp_path, settings, monkeypatch, case, rc, error
+):
+    # every exit before the first poll leaves an ok=0 row, so freshness pages
+    from datetime import timedelta
+
+    from pydantic import SecretStr
+
+    import gecko.telegram_reader as tr
+    from gecko.freshness import check_freshness
+    from gecko.store import Store
+    from gecko.store import parse_utc
+
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_channels = ["@gone"]
+    sess = tmp_path / "gk.session"
+    settings.tg_session_path = str(sess)
+    if case != "no_session":
+        sess.write_text("x")
+        os.chmod(sess, 0o600)
+    client = EarlyFailClient(authorized=case != "unauthorized")
+    monkeypatch.setattr(tr, "_client", lambda s: client)
+    if rc is ValueError:
+        with pytest.raises(ValueError):
+            await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    else:
+        assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == rc
+    store = await Store.open(settings.db_path)
+    try:
+        rows = await (
+            await store.conn.execute(
+                "SELECT ok, error, finished_at FROM runs WHERE job='telegram-reader'"
+            )
+        ).fetchall()
+        assert [(r[0], r[1]) for r in rows] == [(0, error)]
+        later = (parse_utc(rows[0][2]) + timedelta(minutes=31)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        assert "source_calls" in {b.table for b in await check_freshness(store, later)}
+    finally:
+        await store.close()

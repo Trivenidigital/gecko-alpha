@@ -91,7 +91,9 @@ async def _writer_run(store: Store, table: str, agg: str) -> str | None:
     return row[0]
 
 
-async def _non_cron_first_failure(store: Store, table: str) -> str | None:
+async def _non_cron_first_failure(
+    store: Store, table: str, expected: bool
+) -> str | None:
     """Earliest failed run of ``table``'s writers that no cron incident would page."""
     jobs = [j for j in WRITER_JOBS[table] if j in NON_CRON_WRITERS]
     if not jobs:
@@ -103,6 +105,14 @@ async def _non_cron_first_failure(store: Store, table: str) -> str | None:
             jobs,
         )
     ).fetchone()
+    # An expected writer with no run at all (never installed or started) is
+    # measured from the freshness job's first ok run, an anchor it cannot control.
+    if row[0] is None and expected:
+        row = await (
+            await store.conn.execute(
+                "SELECT MIN(finished_at) FROM runs WHERE ok=1 AND job='freshness'"
+            )
+        ).fetchone()
     return row[0]
 
 
@@ -148,14 +158,18 @@ async def _oldest_overdue(store: Store, now: str) -> str | None:
     return row[0]
 
 
-async def check_freshness(store: Store, now: str) -> list[Breach]:
+async def check_freshness(
+    store: Store, now: str, settings: GeckoSettings | None = None
+) -> list[Breach]:
     out: list[Breach] = []
+    # the Telegram reader is expected once channels are configured
+    reader_expected = bool(settings and settings.tg_channels)
     now_dt = parse_utc(now)
     for table, slo in SLO_MINUTES.items():
         first_run = await _writer_run(store, table, "MIN")
         if first_run is None:
             # Bootstrapping, unless a non-cron writer has failed since deploy.
-            failed = await _non_cron_first_failure(store, table)
+            failed = await _non_cron_first_failure(store, table, reader_expected)
             if failed and now_dt - parse_utc(failed) > timedelta(minutes=slo):
                 out.append(Breach(table, None, slo))
             continue
@@ -196,7 +210,7 @@ async def alert_breaches(
 ) -> AlertReport:
     report = AlertReport()
     has_channel = bool(settings.telegram_bot_token and settings.telegram_health_chat_id)
-    for b in await check_freshness(store, now):
+    for b in await check_freshness(store, now, settings):
         if await _recently_alerted(store, b.table, now):
             continue
         if not has_channel:

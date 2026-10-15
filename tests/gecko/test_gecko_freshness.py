@@ -565,3 +565,46 @@ async def test_failing_cron_writer_never_pages_from_freshness(store):
         "rank", "2026-10-01T00:00:00Z", "2026-10-01T00:00:05Z", False
     )
     assert await check_freshness(store, "2026-10-02T00:00:00Z") == []
+
+
+@pytest.mark.parametrize(
+    "channels,age_min,breach",
+    [(["@a"], 31, True), (["@a"], 29, False), ([], 31, False)],
+)
+async def test_never_started_reader_pages_from_the_freshness_anchor(
+    store, settings, channels, age_min, breach
+):
+    # no telegram-reader row at all (unit never installed or started): the
+    # freshness job's own first ok run ends bootstrapping, once channels are set
+    settings.tg_channels = channels
+    t0 = "2026-10-02T00:00:00Z"
+    await store.record_run("freshness", t0, t0, True)
+    now = _plus_from(t0, age_min)
+    hit = [
+        b
+        for b in await check_freshness(store, now, settings)
+        if b.table == "source_calls"
+    ]
+    assert hit == ([Breach("source_calls", None, 30)] if breach else [])
+
+
+async def test_freshness_job_wiring_pages_a_never_started_reader(store, settings):
+    # alert_breaches must hand settings to check_freshness (else tg_channels is unseen)
+    settings.tg_channels = ["@a"]
+    t0 = "2026-10-02T00:00:00Z"
+    await store.record_run("freshness", t0, t0, True)
+    r = await alert_breaches(store, settings, None, _plus_from(t0, 31))
+    assert r.skipped >= 1
+    with capture_logs() as logs:
+        await alert_breaches(store, settings, None, _plus_from(t0, 31))
+    assert {"source_calls"} <= {
+        e["table"] for e in logs if e["event"] == "freshness_alert_skipped_no_channel"
+    }
+
+
+def _plus_from(t0: str, minutes: int) -> str:
+    from datetime import timedelta
+
+    from gecko.store import parse_utc
+
+    return (parse_utc(t0) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")

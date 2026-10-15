@@ -149,25 +149,35 @@ def _client(settings: GeckoSettings):
 
 @register("telegram-reader")
 async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
-    if problem := session_problem(settings, must_exist=True):
-        print(problem, file=sys.stderr)
-        return 2
-    client = _client(settings)
-    await client.connect()
+    # Every exit before the first poll writes an ok=0 run (error = a label or the
+    # exception TYPE), so freshness pages a reader that never gets to poll.
+    started, store = utcnow(), await Store.open(settings.db_path)
+    fail = lambda error: store.record_run(  # noqa: E731
+        "telegram-reader", started, utcnow(), False, error=error
+    )
     try:
-        if not await client.is_user_authorized():
-            print(
-                "telegram session not authorized; run `python -m gecko tg-login`",
-                file=sys.stderr,
-            )
-            return 1
-        store = await Store.open(settings.db_path)
+        if problem := session_problem(settings, must_exist=True):
+            print(problem, file=sys.stderr)
+            await fail("session_problem")
+            return 2
+        client = _client(settings)
         try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                print(
+                    "telegram session not authorized; run `python -m gecko tg-login`",
+                    file=sys.stderr,
+                )
+                await fail("not_authorized")
+                return 1
             await run_reader(store, client, settings)
+        except Exception as exc:
+            await fail(type(exc).__name__)
+            raise
         finally:
-            await store.close()
+            await client.disconnect()
     finally:
-        await client.disconnect()
+        await store.close()
     return 0
 
 
