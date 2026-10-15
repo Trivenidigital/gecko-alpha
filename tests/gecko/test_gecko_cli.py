@@ -110,5 +110,16 @@ def test_help_epilog_lists_jobs_and_exit_codes(capsys):
     assert ei.value.code == 0
     out = capsys.readouterr().out
     assert "exit codes: 0 ok, 1 failure, 2 usage" in out
-    for job in ("dexscreener", "ledger", "rank", "freshness", "coingecko-hourly"):
+    for job in (
+        "dexscreener",
+        "ledger",
+        "rank",
+        "freshness",
+        "coingecko-hourly",
+        "enrich",
+        "telegram-reader",
+        "tg-login",
+        "migrate-calls",
+        "prune",
+    ):
         assert f"\n  {job}" in out

@@ -251,7 +251,8 @@ async def compute_features(
         f.holders = as_int(h)
         f.top10_pct = num(_first(enrich, "top10_pct"))
         f.smart_money_wallets = as_int(_first(enrich, "smart_money_wallets"))
-        sec = _first(enrich, "security_ok")
+        # the newest read as is: unknown stays unknown, never an older True
+        sec = enrich[0].features.get("security_ok")
         f.security_ok = sec if isinstance(sec, bool) else None
         dd = num(_first(enrich, "dd_score"))
         old = await store.observations(

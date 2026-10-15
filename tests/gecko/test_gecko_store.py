@@ -102,7 +102,8 @@ async def test_schedule_and_due_returns(store):
         "2026-10-01T00:00:00Z",
         "dexscreener",
     )
-    await store.schedule_returns("solana:abc", "2026-10-01T00:00:00Z")
+    await store.watchlist_upsert("solana:abc", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
     due = await store.due_returns("2026-10-09T00:00:00Z")
     assert [r.horizon_days for r in due] == [1, 7]
     await store.set_return(
@@ -128,7 +129,8 @@ async def _token_with_returns(store):
         "2026-10-01T00:00:00Z",
         "dexscreener",
     )
-    await store.schedule_returns("solana:abc", "2026-10-01T00:00:00Z")
+    await store.watchlist_upsert("solana:abc", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
 
 
 async def test_set_return_arithmetic(store):
@@ -260,7 +262,7 @@ async def test_stored_timestamps_are_canonical(store):
         "solana:abc", "2026-10-01T00:00:00.9+00:00", "F4", 1, 2.5, {}
     )
     await store.watchlist_exit("solana:abc", "2026-10-03T00:00:00+00:00", "x")
-    await store.schedule_returns("solana:abc", "2026-10-01T00:00:00+00:00")
+    await store.repair_schedules()
     tok = await (
         await store.conn.execute("SELECT first_seen_at, pool_created_at FROM tokens")
     ).fetchone()
@@ -397,7 +399,8 @@ async def test_open_adds_entry_price_to_an_old_watchlist(tmp_path):
 
 
 async def test_set_return_refusal_leaves_no_open_transaction(store):
-    await store.schedule_returns("solana:a", "2026-10-01T00:00:00Z")
+    await store.watchlist_upsert("solana:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules()
     await store.set_return("solana:a", 1, 1.0, 2.0, 1.0, 1.0, "2026-10-02T00:00:00Z")
     with pytest.raises(ReturnAlreadyMeasured):
         await store.set_return(
@@ -500,7 +503,8 @@ async def test_open_adds_last_attempt_at_to_an_old_forward_returns(tmp_path):
         await c.commit()
     s = await Store.open(path)
     try:
-        await s.schedule_returns("s:a", "2026-10-01T00:00:00Z", horizons=(1,))
+        await s.watchlist_upsert("s:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+        await s.repair_schedules(horizons=(1,))
         await s.bump_return_attempt("s:a", 1, attempted_at="2026-10-02T00:00:00Z")
         (due,) = await s.due_returns("2026-10-03T00:00:00Z")
         assert due.last_attempt_at == "2026-10-02T00:00:00Z"
@@ -560,9 +564,9 @@ async def test_busy_timeout_is_set_before_wal(tmp_path, monkeypatch):
 
 async def test_repair_schedules_covers_exited_entries_and_is_idempotent(store):
     await store.watchlist_upsert("s:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1,))  # s:a partially scheduled
     await store.watchlist_upsert("s:b", "2026-10-02T00:00:00Z", "F4", 2, 1.0, {})
     await store.watchlist_exit("s:b", "2026-10-03T00:00:00Z", "liquidity")
-    await store.schedule_returns("s:a", "2026-10-01T00:00:00Z", horizons=(1,))
     assert await store.repair_schedules() == 9
     assert await store.repair_schedules() == 0
     rows = await (
@@ -575,3 +579,21 @@ async def test_repair_schedules_covers_exited_entries_and_is_idempotent(store):
         ("s:a", 1, "2026-10-02T00:00:00Z"),
         ("s:b", 1, "2026-10-03T00:00:00Z"),
     ]
+
+
+async def test_tokens_address_index_on_fresh_and_pre_index_db(tmp_path):
+    # call resolution looks tokens up by address; without the index each is a full scan
+    from gecko.store import Store
+
+    path = str(tmp_path / "g.db")
+    q = "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_tokens_address'"
+    s = await Store.open(path)
+    assert await (await s.conn.execute(q)).fetchone() == (1,)
+    await s.conn.execute("DROP INDEX idx_tokens_address")  # the pre-index schema
+    await s.conn.commit()
+    await s.close()
+    s = await Store.open(path)
+    try:
+        assert await (await s.conn.execute(q)).fetchone() == (1,)
+    finally:
+        await s.close()

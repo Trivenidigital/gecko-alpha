@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   status TEXT NOT NULL DEFAULT 'candidate'
     CHECK (status IN ('candidate','active','disqualified','dead')),
   disqualify_reason TEXT, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_tokens_address ON tokens(address);
 CREATE TABLE IF NOT EXISTS observations (
   id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT NOT NULL, source TEXT NOT NULL,
   observed_at TEXT NOT NULL, features_json TEXT NOT NULL);
@@ -216,6 +217,14 @@ class Store:
         )
         await self.conn.commit()
 
+    async def set_deployer(self, token_id, deployer) -> None:
+        """Record a token's deployer; the first value recorded is kept."""
+        await self.conn.execute(
+            "UPDATE tokens SET deployer=COALESCE(deployer, ?), updated_at=? WHERE token_id=?",
+            (deployer, utcnow(), token_id),
+        )
+        await self.conn.commit()
+
     async def add_observation(
         self, token_id, source, observed_at, features: dict
     ) -> int:
@@ -242,7 +251,7 @@ class Store:
         if source is not None:
             sql += " AND source=?"
             args.append(source)
-        sql += " ORDER BY observed_at DESC LIMIT ?"
+        sql += " ORDER BY observed_at DESC, id DESC LIMIT ?"  # ties: later write first
         args.append(limit)
         rows = await (await self.conn.execute(sql, args)).fetchall()
         return [Observation(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
@@ -324,15 +333,6 @@ class Store:
             )
         ).fetchall()
         return [WatchRow(r[0], r[1], r[2], r[3], r[4], json.loads(r[5])) for r in rows]
-
-    async def schedule_returns(
-        self, token_id, entered_at, horizons=(1, 7, 30, 90, 180)
-    ) -> None:
-        await self.conn.executemany(
-            "INSERT OR IGNORE INTO forward_returns(token_id,horizon_days,due_at) VALUES(?,?,?)",
-            [(token_id, h, iso_plus(entered_at, h)) for h in horizons],
-        )
-        await self.conn.commit()
 
     async def repair_schedules(self, horizons=(1, 7, 30, 90, 180)) -> int:
         """Schedule any missing horizon of every watchlist entry, exited ones
@@ -419,6 +419,16 @@ class Store:
                 f"set_return {token_id} h={horizon_days}: row missing or already measured"
             )
         await self.conn.commit()
+
+    async def close_unmeasured(self, token_id, horizon_days, measured_at) -> bool:
+        """Finalize an open row with no return (ret NULL). Write-once."""
+        cur = await self.conn.execute(
+            "UPDATE forward_returns SET measured_at=? WHERE token_id=? AND horizon_days=? "
+            "AND measured_at IS NULL",
+            (canon_ts(measured_at), token_id, horizon_days),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
 
     async def bump_return_attempt(
         self,

@@ -36,3 +36,37 @@ def test_env_file_is_dot_env_gecko_never_dot_env(tmp_path, monkeypatch):
     assert GeckoSettings().min_liquidity_usd == 250_000  # .env ignored
     (tmp_path / ".env.gecko").write_text("GECKO_MIN_LIQUIDITY_USD=2\n")
     assert GeckoSettings().min_liquidity_usd == 2
+
+
+def test_ledger_max_overdue_days_floor(tmp_path):
+    # an expiry below the floor would close the whole due ledger unmeasured
+    import pytest
+    from pydantic import ValidationError
+
+    db = str(tmp_path / "g.db")
+    assert GeckoSettings(db_path=db, ledger_max_overdue_days=7, _env_file=None)
+    with pytest.raises(ValidationError):
+        GeckoSettings(db_path=db, ledger_max_overdue_days=6, _env_file=None)
+
+
+def test_tg_catchup_limit_floor(tmp_path):
+    # 0 reads nothing while every poll stays ok (the legacy "dark" setting)
+    import pytest
+    from pydantic import ValidationError
+
+    db = str(tmp_path / "g.db")
+    assert GeckoSettings(db_path=db, tg_catchup_limit=1, _env_file=None)
+    with pytest.raises(ValidationError):
+        GeckoSettings(db_path=db, tg_catchup_limit=0, _env_file=None)
+
+
+def test_tg_poll_interval_floor(tmp_path):
+    # a fast poll invites FloodWait on gecko's own session
+    import pytest
+    from pydantic import ValidationError
+
+    db = str(tmp_path / "g.db")
+    assert GeckoSettings(db_path=db, _env_file=None).tg_poll_interval_sec == 120
+    assert GeckoSettings(db_path=db, tg_poll_interval_sec=30, _env_file=None)
+    with pytest.raises(ValidationError):
+        GeckoSettings(db_path=db, tg_poll_interval_sec=29, _env_file=None)

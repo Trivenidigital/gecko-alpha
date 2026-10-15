@@ -70,7 +70,7 @@ async def seed(store, *, btc=True, token_obs=True):
             "benchmark:btc", "coingecko", "2026-10-02T01:00:00Z", {"price_usd": 66000.0}
         )
     await store.watchlist_upsert("solana:abc", E, "F4", 1, 1.0, {})
-    await store.schedule_returns("solana:abc", E)
+    await store.repair_schedules()
 
 
 async def one(store, sql):
@@ -479,7 +479,7 @@ async def test_non_json_body_spends_attempt_and_later_rows_proceed(store, settin
         "solana:def", "dexscreener", "2026-10-01T00:30:00Z", {"price_usd": 1.0}
     )
     await store.watchlist_upsert("solana:def", E, "F4", 2, 0.5, {})
-    await store.schedule_returns("solana:def", E)
+    await store.repair_schedules()
     with aioresponses() as m:
         m.get(DS, status=200, body="<html>")
         m.get(
@@ -729,3 +729,73 @@ async def test_ledger_run_repairs_missing_schedules_first(store, settings):
     assert await one(store, "SELECT COUNT(*) FROM forward_returns") == (5,)
     (e,) = [e for e in logs if e["event"] == "ledger_schedules_repaired"]
     assert e["rows"] == 5
+
+
+async def test_coingecko_price_does_not_freeze_before_deadline(store, settings):
+    await seed(store, token_obs=False)
+    await store.add_observation(
+        "solana:abc", "coingecko", "2026-10-01T00:05:00Z", {"price_usd": 7.0}
+    )
+    # 1-day horizon is due at +24 h; the 48 h entry window is still open
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(
+                DS, payload=[{"priceUsd": "9.0", "liquidity": {"usd": 5}}], repeat=True
+            )
+            await measure_due(store, settings, s, "2026-10-02T02:00:00Z")
+    assert await one(store, "SELECT entry_price FROM watchlist") == (None,)
+    # a DEX row arrives inside the window and wins
+    await store.add_observation(
+        "solana:abc", "dexscreener", "2026-10-02T03:00:00Z", {"price_usd": 3.0}
+    )
+    assert await entry_price(store, "solana:abc", E, allow_cg=False) == 3.0
+
+
+async def test_coingecko_fallback_used_after_deadline(store, settings):
+    await seed(store, token_obs=False)
+    await store.add_observation(
+        "solana:abc", "coingecko", "2026-10-01T00:05:00Z", {"price_usd": 7.0}
+    )
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-03T01:00:00Z", {"price_usd": 61000.0}
+    )
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(
+                DS, payload=[{"priceUsd": "14.0", "liquidity": {"usd": 5}}], repeat=True
+            )
+            await measure_due(store, settings, s, "2026-10-03T01:00:00Z")
+    assert await one(store, "SELECT entry_price FROM watchlist") == (7.0,)
+
+
+async def test_overdue_row_expires_unmeasured(store, settings):
+    await seed(
+        store, btc=False
+    )  # BTC gap at entry: today this row would stay due forever
+    later = "2026-10-20T00:00:00Z"  # 1-day row is 18 d overdue, 7-day row 12 d
+    await store.add_observation(
+        "benchmark:btc", "coingecko", "2026-10-19T23:00:00Z", {"price_usd": 70000.0}
+    )
+    with capture_logs() as logs:
+        async with aiohttp.ClientSession() as s:
+            with aioresponses():
+                r = await measure_due(store, settings, s, later)
+    assert r.expired == 1
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, measured_at, ret FROM forward_returns WHERE horizon_days IN (1,7) "
+            "ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(1, later, None), (7, None, None)]
+    assert any(
+        e["event"] == "ledger_row_expired" and e["horizon_days"] == 1 for e in logs
+    )
+
+
+async def test_close_unmeasured_is_write_once(store):
+    await seed(store)
+    assert await store.close_unmeasured("solana:abc", 1, "2026-10-20T00:00:00Z") is True
+    assert (
+        await store.close_unmeasured("solana:abc", 1, "2026-10-21T00:00:00Z") is False
+    )

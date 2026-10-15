@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 import structlog
 
+from gecko.calls import call_seeds
 from gecko.http import Pacer, UpstreamError, get_json
 from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
@@ -196,6 +197,11 @@ async def collect(
     targets = await _refresh_targets(store, settings)
     known = set(targets)
     found, invalid = await _discover(session, settings, pacer, feeds)
+    seeded: set[tuple[str, str]] = set()
+    for chain, addrs in (await call_seeds(store, settings, now)).items():
+        have = found.setdefault(chain, set())
+        seeded |= {(chain, a) for a in addrs - have}
+        have |= addrs
     written = skipped = refreshed = missing = revived = 0
     for chain, addrs in found.items():
         async for addr, p in _pairs(session, settings, pacer, batches, chain, addrs):
@@ -226,7 +232,7 @@ async def collect(
                 base.get("symbol") or "?",
                 base.get("name") or "?",
                 now,
-                "dexscreener",
+                "telegram" if (chain, addr) in seeded else "dexscreener",
                 pool_created_at=f["pair_created_at"],
             )
             # An aged-out candidate back in band starts a fresh candidacy.
@@ -263,6 +269,7 @@ async def collect(
         invalid=invalid,
         promoted=promoted,
         revived=revived,
+        seeded=len(seeded),
         batches=batches["total"],
         batches_failed=batches["failed"],
         feeds_failed=feeds["failed"],

@@ -19,9 +19,12 @@ def _load_jobs() -> None:
     import gecko.collectors.coingecko  # noqa: F401
     import gecko.collectors.dexscreener  # noqa: F401
     import gecko.collectors.geckoterminal  # noqa: F401
+    import gecko.collectors.goplus  # noqa: F401
     import gecko.freshness  # noqa: F401
     import gecko.ledger  # noqa: F401
+    import gecko.prune  # noqa: F401
     import gecko.rank  # noqa: F401
+    import gecko.telegram_reader  # noqa: F401
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rule", default="F4")
     p.add_argument("--study-dir", default="/root/xs_study")
     p.add_argument("--history-db", default="/root/gecko-history/scout.db")
+    p.add_argument(
+        "--from", dest="date_from", default=None, help="backtest: first t0 (inclusive)"
+    )
+    p.add_argument(
+        "--to", dest="date_to", default=None, help="backtest: last t0 (exclusive)"
+    )
     ns = p.parse_args(argv)
     if ns.list:
         print("\n".join(sorted(JOBS)))
@@ -48,9 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.job not in JOBS:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
-    if ns.job == "ledger" and ns.as_of:
-        # Prices are fetched live, so a replayed "now" would mislabel them.
-        print("ledger is live-only: --as-of is refused", file=sys.stderr)
+    if ns.job in ("ledger", "prune") and ns.as_of:
+        # ledger fetches live prices; a future prune "now" deletes live rows.
+        print(f"{ns.job} is live-only: --as-of is refused", file=sys.stderr)
         return 2
     settings = GeckoSettings()
     if not os.path.isabs(settings.db_path):

@@ -1,6 +1,7 @@
 import aiohttp
 from aioresponses import aioresponses
 from structlog.testing import capture_logs
+from gecko.calls import insert_call
 from gecko.collectors.dexscreener import (
     best_pair,
     pair_features,
@@ -599,3 +600,65 @@ async def test_stale_candidate_back_in_band_is_revived(store, settings):
     assert row == ("candidate", None, NOW)
     done = [e for e in logs if e["event"] == "dexscreener_done"][0]
     assert done["revived"] == 1
+
+
+async def test_called_address_is_discovered_with_telegram_source(store, settings):
+    addr = "0xabc0000000000000000000000000000000000000"
+    settings.chains = ["base"]
+    await insert_call(
+        store,
+        source_type="telegram",
+        source_id="@c",
+        event_id="tg:@c:1",
+        posted_at="2026-10-08T23:00:00Z",
+        text=f"ape {addr}",
+    )
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BOOSTS_URL, payload=[])
+            m.get(PROFILES_URL, payload=[])
+            m.get(
+                TOKENS_URL.format(chain="base", addresses=addr),
+                payload=[pair(addr=addr)],
+            )
+            with capture_logs() as logs:
+                await collect(store, settings, s, NOW, sleep=nosleep)
+    row = await (
+        await store.conn.execute(
+            "SELECT first_source FROM tokens WHERE token_id=?", (f"base:{addr}",)
+        )
+    ).fetchone()
+    assert row == ("telegram",)
+    done = [e for e in logs if e["event"] == "dexscreener_done"]
+    assert len(done) == 1 and done[0]["seeded"] == 1
+
+
+async def test_seed_also_in_feed_keeps_dexscreener_source(store, settings):
+    addr = "0xabc0000000000000000000000000000000000000"
+    settings.chains = ["base"]
+    await insert_call(
+        store,
+        source_type="telegram",
+        source_id="@c",
+        event_id="tg:@c:1",
+        posted_at="2026-10-08T23:00:00Z",
+        text=addr,
+    )
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BOOSTS_URL, payload=[{"chainId": "base", "tokenAddress": addr}])
+            m.get(PROFILES_URL, payload=[])
+            m.get(
+                TOKENS_URL.format(chain="base", addresses=addr),
+                payload=[pair(addr=addr)],
+            )
+            with capture_logs() as logs:
+                await collect(store, settings, s, NOW, sleep=nosleep)
+    row = await (
+        await store.conn.execute(
+            "SELECT first_source FROM tokens WHERE token_id=?", (f"base:{addr}",)
+        )
+    ).fetchone()
+    assert row == ("dexscreener",)
+    done = [e for e in logs if e["event"] == "dexscreener_done"]
+    assert len(done) == 1 and done[0]["seeded"] == 0  # already in the feed

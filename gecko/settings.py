@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_CHAINS = ("solana", "base", "ethereum", "bsc")
@@ -30,6 +30,9 @@ class GeckoSettings(BaseSettings):
     f4_min_vol_ratio: float = 2.0
     top10_disqualify_pct: float = 60.0
     dead_after_days: int = 7
+    # open this long past due: closed unmeasured (irreversible). Floor 7 d, so the
+    # 72 h forward_returns_backlog page always fires first.
+    ledger_max_overdue_days: int = Field(14, ge=7)
     require_security_known: bool = False  # Plan 3 flips to True at cutover
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
@@ -42,11 +45,43 @@ class GeckoSettings(BaseSettings):
     cg_max_pages: int = 14
     cg_hourly_reserve: int = 100  # monthly calls the markets sweep leaves for hourly
     cg_max_lookups_per_run: int = 300  # /coins/{id} platform lookups per sweep
+    gp_min_interval_sec: float = (
+        2.0  # keyless GoPlus: <=30 calls/min, well under 150 CU/min
+    )
+    gp_max_per_run: int = 40  # tokens enriched per hourly run
+    gp_daily_cap: int = (
+        1000  # calls/day; calibrate from the GoPlus dashboard in the soak
+    )
+    gp_refresh_hours: int = (
+        20  # active tokens re-read about daily (holder growth needs it)
+    )
+    tg_seed_max: int = 60  # called addresses offered to DexScreener per run
+    tg_api_id: int = 0
+    tg_api_hash: SecretStr | None = None
+    tg_session_path: str = (
+        ""  # absolute, outside the repo, mode 0600; gecko's OWN session
+    )
+    tg_channels: list[str] = []  # public @handles
+    tg_poll_interval_sec: int = Field(120, ge=30)  # faster invites FloodWait
+    # newest messages read per channel per poll; 0 would read nothing, ok forever
+    tg_catchup_limit: int = Field(200, ge=1)
     coingecko_demo_api_key: SecretStr | None = None
     coingecko_monthly_cap: int = 8000
     telegram_bot_token: SecretStr | None = None
     telegram_health_chat_id: str | None = None
     young_chain_launch_dates: dict[str, str] = {}  # chain -> ISO date
+
+    obs_retention_days: int = 180
+    # >= 35: calls_this_month sums runs back to the 1st of the month
+    runs_retention_days: int = Field(90, ge=35)
+
+    @field_validator("obs_retention_days")
+    @classmethod
+    def _retention_floor(cls, v: int) -> int:
+        # features read <=16 d back, admission 7 d, entry price 48 h: 30 d is the floor
+        if v < 30:
+            raise ValueError("retention must be >= 30 days")
+        return v
 
     @field_validator("chains")
     @classmethod

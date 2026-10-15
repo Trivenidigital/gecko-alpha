@@ -1,9 +1,11 @@
-# Aggregate-observation tests seed the "enrich" writer, which feeds only the
-# aggregate check, so per-source SLOs do not add breaches here.
+# Aggregate-observation tests seed the "enrich" writer. Its own per-source SLO
+# (observations:enrich, 1560 min) counts only goplus_status="ok" rows, so those
+# seeded rows are invisible to it; it falls back to the writer's first ok run,
+# which these tests keep well inside 1560 min, so it adds no breaches here.
 import pytest
 from aioresponses import aioresponses
 from structlog.testing import capture_logs
-from gecko.freshness import check_freshness, SLO_MINUTES, alert_breaches
+from gecko.freshness import Breach, check_freshness, SLO_MINUTES, alert_breaches
 
 TG_URL = "https://api.telegram.org/bottok/sendMessage"
 
@@ -389,7 +391,8 @@ async def test_one_live_source_does_not_hide_a_dead_one(store):
 
 
 async def test_forward_returns_backlog(store):
-    await store.schedule_returns("solana:a", "2026-10-01T00:00:00Z", horizons=(1,))
+    await store.watchlist_upsert("solana:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1,))
     due = "2026-10-02T00:00:00Z"
     ok = [b.table for b in await check_freshness(store, "2026-10-04T23:00:00Z")]
     assert "forward_returns_backlog" not in ok  # 71 h overdue
@@ -464,3 +467,144 @@ async def test_geckoterminal_ok_runs_writing_nothing_still_page(
     )
     tables = [x.table for x in await check_freshness(store, now)]
     assert ("observations:geckoterminal" in tables) is breach
+
+
+async def test_enrich_source_slo(store):
+    await store.record_run(
+        "enrich", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", True
+    )
+    await store.add_observation(
+        "base:x",
+        "enrich",
+        "2026-10-01T00:00:00Z",
+        {"goplus_status": "ok", "security_ok": True},
+    )
+    late = "2026-10-02T03:00:00Z"  # 27 h later
+    assert "observations:enrich" in {
+        b.table for b in await check_freshness(store, late)
+    }
+    assert "observations:enrich" not in {
+        b.table for b in await check_freshness(store, "2026-10-01T20:00:00Z")
+    }
+
+
+async def test_enrich_slo_ignores_unknown_markers(store):
+    t0, late = "2026-10-01T00:00:00Z", "2026-10-02T03:00:00Z"  # 27 h apart
+    await store.record_run("enrich", t0, t0, True)
+    await store.add_observation(
+        "base:x", "enrich", t0, {"goplus_status": "ok", "security_ok": True}
+    )
+    await store.add_observation("base:y", "enrich", late, {"goplus_status": "unknown"})
+    assert "observations:enrich" in {
+        b.table for b in await check_freshness(store, late)
+    }
+    await store.add_observation(
+        "base:z", "enrich", late, {"goplus_status": "ok", "security_ok": False}
+    )
+    assert "observations:enrich" not in {
+        b.table for b in await check_freshness(store, late)
+    }
+
+
+async def test_source_calls_is_run_anchored_on_the_reader(store):
+    # silent channels: reader polls fine, writes no calls -> no page
+    await store.record_run(
+        "telegram-reader", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", True
+    )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", True
+    )
+    assert "source_calls" not in {
+        b.table for b in await check_freshness(store, "2026-10-02T00:20:00Z")
+    }
+    # reader stopped polling (or every poll failed) -> page after 30 min
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:02:00Z", "2026-10-02T00:02:00Z", False
+    )
+    assert "source_calls" in {
+        b.table for b in await check_freshness(store, "2026-10-02T00:40:00Z")
+    }
+
+
+async def test_other_ok_writer_does_not_mask_a_failing_reader(store):
+    # an ok run from any other job (e.g. a future xkol lane) must not keep
+    # source_calls fresh while the reader fails
+    for job in ("xkol", "dexscreener"):
+        await store.record_run(
+            job, "2026-10-02T00:30:00Z", "2026-10-02T00:30:00Z", True
+        )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", False
+    )
+    hit = [
+        b
+        for b in await check_freshness(store, "2026-10-02T00:40:00Z")
+        if b.table == "source_calls"
+    ]
+    assert hit == [Breach("source_calls", None, 30)]
+
+
+@pytest.mark.parametrize(
+    "now,breach", [("2026-10-02T00:31:00Z", True), ("2026-10-02T00:29:00Z", False)]
+)
+async def test_writer_failing_since_deploy_pages(store, now, breach):
+    # no ok run ever, only failures: not "bootstrapping" once the SLO has passed
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:00:00Z", "2026-10-02T00:00:00Z", False
+    )
+    await store.record_run(
+        "telegram-reader", "2026-10-02T00:20:00Z", "2026-10-02T00:20:00Z", False
+    )
+    hit = [b for b in await check_freshness(store, now) if b.table == "source_calls"]
+    assert hit == ([Breach("source_calls", None, 30)] if breach else [])
+
+
+async def test_failing_cron_writer_never_pages_from_freshness(store):
+    # cron failures page through Hermes incidents; freshness must not double-page
+    await store.record_run(
+        "rank", "2026-10-01T00:00:00Z", "2026-10-01T00:00:05Z", False
+    )
+    assert await check_freshness(store, "2026-10-02T00:00:00Z") == []
+
+
+@pytest.mark.parametrize(
+    "channels,age_min,breach",
+    [(["@a"], 31, True), (["@a"], 29, False), ([], 31, False)],
+)
+async def test_never_started_reader_pages_from_the_freshness_anchor(
+    store, settings, channels, age_min, breach
+):
+    # no telegram-reader row at all (unit never installed or started): the
+    # freshness job's own first ok run ends bootstrapping, once channels are set
+    settings.tg_channels = channels
+    t0 = "2026-10-02T00:00:00Z"
+    await store.record_run("freshness", t0, t0, True)
+    now = _plus_from(t0, age_min)
+    hit = [
+        b
+        for b in await check_freshness(store, now, settings)
+        if b.table == "source_calls"
+    ]
+    assert hit == ([Breach("source_calls", None, 30)] if breach else [])
+
+
+async def test_freshness_job_wiring_pages_a_never_started_reader(store, settings):
+    # alert_breaches must hand settings to check_freshness (else tg_channels is unseen)
+    settings.tg_channels = ["@a"]
+    t0 = "2026-10-02T00:00:00Z"
+    await store.record_run("freshness", t0, t0, True)
+    r = await alert_breaches(store, settings, None, _plus_from(t0, 31))
+    assert r.skipped >= 1
+    with capture_logs() as logs:
+        await alert_breaches(store, settings, None, _plus_from(t0, 31))
+    assert {"source_calls"} <= {
+        e["table"] for e in logs if e["event"] == "freshness_alert_skipped_no_channel"
+    }
+
+
+def _plus_from(t0: str, minutes: int) -> str:
+    from datetime import timedelta
+
+    from gecko.store import parse_utc
+
+    return (parse_utc(t0) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")

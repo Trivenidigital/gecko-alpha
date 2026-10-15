@@ -83,7 +83,12 @@ async def _first_priced(
 
 
 async def entry_price(
-    store: Store, token_id: str, entered_at: str, *, as_of: str | None = None
+    store: Store,
+    token_id: str,
+    entered_at: str,
+    *,
+    as_of: str | None = None,
+    allow_cg: bool = True,
 ) -> float | None:
     """Price of the earliest priced DEX observation at or after ``entered_at``.
 
@@ -91,9 +96,11 @@ async def entry_price(
     when no priced DEX row exists in the window. Unpriced rows are passed
     over, and a later row is never preferred to an earlier priced one.
     ``as_of`` bounds the search so a run cannot read its own future.
+    ``allow_cg`` False skips the CoinGecko fallback (the ledger's choice until
+    the 48 h window closes, so a later in-window DEX row is not pre-empted).
     """
     p = await _first_priced(store, token_id, DEX_SOURCES, entered_at, as_of)
-    if p is None:
+    if p is None and allow_cg:
         p = await _first_priced(store, token_id, ("coingecko",), entered_at, as_of)
     return p
 
@@ -179,6 +186,7 @@ class LedgerReport:
     total_loss: int = 0
     unmeasurable: int = 0
     skipped: int = 0
+    expired: int = 0
     gated: int = 0
 
 
@@ -197,7 +205,9 @@ async def _resolve_entry(
     deadline = canon_ts(
         (parse_utc(entered_at) + timedelta(hours=ENTRY_WINDOW_HOURS)).isoformat()
     )
-    ep = await entry_price(store, tid, entered_at, as_of=min(now, deadline))
+    ep = await entry_price(
+        store, tid, entered_at, as_of=min(now, deadline), allow_cg=now > deadline
+    )
     if ep is not None:
         await store.set_entry_price(tid, ep)
     return ep, now > deadline
@@ -257,12 +267,19 @@ async def measure_due(
     closed: set[str] = set()
     pacer = Pacer(settings.ds_min_interval_sec, sleep)
     canary: dict[str, bool] = {}
+    overdue = timedelta(days=settings.ledger_max_overdue_days)
+    expire_before = canon_ts((parse_utc(now) - overdue).isoformat())
     if repaired := await store.repair_schedules():
         log.warning("ledger_schedules_repaired", rows=repaired)
     for due in await store.due_returns(now):
         tid, h = due.token_id, due.horizon_days
         if tid in closed:
             continue  # finalized whole this run
+        if due.due_at < expire_before:  # more than ledger_max_overdue_days past due
+            if await store.close_unmeasured(tid, h, now):
+                rep.expired += 1
+                log.warning("ledger_row_expired", **asdict(due))
+            continue
         trow = await (
             await store.conn.execute(
                 "SELECT chain, address FROM tokens WHERE token_id=?", (tid,)
@@ -282,7 +299,7 @@ async def measure_due(
         entered_at = wrow[0]
         # A BTC gap skips the row without spending an attempt. A gap at ``now``
         # heals on a later run; a gap at ``entered_at`` cannot (nothing
-        # backfills benchmark history), so that row stays due and keeps logging.
+        # backfills benchmark history), so that row stays due until it expires.
         btc_entry = await btc_price_at(store, entered_at)
         btc_now = await btc_price_at(store, now)
         if btc_entry is None or btc_now is None:
@@ -391,6 +408,7 @@ async def ledger_job(settings: GeckoSettings, ns) -> int:
 
     async def body(store, session):
         r = await measure_due(store, settings, session, now)
-        return JobResult(rows_written=r.measured + r.total_loss + r.unmeasurable)
+        n = r.measured + r.total_loss + r.unmeasurable + r.expired
+        return JobResult(rows_written=n)
 
     return await run_job("ledger", settings, body)

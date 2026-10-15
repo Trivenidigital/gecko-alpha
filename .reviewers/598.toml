@@ -1,0 +1,41 @@
+# PR #598 — feat(gecko): Plan 2 — GoPlus enrichment, Telegram calls, track-record + disk tickets.
+#
+# Every mandatory vector was reviewed by an independent reviewer agent against
+# the LAST CODE COMMIT on the branch (9d1e5d74); the commit adding this file is
+# docs/record only (follow-up tickets + this record), so no watched path moves.
+#
+# Review history (SDD ledger, session 2026-10-14/15): 11 per-task reviews with
+# scoped re-reviews; a whole-branch review (4 fix-before-merge items) with one
+# fix wave and a scoped re-review; then four vector reviews at 8feca33c
+# (concurrency CLEAR, ops-safety CLEAR, silent-failure BLOCK x2, logic BLOCK x1),
+# two vector fix rounds, and four re-clears at each new head, final at the SHA below.
+# Unfixed tickets/nits are filed in docs/superpowers/plans/2026-10-09-gecko-core-package-followups.md.
+
+pr = 598
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "gecko",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "9d1e5d74cccd2530ecf6ad19993d5d0390298148"
+logic          = "9d1e5d74cccd2530ecf6ad19993d5d0390298148"
+ops-safety     = "9d1e5d74cccd2530ecf6ad19993d5d0390298148"
+silent-failure = "9d1e5d74cccd2530ecf6ad19993d5d0390298148"

@@ -6,6 +6,7 @@ from datetime import timedelta
 import aiohttp
 import structlog
 
+from gecko.collectors.goplus import KNOWN_VERDICT
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.runs import JobResult, run_job
@@ -16,7 +17,7 @@ log = structlog.get_logger("gecko.freshness")
 
 SLO_MINUTES = {
     "observations": 30,
-    "source_calls": 360,
+    "source_calls": 30,
     "watchlist": 120,
     "forward_returns": 1560,
     "research_notes": 1560,
@@ -27,6 +28,7 @@ SLO_MINUTES = {
     "observations:geckoterminal": 360,
     "observations:coingecko": 1560,
     "observations:geckoterminal_ohlcv": 1560,  # rows that carry candles only
+    "observations:enrich": 1560,
     "benchmark:btc": 180,  # the ledger cannot measure without it
 }
 BTC_TOKEN_ID = "benchmark:btc"
@@ -42,7 +44,7 @@ WRITER_JOBS = {
         "coingecko-hourly",
         "enrich",
     ),
-    "source_calls": ("telegram-reader", "xkol"),
+    "source_calls": ("telegram-reader",),  # an X lane gets its own key, never this one
     "watchlist": ("rank",),
     "forward_returns": ("ledger",),
     "research_notes": ("research",),
@@ -50,10 +52,16 @@ WRITER_JOBS = {
     "observations:geckoterminal": ("geckoterminal",),
     "observations:coingecko": ("coingecko-markets",),
     "observations:geckoterminal_ohlcv": ("geckoterminal-ohlcv",),
+    "observations:enrich": ("enrich",),
     "benchmark:btc": ("coingecko-hourly",),
 }
-# Tables whose writer may legitimately write 0 rows; judged by its last ok run.
-RUN_ANCHORED = frozenset({"watchlist", "forward_returns", "research_notes"})
+# Writers outside Hermes cron: no incident path, so freshness pages their failures.
+NON_CRON_WRITERS = frozenset({"telegram-reader"})
+# Tables whose writer may legitimately write 0 rows (silent channels, an empty
+# watchlist, nothing due); judged by its last ok run.
+RUN_ANCHORED = frozenset(
+    {"watchlist", "forward_returns", "research_notes", "source_calls"}
+)
 DEDUP_HOURS = 6
 
 
@@ -83,6 +91,31 @@ async def _writer_run(store: Store, table: str, agg: str) -> str | None:
     return row[0]
 
 
+async def _non_cron_first_failure(
+    store: Store, table: str, expected: bool
+) -> str | None:
+    """Earliest failed run of ``table``'s writers that no cron incident would page."""
+    jobs = [j for j in WRITER_JOBS[table] if j in NON_CRON_WRITERS]
+    if not jobs:
+        return None
+    row = await (
+        await store.conn.execute(
+            f"SELECT MIN(finished_at) FROM runs WHERE ok=0 AND job IN "
+            f"({','.join('?' * len(jobs))})",
+            jobs,
+        )
+    ).fetchone()
+    # An expected writer with no run at all (never installed or started) is
+    # measured from the freshness job's first ok run, an anchor it cannot control.
+    if row[0] is None and expected:
+        row = await (
+            await store.conn.execute(
+                "SELECT MIN(finished_at) FROM runs WHERE ok=1 AND job='freshness'"
+            )
+        ).fetchone()
+    return row[0]
+
+
 async def _last_write(store: Store, key: str) -> str | None:
     """Newest write for a table, or for a per-source / benchmark check."""
     if key == BTC_TOKEN_ID:
@@ -92,6 +125,8 @@ async def _last_write(store: Store, key: str) -> str | None:
         where, args = "source=?", (src,)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
+        elif src == "enrich":  # unknown markers and verdict-less reads are not data
+            where += " AND " + KNOWN_VERDICT
         elif (
             src == "coingecko"
         ):  # markets rows only: hourly BTC/trending mask a dead sweep
@@ -123,13 +158,21 @@ async def _oldest_overdue(store: Store, now: str) -> str | None:
     return row[0]
 
 
-async def check_freshness(store: Store, now: str) -> list[Breach]:
+async def check_freshness(
+    store: Store, now: str, settings: GeckoSettings | None = None
+) -> list[Breach]:
     out: list[Breach] = []
+    # the Telegram reader is expected once channels are configured
+    reader_expected = bool(settings and settings.tg_channels)
     now_dt = parse_utc(now)
     for table, slo in SLO_MINUTES.items():
         first_run = await _writer_run(store, table, "MIN")
         if first_run is None:
-            continue  # bootstrapping: no writer has succeeded yet
+            # Bootstrapping, unless a non-cron writer has failed since deploy.
+            failed = await _non_cron_first_failure(store, table, reader_expected)
+            if failed and now_dt - parse_utc(failed) > timedelta(minutes=slo):
+                out.append(Breach(table, None, slo))
+            continue
         if table in RUN_ANCHORED:
             # Legitimately row-less runs (an empty watchlist, nothing due):
             # staleness is the writer's last ok run, not the table's last row.
@@ -167,7 +210,7 @@ async def alert_breaches(
 ) -> AlertReport:
     report = AlertReport()
     has_channel = bool(settings.telegram_bot_token and settings.telegram_health_chat_id)
-    for b in await check_freshness(store, now):
+    for b in await check_freshness(store, now, settings):
         if await _recently_alerted(store, b.table, now):
             continue
         if not has_channel:
