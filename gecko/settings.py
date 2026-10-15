@@ -72,9 +72,10 @@ class GeckoSettings(BaseSettings):
     young_chain_launch_dates: dict[str, str] = {}  # chain -> ISO date
 
     obs_retention_days: int = 180
-    runs_retention_days: int = 90
+    # >= 35: calls_this_month sums runs back to the 1st of the month
+    runs_retention_days: int = Field(90, ge=35)
 
-    @field_validator("obs_retention_days", "runs_retention_days")
+    @field_validator("obs_retention_days")
     @classmethod
     def _retention_floor(cls, v: int) -> int:
         # features read <=16 d back, admission 7 d, entry price 48 h: 30 d is the floor

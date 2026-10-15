@@ -48,6 +48,13 @@ def test_retention_floor_validated():
         GeckoSettings(runs_retention_days=10, _env_file=None)
 
 
+def test_runs_retention_floor_covers_a_calendar_month():
+    # calls_this_month sums runs from the 1st: pruning a younger run undercounts it
+    assert GeckoSettings(runs_retention_days=35, _env_file=None)
+    with pytest.raises(ValidationError):
+        GeckoSettings(runs_retention_days=34, _env_file=None)
+
+
 def test_prune_refuses_as_of(monkeypatch, settings):
     import sqlite3
 
