@@ -213,7 +213,7 @@ Amended 2026-10-16 (ruling R1): Hermes = gateway + the `gecko-query` read-only s
 - Freshness: a table with no writes past SLO produces exactly one alert; a second run within 6 h produces none.
 - Collectors: a 429 then 200 sequence succeeds with backoff; a persistent failure exits 1 and writes `runs.ok = 0`.
 - Backtest: reproduces the 09-18 F4 cohort statistics within tolerance on the frozen study data (regression anchor).
-- Target: `tests/gecko` ≤ 9,500 LOC (see S1; amended 2026-10-16).
+- Target: `tests/gecko` ≤ 10,000 LOC (see S1; amended 2026-10-16).
 
 ## 16. Budget
 

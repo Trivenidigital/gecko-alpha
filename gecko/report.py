@@ -1,13 +1,16 @@
-"""Operator reports over the ledger: the weekly scorecard (deterministic)."""
+"""Operator reports over the ledger: weekly scorecard and daily digest (deterministic)."""
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import timedelta
 from statistics import mean, median
 
 import aiohttp
+import structlog
 
+from gecko.features import compute_features
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.numeric import num
@@ -21,6 +24,9 @@ F4_RULE = "F4"
 # Pre-registered split: docs/prereg/2026-10-16-F4-entry-mcap-5m.md
 F4_MCAP_SPLIT_USD = 5_000_000
 F4_HI, F4_LO = "F4 mcap≥5M", "F4 mcap<5M"
+TOP_KEY = "digest:top"  # kv: the top-N token ids the last sent digest showed
+
+log = structlog.get_logger("gecko.report")
 
 
 def _split(text: str, limit: int = MAX_CHARS) -> list[str]:
@@ -51,17 +57,21 @@ async def _send(
     Raises ``RuntimeError`` when the bot token or digest chat is missing;
     returns False when any part is not delivered (later parts are not sent).
     """
+    token, chat = _channel(settings)
+    for part in _split(text):
+        if not await send_telegram(session, token, chat, part):
+            return False
+    return True
+
+
+def _channel(settings: GeckoSettings) -> tuple[str, str]:
+    """(bot token, digest chat id); ``RuntimeError`` when either is missing."""
     token = settings.telegram_bot_token
     if not (token and token.get_secret_value() and settings.telegram_digest_chat_id):
         raise RuntimeError(
             "no digest channel configured (telegram_bot_token / telegram_digest_chat_id)"
         )
-    for part in _split(text):
-        if not await send_telegram(
-            session, token.get_secret_value(), settings.telegram_digest_chat_id, part
-        ):
-            return False
-    return True
+    return token.get_secret_value(), settings.telegram_digest_chat_id
 
 
 def _line(label: str, rows: list[tuple], min_n: int) -> str:
@@ -149,3 +159,123 @@ async def scorecard_job(settings: GeckoSettings, ns) -> int:
         return JobResult(rows_written=0)
 
     return await run_job("scorecard", settings, body)
+
+
+def _clean(value, cap: int = 16) -> str:
+    """Untrusted text (token symbols, model output): printable characters, capped."""
+    return "".join(c for c in str(value) if c.isprintable())[:cap] or "?"
+
+
+def _val(v, spec: str, scale: float = 1.0) -> str:
+    x = num(v)
+    return "?" if x is None else format(x / scale, spec)
+
+
+async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
+    """``#rank SYMBOL (chain) score … | features | verdict`` plus a flags line."""
+    tid, rank, score, sym, chain = row[0], row[1], row[2], row[7], row[8]
+    note = await (
+        await store.conn.execute(
+            "SELECT note_json FROM research_notes WHERE token_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid,),
+        )
+    ).fetchone()
+    try:
+        note = json.loads(note[0]) if note else None
+    except ValueError:
+        note = "bad"
+    flags: list = []
+    if note is None:
+        verdict = "no dossier"
+    elif not isinstance(note, dict):
+        verdict = "bad dossier"
+    else:
+        verdict = f"{_clean(note.get('verdict'))} {_val(note.get('confidence'), 'g')}"
+        flags = note.get("red_flags") if isinstance(note.get("red_flags"), list) else []
+    lines = [
+        f"#{rank} {_clean(sym)} ({_clean(chain)}) score {score:.2f} | "
+        f"age {_val(feats.get('age_days'), '.0f')}d "
+        f"vol7d x{_val(feats.get('vol_7d_ratio'), '.1f')} "
+        f"liq ${_val(feats.get('liquidity_usd'), '.0f', 1000)}K "
+        f"top10 {_val(feats.get('top10_pct'), '.0f')}% | {verdict}"
+    ]
+    if flags:
+        lines.append("  flags: " + "; ".join(_clean(f, 40) for f in flags[:2]))
+    return lines
+
+
+async def digest_text(
+    store: Store, settings: GeckoSettings, now: str
+) -> tuple[str, list[str], bool]:
+    """(message, top-N token ids, whether anything entered or exited) since the
+    last OK digest run; the first digest lists every open watchlist row."""
+    now = canon_ts(now)
+    q = store.conn.execute
+    (anchor,) = await (
+        await q("SELECT MAX(started_at) FROM runs WHERE job='digest' AND ok=1")
+    ).fetchone()
+    rows = await (
+        await q(
+            "SELECT w.token_id, w.rank, w.score, w.features_at_entry_json, "
+            "w.entered_at, w.exited_at, w.exit_reason, t.symbol, t.chain "
+            "FROM watchlist w LEFT JOIN tokens t USING(token_id) "
+            "ORDER BY w.rank, w.token_id"
+        )
+    ).fetchall()
+    open_rows = [r for r in rows if r[5] is None]
+    new = open_rows if anchor is None else [r for r in rows if r[4] > anchor]
+    gone = [] if anchor is None else [r for r in rows if r[5] and r[5] > anchor]
+    top = open_rows[: settings.digest_top_n]
+    entry = {r[0]: json.loads(r[3]) for r in new}
+    lines = [f"gecko digest {now[:10]}", f"ENTRANTS ({len(new)})"]
+    for r in new:
+        lines += await _token_lines(store, r, entry[r[0]])
+    lines.append(f"EXITS ({len(gone)})")
+    lines += [f"{_clean(r[7])} {r[6]}" for r in gone]
+    lines.append(f"TOP {settings.digest_top_n}")
+    for r in top:
+        feats = entry.get(r[0])
+        if feats is None:
+            feats = (await compute_features(store, settings, r[0], now)).as_dict()
+        lines += await _token_lines(store, r, feats)
+    cutoff = canon_ts((parse_utc(now) - timedelta(hours=6)).isoformat())
+    failed = await (
+        await q(
+            "SELECT 1 FROM runs WHERE job='freshness' AND ok=0 AND finished_at>=? "
+            "LIMIT 1",
+            (cutoff,),
+        )
+    ).fetchone()
+    counts = dict(
+        await (
+            await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
+        ).fetchall()
+    )
+    lines.append(
+        f"health: freshness {'FAILED' if failed else 'ok'} | "
+        f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
+        f"watchlist {len(open_rows)}"
+    )
+    return "\n".join(lines), [r[0] for r in top], bool(new or gone)
+
+
+@register("digest")
+async def digest_job(settings: GeckoSettings, ns) -> int:
+    now = canon_ts(ns.as_of) if ns.as_of else utcnow()
+
+    async def body(store: Store, session: aiohttp.ClientSession) -> JobResult:
+        _channel(settings)  # a missing channel fails the run even on a silent day
+        text, top_ids, changed = await digest_text(store, settings, now)
+        top = json.dumps(top_ids)
+        if not changed and await store.kv_get(TOP_KEY) == top:
+            print("[SILENT]")
+            log.info("digest_silent", top=len(top_ids))
+            return JobResult(rows_written=0)
+        print(text)
+        if not await _send(session, settings, text):
+            raise RuntimeError("digest delivery failed")
+        await store.kv_set(TOP_KEY, top, now)  # only after every part was delivered
+        return JobResult(rows_written=1)
+
+    return await run_job("digest", settings, body)

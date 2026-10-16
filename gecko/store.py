@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at TEXT NOT NULL, ok INTEGER NOT NULL, rows_written INTEGER NOT NULL DEFAULT 0,
   credits_used INTEGER NOT NULL DEFAULT 0, error TEXT);
 CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 # Every table and index name the schema creates: a file holding anything else
@@ -334,6 +336,20 @@ class Store:
             await self.conn.execute(f"SELECT MAX({col}) FROM {table}")
         ).fetchone()
         return row[0]
+
+    async def kv_get(self, key: str) -> str | None:
+        row = await (
+            await self.conn.execute("SELECT value FROM kv WHERE key=?", (key,))
+        ).fetchone()
+        return row[0] if row else None
+
+    async def kv_set(self, key: str, value: str, now: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) "
+            "DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, canon_ts(now)),
+        )
+        await self.conn.commit()
 
     async def watchlist_upsert(
         self, token_id, entered_at, rule_id, rank, score, features_at_entry: dict

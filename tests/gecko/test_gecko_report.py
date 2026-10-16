@@ -1,3 +1,4 @@
+import json
 import argparse
 
 import aiohttp
@@ -199,3 +200,223 @@ def test_scorecard_job_is_registered_by_the_cli():
 
     _load_jobs()
     assert JOBS["scorecard"] is scorecard_job
+
+
+# --- digest -------------------------------------------------------------------
+
+OLD = "2026-10-01T00:00:00Z"  # before any real-clock digest run
+
+
+async def _tok(store, tid, sym, *, status="active", chain="solana"):
+    await store.upsert_token(tid, chain, tid, sym, sym, OLD, "dexscreener")
+    await store.set_token_status(tid, status)
+
+
+async def _open(store, tid, rank, *, entered=OLD, feats=None, sym=None):
+    await _tok(store, tid, sym or tid.upper())
+    await store.watchlist_upsert(tid, entered, "F4", rank, 2.0 - rank / 10, feats or {})
+
+
+async def _digest(store, settings, *, ok=True, n=1):
+    """Run the digest job; returns (rc, sent texts, last digest run row)."""
+    from gecko.report import digest_job
+
+    _with_channel(settings)
+    with aioresponses() as m:
+        for _ in range(n):
+            m.post(TG_URL, payload={"ok": ok})
+        rc = await digest_job(settings, argparse.Namespace(as_of=None))
+    sent = [c.kwargs["json"]["text"] for calls in m.requests.values() for c in calls]
+    row = await (
+        await store.conn.execute(
+            "SELECT ok, rows_written, error FROM runs WHERE job='digest' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+    ).fetchone()
+    return rc, sent, row
+
+
+def _section(text, head):
+    lines = text.splitlines()
+    i = next(i for i, ln in enumerate(lines) if ln.startswith(head))
+    out = []
+    for ln in lines[i + 1 :]:
+        if ln.startswith(("ENTRANTS", "EXITS", "TOP ", "health:")):
+            break
+        out.append(ln)
+    return lines[i], out
+
+
+async def test_first_ever_digest_lists_whole_watchlist(store, settings):
+    feats = {"age_days": 3.2, "vol_7d_ratio": 4.25, "liquidity_usd": 52_400.0}
+    feats["top10_pct"] = 31.0
+    await _open(store, "a", 1, feats=feats)
+    await _open(store, "b", 2)
+    await _open(store, "gone", 3)
+    await store.watchlist_exit("gone", "2026-10-02T00:00:00Z", "rank")
+    await _tok(store, "c", "C", status="candidate")
+    rc, (text,), row = await _digest(store, settings)
+    assert rc == 0 and row == (1, 1, None)
+    assert text.splitlines()[0].startswith("gecko digest 20")
+    head, lines = _section(text, "ENTRANTS")
+    assert head == "ENTRANTS (2)"
+    assert lines == [
+        "#1 A (solana) score 1.90 | age 3d vol7d x4.2 liq $52K top10 31% | no dossier",
+        "#2 B (solana) score 1.80 | age ?d vol7d x? liq $?K top10 ?% | no dossier",
+    ]
+    assert _section(text, "EXITS") == ("EXITS (0)", [])
+    head, lines = _section(text, "TOP ")
+    assert head == "TOP 10" and [ln.split()[1] for ln in lines] == ["A", "B"]
+    assert text.splitlines()[-1] == (
+        "health: freshness ok | candidates 1 active 3 watchlist 2"
+    )
+
+
+async def test_digest_diff_anchored_on_last_ok_run(store, settings):
+    await _open(store, "old", 1, entered="2026-10-01T00:00:00Z")
+    await _open(store, "mid", 2, entered="2026-10-05T00:00:00Z")
+    await _open(store, "out", 3, entered="2026-10-01T00:00:00Z")
+    await store.watchlist_exit("out", "2026-10-06T00:00:00Z", "rank")
+    await _open(store, "before", 4, entered="2026-10-01T00:00:00Z")
+    await store.watchlist_exit("before", "2026-10-02T00:00:00Z", "rank")
+    a, b = "2026-10-03T00:00:00Z", "2026-10-07T00:00:00Z"
+    await store.record_run("digest", a, a, True)  # the anchor
+    await store.record_run("digest", b, b, False, error="x")  # must not move it
+    await store.record_run("freshness", b, b, False, error="x")  # > 6 h ago
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0
+    head, lines = _section(text, "ENTRANTS")
+    assert head == "ENTRANTS (1)" and lines[0].startswith("#2 MID (solana) ")
+    assert _section(text, "EXITS") == ("EXITS (1)", ["OUT rank"])
+    assert "freshness ok" in text
+
+
+async def test_digest_silent_when_unchanged(store, settings, capsys):
+    await _open(store, "a", 1)
+    await _open(store, "b", 2)
+    rc, sent, _ = await _digest(store, settings)
+    assert rc == 0 and len(sent) == 1
+    assert json.loads(await store.kv_get("digest:top")) == ["a", "b"]
+    capsys.readouterr()
+    rc, sent, row = await _digest(store, settings)
+    assert rc == 0 and sent == [] and row == (1, 0, None)
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "[SILENT]" and "digest_silent" in out
+
+
+async def test_digest_not_silent_when_top_order_changes(store, settings):
+    await _open(store, "a", 1)
+    await _open(store, "b", 2)
+    await _digest(store, settings)
+    await store.conn.execute("UPDATE watchlist SET rank=3-rank")
+    await store.conn.commit()
+    rc, (text,), row = await _digest(store, settings)
+    assert rc == 0 and row == (1, 1, None)
+    assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
+    assert [ln.split()[1] for ln in _section(text, "TOP ")[1]] == ["B", "A"]
+    assert json.loads(await store.kv_get("digest:top")) == ["b", "a"]
+
+
+async def test_digest_not_silent_on_entry_or_exit_outside_top(store, settings):
+    from gecko.store import iso_plus, utcnow
+
+    settings.digest_top_n = 1
+    await _open(store, "a", 1)
+    await _open(store, "b", 2)
+    _, (text,), _ = await _digest(store, settings)
+    assert _section(text, "TOP ") == ("TOP 1", _section(text, "ENTRANTS")[1][:1])
+    later = iso_plus(utcnow(), 1)  # after the run's real-clock anchor
+    await _open(store, "c", 3, entered=later)
+    rc, (text,), row = await _digest(store, settings)  # top unchanged: ["a"]
+    assert rc == 0 and row == (1, 1, None)
+    assert _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
+    await store.watchlist_exit("b", iso_plus(later, 1), "rank")
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["B rank"])
+
+
+async def test_digest_includes_research_verdict(store, settings):
+    await _open(store, "a", 1)
+    await _open(store, "b", 2)
+    for at, note in (
+        ("2026-10-02T00:00:00Z", {"verdict": "avoid", "confidence": 0.2}),
+        (
+            "2026-10-03T00:00:00Z",
+            {
+                "verdict": "watch",
+                "confidence": 0.7,
+                "red_flags": ["mint\nauthority live", "x" * 60, "third"],
+            },
+        ),
+    ):
+        await store.conn.execute(
+            "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
+            "note_json) VALUES('a',?,'m',1,?)",
+            (at, json.dumps(note)),
+        )
+    await store.conn.commit()
+    _, (text,), _ = await _digest(store, settings)
+    lines = _section(text, "ENTRANTS")[1]
+    assert lines[0].endswith("| watch 0.7")
+    assert lines[1] == "  flags: mintauthority live; " + "x" * 40
+    assert lines[2].endswith("| no dossier")
+
+
+async def test_digest_sanitises_symbols(store, settings):
+    evil = "AB\x00C\nD‮EVILLONGSYMBOLNAME123"
+    await store.record_run("digest", OLD, OLD, True)
+    await _open(store, "a", 1, sym=evil, entered="2026-10-02T00:00:00Z")
+    await _open(store, "z", 2, sym=evil, entered="2026-10-02T00:00:00Z")
+    await store.watchlist_exit("z", "2026-10-03T00:00:00Z", "rank")
+    _, (text,), _ = await _digest(store, settings)
+    assert _section(text, "ENTRANTS")[1][0].startswith("#1 ABCDEVILLONGSYMB (solana) ")
+    assert _section(text, "EXITS")[1] == ["ABCDEVILLONGSYMB rank"]
+    assert "\x00" not in text and "‮" not in text
+    assert not any(ln.startswith(("D", "EVIL")) for ln in text.splitlines())
+
+
+async def test_digest_splits_long_messages(store, settings):
+    settings.digest_top_n = 50
+    for i in range(60):
+        await _open(store, f"t{i:02d}", i + 1, sym=f"SYMBOL{i:02d}LONGER")
+    rc, sent, row = await _digest(store, settings, n=3)
+    assert rc == 0 and row[0] == 1
+    assert len(sent) == 3 and [t[:6] for t in sent] == ["(1/3) ", "(2/3) ", "(3/3) "]
+    assert all(len(t) <= 4000 for t in sent)
+
+
+async def test_digest_send_failure_fails_run(store, settings):
+    await _open(store, "a", 1)
+    rc, sent, row = await _digest(store, settings, ok=False)
+    assert rc == 1 and len(sent) == 1
+    assert row[0] == 0 and "delivery failed" in row[2]
+    assert await store.kv_get("digest:top") is None
+    # the failed run did not move the anchor: "a" is still an entrant
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0 and _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
+
+
+async def test_digest_fails_without_channel_even_when_silent(store, settings):
+    from gecko.report import digest_job
+
+    settings.telegram_digest_chat_id = "chat"
+    rc = await digest_job(settings, argparse.Namespace(as_of=None))
+    row = await (await store.conn.execute("SELECT ok, error FROM runs")).fetchone()
+    assert rc == 1 and row[0] == 0 and "telegram_bot_token" in row[1]
+
+
+async def test_digest_health_reports_recent_freshness_failure(store, settings):
+    from gecko.store import utcnow
+
+    await store.record_run("freshness", utcnow(), utcnow(), False, error="x")
+    _, (text,), _ = await _digest(store, settings)
+    assert text.splitlines()[-1].startswith("health: freshness FAILED | ")
+
+
+def test_digest_job_is_registered_by_the_cli():
+    from gecko.__main__ import _load_jobs
+    from gecko.jobs import JOBS
+    from gecko.report import digest_job
+
+    _load_jobs()
+    assert JOBS["digest"] is digest_job

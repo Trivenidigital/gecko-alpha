@@ -4,7 +4,7 @@ import pytest
 from gecko.store import ReturnAlreadyMeasured, canon_ts
 
 
-async def test_schema_has_seven_tables(store):
+async def test_schema_tables(store):
     rows = await (
         await store.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -18,6 +18,7 @@ async def test_schema_has_seven_tables(store):
         "forward_returns",
         "research_notes",
         "runs",
+        "kv",
     }
 
 
@@ -719,3 +720,32 @@ def test_main_maps_foreign_database_to_exit_2(tmp_path, monkeypatch, capsys):
     assert main(["prune"]) == 2
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1 and "not a gecko database" in err[0]
+
+
+async def test_kv_get_set_upserts(store):
+    assert await store.kv_get("k") is None
+    await store.kv_set("k", "v1", "2026-10-16T00:00:00+00:00")
+    await store.kv_set("k", "v2", "2026-10-17T00:00:00Z")
+    assert await store.kv_get("k") == "v2"
+    rows = await (await store.conn.execute("SELECT * FROM kv")).fetchall()
+    assert rows == [("k", "v2", "2026-10-17T00:00:00Z")]
+
+
+async def test_open_adds_kv_to_a_pre_kv_gecko_db(tmp_path):
+    import aiosqlite
+
+    from gecko.store import SCHEMA, SCHEMA_NAMES, Store
+
+    assert "kv" in SCHEMA_NAMES
+    path = str(tmp_path / "pre_kv.db")
+    async with aiosqlite.connect(path) as c:  # every table but kv, id 0
+        await c.executescript(SCHEMA)
+        await c.execute("DROP TABLE kv")
+        await c.commit()
+    s = await Store.open(path)
+    try:
+        await s.kv_set("k", "v", "2026-10-16T00:00:00Z")
+        assert await s.kv_get("k") == "v"
+    finally:
+        await s.close()
+    assert "kv" in await _table_names(path)
