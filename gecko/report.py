@@ -25,9 +25,12 @@ F4_RULE = "F4"
 # Pre-registered split: docs/prereg/2026-10-16-F4-entry-mcap-5m.md
 F4_MCAP_SPLIT_USD = 5_000_000
 F4_HI, F4_LO = "F4 mcap≥5M", "F4 mcap<5M"
-# kv state of the last SENT digest: its top-N ids and the newest entered_at /
-# exited_at it saw ("" = none yet), so a row committed late is never skipped.
+# kv state of the last SENT digest: its top-N ids, the newest entered_at /
+# exited_at it saw ("" = none yet) and the ids stamped exactly at each mark.
+# A row is new when past its mark, or at it and not in that id list: one rank
+# run stamps every row with the same as_of but commits them one by one.
 TOP, HWM_IN, HWM_OUT = "digest:top", "digest:hwm_entered", "digest:hwm_exited"
+IDS_IN, IDS_OUT = "digest:ids_at_hwm_entered", "digest:ids_at_hwm_exited"
 
 log = structlog.get_logger("gecko.report")
 
@@ -209,6 +212,11 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     return lines
 
 
+def _past_mark(ts: str | None, tid: str, hwm: str, seen: set[str]) -> bool:
+    # newer than the mark, or equal to it and not reported at it
+    return bool(ts) and (ts > hwm or (ts == hwm and tid not in seen))
+
+
 async def digest_text(
     store: Store, settings: GeckoSettings, now: str
 ) -> tuple[str, dict[str, str], bool]:
@@ -216,7 +224,6 @@ async def digest_text(
     exited) since the last sent digest; the first lists every open row."""
     now = canon_ts(now)
     q = store.conn.execute
-    hwm_in, hwm_out = await store.kv_get(HWM_IN), await store.kv_get(HWM_OUT)
     rows = await (
         await q(
             "SELECT w.token_id, w.rank, w.score, w.features_at_entry_json, "
@@ -226,9 +233,18 @@ async def digest_text(
         )
     ).fetchall()
     open_rows = [r for r in rows if r[5] is None]
-    new = open_rows if hwm_in is None else [r for r in rows if r[4] > hwm_in]
-    gone = [] if hwm_out is None else [r for r in rows if r[5] and r[5] > hwm_out]
     top = open_rows[: settings.digest_top_n]
+    state = {TOP: json.dumps([r[0] for r in top])}
+    past = {}  # col -> rows newer than the mark, or at it and not yet reported
+    for key, ids_key, col in ((HWM_IN, IDS_IN, 4), (HWM_OUT, IDS_OUT, 5)):
+        hwm = await store.kv_get(key)
+        seen = set(json.loads(await store.kv_get(ids_key) or "[]"))
+        if hwm is not None:
+            past[col] = [r for r in rows if _past_mark(r[col], r[0], hwm, seen)]
+        state[key] = mark = max((r[col] for r in rows if r[col]), default="")
+        at_mark = sorted(r[0] for r in rows if mark and r[col] == mark)
+        state[ids_key] = json.dumps(at_mark)
+    new, gone = past.get(4, open_rows), past.get(5, [])
     entry = {r[0]: json.loads(r[3]) for r in new}
     lines = [f"gecko digest {now[:10]}", f"ENTRANTS ({len(new)})"]
     for r in new:
@@ -241,23 +257,20 @@ async def digest_text(
         if feats is None:
             feats = (await compute_features(store, settings, r[0], now)).as_dict()
         lines += await _token_lines(store, r, feats)
-    breaches = [b.table for b in await check_freshness(store, now, settings)]
-    health = f"{len(breaches)} breach(es): {', '.join(breaches)}"
-    counts = dict(
-        await (
-            await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
-        ).fetchall()
-    )
+    try:
+        breaches = [b.table for b in await check_freshness(store, now, settings)]
+        health = f"{len(breaches)} breach(es): {', '.join(breaches)}"
+        health = health if breaches else "freshness clean"
+    except Exception as exc:  # noqa: BLE001 — the digest still goes out
+        log.warning("digest_freshness_error", error=type(exc).__name__)
+        health = f"freshness check error {type(exc).__name__}"
+    cur = await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
+    counts = dict(await cur.fetchall())
     lines.append(
-        f"health: {health if breaches else 'freshness clean'} | "
+        f"health: {health} | "
         f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
         f"watchlist {len(open_rows)}"
     )
-    state = {
-        TOP: json.dumps([r[0] for r in top]),
-        HWM_IN: max((r[4] for r in rows), default=""),
-        HWM_OUT: max((r[5] for r in rows if r[5]), default=""),
-    }
     return "\n".join(lines), state, bool(new or gone)
 
 

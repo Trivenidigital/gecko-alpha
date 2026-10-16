@@ -256,7 +256,7 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     await store.watchlist_exit("gone", "2026-10-02T00:00:00Z", "rank")
     await _tok(store, "c", "C", status="candidate")
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 3, None)
+    assert rc == 0 and row == (1, 5, None)
     assert text.splitlines()[0].startswith("gecko digest 20")
     head, lines = _section(text, "ENTRANTS")
     assert head == "ENTRANTS (2)"
@@ -272,9 +272,11 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     )
 
 
-async def _marks(store, entered, exited):
+async def _marks(store, entered, exited, ids_in=(), ids_out=()):
     await store.kv_set("digest:hwm_entered", entered, OLD)
     await store.kv_set("digest:hwm_exited", exited, OLD)
+    await store.kv_set("digest:ids_at_hwm_entered", json.dumps(list(ids_in)), OLD)
+    await store.kv_set("digest:ids_at_hwm_exited", json.dumps(list(ids_out)), OLD)
 
 
 async def _kv(store):
@@ -302,7 +304,50 @@ async def test_digest_diff_anchored_on_last_ok_run(store, settings):
         "digest:top": json.dumps(["old", "mid"]),
         "digest:hwm_entered": "2026-10-05T00:00:00Z",
         "digest:hwm_exited": "2026-10-06T00:00:00Z",
+        "digest:ids_at_hwm_entered": json.dumps(["mid"]),
+        "digest:ids_at_hwm_exited": json.dumps(["out"]),
     }
+
+
+T0 = "2026-10-05T00:00:00Z"  # one rank run's as_of, shared by all its rows
+
+
+async def test_digest_entrant_at_mark_not_yet_reported(store, settings, capsys):
+    # the last digest read mid-run: x (stamped T0) was committed, y not yet
+    await _open(store, "x", 1, entered=T0)
+    await _open(store, "y", 2, entered=T0)
+    await _marks(store, T0, "", ids_in=["x"])
+    rc, (text,), _ = await _digest(store, settings)
+    head, lines = _section(text, "ENTRANTS")
+    assert rc == 0 and head == "ENTRANTS (1)" and lines[0].startswith("#2 Y ")
+    assert json.loads(await store.kv_get("digest:ids_at_hwm_entered")) == ["x", "y"]
+    capsys.readouterr()
+    rc, sent, _ = await _digest(store, settings)  # x and y at the mark: silent
+    assert rc == 0 and sent == [] and "[SILENT]" in capsys.readouterr().out
+
+
+async def test_digest_exit_at_mark_not_yet_reported(store, settings):
+    for tid, rank in (("a", 1), ("x", 2), ("y", 3)):
+        await _open(store, tid, rank)
+    for tid in ("x", "y"):
+        await store.watchlist_exit(tid, T0, "rank")
+    await _marks(store, OLD, T0, ids_in=["a", "x", "y"], ids_out=["x"])
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["Y rank"])
+    assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
+
+
+async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("detector broke")
+
+    monkeypatch.setattr("gecko.report.check_freshness", boom)
+    await _open(store, "a", 1)
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0 and text.splitlines()[-1] == (
+        "health: freshness check error RuntimeError | "
+        "candidates 0 active 1 watchlist 1"
+    )
 
 
 async def test_digest_does_not_miss_row_committed_with_earlier_timestamp(
@@ -338,7 +383,7 @@ async def test_digest_not_silent_when_top_order_changes(store, settings):
     await store.conn.execute("UPDATE watchlist SET rank=3-rank")
     await store.conn.commit()
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 3, None)
+    assert rc == 0 and row == (1, 5, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
     assert [ln.split()[1] for ln in _section(text, "TOP ")[1]] == ["B", "A"]
     assert json.loads(await store.kv_get("digest:top")) == ["b", "a"]
@@ -355,7 +400,7 @@ async def test_digest_not_silent_on_entry_or_exit_outside_top(store, settings):
     later = iso_plus(utcnow(), 1)  # after the run's real-clock anchor
     await _open(store, "c", 3, entered=later)
     rc, (text,), row = await _digest(store, settings)  # top unchanged: ["a"]
-    assert rc == 0 and row == (1, 3, None)
+    assert rc == 0 and row == (1, 5, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
     await store.watchlist_exit("b", iso_plus(later, 1), "rank")
     rc, (text,), _ = await _digest(store, settings)
@@ -468,6 +513,21 @@ async def test_digest_treats_schema_version_0_note_as_no_dossier(store, settings
     )
     await store.conn.commit()
     assert (await _top_lines(store, settings))[0].endswith("| no dossier")
+
+
+async def test_digest_marker_over_older_valid_note_keeps_verdict(store, settings):
+    await _open(store, "a", 1)
+    for at, ver, note in (
+        ("2026-10-02T00:00:00Z", 1, {"verdict": "watch", "confidence": 0.7}),
+        ("2026-10-03T00:00:00Z", 0, {}),  # a newer paid-but-invalid marker
+    ):
+        await store.conn.execute(
+            "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
+            "note_json) VALUES('a',?,'m',?,?)",
+            (at, ver, json.dumps(note)),
+        )
+    await store.conn.commit()
+    assert (await _top_lines(store, settings))[0].endswith("| watch 0.7")
 
 
 def test_digest_job_is_registered_by_the_cli():
