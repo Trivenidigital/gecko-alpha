@@ -256,7 +256,7 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     await store.watchlist_exit("gone", "2026-10-02T00:00:00Z", "rank")
     await _tok(store, "c", "C", status="candidate")
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 1, None)
+    assert rc == 0 and row == (1, 3, None)
     assert text.splitlines()[0].startswith("gecko digest 20")
     head, lines = _section(text, "ENTRANTS")
     assert head == "ENTRANTS (2)"
@@ -268,8 +268,18 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     head, lines = _section(text, "TOP ")
     assert head == "TOP 10" and [ln.split()[1] for ln in lines] == ["A", "B"]
     assert text.splitlines()[-1] == (
-        "health: freshness ok | candidates 1 active 3 watchlist 2"
+        "health: freshness clean | candidates 1 active 3 watchlist 2"
     )
+
+
+async def _marks(store, entered, exited):
+    await store.kv_set("digest:hwm_entered", entered, OLD)
+    await store.kv_set("digest:hwm_exited", exited, OLD)
+
+
+async def _kv(store):
+    rows = await (await store.conn.execute("SELECT key, value FROM kv")).fetchall()
+    return dict(rows)
 
 
 async def test_digest_diff_anchored_on_last_ok_run(store, settings):
@@ -279,16 +289,33 @@ async def test_digest_diff_anchored_on_last_ok_run(store, settings):
     await store.watchlist_exit("out", "2026-10-06T00:00:00Z", "rank")
     await _open(store, "before", 4, entered="2026-10-01T00:00:00Z")
     await store.watchlist_exit("before", "2026-10-02T00:00:00Z", "rank")
-    a, b = "2026-10-03T00:00:00Z", "2026-10-07T00:00:00Z"
-    await store.record_run("digest", a, a, True)  # the anchor
-    await store.record_run("digest", b, b, False, error="x")  # must not move it
-    await store.record_run("freshness", b, b, False, error="x")  # > 6 h ago
+    await _marks(store, "2026-10-03T00:00:00Z", "2026-10-03T00:00:00Z")
+    marks = await _kv(store)
+    rc, _, _ = await _digest(store, settings, ok=False)
+    assert rc == 1 and await _kv(store) == marks  # a failed send moves nothing
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0
     head, lines = _section(text, "ENTRANTS")
     assert head == "ENTRANTS (1)" and lines[0].startswith("#2 MID (solana) ")
     assert _section(text, "EXITS") == ("EXITS (1)", ["OUT rank"])
-    assert "freshness ok" in text
+    assert await _kv(store) == {
+        "digest:top": json.dumps(["old", "mid"]),
+        "digest:hwm_entered": "2026-10-05T00:00:00Z",
+        "digest:hwm_exited": "2026-10-06T00:00:00Z",
+    }
+
+
+async def test_digest_does_not_miss_row_committed_with_earlier_timestamp(
+    store, settings
+):
+    await _open(store, "a", 1)  # entered OLD
+    await _digest(store, settings)  # snapshot at the real clock, after 10-05
+    # a rank run stamped 10-05 commits only now: earlier than that digest's
+    # snapshot time but later than the newest entered_at the digest saw
+    await _open(store, "late", 2, entered="2026-10-05T00:00:00Z")
+    rc, (text,), _ = await _digest(store, settings)
+    head, lines = _section(text, "ENTRANTS")
+    assert rc == 0 and head == "ENTRANTS (1)" and lines[0].startswith("#2 LATE ")
 
 
 async def test_digest_silent_when_unchanged(store, settings, capsys):
@@ -301,7 +328,7 @@ async def test_digest_silent_when_unchanged(store, settings, capsys):
     rc, sent, row = await _digest(store, settings)
     assert rc == 0 and sent == [] and row == (1, 0, None)
     out = capsys.readouterr().out
-    assert out.splitlines()[0] == "[SILENT]" and "digest_silent" in out
+    assert "[SILENT]" in out.splitlines() and "digest_silent" in out
 
 
 async def test_digest_not_silent_when_top_order_changes(store, settings):
@@ -311,7 +338,7 @@ async def test_digest_not_silent_when_top_order_changes(store, settings):
     await store.conn.execute("UPDATE watchlist SET rank=3-rank")
     await store.conn.commit()
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 1, None)
+    assert rc == 0 and row == (1, 3, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
     assert [ln.split()[1] for ln in _section(text, "TOP ")[1]] == ["B", "A"]
     assert json.loads(await store.kv_get("digest:top")) == ["b", "a"]
@@ -328,7 +355,7 @@ async def test_digest_not_silent_on_entry_or_exit_outside_top(store, settings):
     later = iso_plus(utcnow(), 1)  # after the run's real-clock anchor
     await _open(store, "c", 3, entered=later)
     rc, (text,), row = await _digest(store, settings)  # top unchanged: ["a"]
-    assert rc == 0 and row == (1, 1, None)
+    assert rc == 0 and row == (1, 3, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
     await store.watchlist_exit("b", iso_plus(later, 1), "rank")
     rc, (text,), _ = await _digest(store, settings)
@@ -350,7 +377,7 @@ async def test_digest_includes_research_verdict(store, settings):
             "2026-10-03T00:00:00Z",
             {
                 "verdict": "watch",
-                "confidence": 0.7,
+                "confidence": 0.66,  # .1f
                 "red_flags": ["mint\nauthority live", "x" * 60, "third"],
             },
         ),
@@ -376,7 +403,7 @@ async def test_digest_includes_research_verdict(store, settings):
 
 async def test_digest_sanitises_symbols(store, settings):
     evil = "AB\x00C\nD‮EVILLONGSYMBOLNAME123"
-    await store.record_run("digest", OLD, OLD, True)
+    await _marks(store, OLD, OLD)
     await _open(store, "a", 1, sym=evil, entered="2026-10-02T00:00:00Z")
     await _open(store, "z", 2, sym=evil, entered="2026-10-02T00:00:00Z")
     await store.watchlist_exit("z", "2026-10-03T00:00:00Z", "rank")
@@ -391,10 +418,16 @@ async def test_digest_splits_long_messages(store, settings):
     settings.digest_top_n = 50
     for i in range(60):
         await _open(store, f"t{i:02d}", i + 1, sym=f"SYMBOL{i:02d}LONGER")
+    from gecko.report import digest_text
+    from gecko.store import utcnow
+
+    full = (await digest_text(store, settings, utcnow()))[0]
     rc, sent, row = await _digest(store, settings, n=3)
     assert rc == 0 and row[0] == 1
     assert len(sent) == 3 and [t[:6] for t in sent] == ["(1/3) ", "(2/3) ", "(3/3) "]
     assert all(len(t) <= 4000 for t in sent)
+    rejoined = "\n".join(t[6:] for t in sent)  # nothing dropped (date line aside)
+    assert rejoined.splitlines()[1:] == full.splitlines()[1:]
 
 
 async def test_digest_send_failure_fails_run(store, settings):
@@ -402,7 +435,7 @@ async def test_digest_send_failure_fails_run(store, settings):
     rc, sent, row = await _digest(store, settings, ok=False)
     assert rc == 1 and len(sent) == 1
     assert row[0] == 0 and "delivery failed" in row[2]
-    assert await store.kv_get("digest:top") is None
+    assert await _kv(store) == {}
     # the failed run did not move the anchor: "a" is still an entrant
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0 and _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
@@ -417,12 +450,24 @@ async def test_digest_fails_without_channel_even_when_silent(store, settings):
     assert rc == 1 and row[0] == 0 and "telegram_bot_token" in row[1]
 
 
-async def test_digest_health_reports_recent_freshness_failure(store, settings):
-    from gecko.store import utcnow
-
-    await store.record_run("freshness", utcnow(), utcnow(), False, error="x")
+async def test_digest_health_lists_current_freshness_breaches(store, settings):
+    await _open(store, "a", 1)
+    await store.repair_schedules()  # the 1 d return fell due 10-02: overdue now
     _, (text,), _ = await _digest(store, settings)
-    assert text.splitlines()[-1].startswith("health: freshness FAILED | ")
+    assert text.splitlines()[-1] == (
+        "health: 1 breach(es): forward_returns_backlog | "
+        "candidates 0 active 1 watchlist 1"
+    )
+
+
+async def test_digest_treats_schema_version_0_note_as_no_dossier(store, settings):
+    await _open(store, "a", 1)
+    await store.conn.execute(
+        "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
+        "note_json) VALUES('a','2026-10-02T00:00:00Z','m',0,'{\"verdict\":\"x\"}')"
+    )
+    await store.conn.commit()
+    assert (await _top_lines(store, settings))[0].endswith("| no dossier")
 
 
 def test_digest_job_is_registered_by_the_cli():

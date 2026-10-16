@@ -1,3 +1,5 @@
+import os
+
 from gecko.__main__ import main
 
 
@@ -77,6 +79,15 @@ def test_ledger_refuses_as_of(monkeypatch, settings, capsys):
     assert "ledger is live-only" in capsys.readouterr().err
     assert ran == []
     assert main(["ledger"]) == 0 and ran == ["ledger"]
+
+
+def test_digest_refuses_as_of(monkeypatch, settings, capsys):
+    _patch_settings(monkeypatch, settings)
+    ran = _noop_job(monkeypatch, "digest")
+    assert main(["digest", "--as-of", "2026-10-01T00:00:00Z"]) == 2
+    assert "digest is live-only" in capsys.readouterr().err
+    assert ran == [] and not os.path.exists(settings.db_path)  # no run row
+    assert main(["digest"]) == 0 and ran == ["digest"]
 
 
 def test_coingecko_jobs_refuse_without_key(monkeypatch, settings, capsys):

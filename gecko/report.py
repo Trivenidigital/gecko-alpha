@@ -11,6 +11,7 @@ import aiohttp
 import structlog
 
 from gecko.features import compute_features
+from gecko.freshness import check_freshness
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.numeric import num
@@ -24,7 +25,9 @@ F4_RULE = "F4"
 # Pre-registered split: docs/prereg/2026-10-16-F4-entry-mcap-5m.md
 F4_MCAP_SPLIT_USD = 5_000_000
 F4_HI, F4_LO = "F4 mcap≥5M", "F4 mcap<5M"
-TOP_KEY = "digest:top"  # kv: the top-N token ids the last sent digest showed
+# kv state of the last SENT digest: its top-N ids and the newest entered_at /
+# exited_at it saw ("" = none yet), so a row committed late is never skipped.
+TOP, HWM_IN, HWM_OUT = "digest:top", "digest:hwm_entered", "digest:hwm_exited"
 
 log = structlog.get_logger("gecko.report")
 
@@ -178,7 +181,7 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     note = await (
         await store.conn.execute(
             "SELECT note_json FROM research_notes WHERE token_id=? "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            "AND schema_version<>0 ORDER BY created_at DESC, id DESC LIMIT 1",
             (tid,),
         )
     ).fetchone()
@@ -192,7 +195,7 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     elif not isinstance(note, dict):
         verdict = "bad dossier"
     else:
-        verdict = f"{_clean(note.get('verdict'))} {_val(note.get('confidence'), 'g')}"
+        verdict = f"{_clean(note.get('verdict'))} {_val(note.get('confidence'), '.1f')}"
         flags = note.get("red_flags") if isinstance(note.get("red_flags"), list) else []
     lines = [
         f"#{rank} {_clean(sym)} ({_clean(chain)}) score {score:.2f} | "
@@ -208,14 +211,12 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
 
 async def digest_text(
     store: Store, settings: GeckoSettings, now: str
-) -> tuple[str, list[str], bool]:
-    """(message, top-N token ids, whether anything entered or exited) since the
-    last OK digest run; the first digest lists every open watchlist row."""
+) -> tuple[str, dict[str, str], bool]:
+    """(message, kv state to store once sent, whether anything entered or
+    exited) since the last sent digest; the first lists every open row."""
     now = canon_ts(now)
     q = store.conn.execute
-    (anchor,) = await (
-        await q("SELECT MAX(started_at) FROM runs WHERE job='digest' AND ok=1")
-    ).fetchone()
+    hwm_in, hwm_out = await store.kv_get(HWM_IN), await store.kv_get(HWM_OUT)
     rows = await (
         await q(
             "SELECT w.token_id, w.rank, w.score, w.features_at_entry_json, "
@@ -225,8 +226,8 @@ async def digest_text(
         )
     ).fetchall()
     open_rows = [r for r in rows if r[5] is None]
-    new = open_rows if anchor is None else [r for r in rows if r[4] > anchor]
-    gone = [] if anchor is None else [r for r in rows if r[5] and r[5] > anchor]
+    new = open_rows if hwm_in is None else [r for r in rows if r[4] > hwm_in]
+    gone = [] if hwm_out is None else [r for r in rows if r[5] and r[5] > hwm_out]
     top = open_rows[: settings.digest_top_n]
     entry = {r[0]: json.loads(r[3]) for r in new}
     lines = [f"gecko digest {now[:10]}", f"ENTRANTS ({len(new)})"]
@@ -240,43 +241,41 @@ async def digest_text(
         if feats is None:
             feats = (await compute_features(store, settings, r[0], now)).as_dict()
         lines += await _token_lines(store, r, feats)
-    cutoff = canon_ts((parse_utc(now) - timedelta(hours=6)).isoformat())
-    failed = await (
-        await q(
-            "SELECT 1 FROM runs WHERE job='freshness' AND ok=0 AND finished_at>=? "
-            "LIMIT 1",
-            (cutoff,),
-        )
-    ).fetchone()
+    breaches = [b.table for b in await check_freshness(store, now, settings)]
+    health = f"{len(breaches)} breach(es): {', '.join(breaches)}"
     counts = dict(
         await (
             await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
         ).fetchall()
     )
     lines.append(
-        f"health: freshness {'FAILED' if failed else 'ok'} | "
+        f"health: {health if breaches else 'freshness clean'} | "
         f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
         f"watchlist {len(open_rows)}"
     )
-    return "\n".join(lines), [r[0] for r in top], bool(new or gone)
+    state = {
+        TOP: json.dumps([r[0] for r in top]),
+        HWM_IN: max((r[4] for r in rows), default=""),
+        HWM_OUT: max((r[5] for r in rows if r[5]), default=""),
+    }
+    return "\n".join(lines), state, bool(new or gone)
 
 
 @register("digest")
 async def digest_job(settings: GeckoSettings, ns) -> int:
-    now = canon_ts(ns.as_of) if ns.as_of else utcnow()
-
     async def body(store: Store, session: aiohttp.ClientSession) -> JobResult:
         _channel(settings)  # a missing channel fails the run even on a silent day
-        text, top_ids, changed = await digest_text(store, settings, now)
-        top = json.dumps(top_ids)
-        if not changed and await store.kv_get(TOP_KEY) == top:
+        now = utcnow()  # live-only: __main__ refuses --as-of
+        text, state, changed = await digest_text(store, settings, now)
+        if not changed and await store.kv_get(TOP) == state[TOP]:
             print("[SILENT]")
-            log.info("digest_silent", top=len(top_ids))
+            log.info("digest_silent")
             return JobResult(rows_written=0)
         print(text)
         if not await _send(session, settings, text):
             raise RuntimeError("digest delivery failed")
-        await store.kv_set(TOP_KEY, top, now)  # only after every part was delivered
-        return JobResult(rows_written=1)
+        for key, value in state.items():  # only after every part was delivered
+            await store.kv_set(key, value, now)
+        return JobResult(rows_written=len(state))
 
     return await run_job("digest", settings, body)
