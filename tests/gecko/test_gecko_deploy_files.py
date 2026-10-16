@@ -129,12 +129,12 @@ def test_collector_template_is_the_job_template_without_on_failure():
         "gecko collector %i (outages page via the freshness job, not per run)"
     )
 
-    def body(p: Path) -> list[str]:
-        return [
-            ln for ln in _lines(p) if not ln.startswith(("Description=", "OnFailure="))
-        ]
+    def body(p: Path) -> list[str]:  # comments may differ (ops a); nothing else
+        skip = ("#", "Description=", "OnFailure=")
+        return [ln for ln in _lines(p) if not ln.startswith(skip)]
 
     assert body(job) == body(col)  # Environment/ExecStart/MemoryMax cannot drift
+    assert "(OnFailure pages)" not in col.read_text(encoding="utf-8")
     assert not list(GECKO.glob("*.service.d/no-onfailure.conf"))
     assert {p.parent.name for p in GECKO.glob("*.service.d/*.conf")} == {
         "gecko-job@coingecko-markets.service.d"

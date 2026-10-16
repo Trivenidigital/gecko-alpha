@@ -1,5 +1,5 @@
-# gecko job runner: one oneshot instance per job, started by deploy/gecko/timers/.
-# `systemctl start gecko-job@<job>.service` runs `python -m gecko <job>` once.
+# gecko collector runner: one oneshot instance per collector, started by the collector
+# timers; manual: `systemctl start gecko-collector@<job>` runs `python -m gecko <job>` once.
 # A timer cannot start an instance that is still active, so a job never overlaps itself.
 [Unit]
 Description=gecko collector %i (outages page via the freshness job, not per run)
@@ -18,5 +18,6 @@ Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/root/.local/bin/uv run --frozen python -m gecko %i
 Nice=5
 TimeoutStartSec=900
-# bound a runaway job: the kernel OOM-kills it inside this cgroup (OnFailure pages)
+# bound a runaway job: the kernel OOM-kills it inside this cgroup; that does NOT
+# page here (no OnFailure): an outage pages via the freshness job
 MemoryMax=512M
