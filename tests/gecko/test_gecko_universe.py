@@ -53,6 +53,21 @@ async def test_admit_requires_contiguous_24h_survival(store, settings):
     )  # idempotent
 
 
+async def test_exited_watchlist_token_is_never_readmitted(store, settings):
+    # B2: a tax-demoted watchlist exit stays a candidate; a never-listed
+    # survivor with the same history is still admitted.
+    for tid in ("solana:a", "solana:b"):
+        await store.upsert_token(
+            tid, "solana", tid[7:], "A", "A", "2026-10-01T00:00:00Z", "dexscreener"
+        )
+        for at in ("2026-10-01T00:00:00Z", "2026-10-02T01:00:00Z"):
+            await store.add_observation(tid, "dexscreener", at, {"liquidity_usd": 3e5})
+    await store.watchlist_upsert("solana:a", "2026-09-20T00:00:00Z", "F4", 1, 1.0, {})
+    await store.watchlist_exit("solana:a", "2026-10-01T00:00:00Z", "security_tax")
+    assert await admit_survivors(store, settings, "2026-10-02T03:00:00Z") == 1
+    assert await status(store) == "candidate"
+
+
 async def test_trailing_observation_without_liquidity_is_ignored(store, settings):
     await seed(store)
     await store.add_observation(

@@ -688,6 +688,32 @@ def test_dead_or_concentrated_beats_tax(settings):
     assert disqualify(feat(observed_at=eight_days, **tax), settings) == "dead"
 
 
+async def test_tax_demotion_never_overwrites_concurrent_enrich_verdict(
+    store, settings, monkeypatch
+):
+    # B1: enrich commits a structural disqualification after rank read the
+    # token as active and as tax-only; the demotion must not overwrite it.
+    from gecko import rank
+
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    tax = {"security_ok": False, "security_structural": True}
+    await store.add_observation("solana:good", "enrich", "2026-10-15T00:30:00Z", tax)
+    real = rank.compute_features
+
+    async def racing(store_, settings_, tid, as_of):
+        f = await real(store_, settings_, tid, as_of)
+        await store.set_token_status(tid, "disqualified", "security_fail")
+        return f
+
+    monkeypatch.setattr(rank, "compute_features", racing)
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 0
+    row = await one(store, "SELECT exit_reason FROM watchlist")
+    assert row == ("security_fail",)
+    assert await _status(store, "solana:good") == ("disqualified", "security_fail")
+
+
 async def test_security_tax_crash_recovery_exits_next_run(store, settings):
     await seed_token(store, "solana:good")
     await rank_once(store, settings, A)

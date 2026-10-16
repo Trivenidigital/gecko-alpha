@@ -162,8 +162,9 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
             # some other way (the ledger's dead/no_price).
             if reasons.get(tid) == "security_tax":
                 # Status first: a crash before the exit leaves the stored
-                # reason for _exit_reason to find on the next run.
-                await store.set_token_status(tid, "candidate", "security_tax")
+                # reason for _exit_reason to find on the next run. Guarded, and
+                # the STORED reason names the exit: a concurrent enrich verdict wins.
+                await store.demote_if_active(tid, reasons.pop(tid))
             why = await _exit_reason(store, tid, reasons)
             await store.watchlist_exit(tid, as_of, why)
             exited.append(tid)

@@ -265,6 +265,17 @@ class Store:
         )
         await self.conn.commit()
 
+    async def demote_if_active(self, token_id, reason) -> bool:
+        """Back to candidate only while still active: a verdict another job
+        committed since the caller's read is never overwritten."""
+        cur = await self.conn.execute(
+            "UPDATE tokens SET status='candidate', disqualify_reason=?, updated_at=? "
+            "WHERE token_id=? AND status='active'",
+            (reason, utcnow(), token_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
     async def set_deployer(self, token_id, deployer) -> None:
         """Record a token's deployer; the first value recorded is kept."""
         await self.conn.execute(

@@ -230,7 +230,8 @@ async def _finalize_no_entry(store: Store, tid: str, now: str) -> int:
     closed = 0
     for (h,) in rows:
         closed += await store.close_unmeasured(tid, h, now, reason="no_entry_price")
-    await store.watchlist_exit(tid, now, "no_entry_price")
+    # Write time, not run start: rank's rewind guard and the digest marks read it.
+    await store.watchlist_exit(tid, utcnow(), "no_entry_price")
     log.info("ledger_entry_unmeasurable", token_id=tid, horizons=closed)
     return closed
 

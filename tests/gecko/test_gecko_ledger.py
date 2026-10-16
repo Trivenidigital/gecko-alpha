@@ -838,9 +838,11 @@ async def test_ledger_expiry_writes_closed_reason_expired_and_is_not_counted_in_
         await s.close()
 
 
-async def test_no_entry_price_writes_closed_reason(store, settings):
+async def test_no_entry_price_writes_closed_reason(store, settings, monkeypatch):
     await seed(store, token_obs=False)
     late = "2026-10-03T01:00:00Z"  # E+49h: the 48h window has closed
+    # B3: the run started at `late`; the exit is written later, at the real clock
+    monkeypatch.setattr("gecko.ledger.utcnow", lambda: "2026-10-03T01:07:00Z")
     async with aiohttp.ClientSession() as s:
         with aioresponses():
             r = await measure_due(store, settings, s, late)
@@ -851,3 +853,5 @@ async def test_no_entry_price_writes_closed_reason(store, settings):
         )
     ).fetchall()
     assert rows == [(None, late, "no_entry_price")] * 5
+    wl = await one(store, "SELECT exited_at FROM watchlist")
+    assert wl == ("2026-10-03T01:07:00Z",)
