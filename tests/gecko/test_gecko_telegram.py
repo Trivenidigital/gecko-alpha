@@ -91,9 +91,8 @@ async def test_tg_login_creates_session_under_umask_077(
     import gecko.telegram_reader as tr
 
     settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
-    settings.tg_channels, settings.tg_session_path = ["@a"], str(
-        tmp_path / "gk.session"
-    )
+    # H1: login comes before GECKO_TG_CHANNELS is set; it must not require them
+    settings.tg_channels, settings.tg_session_path = [], str(tmp_path / "gk.session")
     mask, seen = [0o022], []
 
     def umask(m):  # a recorder: the Windows CRT keeps only the write bit
@@ -110,6 +109,21 @@ async def test_tg_login_creates_session_under_umask_077(
     with pytest.raises(RuntimeError):
         await tr.tg_login_job(settings, None)
     assert seen == [0o077] and mask == [0o022]
+
+
+async def test_reader_without_channels_still_exits_2(tmp_path, settings, monkeypatch):
+    # H1: only tg-login is exempt; the reader refuses before any client starts
+    from pydantic import SecretStr
+
+    import gecko.telegram_reader as tr
+
+    sess = tmp_path / "gk.session"
+    sess.write_text("x")
+    os.chmod(sess, 0o600)
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_session_path, settings.tg_channels = str(sess), []
+    monkeypatch.setattr(tr, "_client", lambda s: pytest.fail("client started"))
+    assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == 2
 
 
 async def test_failed_channel_marks_run_not_ok(store, settings):
@@ -473,7 +487,7 @@ async def test_reader_refuses_when_lock_held(tmp_path, settings, monkeypatch, ca
         sys.modules, "fcntl", SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=flock)
     )
     monkeypatch.setattr(tr, "os", _PosixOs())
-    monkeypatch.setattr(tr, "session_problem", lambda s, must_exist: None)
+    monkeypatch.setattr(tr, "session_problem", lambda s, **kw: None)
 
     def no_client(_settings):
         raise AssertionError("a second client must not start on a locked session")

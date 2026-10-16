@@ -33,6 +33,7 @@ SLO_MINUTES = {
     "prune": 1560,  # daily; a dead prune grows the database until the disk fills
     "digest": 1560,  # daily; the digest's footer in turn reports freshness's own age
     "scorecard": 11520,  # weekly
+    "db-backup": 1560,  # daily; deploy/gecko/gecko-db-backup.sh writes its runs row
     # Row-anchored: ok polls of channels that never post a call still page.
     "source_calls:rows": 4320,
 }
@@ -62,6 +63,7 @@ WRITER_JOBS = {
     "prune": ("prune",),
     "digest": ("digest",),
     "scorecard": ("scorecard",),
+    "db-backup": ("db-backup",),
     "source_calls:rows": ("telegram-reader",),
 }
 # Writers outside Hermes cron: no incident path, so freshness pages their failures.
@@ -71,7 +73,7 @@ NON_CRON_WRITERS = frozenset({"telegram-reader"})
 # writer's last ok run, not by any table's newest row.
 RUN_ANCHORED = frozenset(
     {"watchlist", "forward_returns", "research_notes", "source_calls", "prune"}
-    | {"digest", "scorecard"}
+    | {"digest", "scorecard", "db-backup"}
 )
 DEDUP_HOURS = 6
 

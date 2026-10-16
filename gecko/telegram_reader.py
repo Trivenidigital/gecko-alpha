@@ -57,10 +57,13 @@ def lock_session(path: str):
     return fh
 
 
-def session_problem(settings: GeckoSettings, *, must_exist: bool) -> str | None:
+def session_problem(
+    settings: GeckoSettings, *, must_exist: bool, require_channels: bool = True
+) -> str | None:
     if settings.tg_api_id <= 0 or settings.tg_api_hash is None:
         return "GECKO_TG_API_ID / GECKO_TG_API_HASH not set"
-    if not settings.tg_channels:
+    # tg-login runs BEFORE channels are set (runbook order); the reader needs them
+    if require_channels and not settings.tg_channels:
         return "GECKO_TG_CHANNELS is empty"
     p = Path(settings.tg_session_path)
     if not p.is_absolute():
@@ -247,7 +250,7 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
 @register("tg-login")
 async def tg_login_job(settings: GeckoSettings, ns) -> int:
     """Interactive, operator-run once: creates gecko's own session (a new device)."""
-    if problem := session_problem(settings, must_exist=False):
+    if problem := session_problem(settings, must_exist=False, require_channels=False):
         print(problem, file=sys.stderr)
         return 2
     path = settings.tg_session_path

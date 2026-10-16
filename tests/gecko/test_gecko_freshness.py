@@ -613,7 +613,8 @@ def _plus_from(t0: str, minutes: int) -> str:
 # A1: digest and scorecard are run-anchored like prune (the digest footer
 # watches freshness back).
 @pytest.mark.parametrize(
-    "job,slo", [("prune", 1560), ("digest", 1560), ("scorecard", 11520)]
+    "job,slo",
+    [("prune", 1560), ("digest", 1560), ("scorecard", 11520), ("db-backup", 1560)],
 )
 async def test_run_anchored_job_key_pages_when_job_stops(store, job, slo):
     t0 = "2026-10-01T00:00:00Z"

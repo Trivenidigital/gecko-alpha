@@ -51,6 +51,8 @@ class GeckoSettings(BaseSettings):
     require_security_known: bool = False  # Plan 3 flips to True at cutover
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
+    # wall clock per run, under the 15 min timer: the rest waits for the next run
+    ohlcv_run_budget_sec: int = Field(600, ge=60, le=840)
     gt_min_interval_sec: float = 2.1
     ds_min_interval_sec: float = 0.25  # spacing of every DexScreener request
     ds_refresh_max_per_run: int = 600  # known tokens re-read per run, oldest first
