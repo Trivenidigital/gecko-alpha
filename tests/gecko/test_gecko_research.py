@@ -9,6 +9,7 @@ import aiohttp
 import pytest
 from aioresponses import aioresponses
 from pydantic import SecretStr
+from structlog.testing import capture_logs
 from yarl import URL
 
 from gecko.research import research, research_job
@@ -71,11 +72,11 @@ async def _tok(store, tid, *, sym="AAA", entered="2026-10-15T00:00:00Z", enrich=
         await store.add_observation(tid, "enrich", entered, enrich)
 
 
-async def _note(store, tid, created_at, cost, note=None):
+async def _note(store, tid, created_at, cost, note=None, ver=1):
     await store.conn.execute(
         "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
         "note_json,cost_usd) VALUES(?,?,?,?,?,?)",
-        (tid, created_at, "m", 1, json.dumps(note or GOOD), cost),
+        (tid, created_at, "m", ver, json.dumps(note or GOOD), cost),
     )
     await store.conn.commit()
 
@@ -116,6 +117,8 @@ async def test_research_writes_validated_note_and_cost(store, keyed):
     assert (tid, model, ver) == ("aa", "claude-sonnet-5-5", 1)
     assert note == GOOD
     assert cost == pytest.approx(0.02 + 0.01 + 3 * 0.01)
+    timeout = call.kwargs["timeout"]  # connect= makes a connect hang unbilled
+    assert (timeout.total, timeout.connect) == (20 * 6, keyed.http_timeout_sec)
     h = call.kwargs["headers"]
     assert h["x-api-key"] == "sk-test-key"
     assert h["anthropic-version"] == "2023-06-01"
@@ -216,9 +219,11 @@ async def test_research_invalid_json_writes_marker_only(store, keyed):
         m.post(API, payload=reply(text="I could not find anything."))
         m.post(API, payload=reply(text='{"verdict": "watch", oops}'))
         m.post(API, payload=reply(text=deep))
-        with pytest.raises(PartialFailure) as ei:
+        with pytest.raises(PartialFailure) as ei, capture_logs() as logs:
             await _run(store, keyed)
     assert (ei.value.credits_used, ei.value.rows_written) == (3, 3)
+    errors = [e["error"] for e in logs if e["event"] == "research_invalid_json"]
+    assert errors == ["ValueError", "ValueError", "RecursionError"]
     marker = {"status": "invalid", "reason": "invalid_json"}
     assert [n[:4] for n in await _notes(store)] == [
         (t, "claude-sonnet-5-5", 0, marker) for t in ("aa", "bb", "cc")
@@ -257,6 +262,22 @@ async def test_research_paid_failures_write_markers(store, keyed):
         res, _ = await _run(store, keyed)
         [body] = _bodies(m)
     assert "0xt3t3t3t3" in body["messages"][0]["content"]
+    assert (res.rows_written, res.credits_used) == (1, 1)
+
+
+async def test_research_marker_blocks_a_token_for_seven_days(store, keyed):
+    marker = {"status": "invalid", "reason": "invalid_json"}
+    await _tok(store, "m8")
+    await _note(store, "m8", "2026-10-08T11:59:59Z", 0.06, marker, ver=0)  # 8 d
+    await _tok(store, "m6", entered="2026-10-14T00:00:00Z")
+    await _note(store, "m6", "2026-10-10T12:00:00Z", 0.06, marker, ver=0)  # 6 d
+    await _tok(store, "ok", entered="2026-10-13T00:00:00Z")
+    await _note(store, "ok", "2026-09-01T00:00:00Z", 0.06)  # a valid note: forever
+    with aioresponses() as m:
+        m.post(API, payload=reply(), repeat=True)
+        res, _ = await _run(store, keyed)
+        [body] = _bodies(m)
+    assert "0xm8m8m8m8" in body["messages"][0]["content"]
     assert (res.rows_written, res.credits_used) == (1, 1)
 
 

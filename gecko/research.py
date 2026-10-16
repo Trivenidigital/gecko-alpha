@@ -17,13 +17,14 @@ from gecko.jobs import register
 from gecko.numeric import finite, num
 from gecko.runs import JobResult, PartialFailure, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, utcnow
+from gecko.store import Store, canon_ts, iso_plus, utcnow
 
 log = structlog.get_logger("gecko.research")
 
 SCHEMA_VERSION = 1  # 0 = a paid reply that gave no dossier (a marker)
 EST_NEXT_USD = 0.10  # assumed cost of the next dossier, checked against the cap
 RETRY_DELAY_SEC = 10
+MARKER_RETRY_DAYS = 7  # a marker blocks a token this long; a valid note forever
 TEXT_CAPS = {"what_it_is": 400, "team_or_deployer_history": 400, "narrative_fit": 300}
 ENTRY_FACTS = ("age_days", "liquidity_usd", "mcap_usd", "vol_7d_ratio", "callers_7d")
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -32,7 +33,8 @@ SPENT_SQL = "SELECT COALESCE(SUM(cost_usd), 0) FROM research_notes WHERE created
 TARGETS_SQL = (
     "SELECT w.token_id, w.features_at_entry_json, t.chain, t.address, t.symbol, "
     "t.name FROM watchlist w JOIN tokens t USING(token_id) WHERE w.exited_at IS NULL "
-    "AND NOT EXISTS (SELECT 1 FROM research_notes r WHERE r.token_id = w.token_id) "
+    "AND NOT EXISTS (SELECT 1 FROM research_notes r WHERE r.token_id = w.token_id "
+    "AND (r.schema_version >= 1 OR r.created_at > ?)) "
     "ORDER BY w.entered_at DESC, w.token_id LIMIT ?"
 )
 ENRICH_SQL = (
@@ -122,7 +124,10 @@ async def _post_messages(
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
-        timeout=aiohttp.ClientTimeout(total=settings.http_timeout_sec * 6),
+        # connect= bounds a hang before the request is sent: a ConnectionTimeoutError
+        timeout=aiohttp.ClientTimeout(
+            total=settings.http_timeout_sec * 6, connect=settings.http_timeout_sec
+        ),
     ) as resp:
         if resp.status != 200:
             raise MessagesError(resp.status)
@@ -159,7 +164,10 @@ async def research(
     now = canon_ts(now)
     q = store.conn.execute
     (spent,) = await (await q(SPENT_SQL, (now[:10] + "T00:00:00Z",))).fetchone()
-    targets = await (await q(TARGETS_SQL, (settings.research_max_per_run,))).fetchall()
+    retry_from = iso_plus(now, -MARKER_RETRY_DAYS)
+    targets = await (
+        await q(TARGETS_SQL, (retry_from, settings.research_max_per_run))
+    ).fetchall()
     calls = written = attempted = failed = 0
 
     async def send(body: dict) -> dict:
@@ -220,9 +228,9 @@ async def research(
                 )
                 try:
                     note = parse_dossier(text).model_dump_json()
-                except (ValueError, RecursionError):
-                    reason = "invalid_json"
-                    log.warning("research_invalid_json", token_id=tid)
+                except (ValueError, RecursionError) as e:
+                    reason, error = "invalid_json", type(e).__name__
+                    log.warning("research_invalid_json", token_id=tid, error=error)
             if reason is not None:  # paid, no dossier: a marker, never retried
                 failed += 1
                 note = json.dumps({"status": "invalid", "reason": reason})
