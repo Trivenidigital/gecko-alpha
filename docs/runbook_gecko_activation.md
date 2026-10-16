@@ -31,9 +31,10 @@ ls /etc/systemd/system/codex-systemd-failure-alert@.service   # the OnFailure= t
 systemctl --version | head -1                         # >= 254 for the reader's RestartMode=direct
 ```
 
-The reader unit's `RestartMode=direct` needs systemd 254 or newer. On older
-systemd the key is ignored with a warning, and each auto-restart still pages;
-the start limit bounds that to 5 pages per hour.
+The reader unit's `RestartMode=direct` needs systemd 254 or newer (the VPS runs
+255). On older systemd the key is ignored with a warning; auto-restarts do not
+pass through the failed state there, so OnFailure pages once, when the start
+limit (5 per hour) is hit.
 
 ## 1. Install the units (`--no-start`)
 
