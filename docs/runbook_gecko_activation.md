@@ -35,12 +35,48 @@ The reader unit's `RestartMode=direct` needs systemd 254 or newer. On older
 systemd the key is ignored with a warning, and each auto-restart still pages;
 the start limit bounds that to 5 pages per hour.
 
-## 1. Stage 1: env file, directories, history copy
+## 1. Install the units (`--no-start`)
+
+Run this immediately after the preflight fast-forward: it needs no
+`.env.gecko` and starts nothing, and running it first shrinks the window in
+which the drift watchdog sees repo units missing in prod from tens of minutes
+to seconds.
+
+```bash
+cd /root/gecko-alpha
+deploy/gecko/install.sh --dry-run --no-start   # review every action first
+deploy/gecko/install.sh --no-start             # install + enable, start nothing yet
+```
+
+Installs `gecko-job@.service` (+ the coingecko-markets timeout drop-in),
+`gecko-telegram-reader.service` (installed, NOT enabled),
+`gecko-db-backup.service`, every `gecko-*.timer`, and
+`/usr/local/bin/gecko-db-backup.sh`. With `--no-start` it enables every timer
+except the two `coingecko-*` timers but starts none of them, so sections 3 to 6
+run by hand before anything is scheduled; the timers are started in section 6b.
+It prints `systemctl list-timers 'gecko-*'`.
+
+`scripts/systemd-drift-watchdog.sh` tracks `deploy/gecko/`, its timers and its
+drop-ins. Between the code update and this step it would report every gecko
+unit as missing in prod; running this step right after the fast-forward keeps
+that window to seconds.
+
+Scripts run from `/usr/local/bin`, so a later `git pull` changes nothing there:
+re-run `install.sh` after any change under `deploy/gecko/`.
+
+A timer cannot start an instance that is still running, so no job overlaps
+itself (the enrich budget no-overlap requirement). A SIGKILLed run still
+records no credits; that gap stays open.
+
+An enabled timer also starts at the next boot, so do not reboot between this
+step and section 6b.
+
+## 2. Env file, directories, history copy
 
 This is the prep script (`plan3_vps_prep.sh`); it is idempotent and never
 echoes secret values. Its equivalent steps:
 
-**1a. `.env.gecko` (mode 0600)** by copying values from the legacy `.env`.
+**2a. `.env.gecko` (mode 0600)** by copying values from the legacy `.env`.
 A key is written only when its legacy value is non-empty: an empty secret
 parses as an empty string, not as unset, and slips past the "key missing"
 guards.
@@ -86,14 +122,15 @@ The units also set it, but systemd lets `EnvironmentFile=` values override
 grep '^GECKO_DB_PATH=' .env.gecko    # /root/gecko-alpha/gecko.db or nothing
 ```
 
-**1b. Directories.** `install.sh` also creates them; doing it here is harmless.
+**2b. Directories.** `install.sh` already created them in section 1;
+re-running is harmless.
 
 ```bash
 install -d -m 700 /root/.gecko
 install -d -m 755 /var/lib/gecko
 ```
 
-**1c. Read-only history copy** of `scout.db` for `migrate-calls` and the
+**2c. Read-only history copy** of `scout.db` for `migrate-calls` and the
 backtest. Checkpointed into one file, DELETE journal, then 0444. Needs about
 1.6 GB free.
 
@@ -108,41 +145,11 @@ mv "$HIST.tmp" "$HIST" && chmod 0444 "$HIST"
 sqlite3 "file:$HIST?mode=ro&immutable=1" "PRAGMA quick_check;"    # ok
 ```
 
-## 2. Stage 2: install the units
-
-```bash
-cd /root/gecko-alpha
-deploy/gecko/install.sh --dry-run --no-start   # review every action first
-deploy/gecko/install.sh --no-start             # install + enable, start nothing yet
-```
-
-Installs `gecko-job@.service` (+ the coingecko-markets timeout drop-in),
-`gecko-telegram-reader.service` (installed, NOT enabled),
-`gecko-db-backup.service`, every `gecko-*.timer`, and
-`/usr/local/bin/gecko-db-backup.sh`. With `--no-start` it enables every timer
-except the two `coingecko-*` timers but starts none of them, so sections 3 to 6
-run by hand before anything is scheduled; the timers are started in section 6b.
-It prints `systemctl list-timers 'gecko-*'`.
-
-`scripts/systemd-drift-watchdog.sh` tracks `deploy/gecko/`, its timers and its
-drop-ins. Between the code update and this step it reports every gecko unit as
-missing in prod; that is expected and clears once `install.sh` has run.
-
-Scripts run from `/usr/local/bin`, so a later `git pull` changes nothing there:
-re-run `install.sh` after any change under `deploy/gecko/`.
-
-A timer cannot start an instance that is still running, so no job overlaps
-itself (the enrich budget no-overlap requirement). A SIGKILLed run still
-records no credits; that gap stays open.
-
-An enabled timer also starts at the next boot, so do not reboot between this
-step and section 6b.
-
 ## 3. `python -m gecko check`
 
 NOTE: `check` is not read-only. It creates `gecko.db` at the absolute
 `GECKO_DB_PATH` and stamps its application id if the file does not exist.
-Run it only after `.env.gecko` points at the intended path (the section 1a
+Run it only after `.env.gecko` points at the intended path (the section 2a
 `GECKO_DB_PATH` check), or it creates a database in the wrong place.
 
 ```bash
@@ -361,6 +368,9 @@ Disables and stops every gecko timer and unit, deletes the unit files and
 `/root/gecko-history`. Never touch `scout.db` or the legacy units: gecko never
 wrote to them. The legacy pipeline keeps running throughout.
 
+The drift watchdog will list the gecko units as missing in prod after
+`--remove` (expected; alerted once, then tombstone-suppressed).
+
 ## 13. Known limits
 
 - Backups are LOCAL only (newest 3 `gecko.db.bak.*`). Off-host shipping of
@@ -374,8 +384,8 @@ wrote to them. The legacy pipeline keeps running throughout.
 | Stage | Action | Class | Approval record (who, where, quote) | Timestamp (UTC) | Executed by |
 |---|---|---|---|---|---|
 | 0 | preflight | read-only | | | |
-| 1 | `.env.gecko`, dirs, history copy | prod-state | | | |
-| 2 | `install.sh --no-start` (timers enabled, not started) | deploy | | | |
+| 1 | `install.sh --no-start` (timers enabled, not started) | deploy | | | |
+| 2 | `.env.gecko`, dirs, history copy | prod-state | | | |
 | 6b | start every non-coingecko timer | deploy | | | |
 | 3-7 | check, manual runs, migrate-calls, backtest | prod-state | | | |
 | 8 | `GECKO_REQUIRE_SECURITY_KNOWN=true` | flag | | | |

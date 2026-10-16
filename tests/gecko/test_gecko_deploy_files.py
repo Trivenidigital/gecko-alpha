@@ -218,6 +218,9 @@ def test_install_refuses_to_run_as_non_root():
 SHIM = """#!{py}
 import os, re, sqlite3, sys
 db, cmds = sys.argv[1], sys.argv[2:]
+# FAKE_VANISH: the source path disappears after the [ -f ] check (a race)
+if os.environ.get("FAKE_VANISH") and any(x.startswith(".backup") for x in cmds):
+    os.remove(db.removeprefix("file:").split("?")[0])
 c = sqlite3.connect(db, uri=db.startswith("file:"))
 fakes = {{"PRAGMA quick_check;": "FAKE_QC", "PRAGMA journal_mode=DELETE;": "FAKE_MODE"}}
 for cmd in cmds:
@@ -413,3 +416,19 @@ def test_skill_examples_run(snapshot, capsys):
     for sql in examples:
         assert _query_module().run(sql, snapshot) == 0, sql
     assert '"rank": 3' in capsys.readouterr().out
+
+
+@posix_only
+async def test_backup_of_a_vanished_db_fails_and_creates_nothing(tmp_path):
+    # the source is opened file:...?mode=ro, so a path removed after the
+    # existence check fails instead of being created as an empty database
+    script, env = await _backup_env(tmp_path, shim=True)
+    r = subprocess.run(
+        ["bash", str(script)],
+        env={**env, "FAKE_VANISH": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0 and "backup failed" in r.stderr
+    assert not (tmp_path / "gecko.db").exists()
+    assert len(_dated_baks(tmp_path)) == 3  # nothing new, nothing rotated
