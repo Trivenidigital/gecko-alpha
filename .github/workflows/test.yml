@@ -136,6 +136,8 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - run: uv python install 3.12
       - run: uv sync --all-extras
+      # the functional backup-script test skips without the CLI: fail loudly instead
+      - run: sqlite3 --version
       - run: uv run pytest tests/gecko -q --timeout=120
       - run: uv run python scripts/gecko_loc_guard.py
       - run: uv run python -m black --check gecko tests/gecko scripts/gecko_loc_guard.py

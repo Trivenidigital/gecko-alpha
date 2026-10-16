@@ -6,6 +6,9 @@ Description=gecko telegram reader
 After=network-online.target
 Wants=network-online.target
 OnFailure=codex-systemd-failure-alert@%n.service
+# RestartSec=30 never trips the default 5-in-10s limit: bound a crash loop at 5/h
+StartLimitIntervalSec=1h
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -17,6 +20,9 @@ ExecStart=/root/.local/bin/uv run --frozen python -m gecko telegram-reader
 Restart=always
 RestartSec=30
 RestartPreventExitStatus=2
+# systemd >= 254: an auto-restart does not pass through failed (no OnFailure page per
+# restart); older systemd warns about the unknown key and ignores it.
+RestartMode=direct
 Nice=5
 
 [Install]

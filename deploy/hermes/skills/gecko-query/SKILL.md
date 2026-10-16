@@ -24,6 +24,13 @@ The data is a snapshot of `gecko.db` refreshed nightly at about 03:20 UTC
 (`/var/lib/gecko/gecko-snapshot.db`). It can be up to a day old; say so when
 freshness matters. You cannot change anything through this skill.
 
+Every answer states the snapshot's age. Run this first and report the result
+("data as of <time> UTC"):
+
+```bash
+python3 ~/.hermes/skills/gecko-query/query.py "SELECT MAX(finished_at) AS snapshot_as_of FROM runs"
+```
+
 ## Command
 
 ```bash

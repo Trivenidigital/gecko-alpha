@@ -1,6 +1,7 @@
 """deploy/: systemd units + timers, the env example, the backup script, gecko-query."""
 
 import importlib.util
+import os
 import re
 import shutil
 import sqlite3
@@ -58,6 +59,7 @@ def test_every_timer_starts_a_registered_job_on_its_schedule():
     for t in sorted((GECKO / "timers").glob("*.timer")):
         k = _keys(t)
         assert k["Persistent"] == "true" and k["AccuracySec"] == "1min", t.name
+        assert k["WantedBy"] == "timers.target", t.name
         if t.name == "gecko-db-backup.timer":
             assert k["Unit"] == "gecko-db-backup.service"
             assert k["OnCalendar"] == "*-*-* 03:20:00"
@@ -100,8 +102,12 @@ def test_job_template_and_reader_contracts():
     assert job["TimeoutStartSec"] == "900"
     dropin = GECKO / "gecko-job@coingecko-markets.service.d" / "timeout.conf"
     assert _keys(dropin)["TimeoutStartSec"] == "1500"
+    assert job["Environment"] == "PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin"
     reader = _keys(GECKO / "gecko-telegram-reader.service")
     assert reader["RestartPreventExitStatus"] == "2"
+    # a persistent crash stops after 5 starts/h; >=254 no page per auto-restart
+    assert reader["StartLimitIntervalSec"] == "1h" and reader["StartLimitBurst"] == "5"
+    assert reader["RestartMode"] == "direct"
     assert reader["Restart"] == "always" and reader["RestartSec"] == "30"
     assert reader["ExecStart"].endswith("python -m gecko telegram-reader")
     backup = _keys(GECKO / "gecko-db-backup.service")
@@ -154,43 +160,156 @@ def test_scripts_parse(script):
 
 
 @posix_only
-@pytest.mark.parametrize("flag", [[], ["--with-coingecko"]])
-def test_install_dry_run_enables_coingecko_only_with_the_flag(flag):
+@pytest.mark.parametrize(
+    "flags, verb, coingecko",
+    [
+        ([], "enable --now", False),
+        (["--with-coingecko"], "enable --now", True),
+        (["--no-start"], "enable", False),
+    ],
+)
+def test_install_dry_run_enables_the_right_timers(flags, verb, coingecko):
     r = subprocess.run(
-        ["bash", str(GECKO / "install.sh"), "--dry-run", *flag],
+        ["bash", str(GECKO / "install.sh"), "--dry-run", *flags],
         capture_output=True,
         text=True,
     )
     assert r.returncode == 0, r.stderr
-    enabled = set(re.findall(r"^\+ systemctl enable --now (\S+)$", r.stdout, re.M))
+    calls = re.findall(r"^\+ systemctl (enable(?: --now)?) (\S+)$", r.stdout, re.M)
+    assert {v for v, _ in calls} == {verb}
+    enabled = {u for _, u in calls}
+    timers = {p.name for p in (GECKO / "timers").glob("*.timer")}
     cg = {"gecko-coingecko-markets.timer", "gecko-coingecko-hourly.timer"}
-    assert cg & enabled == (cg if flag else set())
-    assert "gecko-dexscreener.timer" in enabled and "gecko-db-backup.timer" in enabled
-    assert not [u for u in enabled if "telegram-reader" in u]
+    assert enabled == (timers if coingecko else timers - cg)  # never the reader
+
+
+@posix_only
+def test_install_remove_dry_run_disables_everything_and_keeps_data():
+    r = subprocess.run(
+        ["bash", str(GECKO / "install.sh"), "--remove", "--dry-run"],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    for t in (GECKO / "timers").glob("*.timer"):
+        assert f"+ systemctl disable --now {t.name}\n" in out
+        assert f"+ rm -f /etc/systemd/system/{t.name}\n" in out
+    assert "+ systemctl disable --now gecko-telegram-reader.service\n" in out
+    assert "+ rm -f /etc/systemd/system/gecko-job@.service\n" in out
+    assert "+ rm -f /usr/local/bin/gecko-db-backup.sh\n" in out
+    rms = [ln for ln in out.splitlines() if ln.startswith("+ rm")]
+    assert not [
+        ln for ln in rms if "gecko.db" in ln or ".env" in ln or "/var/lib" in ln
+    ]
+
+
+@posix_only
+@pytest.mark.skipif(os.name == "posix" and os.geteuid() == 0, reason="runs as root")
+def test_install_refuses_to_run_as_non_root():
+    r = subprocess.run(
+        ["bash", str(GECKO / "install.sh")], capture_output=True, text=True
+    )
+    assert r.returncode == 1 and "run as root" in r.stderr
+    assert "+ install" not in r.stdout  # refused before any action
+
+
+# sqlite3 CLI stand-in: the subset gecko-db-backup.sh uses, plus fault knobs
+SHIM = """#!{py}
+import os, re, sqlite3, sys
+db, cmds = sys.argv[1], sys.argv[2:]
+c = sqlite3.connect(db, uri=db.startswith("file:"))
+fakes = {{"PRAGMA quick_check;": "FAKE_QC", "PRAGMA journal_mode=DELETE;": "FAKE_MODE"}}
+for cmd in cmds:
+    if cmd.startswith(".timeout"):
+        continue
+    m = re.match(r"[.]backup '(.+)'", cmd)
+    if m:
+        d = sqlite3.connect(m.group(1))
+        c.backup(d)
+        d.close()
+        continue
+    rows = c.execute(cmd).fetchall()
+    if os.environ.get(fakes.get(cmd, "-")):
+        rows = [(os.environ[fakes[cmd]],)]
+    for r in rows:
+        print("|".join(map(str, r)))
+"""
+
+
+async def _backup_env(tmp_path: Path, shim: bool) -> tuple[Path, dict]:
+    """The backup script repointed at tmp_path; a live WAL gecko.db; 3 old baks."""
+    s = await Store.open(str(tmp_path / "gecko.db"))
+    await s.close()
+    script = (GECKO / "gecko-db-backup.sh").read_text(encoding="utf-8")
+    for var, val in (("DB", "/gecko.db"), ("BAK_DIR", ""), ("SNAP_DIR", "/snap")):
+        script = re.sub(rf"(?m)^{var}=.*$", f"{var}={tmp_path}{val}", script)
+    (tmp_path / "b.sh").write_text(script, encoding="utf-8")
+    for ts in ("20200101T000000Z", "20200102T000000Z", "20200103T000000Z"):
+        (tmp_path / f"gecko.db.bak.{ts}").write_text("old")
+    env = dict(os.environ)
+    if shim:
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "sqlite3").write_text(SHIM.format(py=sys.executable))
+        (tmp_path / "bin" / "sqlite3").chmod(0o755)
+        env["PATH"] = f"{tmp_path / 'bin'}:{env['PATH']}"
+    return tmp_path / "b.sh", env
+
+
+def _check_snapshot(snap: Path) -> None:
+    assert snap.stat().st_mode & 0o777 == 0o644
+    with sqlite3.connect(f"file:{snap}?mode=ro&immutable=1", uri=True) as c:
+        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert c.execute("SELECT COUNT(*) FROM watchlist").fetchone() == (0,)
+
+
+def _dated_baks(d: Path) -> list[str]:
+    pat = r"gecko\.db\.bak\.\d{8}T\d{6}Z"
+    return sorted(p.name for p in d.iterdir() if re.fullmatch(pat, p.name))
 
 
 @posix_only
 @pytest.mark.skipif(shutil.which("sqlite3") is None, reason="sqlite3 CLI")
-async def test_backup_script_rotates_checks_and_publishes_a_snapshot(tmp_path):
-    s = await Store.open(str(tmp_path / "gecko.db"))
-    await s.close()
-    snap = tmp_path / "snap"
-    script = (GECKO / "gecko-db-backup.sh").read_text(encoding="utf-8")
-    script = re.sub(r"(?m)^DB=.*$", f"DB={tmp_path}/gecko.db", script)
-    script = re.sub(r"(?m)^BAK_DIR=.*$", f"BAK_DIR={tmp_path}", script)
-    script = re.sub(r"(?m)^SNAP_DIR=.*$", f"SNAP_DIR={snap}", script)
-    (tmp_path / "b.sh").write_text(script, encoding="utf-8")
-    for ts in ("20200101T000000Z", "20200102T000000Z", "20200103T000000Z"):
-        (tmp_path / f"gecko.db.bak.{ts}").write_text("old")
+async def test_backup_script_with_the_real_sqlite3_cli(tmp_path):
+    script, env = await _backup_env(tmp_path, shim=False)
     (tmp_path / "gecko.db.bak.20200104T000000Z.partial").write_text("crashed")
-    r = subprocess.run(["bash", str(tmp_path / "b.sh")], capture_output=True, text=True)
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     baks = sorted(p.name for p in tmp_path.glob("gecko.db.bak.*"))
     assert len(baks) == 3 and baks[0] == "gecko.db.bak.20200102T000000Z", baks
-    assert (snap / "gecko-snapshot.db").stat().st_mode & 0o777 == 0o644
-    uri = f"file:{snap / 'gecko-snapshot.db'}?mode=ro&immutable=1"
-    with sqlite3.connect(uri, uri=True) as c:
-        assert c.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    _check_snapshot(tmp_path / "snap" / "gecko-snapshot.db")
+
+
+@posix_only
+async def test_backup_rotation_touches_only_dated_gecko_backups(tmp_path):
+    script, env = await _backup_env(tmp_path, shim=True)
+    decoys = ["gecko.db-wal-copy", "gecko.db.bak.notadate", "scout.db.bak.X"]
+    for d in decoys:
+        (tmp_path / d).write_text("keep")
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    dated = _dated_baks(tmp_path)
+    assert len(dated) == 3 and dated[0] == "gecko.db.bak.20200102T000000Z", dated
+    assert all((tmp_path / d).read_text() == "keep" for d in decoys)
+    assert (tmp_path / "gecko.db").stat().st_size > 0  # the live database survives
+    _check_snapshot(tmp_path / "snap" / "gecko-snapshot.db")
+
+
+@posix_only
+@pytest.mark.parametrize("fault", [{"FAKE_QC": "corrupt"}, {"FAKE_MODE": "wal"}])
+async def test_backup_check_failure_replaces_nothing(tmp_path, fault):
+    script, env = await _backup_env(tmp_path, shim=True)
+    (tmp_path / "snap").mkdir()
+    (tmp_path / "snap" / "gecko-snapshot.db").write_text("PREV")
+    r = subprocess.run(
+        ["bash", str(script)], env={**env, **fault}, capture_output=True, text=True
+    )
+    assert r.returncode != 0 and "gecko-db-backup:" in r.stderr
+    assert (tmp_path / "snap" / "gecko-snapshot.db").read_text() == "PREV"
+    # no new backup, none rotated away
+    assert _dated_baks(tmp_path) == [
+        f"gecko.db.bak.2020010{i}T000000Z" for i in (1, 2, 3)
+    ]
 
 
 def _query_module():

@@ -18,8 +18,9 @@ Stop at the first unexpected output; never improvise past a failed check.
 
 ```bash
 cd /root/gecko-alpha
-git fetch -q origin && git status --short --branch     # clean tracked tree
-git rev-parse HEAD                                     # = the approved SHA
+git status --short --branch                            # clean tracked tree, on master
+git fetch origin && git merge --ff-only origin/master  # fails (diverged/dirty): STOP, report, never merge
+git rev-parse HEAD                                     # = the approved SHA, else STOP and report
 df -h /                                                # >= 8 GiB free (gecko.db + history copy + backups)
 command -v sqlite3 && sqlite3 --version                # sqlite3 CLI present
 /root/.local/bin/uv sync --frozen                      # gecko deps from uv.lock
@@ -106,15 +107,21 @@ sqlite3 "file:$HIST?mode=ro&immutable=1" "PRAGMA quick_check;"    # ok
 
 ```bash
 cd /root/gecko-alpha
-deploy/gecko/install.sh --dry-run    # review every action first
-deploy/gecko/install.sh              # without --with-coingecko until a Demo key exists
+deploy/gecko/install.sh --dry-run --no-start   # review every action first
+deploy/gecko/install.sh --no-start             # install + enable, start nothing yet
 ```
 
 Installs `gecko-job@.service` (+ the coingecko-markets timeout drop-in),
 `gecko-telegram-reader.service` (installed, NOT enabled),
 `gecko-db-backup.service`, every `gecko-*.timer`, and
-`/usr/local/bin/gecko-db-backup.sh`. Enables and starts every timer except the
-two `coingecko-*` timers, and prints `systemctl list-timers 'gecko-*'`.
+`/usr/local/bin/gecko-db-backup.sh`. With `--no-start` it enables every timer
+except the two `coingecko-*` timers but starts none of them, so sections 3 to 6
+run by hand before anything is scheduled; the timers are started in section 6b.
+It prints `systemctl list-timers 'gecko-*'`.
+
+`scripts/systemd-drift-watchdog.sh` tracks `deploy/gecko/`, its timers and its
+drop-ins. Between the code update and this step it reports every gecko unit as
+missing in prod; that is expected and clears once `install.sh` has run.
 
 Scripts run from `/usr/local/bin`, so a later `git pull` changes nothing there:
 re-run `install.sh` after any change under `deploy/gecko/`.
@@ -123,10 +130,8 @@ A timer cannot start an instance that is still running, so no job overlaps
 itself (the enrich budget no-overlap requirement). A SIGKILLed run still
 records no credits; that gap stays open.
 
-The timers start firing as soon as they are enabled. To run section 4 by hand
-first, install, then immediately `systemctl stop 'gecko-*.timer'`, do sections
-3 to 6, then `systemctl start` the timers you stopped (never the coingecko pair
-without a key).
+An enabled timer also starts at the next boot, so do not reboot between this
+step and section 6b.
 
 ## 3. `python -m gecko check`
 
@@ -144,9 +149,14 @@ line must be `OK` (or an expected `WARN` for the missing CoinGecko key). Add
 `--send` once to the shell form to post a test message to the health chat.
 
 **OnFailure falsifier:** `systemctl start gecko-job@no-such-job.service` exits
-2 (unknown job). The health chat must receive the codex-systemd failure page
-for `gecko-job@no-such-job.service`. If no page arrives, job crashes are
-silent: stop and fix before going further.
+2 (unknown job). The chat the codex handler posts to must receive the
+codex-systemd failure page for `gecko-job@no-such-job.service`. If no page
+arrives, job crashes are silent: stop and fix before going further. Then clear
+the failed state so it does not linger in `--failed` listings:
+
+```bash
+systemctl reset-failed gecko-job@no-such-job.service
+```
 
 ## 4. First manual runs, in order
 
@@ -195,6 +205,17 @@ echo "rc=$?"
 Expect `PASS` in the result row and rc 0. rc 1 means EITHER the battery failed
 OR the job could not load the study (`backtest: cannot load study: ...`) or
 crashed: read the output, never the exit code alone.
+
+### 6b. Start the timers
+
+Every timer except the two `coingecko-*` ones (those wait for a Demo key,
+section 10):
+
+```bash
+cd /root/gecko-alpha
+systemctl start $(ls deploy/gecko/timers | grep -v '^gecko-coingecko-')
+systemctl list-timers 'gecko-*' --all --no-pager     # 13 timers with a NEXT time
+```
 
 ## 7. Verification SQL
 
@@ -284,11 +305,12 @@ answer. The snapshot it reads (`/var/lib/gecko/gecko-snapshot.db`, 0644) is
 refreshed nightly by `gecko-db-backup.service` regardless.
 
 ```bash
-install -d -m 755 /tmp/gecko-query && cp deploy/hermes/skills/gecko-query/* /tmp/gecko-query/
+d=$(mktemp -d) && chmod 755 "$d"
+cp deploy/hermes/skills/gecko-query/SKILL.md deploy/hermes/skills/gecko-query/query.py "$d"/
+chmod 644 "$d"/*
 sudo -u gecko-agent install -d -m 700 /home/gecko-agent/.hermes/skills/gecko-query
-sudo -u gecko-agent cp /tmp/gecko-query/SKILL.md /tmp/gecko-query/query.py \
-  /home/gecko-agent/.hermes/skills/gecko-query/
-rm -rf /tmp/gecko-query
+sudo -u gecko-agent cp "$d/SKILL.md" "$d/query.py" /home/gecko-agent/.hermes/skills/gecko-query/
+rm -rf "$d"
 sudo -u gecko-agent python3 /home/gecko-agent/.hermes/skills/gecko-query/query.py \
   "SELECT job, MAX(finished_at) FROM runs GROUP BY job"     # rows, rc 0
 sudo -u gecko-agent python3 /home/gecko-agent/.hermes/skills/gecko-query/query.py \
@@ -325,7 +347,8 @@ wrote to them. The legacy pipeline keeps running throughout.
 |---|---|---|---|---|---|
 | 0 | preflight | read-only | | | |
 | 1 | `.env.gecko`, dirs, history copy | prod-state | | | |
-| 2 | `install.sh` (timers enabled) | deploy | | | |
+| 2 | `install.sh --no-start` (timers enabled, not started) | deploy | | | |
+| 6b | start every non-coingecko timer | deploy | | | |
 | 3-7 | check, manual runs, migrate-calls, backtest | prod-state | | | |
 | 8 | `GECKO_REQUIRE_SECURITY_KNOWN=true` | flag | | | |
 | 9 | tg-login, reader unit, `GECKO_TG_CHANNELS` | flag (OWNER) | | | |
