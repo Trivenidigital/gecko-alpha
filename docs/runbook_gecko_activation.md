@@ -69,6 +69,29 @@ A timer cannot start an instance that is still running, so no job overlaps
 itself (the enrich budget no-overlap requirement). A SIGKILLed run still
 records no credits; that gap stays open.
 
+There is no app-level job lock: systemd is the only thing preventing overlap.
+Never run a scheduled job as `uv run python -m gecko <job>` while its timer is
+live; use `systemctl start gecko-job@<job>.service`, which waits on (never
+overlaps) a running instance.
+
+Schedules (UTC, `deploy/gecko/timers/`):
+
+| Unit | Schedule |
+|---|---|
+| dexscreener | every 10 min (`*:00/10`, +up to 60 s random delay) |
+| geckoterminal | every 15 min from :07 |
+| freshness | every 30 min from :05 |
+| enrich / benchmark / rank / coingecko-hourly | hourly at :17 / :35 / :45 / :50 |
+| coingecko-markets | 02:30 |
+| gecko-db-backup | 03:24 (after the 03:00 legacy backup, off the dexscreener grid) |
+| prune | 03:40 |
+| geckoterminal-ohlcv | 04:20 |
+| ledger | 05:10 |
+| research | 06:00 |
+| digest | 07:00 |
+| scorecard | Monday 08:00 |
+| telegram-reader | long-running service (section 9) |
+
 An enabled timer also starts at the next boot, so do not reboot between this
 step and section 6b.
 
@@ -277,7 +300,7 @@ After 24 h, check the timers fired and nothing failed:
 ```bash
 systemctl list-timers 'gecko-*' --all --no-pager
 systemctl list-units 'gecko-*' --failed --no-pager
-ls -la /root/gecko-alpha/gecko.db.bak.* /var/lib/gecko/gecko-snapshot.db   # after 03:20
+ls -lai /root/gecko-alpha/gecko.db.bak.* /var/lib/gecko/gecko-snapshot.db  # after 03:24; snapshot inode = newest backup's
 ```
 
 ## 8. `require_security_known` flip criterion
@@ -374,6 +397,13 @@ The drift watchdog will list the gecko units as missing in prod after
 
 ## 13. Known limits
 
+- Disk budget for gecko backups: the live `gecko.db` plus 3 backups. The
+  snapshot is a hardlink of the newest backup (same inode, no extra space; a
+  copy only if `/var/lib/gecko` were on another filesystem). Peak during a run
+  is one more `.partial` copy. The backup refuses to start (and pages) unless
+  free space is at least 2 x `gecko.db` + 1 GiB. It copies with `VACUUM INTO`
+  (one read transaction, so writers never make it restart) and, on success,
+  writes a `runs` row with job `db-backup` that `freshness` watches.
 - Backups are LOCAL only (newest 3 `gecko.db.bak.*`). Off-host shipping of
   `gecko.db` waits for B2 keys (followups ticket); legacy backup units must not
   be retired before it exists.

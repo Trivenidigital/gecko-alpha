@@ -13,7 +13,7 @@ import pytest
 
 from gecko.__main__ import JOBS, _load_jobs
 from gecko.settings import GeckoSettings
-from gecko.store import Store
+from gecko.store import Store, parse_utc
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
@@ -62,7 +62,7 @@ def test_every_timer_starts_a_registered_job_on_its_schedule():
         assert k["WantedBy"] == "timers.target", t.name
         if t.name == "gecko-db-backup.timer":
             assert k["Unit"] == "gecko-db-backup.service"
-            assert k["OnCalendar"] == "*-*-* 03:20:00"
+            assert k["OnCalendar"] == "*-*-* 03:24:00"  # off the :00/10 grid
             continue
         m = re.fullmatch(r"gecko-job@(.+)\.service", k["Unit"])
         assert m and m.group(1) in JOBS, f"{t.name}: {k['Unit']}"
@@ -219,28 +219,23 @@ SHIM = """#!{py}
 import os, re, sqlite3, sys
 db, cmds = sys.argv[1], sys.argv[2:]
 # FAKE_VANISH: the source path disappears after the [ -f ] check (a race)
-if os.environ.get("FAKE_VANISH") and any(x.startswith(".backup") for x in cmds):
+if os.environ.get("FAKE_VANISH") and any(x.startswith("VACUUM INTO") for x in cmds):
     os.remove(db.removeprefix("file:").split("?")[0])
 c = sqlite3.connect(db, uri=db.startswith("file:"))
 fakes = {{"PRAGMA quick_check;": "FAKE_QC", "PRAGMA journal_mode=DELETE;": "FAKE_MODE"}}
 for cmd in cmds:
     if cmd.startswith(".timeout"):
         continue
-    m = re.match(r"[.]backup '(.+)'", cmd)
-    if m:
-        d = sqlite3.connect(m.group(1))
-        c.backup(d)
-        d.close()
-        continue
-    rows = c.execute(cmd).fetchall()
+    rows = c.execute(cmd).fetchall()  # no .backup: the script must use VACUUM INTO
     if os.environ.get(fakes.get(cmd, "-")):
         rows = [(os.environ[fakes[cmd]],)]
     for r in rows:
         print("|".join(map(str, r)))
+c.commit()
 """
 
 
-async def _backup_env(tmp_path: Path, shim: bool) -> tuple[Path, dict]:
+async def _backup_env(tmp_path: Path, shim: bool, **bins: str) -> tuple[Path, dict]:
     """The backup script repointed at tmp_path; a live WAL gecko.db; 3 old baks."""
     s = await Store.open(str(tmp_path / "gecko.db"))
     await s.close()
@@ -252,10 +247,12 @@ async def _backup_env(tmp_path: Path, shim: bool) -> tuple[Path, dict]:
         (tmp_path / f"gecko.db.bak.{ts}").write_text("old")
     env = dict(os.environ)
     if shim:
-        (tmp_path / "bin").mkdir()
-        (tmp_path / "bin" / "sqlite3").write_text(SHIM.format(py=sys.executable))
-        (tmp_path / "bin" / "sqlite3").chmod(0o755)
-        env["PATH"] = f"{tmp_path / 'bin'}:{env['PATH']}"
+        bins["sqlite3"] = SHIM.format(py=sys.executable)
+    (tmp_path / "bin").mkdir()
+    for name, body in bins.items():  # stand-ins ahead of the real tools on PATH
+        (tmp_path / "bin" / name).write_text(body)
+        (tmp_path / "bin" / name).chmod(0o755)
+    env["PATH"] = f"{tmp_path / 'bin'}:{env['PATH']}"
     return tmp_path / "b.sh", env
 
 
@@ -271,6 +268,28 @@ def _dated_baks(d: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if re.fullmatch(pat, p.name))
 
 
+def _backup_runs(d: Path) -> list[tuple]:
+    with sqlite3.connect(d / "gecko.db") as c:
+        sql = "SELECT * FROM runs WHERE job='db-backup'"
+        return [tuple(r) for r in c.execute(sql).fetchall()]
+
+
+def _assert_failed_cleanly(d: Path) -> None:
+    """A failed run: no new or rotated backup, no .partial left, no runs row."""
+    assert _dated_baks(d) == [f"gecko.db.bak.2020010{i}T000000Z" for i in (1, 2, 3)]
+    assert not list(d.glob("*.partial*"))  # the EXIT trap removed it
+    assert not (d / "gecko.db").exists() or _backup_runs(d) == []
+
+
+def _assert_runs_row(d: Path) -> None:
+    rows = _backup_runs(d)
+    assert len(rows) == 1, rows  # (id, job, started, finished, ok, rows, credits, err)
+    _, _, started, finished, ok, written, credits, error = rows[0]
+    assert (ok, written, credits, error) == (1, 1, 0, None)
+    assert parse_utc(started) <= parse_utc(finished)  # gecko.store's own format
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", finished)
+
+
 @posix_only
 @pytest.mark.skipif(shutil.which("sqlite3") is None, reason="sqlite3 CLI")
 async def test_backup_script_with_the_real_sqlite3_cli(tmp_path):
@@ -281,6 +300,8 @@ async def test_backup_script_with_the_real_sqlite3_cli(tmp_path):
     baks = sorted(p.name for p in tmp_path.glob("gecko.db.bak.*"))
     assert len(baks) == 3 and baks[0] == "gecko.db.bak.20200102T000000Z", baks
     _check_snapshot(tmp_path / "snap" / "gecko-snapshot.db")
+    _assert_runs_row(tmp_path)
+    assert not list(tmp_path.glob("*.partial*"))
 
 
 @posix_only
@@ -296,6 +317,7 @@ async def test_backup_rotation_touches_only_dated_gecko_backups(tmp_path):
     assert all((tmp_path / d).read_text() == "keep" for d in decoys)
     assert (tmp_path / "gecko.db").stat().st_size > 0  # the live database survives
     _check_snapshot(tmp_path / "snap" / "gecko-snapshot.db")
+    _assert_runs_row(tmp_path)
 
 
 @posix_only
@@ -309,10 +331,7 @@ async def test_backup_check_failure_replaces_nothing(tmp_path, fault):
     )
     assert r.returncode != 0 and "gecko-db-backup:" in r.stderr
     assert (tmp_path / "snap" / "gecko-snapshot.db").read_text() == "PREV"
-    # no new backup, none rotated away
-    assert _dated_baks(tmp_path) == [
-        f"gecko.db.bak.2020010{i}T000000Z" for i in (1, 2, 3)
-    ]
+    _assert_failed_cleanly(tmp_path)
 
 
 def _query_module():
@@ -431,4 +450,37 @@ async def test_backup_of_a_vanished_db_fails_and_creates_nothing(tmp_path):
     )
     assert r.returncode != 0 and "backup failed" in r.stderr
     assert not (tmp_path / "gecko.db").exists()
-    assert len(_dated_baks(tmp_path)) == 3  # nothing new, nothing rotated
+    _assert_failed_cleanly(tmp_path)
+
+
+def test_backup_copies_with_vacuum_into_not_dot_backup():
+    # one read transaction: .backup restarts whenever another connection commits
+    code = [ln for ln in _lines(GECKO / "gecko-db-backup.sh") if not ln[:1] == "#"]
+    vacuum = [ln for ln in code if "VACUUM INTO" in ln]
+    assert len(vacuum) == 1 and 'sqlite3 "file:$DB?mode=ro"' in vacuum[0]
+    assert not [ln for ln in code if ".backup" in ln]
+
+
+@posix_only
+async def test_backup_refuses_without_free_space(tmp_path):
+    df = "#!/bin/sh\necho 'Filesystem 1-blocks Used Available Capacity Mounted'\n"
+    df += "echo '/dev/x 100 99 1 99% /'\n"  # 1 byte free
+    script, env = await _backup_env(tmp_path, shim=True, df=df)
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "free space 1 B < 2 x gecko.db + 1 GiB" in r.stderr
+    _assert_failed_cleanly(tmp_path)
+    assert not (tmp_path / "snap").exists()
+
+
+@posix_only
+@pytest.mark.parametrize("link_works", [True, False])
+async def test_backup_snapshot_shares_the_backup_inode(tmp_path, link_works):
+    bins = {} if link_works else {"ln": "#!/bin/sh\nexit 1\n"}  # cross-filesystem
+    script, env = await _backup_env(tmp_path, shim=True, **bins)
+    r = subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    snap = tmp_path / "snap" / "gecko-snapshot.db"
+    newest = tmp_path / _dated_baks(tmp_path)[-1]
+    assert (snap.stat().st_ino == newest.stat().st_ino) is link_works
+    assert snap.read_bytes() == newest.read_bytes()
+    _check_snapshot(snap)
