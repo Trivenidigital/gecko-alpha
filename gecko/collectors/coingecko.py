@@ -12,7 +12,7 @@ from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
 from gecko.runs import JobResult, PartialFailure, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, utcnow
+from gecko.store import Store, canon_ts, iso_plus, utcnow
 from gecko.universe import in_band
 
 log = structlog.get_logger("gecko.coingecko")
@@ -141,9 +141,10 @@ async def _budget_left(
 
 
 async def _known_platform(
-    store: Store, cid: str, now: str
+    store: Store, settings: GeckoSettings, cid: str, now: str
 ) -> tuple[str, str] | None | bool:
-    """(chain, address) if mapped, False if known-unmapped, None if never fetched."""
+    """(chain, address) if mapped, False if known-unmapped, None if never fetched
+    (a marker older than ``cg_unmapped_ttl_days`` counts as never fetched)."""
     row = await (
         await store.conn.execute(
             "SELECT chain, address FROM tokens WHERE cg_id=? AND chain!='cg'", (cid,)
@@ -154,7 +155,8 @@ async def _known_platform(
     seen = await store.observations(
         f"cg:{cid}", as_of=now, source="cg_unmapped", limit=1
     )
-    return False if seen else None
+    fresh = iso_plus(now, -settings.cg_unmapped_ttl_days)
+    return False if seen and seen[0].observed_at > fresh else None
 
 
 async def _fetch_platform(
@@ -162,7 +164,9 @@ async def _fetch_platform(
 ) -> tuple[str, str] | None:
     """First platform on a configured chain; otherwise mark the coin unmapped."""
     body = await cg.get(f"/coins/{cid}", COIN_PARAMS)
-    platforms = (body or {}).get("platforms") or {}
+    platforms = (body if isinstance(body, dict) else {}).get("platforms") or {}
+    if not isinstance(platforms, dict) or not any(str(k).strip() for k in platforms):
+        return None  # no answer (empty, or the {"": ""} placeholder): no marker
     for platform, addr in platforms.items():
         chain = PLATFORM_MAP.get(platform)
         if chain not in settings.chains or not addr or not str(addr).strip():
@@ -245,7 +249,7 @@ async def markets_sweep(
                 ):
                     continue
                 cid = r["id"]
-                mapped = await _known_platform(store, cid, now)
+                mapped = await _known_platform(store, settings, cid, now)
                 if mapped is None:
                     if (
                         cg.calls + 1 + reserved > left

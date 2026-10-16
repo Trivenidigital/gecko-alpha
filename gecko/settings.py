@@ -57,6 +57,7 @@ class GeckoSettings(BaseSettings):
     cg_max_pages: int = 14
     cg_hourly_reserve: int = 100  # monthly calls the markets sweep leaves for hourly
     cg_max_lookups_per_run: int = 300  # /coins/{id} platform lookups per sweep
+    cg_unmapped_ttl_days: int = Field(30, ge=1)  # an unmapped coin is re-looked-up
     gp_min_interval_sec: float = (
         2.0  # keyless GoPlus: <=30 calls/min, well under 150 CU/min
     )

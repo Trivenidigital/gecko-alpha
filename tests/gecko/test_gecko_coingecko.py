@@ -158,6 +158,40 @@ async def test_sweep_does_not_refetch_unmapped(store, cg_settings):
     assert first.credits_used == 3 and second.credits_used == 2
 
 
+@pytest.mark.parametrize("age_days,credits", [(29, 2), (31, 3)])
+async def test_unmapped_marker_is_rechecked_after_ttl(
+    store, cg_settings, age_days, credits
+):
+    # C1: a marker older than cg_unmapped_ttl_days (default 30) is re-looked-up
+    assert cg_settings.cg_unmapped_ttl_days == 30
+    from gecko.store import iso_plus
+
+    marker_at = iso_plus(NOW, -age_days)
+    await store.add_observation("cg:nochain", "cg_unmapped", marker_at, {})
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("nochain", 2e6)])
+        m.get(COIN, payload={"platforms": {"tron": "T1"}})
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            r = await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    assert r.credits_used == credits
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"platforms": {}}, {"platforms": {"": ""}}, {"platforms": None}]
+)
+async def test_empty_platforms_answer_writes_no_marker(store, cg_settings, body):
+    # C1: no answer is not "unmapped": the coin is looked up again next sweep
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("nochain", 2e6)])
+        m.get(COIN, payload=body)
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    n = await (await store.conn.execute("SELECT COUNT(*) FROM observations")).fetchone()
+    assert n == (0,)
+
+
 async def test_markets_429_then_200(store, cg_settings):
     with aioresponses() as m:
         m.get(MARKETS, status=429)
