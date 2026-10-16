@@ -272,10 +272,17 @@ logs "research disabled" and writes nothing.
 
 - A token with a valid dossier is never researched again.
 - A token whose only rows are markers (`schema_version=0`: invalid JSON, an
-  abandoned pause, a timeout) is retried once every `MARKER_RETRY_DAYS` (7)
+  abandoned pause, a timeout, an unreadable 200 body) is retried once every `MARKER_RETRY_DAYS` (7)
   while it stays on the watchlist.
-- A malformed HTTP 200 body writes no marker and fails the run. The usual
-  cause is a wrong `GECKO_ANTHROPIC_BASE_URL`: fix the URL.
+- A malformed or unreadable HTTP 200 body is billed: it writes a `body_error`
+  marker (cost `EST_NEXT_USD`, $0.10, counted toward
+  `research_daily_usd_cap`, retried after `MARKER_RETRY_DAYS`) and still fails
+  the run when no valid dossier results. The usual cause is a wrong
+  `GECKO_ANTHROPIC_BASE_URL`: fix the URL.
+- `GECKO_RESEARCH_DAILY_USD_CAP` below 0.10 is refused at settings load and
+  stops EVERY gecko job from starting. To pause research, unset
+  `GECKO_ANTHROPIC_API_KEY` or run
+  `systemctl disable --now gecko-research.timer`; never set the cap to 0.
 - Pricing defaults were verified against the Anthropic docs on 2026-10-16:
   claude-sonnet-5-5 at $2 / $10 per million input / output tokens, web search
   at $10 per 1,000. One dossier can overshoot `research_daily_usd_cap` by
