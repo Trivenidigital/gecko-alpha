@@ -649,9 +649,11 @@ def test_mintable_owned_is_structural(key):
 @pytest.mark.parametrize(
     "mock,code",
     [
-        ({"payload": {"code": 4012, "message": "bad"}}, 4012),
+        ({"payload": {"code": 2004, "message": "address format"}}, 2004),
+        ({"payload": {"code": "2001", "message": "bad address"}}, 2001),
         ({"status": 404}, 404),
         ({"status": 400}, 400),
+        ({"status": 422}, 422),
     ],
 )
 async def test_error_marker_written_on_goplus_code_error_and_4xx(
@@ -670,8 +672,36 @@ async def test_error_marker_written_on_goplus_code_error_and_4xx(
     assert tid not in [t for t, _, _ in await enrich_queue(store, settings, NOW)]
 
 
-@pytest.mark.parametrize("status", [429, 503])
-async def test_429_writes_no_marker(store, settings, status, monkeypatch):
+@pytest.mark.parametrize(
+    "mock",
+    [
+        {"status": 429},
+        {"status": 503},
+        {"status": 408},
+        {"payload": {"code": 4012, "message": "bad"}},
+        {"payload": {"code": 3000, "message": "x"}},
+    ],
+)
+async def test_429_writes_no_marker(store, settings, mock, monkeypatch):
+    # transient: no marker, counted failed, the run moves on to the next token
+    from structlog.testing import capture_logs
+
+    _fast_retries(monkeypatch)
+    tid = await tok(store, "base", A, status="candidate")
+    tb = await tok(store, "base", B, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, repeat=True, **mock)
+            m.get(BASE_URL + B, payload={"code": 1, "result": {B: evm()}})
+            with capture_logs() as logs:
+                r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert await enrich_rows(store, tid) == [] and r.rows_written == 1
+    (done,) = [e for e in logs if e["event"] == "enrich_done"]
+    assert done["failed"] == 1
+    assert [t for t, _, _ in await enrich_queue(store, settings, NOW)] == [tid]
+
+
+def _fast_retries(monkeypatch):
     import gecko.collectors.goplus as gp
 
     real = gp.get_json
@@ -680,14 +710,71 @@ async def test_429_writes_no_marker(store, settings, status, monkeypatch):
         return await real(*a, sleep=_nosleep, **kw)
 
     monkeypatch.setattr(gp, "get_json", fast)
+
+
+@pytest.mark.parametrize(
+    "mock",
+    [
+        {"exception": aiohttp.ClientConnectionError()},  # status 0
+        {"body": "<html>not json</html>"},  # ValueError
+        {"body": ""},  # empty body -> GoPlusError(None)
+        {"payload": ["not", "a", "dict"]},  # GoPlusError(None)
+    ],
+)
+async def test_no_marker_for_transport_nonjson_and_empty_body(
+    store, settings, mock, monkeypatch
+):
+    _fast_retries(monkeypatch)
+    tid = await tok(store, "base", A, status="candidate")
+    tb = await tok(store, "base", B, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, repeat=True, **mock)
+            m.get(BASE_URL + B, payload={"code": 1, "result": {B: evm()}})
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert await enrich_rows(store, tid) == []
+    assert r.rows_written == 1 and len(await enrich_rows(store, tb)) == 1
+    assert [t for t, _, _ in await enrich_queue(store, settings, NOW)] == [tid]
+
+
+async def test_marked_candidate_requeued_after_refresh_hours(store, settings):
+    from datetime import timedelta
+
+    from gecko.store import parse_utc
+
+    def at(h):
+        d = parse_utc(NOW) + timedelta(hours=h)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     tid = await tok(store, "base", A, status="candidate")
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
-            m.get(BASE_URL + A, status=status, repeat=True)
+            m.get(BASE_URL + A, status=404)
             with pytest.raises(PartialFailure):
                 await enrich(store, settings, s, NOW, sleep=_nosleep)
-    assert await enrich_rows(store, tid) == []
-    assert [t for t, _, _ in await enrich_queue(store, settings, NOW)] == [tid]
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["goplus_status"] == "error"
+    hours = settings.gp_refresh_hours
+    assert await enrich_queue(store, settings, at(hours - 1)) == []
+    q = await enrich_queue(store, settings, at(hours + 1))
+    assert [t for t, _, _ in q] == [tid]
+
+
+async def test_active_tax_only_failure_not_disqualified_at_enrich(store, settings):
+    from structlog.testing import capture_logs
+
+    tid = await tok(store, "base", A)  # active
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm(sell_tax="0.3")}})
+            with capture_logs() as logs:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert await _status_of(store, tid) == ("active", None)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["security_ok"] is False
+    assert o.features["security_structural"] is True
+    assert [e["token_id"] for e in logs if e["event"] == "token_security_tax"] == [tid]
+    assert not [e for e in logs if e["event"] == "token_security_fail"]
 
 
 async def _tax_row(store, tid, at, structural=True):
@@ -763,24 +850,31 @@ def test_enrich_refuses_as_of(monkeypatch, settings, capsys):
     assert gecko.__main__.main(["enrich"]) == 0 and ran == [None]
 
 
-async def test_4029_is_transient_and_stops_run(store, settings):
-    # GoPlus throttling inside a 200 body: no marker, and no more calls this run
+@pytest.mark.parametrize(
+    "mock,event,code",
+    [
+        ({"payload": {"code": 4029, "message": "rate"}}, "goplus_rate_limited", 4029),
+        ({"payload": {"code": 5000, "message": "x"}}, "goplus_upstream_blocked", 5000),
+        ({"status": 403}, "goplus_upstream_blocked", 403),
+    ],
+)
+async def test_4029_is_transient_and_stops_run(store, settings, mock, event, code):
+    # upstream-wide refusal: no marker, and no more calls this run
     from structlog.testing import capture_logs
 
     C = "0x" + "c" * 40
     ta, tb, tc = [await tok(store, "base", x, status="candidate") for x in (A, B, C)]
-    rate = {"code": 4029, "message": "too many requests"}
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
             m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
-            m.get(BASE_URL + B, payload=rate)
+            m.get(BASE_URL + B, **mock)
             with capture_logs() as logs:
                 r = await enrich(store, settings, s, NOW, sleep=_nosleep)
             assert len(m.requests) == 2  # C was never called
     assert r.rows_written == 1 and r.credits_used == 2
     assert await enrich_rows(store, tb) == [] and await enrich_rows(store, tc) == []
-    (ev,) = [e for e in logs if e["event"] == "goplus_rate_limited"]
-    assert ev["token_id"] == tb and ev["code"] == 4029
+    (ev,) = [e for e in logs if e["event"] == event]
+    assert ev["token_id"] == tb and ev["code"] == code
     (done,) = [e for e in logs if e["event"] == "enrich_done"]
     assert done["failed"] == 1
     q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
@@ -788,7 +882,7 @@ async def test_4029_is_transient_and_stops_run(store, settings):
     # throttled before anything was written: the run fails
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
-            m.get(BASE_URL + B, payload=rate)
+            m.get(BASE_URL + B, **mock)
             with pytest.raises(PartialFailure) as ei:
                 await enrich(store, settings, s, NOW, sleep=_nosleep)
             assert len(m.requests) == 1

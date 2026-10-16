@@ -30,7 +30,9 @@ OK_CODES = (
     1,
     2,
 )  # 2 = partial data: parsed, and any missing core flag reads as unknown
-RATE_LIMITED = 4029  # GoPlus throttling inside a 200 body: transient
+RATE_LIMITED = 4029  # GoPlus throttling inside a 200 body
+UPSTREAM_BLOCKED = 5000  # GoPlus server-side refusal inside a 200 body
+MARK_HTTP = (400, 404, 422)  # this address is the problem: mark, do not retry
 MAX_TAX = 0.10
 # Launch taxes often drop within hours: a tax-only failure is re-read, not final.
 TAX_FLAGS = {"buy_tax", "sell_tax"}
@@ -237,17 +239,29 @@ async def enrich_queue(
     return [(r[0], r[1], r[2]) for r in due]
 
 
-def _error_code(exc: Exception):
+def _error_code(exc: Exception) -> int | None:
     """The code to mark a deterministic failure with, or None to retry next run.
 
-    A GoPlus error code (not 1) or a 4xx other than 429 is deterministic; 429,
-    5xx and transport errors (status 0) are transient. GoPlus 4029 (throttled)
-    never reaches here: enrich stops the run on it.
+    Only address-level failures are deterministic: GoPlus 2xxx codes and HTTP
+    400/404/422. Everything else (other codes, 408, 429, 5xx, transport) is
+    transient.
     """
     if isinstance(exc, GoPlusError):
-        return exc.code if exc.code != 1 else None
+        code = as_int(exc.code)
+        return code if code is not None and 2000 <= code <= 2999 else None
     status = getattr(exc, "status", 0)
-    return status if 400 <= status <= 499 and status != 429 else None
+    return status if status in MARK_HTTP else None
+
+
+def _stop_event(exc: Exception) -> tuple[str, int] | None:
+    """(log event, code) when the failure is upstream-wide and ends the run."""
+    if isinstance(exc, GoPlusError):
+        code = as_int(exc.code)
+        if code == RATE_LIMITED:
+            return "goplus_rate_limited", code
+        return ("goplus_upstream_blocked", code) if code == UPSTREAM_BLOCKED else None
+    status = getattr(exc, "status", 0)
+    return ("goplus_upstream_blocked", status) if status == 403 else None
 
 
 async def _fetch(session, settings, chain, address):
@@ -288,10 +302,11 @@ async def enrich(
                 r = await _fetch(session, settings, chain, address)
             except (UpstreamError, GoPlusError) as exc:
                 failed += 1
-                if str(getattr(exc, "code", None)) == str(RATE_LIMITED):
-                    # stop: the rest of the budget would only hit a throttled upstream
+                stop = _stop_event(exc)
+                if stop is not None:
+                    # stop: the rest of the budget would only hit a refusing upstream
                     throttled = True
-                    log.warning("goplus_rate_limited", token_id=tid, code=exc.code)
+                    log.warning(stop[0], token_id=tid, code=stop[1])
                     break
                 log.warning(
                     "goplus_fetch_failed",
