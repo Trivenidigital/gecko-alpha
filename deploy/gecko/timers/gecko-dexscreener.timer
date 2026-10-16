@@ -2,7 +2,7 @@
 Description=gecko-dexscreener schedule
 
 [Timer]
-Unit=gecko-job@dexscreener.service
+Unit=gecko-collector@dexscreener.service
 OnCalendar=*-*-* *:00/10:00
 Persistent=true
 AccuracySec=1min

@@ -2,7 +2,7 @@
 Description=gecko-geckoterminal schedule
 
 [Timer]
-Unit=gecko-job@geckoterminal.service
+Unit=gecko-collector@geckoterminal.service
 OnCalendar=*-*-* *:07/15:00
 Persistent=true
 AccuracySec=1min

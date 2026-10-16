@@ -50,6 +50,7 @@ deploy/gecko/install.sh --no-start             # install + enable, start nothing
 ```
 
 Installs `gecko-job@.service` (+ the coingecko-markets timeout drop-in),
+`gecko-collector@.service` (the same runner without `OnFailure=`),
 `gecko-telegram-reader.service` (installed, NOT enabled),
 `gecko-db-backup.service`, every `gecko-*.timer`, and
 `/usr/local/bin/gecko-db-backup.sh`. With `--no-start` it enables every timer
@@ -77,8 +78,12 @@ records no credits; that gap stays open.
 
 There is no app-level job lock: systemd is the only thing preventing overlap.
 Never run a scheduled job as `uv run python -m gecko <job>` while its timer is
-live; use `systemctl start gecko-job@<job>.service`, which waits on (never
-overlaps) a running instance.
+live; start the unit its timer starts, which waits on (never overlaps) a
+running instance: `systemctl start gecko-collector@<job>.service` for
+dexscreener, geckoterminal and geckoterminal-ohlcv, `gecko-job@<job>.service`
+for every other job. The two templates are different units, so a
+`gecko-job@dexscreener` run CAN overlap a timer-started
+`gecko-collector@dexscreener` run.
 
 Schedules (UTC, `deploy/gecko/timers/`):
 
@@ -98,16 +103,19 @@ Schedules (UTC, `deploy/gecko/timers/`):
 | scorecard | Monday 08:00 |
 | telegram-reader | long-running service (section 9) |
 
-Paging. Every gecko unit pages the codex failure handler on each failed run
-(`OnFailure=`), except `gecko-job@dexscreener`, `gecko-job@geckoterminal` and
-`gecko-job@geckoterminal-ohlcv`: their `no-onfailure.conf` drop-ins clear the
-list, so a high-frequency collector does not page per failed run. Their
-outages page only through `freshness` (per-source SLOs, deduplicated for 6 h).
-Check after the install:
+Paging. Every `gecko-job@` instance, the reader and `gecko-db-backup` page the
+codex failure handler on each failed run (`OnFailure=`). The dexscreener,
+geckoterminal and geckoterminal-ohlcv timers start `gecko-collector@<job>`
+instead: the same runner (a test pins the two templates identical apart from
+`Description=` and `OnFailure=`) with no `OnFailure=`, so a high-frequency
+collector does not page per failed run. Their outages page only through
+`freshness` (per-source SLOs, deduplicated for 6 h). An empty `OnFailure=` in
+a drop-in does NOT clear the template's list (checked on systemd 255), hence a
+separate template. Check after the install:
 
 ```bash
-systemctl show -p OnFailure gecko-job@dexscreener.service   # OnFailure=  (empty)
-systemctl show -p OnFailure gecko-job@rank.service          # the codex handler
+systemctl show -p OnFailure --value gecko-collector@dexscreener.service   # prints nothing
+systemctl show -p OnFailure --value gecko-job@rank.service                # codex-systemd-failure-alert@...
 ```
 
 Each job and the reader run under `MemoryMax=512M`; an out-of-memory kill
@@ -237,8 +245,10 @@ its journal before the next one:
 ```bash
 for j in dexscreener geckoterminal benchmark rank freshness ledger enrich \
          geckoterminal-ohlcv prune scorecard digest; do
-  echo "== $j"; systemctl start "gecko-job@$j.service"; echo "rc=$?"
-  journalctl -u "gecko-job@$j.service" -n 15 --no-pager
+  case $j in dexscreener|geckoterminal*) u="gecko-collector@$j.service" ;;
+             *) u="gecko-job@$j.service" ;; esac   # the unit its timer starts
+  echo "== $u"; systemctl start "$u"; echo "rc=$?"
+  journalctl -u "$u" -n 15 --no-pager
 done
 ```
 
@@ -308,6 +318,10 @@ cd /root/gecko-alpha
 systemctl start $(ls deploy/gecko/timers | grep -v '^gecko-coingecko-')
 systemctl list-timers 'gecko-*' --all --no-pager     # 13 timers with a NEXT time
 ```
+
+The dexscreener, geckoterminal and geckoterminal-ohlcv timers start
+`gecko-collector@<job>.service` instances; every other job timer starts
+`gecko-job@<job>.service`.
 
 ## 7. Verification SQL
 

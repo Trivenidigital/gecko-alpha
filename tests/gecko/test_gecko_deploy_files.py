@@ -42,6 +42,8 @@ SCHEDULES = {  # job -> OnCalendar (spec §11 + the system-review amendments)
     "coingecko-hourly": "*-*-* *:50:00",
 }
 ON_FAILURE = "OnFailure=codex-systemd-failure-alert@%n.service"
+# per-run failures of these page via freshness (gecko-collector@), not OnFailure
+COLLECTORS = ("dexscreener", "geckoterminal", "geckoterminal-ohlcv")
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="bash scripts")
 
 
@@ -64,8 +66,11 @@ def test_every_timer_starts_a_registered_job_on_its_schedule():
             assert k["Unit"] == "gecko-db-backup.service"
             assert k["OnCalendar"] == "*-*-* 03:24:00"  # off the :00/10 grid
             continue
-        m = re.fullmatch(r"gecko-job@(.+)\.service", k["Unit"])
-        assert m and m.group(1) in JOBS, f"{t.name}: {k['Unit']}"
+        m = re.fullmatch(r"gecko-(job|collector)@(.+)\.service", k["Unit"])
+        assert m and m.group(2) in JOBS, f"{t.name}: {k['Unit']}"
+        # the three collectors use the no-OnFailure template, every other job pages
+        assert (m.group(1) == "collector") is (m.group(2) in COLLECTORS), t.name
+        m = re.fullmatch(r"gecko-\w+@(.+)\.service", k["Unit"])
         assert t.name == f"gecko-{m.group(1)}.timer"
         seen[m.group(1)] = k["OnCalendar"]
     assert seen == SCHEDULES
@@ -77,11 +82,12 @@ def test_every_service_pages_on_failure():
     services = sorted(GECKO.glob("*.service"))
     assert {p.name for p in services} == {
         "gecko-job@.service",
+        "gecko-collector@.service",
         "gecko-telegram-reader.service",
         "gecko-db-backup.service",
     }
     for p in services:
-        assert ON_FAILURE in _lines(p), p.name
+        assert (ON_FAILURE in _lines(p)) is (p.name != "gecko-collector@.service")
 
 
 @pytest.mark.parametrize(
@@ -115,13 +121,24 @@ def test_job_template_and_reader_contracts():
     assert job["MemoryMax"] == reader["MemoryMax"] == "512M"
 
 
-def test_only_the_high_frequency_collectors_skip_the_per_run_page():
-    # freshness's per-source SLO pages their outages; every other job pages per failure
-    dropins = {p.parent.name: p for p in GECKO.glob("*.service.d/no-onfailure.conf")}
-    jobs = ("dexscreener", "geckoterminal", "geckoterminal-ohlcv")
-    assert set(dropins) == {f"gecko-job@{j}.service.d" for j in jobs}
-    for p in dropins.values():  # an empty assignment resets the OnFailure= list
-        assert [ln for ln in _lines(p) if ln[:1] != "#"] == ["[Unit]", "OnFailure="]
+def test_collector_template_is_the_job_template_without_on_failure():
+    # an empty OnFailure= in a drop-in does not reset the list (systemd 255)
+    job, col = (GECKO / "gecko-job@.service", GECKO / "gecko-collector@.service")
+    assert not [ln for ln in _lines(col) if ln.startswith("OnFailure")]
+    assert _keys(col)["Description"] == (
+        "gecko collector %i (outages page via the freshness job, not per run)"
+    )
+
+    def body(p: Path) -> list[str]:
+        return [
+            ln for ln in _lines(p) if not ln.startswith(("Description=", "OnFailure="))
+        ]
+
+    assert body(job) == body(col)  # Environment/ExecStart/MemoryMax cannot drift
+    assert not list(GECKO.glob("*.service.d/no-onfailure.conf"))
+    assert {p.parent.name for p in GECKO.glob("*.service.d/*.conf")} == {
+        "gecko-job@coingecko-markets.service.d"
+    }
 
 
 def test_no_secret_value_anywhere_under_deploy():
@@ -193,7 +210,9 @@ def test_install_dry_run_enables_the_right_timers(tmp_path, flags, verb, coingec
     )
     assert r.returncode == 0, r.stderr
     out = r.stdout
-    for c in GECKO.glob("*.service.d/*.conf"):  # every drop-in, incl. no-onfailure
+    for u in ("gecko-job@.service", "gecko-collector@.service"):
+        assert f"+ install -m 0644 {GECKO}/{u} /etc/systemd/system/{u}\n" in out
+    for c in GECKO.glob("*.service.d/*.conf"):  # every tracked drop-in
         rel = f"{c.parent.name}/{c.name}"
         assert f"+ install -m 0644 {GECKO}/{rel} /etc/systemd/system/{rel}\n" in out
     for t in ("gecko-coingecko-markets.timer", "gecko-coingecko-hourly.timer"):
@@ -223,7 +242,9 @@ def test_install_remove_dry_run_disables_everything_and_keeps_data():
         assert f"+ systemctl disable --now {t.name}\n" in out
         assert f"+ rm -f /etc/systemd/system/{t.name}\n" in out
     assert "+ systemctl disable --now gecko-telegram-reader.service\n" in out
-    assert "+ rm -f /etc/systemd/system/gecko-job@.service\n" in out
+    for u in ("gecko-job@.service", "gecko-collector@.service"):
+        assert f"+ rm -f /etc/systemd/system/{u}\n" in out
+    assert " gecko-collector@*.service " in out  # stopped on --remove
     assert "+ rm -f /usr/local/bin/gecko-db-backup.sh\n" in out
     for c in GECKO.glob("*.service.d/*.conf"):
         assert f"+ rm -f /etc/systemd/system/{c.parent.name}/{c.name}\n" in out

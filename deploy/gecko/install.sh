@@ -3,6 +3,7 @@
 #   deploy/gecko/install.sh [--dry-run] [--with-coingecko] [--no-start]
 #   deploy/gecko/install.sh --remove [--dry-run]
 # Installs: gecko-job@.service (+ every deploy/gecko/<unit>.service.d/*.conf drop-in),
+# gecko-collector@.service (the same runner without OnFailure=, for the collector timers),
 # gecko-telegram-reader.service (NOT enabled: the owner runs tg-login first),
 # gecko-db-backup.service, every deploy/gecko/timers/*.timer, and
 # /usr/local/bin/gecko-db-backup.sh. Enables + starts every timer except the two
@@ -38,7 +39,7 @@ for t in "$SRC"/timers/*.timer; do timers+=("$(basename "$t")"); done
 [ "${#timers[@]}" -gt 0 ] || { echo "no timers under $SRC/timers" >&2; exit 1; }
 ENABLE=(systemctl enable --now)
 [ "$NO_START" = 0 ] || ENABLE=(systemctl enable)
-units=(gecko-job@.service gecko-telegram-reader.service gecko-db-backup.service)
+units=(gecko-job@.service gecko-collector@.service gecko-telegram-reader.service gecko-db-backup.service)
 dropins=()
 for d in "$SRC"/*.service.d/*.conf; do dropins+=("$(basename "$(dirname "$d")")/$(basename "$d")"); done
 
@@ -47,7 +48,7 @@ if [ "$REMOVE" = 1 ]; then
     run systemctl disable --now "$t" || true
   done
   run systemctl disable --now gecko-telegram-reader.service || true
-  run systemctl stop 'gecko-job@*.service' gecko-db-backup.service || true
+  run systemctl stop 'gecko-job@*.service' 'gecko-collector@*.service' gecko-db-backup.service || true
   for t in "${timers[@]}"; do run rm -f "$UNIT_DIR/$t"; done
   for u in "${units[@]}"; do run rm -f "$UNIT_DIR/$u"; done
   for c in "${dropins[@]}"; do

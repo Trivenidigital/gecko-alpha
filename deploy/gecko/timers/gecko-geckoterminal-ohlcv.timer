@@ -2,7 +2,7 @@
 Description=gecko-geckoterminal-ohlcv schedule
 
 [Timer]
-Unit=gecko-job@geckoterminal-ohlcv.service
+Unit=gecko-collector@geckoterminal-ohlcv.service
 OnCalendar=*-*-* 04:20:00
 Persistent=true
 AccuracySec=1min
