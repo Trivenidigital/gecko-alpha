@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-digest schedule
+
+[Timer]
+Unit=gecko-job@digest.service
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

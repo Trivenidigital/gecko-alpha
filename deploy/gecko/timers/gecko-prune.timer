@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-prune schedule
+
+[Timer]
+Unit=gecko-job@prune.service
+OnCalendar=*-*-* 03:40:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

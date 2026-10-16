@@ -1,0 +1,10 @@
+# Nightly LOCAL gecko.db backup + the read-only snapshot gecko-query reads.
+[Unit]
+Description=gecko.db local backup and snapshot refresh
+OnFailure=codex-systemd-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gecko-db-backup.sh
+Nice=10
+TimeoutStartSec=1800

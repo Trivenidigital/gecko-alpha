@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-ledger schedule
+
+[Timer]
+Unit=gecko-job@ledger.service
+OnCalendar=*-*-* 05:10:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

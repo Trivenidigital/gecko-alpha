@@ -1,0 +1,23 @@
+# gecko Telegram channel reader (long-running). Installed but NOT enabled by
+# install.sh: the owner runs `python -m gecko tg-login` first (runbook).
+# Exit 2 = configuration or session-lock problem: do not restart-loop on it.
+[Unit]
+Description=gecko telegram reader
+After=network-online.target
+Wants=network-online.target
+OnFailure=codex-systemd-failure-alert@%n.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gecko-alpha
+EnvironmentFile=/root/gecko-alpha/.env.gecko
+Environment=GECKO_DB_PATH=/root/gecko-alpha/gecko.db
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.local/bin/uv run --frozen python -m gecko telegram-reader
+Restart=always
+RestartSec=30
+RestartPreventExitStatus=2
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

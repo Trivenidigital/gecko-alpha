@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-benchmark schedule
+
+[Timer]
+Unit=gecko-job@benchmark.service
+OnCalendar=*-*-* *:35:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
