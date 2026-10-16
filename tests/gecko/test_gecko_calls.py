@@ -51,14 +51,14 @@ async def _token(store, chain, addr):
     )
 
 
-async def test_resolve_unique_match_only(store):
+async def test_resolve_unique_match_only(store, settings):
     kw = dict(source_type="telegram", source_id="@c", posted_at="2026-10-14T11:00:00Z")
     await insert_call(store, event_id="tg:@c:1", text=SOL, **kw)
     await insert_call(store, event_id="tg:@c:2", text=EVM, **kw)
     await _token(store, "solana", SOL)
     await _token(store, "base", EVM.lower())
     await _token(store, "bsc", EVM.lower())  # same address on two EVM chains: ambiguous
-    assert await resolve_calls(store, NOW, since="2026-10-07T00:00:00Z") == 1
+    assert await resolve_calls(store, settings, NOW, since="2026-10-07T00:00:00Z") == 1
     rows = await (
         await store.conn.execute(
             "SELECT event_id, token_id, resolved_at FROM source_calls ORDER BY event_id"
@@ -67,7 +67,7 @@ async def test_resolve_unique_match_only(store):
     assert rows == [("tg:@c:1", f"solana:{SOL}", NOW), ("tg:@c:2", None, None)]
 
 
-async def test_resolve_respects_window(store):
+async def test_resolve_respects_window(store, settings):
     await insert_call(
         store,
         source_type="telegram",
@@ -77,8 +77,8 @@ async def test_resolve_respects_window(store):
         text=SOL,
     )
     await _token(store, "solana", SOL)
-    assert await resolve_calls(store, NOW, since="2026-10-07T00:00:00Z") == 0
-    assert await resolve_calls(store, NOW, since=None) == 1
+    assert await resolve_calls(store, settings, NOW, since="2026-10-07T00:00:00Z") == 0
+    assert await resolve_calls(store, settings, NOW, since=None) == 1
 
 
 async def test_seeds_expand_evm_over_configured_chains(store, settings):
@@ -115,7 +115,7 @@ async def test_seeds_skip_resolved_and_respect_cap(store, settings):
     assert await call_seeds(store, settings, NOW) == {"solana": {SOL}}  # newest only
     settings.tg_seed_max = 60
     await _token(store, "solana", SOL)
-    await resolve_calls(store, NOW, since=None)
+    await resolve_calls(store, settings, NOW, since=None)
     assert await call_seeds(store, settings, NOW) == {
         c: {evm} for c in settings.chains if c != "solana"
     }
@@ -131,3 +131,35 @@ async def test_insert_constraint_violation_raises(store):
             posted_at="2026-10-14T11:00:00Z",
             text=SOL,
         )
+
+
+async def test_matches_uses_primary_keys(store, settings, monkeypatch):
+    from gecko.calls import _matches
+
+    await _token(store, "solana", SOL)
+    await _token(store, "base", EVM.lower())
+    seen: list[tuple] = []
+    real = store.conn.execute
+
+    async def spy(sql, args=None):
+        seen.append((sql, tuple(args or ())))
+        return await real(sql, args)
+
+    monkeypatch.setattr(store.conn, "execute", spy)
+    assert await _matches(store, settings, SOL) == {f"solana:{SOL}"}
+    assert await _matches(store, settings, EVM.lower()) == {f"base:{EVM.lower()}"}
+    monkeypatch.undo()
+    evm = tuple(f"{c}:{EVM.lower()}" for c in ("base", "ethereum", "bsc"))
+    assert [args for _, args in seen] == [(f"solana:{SOL}",), evm]  # chain selection
+    for sql, args in seen:
+        plan = await (
+            await store.conn.execute(f"EXPLAIN QUERY PLAN {sql}", args)
+        ).fetchall()
+        detail = " | ".join(r[-1] for r in plan)
+        assert "SCAN tokens" not in detail
+        assert "sqlite_autoindex_tokens_1 (token_id=?)" in detail  # primary key
+    settings.chains = ["solana"]  # an EVM address has no configured chain: no query
+    monkeypatch.setattr(store.conn, "execute", spy)
+    assert await _matches(store, settings, EVM.lower()) == set() and len(seen) == 2
+    assert await _matches(store, settings, SOL) == {f"solana:{SOL}"}
+    assert seen[2][1] == (f"solana:{SOL}",)

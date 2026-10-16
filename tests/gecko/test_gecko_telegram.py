@@ -8,7 +8,13 @@ import pytest
 from structlog.testing import capture_logs
 
 from gecko.__main__ import main
-from gecko.telegram_reader import initial_marks, poll_once, run_reader, session_problem
+from gecko.telegram_reader import (
+    NoChannelsResolved,
+    initial_marks,
+    poll_once,
+    run_reader,
+    session_problem,
+)
 
 SOL = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
 
@@ -53,8 +59,8 @@ async def _runs(store):
 async def test_poll_ingests_calls_and_advances_marks(store, settings):
     c = FakeClient({"@a": [msg(1, f"ape {SOL}"), msg(2, "gm"), msg(3, "$WIF")]})
     marks = {}
-    written, failed = await poll_once(store, c, settings, {"@a": "@a"}, marks)
-    assert (written, failed) == (2, 0) and marks == {"@a": 3}
+    written, failed, wait = await poll_once(store, c, settings, {"@a": "@a"}, marks)
+    assert (written, failed, wait) == (2, 0, None) and marks == {"@a": 3}
     await poll_once(store, c, settings, {"@a": "@a"}, marks)
     assert c.requests == [
         ("@a", settings.tg_catchup_limit, 0, False),  # first start: newest only
@@ -85,9 +91,8 @@ async def test_tg_login_creates_session_under_umask_077(
     import gecko.telegram_reader as tr
 
     settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
-    settings.tg_channels, settings.tg_session_path = ["@a"], str(
-        tmp_path / "gk.session"
-    )
+    # H1: login comes before GECKO_TG_CHANNELS is set; it must not require them
+    settings.tg_channels, settings.tg_session_path = [], str(tmp_path / "gk.session")
     mask, seen = [0o022], []
 
     def umask(m):  # a recorder: the Windows CRT keeps only the write bit
@@ -104,6 +109,21 @@ async def test_tg_login_creates_session_under_umask_077(
     with pytest.raises(RuntimeError):
         await tr.tg_login_job(settings, None)
     assert seen == [0o077] and mask == [0o022]
+
+
+async def test_reader_without_channels_still_exits_2(tmp_path, settings, monkeypatch):
+    # H1: only tg-login is exempt; the reader refuses before any client starts
+    from pydantic import SecretStr
+
+    import gecko.telegram_reader as tr
+
+    sess = tmp_path / "gk.session"
+    sess.write_text("x")
+    os.chmod(sess, 0o600)
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_session_path, settings.tg_channels = str(sess), []
+    monkeypatch.setattr(tr, "_client", lambda s: pytest.fail("client started"))
+    assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == 2
 
 
 async def test_failed_channel_marks_run_not_ok(store, settings):
@@ -124,7 +144,7 @@ async def test_entities_resolved_once(store, settings):
 
 async def test_unresolvable_channel_fails_fast(store, settings):
     settings.tg_channels = ["@missing"]
-    with pytest.raises(ValueError):
+    with pytest.raises(NoChannelsResolved):
         await run_reader(store, FakeClient({}), settings, cycles=1)
 
 
@@ -277,7 +297,7 @@ class EarlyFailClient:
     [
         ("no_session", 2, "session_problem"),
         ("unauthorized", 1, "not_authorized"),
-        ("bad_handle", ValueError, "ValueError"),
+        ("bad_handle", 1, "no_channels_resolved"),
     ],
 )
 async def test_reader_failing_before_first_poll_records_run_and_pages(
@@ -355,3 +375,230 @@ async def test_reader_client_construction_failure_records_run(
     finally:
         await store.close()
     assert rows == [(0, "ImportError")]
+
+
+def _job_settings(tmp_path, settings, channels=("@a",), session=True):
+    from pydantic import SecretStr
+
+    settings.tg_api_id, settings.tg_api_hash = 1, SecretStr("h")
+    settings.tg_channels = list(channels)
+    sess = tmp_path / "gk.session"
+    settings.tg_session_path = str(sess)
+    if session:
+        sess.write_text("x")
+        os.chmod(sess, 0o600)
+    return sess
+
+
+async def _job_runs(settings):
+    from gecko.store import Store
+
+    store = await Store.open(settings.db_path)
+    try:
+        return await (
+            await store.conn.execute(
+                "SELECT ok, error FROM runs WHERE job='telegram-reader' ORDER BY id"
+            )
+        ).fetchall()
+    finally:
+        await store.close()
+
+
+async def test_unresolved_handle_is_skipped_and_logged(store, settings):
+    settings.tg_channels = ["@a", "@gone"]
+    c = FakeClient({"@a": [msg(1, SOL)]})
+    with capture_logs() as logs:
+        await run_reader(store, c, settings, cycles=2, sleep=_nosleep)
+    assert c.resolved == ["@a", "@gone"]  # one by one, each tried once
+    assert {r[0] for r in c.requests} == {"@a"}
+    assert await _runs(store) == [
+        (1, 1, "1 handle(s) unresolved"),
+        (1, 0, "1 handle(s) unresolved"),
+    ]
+    assert [
+        (e["channel"], e["error"]) for e in logs if e["event"] == "tg_handle_unresolved"
+    ] == [("@gone", "ValueError")]
+
+
+async def test_all_handles_unresolved_fails_run(tmp_path, settings, monkeypatch):
+    import gecko.telegram_reader as tr
+
+    _job_settings(tmp_path, settings, channels=("@gone", "@also_gone"))
+    client = EarlyFailClient()
+    monkeypatch.setattr(tr, "_client", lambda s: client)
+    with capture_logs() as logs:
+        rc = await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    assert rc == 1
+    assert await _job_runs(settings) == [(0, "no_channels_resolved")]
+    assert sum(e["event"] == "tg_handle_unresolved" for e in logs) == 2
+
+
+class FloodWait(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"wait {seconds}")
+        self.seconds = seconds
+
+
+async def test_flood_wait_extends_sleep(store, settings):
+    settings.tg_channels = ["@a", "@b"]
+    waits = [900, 5]  # one per poll of @b; then @b reads fine
+
+    class FloodClient(FakeClient):
+        async def get_messages(self, entity, limit, min_id, reverse=False):
+            if entity == "@b" and waits:
+                raise FloodWait(waits.pop(0))
+            return await super().get_messages(entity, limit, min_id, reverse)
+
+    slept = []
+
+    async def sleep(sec):
+        slept.append(sec)
+
+    c = FloodClient({"@a": [msg(1, SOL)], "@b": []})
+    with capture_logs() as logs:
+        await run_reader(store, c, settings, cycles=3, sleep=sleep)
+    # longer than the interval: honoured; shorter: the interval still applies
+    assert slept == [900, settings.tg_poll_interval_sec]
+    assert [e["seconds"] for e in logs if e["event"] == "tg_flood_wait"] == [900, 5]
+    assert [r[0] for r in await _runs(store)] == [0, 0, 1]
+
+
+class _PosixOs:
+    """tr.os seen as POSIX; everything else is the real os (files really open)."""
+
+    name = "posix"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+
+async def test_reader_refuses_when_lock_held(tmp_path, settings, monkeypatch, capsys):
+    import gecko.telegram_reader as tr
+
+    sess = _job_settings(tmp_path, settings)
+    ops, held = [], [True]
+
+    def flock(fd, op):
+        ops.append(op)
+        if held[0]:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    monkeypatch.setitem(
+        sys.modules, "fcntl", SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=flock)
+    )
+    monkeypatch.setattr(tr, "os", _PosixOs())
+    monkeypatch.setattr(tr, "session_problem", lambda s, **kw: None)
+
+    def no_client(_settings):
+        raise AssertionError("a second client must not start on a locked session")
+
+    monkeypatch.setattr(tr, "_client", no_client)
+    lock_msg = "session lock held: another reader or tg-login is running"
+    assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == 2
+    assert lock_msg in capsys.readouterr().err
+    assert await _job_runs(settings) == [(0, "session_locked")]
+    sess.unlink()  # tg-login takes the same lock (before refusing on the file)
+    assert await tr.tg_login_job(settings, None) == 2
+    assert lock_msg in capsys.readouterr().err
+    assert ops == [6, 6] and (tmp_path / "gk.session.lock").exists()
+    held[0] = False
+    fh = tr.lock_session(str(sess))
+    try:
+        assert ops[-1] == 6 and not fh.closed  # LOCK_EX | LOCK_NB, handle kept open
+    finally:
+        fh.close()
+
+
+async def test_tg_login_refuses_existing_session(
+    tmp_path, settings, monkeypatch, capsys
+):
+    import gecko.telegram_reader as tr
+
+    sess = _job_settings(tmp_path, settings)
+
+    def no_client(_settings):
+        raise AssertionError("must not adopt an existing session")
+
+    monkeypatch.setattr(tr, "_client", no_client)
+    assert await tr.tg_login_job(settings, None) == 2
+    err = capsys.readouterr().err
+    assert f"session exists at {sess}" in err and "fresh device" in err
+    assert sess.read_text() == "x"
+
+
+class _DisconnectFails(EarlyFailClient):
+    def __init__(self, authorized=True, cause=None):
+        super().__init__(authorized)
+        self.cause = cause
+
+    async def is_user_authorized(self):
+        if self.cause:
+            raise self.cause
+        return self.authorized
+
+    async def disconnect(self):
+        raise ConnectionError("socket gone")
+
+
+async def test_disconnect_error_does_not_mask_cause(tmp_path, settings, monkeypatch):
+    import gecko.telegram_reader as tr
+
+    _job_settings(tmp_path, settings)
+    client = _DisconnectFails(cause=RuntimeError("the real cause"))
+    monkeypatch.setattr(tr, "_client", lambda s: client)
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError, match="the real cause"):
+            await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    assert await _job_runs(settings) == [(0, "RuntimeError")]
+    assert [e["error"] for e in logs if e["event"] == "tg_disconnect_failed"] == [
+        "ConnectionError"
+    ]
+
+
+async def test_not_authorized_writes_one_run_row(tmp_path, settings, monkeypatch):
+    import gecko.telegram_reader as tr
+
+    _job_settings(tmp_path, settings)
+    monkeypatch.setattr(tr, "_client", lambda s: _DisconnectFails(authorized=False))
+    assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == 1
+    assert await _job_runs(settings) == [(0, "not_authorized")]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real flock contention")
+def test_session_lock_contends_for_real(tmp_path):
+    import stat
+
+    import gecko.telegram_reader as tr
+
+    p = str(tmp_path / "gk.session")
+    first = tr.lock_session(p)
+    try:
+        with pytest.raises(tr.SessionLocked):
+            tr.lock_session(p)
+        assert stat.S_IMODE(os.stat(p + ".lock").st_mode) == 0o600
+    finally:
+        first.close()
+    tr.lock_session(p).close()  # released with the handle
+
+
+async def test_failed_run_record_is_retried_once(tmp_path, settings, monkeypatch):
+    # a fail() whose write raised recorded nothing: the outer except writes the row
+    import gecko.telegram_reader as tr
+    from gecko.store import Store
+
+    _job_settings(tmp_path, settings)
+    monkeypatch.setattr(tr, "_client", lambda s: EarlyFailClient(authorized=False))
+    real, calls = Store.record_run, []
+
+    async def flaky(self, *a, **kw):
+        calls.append(kw.get("error"))
+        if len(calls) == 1:
+            raise OSError("disk hiccup")
+        return await real(self, *a, **kw)
+
+    monkeypatch.setattr(Store, "record_run", flaky)
+    with pytest.raises(OSError):
+        await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    monkeypatch.setattr(Store, "record_run", real)
+    assert calls == ["not_authorized", "OSError"]
+    assert await _job_runs(settings) == [(0, "OSError")]

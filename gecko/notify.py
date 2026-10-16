@@ -33,8 +33,9 @@ async def send_telegram(
         )
         return False
     if status != 200 or not isinstance(body, dict) or not body.get("ok"):
-        reason = body.get("description") if isinstance(body, dict) else None
-        log.warning("telegram_failed", status=status, reason=reason or "ok=false")
+        # status and ok only: the upstream description is never logged
+        ok = body.get("ok") is True if isinstance(body, dict) else None  # bool only
+        log.warning("telegram_failed", status=status, ok=ok, reason="not ok")
         return False
     log.info("telegram_sent", status=status)
     return True

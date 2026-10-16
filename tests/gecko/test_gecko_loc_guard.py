@@ -20,7 +20,7 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
 def test_guard_passes_on_current_tree():
     p = _run()
     assert p.returncode == 0, p.stdout + p.stderr
-    m = re.search(r"gecko=(\d+)/3650 tests=(\d+)/7500", p.stdout)
+    m = re.search(r"gecko=(\d+)/4800 tests=(\d+)/10000", p.stdout)
     assert m, p.stdout
     assert int(m.group(1)) > 0 and int(m.group(2)) > 0
 
@@ -28,11 +28,11 @@ def test_guard_passes_on_current_tree():
 def test_guard_fails_when_limit_exceeded(tmp_path):
     big = tmp_path / "gecko"
     big.mkdir()
-    (big / "x.py").write_text("\n".join(f"a{i} = {i}" for i in range(3700)))
+    (big / "x.py").write_text("\n".join(f"a{i} = {i}" for i in range(4850)))
     (tmp_path / "tests" / "gecko").mkdir(parents=True)
     p = _run("--root", str(tmp_path))
     assert p.returncode == 1, p.stdout + p.stderr
-    assert "gecko=3700/3650" in p.stdout
+    assert "gecko=4850/4800" in p.stdout
 
 
 def test_guard_skips_pycache_and_non_py(tmp_path):
@@ -44,7 +44,7 @@ def test_guard_skips_pycache_and_non_py(tmp_path):
     (tmp_path / "tests" / "gecko").mkdir(parents=True)
     p = _run("--root", str(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
-    assert "gecko=1/3650 tests=0/7500" in p.stdout
+    assert "gecko=1/4800 tests=0/10000" in p.stdout
 
 
 def _lines(n: int) -> str:
@@ -53,11 +53,11 @@ def _lines(n: int) -> str:
 
 def test_guard_passes_at_exact_gecko_limit(tmp_path):
     (tmp_path / "gecko").mkdir()
-    (tmp_path / "gecko" / "x.py").write_text(_lines(3650))
+    (tmp_path / "gecko" / "x.py").write_text(_lines(4800))
     (tmp_path / "tests" / "gecko").mkdir(parents=True)
     p = _run("--root", str(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
-    assert "gecko=3650/3650" in p.stdout
+    assert "gecko=4800/4800" in p.stdout
 
 
 def test_guard_fails_when_tests_limit_exceeded(tmp_path):
@@ -65,10 +65,10 @@ def test_guard_fails_when_tests_limit_exceeded(tmp_path):
     (tmp_path / "gecko" / "x.py").write_text(_lines(10))
     t = tmp_path / "tests" / "gecko"
     t.mkdir(parents=True)
-    (t / "test_x.py").write_text(_lines(7501))
+    (t / "test_x.py").write_text(_lines(10001))
     p = _run("--root", str(tmp_path))
     assert p.returncode == 1, p.stdout + p.stderr
-    assert "gecko=10/3650 tests=7501/7500" in p.stdout
+    assert "gecko=10/4800 tests=10001/10000" in p.stdout
 
 
 def test_guard_passes_at_exact_tests_limit(tmp_path):
@@ -76,10 +76,10 @@ def test_guard_passes_at_exact_tests_limit(tmp_path):
     (tmp_path / "gecko" / "x.py").write_text(_lines(10))
     t = tmp_path / "tests" / "gecko"
     t.mkdir(parents=True)
-    (t / "test_x.py").write_text(_lines(7500))
+    (t / "test_x.py").write_text(_lines(10000))
     p = _run("--root", str(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
-    assert "gecko=10/3650 tests=7500/7500" in p.stdout
+    assert "gecko=10/4800 tests=10000/10000" in p.stdout
 
 
 def test_guard_exits_2_when_counted_dir_missing(tmp_path):

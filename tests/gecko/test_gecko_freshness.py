@@ -608,3 +608,224 @@ def _plus_from(t0: str, minutes: int) -> str:
     from gecko.store import parse_utc
 
     return (parse_utc(t0) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@pytest.mark.parametrize(
+    "job,key",
+    [
+        ("dexscreener", "observations:dexscreener"),
+        ("geckoterminal", "observations:geckoterminal"),
+        ("geckoterminal-ohlcv", "observations:geckoterminal_ohlcv"),
+    ],
+)
+@pytest.mark.parametrize("failed_run", [True, False])
+async def test_collector_that_never_succeeded_pages(store, job, key, failed_run):
+    # N3: collectors run under gecko-collector@ (no OnFailure): failing since
+    # deploy, or never started at all, pages here even with no channels set
+    t0, slo = "2026-10-02T00:00:00Z", SLO_MINUTES[key]
+    await store.record_run(job if failed_run else "freshness", t0, t0, not failed_run)
+    for minutes, want in ((slo - 1, []), (slo + 1, [Breach(key, None, slo)])):
+        out = await check_freshness(store, _plus_from(t0, minutes))
+        assert [b for b in out if b.table == key] == want
+
+
+async def test_collector_after_first_ok_run_is_row_anchored(store):
+    key, t0 = "observations:dexscreener", "2026-10-02T00:00:00Z"
+    await store.record_run("dexscreener", t0, t0, False)
+    t1 = _plus_from(t0, 60)
+    await store.record_run("dexscreener", t1, t1, True)
+
+    async def hits(minutes: int) -> list[str]:
+        out = await check_freshness(store, _plus_from(t1, minutes))
+        return [b.table for b in out if b.table == key]
+
+    assert await hits(29) == []  # the empty table gets one SLO window from t1
+    assert await hits(31) == [key]
+    await store.upsert_token("solana:a", "solana", "A", "A", "A", t1, "dexscreener")
+    await store.add_observation("solana:a", "dexscreener", _plus_from(t1, 30), {})
+    assert await hits(59) == []  # anchored to the newest row, not the ok run
+    assert await hits(61) == [key]
+
+
+# A1: digest and scorecard are run-anchored like prune (the digest footer
+# watches freshness back).
+@pytest.mark.parametrize(
+    "job,slo",
+    [("prune", 1560), ("digest", 1560), ("scorecard", 11520), ("db-backup", 1560)],
+)
+async def test_run_anchored_job_key_pages_when_job_stops(store, job, slo):
+    t0 = "2026-10-01T00:00:00Z"
+    # bootstrapping: the job never succeeded, so no page however late
+    assert job not in {
+        b.table for b in await check_freshness(store, _plus_from(t0, slo * 4))
+    }
+    await store.record_run(job, t0, t0, True)
+    assert job not in {
+        b.table for b in await check_freshness(store, _plus_from(t0, slo - 1))
+    }
+    hit = [
+        b
+        for b in await check_freshness(store, _plus_from(t0, slo + 1))
+        if b.table == job
+    ]
+    assert hit == [Breach(job, t0, slo)]
+
+
+async def test_benchmark_btc_row_does_not_mask_dead_geckoterminal(store):
+    # A2: the benchmark job writes BTC under source=geckoterminal every hour
+    t0 = "2026-10-01T00:00:00Z"
+    await store.record_run("geckoterminal", t0, t0, True)
+    await store.add_observation("solana:a", "geckoterminal", t0, {"price_usd": 1})
+    now = _plus_from(t0, 400)
+    await store.add_observation("benchmark:btc", "geckoterminal", now, {"price_usd": 1})
+    tables = {b.table for b in await check_freshness(store, now)}
+    assert {"observations", "observations:geckoterminal"} <= tables
+
+
+async def _reader_ok_every_30_min(store, t0: str, hours: int) -> None:
+    for m in range(0, hours * 60 + 1, 30):
+        ts = _plus_from(t0, m)
+        await store.record_run("telegram-reader", ts, ts, True)
+
+
+@pytest.mark.parametrize("channels,reader_ok", [([], True), (["@a"], False)])
+async def test_source_calls_rows_key_inactive_without_channels(
+    store, settings, channels, reader_ok
+):
+    t0 = "2026-10-01T00:00:00Z"
+    settings.tg_channels = channels
+    if reader_ok:
+        await _reader_ok_every_30_min(store, t0, 100)
+    else:  # configured, but the reader never had an ok run
+        await store.record_run("telegram-reader", t0, t0, False)
+    now = _plus_from(t0, 100 * 60)
+    for s in (settings, None):
+        assert "source_calls:rows" not in {
+            b.table for b in await check_freshness(store, now, s)
+        }
+
+
+async def test_source_calls_rows_key_pages_after_72h_of_ok_runs_with_zero_rows(
+    store, settings
+):
+    t0 = "2026-10-01T00:00:00Z"
+    settings.tg_channels = ["@a"]
+    await _reader_ok_every_30_min(store, t0, 73)
+    # every poll is ok, so the run-anchored source_calls key stays quiet
+    tables = {
+        b.table for b in await check_freshness(store, _plus_from(t0, 71 * 60), settings)
+    }
+    assert "source_calls" not in tables and "source_calls:rows" not in tables
+    hit = [
+        b
+        for b in await check_freshness(store, _plus_from(t0, 73 * 60), settings)
+        if b.table == "source_calls:rows"
+    ]
+    assert hit == [Breach("source_calls:rows", None, 4320)]
+    # a call posted inside the window clears it; its age is what is measured
+    posted = _plus_from(t0, 60 * 60)
+    await store.conn.execute(
+        "INSERT INTO source_calls(source_type,source_id,event_id,posted_at,text_hash) "
+        "VALUES('telegram','@a','@a:1',?,'h')",
+        (posted,),
+    )
+    await store.conn.commit()
+    assert "source_calls:rows" not in {
+        b.table for b in await check_freshness(store, _plus_from(t0, 73 * 60), settings)
+    }
+    hit = [
+        b
+        for b in await check_freshness(store, _plus_from(t0, 133 * 60), settings)
+        if b.table == "source_calls:rows"
+    ]
+    assert hit == [Breach("source_calls:rows", posted, 4320)]
+
+
+async def test_research_key_skipped_without_api_key(store, settings):
+    from pydantic import SecretStr
+
+    t0 = "2026-10-01T00:00:00Z"
+    await store.record_run("research", t0, t0, True)
+    late = _plus_from(t0, 1561)
+    for s in (settings, None):  # no key, or no settings at all
+        with capture_logs() as logs:
+            tables = {b.table for b in await check_freshness(store, late, s)}
+        assert "research_notes" not in tables
+        skipped = [e for e in logs if e["event"] == "freshness_key_skipped"]
+        assert [(e["key"], e["log_level"]) for e in skipped] == [
+            ("research_notes", "debug")
+        ]
+    settings.anthropic_api_key = SecretStr("")  # an empty key is no key
+    assert "research_notes" not in {
+        b.table for b in await check_freshness(store, late, settings)
+    }
+    settings.anthropic_api_key = SecretStr("k")
+    assert "research_notes" in {
+        b.table for b in await check_freshness(store, late, settings)
+    }
+
+
+async def test_backlog_text_carries_counts(store, settings):
+    import aiohttp
+
+    _with_channel(settings)
+    for tid in ("solana:a", "solana:b", "solana:c"):
+        await store.watchlist_upsert(tid, "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1,))
+    now = "2026-10-05T01:00:00Z"  # 73 h past every due_at
+    # one row closed expired 2 days ago, one 8 days ago (outside the 7 d window)
+    await store.conn.execute(
+        "UPDATE forward_returns SET closed_reason='expired', measured_at=? "
+        "WHERE token_id='solana:c'",
+        ("2026-10-03T00:00:00Z",),
+    )
+    await store.conn.execute(
+        "INSERT INTO forward_returns(token_id,horizon_days,due_at,measured_at,"
+        "closed_reason) VALUES('solana:d',1,'2026-09-20T00:00:00Z',"
+        "'2026-09-27T00:00:00Z','expired')"
+    )
+    await store.conn.commit()
+    with aioresponses() as m:
+        m.post(TG_URL, payload={"ok": True}, repeat=True)
+        async with aiohttp.ClientSession() as session:
+            await alert_breaches(store, settings, session, now)
+    texts = [c.kwargs["json"]["text"] for c in m.requests[("POST", _tg_url())]]
+    backlog = [t for t in texts if "forward_returns_backlog" in t]
+    assert len(backlog) == 1
+    assert (
+        "forward_returns_backlog: 2 row(s) > 72 h overdue "
+        "(oldest 2026-10-02T00:00:00Z); expired last 7 d: 1"
+    ) in backlog[0]
+
+
+def _tg_url():
+    from yarl import URL
+
+    return URL(TG_URL)
+
+
+async def test_source_calls_rows_old_history_waits_a_full_window_of_ok_polls(
+    store, settings
+):
+    # a call posted 10 days before the reader's first ok poll (migrated history
+    # or catch-up) must not page until the reader has polled ok for 72 h
+    settings.tg_channels = ["@a"]
+    first_ok = "2026-10-11T00:00:00Z"
+    old = "2026-10-01T00:00:00Z"
+    await store.conn.execute(
+        "INSERT INTO source_calls(source_type,source_id,event_id,posted_at,text_hash) "
+        "VALUES('telegram','@a','@a:1',?,'h')",
+        (old,),
+    )
+    await store.conn.commit()
+    await _reader_ok_every_30_min(store, first_ok, 73)
+    assert "source_calls:rows" not in {
+        b.table
+        for b in await check_freshness(store, _plus_from(first_ok, 71 * 60), settings)
+    }
+    hit = [
+        b
+        for b in await check_freshness(store, _plus_from(first_ok, 73 * 60), settings)
+        if b.table == "source_calls:rows"
+    ]
+    assert hit == [Breach("source_calls:rows", old, 4320)]

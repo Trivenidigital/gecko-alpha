@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,7 +49,15 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at TEXT NOT NULL, ok INTEGER NOT NULL, rows_written INTEGER NOT NULL DEFAULT 0,
   credits_used INTEGER NOT NULL DEFAULT 0, error TEXT);
 CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
+
+# Every table and index name the schema creates: a file holding anything else
+# (bar SQLite's own ``sqlite_*`` objects) is not a gecko database.
+SCHEMA_NAMES = frozenset(
+    re.findall(r"CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)", SCHEMA)
+)
 
 # Sources whose observations carry a market price (and maybe liquidity).
 MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
@@ -58,6 +67,7 @@ DEX_SOURCES = ("dexscreener", "geckoterminal")  # market sources with liquidity
 LATE_COLUMNS = (
     ("watchlist", "entry_price", "REAL"),
     ("forward_returns", "last_attempt_at", "TEXT"),
+    ("forward_returns", "closed_reason", "TEXT"),
 )
 
 TIME_COLUMN = {
@@ -99,6 +109,17 @@ def iso_plus(ts: str, days: int) -> str:
     return (parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class ForeignDatabase(Exception):
+    """``Store.open`` was pointed at a SQLite file that is not a gecko database."""
+
+    def __init__(self, path: str, application_id: int):
+        super().__init__(
+            f"{path} is not a gecko database (application_id={application_id})"
+        )
+        self.path = path
+        self.application_id = application_id
+
+
 class ReturnAlreadyMeasured(ValueError):
     """``set_return`` found no unmeasured row: missing, or already finalized."""
 
@@ -131,8 +152,33 @@ class ReturnRow:
 
 
 class Store:
+    APPLICATION_ID = 0x47454B4F  # ASCII "GEKO", stamped in the file header
+
     def __init__(self, conn: aiosqlite.Connection):
         self.conn = conn
+
+    @classmethod
+    async def _check_identity(cls, conn: aiosqlite.Connection, path: str) -> int:
+        """The file's ``application_id``; raise ``ForeignDatabase`` unless the
+        file is fresh or gecko's own.
+
+        Runs before any DDL or journal-mode change, so a refused file is
+        left exactly as it was found.
+        """
+        (pages,) = await (await conn.execute("PRAGMA page_count")).fetchone()
+        (app_id,) = await (await conn.execute("PRAGMA application_id")).fetchone()
+        if pages == 0 or app_id == cls.APPLICATION_ID:
+            return app_id
+        if app_id != 0:
+            raise ForeignDatabase(path, app_id)
+        rows = await (
+            await conn.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            )
+        ).fetchall()
+        if any(r[0] not in SCHEMA_NAMES for r in rows):
+            raise ForeignDatabase(path, app_id)
+        return app_id
 
     @classmethod
     async def open(cls, path: str) -> "Store":
@@ -140,6 +186,8 @@ class Store:
         try:
             # busy_timeout first: switching to WAL itself needs the lock.
             await conn.execute("PRAGMA busy_timeout=30000")
+            if await cls._check_identity(conn, path) != cls.APPLICATION_ID:
+                await conn.execute(f"PRAGMA application_id={cls.APPLICATION_ID}")
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute("PRAGMA foreign_keys=ON")
             await conn.executescript(SCHEMA)
@@ -217,6 +265,17 @@ class Store:
         )
         await self.conn.commit()
 
+    async def demote_if_active(self, token_id, reason) -> bool:
+        """Back to candidate only while still active: a verdict another job
+        committed since the caller's read is never overwritten."""
+        cur = await self.conn.execute(
+            "UPDATE tokens SET status='candidate', disqualify_reason=?, updated_at=? "
+            "WHERE token_id=? AND status='active'",
+            (reason, utcnow(), token_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
     async def set_deployer(self, token_id, deployer) -> None:
         """Record a token's deployer; the first value recorded is kept."""
         await self.conn.execute(
@@ -288,6 +347,20 @@ class Store:
             await self.conn.execute(f"SELECT MAX({col}) FROM {table}")
         ).fetchone()
         return row[0]
+
+    async def kv_get(self, key: str) -> str | None:
+        row = await (
+            await self.conn.execute("SELECT value FROM kv WHERE key=?", (key,))
+        ).fetchone()
+        return row[0] if row else None
+
+    async def kv_set(self, key: str, value: str, now: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) "
+            "DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, canon_ts(now)),
+        )
+        await self.conn.commit()
 
     async def watchlist_upsert(
         self, token_id, entered_at, rule_id, rank, score, features_at_entry: dict
@@ -420,15 +493,41 @@ class Store:
             )
         await self.conn.commit()
 
-    async def close_unmeasured(self, token_id, horizon_days, measured_at) -> bool:
-        """Finalize an open row with no return (ret NULL). Write-once."""
+    async def close_unmeasured(
+        self, token_id, horizon_days, measured_at, reason: str
+    ) -> bool:
+        """Finalize an open row with no return (ret NULL), recording why in
+        ``closed_reason``. Write-once."""
         cur = await self.conn.execute(
-            "UPDATE forward_returns SET measured_at=? WHERE token_id=? AND horizon_days=? "
-            "AND measured_at IS NULL",
-            (canon_ts(measured_at), token_id, horizon_days),
+            "UPDATE forward_returns SET measured_at=?, closed_reason=? "
+            "WHERE token_id=? AND horizon_days=? AND measured_at IS NULL",
+            (canon_ts(measured_at), reason, token_id, horizon_days),
         )
         await self.conn.commit()
         return cur.rowcount == 1
+
+    async def expired_count(self, since: str) -> int:
+        """Rows closed as ``expired`` at or after ``since``."""
+        row = await (
+            await self.conn.execute(
+                "SELECT COUNT(*) FROM forward_returns "
+                "WHERE closed_reason='expired' AND measured_at>=?",
+                (canon_ts(since),),
+            )
+        ).fetchone()
+        return row[0]
+
+    async def overdue_count(self, now: str, hours: float) -> int:
+        """Open rows whose ``due_at`` is more than ``hours`` before ``now``."""
+        cutoff = canon_ts((parse_utc(now) - timedelta(hours=hours)).isoformat())
+        row = await (
+            await self.conn.execute(
+                "SELECT COUNT(*) FROM forward_returns "
+                "WHERE measured_at IS NULL AND due_at<?",
+                (cutoff,),
+            )
+        ).fetchone()
+        return row[0]
 
     async def bump_return_attempt(
         self,

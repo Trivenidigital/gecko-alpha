@@ -4,6 +4,7 @@ import datetime as dt
 import pytest
 from gecko.features import Features
 from gecko.rank import disqualify, rule_f4, score, rank_once
+from gecko.store import iso_plus
 
 A = "2026-10-15T00:00:00Z"
 
@@ -25,7 +26,9 @@ def feat(**kw) -> Features:
 
 
 def test_disqualify_which_gate(settings):
-    assert disqualify(feat(security_ok=False), settings) == "security_fail"
+    fail = feat(security_ok=False, security_structural=False)
+    assert disqualify(fail, settings) == "security_fail"
+    assert disqualify(feat(security_ok=False), settings) == "security_tax"
     assert disqualify(feat(top10_pct=61.0), settings) == "concentration"
     assert disqualify(feat(liquidity_gate_usd=100.0), settings) == "liquidity"
     # no fresh reading is absence, judged by "dead" only
@@ -45,17 +48,22 @@ def test_disqualify_boundaries(settings):
 def test_disqualify_precedence(settings):
     everything = dict(
         security_ok=False,
+        security_structural=False,
         top10_pct=99.0,
         liquidity_gate_usd=1.0,
         observed_at="2026-09-01T00:00:00Z",
     )
     assert disqualify(feat(**everything), settings) == "security_fail"
-    everything["security_ok"] = True
+    everything["security_structural"] = True
     assert disqualify(feat(**everything), settings) == "concentration"
     everything["top10_pct"] = None
     assert disqualify(feat(**everything), settings) == "liquidity"
     everything["liquidity_gate_usd"] = 300_000.0
     assert disqualify(feat(**everything), settings) == "dead"
+    everything["observed_at"] = A
+    assert disqualify(feat(**everything), settings) == "security_tax"
+    everything["security_ok"] = True
+    assert disqualify(feat(**everything), settings) is None
 
 
 def test_f4_boundaries(settings):
@@ -529,6 +537,72 @@ async def test_rank_job_exits_1_on_rewind(settings):
         await s.close()
 
 
+async def test_rank_job_reads_the_clock_after_store_open(settings, monkeypatch):
+    # concurrency: as_of taken before the open (or the stamp's commit) could
+    # predate a ledger exit committed during that wait, tripping the rewind guard
+    from gecko import rank
+    from gecko.rank import ACTIVATION_KEY, rank_job
+    from gecko.store import Store
+
+    events, real_open, real_rank = [], Store.open.__func__, rank.rank_once
+
+    async def spy_open(cls, path):
+        events.append("open")
+        store = await real_open(cls, path)
+        real_commit = store.conn.commit
+
+        async def commit():
+            events.append("commit")
+            return await real_commit()
+
+        store.conn.commit = commit
+        return store
+
+    async def spy_rank(*a, **k):
+        events.append("rank_once")
+        return await real_rank(*a, **k)
+
+    def clock():
+        events.append("clock")
+        return A
+
+    monkeypatch.setattr(Store, "open", classmethod(spy_open))
+    monkeypatch.setattr("gecko.rank.utcnow", clock)
+    monkeypatch.setattr("gecko.rank.rank_once", spy_rank)
+    assert await rank_job(settings, argparse.Namespace(as_of=None)) == 0
+    # stamp clock, its commit, then the as_of clock right before rank_once
+    assert events[:5] == ["open", "clock", "commit", "clock", "rank_once"]
+    s = await real_open(Store, settings.db_path)
+    try:
+        assert await s.kv_get(ACTIVATION_KEY) == A
+    finally:
+        await s.close()
+
+
+async def test_activation_stamped_once_then_as_of_refused(
+    settings, monkeypatch, capsys
+):
+    # F1: the first live run stamps activation:at once; replays are then refused
+    from gecko.rank import ACTIVATION_KEY, rank_job
+    from gecko.store import Store
+
+    ns = argparse.Namespace
+    assert await rank_job(settings, ns(as_of=A)) == 0  # before activation: allowed
+    for t in ("2026-10-16T00:00:00Z", "2026-10-17T00:00:00Z", None):
+        if t is None:
+            assert await rank_job(settings, ns(as_of="2026-10-18T00:00:00Z")) == 2
+            continue
+        monkeypatch.setattr("gecko.rank.utcnow", lambda t=t: t)
+        assert await rank_job(settings, ns(as_of=None)) == 0
+    assert "--as-of is refused" in capsys.readouterr().err
+    s = await Store.open(settings.db_path)
+    try:
+        assert await s.kv_get(ACTIVATION_KEY) == "2026-10-16T00:00:00Z"
+        assert await one(s, "SELECT COUNT(*) FROM runs WHERE job='rank'") == (3,)
+    finally:
+        await s.close()
+
+
 async def test_exit_reason_falls_back_to_stored_disqualify_reason(store, settings):
     await seed_token(store, "solana:good")
     await rank_once(store, settings, A)
@@ -595,3 +669,160 @@ async def test_crashed_entrant_that_exits_next_run_is_still_scheduled(
     ).fetchall()
     assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
     assert rows[0][1] == "2026-10-16T00:00:00Z"
+
+
+def test_disqualifier_order_structural_before_tax(settings):
+    # both flags fired: structural is checked first and is terminal
+    both = feat(security_ok=False, security_structural=False, top10_pct=99.0)
+    assert disqualify(both, settings) == "security_fail"
+    # tax-only (structural clean or unknown) and nothing else fires: security_tax
+    tax = feat(security_ok=False, security_structural=True)
+    assert disqualify(tax, settings) == "security_tax"
+    assert disqualify(feat(security_ok=False), settings) == "security_tax"
+    # a structural flag disqualifies even when security_ok is not False
+    assert disqualify(feat(security_structural=False), settings) == "security_fail"
+
+
+async def _status(store, tid):
+    return await one(
+        store, f"SELECT status, disqualify_reason FROM tokens WHERE token_id='{tid}'"
+    )
+
+
+async def test_tax_rise_exits_watchlist_with_security_tax(store, settings):
+    await seed_token(store, "solana:good")
+    await store.add_observation(
+        "solana:good", "enrich", "2026-10-14T00:00:00Z", {"security_ok": True}
+    )
+    r = await rank_once(store, settings, A)
+    assert r.entered == ["solana:good"] and r.exited_tax == 0
+    # the newest enrich read is a tax-only failure
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 1
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_tax",)
+    assert await _status(store, "solana:good") == ("candidate", "security_tax")
+    assert await store.active_watchlist() == []
+
+
+async def test_tax_fail_candidate_is_not_disqualified_by_rank(store, settings):
+    await seed_token(store, "solana:taxed")
+    await store.add_observation(
+        "solana:taxed",
+        "enrich",
+        "2026-10-14T00:00:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, A)
+    # not admitted, not exited, and its status is left exactly as it was
+    assert r.entered == [] and r.exited == [] and r.exited_tax == 0
+    assert await store.active_watchlist() == []
+    assert await _status(store, "solana:taxed") == ("active", None)
+
+
+async def test_structural_flag_disqualifies(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": False},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 0
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_fail",)
+    assert await _status(store, "solana:good") == ("disqualified", "security_fail")
+
+
+def test_dead_or_concentrated_beats_tax(settings):
+    # a terminal gate retires a tax-flagged token instead of re-reading it forever
+    tax = dict(security_ok=False, security_structural=True)
+    assert disqualify(feat(top10_pct=99.0, **tax), settings) == "concentration"
+    eight_days = "2026-10-07T00:00:00Z"  # 8 d before A
+    assert disqualify(feat(observed_at=eight_days, **tax), settings) == "dead"
+
+
+async def test_tax_demotion_never_overwrites_concurrent_enrich_verdict(
+    store, settings, monkeypatch
+):
+    # B1: enrich commits a structural disqualification after rank read the
+    # token as active and as tax-only; the demotion must not overwrite it.
+    from gecko import rank
+
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    tax = {"security_ok": False, "security_structural": True}
+    await store.add_observation("solana:good", "enrich", "2026-10-15T00:30:00Z", tax)
+    real = rank.compute_features
+
+    async def racing(store_, settings_, tid, as_of):
+        f = await real(store_, settings_, tid, as_of)
+        await store.set_token_status(tid, "disqualified", "security_fail")
+        return f
+
+    monkeypatch.setattr(rank, "compute_features", racing)
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 0
+    row = await one(store, "SELECT exit_reason FROM watchlist")
+    assert row == ("security_fail",)
+    assert await _status(store, "solana:good") == ("disqualified", "security_fail")
+
+
+async def test_security_tax_crash_recovery_exits_next_run(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    # a crash landed between the status demotion and the watchlist exit
+    await store.set_token_status("solana:good", "candidate", "security_tax")
+    assert [w.token_id for w in await store.active_watchlist()] == ["solana:good"]
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 1
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_tax",)
+    assert await _status(store, "solana:good") == ("candidate", "security_tax")
+
+
+async def test_security_tax_exit_keeps_forward_returns_schedule(
+    store, settings, monkeypatch
+):
+    class _Crash(Exception):
+        pass
+
+    async def crash():
+        raise _Crash
+
+    await seed_token(store, "solana:good")
+    # a crash right after the entry: the tax exit is the first chance to schedule
+    monkeypatch.setattr(store, "repair_schedules", crash)
+    with pytest.raises(_Crash):
+        await rank_once(store, settings, A)
+    monkeypatch.undo()
+    assert await one(store, "SELECT COUNT(*) FROM forward_returns") == (0,)
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited_tax == 1
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, due_at, measured_at, closed_reason "
+            "FROM forward_returns WHERE token_id='solana:good' ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(h, iso_plus(A, h), None, None) for h in (1, 7, 30, 90, 180)]

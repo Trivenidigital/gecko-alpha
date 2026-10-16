@@ -40,6 +40,23 @@ async def test_run_job_records_partial_failure_counts(settings):
     assert "RuntimeError: x" in row[3]
 
 
+async def test_job_failed_log_carries_the_type_never_the_message(settings):
+    # E1: the message can carry an upstream body or a URL; the runs row keeps it
+    from structlog.testing import capture_logs
+
+    async def boom(store, session):
+        raise PartialFailure(RuntimeError("https://x/?key=SECRET"), rows_written=1)
+
+    with capture_logs() as logs:
+        assert await run_job("t", settings, boom) == 1
+    [ev] = [e for e in logs if e["event"] == "job_failed"]
+    assert ev["error"] == "RuntimeError" and "SECRET" not in repr(logs)
+    s = await Store.open(settings.db_path)
+    (err,) = await (await s.conn.execute("SELECT error FROM runs")).fetchone()
+    await s.close()
+    assert "key=SECRET" in err
+
+
 def test_partial_failure_message_and_fields():
     cause = ValueError("bad")
     pf = PartialFailure(cause, credits_used=2)

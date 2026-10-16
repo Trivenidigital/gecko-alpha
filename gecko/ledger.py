@@ -213,10 +213,9 @@ async def _resolve_entry(
     return ep, now > deadline
 
 
-async def _finalize_no_entry(
-    store: Store, tid: str, btc_entry: float, btc_now: float, now: str
-) -> int:
-    """No entry price exists: every open horizon is unmeasurable (ret NULL).
+async def _finalize_no_entry(store: Store, tid: str, now: str) -> int:
+    """No entry price exists: every open horizon is unmeasurable (ret NULL,
+    ``closed_reason='no_entry_price'``).
 
     The token is not marked dead: a missing price at entry says nothing
     about whether it trades now.
@@ -228,11 +227,13 @@ async def _finalize_no_entry(
             (tid,),
         )
     ).fetchall()
+    closed = 0
     for (h,) in rows:
-        await store.set_return(tid, h, None, 0.0, btc_entry, btc_now, now)
-    await store.watchlist_exit(tid, now, "no_entry_price")
-    log.info("ledger_entry_unmeasurable", token_id=tid, horizons=len(rows))
-    return len(rows)
+        closed += await store.close_unmeasured(tid, h, now, reason="no_entry_price")
+    # Write time, not run start: rank's rewind guard and the digest marks read it.
+    await store.watchlist_exit(tid, utcnow(), "no_entry_price")
+    log.info("ledger_entry_unmeasurable", token_id=tid, horizons=closed)
+    return closed
 
 
 async def _canary_ok(
@@ -276,7 +277,7 @@ async def measure_due(
         if tid in closed:
             continue  # finalized whole this run
         if due.due_at < expire_before:  # more than ledger_max_overdue_days past due
-            if await store.close_unmeasured(tid, h, now):
+            if await store.close_unmeasured(tid, h, now, reason="expired"):
                 rep.expired += 1
                 log.warning("ledger_row_expired", **asdict(due))
             continue
@@ -315,9 +316,7 @@ async def measure_due(
         ep, window_closed = await _resolve_entry(store, tid, entered_at, wrow[1], now)
         if ep is None:
             if window_closed:
-                rep.unmeasurable += await _finalize_no_entry(
-                    store, tid, btc_entry, btc_now, now
-                )
+                rep.unmeasurable += await _finalize_no_entry(store, tid, now)
                 closed.add(tid)
             else:
                 log.info("ledger_entry_price_pending", token_id=tid, horizon_days=h)
@@ -408,7 +407,8 @@ async def ledger_job(settings: GeckoSettings, ns) -> int:
 
     async def body(store, session):
         r = await measure_due(store, settings, session, now)
-        n = r.measured + r.total_loss + r.unmeasurable + r.expired
+        # Expiries are not writes of a measurement: they stay in ledger_done.
+        n = r.measured + r.total_loss + r.unmeasurable
         return JobResult(rows_written=n)
 
     return await run_job("ledger", settings, body)

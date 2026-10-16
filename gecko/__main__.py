@@ -9,6 +9,7 @@ import structlog
 
 from gecko.jobs import JOBS, JobFn, register  # noqa: F401
 from gecko.settings import GeckoSettings
+from gecko.store import ForeignDatabase
 
 log = structlog.get_logger("gecko.main")
 
@@ -16,6 +17,8 @@ log = structlog.get_logger("gecko.main")
 def _load_jobs() -> None:
     # Importing registers jobs; later tasks add modules here.
     import gecko.backtest.runner  # noqa: F401
+    import gecko.benchmark  # noqa: F401
+    import gecko.check  # noqa: F401
     import gecko.collectors.coingecko  # noqa: F401
     import gecko.collectors.dexscreener  # noqa: F401
     import gecko.collectors.geckoterminal  # noqa: F401
@@ -24,7 +27,28 @@ def _load_jobs() -> None:
     import gecko.ledger  # noqa: F401
     import gecko.prune  # noqa: F401
     import gecko.rank  # noqa: F401
+    import gecko.report  # noqa: F401
+    import gecko.research  # noqa: F401
     import gecko.telegram_reader  # noqa: F401
+
+
+def configure_logging(log_format: str) -> None:
+    """Render structlog events for journald: one JSON line each, or console."""
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if log_format == "json"
+        else structlog.dev.ConsoleRenderer()
+    )
+    structlog.configure(
+        # stderr, looked up per logger (never a stale stream): stdout is results only
+        logger_factory=lambda *_: structlog.PrintLogger(sys.stderr),
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            renderer,
+        ],
+        cache_logger_on_first_use=False,  # tests reconfigure per test
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="jobs:\n  "
         + "\n  ".join(sorted(JOBS))
-        + "\n\nexit codes: 0 ok, 1 failure, 2 usage",
+        + "\n\nexit codes: 0 ok, 1 failure, 2 usage or foreign database",
     )
     p.add_argument("job", nargs="?")
     p.add_argument("--list", action="store_true")
@@ -50,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--to", dest="date_to", default=None, help="backtest: last t0 (exclusive)"
     )
+    p.add_argument(
+        "--send", action="store_true", help="check: post a test message to health"
+    )
     ns = p.parse_args(argv)
     if ns.list:
         print("\n".join(sorted(JOBS)))
@@ -57,12 +84,16 @@ def main(argv: list[str] | None = None) -> int:
     if ns.job not in JOBS:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
-    if ns.job in ("ledger", "prune") and ns.as_of:
-        # ledger fetches live prices; a future prune "now" deletes live rows.
+    if ns.job in ("ledger", "prune", "enrich", "digest", "research") and ns.as_of:
+        # ledger fetches live prices; a future prune "now" deletes live rows;
+        # enrich stamps today's GoPlus read at a past time (replay lookahead);
+        # digest sends and moves its kv high-water marks; research reads today's web.
         print(f"{ns.job} is live-only: --as-of is refused", file=sys.stderr)
         return 2
     settings = GeckoSettings()
-    if not os.path.isabs(settings.db_path):
+    configure_logging(settings.log_format)
+    # check reports a relative path as a FAIL line instead of being refused here
+    if ns.job != "check" and not os.path.isabs(settings.db_path):
         # A relative path silently forks the database per working directory.
         print(
             f"GECKO_DB_PATH must be absolute (got {settings.db_path!r})",
@@ -77,9 +108,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         return asyncio.run(JOBS[ns.job](settings, ns))
+    except ForeignDatabase as exc:  # refused before any write: a config error
+        print(f"job {ns.job!r} refused: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001 — a crash outside run_job still exits 1
-        log.error("job_crashed", job=ns.job, error=f"{type(exc).__name__}: {exc}")
-        print(f"job {ns.job!r} crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # the type only: an exception's text can carry an upstream body or a URL
+        log.error("job_crashed", job=ns.job, error=type(exc).__name__)
+        print(f"job {ns.job!r} crashed: {type(exc).__name__}", file=sys.stderr)
         return 1
 
 

@@ -4,7 +4,7 @@ import pytest
 from gecko.store import ReturnAlreadyMeasured, canon_ts
 
 
-async def test_schema_has_seven_tables(store):
+async def test_schema_tables(store):
     rows = await (
         await store.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -18,6 +18,7 @@ async def test_schema_has_seven_tables(store):
         "forward_returns",
         "research_notes",
         "runs",
+        "kv",
     }
 
 
@@ -597,3 +598,154 @@ async def test_tokens_address_index_on_fresh_and_pre_index_db(tmp_path):
         assert await (await s.conn.execute(q)).fetchone() == (1,)
     finally:
         await s.close()
+
+
+async def _app_id(path):
+    import aiosqlite
+
+    async with aiosqlite.connect(path) as c:
+        return (await (await c.execute("PRAGMA application_id")).fetchone())[0]
+
+
+async def _table_names(path):
+    import aiosqlite
+
+    async with aiosqlite.connect(path) as c:
+        rows = await (
+            await c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+async def test_open_refuses_foreign_database_before_ddl(tmp_path):
+    import aiosqlite
+
+    from gecko.store import ForeignDatabase, Store
+
+    path = str(tmp_path / "scout.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute("CREATE TABLE scout_like (id INTEGER PRIMARY KEY, x TEXT)")
+        await c.commit()
+    with pytest.raises(ForeignDatabase) as ei:
+        await Store.open(path)
+    assert ei.value.application_id == 0
+    assert await _table_names(path) == {"scout_like"}  # no gecko DDL ran
+    assert await _app_id(path) == 0  # and the file was not stamped
+
+
+async def test_open_refuses_wrong_application_id(tmp_path):
+    import aiosqlite
+
+    from gecko.store import ForeignDatabase, Store
+
+    path = str(tmp_path / "other.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute("PRAGMA application_id=1234")
+        await c.execute("CREATE TABLE tokens (token_id TEXT PRIMARY KEY)")
+        await c.commit()
+    with pytest.raises(ForeignDatabase) as ei:
+        await Store.open(path)
+    assert ei.value.application_id == 1234
+    assert await _table_names(path) == {"tokens"}
+    assert await _app_id(path) == 1234
+
+
+async def test_open_stamps_application_id_on_fresh_file(tmp_path):
+    from gecko.store import Store
+
+    path = str(tmp_path / "fresh.db")
+    s = await Store.open(path)
+    await s.close()
+    assert Store.APPLICATION_ID == 0x47454B4F
+    assert await _app_id(path) == Store.APPLICATION_ID
+    s = await Store.open(path)  # a stamped gecko file reopens cleanly
+    await s.close()
+
+
+async def test_open_accepts_existing_gecko_db_without_id(tmp_path):
+    import aiosqlite
+
+    from gecko.store import SCHEMA, Store
+
+    path = str(tmp_path / "pre_plan3.db")
+    async with aiosqlite.connect(path) as c:  # a pre-Plan-3 gecko db: id 0
+        await c.executescript(SCHEMA)
+        await c.execute(
+            "INSERT INTO runs(job,started_at,finished_at,ok) VALUES('rank','a','b',1)"
+        )
+        await c.commit()
+    assert await _app_id(path) == 0
+    s = await Store.open(path)
+    await s.close()
+    assert await _app_id(path) == Store.APPLICATION_ID
+
+
+async def test_close_unmeasured_records_reason(store):
+    await store.watchlist_upsert("s:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1, 7))
+    at = "2026-10-20T00:00:00+00:00"
+    assert await store.close_unmeasured("s:a", 1, at, reason="expired") is True
+    assert await store.close_unmeasured("s:a", 1, at, reason="no_entry_price") is False
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, measured_at, ret, closed_reason FROM forward_returns "
+            "ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert rows == [(1, "2026-10-20T00:00:00Z", None, "expired"), (7, None, None, None)]
+
+
+async def test_expired_and_overdue_counts(store):
+    await store.watchlist_upsert("s:a", "2026-10-01T00:00:00Z", "F4", 1, 1.0, {})
+    await store.repair_schedules(horizons=(1, 7, 30))  # due 10-02, 10-08, 10-31
+    await store.close_unmeasured("s:a", 1, "2026-10-10T00:00:00Z", reason="expired")
+    assert await store.expired_count("2026-10-10T00:00:00Z") == 1
+    assert await store.expired_count("2026-10-10T00:00:01Z") == 0
+    # open rows: 7 (due 10-08) and 30 (due 10-31)
+    assert await store.overdue_count("2026-10-11T00:00:00Z", 48) == 1
+    assert await store.overdue_count("2026-10-11T00:00:00Z", 72) == 0  # strict
+    assert await store.overdue_count("2026-10-11T00:00:00Z", 24 * 4) == 0
+    assert await store.overdue_count("2026-11-05T00:00:00Z", 72) == 2
+
+
+def test_main_maps_foreign_database_to_exit_2(tmp_path, monkeypatch, capsys):
+    import sqlite3
+
+    from gecko.__main__ import main
+
+    path = str(tmp_path / "scout.db")
+    with sqlite3.connect(path) as c:
+        c.execute("CREATE TABLE scout_like (id INTEGER PRIMARY KEY)")
+    monkeypatch.setenv("GECKO_DB_PATH", path)
+    assert main(["prune"]) == 2
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and "not a gecko database" in err[0]
+
+
+async def test_kv_get_set_upserts(store):
+    assert await store.kv_get("k") is None
+    await store.kv_set("k", "v1", "2026-10-16T00:00:00+00:00")
+    await store.kv_set("k", "v2", "2026-10-17T00:00:00Z")
+    assert await store.kv_get("k") == "v2"
+    rows = await (await store.conn.execute("SELECT * FROM kv")).fetchall()
+    assert rows == [("k", "v2", "2026-10-17T00:00:00Z")]
+
+
+async def test_open_adds_kv_to_a_pre_kv_gecko_db(tmp_path):
+    import aiosqlite
+
+    from gecko.store import SCHEMA, SCHEMA_NAMES, Store
+
+    assert "kv" in SCHEMA_NAMES
+    path = str(tmp_path / "pre_kv.db")
+    async with aiosqlite.connect(path) as c:  # every table but kv, id 0
+        await c.executescript(SCHEMA)
+        await c.execute("DROP TABLE kv")
+        await c.commit()
+    s = await Store.open(path)
+    try:
+        await s.kv_set("k", "v", "2026-10-16T00:00:00Z")
+        assert await s.kv_get("k") == "v"
+    finally:
+        await s.close()
+    assert "kv" in await _table_names(path)

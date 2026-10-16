@@ -28,12 +28,42 @@ from gecko.store import Store, canon_ts, parse_utc, utcnow
 log = structlog.get_logger("gecko.telegram")
 REPO = Path(__file__).resolve().parents[1]
 RESOLVE_DAYS = 7
+LOCK_HELD = "session lock held: another reader or tg-login is running"
 
 
-def session_problem(settings: GeckoSettings, *, must_exist: bool) -> str | None:
+class NoChannelsResolved(Exception):
+    """Every configured handle failed to resolve: nothing to poll."""
+
+
+class SessionLocked(Exception):
+    """Another reader or tg-login holds the session's advisory lock."""
+
+
+def lock_session(path: str):
+    """Hold ``<path>.lock`` exclusively; the caller keeps the handle open.
+
+    Two Telethon clients on one session risk AUTH_KEY_DUPLICATED, which can
+    revoke it. POSIX only: elsewhere the file is opened and no lock is taken.
+    """
+    fh = os.fdopen(os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o600), "r+")
+    if os.name == "posix":
+        import fcntl
+
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            raise SessionLocked(path) from None
+    return fh
+
+
+def session_problem(
+    settings: GeckoSettings, *, must_exist: bool, require_channels: bool = True
+) -> str | None:
     if settings.tg_api_id <= 0 or settings.tg_api_hash is None:
         return "GECKO_TG_API_ID / GECKO_TG_API_HASH not set"
-    if not settings.tg_channels:
+    # tg-login runs BEFORE channels are set (runbook order); the reader needs them
+    if require_channels and not settings.tg_channels:
         return "GECKO_TG_CHANNELS is empty"
     p = Path(settings.tg_session_path)
     if not p.is_absolute():
@@ -72,8 +102,10 @@ async def initial_marks(store: Store, handles: list[str]) -> dict[str, int]:
 
 async def poll_once(
     store, client, settings, entities, marks, *, now: str | None = None
-) -> tuple[int, int]:
+) -> tuple[int, int, int | None]:
+    """Returns (calls written, channels failed, longest FloodWait seconds or None)."""
     written = failed = 0
+    wait: int | None = None
     for handle, ent in entities.items():
         mark, limit = marks.get(handle, 0), settings.tg_catchup_limit
         try:
@@ -86,11 +118,11 @@ async def poll_once(
             Exception
         ) as exc:  # noqa: BLE001 — RPC/flood/transport: recorded, other channels go on
             failed += 1
+            sec = getattr(exc, "seconds", None)
+            if isinstance(sec, int) and not isinstance(sec, bool):
+                wait = max(wait or 0, sec)
             log.warning(
-                "tg_poll_failed",
-                channel=handle,
-                error=type(exc).__name__,
-                wait_sec=getattr(exc, "seconds", None),
+                "tg_poll_failed", channel=handle, error=type(exc).__name__, wait_sec=sec
             )
             continue
         if len(msgs) >= limit:
@@ -108,33 +140,48 @@ async def poll_once(
                 written += 1
     now = canon_ts(now) or utcnow()  # test seam: a fixed clock, no date bomb
     since = canon_ts((parse_utc(now) - timedelta(days=RESOLVE_DAYS)).isoformat())
-    await resolve_calls(store, now, since=since)
-    return written, failed
+    await resolve_calls(store, settings, now, since=since)
+    return written, failed, wait
 
 
 async def run_reader(
     store, client, settings, *, sleep=asyncio.sleep, cycles=None
 ) -> None:
-    entities = {
-        h.lower(): await client.get_input_entity(h) for h in settings.tg_channels
-    }
+    # One by one: a renamed or deleted channel must not stop the others. An
+    # unresolved handle is retried only on the next restart; until then every
+    # run row names the count, without failing the polls that did work.
+    entities = {}
+    for h in settings.tg_channels:
+        try:
+            entities[h.lower()] = await client.get_input_entity(h)
+        except Exception as exc:  # noqa: BLE001 — counted, logged, skipped
+            log.warning("tg_handle_unresolved", channel=h, error=type(exc).__name__)
+    if not entities:
+        raise NoChannelsResolved(len(settings.tg_channels))
+    unresolved = len(settings.tg_channels) - len(entities)
     marks = await initial_marks(store, list(entities))
     log.info("tg_reader_started", channels=len(entities), marks=marks)
     n = 0
     while cycles is None or n < cycles:
         started = utcnow()
-        written, failed = await poll_once(store, client, settings, entities, marks)
+        written, failed, wait = await poll_once(
+            store, client, settings, entities, marks
+        )
+        errors = [f"{failed} channel(s) failed"] if failed else []
+        errors += [f"{unresolved} handle(s) unresolved"] if unresolved else []
         await store.record_run(
             "telegram-reader",
             started,
             utcnow(),
             failed == 0,
             rows_written=written,
-            error=f"{failed} channel(s) failed" if failed else None,
+            error="; ".join(errors) or None,
         )
         n += 1
+        if wait is not None:
+            log.warning("tg_flood_wait", seconds=wait)
         if cycles is None or n < cycles:
-            await sleep(settings.tg_poll_interval_sec)
+            await sleep(max(settings.tg_poll_interval_sec, wait or 0))
 
 
 def _client(settings: GeckoSettings):
@@ -152,13 +199,23 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
     # Every exit before the first poll writes an ok=0 run (error = a label or the
     # exception TYPE), so freshness pages a reader that never gets to poll.
     started, store = utcnow(), await Store.open(settings.db_path)
-    fail = lambda error: store.record_run(  # noqa: E731
-        "telegram-reader", started, utcnow(), False, error=error
-    )
+    recorded, lock = False, None
+
+    async def fail(error: str) -> None:
+        nonlocal recorded
+        await store.record_run("telegram-reader", started, utcnow(), False, error=error)
+        recorded = True  # one ok=0 row; a write that raised is retried by the except
+
     try:
         if problem := session_problem(settings, must_exist=True):
             print(problem, file=sys.stderr)
             await fail("session_problem")
+            return 2
+        try:
+            lock = lock_session(settings.tg_session_path)
+        except SessionLocked:
+            print(LOCK_HELD, file=sys.stderr)
+            await fail("session_locked")
             return 2
         client = _client(settings)  # inside: an ImportError/corrupt session is recorded
         try:
@@ -171,12 +228,21 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
                 await fail("not_authorized")
                 return 1
             await run_reader(store, client, settings)
+        except NoChannelsResolved:
+            await fail("no_channels_resolved")
+            return 1
         finally:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception as exc:  # noqa: BLE001 — must not replace the cause
+                log.warning("tg_disconnect_failed", error=type(exc).__name__)
     except Exception as exc:
-        await fail(type(exc).__name__)
+        if not recorded:
+            await fail(type(exc).__name__)
         raise
     finally:
+        if lock is not None:
+            lock.close()
         await store.close()
     return 0
 
@@ -184,17 +250,32 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
 @register("tg-login")
 async def tg_login_job(settings: GeckoSettings, ns) -> int:
     """Interactive, operator-run once: creates gecko's own session (a new device)."""
-    if problem := session_problem(settings, must_exist=False):
+    if problem := session_problem(settings, must_exist=False, require_channels=False):
         print(problem, file=sys.stderr)
         return 2
-    old = os.umask(0o077)  # Telethon creates the session (and -journal) itself
+    path = settings.tg_session_path
+    if Path(path).exists():  # a copied (legacy) session would run as its device
+        print(
+            f"session exists at {path}; move it away to create a fresh device",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        client = _client(settings)
-        await client.start()  # prompts for phone and login code on this terminal
-        await client.disconnect()
+        lock = lock_session(path)
+    except SessionLocked:
+        print(LOCK_HELD, file=sys.stderr)
+        return 2
+    try:
+        old = os.umask(0o077)  # Telethon creates the session (and -journal) itself
+        try:
+            client = _client(settings)
+            await client.start()  # prompts for phone and login code on this terminal
+            await client.disconnect()
+        finally:
+            os.umask(old)
+        os.chmod(path, 0o600)
     finally:
-        os.umask(old)
-    os.chmod(settings.tg_session_path, 0o600)
+        lock.close()
     print(f"session written to {settings.tg_session_path} (0600)")
     return 0
 
@@ -232,7 +313,7 @@ async def migrate_calls_job(settings: GeckoSettings, ns) -> int:
                     )
                 ).fetchall()
             ]
-        resolved = await resolve_calls(store, utcnow(), since=None)
+        resolved = await resolve_calls(store, settings, utcnow(), since=None)
         print(f"migrated {n} call(s), resolved {resolved}")
         print(f"GECKO_TG_CHANNELS={json.dumps(chans)}")
         return JobResult(rows_written=n)

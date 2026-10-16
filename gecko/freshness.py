@@ -30,6 +30,12 @@ SLO_MINUTES = {
     "observations:geckoterminal_ohlcv": 1560,  # rows that carry candles only
     "observations:enrich": 1560,
     "benchmark:btc": 180,  # the ledger cannot measure without it
+    "prune": 1560,  # daily; a dead prune grows the database until the disk fills
+    "digest": 1560,  # daily; the digest's footer in turn reports freshness's own age
+    "scorecard": 11520,  # weekly
+    "db-backup": 1560,  # daily; deploy/gecko/gecko-db-backup.sh writes its runs row
+    # Row-anchored: ok polls of channels that never post a call still page.
+    "source_calls:rows": 4320,
 }
 BTC_TOKEN_ID = "benchmark:btc"
 BACKLOG = "forward_returns_backlog"
@@ -53,14 +59,24 @@ WRITER_JOBS = {
     "observations:coingecko": ("coingecko-markets",),
     "observations:geckoterminal_ohlcv": ("geckoterminal-ohlcv",),
     "observations:enrich": ("enrich",),
-    "benchmark:btc": ("coingecko-hourly",),
+    "benchmark:btc": ("coingecko-hourly", "benchmark"),
+    "prune": ("prune",),
+    "digest": ("digest",),
+    "scorecard": ("scorecard",),
+    "db-backup": ("db-backup",),
+    "source_calls:rows": ("telegram-reader",),
 }
 # Writers outside Hermes cron: no incident path, so freshness pages their failures.
-NON_CRON_WRITERS = frozenset({"telegram-reader"})
-# Tables whose writer may legitimately write 0 rows (silent channels, an empty
-# watchlist, nothing due); judged by its last ok run.
+# The collectors (gecko-collector@, no OnFailure) are always expected to run.
+NON_CRON_WRITERS = frozenset(
+    {"telegram-reader", "dexscreener", "geckoterminal", "geckoterminal-ohlcv"}
+)
+# Freshness keys whose writer job may legitimately write 0 rows (silent
+# channels, an empty watchlist, nothing due, nothing to prune); judged by the
+# writer's last ok run, not by any table's newest row.
 RUN_ANCHORED = frozenset(
-    {"watchlist", "forward_returns", "research_notes", "source_calls"}
+    {"watchlist", "forward_returns", "research_notes", "source_calls", "prune"}
+    | {"digest", "scorecard", "db-backup"}
 )
 DEDUP_HOURS = 6
 
@@ -70,6 +86,7 @@ class Breach:
     table: str
     last_write: str | None
     slo_minutes: int
+    detail: str | None = None  # replaces the generic page text when set
 
 
 @dataclass
@@ -98,6 +115,7 @@ async def _non_cron_first_failure(
     jobs = [j for j in WRITER_JOBS[table] if j in NON_CRON_WRITERS]
     if not jobs:
         return None
+    expected = expected or jobs != ["telegram-reader"]  # a collector is expected
     row = await (
         await store.conn.execute(
             f"SELECT MIN(finished_at) FROM runs WHERE ok=0 AND job IN "
@@ -120,22 +138,20 @@ async def _last_write(store: Store, key: str) -> str | None:
     """Newest write for a table, or for a per-source / benchmark check."""
     if key == BTC_TOKEN_ID:
         where, args = "token_id=?", (BTC_TOKEN_ID,)
-    elif key.startswith("observations:"):
-        src = key.split(":", 1)[1]
-        where, args = "source=?", (src,)
+    elif key.split(":", 1)[0] == "observations":
+        # Benchmark BTC rows are not collector data: they never mask a dead one.
+        where, args = "token_id!=?", (BTC_TOKEN_ID,)
+        src = key.partition(":")[2]
+        if src:
+            where, args = where + " AND source=?", (*args, src)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
         elif src == "enrich":  # unknown markers and verdict-less reads are not data
             where += " AND " + KNOWN_VERDICT
-        elif (
-            src == "coingecko"
-        ):  # markets rows only: hourly BTC/trending mask a dead sweep
-            where += (
-                " AND token_id!='benchmark:btc'"
-                " AND json_extract(features_json, '$.trending_rank') IS NULL"
-            )
+        elif src == "coingecko":  # markets rows only: trending rows mask a dead sweep
+            where += " AND json_extract(features_json, '$.trending_rank') IS NULL"
     else:
-        return await store.last_write(key)
+        return await store.last_write(key.split(":", 1)[0])
     row = await (
         await store.conn.execute(
             f"SELECT observed_at FROM observations WHERE {where} "
@@ -158,6 +174,24 @@ async def _oldest_overdue(store: Store, now: str) -> str | None:
     return row[0]
 
 
+async def _skip(store: Store, table: str, settings: GeckoSettings | None) -> bool:
+    """Keys judged only once their lane is switched on."""
+    if table == "research_notes" and not (
+        settings
+        and settings.anthropic_api_key
+        and settings.anthropic_api_key.get_secret_value()
+    ):
+        log.debug("freshness_key_skipped", key=table)
+        return True
+    if table == "source_calls:rows":
+        # Configured channels and a reader that has polled ok at least once;
+        # before that the run-anchored source_calls key owns the page.
+        return not (settings and settings.tg_channels) or (
+            await _writer_run(store, table, "MIN") is None
+        )
+    return False
+
+
 async def check_freshness(
     store: Store, now: str, settings: GeckoSettings | None = None
 ) -> list[Breach]:
@@ -166,6 +200,8 @@ async def check_freshness(
     reader_expected = bool(settings and settings.tg_channels)
     now_dt = parse_utc(now)
     for table, slo in SLO_MINUTES.items():
+        if await _skip(store, table, settings):
+            continue
         first_run = await _writer_run(store, table, "MIN")
         if first_run is None:
             # Bootstrapping, unless a non-cron writer has failed since deploy.
@@ -182,13 +218,25 @@ async def check_freshness(
             # An empty table is measured from the writer's first ok run, so a
             # writer that just started gets one SLO window to produce rows.
             anchor = last if last is not None else first_run
+            if table == "source_calls:rows":
+                # Old history or catch-up rows must not page before the reader
+                # has polled ok for a full SLO window.
+                anchor = max(anchor, first_run, key=parse_utc)
         if now_dt - parse_utc(anchor) > timedelta(minutes=slo):
             out.append(Breach(table, last, slo))
     # Needs no bootstrap: no scheduled row, no backlog. A ledger that never
     # succeeds is exactly what this catches. last_write is the oldest due_at.
     overdue = await _oldest_overdue(store, now)
     if overdue is not None:
-        out.append(Breach(BACKLOG, overdue, BACKLOG_HOURS * 60))
+        n = await store.overdue_count(now, BACKLOG_HOURS)
+        expired = await store.expired_count(
+            canon_ts((now_dt - timedelta(days=7)).isoformat())
+        )
+        text = (
+            f"{BACKLOG}: {n} row(s) > {BACKLOG_HOURS} h overdue (oldest {overdue}); "
+            f"expired last 7 d: {expired}"
+        )
+        out.append(Breach(BACKLOG, overdue, BACKLOG_HOURS * 60, text))
     return out
 
 
@@ -219,8 +267,10 @@ async def alert_breaches(
             report.skipped += 1
             continue
         text = (
-            f"gecko freshness breach: table {b.table} last activity {b.last_write or 'never'} "
-            f"exceeds SLO {b.slo_minutes} min (checked {now})"
+            f"gecko freshness breach: {b.detail} (checked {now})"
+            if b.detail
+            else f"gecko freshness breach: table {b.table} last activity "
+            f"{b.last_write or 'never'} exceeds SLO {b.slo_minutes} min (checked {now})"
         )
         log.info(
             "freshness_alert_dispatched",

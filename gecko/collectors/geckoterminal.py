@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import aiohttp
 import structlog
@@ -201,9 +202,11 @@ async def collect_ohlcv(
     now: str,
     *,
     sleep=asyncio.sleep,
+    clock=time.monotonic,
 ) -> JobResult:
     now = canon_ts(now)
     pacer = Pacer(settings.gt_min_interval_sec, sleep)
+    deadline = clock() + settings.ohlcv_run_budget_sec
     rows = await (
         await store.conn.execute(
             "SELECT t.token_id, t.chain, (SELECT MAX(observed_at) FROM observations o "
@@ -219,6 +222,9 @@ async def collect_ohlcv(
         # The budget counts upstream fetches only: pool-less tokens never gain an
         # OHLCV row, so they would sort first forever and starve every later token.
         if fetched >= settings.ohlcv_max_per_run:
+            break
+        if clock() > deadline:  # oldest-first: the rest leads the next run
+            log.info("ohlcv_budget_exhausted", fetched=fetched)
             break
         pool = await _pool_for(store, tid, now)
         if not pool:

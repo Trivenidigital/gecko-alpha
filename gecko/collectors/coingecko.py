@@ -6,12 +6,13 @@ from typing import Any
 import aiohttp
 import structlog
 
+from gecko.benchmark import BTC_ID, upsert_btc
 from gecko.http import Pacer, UpstreamError, _retryable, get_json
 from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
 from gecko.runs import JobResult, PartialFailure, run_job
 from gecko.settings import GeckoSettings
-from gecko.store import Store, canon_ts, utcnow
+from gecko.store import Store, canon_ts, iso_plus, utcnow
 from gecko.universe import in_band
 
 log = structlog.get_logger("gecko.coingecko")
@@ -23,7 +24,6 @@ PLATFORM_MAP = {
     "ethereum": "ethereum",
     "binance-smart-chain": "bsc",
 }
-BTC_ID = "benchmark:btc"
 RETRY_BACKOFF = (2.0, 4.0, 8.0)
 COIN_PARAMS = {
     "localization": "false",
@@ -141,9 +141,10 @@ async def _budget_left(
 
 
 async def _known_platform(
-    store: Store, cid: str, now: str
+    store: Store, settings: GeckoSettings, cid: str, now: str
 ) -> tuple[str, str] | None | bool:
-    """(chain, address) if mapped, False if known-unmapped, None if never fetched."""
+    """(chain, address) if mapped, False if known-unmapped, None if never fetched
+    (a marker older than ``cg_unmapped_ttl_days`` counts as never fetched)."""
     row = await (
         await store.conn.execute(
             "SELECT chain, address FROM tokens WHERE cg_id=? AND chain!='cg'", (cid,)
@@ -154,7 +155,8 @@ async def _known_platform(
     seen = await store.observations(
         f"cg:{cid}", as_of=now, source="cg_unmapped", limit=1
     )
-    return False if seen else None
+    fresh = iso_plus(now, -settings.cg_unmapped_ttl_days)
+    return False if seen and seen[0].observed_at > fresh else None
 
 
 async def _fetch_platform(
@@ -162,7 +164,10 @@ async def _fetch_platform(
 ) -> tuple[str, str] | None:
     """First platform on a configured chain; otherwise mark the coin unmapped."""
     body = await cg.get(f"/coins/{cid}", COIN_PARAMS)
-    platforms = (body or {}).get("platforms") or {}
+    if not isinstance(body, dict) or "platforms" not in body:
+        return None  # no answer: no marker, looked up again next sweep
+    # {} or the {"": ""} placeholder is an answer: marked, retried after the TTL
+    platforms = body["platforms"] if isinstance(body["platforms"], dict) else {}
     for platform, addr in platforms.items():
         chain = PLATFORM_MAP.get(platform)
         if chain not in settings.chains or not addr or not str(addr).strip():
@@ -245,7 +250,7 @@ async def markets_sweep(
                 ):
                     continue
                 cid = r["id"]
-                mapped = await _known_platform(store, cid, now)
+                mapped = await _known_platform(store, settings, cid, now)
                 if mapped is None:
                     if (
                         cg.calls + 1 + reserved > left
@@ -328,24 +333,14 @@ async def hourly(
         )
         btc = ((price or {}).get("bitcoin") or {}).get("usd")
         if btc:
-            await store.upsert_token(
-                BTC_ID,
-                "benchmark",
-                "btc",
-                "BTC",
-                "Bitcoin",
-                now,
-                "coingecko",
-                cg_id="bitcoin",
-            )
-            # Never a candidate: admission, OHLCV and rank scans skip it.
-            await store.set_token_status(BTC_ID, "disqualified", "benchmark")
+            await upsert_btc(store, now, "coingecko")
             await store.add_observation(
                 BTC_ID, "coingecko", now, {"price_usd": float(btc)}
             )
             written += 1
         else:
-            log.warning("cg_btc_price_missing", body=price)
+            keys = sorted(map(str, price))[:8] if isinstance(price, dict) else None
+            log.warning("cg_btc_price_missing", kind=type(price).__name__, keys=keys)
         return JobResult(rows_written=written, credits_used=cg.calls)
     except Exception as exc:
         raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc

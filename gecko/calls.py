@@ -11,7 +11,7 @@ import json
 import re
 from datetime import timedelta
 
-from gecko.identity import EVM_CHAINS, is_valid_address, norm_address
+from gecko.identity import EVM_CHAINS, is_valid_address, norm_address, token_id
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, parse_utc
 
@@ -73,22 +73,26 @@ async def insert_call(
     return cur.rowcount == 1
 
 
-async def _matches(store: Store, addr: str) -> set[str]:
+def _call_chains(settings: GeckoSettings, addr: str) -> list[str]:
+    """Configured chains an address of this shape can live on."""
     if addr.startswith("0x"):
-        q = ",".join("?" * len(EVM_CHAINS))
-        sql, args = f"SELECT token_id FROM tokens WHERE address=? AND chain IN ({q})", (
-            addr,
-            *sorted(EVM_CHAINS),
-        )
-    else:
-        sql, args = (
-            "SELECT token_id FROM tokens WHERE address=? AND chain='solana'",
-            (addr,),
-        )
-    return {r[0] for r in await (await store.conn.execute(sql, args)).fetchall()}
+        return [c for c in settings.chains if c in EVM_CHAINS]
+    return ["solana"] if "solana" in settings.chains else []
 
 
-async def resolve_calls(store: Store, now: str, *, since: str | None) -> int:
+async def _matches(store: Store, settings: GeckoSettings, addr: str) -> set[str]:
+    """Known tokens for ``addr``: primary-key lookups, one candidate id per chain."""
+    ids = [token_id(c, addr) for c in _call_chains(settings, addr)]
+    if not ids:
+        return set()
+    q = ",".join("?" * len(ids))
+    sql = f"SELECT token_id FROM tokens WHERE token_id IN ({q})"
+    return {r[0] for r in await (await store.conn.execute(sql, ids)).fetchall()}
+
+
+async def resolve_calls(
+    store: Store, settings: GeckoSettings, now: str, *, since: str | None
+) -> int:
     sql = "SELECT id, addresses_json FROM source_calls WHERE token_id IS NULL AND addresses_json!='[]'"
     args: tuple = ()
     if since is not None:
@@ -98,7 +102,7 @@ async def resolve_calls(store: Store, now: str, *, since: str | None) -> int:
     for cid, aj in await (await store.conn.execute(sql, args)).fetchall():
         tids: set[str] = set()
         for a in json.loads(aj):
-            tids |= await _matches(store, a)
+            tids |= await _matches(store, settings, a)
         if len(tids) != 1:
             continue  # unknown yet, or ambiguous across chains
         cur = await store.conn.execute(
@@ -128,11 +132,6 @@ async def call_seeds(
                 addrs.append(a)
     seeds: dict[str, set[str]] = {}
     for a in addrs[: settings.tg_seed_max]:
-        chains = (
-            [c for c in settings.chains if c in EVM_CHAINS]
-            if a.startswith("0x")
-            else (["solana"] if "solana" in settings.chains else [])
-        )
-        for c in chains:
+        for c in _call_chains(settings, a):
             seeds.setdefault(c, set()).add(norm_address(c, a))
     return seeds

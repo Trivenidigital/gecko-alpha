@@ -1,3 +1,5 @@
+import os
+
 from gecko.__main__ import main
 
 
@@ -44,11 +46,15 @@ def test_job_crash_before_run_job_exits_1(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
 
     async def boom(settings, ns):
-        raise RuntimeError("crashed before run_job")
+        raise RuntimeError("upstream body text")
 
     monkeypatch.setitem(JOBS, "boom", boom)
     assert main(["boom"]) == 1
-    assert "crashed before run_job" in capsys.readouterr().err
+    cap = capsys.readouterr()
+    assert "job 'boom' crashed: RuntimeError" in cap.err
+    # the type only, in the stderr line and the log: never the exception's text
+    assert "upstream body text" not in cap.err + cap.out
+    assert '"error": "RuntimeError"' in cap.err  # the job_crashed log, on stderr
 
 
 def _patch_settings(monkeypatch, settings):
@@ -77,6 +83,24 @@ def test_ledger_refuses_as_of(monkeypatch, settings, capsys):
     assert "ledger is live-only" in capsys.readouterr().err
     assert ran == []
     assert main(["ledger"]) == 0 and ran == ["ledger"]
+
+
+def test_digest_refuses_as_of(monkeypatch, settings, capsys):
+    _patch_settings(monkeypatch, settings)
+    ran = _noop_job(monkeypatch, "digest")
+    assert main(["digest", "--as-of", "2026-10-01T00:00:00Z"]) == 2
+    assert "digest is live-only" in capsys.readouterr().err
+    assert ran == [] and not os.path.exists(settings.db_path)  # no run row
+    assert main(["digest"]) == 0 and ran == ["digest"]
+
+
+def test_research_refuses_as_of(monkeypatch, settings, capsys):
+    _patch_settings(monkeypatch, settings)
+    ran = _noop_job(monkeypatch, "research")
+    assert main(["research", "--as-of", "2026-10-01T00:00:00Z"]) == 2
+    assert "research is live-only" in capsys.readouterr().err
+    assert ran == [] and not os.path.exists(settings.db_path)  # no run row
+    assert main(["research"]) == 0 and ran == ["research"]
 
 
 def test_coingecko_jobs_refuse_without_key(monkeypatch, settings, capsys):

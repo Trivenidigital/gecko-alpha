@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import statistics
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -14,6 +15,9 @@ from gecko.store import Store, canon_ts, parse_utc, utcnow
 
 log = structlog.get_logger("gecko.rank")
 RULE_ID = "F4"
+# Stamped once, by the first live (no --as-of) run: the F4 scorecard cohort
+# starts here, and from then on --as-of replays belong to the backtest harness.
+ACTIVATION_KEY = "activation:at"
 SCORE_KEYS = (
     "vol_7d_ratio",
     "holder_growth_7d",
@@ -30,7 +34,7 @@ WEIGHTS = {
 
 def disqualify(f: Features, settings: GeckoSettings) -> str | None:
     """First disqualifier that fires, checked in a fixed order, or None."""
-    if f.security_ok is False:
+    if f.security_structural is False:
         return "security_fail"
     if f.top10_pct is not None and f.top10_pct > settings.top10_disqualify_pct:
         return "concentration"
@@ -42,6 +46,10 @@ def disqualify(f: Features, settings: GeckoSettings) -> str | None:
         f.observed_at
     ) > timedelta(days=settings.dead_after_days):
         return "dead"
+    # Last: a tax-only failure is re-read, not terminal (rank_once keeps it a
+    # candidate), so every terminal gate above must get to retire it first.
+    if f.security_ok is False:
+        return "security_tax"
     return None
 
 
@@ -99,6 +107,7 @@ class RankReport:
     entered: list[str]
     exited: list[str]
     ranked: int
+    exited_tax: int
 
 
 async def _column(store: Store, sql: str) -> list[str]:
@@ -136,6 +145,11 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
     ):
         f = await compute_features(store, settings, tid, as_of)
         why = disqualify(f, settings)
+        if why == "security_tax":
+            # Unlisted: simply not admitted, status untouched. Listed: the exit
+            # loop below demotes it to a candidate.
+            reasons[tid] = why
+            continue
         if why:
             status = "dead" if why == "dead" else "disqualified"
             await store.set_token_status(tid, status, why)
@@ -145,14 +159,20 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
 
     current = {w.token_id: w for w in await store.active_watchlist()}
     exited: list[str] = []
+    exited_tax = 0
     for tid, w in current.items():
         if tid not in feats:
             # Not active this run: this run's disqualifier, or left `active`
             # some other way (the ledger's dead/no_price).
-            await store.watchlist_exit(
-                tid, as_of, await _exit_reason(store, tid, reasons)
-            )
+            if reasons.get(tid) == "security_tax":
+                # Status first: a crash before the exit leaves the stored
+                # reason for _exit_reason to find on the next run. Guarded, and
+                # the STORED reason names the exit: a concurrent enrich verdict wins.
+                await store.demote_if_active(tid, reasons.pop(tid))
+            why = await _exit_reason(store, tid, reasons)
+            await store.watchlist_exit(tid, as_of, why)
             exited.append(tid)
+            exited_tax += why == "security_tax"
         elif parse_utc(as_of) - parse_utc(w.entered_at) > timedelta(
             days=settings.watchlist_max_age_days
         ):
@@ -195,15 +215,35 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
         entered=len(entering),
         scheduled=repaired,
         exited=len(exited),
+        exited_tax=exited_tax,
     )
-    return RankReport(entering, exited, len(final))
+    return RankReport(entering, exited, len(final), exited_tax)
 
 
 @register("rank")
 async def rank_job(settings: GeckoSettings, ns) -> int:
-    as_of = canon_ts(ns.as_of) if ns.as_of else utcnow()
+    fixed = canon_ts(ns.as_of) if ns.as_of else None
+    if ns.as_of:
+        store = await Store.open(settings.db_path)
+        try:
+            activated = await store.kv_get(ACTIVATION_KEY)
+        finally:
+            await store.close()
+        if activated:
+            print(f"rank live since {activated}: --as-of is refused", file=sys.stderr)
+            return 2
 
     async def body(store, session):
+        if not ns.as_of:  # OR IGNORE: the first live run's stamp is never moved
+            stamp = utcnow()
+            await store.conn.execute(
+                "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                (ACTIVATION_KEY, stamp, stamp),
+            )
+            await store.conn.commit()
+        # the live clock is read last, after Store.open and the stamp's commit:
+        # the window to rank_once's rewind guard is zero writes (and waits) wide
+        as_of = fixed or utcnow()
         r = await rank_once(store, settings, as_of)
         return JobResult(rows_written=r.ranked)
 

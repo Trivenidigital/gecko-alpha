@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-rank schedule
+
+[Timer]
+Unit=gecko-job@rank.service
+OnCalendar=*-*-* *:45:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

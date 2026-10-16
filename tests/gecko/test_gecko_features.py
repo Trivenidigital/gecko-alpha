@@ -693,3 +693,28 @@ async def test_security_ok_tie_on_observed_at_takes_the_later_write(
         )
     f = await compute_features(store, settings, "solana:abc", T0)
     assert f.security_ok is last
+
+
+async def test_features_security_structural_follows_newest_row(store, settings):
+    # the newest row decides, as for security_ok; unknown or non-bool is None
+    await seed(store)
+    tid, d1, d2 = "solana:abc", "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z"
+    await store.add_observation(
+        tid, "enrich", d1, {"security_ok": False, "security_structural": False}
+    )
+    await store.add_observation(
+        tid, "enrich", d2, {"security_ok": False, "security_structural": True}
+    )
+    f = await compute_features(store, settings, tid, d1)
+    assert f.security_structural is False
+    f = await compute_features(store, settings, tid, d2)
+    assert f.security_ok is False and f.security_structural is True
+    # tie on observed_at: the later write wins; a non-bool reads as unknown
+    await store.add_observation(tid, "enrich", d2, {"security_structural": 1})
+    f = await compute_features(store, settings, tid, d2)
+    assert f.security_structural is None and f.security_ok is None
+    d3 = "2026-10-03T00:00:00Z"
+    await store.add_observation(tid, "enrich", d3, {"goplus_status": "unknown"})
+    assert (
+        await compute_features(store, settings, tid, d3)
+    ).security_structural is None

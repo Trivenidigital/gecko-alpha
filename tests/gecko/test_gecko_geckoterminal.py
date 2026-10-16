@@ -189,6 +189,27 @@ async def test_collect_ohlcv_sorted_ascending_and_budgeted(store, settings):
     )
 
 
+async def test_collect_ohlcv_stops_at_wall_clock_budget(store, settings):
+    # H7: past ohlcv_run_budget_sec (600 s) the run stops fetching and ends ok
+    from structlog.testing import capture_logs
+
+    assert settings.ohlcv_run_budget_sec == 600
+    for t in "abc":
+        await store.upsert_token(f"solana:{t}", "solana", t, "X", "X", NOW, "gt")
+        feats = {"pool_address": f"p{t}", "liquidity_usd": 3e5}
+        await store.add_observation(f"solana:{t}", "geckoterminal", NOW, feats)
+    ticks = iter([0.0, 100.0, 601.0, 601.0])  # deadline, then one check per token
+    with aioresponses() as m, capture_logs() as logs:
+        m.get(OHLCV_URL.format(network="solana", pool="pa"), payload={})
+        async with aiohttp.ClientSession() as s:
+            r = await collect_ohlcv(
+                store, settings, s, NOW, sleep=nosleep, clock=lambda: next(ticks)
+            )
+    assert r.rows_written == 1
+    [ev] = [e for e in logs if e["event"] == "ohlcv_budget_exhausted"]
+    assert ev["fetched"] == 1
+
+
 async def test_collect_ohlcv_poolless_tokens_do_not_consume_budget(store, settings):
     # A token with no known pool sorts first (never had OHLCV) forever; it must not
     # starve the budget and block tokens that do have a pool.

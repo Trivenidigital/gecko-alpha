@@ -37,6 +37,9 @@ async def admit_survivors(store: Store, settings: GeckoSettings, now: str) -> in
         await store.conn.execute(
             f"SELECT o.token_id, o.observed_at, o.features_json FROM observations o "
             f"JOIN tokens t ON t.token_id=o.token_id WHERE t.status='candidate' "
+            # v1 has no re-entry: a demoted (tax) watchlist exit stays a candidate
+            f"AND t.token_id NOT IN (SELECT token_id FROM watchlist "
+            f"WHERE exited_at IS NOT NULL) "
             f"AND o.source IN ({q}) AND o.observed_at>=? AND o.observed_at<=? "
             f"ORDER BY o.token_id, o.observed_at, o.id",
             (*MARKET_SOURCES, scan_from, now),

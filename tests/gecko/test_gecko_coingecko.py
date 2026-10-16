@@ -158,6 +158,51 @@ async def test_sweep_does_not_refetch_unmapped(store, cg_settings):
     assert first.credits_used == 3 and second.credits_used == 2
 
 
+@pytest.mark.parametrize("age_days,credits", [(29, 2), (31, 3)])
+async def test_unmapped_marker_is_rechecked_after_ttl(
+    store, cg_settings, age_days, credits
+):
+    # C1: a marker older than cg_unmapped_ttl_days (default 30) is re-looked-up
+    assert cg_settings.cg_unmapped_ttl_days == 30
+    from gecko.store import iso_plus
+
+    marker_at = iso_plus(NOW, -age_days)
+    await store.add_observation("cg:nochain", "cg_unmapped", marker_at, {})
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("nochain", 2e6)])
+        m.get(COIN, payload={"platforms": {"tron": "T1"}})
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            r = await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    assert r.credits_used == credits
+
+
+@pytest.mark.parametrize(
+    "body,markers",
+    [
+        ([], 0),  # not a dict: no answer, looked up again next sweep
+        ({}, 0),  # no platforms key: no answer
+        ({"platforms": {"": ""}}, 1),  # placeholder: an answer, retried after TTL
+        ({"platforms": {}}, 1),
+        ({"platforms": None}, 1),
+    ],
+)
+async def test_empty_platforms_answer_writes_no_marker(
+    store, cg_settings, body, markers
+):
+    # C1 / N2: only a body without a platforms map is "no answer"
+    with aioresponses() as m:
+        m.get(MARKETS, payload=[row("nochain", 2e6)])
+        m.get(COIN, payload=body)
+        m.get(MARKETS, payload=[])
+        async with aiohttp.ClientSession() as s:
+            await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    sql = "SELECT COUNT(*) FROM observations WHERE source='cg_unmapped'"
+    assert await (await store.conn.execute(sql)).fetchone() == (markers,)
+    n = await (await store.conn.execute("SELECT COUNT(*) FROM observations")).fetchone()
+    assert n == (markers,)
+
+
 async def test_markets_429_then_200(store, cg_settings):
     with aioresponses() as m:
         m.get(MARKETS, status=429)
@@ -427,13 +472,16 @@ async def test_hourly_logs_missing_btc_price(store, cg_settings):
 
     with aioresponses() as m:
         m.get(TRENDING, payload={"coins": []})
-        m.get(PRICE, payload={})
+        m.get(PRICE, payload={"status": {"error_message": "body-text"}})
         async with aiohttp.ClientSession() as s:
             with capture_logs() as logs:
                 r = await hourly(store, cg_settings, s, NOW, sleep=RecordingSleep())
     assert r.credits_used == 2 and r.rows_written == 0
     missing = [e for e in logs if e["event"] == "cg_btc_price_missing"]
     assert len(missing) == 1 and missing[0]["log_level"] == "warning"
+    # E2: the value's type and keys only, never the body
+    assert (missing[0]["kind"], missing[0]["keys"]) == ("dict", ["status"])
+    assert "body-text" not in repr(missing[0])
     assert await store.observations("benchmark:btc", as_of=NOW) == []
 
 

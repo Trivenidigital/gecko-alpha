@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # systemd-drift-watchdog — detect drift between repo systemd/*.{service,timer}
+# (plus deploy/gecko/ and deploy/gecko/timers/, with their <unit>.d/*.conf drop-ins)
 # and prod /etc/systemd/system/<name>, plus enumerate unexpected drop-ins
 # (<unit>.d/*.conf). Alert via Telegram on drift; silent-suppress identical
 # drift-sets via sha256 ack tombstone.
@@ -87,30 +88,64 @@ if ! flock -n 9; then
     exit 0
 fi
 
+# Repo unit sources. deploy/gecko (+ timers/) holds the lean gecko package's
+# units, installed by deploy/gecko/install.sh; its drop-in dirs
+# (<unit>.d/*.conf, e.g. gecko-job@coingecko-markets.service.d) are tracked too.
+REPO_SOURCES=(
+    "$REPO_DIR/systemd"
+    "$REPO_DIR/deploy/gecko"
+    "$REPO_DIR/deploy/gecko/timers"
+)
+
 # --- Direction-A: repo → prod -------------------------------------------
 
 DRIFT_LINES=()
 
+# true when the relative path (a unit, or <unit>.d/<conf>) exists under a repo source
+repo_has() {
+    local src
+    for src in "${REPO_SOURCES[@]}"; do
+        [[ -f "$src/$1" ]] && return 0
+    done
+    return 1
+}
+
 # V47 MUST-FIX — process substitution preserves outer-scope DRIFT_LINES
 # (piped `while` would run in subshell and lose appends at loop exit).
 # V48 MUST-FIX — sort -z makes filesystem-order irrelevant.
-while IFS= read -r -d '' f; do
-    name=$(basename "$f")
-    if [[ ! -f "$PROD_SYSTEMD_DIR/$name" ]]; then
-        DRIFT_LINES+=("DRIFT: $name (missing in prod)")
-        continue
-    fi
-    # V45 MUST-FIX #2 — `if ! diff ...` guard so set -e doesn't kill the loop
-    # on the FIRST drift detection (bare `diff -q` returns 1 = "differ" which
-    # would trip set -e mid-loop).
-    if ! diff -q "$f" "$PROD_SYSTEMD_DIR/$name" >/dev/null 2>&1; then
-        DRIFT_LINES+=("DRIFT: $name")
-    fi
-    # V45 SHOULD-FIX — drop-in detection via compgen -G
-    if compgen -G "$PROD_SYSTEMD_DIR/${name}.d/*.conf" >/dev/null 2>&1; then
-        DRIFT_LINES+=("DROP-IN PRESENT: ${name}.d/")
-    fi
-done < <(find "$REPO_DIR/systemd" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) -print0 2>/dev/null | sort -z)
+for src in "${REPO_SOURCES[@]}"; do
+    while IFS= read -r -d '' f; do
+        name=$(basename "$f")
+        if [[ ! -f "$PROD_SYSTEMD_DIR/$name" ]]; then
+            DRIFT_LINES+=("DRIFT: $name (missing in prod)")
+            continue
+        fi
+        # V45 MUST-FIX #2 — `if ! diff ...` guard so set -e doesn't kill the loop
+        # on the FIRST drift detection (bare `diff -q` returns 1 = "differ" which
+        # would trip set -e mid-loop).
+        if ! diff -q "$f" "$PROD_SYSTEMD_DIR/$name" >/dev/null 2>&1; then
+            DRIFT_LINES+=("DRIFT: $name")
+        fi
+        # V45 SHOULD-FIX — drop-in detection; a drop-in tracked in the repo
+        # is compared below instead of being reported as present.
+        for conf in "$PROD_SYSTEMD_DIR/${name}.d"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            if ! repo_has "${name}.d/$(basename "$conf")"; then
+                DRIFT_LINES+=("DROP-IN PRESENT: ${name}.d/")
+                break
+            fi
+        done
+    done < <(find "$src" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" \) -print0 2>/dev/null | sort -z)
+    # repo-tracked drop-ins: <unit>.d/*.conf must exist and match in prod
+    while IFS= read -r -d '' f; do
+        rel="$(basename "$(dirname "$f")")/$(basename "$f")"
+        if [[ ! -f "$PROD_SYSTEMD_DIR/$rel" ]]; then
+            DRIFT_LINES+=("DRIFT: $rel (missing in prod)")
+        elif ! diff -q "$f" "$PROD_SYSTEMD_DIR/$rel" >/dev/null 2>&1; then
+            DRIFT_LINES+=("DRIFT: $rel")
+        fi
+    done < <(find "$src" -mindepth 2 -maxdepth 2 -type f -path "*.d/*.conf" -print0 2>/dev/null | sort -z)
+done
 
 # --- Direction-B: prod → repo (V45 MUST-FIX #3) -------------------------
 
@@ -124,7 +159,7 @@ DIRB_FIND_ARGS=("${DIRB_FIND_ARGS[@]:1}")
 
 while IFS= read -r -d '' p; do
     name=$(basename "$p")
-    if [[ ! -f "$REPO_DIR/systemd/$name" ]]; then
+    if ! repo_has "$name"; then
         DRIFT_LINES+=("UNTRACKED PROD UNIT: $name")
     fi
 done < <(find "$PROD_SYSTEMD_DIR" -maxdepth 1 -type f \( "${DIRB_FIND_ARGS[@]}" \) -print0 2>/dev/null | sort -z)
