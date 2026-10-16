@@ -28,6 +28,7 @@ def _load_jobs() -> None:
     import gecko.prune  # noqa: F401
     import gecko.rank  # noqa: F401
     import gecko.report  # noqa: F401
+    import gecko.research  # noqa: F401
     import gecko.telegram_reader  # noqa: F401
 
 
