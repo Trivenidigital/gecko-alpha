@@ -325,7 +325,7 @@ section 10):
 
 ```bash
 cd /root/gecko-alpha
-systemctl start gecko-collector@dexscreener.service   # blocks until the run finishes
+systemctl start gecko-collector@dexscreener.service; echo "rc=$?"   # blocks until the run finishes; a collector does not page, so the rc is your signal
 systemctl start $(ls deploy/gecko/timers | grep -v '^gecko-coingecko-')
 systemctl list-timers 'gecko-*' --all --no-pager     # 13 timers with a NEXT time
 ```
