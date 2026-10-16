@@ -6,6 +6,7 @@ from typing import Any
 import aiohttp
 import structlog
 
+from gecko.benchmark import BTC_ID, upsert_btc
 from gecko.http import Pacer, UpstreamError, _retryable, get_json
 from gecko.identity import is_valid_address, norm_address, token_id
 from gecko.jobs import register
@@ -23,7 +24,6 @@ PLATFORM_MAP = {
     "ethereum": "ethereum",
     "binance-smart-chain": "bsc",
 }
-BTC_ID = "benchmark:btc"
 RETRY_BACKOFF = (2.0, 4.0, 8.0)
 COIN_PARAMS = {
     "localization": "false",
@@ -328,18 +328,7 @@ async def hourly(
         )
         btc = ((price or {}).get("bitcoin") or {}).get("usd")
         if btc:
-            await store.upsert_token(
-                BTC_ID,
-                "benchmark",
-                "btc",
-                "BTC",
-                "Bitcoin",
-                now,
-                "coingecko",
-                cg_id="bitcoin",
-            )
-            # Never a candidate: admission, OHLCV and rank scans skip it.
-            await store.set_token_status(BTC_ID, "disqualified", "benchmark")
+            await upsert_btc(store, now, "coingecko")
             await store.add_observation(
                 BTC_ID, "coingecko", now, {"price_usd": float(btc)}
             )
