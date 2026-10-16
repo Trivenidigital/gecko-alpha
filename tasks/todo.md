@@ -1,4 +1,32 @@
-## Active Work: 2026-10-02 09:24 UTC — Overnight autonomous closeout no-build verification
+## Active Work: 2026-10-02 12:28 UTC — Overnight autonomous closeout production-push verification
+
+**Plan (evidence-only; no product build is pre-authorized by this plan):**
+
+- [x] Refresh clean `origin/master`, read automation memory, project lessons and
+  current closeout queue; create isolated closeout branch.
+- [x] Drift-check templates, operating model, reporter and current child queue;
+  do not reopen archived cockpit/trust parents or the closed pool probe.
+- [x] Run the Hermes-first discovery check and preserve the existing Gecko
+  runtime/receipt boundary unless a concrete replacement is verified.
+- [x] Verify current runtime assumptions read-only: target identity, service and
+  timer state, worker start boundary, deployed revision, and production
+  porcelain count.
+- [x] Obtain two orthogonal plan reviews; fold any evidence or scope correction.
+- [x] Write the no-build closeout report and mark this checklist/review outcome.
+- [x] Run focused reporter checks and diff validation; commit only if the
+  evidence record is reviewer-clean. No deploy, DB/config/account mutation,
+  vendor call, policy change, or trading action is in scope.
+
+**Scope boundary:** Current source contains the requested template pack, durable
+role map, status reporter, and bounded DASH-08/DASH-11 visibility. The dated
+Fable tracker is not current authority; a fresh named child is required before
+new dashboard/API work. The worker timer fired at 07:33:34Z but OAuth failed in
+`ExecStartPre` (status 21) before its main process began; this is an operator
+account gate, not autonomous completion evidence.
+
+---
+
+## Completed Work: 2026-10-02 09:24 UTC — Overnight autonomous closeout no-build verification
 
 **Plan (evidence-only):**
 
@@ -12,9 +40,9 @@
 - [x] Write a durable closeout report that distinguishes complete PR #594,
   worker pre-start failure, operator-only gates, and parked work; focused
   status-reporter tests and syntax checks pass.
-- [ ] Commit and publish the docs-only closeout after final PR review. No deploy,
-  database/config/account mutation, vendor call, policy change, or trading
-  action is in scope.
+- [x] Published as docs-only PR #595 and merged at `5bbe8e5f` after its exact
+  reviewed head passed; no deploy, database/config/account mutation, vendor
+  call, policy change, or trading action occurred.
 
 **Current evidence:** PR #594 merged into `origin/master` at `f5b2154a`; its
 reviewed head `9390a6ec` has all four checks green. At 2026-10-02T09:24:43Z,
