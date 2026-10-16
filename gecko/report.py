@@ -270,15 +270,16 @@ async def digest_text(
     ).fetchall()
     open_rows = [r for r in rows if r[5] is None]
     top = open_rows[: settings.digest_top_n]
+    # Every row, open or exited: one that entered and exited between two digests
+    # is listed under both. Keys absent (first digest): every row is new.
     seen_in = set(json.loads(await store.kv_get(SEEN_IN) or "[]"))
-    out_raw = await store.kv_get(SEEN_OUT)  # None: the first digest lists no exits
-    seen_out = set(json.loads(out_raw or "[]"))
-    new = [r for r in open_rows if r[0] not in seen_in]
-    gone = [r for r in rows if r[5] and r[0] not in seen_out] if out_raw else []
+    seen_out = set(json.loads(await store.kv_get(SEEN_OUT) or "[]"))
+    new = [r for r in rows if r[0] not in seen_in]
+    gone = [r for r in rows if r[5] and r[0] not in seen_out]
     state = {
         TOP: json.dumps([r[0] for r in top]),
         SEEN_IN: json.dumps(sorted(seen_in | {r[0] for r in new})),
-        SEEN_OUT: json.dumps(sorted(seen_out | {r[0] for r in rows if r[5]})),
+        SEEN_OUT: json.dumps(sorted(seen_out | {r[0] for r in gone})),
     }
     entry = {r[0]: json.loads(r[3]) for r in new}
     lines = [f"gecko digest {now[:10]}", f"ENTRANTS ({len(new)})"]

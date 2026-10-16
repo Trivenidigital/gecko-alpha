@@ -289,12 +289,13 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     assert rc == 0 and row == (1, 3, None)
     assert text.splitlines()[0].startswith("gecko digest 20")
     head, lines = _section(text, "ENTRANTS")
-    assert head == "ENTRANTS (2)"
+    assert head == "ENTRANTS (3)"  # every row; an exited one is also an exit
     assert lines == [
         "#1 A (solana) score 1.90 | age 3d vol7d x4.2 liq $52K top10 31% | no dossier",
         "#2 B (solana) score 1.80 | age ?d vol7d x? liq $?K top10 ?% | no dossier",
+        "#3 GONE (solana) score 1.70 | age ?d vol7d x? liq $?K top10 ?% | no dossier",
     ]
-    assert _section(text, "EXITS") == ("EXITS (0)", [])
+    assert _section(text, "EXITS") == ("EXITS (1)", ["GONE rank"])
     head, lines = _section(text, "TOP ")
     assert head == "TOP 10" and [ln.split()[1] for ln in lines] == ["A", "B"]
     assert text.splitlines()[-1] == (
@@ -384,6 +385,15 @@ async def test_digest_two_writer_race_reports_an_earlier_stamp_committed_later(
     assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["B rank"])
     head, lines = _section(text, "ENTRANTS")
     assert head == "ENTRANTS (1)" and lines[0].startswith("#3 C ")
+    await _open(store, "e", 5, entered=w)  # enters and exits between two digests
+    await store.watchlist_exit("e", w, "rank")
+    rc, (text,), _ = await _digest(store, settings)
+    head, lines = _section(text, "ENTRANTS")
+    assert head == "ENTRANTS (1)" and lines[0].startswith("#5 E ")
+    assert _section(text, "EXITS") == ("EXITS (1)", ["E rank"])
+    await _fresh(store)
+    rc, sent, _ = await _digest(store, settings)
+    assert rc == 0 and sent == []  # each reported once: silent
 
 
 async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
