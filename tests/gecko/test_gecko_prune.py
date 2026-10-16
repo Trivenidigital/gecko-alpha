@@ -70,3 +70,14 @@ def test_prune_refuses_as_of(monkeypatch, settings):
     assert main(["prune", "--as-of", "2027-01-01T00:00:00Z"]) == 2
     with sqlite3.connect(settings.db_path) as c:
         assert c.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 1
+
+
+async def test_prune_keeps_cg_unmapped_markers(store, settings):
+    # the coingecko collector's "known unmapped" marker: losing it re-spends a lookup
+    await store.add_observation("cg:nochain", "cg_unmapped", OLD, {"platforms": []})
+    await store.add_observation("cg:x", "coingecko", OLD, {"price_usd": 1})
+    assert await prune(store, settings, NOW) == (1, 0)
+    rows = await (
+        await store.conn.execute("SELECT token_id, source FROM observations")
+    ).fetchall()
+    assert rows == [("cg:nochain", "cg_unmapped")]

@@ -9,6 +9,7 @@ import structlog
 
 from gecko.jobs import JOBS, JobFn, register  # noqa: F401
 from gecko.settings import GeckoSettings
+from gecko.store import ForeignDatabase
 
 log = structlog.get_logger("gecko.main")
 
@@ -34,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="jobs:\n  "
         + "\n  ".join(sorted(JOBS))
-        + "\n\nexit codes: 0 ok, 1 failure, 2 usage",
+        + "\n\nexit codes: 0 ok, 1 failure, 2 usage or foreign database",
     )
     p.add_argument("job", nargs="?")
     p.add_argument("--list", action="store_true")
@@ -77,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         return asyncio.run(JOBS[ns.job](settings, ns))
+    except ForeignDatabase as exc:  # refused before any write: a config error
+        print(f"job {ns.job!r} refused: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001 — a crash outside run_job still exits 1
         log.error("job_crashed", job=ns.job, error=f"{type(exc).__name__}: {exc}")
         print(f"job {ns.job!r} crashed: {type(exc).__name__}: {exc}", file=sys.stderr)

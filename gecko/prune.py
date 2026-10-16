@@ -38,7 +38,9 @@ async def prune(
 ) -> tuple[int, int]:
     obs_cut = _ago(now, settings.obs_retention_days)
     runs_cut = _ago(now, settings.runs_retention_days)
-    obs_where = "observed_at<? AND token_id!=?"
+    # cg_unmapped markers record "this coin has no supported platform"; pruning
+    # one makes the coingecko collector spend a /coins lookup on it again.
+    obs_where = "observed_at<? AND token_id!=? AND NOT (source='cg_unmapped')"
     runs_where = (
         "finished_at<? AND id NOT IN (SELECT MIN(id) FROM runs WHERE ok=1 GROUP BY job)"
     )

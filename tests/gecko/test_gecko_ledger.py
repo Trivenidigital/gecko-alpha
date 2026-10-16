@@ -320,7 +320,7 @@ async def test_missing_entry_price_waits_then_finalizes_all_horizons(store, sett
             "FROM forward_returns ORDER BY horizon_days"
         )
     ).fetchall()
-    assert rows == [(None, 0.0, None, None, late, 0)] * 5
+    assert rows == [(None, None, None, None, late, 0)] * 5
     assert await one(
         store,
         "SELECT exit_reason, entry_price FROM watchlist WHERE token_id='solana:abc'",
@@ -795,7 +795,59 @@ async def test_overdue_row_expires_unmeasured(store, settings):
 
 async def test_close_unmeasured_is_write_once(store):
     await seed(store)
-    assert await store.close_unmeasured("solana:abc", 1, "2026-10-20T00:00:00Z") is True
     assert (
-        await store.close_unmeasured("solana:abc", 1, "2026-10-21T00:00:00Z") is False
+        await store.close_unmeasured("solana:abc", 1, "2026-10-20T00:00:00Z", "expired")
+        is True
     )
+    assert (
+        await store.close_unmeasured("solana:abc", 1, "2026-10-21T00:00:00Z", "expired")
+        is False
+    )
+
+
+async def test_ledger_expiry_writes_closed_reason_expired_and_is_not_counted_in_rows_written(
+    settings,
+):
+    from gecko.store import Store
+
+    s = await Store.open(settings.db_path)
+    try:
+        await seed(s, btc=False)  # BTC gap at entry: rows stay due until expiry
+        await s.add_observation(
+            "benchmark:btc", "coingecko", "2026-10-19T23:00:00Z", {"price_usd": 7e4}
+        )
+    finally:
+        await s.close()
+    later = "2026-10-20T00:00:00Z"  # 1-day row 18 d overdue: expires
+    with aioresponses():
+        rc = await gecko.ledger.ledger_job(settings, argparse.Namespace(as_of=later))
+    assert rc == 0
+    s = await Store.open(settings.db_path)
+    try:
+        assert await one(
+            s,
+            "SELECT measured_at, ret, closed_reason FROM forward_returns "
+            "WHERE horizon_days=1",
+        ) == (later, None, "expired")
+        assert await one(s, "SELECT job, ok, rows_written FROM runs") == (
+            "ledger",
+            1,
+            0,
+        )
+    finally:
+        await s.close()
+
+
+async def test_no_entry_price_writes_closed_reason(store, settings):
+    await seed(store, token_obs=False)
+    late = "2026-10-03T01:00:00Z"  # E+49h: the 48h window has closed
+    async with aiohttp.ClientSession() as s:
+        with aioresponses():
+            r = await measure_due(store, settings, s, late)
+    assert r.unmeasurable == 5
+    rows = await (
+        await store.conn.execute(
+            "SELECT ret, measured_at, closed_reason FROM forward_returns"
+        )
+    ).fetchall()
+    assert rows == [(None, late, "no_entry_price")] * 5

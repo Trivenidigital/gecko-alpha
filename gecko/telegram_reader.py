@@ -108,7 +108,7 @@ async def poll_once(
                 written += 1
     now = canon_ts(now) or utcnow()  # test seam: a fixed clock, no date bomb
     since = canon_ts((parse_utc(now) - timedelta(days=RESOLVE_DAYS)).isoformat())
-    await resolve_calls(store, now, since=since)
+    await resolve_calls(store, settings, now, since=since)
     return written, failed
 
 
@@ -232,7 +232,7 @@ async def migrate_calls_job(settings: GeckoSettings, ns) -> int:
                     )
                 ).fetchall()
             ]
-        resolved = await resolve_calls(store, utcnow(), since=None)
+        resolved = await resolve_calls(store, settings, utcnow(), since=None)
         print(f"migrated {n} call(s), resolved {resolved}")
         print(f"GECKO_TG_CHANNELS={json.dumps(chans)}")
         return JobResult(rows_written=n)
