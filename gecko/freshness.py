@@ -62,8 +62,9 @@ WRITER_JOBS = {
 }
 # Writers outside Hermes cron: no incident path, so freshness pages their failures.
 NON_CRON_WRITERS = frozenset({"telegram-reader"})
-# Tables whose writer may legitimately write 0 rows (silent channels, an empty
-# watchlist, nothing due); judged by its last ok run.
+# Freshness keys whose writer job may legitimately write 0 rows (silent
+# channels, an empty watchlist, nothing due, nothing to prune); judged by the
+# writer's last ok run, not by any table's newest row.
 RUN_ANCHORED = frozenset(
     {"watchlist", "forward_returns", "research_notes", "source_calls", "prune"}
 )
@@ -166,8 +167,10 @@ async def _oldest_overdue(store: Store, now: str) -> str | None:
 
 async def _skip(store: Store, table: str, settings: GeckoSettings | None) -> bool:
     """Keys judged only once their lane is switched on."""
-    if table == "research_notes" and (
-        settings is None or settings.anthropic_api_key is None
+    if table == "research_notes" and not (
+        settings
+        and settings.anthropic_api_key
+        and settings.anthropic_api_key.get_secret_value()
     ):
         log.debug("freshness_key_skipped", key=table)
         return True
@@ -206,6 +209,10 @@ async def check_freshness(
             # An empty table is measured from the writer's first ok run, so a
             # writer that just started gets one SLO window to produce rows.
             anchor = last if last is not None else first_run
+            if table == "source_calls:rows":
+                # Old history or catch-up rows must not page before the reader
+                # has polled ok for a full SLO window.
+                anchor = max(anchor, first_run, key=parse_utc)
         if now_dt - parse_utc(anchor) > timedelta(minutes=slo):
             out.append(Breach(table, last, slo))
     # Needs no bootstrap: no scheduled row, no backlog. A ledger that never

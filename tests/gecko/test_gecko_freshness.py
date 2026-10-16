@@ -701,6 +701,10 @@ async def test_research_key_skipped_without_api_key(store, settings):
         assert [(e["key"], e["log_level"]) for e in skipped] == [
             ("research_notes", "debug")
         ]
+    settings.anthropic_api_key = SecretStr("")  # an empty key is no key
+    assert "research_notes" not in {
+        b.table for b in await check_freshness(store, late, settings)
+    }
     settings.anthropic_api_key = SecretStr("k")
     assert "research_notes" in {
         b.table for b in await check_freshness(store, late, settings)
@@ -744,3 +748,30 @@ def _tg_url():
     from yarl import URL
 
     return URL(TG_URL)
+
+
+async def test_source_calls_rows_old_history_waits_a_full_window_of_ok_polls(
+    store, settings
+):
+    # a call posted 10 days before the reader's first ok poll (migrated history
+    # or catch-up) must not page until the reader has polled ok for 72 h
+    settings.tg_channels = ["@a"]
+    first_ok = "2026-10-11T00:00:00Z"
+    old = "2026-10-01T00:00:00Z"
+    await store.conn.execute(
+        "INSERT INTO source_calls(source_type,source_id,event_id,posted_at,text_hash) "
+        "VALUES('telegram','@a','@a:1',?,'h')",
+        (old,),
+    )
+    await store.conn.commit()
+    await _reader_ok_every_30_min(store, first_ok, 73)
+    assert "source_calls:rows" not in {
+        b.table
+        for b in await check_freshness(store, _plus_from(first_ok, 71 * 60), settings)
+    }
+    hit = [
+        b
+        for b in await check_freshness(store, _plus_from(first_ok, 73 * 60), settings)
+        if b.table == "source_calls:rows"
+    ]
+    assert hit == [Breach("source_calls:rows", old, 4320)]
