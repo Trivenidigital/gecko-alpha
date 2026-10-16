@@ -513,14 +513,17 @@ async def test_digest_health_lists_current_freshness_breaches(store, settings):
     )
 
 
-async def test_digest_treats_schema_version_0_note_as_no_dossier(store, settings):
+async def test_digest_renders_a_marker_as_dossier_failed(store, settings):
+    # D2: a paid call that gave no dossier is not "no dossier"; never a verdict
     await _open(store, "a", 1)
     await store.conn.execute(
         "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
-        "note_json) VALUES('a','2026-10-02T00:00:00Z','m',0,'{\"verdict\":\"x\"}')"
+        "note_json) VALUES('a','2026-10-02T00:00:00Z','m',0,"
+        '\'{"verdict":"x","reason":"paused_turn_abandoned"}\')'
     )
     await store.conn.commit()
-    assert (await _top_lines(store, settings))[0].endswith("| no dossier")
+    line = (await _top_lines(store, settings))[0]
+    assert line.endswith("| dossier failed (paused_turn_abandoned)")
 
 
 async def test_digest_marker_over_older_valid_note_keeps_verdict(store, settings):

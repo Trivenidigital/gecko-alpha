@@ -6,6 +6,9 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_CHAINS = ("solana", "base", "ethereum", "bsc")
+EST_NEXT_USD = (
+    0.10  # research: assumed cost of the next dossier, checked against the cap
+)
 OPTIONAL_SECRETS = (  # credentials and chat ids: a blank value means unset
     "tg_api_hash",
     "coingecko_demo_api_key",
@@ -89,7 +92,7 @@ class GeckoSettings(BaseSettings):
     anthropic_base_url: str = "https://api.anthropic.com"
     research_model: str = "claude-sonnet-5-5"
     research_max_per_run: int = Field(10, ge=0)
-    research_daily_usd_cap: float = Field(1.5, ge=0)
+    research_daily_usd_cap: float = Field(1.5, ge=EST_NEXT_USD)  # below: never runs
     research_max_searches: int = Field(5, ge=0, le=20)
     research_usd_per_mtok_in: float = Field(2.0, ge=0)
     research_usd_per_mtok_out: float = Field(10.0, ge=0)

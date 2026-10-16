@@ -265,6 +265,28 @@ async def test_research_paid_failures_write_markers(store, keyed):
     assert (res.rows_written, res.credits_used) == (1, 1)
 
 
+@pytest.mark.parametrize("bad", ["not json", {"no": "content"}, "payload_error"])
+async def test_research_unreadable_200_body_is_billed(store, keyed, monkeypatch, bad):
+    # D1: a 200 was billed even when its body cannot be read or parsed
+    await _tok(store, "aa")
+    if bad == "payload_error":
+
+        async def broken(self, *a, **k):
+            raise aiohttp.ClientPayloadError("truncated")
+
+        monkeypatch.setattr(aiohttp.ClientResponse, "text", broken)
+    with aioresponses() as m:
+        if isinstance(bad, dict):
+            m.post(API, payload=bad)
+        else:
+            m.post(API, body=bad)
+        with pytest.raises(PartialFailure) as ei:  # still no dossier at all
+            await _run(store, keyed)
+    assert (ei.value.rows_written, ei.value.credits_used) == (1, 1)
+    [(tid, _, ver, note, cost)] = await _notes(store)
+    assert (tid, ver, note["reason"], cost) == ("aa", 0, "body_error", 0.10)
+
+
 async def test_research_marker_blocks_a_token_for_seven_days(store, keyed):
     marker = {"status": "invalid", "reason": "invalid_json"}
     await _tok(store, "m8")

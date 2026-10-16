@@ -133,12 +133,17 @@ def test_ai_layer_bounds(tmp_path):
     ok = dict(
         research_max_searches=20,
         research_max_per_run=0,
-        research_daily_usd_cap=0,
+        research_daily_usd_cap=0.10,  # D2: the floor is one dossier's estimate
         digest_top_n=50,
         scorecard_min_n=1,
         log_format="console",
     )
     assert GeckoSettings(db_path=db, _env_file=None, **ok)
+    from gecko import research, settings
+
+    assert (
+        research.EST_NEXT_USD == settings.EST_NEXT_USD == ok["research_daily_usd_cap"]
+    )
     assert GeckoSettings(db_path=db, digest_top_n=1, _env_file=None)
     for n in (256, 8192):
         assert GeckoSettings(db_path=db, research_max_tokens=n, _env_file=None)
@@ -152,7 +157,7 @@ def test_ai_layer_bounds(tmp_path):
         {"research_max_searches": 21},
         {"research_max_searches": -1},
         {"research_max_per_run": -1},
-        {"research_daily_usd_cap": -0.01},
+        {"research_daily_usd_cap": 0.09},  # below EST_NEXT_USD: research never runs
         {"digest_top_n": 0},
         {"digest_top_n": 51},
         {"scorecard_min_n": 0},

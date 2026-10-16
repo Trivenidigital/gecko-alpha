@@ -16,13 +16,12 @@ from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 from gecko.jobs import register
 from gecko.numeric import finite, num
 from gecko.runs import JobResult, PartialFailure, run_job
-from gecko.settings import GeckoSettings
+from gecko.settings import EST_NEXT_USD, GeckoSettings
 from gecko.store import Store, canon_ts, iso_plus, utcnow
 
 log = structlog.get_logger("gecko.research")
 
 SCHEMA_VERSION = 1  # 0 = a paid reply that gave no dossier (a marker)
-EST_NEXT_USD = 0.10  # assumed cost of the next dossier, checked against the cap
 RETRY_DELAY_SEC = 10
 MARKER_RETRY_DAYS = 7  # a marker blocks a token this long; a valid note forever
 TEXT_CAPS = {"what_it_is": 400, "team_or_deployer_history": 400, "narrative_fit": 300}
@@ -106,6 +105,10 @@ def _cost(settings: GeckoSettings, reply: dict) -> float:
     return max(0.0, usd / 1e6 + (searches or 0) * settings.research_usd_per_search)
 
 
+class BodyError(ValueError):
+    """A 200 whose body could not be read or parsed: the call was billed."""
+
+
 class MessagesError(Exception):
     def __init__(self, status: int):
         super().__init__(f"messages api status {status}")
@@ -115,7 +118,8 @@ class MessagesError(Exception):
 async def _post_messages(
     session: aiohttp.ClientSession, settings: GeckoSettings, body: dict
 ) -> dict:
-    """One Messages API call; a non-200 status or a malformed body raises."""
+    """One Messages API call; a non-200 status raises ``MessagesError``, an
+    unreadable or malformed 200 body ``BodyError``."""
     async with session.post(
         settings.anthropic_base_url.rstrip("/") + "/v1/messages",
         json=body,
@@ -131,9 +135,12 @@ async def _post_messages(
     ) as resp:
         if resp.status != 200:
             raise MessagesError(resp.status)
-        data = json.loads(await resp.text())
+        try:
+            data = json.loads(await resp.text())
+        except (ValueError, aiohttp.ClientPayloadError) as exc:
+            raise BodyError(type(exc).__name__) from exc
     if not isinstance(data, dict) or not isinstance(data.get("content"), list):
-        raise ValueError("messages api body has no content list")
+        raise BodyError("messages api body has no content list")
     return data
 
 
@@ -212,12 +219,15 @@ async def research(
             except (MessagesError, aiohttp.ClientError, TimeoutError, ValueError) as e:
                 status, error = getattr(e, "status", None), type(e).__name__
                 log.warning("research_failed", token_id=tid, status=status, error=error)
-                # a timeout after the request went out is usually completed and billed
-                sent = isinstance(e, TimeoutError) and not isinstance(e, UNSENT)
+                # a timeout after the request went out is usually completed and
+                # billed; a 200 with an unreadable body certainly was
+                timed_out = isinstance(e, TimeoutError) and not isinstance(e, UNSENT)
+                sent = timed_out or isinstance(e, BodyError)
                 if not (replies or sent):
                     failed += 1
                     continue
-                reason = "timeout" if sent else "resend_failed"
+                reason = "timeout" if timed_out else "resend_failed"
+                reason = "body_error" if isinstance(e, BodyError) else reason
                 unbilled = EST_NEXT_USD if sent else 0.0
             if reason is None:
                 text = "".join(

@@ -186,19 +186,23 @@ def _val(v, spec: str, scale: float = 1.0) -> str:
 async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     """``#rank SYMBOL (chain) score … | features | verdict`` plus a flags line."""
     tid, rank, score, sym, chain = row[0], row[1], row[2], row[7], row[8]
-    note = await (
+    # a valid note wins; else the newest marker (a paid call that gave none)
+    row = await (
         await store.conn.execute(
-            "SELECT note_json FROM research_notes WHERE token_id=? "
-            "AND schema_version<>0 ORDER BY created_at DESC, id DESC LIMIT 1",
+            "SELECT note_json, schema_version FROM research_notes WHERE token_id=? "
+            "ORDER BY schema_version<>0 DESC, created_at DESC, id DESC LIMIT 1",
             (tid,),
         )
     ).fetchone()
     try:
-        note = json.loads(note[0]) if note else None
+        note = json.loads(row[0]) if row else None
     except ValueError:
         note = "bad"
     flags: list = []
-    if note is None:
+    if row and row[1] == 0:
+        reason = note.get("reason") if isinstance(note, dict) else None
+        verdict = f"dossier failed ({_clean(reason, 24)})"
+    elif note is None:
         verdict = "no dossier"
     elif not isinstance(note, dict):
         verdict = "bad dossier"
