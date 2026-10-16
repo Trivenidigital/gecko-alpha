@@ -461,13 +461,16 @@ async def test_hourly_logs_missing_btc_price(store, cg_settings):
 
     with aioresponses() as m:
         m.get(TRENDING, payload={"coins": []})
-        m.get(PRICE, payload={})
+        m.get(PRICE, payload={"status": {"error_message": "body-text"}})
         async with aiohttp.ClientSession() as s:
             with capture_logs() as logs:
                 r = await hourly(store, cg_settings, s, NOW, sleep=RecordingSleep())
     assert r.credits_used == 2 and r.rows_written == 0
     missing = [e for e in logs if e["event"] == "cg_btc_price_missing"]
     assert len(missing) == 1 and missing[0]["log_level"] == "warning"
+    # E2: the value's type and keys only, never the body
+    assert (missing[0]["kind"], missing[0]["keys"]) == ("dict", ["status"])
+    assert "body-text" not in repr(missing[0])
     assert await store.observations("benchmark:btc", as_of=NOW) == []
 
 

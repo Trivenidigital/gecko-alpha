@@ -450,10 +450,23 @@ async def test_every_fetch_failing_raises_partial_failure(store, settings):
     await tok(store, "base", A)
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
-            m.get(BASE_URL + A, status=400)
+            m.get(BASE_URL + A, status=503)  # transient: no marker, a real failure
             with pytest.raises(PartialFailure) as ei:
                 await enrich(store, settings, s, NOW, sleep=_nosleep)
     assert ei.value.credits_used == 1
+
+
+async def test_all_marker_run_is_not_a_failure(store, settings):
+    # E5: a deterministic 2xxx/4xx marker is a written verdict, not a failure
+    b = "0x" + "b" * 40
+    for addr in (A, b):
+        await tok(store, "base", addr)
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 2004, "result": {}})
+            m.get(BASE_URL + b, status=404)
+            r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert (r.rows_written, r.credits_used) == (2, 2)
 
 
 async def test_solana_uses_solana_endpoint(store, settings):
@@ -750,8 +763,7 @@ async def test_marked_candidate_requeued_after_refresh_hours(store, settings):
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
             m.get(BASE_URL + A, status=404)
-            with pytest.raises(PartialFailure):
-                await enrich(store, settings, s, NOW, sleep=_nosleep)
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
     (o,) = await enrich_rows(store, tid)
     assert o.features["goplus_status"] == "error"
     hours = settings.gp_refresh_hours

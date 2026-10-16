@@ -26,6 +26,9 @@ WRITER_JOBS = (
     "ledger",
     "freshness",
     "prune",
+    "research",
+    "digest",
+    "scorecard",
 )
 
 Line = tuple[str, str, str]  # (OK|WARN|FAIL, check name, detail)
@@ -50,6 +53,7 @@ async def _db_checks(settings: GeckoSettings) -> list[Line]:
         return [("FAIL", "db_path", f"not absolute: {settings.db_path!r}")]
     if not os.access(path.parent, os.W_OK):
         return [("FAIL", "db_path", f"parent {path.parent} missing or not writable")]
+    existed = path.exists()  # Store.open would create a missing file silently
     try:
         store = await Store.open(str(path))
     except ForeignDatabase as exc:
@@ -66,7 +70,13 @@ async def _db_checks(settings: GeckoSettings) -> list[Line]:
         ).fetchall()
     finally:
         await store.close()
-    out: list[Line] = [("OK", "db_path", f"{path} (application_id stamped)")]
+    out: list[Line] = [
+        (
+            ("OK", "db_path", f"{path} (application_id stamped)")
+            if existed
+            else ("WARN", "db_path", f"{path} did not exist: created new empty DB")
+        )
+    ]
     ran = {r[0] for r in rows}
     missing = [j for j in WRITER_JOBS if j not in ran]
     for job in missing:

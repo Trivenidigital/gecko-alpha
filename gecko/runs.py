@@ -59,7 +59,9 @@ async def run_job(name: str, settings: GeckoSettings, fn: JobBody) -> int:
                     credits_used=partial.credits_used if partial else 0,
                     error=err,
                 )
-                log.error("job_failed", job=name, error=str(exc))
+                # the type only: the message can carry an upstream body or a URL;
+                # the runs row (operator-readable) keeps the full text
+                log.error("job_failed", job=name, error=type(cause).__name__)
                 return 1
         await store.record_run(
             name,

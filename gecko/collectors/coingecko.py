@@ -338,7 +338,8 @@ async def hourly(
             )
             written += 1
         else:
-            log.warning("cg_btc_price_missing", body=price)
+            keys = sorted(map(str, price))[:8] if isinstance(price, dict) else None
+            log.warning("cg_btc_price_missing", kind=type(price).__name__, keys=keys)
         return JobResult(rows_written=written, credits_used=cg.calls)
     except Exception as exc:
         raise PartialFailure(exc, credits_used=cg.calls, rows_written=written) from exc

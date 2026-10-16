@@ -280,6 +280,31 @@ def test_stored_price_is_earliest_across_tables(tmp_path):
     assert load_study(str(tmp_path), str(tmp_path / "scout.db")) == []
 
 
+def test_stored_prices_skips_only_absent_tables(tmp_path):
+    # E3: an absent table is skipped and named; any other OperationalError raises
+    from contextlib import closing
+
+    from structlog.testing import capture_logs
+
+    from gecko.backtest.study import STORED_QUERIES, _stored_prices
+
+    db = tmp_path / "h.db"
+    with closing(sqlite3.connect(db)) as c:
+        c.execute(
+            "CREATE TABLE predictions(coin_id, predicted_at, price_at_prediction)"
+        )
+        c.commit()
+    with capture_logs() as logs:
+        assert _stored_prices(str(db)) == {}
+    absent = [e["table"] for e in logs if e["event"] == "study_stored_table_absent"]
+    assert absent == [q.split(" FROM ")[1].split()[0] for q in STORED_QUERIES[1:]]
+    with closing(sqlite3.connect(db)) as c:
+        c.execute("CREATE TABLE paper_trades(x)")  # drifted schema, not absent
+        c.commit()
+    with pytest.raises(sqlite3.OperationalError, match="no such column"):
+        _stored_prices(str(db))
+
+
 def test_history_db_open_leaves_no_sidecars(tmp_path):
     write_study(tmp_path, {"a": coin(10, 1.0, 2.0)})
     db = sqlite3.connect(tmp_path / "scout.db")

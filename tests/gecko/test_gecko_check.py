@@ -22,6 +22,9 @@ WRITERS = (
     "ledger",
     "freshness",
     "prune",
+    "research",  # E4: the AI-layer writers own freshness keys too
+    "digest",
+    "scorecard",
 )
 GIB = 1024**3
 _Usage = namedtuple("_Usage", "total used free")
@@ -104,7 +107,9 @@ def test_check_reports_missing_keys_as_warn_and_missing_telegram_as_fail(
     assert by["anthropic"] == ["WARN not set: GECKO_ANTHROPIC_API_KEY, research dark"]
     # no channels configured: reader not activated, a WARN
     assert by["telegram_reader"][0].startswith("WARN")
-    assert by["db_path"][0].startswith("OK")
+    # E4: a missing file is created by the open: never reported as OK
+    assert by["db_path"][0].endswith("did not exist: created new empty DB")
+    assert by["db_path"][0].startswith("WARN")
     assert by["chains"][0].startswith("OK")
     assert by["retention"][0].startswith("OK")
     # the only FAIL is telegram

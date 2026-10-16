@@ -101,8 +101,13 @@ def _stored_prices(history_db: str | None) -> dict[str, tuple[str, float]]:
         for q in STORED_QUERIES:
             try:
                 rows = conn.execute(q).fetchall()
-            except sqlite3.OperationalError:
-                continue  # table absent from this history snapshot
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc):
+                    raise  # a locked or corrupt history db is not an absent table
+                log.info(
+                    "study_stored_table_absent", table=q.split(" FROM ")[1].split()[0]
+                )
+                continue
             for cid, ts, p in rows:
                 if cid and p and p > 0:
                     ts = str(ts).replace(" ", "T")[:19]

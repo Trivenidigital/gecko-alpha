@@ -319,6 +319,10 @@ async def enrich(
                 if code is not None:  # deterministic: retrying next run is waste
                     marker = {"goplus_status": "error", "code": code}
                     await store.add_observation(tid, "enrich", now, marker)
+                    written, failed = (
+                        written + 1,
+                        failed - 1,
+                    )  # a verdict, not a failure
                 continue
             except ValueError as exc:  # non-JSON body
                 failed += 1
