@@ -32,9 +32,6 @@ def disqualify(f: Features, settings: GeckoSettings) -> str | None:
     """First disqualifier that fires, checked in a fixed order, or None."""
     if f.security_structural is False:
         return "security_fail"
-    # A tax-only failure is re-read, not terminal: rank_once keeps it a candidate.
-    if f.security_ok is False:
-        return "security_tax"
     if f.top10_pct is not None and f.top10_pct > settings.top10_disqualify_pct:
         return "concentration"
     # No fresh DEX reading is absence, not thinness: only "dead" judges it.
@@ -45,6 +42,10 @@ def disqualify(f: Features, settings: GeckoSettings) -> str | None:
         f.observed_at
     ) > timedelta(days=settings.dead_after_days):
         return "dead"
+    # Last: a tax-only failure is re-read, not terminal (rank_once keeps it a
+    # candidate), so every terminal gate above must get to retire it first.
+    if f.security_ok is False:
+        return "security_tax"
     return None
 
 

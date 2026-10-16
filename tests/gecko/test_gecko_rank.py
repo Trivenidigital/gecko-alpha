@@ -54,13 +54,15 @@ def test_disqualify_precedence(settings):
     )
     assert disqualify(feat(**everything), settings) == "security_fail"
     everything["security_structural"] = True
-    assert disqualify(feat(**everything), settings) == "security_tax"
-    everything["security_ok"] = True
     assert disqualify(feat(**everything), settings) == "concentration"
     everything["top10_pct"] = None
     assert disqualify(feat(**everything), settings) == "liquidity"
     everything["liquidity_gate_usd"] = 300_000.0
     assert disqualify(feat(**everything), settings) == "dead"
+    everything["observed_at"] = A
+    assert disqualify(feat(**everything), settings) == "security_tax"
+    everything["security_ok"] = True
+    assert disqualify(feat(**everything), settings) is None
 
 
 def test_f4_boundaries(settings):
@@ -606,12 +608,10 @@ def test_disqualifier_order_structural_before_tax(settings):
     # both flags fired: structural is checked first and is terminal
     both = feat(security_ok=False, security_structural=False, top10_pct=99.0)
     assert disqualify(both, settings) == "security_fail"
-    # tax-only (structural clean or unknown) precedes concentration
-    tax = feat(security_ok=False, security_structural=True, top10_pct=99.0)
+    # tax-only (structural clean or unknown) and nothing else fires: security_tax
+    tax = feat(security_ok=False, security_structural=True)
     assert disqualify(tax, settings) == "security_tax"
-    assert disqualify(feat(security_ok=False, top10_pct=99.0), settings) == (
-        "security_tax"
-    )
+    assert disqualify(feat(security_ok=False), settings) == "security_tax"
     # a structural flag disqualifies even when security_ok is not False
     assert disqualify(feat(security_structural=False), settings) == "security_fail"
 
@@ -677,3 +677,48 @@ async def test_structural_flag_disqualifies(store, settings):
     )
     assert row == ("security_fail",)
     assert await _status(store, "solana:good") == ("disqualified", "security_fail")
+
+
+def test_dead_or_concentrated_beats_tax(settings):
+    # a terminal gate retires a tax-flagged token instead of re-reading it forever
+    tax = dict(security_ok=False, security_structural=True)
+    assert disqualify(feat(top10_pct=99.0, **tax), settings) == "concentration"
+    eight_days = "2026-10-07T00:00:00Z"  # 8 d before A
+    assert disqualify(feat(observed_at=eight_days, **tax), settings) == "dead"
+
+
+async def test_security_tax_crash_recovery_exits_next_run(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    # a crash landed between the status demotion and the watchlist exit
+    await store.set_token_status("solana:good", "candidate", "security_tax")
+    assert [w.token_id for w in await store.active_watchlist()] == ["solana:good"]
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 1
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_tax",)
+    assert await _status(store, "solana:good") == ("candidate", "security_tax")
+
+
+async def test_security_tax_exit_keeps_forward_returns_schedule(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited_tax == 1
+    await store.repair_schedules()
+    rows = await (
+        await store.conn.execute(
+            "SELECT horizon_days, due_at FROM forward_returns "
+            "WHERE token_id='solana:good' ORDER BY horizon_days"
+        )
+    ).fetchall()
+    assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
+    assert rows[0][1] == "2026-10-16T00:00:00Z"
