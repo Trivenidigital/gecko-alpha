@@ -30,6 +30,7 @@ OK_CODES = (
     1,
     2,
 )  # 2 = partial data: parsed, and any missing core flag reads as unknown
+RATE_LIMITED = 4029  # GoPlus throttling inside a 200 body: transient
 MAX_TAX = 0.10
 # Launch taxes often drop within hours: a tax-only failure is re-read, not final.
 TAX_FLAGS = {"buy_tax", "sell_tax"}
@@ -240,7 +241,8 @@ def _error_code(exc: Exception):
     """The code to mark a deterministic failure with, or None to retry next run.
 
     A GoPlus error code (not 1) or a 4xx other than 429 is deterministic; 429,
-    5xx and transport errors (status 0) are transient.
+    5xx and transport errors (status 0) are transient. GoPlus 4029 (throttled)
+    never reaches here: enrich stops the run on it.
     """
     if isinstance(exc, GoPlusError):
         return exc.code if exc.code != 1 else None
@@ -277,6 +279,7 @@ async def enrich(
     todo = queue[: min(settings.gp_max_per_run, budget)]
     pacer = Pacer(settings.gp_min_interval_sec, sleep)
     calls = written = failed = disq = unknown = 0
+    throttled = False
     try:  # a crash (e.g. a lock timeout) still charges the calls already made
         for tid, chain, address in todo:
             await pacer.wait()
@@ -285,6 +288,11 @@ async def enrich(
                 r = await _fetch(session, settings, chain, address)
             except (UpstreamError, GoPlusError) as exc:
                 failed += 1
+                if str(getattr(exc, "code", None)) == str(RATE_LIMITED):
+                    # stop: the rest of the budget would only hit a throttled upstream
+                    throttled = True
+                    log.warning("goplus_rate_limited", token_id=tid, code=exc.code)
+                    break
                 log.warning(
                     "goplus_fetch_failed",
                     token_id=tid,
@@ -332,7 +340,7 @@ async def enrich(
         budget_left=budget - calls,
         enrich_queue_len=len(queue),
     )
-    if todo and failed == len(todo):
+    if todo and (failed == len(todo) or (throttled and written == 0)):
         raise PartialFailure(
             RuntimeError("every GoPlus fetch failed"), credits_used=calls
         )

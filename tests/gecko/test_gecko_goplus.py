@@ -440,7 +440,7 @@ async def test_error_code_counts_failure_and_other_tokens_continue(store, settin
     tb = await tok(store, "base", B)
     async with aiohttp.ClientSession() as s:
         with aioresponses() as m:
-            m.get(BASE_URL + A, payload={"code": 4029, "message": "rate"})
+            m.get(BASE_URL + A, payload={"code": 4012, "message": "bad"})
             m.get(BASE_URL + B, payload={"code": 1, "result": {B: evm()}})
             r = await enrich(store, settings, s, NOW, sleep=_nosleep)
     assert r.rows_written == 1 and len(await enrich_rows(store, tb)) == 1
@@ -761,3 +761,36 @@ def test_enrich_refuses_as_of(monkeypatch, settings, capsys):
     assert "enrich is live-only" in capsys.readouterr().err
     assert ran == []
     assert gecko.__main__.main(["enrich"]) == 0 and ran == [None]
+
+
+async def test_4029_is_transient_and_stops_run(store, settings):
+    # GoPlus throttling inside a 200 body: no marker, and no more calls this run
+    from structlog.testing import capture_logs
+
+    C = "0x" + "c" * 40
+    ta, tb, tc = [await tok(store, "base", x, status="candidate") for x in (A, B, C)]
+    rate = {"code": 4029, "message": "too many requests"}
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm()}})
+            m.get(BASE_URL + B, payload=rate)
+            with capture_logs() as logs:
+                r = await enrich(store, settings, s, NOW, sleep=_nosleep)
+            assert len(m.requests) == 2  # C was never called
+    assert r.rows_written == 1 and r.credits_used == 2
+    assert await enrich_rows(store, tb) == [] and await enrich_rows(store, tc) == []
+    (ev,) = [e for e in logs if e["event"] == "goplus_rate_limited"]
+    assert ev["token_id"] == tb and ev["code"] == 4029
+    (done,) = [e for e in logs if e["event"] == "enrich_done"]
+    assert done["failed"] == 1
+    q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+    assert q == [tb, tc]  # still never-enriched, still at the head
+    # throttled before anything was written: the run fails
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + B, payload=rate)
+            with pytest.raises(PartialFailure) as ei:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+            assert len(m.requests) == 1
+    assert ei.value.credits_used == 1
+    assert await enrich_rows(store, tb) == []
