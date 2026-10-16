@@ -71,6 +71,22 @@ class GeckoSettings(BaseSettings):
     telegram_health_chat_id: str | None = None
     young_chain_launch_dates: dict[str, str] = {}  # chain -> ISO date
 
+    # AI layer: research, digest, scorecard
+    anthropic_api_key: SecretStr | None = None
+    anthropic_base_url: str = "https://api.anthropic.com"
+    research_model: str = "claude-sonnet-5-5"
+    research_max_per_run: int = Field(10, ge=0)
+    research_daily_usd_cap: float = Field(1.5, ge=0)
+    research_max_searches: int = Field(5, ge=0, le=20)
+    research_usd_per_mtok_in: float = 2.0
+    research_usd_per_mtok_out: float = 10.0
+    research_usd_per_search: float = 0.01
+    research_max_tokens: int = 2000
+    telegram_digest_chat_id: str | None = None
+    digest_top_n: int = Field(10, ge=1, le=50)
+    scorecard_min_n: int = Field(20, ge=1)
+    log_format: str = "json"  # "json" | "console"
+
     obs_retention_days: int = 180
     # >= 35: calls_this_month sums runs back to the 1st of the month
     runs_retention_days: int = Field(90, ge=35)
@@ -89,6 +105,13 @@ class GeckoSettings(BaseSettings):
         bad = [c for c in v if c not in SUPPORTED_CHAINS]
         if bad:
             raise ValueError(f"unsupported chains: {bad}")
+        return v
+
+    @field_validator("log_format")
+    @classmethod
+    def _log_format_known(cls, v: str) -> str:
+        if v not in ("json", "console"):
+            raise ValueError(f"log_format must be 'json' or 'console', got {v!r}")
         return v
 
     @field_validator("tg_channels")

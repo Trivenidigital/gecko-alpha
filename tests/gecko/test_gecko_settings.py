@@ -89,3 +89,61 @@ def test_channel_normalisation(tmp_path, monkeypatch):
     for bad in (["@Foo", "t.me/foo"], ["@"], ["  "], ["https://t.me/"]):
         with pytest.raises(ValueError):
             GeckoSettings(db_path=db, tg_channels=bad, _env_file=None)
+
+
+def test_ai_layer_defaults(tmp_path):
+    s = GeckoSettings(db_path=str(tmp_path / "g.db"), _env_file=None)
+    assert s.anthropic_api_key is None
+    assert s.research_model == "claude-sonnet-5-5"
+    assert s.research_max_per_run == 10
+    assert s.research_daily_usd_cap == 1.5
+    assert s.research_max_searches == 5
+    assert s.research_usd_per_mtok_in == 2.0
+    assert s.research_usd_per_mtok_out == 10.0
+    assert s.research_usd_per_search == 0.01
+    assert s.research_max_tokens == 2000
+    assert s.telegram_digest_chat_id is None
+    assert s.digest_top_n == 10
+    assert s.scorecard_min_n == 20
+    assert s.anthropic_base_url == "https://api.anthropic.com"
+    assert s.log_format == "json"
+
+
+def test_ai_layer_bounds(tmp_path):
+    import pytest
+    from pydantic import ValidationError
+
+    db = str(tmp_path / "g.db")
+    ok = dict(
+        research_max_searches=20,
+        research_max_per_run=0,
+        research_daily_usd_cap=0,
+        digest_top_n=50,
+        scorecard_min_n=1,
+        log_format="console",
+    )
+    assert GeckoSettings(db_path=db, _env_file=None, **ok)
+    assert GeckoSettings(db_path=db, digest_top_n=1, _env_file=None)
+    for bad in (
+        {"research_max_searches": 21},
+        {"research_max_searches": -1},
+        {"research_max_per_run": -1},
+        {"research_daily_usd_cap": -0.01},
+        {"digest_top_n": 0},
+        {"digest_top_n": 51},
+        {"scorecard_min_n": 0},
+        {"log_format": "xml"},
+    ):
+        with pytest.raises(ValidationError):
+            GeckoSettings(db_path=db, _env_file=None, **bad)
+
+
+def test_anthropic_api_key_is_secret(tmp_path, monkeypatch):
+    from pydantic import SecretStr
+
+    monkeypatch.setenv("GECKO_ANTHROPIC_API_KEY", "sk-ant-topsecret")
+    s = GeckoSettings(db_path=str(tmp_path / "g.db"), _env_file=None)
+    assert isinstance(s.anthropic_api_key, SecretStr)
+    assert s.anthropic_api_key.get_secret_value() == "sk-ant-topsecret"
+    assert "topsecret" not in repr(s.anthropic_api_key)
+    assert "topsecret" not in repr(s)
