@@ -163,7 +163,8 @@ async def scorecard_job(settings: GeckoSettings, ns) -> int:
 
 def _clean(value, cap: int = 16) -> str:
     """Untrusted text (token symbols, model output): printable characters, capped."""
-    return "".join(c for c in str(value) if c.isprintable())[:cap] or "?"
+    text = "" if value is None else str(value)
+    return "".join(c for c in text if c.isprintable())[:cap] or "?"
 
 
 def _val(v, spec: str, scale: float = 1.0) -> str:

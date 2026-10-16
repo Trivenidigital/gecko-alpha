@@ -335,6 +335,12 @@ async def test_digest_not_silent_on_entry_or_exit_outside_top(store, settings):
     assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["B rank"])
 
 
+async def _top_lines(store, settings):
+    from gecko.report import digest_text
+
+    return _section((await digest_text(store, settings, OLD))[0], "TOP ")[1]
+
+
 async def test_digest_includes_research_verdict(store, settings):
     await _open(store, "a", 1)
     await _open(store, "b", 2)
@@ -360,6 +366,12 @@ async def test_digest_includes_research_verdict(store, settings):
     assert lines[0].endswith("| watch 0.7")
     assert lines[1] == "  flags: mintauthority live; " + "x" * 40
     assert lines[2].endswith("| no dossier")
+    await store.conn.execute(
+        "INSERT INTO research_notes(token_id,created_at,model,schema_version,"
+        "note_json) VALUES('b','2026-10-04T00:00:00Z','m',1,'{}')"
+    )
+    await store.conn.commit()
+    assert (await _top_lines(store, settings))[2].endswith("| ? ?")
 
 
 async def test_digest_sanitises_symbols(store, settings):
