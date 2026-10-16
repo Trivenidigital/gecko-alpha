@@ -352,7 +352,7 @@ async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
     await _open(store, "a", 1)
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0 and text.splitlines()[-1] == (
-        "health: freshness check error _Boom | " "candidates 0 active 1 watchlist 1"
+        "health: freshness check error _Boom | candidates 0 active 1 watchlist 1"
     )
 
 

@@ -24,12 +24,10 @@ class GeckoSettings(BaseSettings):
     must not leak in here.
     """
 
-    # env_ignore_empty: `GECKO_X=` (env or .env.gecko) is unset, never an empty secret
+    # No env_ignore_empty: a blank NON-secret key must fail, not load a default
+    # (a blank GECKO_REQUIRE_SECURITY_KNOWN= would silently read False).
     model_config = SettingsConfigDict(
-        env_prefix="GECKO_",
-        env_file=".env.gecko",
-        extra="ignore",
-        env_ignore_empty=True,
+        env_prefix="GECKO_", env_file=".env.gecko", extra="ignore"
     )
 
     db_path: str = "gecko.db"
@@ -116,8 +114,8 @@ class GeckoSettings(BaseSettings):
     @field_validator(*OPTIONAL_SECRETS, mode="before")
     @classmethod
     def _blank_is_unset(cls, v):
-        # whitespace-only ONLY: "" is env_ignore_empty's (env and .env.gecko)
-        return None if isinstance(v, str) and v and not v.strip() else v
+        # `GECKO_X=` or whitespace (env or .env.gecko): unset, never an empty secret
+        return None if isinstance(v, str) and not v.strip() else v
 
     @field_validator("chains")
     @classmethod

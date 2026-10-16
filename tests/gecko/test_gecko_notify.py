@@ -14,10 +14,16 @@ async def test_send_telegram_ok():
 
 
 async def test_send_telegram_ok_false():
+    from structlog.testing import capture_logs
+
     with aioresponses() as m:
-        m.post(URL, payload={"ok": False, "description": "chat not found"})
+        m.post(URL, status=400, payload={"ok": False, "description": "chat not found"})
         async with aiohttp.ClientSession() as session:
-            assert await send_telegram(session, "tok", "1", "hi") is False
+            with capture_logs() as logs:
+                assert await send_telegram(session, "tok", "1", "hi") is False
+    (e,) = [e for e in logs if e["event"] == "telegram_failed"]
+    assert (e["status"], e["ok"]) == (400, False)
+    assert "chat not found" not in repr(logs)  # upstream text is never logged
 
 
 async def test_send_telegram_html_502_returns_false():

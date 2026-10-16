@@ -220,3 +220,19 @@ def test_empty_coingecko_key_still_refused_keyless(tmp_path, monkeypatch, capsys
         "job 'coingecko-hourly' needs GECKO_COINGECKO_DEMO_API_KEY; "
         "refusing to run keyless\n"
     )
+
+
+def test_blank_non_secret_key_still_fails_loudly(tmp_path, monkeypatch):
+    import pytest
+    from pydantic import ValidationError
+    from pydantic_settings import SettingsError
+
+    monkeypatch.chdir(tmp_path)
+    db = str(tmp_path / "g.db")
+    monkeypatch.setenv("GECKO_REQUIRE_SECURITY_KNOWN", "")  # never a silent False
+    with pytest.raises(ValidationError, match="require_security_known"):
+        GeckoSettings(db_path=db)
+    monkeypatch.delenv("GECKO_REQUIRE_SECURITY_KNOWN")
+    monkeypatch.setenv("GECKO_CHAINS", "")  # never a silent all-chains default
+    with pytest.raises(SettingsError, match='field "chains"'):
+        GeckoSettings(db_path=db)
