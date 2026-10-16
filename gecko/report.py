@@ -87,7 +87,10 @@ def _line(label: str, rows: list[tuple], min_n: int) -> str:
     text = (
         f"{label}: n={len(vals)} loss={sum(r[1] == -1.0 for r in vals)} "
         f"unmeasurable={sum(r[2] == 'no_entry_price' for r in done)} "
-        f"expired={sum(r[2] == 'expired' for r in done)} pending={len(rows) - len(done)}"
+        f"expired={sum(r[2] == 'expired' for r in done)} "
+        # measured with no return and no recorded reason: counted, never hidden
+        f"other={sum(r[1] is None and r[2] is None for r in done)} "
+        f"pending={len(rows) - len(done)}"
     )
     # (multiple, multiple vs BTC); rows without a usable BTC pair are skipped
     st = [(1 + r[1], (1 + r[1]) / (r[4] / r[3])) for r in vals if r[3] and r[4]]

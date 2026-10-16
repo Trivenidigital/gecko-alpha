@@ -402,7 +402,7 @@ def test_backtest_pass_exits_0(tmp_path, capsys, monkeypatch):
     assert "| PASS |" in out
 
 
-def test_study_excludes_coins_without_stored_price(tmp_path):
+def test_study_excludes_coins_without_stored_price(tmp_path, capsys, monkeypatch):
     from structlog.testing import capture_logs
 
     write_study(
@@ -422,3 +422,12 @@ def test_study_excludes_coins_without_stored_price(tmp_path):
     assert [e["n"] for e in logs if e["event"] == "study_excluded_no_price"] == [2]
     # without a history db there is nothing to check against: all kept
     assert len(load_study(str(tmp_path), None)) == 3
+    from gecko.__main__ import main
+
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "gecko.db"))
+    hist = str(tmp_path / "scout.db")
+    main(["backtest", "--study-dir", str(tmp_path), "--history-db", hist])
+    assert (
+        "excluded chart/stored >2x 0 | excluded no stored price 2 | rejected ids 0"
+        in (capsys.readouterr().out)
+    )

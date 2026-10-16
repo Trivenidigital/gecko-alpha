@@ -40,6 +40,8 @@ def configure_logging(log_format: str) -> None:
         else structlog.dev.ConsoleRenderer()
     )
     structlog.configure(
+        # stderr, looked up per logger (never a stale stream): stdout is results only
+        logger_factory=lambda *_: structlog.PrintLogger(sys.stderr),
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
@@ -110,8 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"job {ns.job!r} refused: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # noqa: BLE001 — a crash outside run_job still exits 1
-        log.error("job_crashed", job=ns.job, error=f"{type(exc).__name__}: {exc}")
-        print(f"job {ns.job!r} crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # the type only: an exception's text can carry an upstream body or a URL
+        log.error("job_crashed", job=ns.job, error=type(exc).__name__)
+        print(f"job {ns.job!r} crashed: {type(exc).__name__}", file=sys.stderr)
         return 1
 
 

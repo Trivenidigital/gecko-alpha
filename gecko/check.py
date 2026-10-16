@@ -29,6 +29,12 @@ WRITER_JOBS = (
 )
 
 Line = tuple[str, str, str]  # (OK|WARN|FAIL, check name, detail)
+# (check name, settings field, what goes dark without it): presence-only checks
+PRESENCE = (
+    ("digest_chat", "telegram_digest_chat_id", "digest"),
+    ("coingecko", "coingecko_demo_api_key", "markets/hourly"),
+    ("anthropic", "anthropic_api_key", "research"),
+)
 
 
 def _present(name: str, value, dark: str) -> Line:
@@ -50,8 +56,7 @@ async def _db_checks(settings: GeckoSettings) -> list[Line]:
         return [("FAIL", "db_path", str(exc))]
     except Exception as exc:  # noqa: BLE001 — reported as a FAIL line
         return [("FAIL", "db_path", f"open failed: {type(exc).__name__}")]
-    try:
-        (app_id,) = await (await store.conn.execute("PRAGMA application_id")).fetchone()
+    try:  # Store.open stamps a new file and refuses a foreign one
         rows = await (
             await store.conn.execute(
                 "SELECT DISTINCT job FROM runs WHERE ok=1 AND job IN (%s)"
@@ -61,13 +66,7 @@ async def _db_checks(settings: GeckoSettings) -> list[Line]:
         ).fetchall()
     finally:
         await store.close()
-    out: list[Line] = [
-        (
-            ("OK", "db_path", f"{path} (application_id stamped)")
-            if app_id == Store.APPLICATION_ID
-            else ("FAIL", "db_path", f"{path} application_id={app_id} not stamped")
-        )
-    ]
+    out: list[Line] = [("OK", "db_path", f"{path} (application_id stamped)")]
     ran = {r[0] for r in rows}
     missing = [j for j in WRITER_JOBS if j not in ran]
     for job in missing:
@@ -134,27 +133,9 @@ async def run_checks(settings: GeckoSettings, *, send: bool) -> list[Line]:
         else ("WARN", "chains", "empty: nothing is collected")
     )
     out.append(await _telegram(settings, send))
-    out.append(
-        _present(
-            "digest_chat",
-            settings.telegram_digest_chat_id,
-            "GECKO_TELEGRAM_DIGEST_CHAT_ID, digest dark",
-        )
-    )
-    out.append(
-        _present(
-            "coingecko",
-            settings.coingecko_demo_api_key,
-            "GECKO_COINGECKO_DEMO_API_KEY, markets/hourly dark",
-        )
-    )
-    out.append(
-        _present(
-            "anthropic",
-            settings.anthropic_api_key,
-            "GECKO_ANTHROPIC_API_KEY, research dark",
-        )
-    )
+    for name, attr, what in PRESENCE:  # the env var is GECKO_ + the field name
+        dark = f"GECKO_{attr.upper()}, {what} dark"
+        out.append(_present(name, getattr(settings, attr), dark))
     problem = session_problem(settings, must_exist=True)
     if problem is None:
         out.append(("OK", "telegram_reader", f"{len(settings.tg_channels)} channel(s)"))

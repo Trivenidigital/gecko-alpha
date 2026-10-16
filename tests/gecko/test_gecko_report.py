@@ -50,7 +50,7 @@ async def test_scorecard_insufficient_data_under_min_n(store, settings):
         "gecko scorecard 2026-10-23 — watchlist open 4, exited 1, entrants 7 d 4"
     )
     assert _line(text, "F4 7d:") == (
-        "F4 7d: n=3 loss=1 unmeasurable=0 expired=0 pending=2 INSUFFICIENT_DATA (n=3)"
+        "F4 7d: n=3 loss=1 unmeasurable=0 expired=0 other=0 pending=2 INSUFFICIENT_DATA (n=3)"
     )
     assert "mean" not in text and "median" not in text and "beat" not in text
 
@@ -67,11 +67,11 @@ async def test_scorecard_stats_on_fixture_cohort(store, settings):
     settings.scorecard_min_n = 4
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 7d:") == (
-        "F4 7d: n=4 loss=1 unmeasurable=0 expired=0 pending=0 | mean 2.50x "
+        "F4 7d: n=4 loss=1 unmeasurable=0 expired=0 other=0 pending=0 | mean 2.50x "
         "median 1.50x ≥2x 50% ≥7x 25% beat BTC 50% vs BTC 1.60x"
     )
     assert _line(text, "F4 30d:") == (
-        "F4 30d: n=0 loss=0 unmeasurable=0 expired=0 pending=4 INSUFFICIENT_DATA (n=0)"
+        "F4 30d: n=0 loss=0 unmeasurable=0 expired=0 other=0 pending=4 INSUFFICIENT_DATA (n=0)"
     )
 
 
@@ -82,16 +82,20 @@ async def test_scorecard_reports_expired_and_unmeasurable(store, settings):
     await _ret(store, "y", 1, None, btc=(None, None), reason="no_entry_price")
     await _ret(store, "y", 7, None, btc=(None, None), reason="no_entry_price")
     await _ret(store, "x", 30, 1.0, btc=(None, None))  # no BTC pair: no statistics
+    await _ret(store, "x", 90, None, btc=(None, None))  # no return, no reason
     settings.scorecard_min_n = 1
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 1d:") == (
-        "F4 1d: n=0 loss=0 unmeasurable=1 expired=1 pending=0 INSUFFICIENT_DATA (n=0)"
+        "F4 1d: n=0 loss=0 unmeasurable=1 expired=1 other=0 pending=0 INSUFFICIENT_DATA (n=0)"
     )
     assert _line(text, "F4 7d:").startswith(
-        "F4 7d: n=0 loss=0 unmeasurable=1 expired=0 pending=1 "
+        "F4 7d: n=0 loss=0 unmeasurable=1 expired=0 other=0 pending=1 "
     )
     assert _line(text, "F4 30d:") == (
-        "F4 30d: n=1 loss=0 unmeasurable=0 expired=0 pending=1 INSUFFICIENT_DATA (n=0)"
+        "F4 30d: n=1 loss=0 unmeasurable=0 expired=0 other=0 pending=1 INSUFFICIENT_DATA (n=0)"
+    )
+    assert _line(text, "F4 90d:") == (
+        "F4 90d: n=0 loss=0 unmeasurable=0 expired=0 other=1 pending=1 INSUFFICIENT_DATA (n=0)"
     )
 
 
@@ -106,7 +110,7 @@ async def test_scorecard_splits_f4_by_entry_mcap(store, settings):
     settings.scorecard_min_n = 1
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 mcap≥5M 90d:") == (
-        "F4 mcap≥5M 90d: n=2 loss=0 unmeasurable=0 expired=0 pending=0 | mean 2.00x "
+        "F4 mcap≥5M 90d: n=2 loss=0 unmeasurable=0 expired=0 other=0 pending=0 | mean 2.00x "
         "median 2.00x ≥2x 50% ≥7x 0% beat BTC 50% vs BTC 2.00x"
     )
     assert _line(text, "F4 mcap<5M 90d:").endswith(
@@ -338,15 +342,17 @@ async def test_digest_exit_at_mark_not_yet_reported(store, settings):
 
 
 async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
+    class _Boom(Exception):  # not a RuntimeError: the handler must catch it all
+        pass
+
     async def boom(*a, **k):
-        raise RuntimeError("detector broke")
+        raise _Boom("detector broke")
 
     monkeypatch.setattr("gecko.report.check_freshness", boom)
     await _open(store, "a", 1)
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0 and text.splitlines()[-1] == (
-        "health: freshness check error RuntimeError | "
-        "candidates 0 active 1 watchlist 1"
+        "health: freshness check error _Boom | " "candidates 0 active 1 watchlist 1"
     )
 
 
@@ -372,8 +378,8 @@ async def test_digest_silent_when_unchanged(store, settings, capsys):
     capsys.readouterr()
     rc, sent, row = await _digest(store, settings)
     assert rc == 0 and sent == [] and row == (1, 0, None)
-    out = capsys.readouterr().out
-    assert "[SILENT]" in out.splitlines() and "digest_silent" in out
+    cap = capsys.readouterr()  # the log is on stdout or stderr: test order decides
+    assert "[SILENT]" in cap.out.splitlines() and "digest_silent" in cap.out + cap.err
 
 
 async def test_digest_not_silent_when_top_order_changes(store, settings):

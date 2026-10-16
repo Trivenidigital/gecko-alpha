@@ -231,7 +231,8 @@ async def research(
                 except (ValueError, RecursionError) as e:
                     reason, error = "invalid_json", type(e).__name__
                     log.warning("research_invalid_json", token_id=tid, error=error)
-            if reason is not None:  # paid, no dossier: a marker, never retried
+            # paid, no dossier: a marker; retried after MARKER_RETRY_DAYS
+            if reason is not None:
                 failed += 1
                 note = json.dumps({"status": "invalid", "reason": reason})
             cost = sum(_cost(settings, r) for r in replies) + unbilled

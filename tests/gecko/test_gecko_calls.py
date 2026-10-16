@@ -149,7 +149,8 @@ async def test_matches_uses_primary_keys(store, settings, monkeypatch):
     assert await _matches(store, settings, SOL) == {f"solana:{SOL}"}
     assert await _matches(store, settings, EVM.lower()) == {f"base:{EVM.lower()}"}
     monkeypatch.undo()
-    assert len(seen) == 2
+    evm = tuple(f"{c}:{EVM.lower()}" for c in ("base", "ethereum", "bsc"))
+    assert [args for _, args in seen] == [(f"solana:{SOL}",), evm]  # chain selection
     for sql, args in seen:
         plan = await (
             await store.conn.execute(f"EXPLAIN QUERY PLAN {sql}", args)
@@ -157,3 +158,8 @@ async def test_matches_uses_primary_keys(store, settings, monkeypatch):
         detail = " | ".join(r[-1] for r in plan)
         assert "SCAN tokens" not in detail
         assert "sqlite_autoindex_tokens_1 (token_id=?)" in detail  # primary key
+    settings.chains = ["solana"]  # an EVM address has no configured chain: no query
+    monkeypatch.setattr(store.conn, "execute", spy)
+    assert await _matches(store, settings, EVM.lower()) == set() and len(seen) == 2
+    assert await _matches(store, settings, SOL) == {f"solana:{SOL}"}
+    assert seen[2][1] == (f"solana:{SOL}",)

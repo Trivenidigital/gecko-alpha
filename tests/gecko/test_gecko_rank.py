@@ -4,6 +4,7 @@ import datetime as dt
 import pytest
 from gecko.features import Features
 from gecko.rank import disqualify, rule_f4, score, rank_once
+from gecko.store import iso_plus
 
 A = "2026-10-15T00:00:00Z"
 
@@ -702,9 +703,22 @@ async def test_security_tax_crash_recovery_exits_next_run(store, settings):
     assert await _status(store, "solana:good") == ("candidate", "security_tax")
 
 
-async def test_security_tax_exit_keeps_forward_returns_schedule(store, settings):
+async def test_security_tax_exit_keeps_forward_returns_schedule(
+    store, settings, monkeypatch
+):
+    class _Crash(Exception):
+        pass
+
+    async def crash():
+        raise _Crash
+
     await seed_token(store, "solana:good")
-    await rank_once(store, settings, A)
+    # a crash right after the entry: the tax exit is the first chance to schedule
+    monkeypatch.setattr(store, "repair_schedules", crash)
+    with pytest.raises(_Crash):
+        await rank_once(store, settings, A)
+    monkeypatch.undo()
+    assert await one(store, "SELECT COUNT(*) FROM forward_returns") == (0,)
     await store.add_observation(
         "solana:good",
         "enrich",
@@ -713,12 +727,10 @@ async def test_security_tax_exit_keeps_forward_returns_schedule(store, settings)
     )
     r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
     assert r.exited_tax == 1
-    await store.repair_schedules()
     rows = await (
         await store.conn.execute(
-            "SELECT horizon_days, due_at FROM forward_returns "
-            "WHERE token_id='solana:good' ORDER BY horizon_days"
+            "SELECT horizon_days, due_at, measured_at, closed_reason "
+            "FROM forward_returns WHERE token_id='solana:good' ORDER BY horizon_days"
         )
     ).fetchall()
-    assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
-    assert rows[0][1] == "2026-10-16T00:00:00Z"
+    assert rows == [(h, iso_plus(A, h), None, None) for h in (1, 7, 30, 90, 180)]

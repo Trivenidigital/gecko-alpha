@@ -95,11 +95,13 @@ def test_check_reports_missing_keys_as_warn_and_missing_telegram_as_fail(
     by = _lines(out)
     assert rc == 1
     assert by["telegram"][0].startswith("FAIL")
-    assert by["digest_chat"][0].startswith("WARN")
-    assert by["coingecko"][0].startswith("WARN")
-    assert "markets/hourly dark" in by["coingecko"][0]
-    assert by["anthropic"][0].startswith("WARN")
-    assert "research dark" in by["anthropic"][0]
+    assert by["digest_chat"] == [
+        "WARN not set: GECKO_TELEGRAM_DIGEST_CHAT_ID, digest dark"
+    ]
+    assert by["coingecko"] == [
+        "WARN not set: GECKO_COINGECKO_DEMO_API_KEY, markets/hourly dark"
+    ]
+    assert by["anthropic"] == ["WARN not set: GECKO_ANTHROPIC_API_KEY, research dark"]
     # no channels configured: reader not activated, a WARN
     assert by["telegram_reader"][0].startswith("WARN")
     assert by["db_path"][0].startswith("OK")
@@ -138,6 +140,8 @@ def test_check_send_posts_to_health_chat(monkeypatch, tmp_path, capsys):
         rc = _run(monkeypatch, s, ["check", "--send"])
     out = capsys.readouterr().out
     assert rc == 1
+    # logs (the failed send's warning) go to stderr: stdout is check lines only
+    assert all(ln.startswith(("OK ", "WARN ", "FAIL ")) for ln in out.splitlines())
     assert _lines(out)["telegram"][0].startswith("FAIL")
 
     # without --send nothing is posted (an unmocked request would be recorded)
