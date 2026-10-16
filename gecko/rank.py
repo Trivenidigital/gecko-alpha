@@ -30,8 +30,11 @@ WEIGHTS = {
 
 def disqualify(f: Features, settings: GeckoSettings) -> str | None:
     """First disqualifier that fires, checked in a fixed order, or None."""
-    if f.security_ok is False:
+    if f.security_structural is False:
         return "security_fail"
+    # A tax-only failure is re-read, not terminal: rank_once keeps it a candidate.
+    if f.security_ok is False:
+        return "security_tax"
     if f.top10_pct is not None and f.top10_pct > settings.top10_disqualify_pct:
         return "concentration"
     # No fresh DEX reading is absence, not thinness: only "dead" judges it.
@@ -99,6 +102,7 @@ class RankReport:
     entered: list[str]
     exited: list[str]
     ranked: int
+    exited_tax: int
 
 
 async def _column(store: Store, sql: str) -> list[str]:
@@ -136,6 +140,11 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
     ):
         f = await compute_features(store, settings, tid, as_of)
         why = disqualify(f, settings)
+        if why == "security_tax":
+            # Unlisted: simply not admitted, status untouched. Listed: the exit
+            # loop below demotes it to a candidate.
+            reasons[tid] = why
+            continue
         if why:
             status = "dead" if why == "dead" else "disqualified"
             await store.set_token_status(tid, status, why)
@@ -145,14 +154,19 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
 
     current = {w.token_id: w for w in await store.active_watchlist()}
     exited: list[str] = []
+    exited_tax = 0
     for tid, w in current.items():
         if tid not in feats:
             # Not active this run: this run's disqualifier, or left `active`
             # some other way (the ledger's dead/no_price).
-            await store.watchlist_exit(
-                tid, as_of, await _exit_reason(store, tid, reasons)
-            )
+            if reasons.get(tid) == "security_tax":
+                # Status first: a crash before the exit leaves the stored
+                # reason for _exit_reason to find on the next run.
+                await store.set_token_status(tid, "candidate", "security_tax")
+            why = await _exit_reason(store, tid, reasons)
+            await store.watchlist_exit(tid, as_of, why)
             exited.append(tid)
+            exited_tax += why == "security_tax"
         elif parse_utc(as_of) - parse_utc(w.entered_at) > timedelta(
             days=settings.watchlist_max_age_days
         ):
@@ -195,8 +209,9 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
         entered=len(entering),
         scheduled=repaired,
         exited=len(exited),
+        exited_tax=exited_tax,
     )
-    return RankReport(entering, exited, len(final))
+    return RankReport(entering, exited, len(final), exited_tax)
 
 
 @register("rank")

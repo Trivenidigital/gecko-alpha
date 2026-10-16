@@ -25,7 +25,9 @@ def feat(**kw) -> Features:
 
 
 def test_disqualify_which_gate(settings):
-    assert disqualify(feat(security_ok=False), settings) == "security_fail"
+    fail = feat(security_ok=False, security_structural=False)
+    assert disqualify(fail, settings) == "security_fail"
+    assert disqualify(feat(security_ok=False), settings) == "security_tax"
     assert disqualify(feat(top10_pct=61.0), settings) == "concentration"
     assert disqualify(feat(liquidity_gate_usd=100.0), settings) == "liquidity"
     # no fresh reading is absence, judged by "dead" only
@@ -45,11 +47,14 @@ def test_disqualify_boundaries(settings):
 def test_disqualify_precedence(settings):
     everything = dict(
         security_ok=False,
+        security_structural=False,
         top10_pct=99.0,
         liquidity_gate_usd=1.0,
         observed_at="2026-09-01T00:00:00Z",
     )
     assert disqualify(feat(**everything), settings) == "security_fail"
+    everything["security_structural"] = True
+    assert disqualify(feat(**everything), settings) == "security_tax"
     everything["security_ok"] = True
     assert disqualify(feat(**everything), settings) == "concentration"
     everything["top10_pct"] = None
@@ -595,3 +600,80 @@ async def test_crashed_entrant_that_exits_next_run_is_still_scheduled(
     ).fetchall()
     assert [h for h, _ in rows] == [1, 7, 30, 90, 180]
     assert rows[0][1] == "2026-10-16T00:00:00Z"
+
+
+def test_disqualifier_order_structural_before_tax(settings):
+    # both flags fired: structural is checked first and is terminal
+    both = feat(security_ok=False, security_structural=False, top10_pct=99.0)
+    assert disqualify(both, settings) == "security_fail"
+    # tax-only (structural clean or unknown) precedes concentration
+    tax = feat(security_ok=False, security_structural=True, top10_pct=99.0)
+    assert disqualify(tax, settings) == "security_tax"
+    assert disqualify(feat(security_ok=False, top10_pct=99.0), settings) == (
+        "security_tax"
+    )
+    # a structural flag disqualifies even when security_ok is not False
+    assert disqualify(feat(security_structural=False), settings) == "security_fail"
+
+
+async def _status(store, tid):
+    return await one(
+        store, f"SELECT status, disqualify_reason FROM tokens WHERE token_id='{tid}'"
+    )
+
+
+async def test_tax_rise_exits_watchlist_with_security_tax(store, settings):
+    await seed_token(store, "solana:good")
+    await store.add_observation(
+        "solana:good", "enrich", "2026-10-14T00:00:00Z", {"security_ok": True}
+    )
+    r = await rank_once(store, settings, A)
+    assert r.entered == ["solana:good"] and r.exited_tax == 0
+    # the newest enrich read is a tax-only failure
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 1
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_tax",)
+    assert await _status(store, "solana:good") == ("candidate", "security_tax")
+    assert await store.active_watchlist() == []
+
+
+async def test_tax_fail_candidate_is_not_disqualified_by_rank(store, settings):
+    await seed_token(store, "solana:taxed")
+    await store.add_observation(
+        "solana:taxed",
+        "enrich",
+        "2026-10-14T00:00:00Z",
+        {"security_ok": False, "security_structural": True},
+    )
+    r = await rank_once(store, settings, A)
+    # not admitted, not exited, and its status is left exactly as it was
+    assert r.entered == [] and r.exited == [] and r.exited_tax == 0
+    assert await store.active_watchlist() == []
+    assert await _status(store, "solana:taxed") == ("active", None)
+
+
+async def test_structural_flag_disqualifies(store, settings):
+    await seed_token(store, "solana:good")
+    await rank_once(store, settings, A)
+    await store.add_observation(
+        "solana:good",
+        "enrich",
+        "2026-10-15T00:30:00Z",
+        {"security_ok": False, "security_structural": False},
+    )
+    r = await rank_once(store, settings, "2026-10-15T01:00:00Z")
+    assert r.exited == ["solana:good"] and r.exited_tax == 0
+    row = await one(
+        store, "SELECT exit_reason FROM watchlist WHERE token_id='solana:good'"
+    )
+    assert row == ("security_fail",)
+    assert await _status(store, "solana:good") == ("disqualified", "security_fail")
