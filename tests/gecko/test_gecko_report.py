@@ -473,6 +473,22 @@ async def test_digest_footer_warning_sends_on_a_silent_day(
         assert f"| {footer} |" in sent[0].splitlines()[-1]
 
 
+async def test_digest_freshness_error_sends_on_a_silent_day(
+    store, settings, monkeypatch
+):
+    # ruling (2): a check_freshness exception is a fourth footer warning
+    async def boom(*a, **k):
+        raise KeyError("detector broke")
+
+    await _open(store, "a", 1)
+    await _fresh(store)
+    await _digest(store, settings)
+    monkeypatch.setattr("gecko.report.check_freshness", boom)
+    rc, sent, _ = await _digest(store, settings)
+    assert rc == 0 and len(sent) == 1
+    assert sent[0].splitlines()[-1].startswith("health: freshness check error KeyError")
+
+
 async def test_digest_not_silent_when_top_order_changes(store, settings):
     await _open(store, "a", 1)
     await _open(store, "b", 2)

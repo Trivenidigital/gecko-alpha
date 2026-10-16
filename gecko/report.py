@@ -292,13 +292,14 @@ async def digest_text(
         if feats is None:
             feats = (await compute_features(store, settings, r[0], now)).as_dict()
         lines += await _token_lines(store, r, feats)
+    broken = False  # a failed freshness check is a footer warning: the digest sends
     try:
         breaches = [b.table for b in await check_freshness(store, now, settings)]
         health = f"{len(breaches)} breach(es): {', '.join(breaches)}"
         health = health if breaches else "freshness clean"
     except Exception as exc:  # noqa: BLE001 — the digest still goes out
         log.warning("digest_freshness_error", error=type(exc).__name__)
-        health = f"freshness check error {type(exc).__name__}"
+        health, broken = f"freshness check error {type(exc).__name__}", True
     cur = await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
     counts = dict(await cur.fetchall())
     extras, warn = await _health_extras(store, settings, now)
@@ -307,7 +308,7 @@ async def digest_text(
         f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
         f"watchlist {len(open_rows)} | " + " | ".join(extras)
     )
-    return "\n".join(lines), state, bool(new or gone or warn)
+    return "\n".join(lines), state, bool(new or gone or warn or broken)
 
 
 @register("digest")

@@ -329,7 +329,9 @@ systemctl list-timers 'gecko-*' --all --no-pager     # 13 timers with a NEXT tim
 
 The dexscreener, geckoterminal and geckoterminal-ohlcv timers start
 `gecko-collector@<job>.service` instances; every other job timer starts
-`gecko-job@<job>.service`.
+`gecko-job@<job>.service`. Start the three collector timers before or together
+with `gecko-freshness.timer` (the one command above does both): freshness pages
+a collector that has never succeeded after its SLO (30 min for dexscreener).
 
 ## 7. Verification SQL
 
