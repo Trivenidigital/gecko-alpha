@@ -17,6 +17,7 @@ from gecko.freshness import check_freshness
 from gecko.jobs import register
 from gecko.notify import send_telegram
 from gecko.numeric import num
+from gecko.rank import ACTIVATION_KEY
 from gecko.runs import JobResult, run_job
 from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, parse_utc, utcnow
@@ -86,18 +87,19 @@ def _line(label: str, rows: list[tuple], min_n: int) -> str:
     """One horizon line. ``rows``: (measured, ret, closed_reason, btc_entry, btc_price)."""
     done = [r for r in rows if r[0]]
     vals = [r for r in done if r[1] is not None]
+    # (multiple, multiple vs BTC); rows without a usable BTC pair are skipped
+    st = [(1 + r[1], (1 + r[1]) / (r[4] / r[3])) for r in vals if r[3] and r[4]]
     text = (
-        f"{label}: n={len(vals)} loss={sum(r[1] == -1.0 for r in vals)} "
+        f"{label}: n={len(st)} ret_n={len(vals)} "
+        f"loss={sum(r[1] == -1.0 for r in vals)} "
         f"unmeasurable={sum(r[2] == 'no_entry_price' for r in done)} "
         f"expired={sum(r[2] == 'expired' for r in done)} "
         # measured with no return and no recorded reason: counted, never hidden
         f"other={sum(r[1] is None and r[2] is None for r in done)} "
         f"pending={len(rows) - len(done)}"
     )
-    # (multiple, multiple vs BTC); rows without a usable BTC pair are skipped
-    st = [(1 + r[1], (1 + r[1]) / (r[4] / r[3])) for r in vals if r[3] and r[4]]
     if len(st) < min_n:
-        return f"{text} INSUFFICIENT_DATA (n={len(st)})"
+        return f"{text} INSUFFICIENT_DATA"
     ms = [m for m, _ in st]
 
     def pct(flags) -> str:
@@ -112,8 +114,10 @@ def _line(label: str, rows: list[tuple], min_n: int) -> str:
 
 async def scorecard_text(store: Store, settings: GeckoSettings, now: str) -> str:
     """Weekly scorecard as of ``now``: per rule and horizon, ledger counts and,
-    from ``scorecard_min_n`` measured rows up, the return statistics."""
+    from ``scorecard_min_n`` measured rows up, the return statistics. The F4
+    cohort is entrants at or after ``activation:at`` (none when unrecorded)."""
     now = canon_ts(now)
+    act = await store.kv_get(ACTIVATION_KEY)
     p = {"now": now, "week": canon_ts((parse_utc(now) - timedelta(days=7)).isoformat())}
     o, e, k = await (
         await store.conn.execute(
@@ -127,7 +131,8 @@ async def scorecard_text(store: Store, settings: GeckoSettings, now: str) -> str
         await store.conn.execute(
             "SELECT w.rule_id, w.token_id, f.horizon_days, "
             "f.measured_at IS NOT NULL AND f.measured_at<=:now, f.ret, f.closed_reason, "
-            "f.btc_entry, f.btc_price, json_extract(w.features_at_entry_json,'$.mcap_usd') "
+            "f.btc_entry, f.btc_price, json_extract(w.features_at_entry_json,'$.mcap_usd'), "
+            "w.entered_at "
             "FROM forward_returns f JOIN watchlist w ON w.token_id=f.token_id "
             "WHERE w.entered_at<=:now",
             p,
@@ -135,7 +140,9 @@ async def scorecard_text(store: Store, settings: GeckoSettings, now: str) -> str
     ).fetchall()
     groups: dict[tuple[str, int], list[tuple]] = defaultdict(list)
     unknown: set[str] = set()
-    for rule, tid, h, done, ret, reason, be, bp, mcap in rows:
+    for rule, tid, h, done, ret, reason, be, bp, mcap, entered in rows:
+        if rule == F4_RULE and (act is None or entered < act):
+            continue  # pre-activation (replay or test) entrants are not the cohort
         r = (bool(done), ret, reason, be, bp)
         groups[(rule, h)].append(r)
         if rule == F4_RULE:
@@ -145,7 +152,7 @@ async def scorecard_text(store: Store, settings: GeckoSettings, now: str) -> str
                 groups[(F4_HI if mc >= F4_MCAP_SPLIT_USD else F4_LO, h)].append(r)
     lines = [
         f"gecko scorecard {now[:10]} — watchlist open {o}, exited {e}, entrants 7 d {k}"
-    ]
+    ] + ([] if act else ["activation not recorded: the F4 cohort is empty"])
     for rule in sorted({r[0] for r in rows}):
         labels = (rule, F4_HI, F4_LO) if rule == F4_RULE else (rule,)
         for h in HORIZONS:

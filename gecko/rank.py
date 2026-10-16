@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import statistics
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -14,6 +15,9 @@ from gecko.store import Store, canon_ts, parse_utc, utcnow
 
 log = structlog.get_logger("gecko.rank")
 RULE_ID = "F4"
+# Stamped once, by the first live (no --as-of) run: the F4 scorecard cohort
+# starts here, and from then on --as-of replays belong to the backtest harness.
+ACTIVATION_KEY = "activation:at"
 SCORE_KEYS = (
     "vol_7d_ratio",
     "holder_growth_7d",
@@ -219,8 +223,23 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
 @register("rank")
 async def rank_job(settings: GeckoSettings, ns) -> int:
     as_of = canon_ts(ns.as_of) if ns.as_of else utcnow()
+    if ns.as_of:
+        store = await Store.open(settings.db_path)
+        try:
+            activated = await store.kv_get(ACTIVATION_KEY)
+        finally:
+            await store.close()
+        if activated:
+            print(f"rank live since {activated}: --as-of is refused", file=sys.stderr)
+            return 2
 
     async def body(store, session):
+        if not ns.as_of:  # OR IGNORE: the first live run's stamp is never moved
+            await store.conn.execute(
+                "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
+                (ACTIVATION_KEY, as_of, as_of),
+            )
+            await store.conn.commit()
         r = await rank_once(store, settings, as_of)
         return JobResult(rows_written=r.ranked)
 

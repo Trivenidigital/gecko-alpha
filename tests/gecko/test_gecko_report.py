@@ -14,6 +14,7 @@ NOW = "2026-10-23T00:00:00Z"
 
 
 async def _wl(store, tid, *, rule="F4", entered=E, feats=None):
+    await store.kv_set("activation:at", "2026-09-01T00:00:00Z", E)  # F1 cutoff
     await store.watchlist_upsert(tid, entered, rule, 1, 1.0, feats or {})
     await store.repair_schedules()
 
@@ -50,7 +51,8 @@ async def test_scorecard_insufficient_data_under_min_n(store, settings):
         "gecko scorecard 2026-10-23 — watchlist open 4, exited 1, entrants 7 d 4"
     )
     assert _line(text, "F4 7d:") == (
-        "F4 7d: n=3 loss=1 unmeasurable=0 expired=0 other=0 pending=2 INSUFFICIENT_DATA (n=3)"
+        "F4 7d: n=3 ret_n=3 loss=1 unmeasurable=0 expired=0 other=0 pending=2 "
+        "INSUFFICIENT_DATA"
     )
     assert "mean" not in text and "median" not in text and "beat" not in text
 
@@ -67,11 +69,12 @@ async def test_scorecard_stats_on_fixture_cohort(store, settings):
     settings.scorecard_min_n = 4
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 7d:") == (
-        "F4 7d: n=4 loss=1 unmeasurable=0 expired=0 other=0 pending=0 | mean 2.50x "
+        "F4 7d: n=4 ret_n=4 loss=1 unmeasurable=0 expired=0 other=0 pending=0 | mean 2.50x "
         "median 1.50x ≥2x 50% ≥7x 25% beat BTC 50% vs BTC 1.60x"
     )
     assert _line(text, "F4 30d:") == (
-        "F4 30d: n=0 loss=0 unmeasurable=0 expired=0 other=0 pending=4 INSUFFICIENT_DATA (n=0)"
+        "F4 30d: n=0 ret_n=0 loss=0 unmeasurable=0 expired=0 other=0 pending=4 "
+        "INSUFFICIENT_DATA"
     )
 
 
@@ -86,16 +89,20 @@ async def test_scorecard_reports_expired_and_unmeasurable(store, settings):
     settings.scorecard_min_n = 1
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 1d:") == (
-        "F4 1d: n=0 loss=0 unmeasurable=1 expired=1 other=0 pending=0 INSUFFICIENT_DATA (n=0)"
+        "F4 1d: n=0 ret_n=0 loss=0 unmeasurable=1 expired=1 other=0 pending=0 "
+        "INSUFFICIENT_DATA"
     )
     assert _line(text, "F4 7d:").startswith(
-        "F4 7d: n=0 loss=0 unmeasurable=1 expired=0 other=0 pending=1 "
+        "F4 7d: n=0 ret_n=0 loss=0 unmeasurable=1 expired=0 other=0 pending=1 "
     )
     assert _line(text, "F4 30d:") == (
-        "F4 30d: n=1 loss=0 unmeasurable=0 expired=0 other=0 pending=1 INSUFFICIENT_DATA (n=0)"
+        # F2: n counts rows with a usable BTC pair, ret_n rows with a return
+        "F4 30d: n=0 ret_n=1 loss=0 unmeasurable=0 expired=0 other=0 pending=1 "
+        "INSUFFICIENT_DATA"
     )
     assert _line(text, "F4 90d:") == (
-        "F4 90d: n=0 loss=0 unmeasurable=0 expired=0 other=1 pending=1 INSUFFICIENT_DATA (n=0)"
+        "F4 90d: n=0 ret_n=0 loss=0 unmeasurable=0 expired=0 other=1 pending=1 "
+        "INSUFFICIENT_DATA"
     )
 
 
@@ -110,7 +117,8 @@ async def test_scorecard_splits_f4_by_entry_mcap(store, settings):
     settings.scorecard_min_n = 1
     text = await scorecard_text(store, settings, NOW)
     assert _line(text, "F4 mcap≥5M 90d:") == (
-        "F4 mcap≥5M 90d: n=2 loss=0 unmeasurable=0 expired=0 other=0 pending=0 | mean 2.00x "
+        "F4 mcap≥5M 90d: n=2 ret_n=2 loss=0 unmeasurable=0 expired=0 other=0 pending=0 "
+        "| mean 2.00x "
         "median 2.00x ≥2x 50% ≥7x 0% beat BTC 50% vs BTC 2.00x"
     )
     assert _line(text, "F4 mcap<5M 90d:").endswith(
@@ -118,9 +126,26 @@ async def test_scorecard_splits_f4_by_entry_mcap(store, settings):
     )
     assert _line(text, "F4 90d:").startswith("F4 90d: n=4 ")  # unknown mcap included
     assert _line(text, "F4 mcap unknown") == "F4 mcap unknown 1"
-    assert _line(text, "F4 mcap≥5M 1d:").endswith("pending=2 INSUFFICIENT_DATA (n=0)")
+    assert _line(text, "F4 mcap≥5M 1d:").endswith("pending=2 INSUFFICIENT_DATA")
     assert _line(text, "X1 90d:").startswith("X1 90d: n=0 ")
     assert "X1 mcap" not in text
+
+
+async def test_scorecard_f4_cohort_starts_at_activation(store, settings):
+    # F1: replay/test entrants before activation:at are not the F4 cohort
+    for tid, entered in (("pre", "2026-09-30T00:00:00Z"), ("post", E)):
+        await _wl(store, tid, entered=entered)
+        await _ret(store, tid, 7, 1.0)
+    await store.kv_set("activation:at", "2026-10-01T00:00:00Z", E)
+    settings.scorecard_min_n = 1
+    text = await scorecard_text(store, settings, NOW)
+    assert _line(text, "F4 7d:").startswith("F4 7d: n=1 ret_n=1 ")
+    assert "activation not recorded" not in text
+    await store.conn.execute("DELETE FROM kv")
+    await store.conn.commit()
+    text = await scorecard_text(store, settings, NOW)
+    assert _line(text, "activation not recorded")
+    assert _line(text, "F4 7d:").startswith("F4 7d: n=0 ret_n=0 ")
 
 
 def _with_channel(settings, chat="chat"):

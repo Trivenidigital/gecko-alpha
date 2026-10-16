@@ -537,6 +537,30 @@ async def test_rank_job_exits_1_on_rewind(settings):
         await s.close()
 
 
+async def test_activation_stamped_once_then_as_of_refused(
+    settings, monkeypatch, capsys
+):
+    # F1: the first live run stamps activation:at once; replays are then refused
+    from gecko.rank import ACTIVATION_KEY, rank_job
+    from gecko.store import Store
+
+    ns = argparse.Namespace
+    assert await rank_job(settings, ns(as_of=A)) == 0  # before activation: allowed
+    for t in ("2026-10-16T00:00:00Z", "2026-10-17T00:00:00Z", None):
+        if t is None:
+            assert await rank_job(settings, ns(as_of="2026-10-18T00:00:00Z")) == 2
+            continue
+        monkeypatch.setattr("gecko.rank.utcnow", lambda t=t: t)
+        assert await rank_job(settings, ns(as_of=None)) == 0
+    assert "--as-of is refused" in capsys.readouterr().err
+    s = await Store.open(settings.db_path)
+    try:
+        assert await s.kv_get(ACTIVATION_KEY) == "2026-10-16T00:00:00Z"
+        assert await one(s, "SELECT COUNT(*) FROM runs WHERE job='rank'") == (3,)
+    finally:
+        await s.close()
+
+
 async def test_exit_reason_falls_back_to_stored_disqualify_reason(store, settings):
     await seed_token(store, "solana:good")
     await rank_once(store, settings, A)
