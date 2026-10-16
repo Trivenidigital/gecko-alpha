@@ -272,7 +272,8 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     head, lines = _section(text, "TOP ")
     assert head == "TOP 10" and [ln.split()[1] for ln in lines] == ["A", "B"]
     assert text.splitlines()[-1] == (
-        "health: freshness clean | candidates 1 active 3 watchlist 2"
+        "health: freshness clean | candidates 1 active 3 watchlist 2 | "
+        "freshness never ran | enrich queue 4"
     )
 
 
@@ -352,7 +353,8 @@ async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
     await _open(store, "a", 1)
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0 and text.splitlines()[-1] == (
-        "health: freshness check error _Boom | candidates 0 active 1 watchlist 1"
+        "health: freshness check error _Boom | candidates 0 active 1 watchlist 1 | "
+        "freshness never ran | enrich queue 1"
     )
 
 
@@ -507,7 +509,7 @@ async def test_digest_health_lists_current_freshness_breaches(store, settings):
     _, (text,), _ = await _digest(store, settings)
     assert text.splitlines()[-1] == (
         "health: 1 breach(es): forward_returns_backlog | "
-        "candidates 0 active 1 watchlist 1"
+        "candidates 0 active 1 watchlist 1 | freshness never ran | enrich queue 1"
     )
 
 
@@ -543,3 +545,26 @@ def test_digest_job_is_registered_by_the_cli():
 
     _load_jobs()
     assert JOBS["digest"] is digest_job
+
+
+async def test_digest_footer_freshness_age_reader_handles_enrich_queue(store, settings):
+    # A1 freshness age, A3 unresolved reader handles, A4 the enrich queue length
+    from gecko.collectors.goplus import enrich_queue
+    from gecko.report import digest_text
+
+    now = "2026-10-16T12:00:00Z"
+    await _open(store, "a", 1)
+    await _tok(store, "c", "C", status="candidate")
+    text, _, _ = await digest_text(store, settings, now)
+    assert text.splitlines()[-1].endswith("| freshness never ran | enrich queue 2")
+    await store.record_run(
+        "freshness", "2026-10-16T08:50:00Z", "2026-10-16T08:55:00Z", 1
+    )
+    await store.record_run("freshness", now, now, False)  # a failed run is not ok
+    err = "1 channel(s) failed; 3 handle(s) unresolved"
+    await store.record_run("telegram-reader", now, now, False, error=err)
+    text, _, _ = await digest_text(store, settings, now)
+    assert len(await enrich_queue(store, settings, now)) == 2
+    assert text.splitlines()[-1].endswith(
+        "| freshness ok 3h ago | reader: 3 unresolved handle(s) | enrich queue 2"
+    )

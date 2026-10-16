@@ -610,22 +610,38 @@ def _plus_from(t0: str, minutes: int) -> str:
     return (parse_utc(t0) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-async def test_prune_key_pages_when_prune_stops(store):
+# A1: digest and scorecard are run-anchored like prune (the digest footer
+# watches freshness back).
+@pytest.mark.parametrize(
+    "job,slo", [("prune", 1560), ("digest", 1560), ("scorecard", 11520)]
+)
+async def test_run_anchored_job_key_pages_when_job_stops(store, job, slo):
     t0 = "2026-10-01T00:00:00Z"
-    # bootstrapping: prune never succeeded, so no page however late
-    assert "prune" not in {
-        b.table for b in await check_freshness(store, _plus_from(t0, 5000))
+    # bootstrapping: the job never succeeded, so no page however late
+    assert job not in {
+        b.table for b in await check_freshness(store, _plus_from(t0, slo * 4))
     }
-    await store.record_run("prune", t0, t0, True)
-    assert "prune" not in {
-        b.table for b in await check_freshness(store, _plus_from(t0, 1559))
+    await store.record_run(job, t0, t0, True)
+    assert job not in {
+        b.table for b in await check_freshness(store, _plus_from(t0, slo - 1))
     }
     hit = [
         b
-        for b in await check_freshness(store, _plus_from(t0, 1561))
-        if b.table == "prune"
+        for b in await check_freshness(store, _plus_from(t0, slo + 1))
+        if b.table == job
     ]
-    assert hit == [Breach("prune", t0, 1560)]
+    assert hit == [Breach(job, t0, slo)]
+
+
+async def test_benchmark_btc_row_does_not_mask_dead_geckoterminal(store):
+    # A2: the benchmark job writes BTC under source=geckoterminal every hour
+    t0 = "2026-10-01T00:00:00Z"
+    await store.record_run("geckoterminal", t0, t0, True)
+    await store.add_observation("solana:a", "geckoterminal", t0, {"price_usd": 1})
+    now = _plus_from(t0, 400)
+    await store.add_observation("benchmark:btc", "geckoterminal", now, {"price_usd": 1})
+    tables = {b.table for b in await check_freshness(store, now)}
+    assert {"observations", "observations:geckoterminal"} <= tables
 
 
 async def _reader_ok_every_30_min(store, t0: str, hours: int) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import timedelta
 from statistics import mean, median
@@ -10,6 +11,7 @@ from statistics import mean, median
 import aiohttp
 import structlog
 
+from gecko.collectors.goplus import enrich_queue
 from gecko.features import compute_features
 from gecko.freshness import check_freshness
 from gecko.jobs import register
@@ -215,6 +217,21 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     return lines
 
 
+async def _health_extras(store: Store, settings: GeckoSettings, now: str) -> list[str]:
+    """Freshness's own last ok run (digest and freshness watch each other), the
+    reader's unresolved handles, and the enrich job's queue length."""
+    q = store.conn.execute
+    sql = "SELECT MAX(finished_at) FROM runs WHERE job='freshness' AND ok=1"
+    (last,) = await (await q(sql)).fetchone()
+    hours = (parse_utc(now) - parse_utc(last)).total_seconds() // 3600 if last else 0
+    out = [f"freshness ok {hours:.0f}h ago" if last else "freshness never ran"]
+    sql = "SELECT error FROM runs WHERE job='telegram-reader' ORDER BY finished_at DESC"
+    row = await (await q(sql + ", id DESC LIMIT 1")).fetchone()
+    if row and (m := re.search(r"(\d+) handle\(s\) unresolved", row[0] or "")):
+        out.append(f"reader: {m[1]} unresolved handle(s)")
+    return out + [f"enrich queue {len(await enrich_queue(store, settings, now))}"]
+
+
 def _past_mark(ts: str | None, tid: str, hwm: str, seen: set[str]) -> bool:
     # newer than the mark, or equal to it and not reported at it
     return bool(ts) and (ts > hwm or (ts == hwm and tid not in seen))
@@ -272,7 +289,8 @@ async def digest_text(
     lines.append(
         f"health: {health} | "
         f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
-        f"watchlist {len(open_rows)}"
+        f"watchlist {len(open_rows)} | "
+        + " | ".join(await _health_extras(store, settings, now))
     )
     return "\n".join(lines), state, bool(new or gone)
 

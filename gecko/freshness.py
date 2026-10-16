@@ -31,6 +31,8 @@ SLO_MINUTES = {
     "observations:enrich": 1560,
     "benchmark:btc": 180,  # the ledger cannot measure without it
     "prune": 1560,  # daily; a dead prune grows the database until the disk fills
+    "digest": 1560,  # daily; the digest's footer in turn reports freshness's own age
+    "scorecard": 11520,  # weekly
     # Row-anchored: ok polls of channels that never post a call still page.
     "source_calls:rows": 4320,
 }
@@ -58,6 +60,8 @@ WRITER_JOBS = {
     "observations:enrich": ("enrich",),
     "benchmark:btc": ("coingecko-hourly", "benchmark"),
     "prune": ("prune",),
+    "digest": ("digest",),
+    "scorecard": ("scorecard",),
     "source_calls:rows": ("telegram-reader",),
 }
 # Writers outside Hermes cron: no incident path, so freshness pages their failures.
@@ -67,6 +71,7 @@ NON_CRON_WRITERS = frozenset({"telegram-reader"})
 # writer's last ok run, not by any table's newest row.
 RUN_ANCHORED = frozenset(
     {"watchlist", "forward_returns", "research_notes", "source_calls", "prune"}
+    | {"digest", "scorecard"}
 )
 DEDUP_HOURS = 6
 
@@ -127,20 +132,18 @@ async def _last_write(store: Store, key: str) -> str | None:
     """Newest write for a table, or for a per-source / benchmark check."""
     if key == BTC_TOKEN_ID:
         where, args = "token_id=?", (BTC_TOKEN_ID,)
-    elif key.startswith("observations:"):
-        src = key.split(":", 1)[1]
-        where, args = "source=?", (src,)
+    elif key.split(":", 1)[0] == "observations":
+        # Benchmark BTC rows are not collector data: they never mask a dead one.
+        where, args = "token_id!=?", (BTC_TOKEN_ID,)
+        src = key.partition(":")[2]
+        if src:
+            where, args = where + " AND source=?", (*args, src)
         if src == "geckoterminal_ohlcv":  # status markers are not data
             where += " AND json_array_length(features_json, '$.candles') > 0"
         elif src == "enrich":  # unknown markers and verdict-less reads are not data
             where += " AND " + KNOWN_VERDICT
-        elif (
-            src == "coingecko"
-        ):  # markets rows only: hourly BTC/trending mask a dead sweep
-            where += (
-                " AND token_id!='benchmark:btc'"
-                " AND json_extract(features_json, '$.trending_rank') IS NULL"
-            )
+        elif src == "coingecko":  # markets rows only: trending rows mask a dead sweep
+            where += " AND json_extract(features_json, '$.trending_rank') IS NULL"
     else:
         return await store.last_write(key.split(":", 1)[0])
     row = await (
