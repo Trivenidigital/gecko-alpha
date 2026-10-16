@@ -31,6 +31,8 @@ OK_CODES = (
     2,
 )  # 2 = partial data: parsed, and any missing core flag reads as unknown
 MAX_TAX = 0.10
+# Launch taxes often drop within hours: a tax-only failure is re-read, not final.
+TAX_FLAGS = {"buy_tax", "sell_tax"}
 RENOUNCED = {
     "",
     "0x0000000000000000000000000000000000000000",
@@ -158,9 +160,11 @@ def goplus_features(chain: str, r: dict) -> dict:
         if _flag(r.get("trusted_token")):
             flags, known = [], True
     security_ok = False if flags else (True if known else None)
+    structural = [k for k in flags if chain not in EVM_CHAINS or k not in TAX_FLAGS]
     return {
         "goplus_status": "ok",
         "security_ok": security_ok,
+        "security_structural": False if structural else (True if known else None),
         "security_flags": sorted(flags),
         "holders": as_int(r.get("holder_count")),
         "top10_pct": _top10(chain, r),
@@ -201,22 +205,47 @@ async def enrich_queue(
             " AND o.source='enrich'), "
             "(SELECT COUNT(*) FROM observations o WHERE o.token_id=t.token_id "
             f" AND o.source='enrich' AND {KNOWN_VERDICT}), "
-            "t.first_seen_at "
+            "t.first_seen_at, "
+            # 1 when the newest known verdict is a tax-only failure
+            "(SELECT json_type(features_json,'$.security_ok')='false' AND "
+            " json_type(features_json,'$.security_structural') IS NOT 'false' "
+            " FROM observations o WHERE o.token_id=t.token_id AND o.source='enrich' "
+            f" AND {KNOWN_VERDICT} ORDER BY observed_at DESC, id DESC LIMIT 1) "
             "FROM tokens t LEFT JOIN watchlist w ON w.token_id=t.token_id AND w.exited_at IS NULL "
             f"WHERE t.status IN ('candidate','active') AND t.chain IN ({q})",
             tuple(settings.chains),
         )
     ).fetchall()
+    rows = [(*r[:8], r[3] == "candidate" and bool(r[8])) for r in rows]
     due = [
         r
         for r in rows
-        if r[5] is None or (r[5] < stale and (r[3] == "active" or r[6] == 0))
+        if r[5] is None or (r[5] < stale and (r[3] == "active" or r[6] == 0 or r[8]))
     ]
-    # never-enriched first, FIFO by arrival; then oldest last row
+    # never-enriched first, FIFO by arrival; then oldest last row; tax re-reads last
     due.sort(
-        key=lambda r: (not r[4], r[3] != "active", r[5] is not None, r[5] or r[7], r[0])
+        key=lambda r: (
+            not r[4],
+            r[3] != "active",
+            r[5] is not None,
+            r[8],
+            r[5] or r[7],
+            r[0],
+        )
     )
     return [(r[0], r[1], r[2]) for r in due]
+
+
+def _error_code(exc: Exception):
+    """The code to mark a deterministic failure with, or None to retry next run.
+
+    A GoPlus error code (not 1) or a 4xx other than 429 is deterministic; 429,
+    5xx and transport errors (status 0) are transient.
+    """
+    if isinstance(exc, GoPlusError):
+        return exc.code if exc.code != 1 else None
+    status = getattr(exc, "status", 0)
+    return status if 400 <= status <= 499 and status != 429 else None
 
 
 async def _fetch(session, settings, chain, address):
@@ -244,9 +273,8 @@ async def enrich(
     budget = max(
         0, settings.gp_daily_cap - await calls_today(store, budget_now or utcnow())
     )
-    todo = (await enrich_queue(store, settings, now))[
-        : min(settings.gp_max_per_run, budget)
-    ]
+    queue = await enrich_queue(store, settings, now)
+    todo = queue[: min(settings.gp_max_per_run, budget)]
     pacer = Pacer(settings.gp_min_interval_sec, sleep)
     calls = written = failed = disq = unknown = 0
     try:  # a crash (e.g. a lock timeout) still charges the calls already made
@@ -264,6 +292,10 @@ async def enrich(
                     status=getattr(exc, "status", None),
                     code=getattr(exc, "code", None),
                 )
+                code = _error_code(exc)
+                if code is not None:  # deterministic: retrying next run is waste
+                    marker = {"goplus_status": "error", "code": code}
+                    await store.add_observation(tid, "enrich", now, marker)
                 continue
             except ValueError as exc:  # non-JSON body
                 failed += 1
@@ -281,9 +313,12 @@ async def enrich(
                 await store.set_deployer(tid, deployer)
             await store.add_observation(tid, "enrich", now, f)
             written, unknown = written + 1, unknown + (f["security_ok"] is None)
-            if f["security_ok"] is False:
+            if f["security_structural"] is False:
                 await store.set_token_status(tid, "disqualified", "security_fail")
+                log.info("token_security_fail", token_id=tid, flags=f["security_flags"])
                 disq += 1
+            elif f["security_ok"] is False:  # tax-only: re-read after refresh hours
+                log.info("token_security_tax", token_id=tid, flags=f["security_flags"])
     except Exception as exc:  # noqa: BLE001
         raise PartialFailure(exc, credits_used=calls, rows_written=written) from exc
 
@@ -295,6 +330,7 @@ async def enrich(
         disqualified=disq,
         unknown_security=unknown,
         budget_left=budget - calls,
+        enrich_queue_len=len(queue),
     )
     if todo and failed == len(todo):
         raise PartialFailure(

@@ -582,3 +582,182 @@ async def test_crash_mid_run_records_the_goplus_calls_spent(
         )
     ).fetchone()
     assert rc == 1 and row == (0, 2, 1)
+
+
+async def _status_of(store, tid):
+    return await (
+        await store.conn.execute(
+            "SELECT status, disqualify_reason FROM tokens WHERE token_id=?", (tid,)
+        )
+    ).fetchone()
+
+
+async def test_tax_only_failure_keeps_candidate(store, settings):
+    from structlog.testing import capture_logs
+
+    tid = await tok(store, "base", A, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: evm(buy_tax="0.2")}})
+            with capture_logs() as logs:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["security_ok"] is False
+    assert o.features["security_structural"] is True
+    assert o.features["security_flags"] == ["buy_tax"]
+    assert (await _status_of(store, tid))[0] == "candidate"
+    (ev,) = [e for e in logs if e["event"] == "token_security_tax"]
+    assert ev["token_id"] == tid and ev["flags"] == ["buy_tax"]
+    assert not [e for e in logs if e["event"] == "token_security_fail"]
+
+
+async def test_structural_flag_disqualifies(store, settings):
+    from structlog.testing import capture_logs
+
+    tid = await tok(store, "base", A, status="candidate")
+    bad = evm(is_honeypot="1", sell_tax="0.5")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, payload={"code": 1, "result": {A: bad}})
+            with capture_logs() as logs:
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features["security_structural"] is False
+    assert await _status_of(store, tid) == ("disqualified", "security_fail")
+    (ev,) = [e for e in logs if e["event"] == "token_security_fail"]
+    assert ev["token_id"] == tid and ev["flags"] == ["honeypot", "sell_tax"]
+    assert not [e for e in logs if e["event"] == "token_security_tax"]
+
+
+@pytest.mark.parametrize("key", ["is_mintable", "is_proxy"])
+def test_mintable_owned_is_structural(key):
+    owned = evm(**{key: "1", "owner_address": "0x" + "1" * 40})
+    f = goplus_features("base", owned)
+    assert f["security_ok"] is False and f["security_structural"] is False
+    # renounced: no flag, known -> True; owner unknown -> None (never safe)
+    assert goplus_features("base", evm(**{key: "1"}))["security_structural"] is True
+    r = evm(**{key: "1"})
+    del r["owner_address"]
+    assert goplus_features("base", r)["security_structural"] is None
+    # every Solana flag is structural; a tax-only EVM failure is not
+    frozen = sol(freezable={"status": "1"})
+    assert goplus_features("solana", frozen)["security_structural"] is False
+    assert goplus_features("solana", sol(freezable={}))["security_structural"] is None
+    assert goplus_features("base", evm(sell_tax="0.5"))["security_structural"] is True
+
+
+@pytest.mark.parametrize(
+    "mock,code",
+    [
+        ({"payload": {"code": 4012, "message": "bad"}}, 4012),
+        ({"status": 404}, 404),
+        ({"status": 400}, 400),
+    ],
+)
+async def test_error_marker_written_on_goplus_code_error_and_4xx(
+    store, settings, mock, code
+):
+    tid = await tok(store, "base", A, status="candidate")
+    tb = await tok(store, "base", B, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, **mock)
+            m.get(BASE_URL + B, payload={"code": 1, "result": {B: evm()}})
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (o,) = await enrich_rows(store, tid)
+    assert o.features == {"goplus_status": "error", "code": code}
+    # the marked token left the never-enriched head
+    assert tid not in [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_429_writes_no_marker(store, settings, status, monkeypatch):
+    import gecko.collectors.goplus as gp
+
+    real = gp.get_json
+
+    async def fast(*a, **kw):  # skip the 2/4/8 s retry backoff
+        return await real(*a, sleep=_nosleep, **kw)
+
+    monkeypatch.setattr(gp, "get_json", fast)
+    tid = await tok(store, "base", A, status="candidate")
+    async with aiohttp.ClientSession() as s:
+        with aioresponses() as m:
+            m.get(BASE_URL + A, status=status, repeat=True)
+            with pytest.raises(PartialFailure):
+                await enrich(store, settings, s, NOW, sleep=_nosleep)
+    assert await enrich_rows(store, tid) == []
+    assert [t for t, _, _ in await enrich_queue(store, settings, NOW)] == [tid]
+
+
+async def _tax_row(store, tid, at, structural=True):
+    feats = {"goplus_status": "ok", "security_ok": False, "security_flags": ["x"]}
+    if structural is not None:
+        feats["security_structural"] = structural
+    await store.add_observation(tid, "enrich", at, feats)
+
+
+async def test_tax_failed_candidate_requeued_after_refresh_hours(store, settings):
+    from structlog.testing import capture_logs
+
+    settings.gp_refresh_hours = 24
+    old = "2026-10-13T11:00:00Z"  # 25h before NOW
+    tax = await tok(store, "base", "0x" + "1" * 40, status="candidate")
+    await _tax_row(store, tax, old)
+    legacy = await tok(store, "base", "0x" + "2" * 40, status="candidate")
+    await _tax_row(store, legacy, old, structural=None)  # no key: not False
+    struct = await tok(store, "base", "0x" + "3" * 40, status="candidate")
+    await _tax_row(store, struct, old, structural=False)
+    clean = await tok(store, "base", "0x" + "4" * 40, status="candidate")
+    await store.add_observation(
+        clean, "enrich", old, {"goplus_status": "ok", "security_ok": True}
+    )
+    unknown = await tok(store, "base", "0x" + "5" * 40, status="candidate")
+    await store.add_observation(unknown, "enrich", old, {"goplus_status": "unknown"})
+    new = await tok(store, "base", "0x" + "6" * 40, status="candidate")
+    act = await tok(store, "base", "0x" + "7" * 40)
+    await store.add_observation(act, "enrich", old, {"goplus_status": "ok"})
+    q = [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+    # actives, never-enriched, never-known refresh, then tax-refresh
+    assert q == [act, new, unknown, tax, legacy]
+    # a newer non-verdict row does not hide the tax verdict
+    await store.add_observation(tax, "enrich", old, {"goplus_status": "unknown"})
+    assert tax in [t for t, _, _ in await enrich_queue(store, settings, NOW)]
+    # enrich_done reports the whole due queue, not only the run slice
+    settings.gp_max_per_run = 0
+    async with aiohttp.ClientSession() as s:
+        with capture_logs() as logs:
+            await enrich(store, settings, s, NOW, sleep=_nosleep)
+    (done,) = [e for e in logs if e["event"] == "enrich_done"]
+    assert done["enrich_queue_len"] == 5
+
+
+async def test_tax_failed_candidate_not_requeued_before_refresh_hours(store, settings):
+    settings.gp_refresh_hours = 24
+    ta = await tok(store, "base", A, status="candidate")
+    await _tax_row(store, ta, "2026-10-13T13:00:00Z")  # 23h before NOW
+    assert await enrich_queue(store, settings, NOW) == []
+    # a newer known clean verdict ends the tax refresh
+    tb = await tok(store, "base", B, status="candidate")
+    await _tax_row(store, tb, "2026-10-12T00:00:00Z")
+    clean = {"goplus_status": "ok", "security_ok": True}
+    await store.add_observation(tb, "enrich", "2026-10-12T01:00:00Z", clean)
+    assert await enrich_queue(store, settings, NOW) == []
+
+
+def test_enrich_refuses_as_of(monkeypatch, settings, capsys):
+    import gecko.__main__
+    from gecko.jobs import JOBS
+
+    monkeypatch.setattr(gecko.__main__, "GeckoSettings", lambda: settings)
+    ran = []
+
+    async def job(settings, ns):
+        ran.append(ns.as_of)
+        return 0
+
+    monkeypatch.setitem(JOBS, "enrich", job)
+    assert gecko.__main__.main(["enrich", "--as-of", "2026-10-01T00:00:00Z"]) == 2
+    assert "enrich is live-only" in capsys.readouterr().err
+    assert ran == []
+    assert gecko.__main__.main(["enrich"]) == 0 and ran == [None]

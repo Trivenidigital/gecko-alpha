@@ -59,6 +59,7 @@ class Features:
     caller_quality: float | None = None
     narrative_mentions_7d: int = 0
     security_ok: bool | None = None
+    security_structural: bool | None = None  # False = a non-tax flag fired
     young_chain: bool = False
     momentum_ctx: float | None = None
 
@@ -254,6 +255,8 @@ async def compute_features(
         # the newest read as is: unknown stays unknown, never an older True
         sec = enrich[0].features.get("security_ok")
         f.security_ok = sec if isinstance(sec, bool) else None
+        st = enrich[0].features.get("security_structural")
+        f.security_structural = st if isinstance(st, bool) else None
         dd = num(_first(enrich, "dd_score"))
         old = await store.observations(
             token_id, as_of=week_ago, source=ENRICH_SOURCE, limit=30
