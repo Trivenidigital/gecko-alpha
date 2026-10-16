@@ -538,16 +538,29 @@ async def test_rank_job_exits_1_on_rewind(settings):
 
 
 async def test_rank_job_reads_the_clock_after_store_open(settings, monkeypatch):
-    # concurrency: as_of taken before the open could predate a ledger exit
-    # committed while the open waited on the lock, tripping the rewind guard
+    # concurrency: as_of taken before the open (or the stamp's commit) could
+    # predate a ledger exit committed during that wait, tripping the rewind guard
+    from gecko import rank
     from gecko.rank import ACTIVATION_KEY, rank_job
     from gecko.store import Store
 
-    events, real_open = [], Store.open.__func__
+    events, real_open, real_rank = [], Store.open.__func__, rank.rank_once
 
     async def spy_open(cls, path):
         events.append("open")
-        return await real_open(cls, path)
+        store = await real_open(cls, path)
+        real_commit = store.conn.commit
+
+        async def commit():
+            events.append("commit")
+            return await real_commit()
+
+        store.conn.commit = commit
+        return store
+
+    async def spy_rank(*a, **k):
+        events.append("rank_once")
+        return await real_rank(*a, **k)
 
     def clock():
         events.append("clock")
@@ -555,8 +568,10 @@ async def test_rank_job_reads_the_clock_after_store_open(settings, monkeypatch):
 
     monkeypatch.setattr(Store, "open", classmethod(spy_open))
     monkeypatch.setattr("gecko.rank.utcnow", clock)
+    monkeypatch.setattr("gecko.rank.rank_once", spy_rank)
     assert await rank_job(settings, argparse.Namespace(as_of=None)) == 0
-    assert events[:2] == ["open", "clock"] and events.count("clock") == 1
+    # stamp clock, its commit, then the as_of clock right before rank_once
+    assert events[:5] == ["open", "clock", "commit", "clock", "rank_once"]
     s = await real_open(Store, settings.db_path)
     try:
         assert await s.kv_get(ACTIVATION_KEY) == A

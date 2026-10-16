@@ -284,6 +284,8 @@ logs "research disabled" and writes nothing.
   stops EVERY gecko job from starting. To pause research, unset
   `GECKO_ANTHROPIC_API_KEY` or run
   `systemctl disable --now gecko-research.timer`; never set the cap to 0.
+  Likewise GECKO_RESEARCH_MAX_PER_RUN must be ≥ 1 (0 is refused at settings
+  load for every job).
 - Pricing defaults were verified against the Anthropic docs on 2026-10-16:
   claude-sonnet-5-5 at $2 / $10 per million input / output tokens, web search
   at $10 per 1,000. One dossier can overshoot `research_daily_usd_cap` by
@@ -323,15 +325,18 @@ section 10):
 
 ```bash
 cd /root/gecko-alpha
+systemctl start gecko-collector@dexscreener.service   # blocks until the run finishes
 systemctl start $(ls deploy/gecko/timers | grep -v '^gecko-coingecko-')
 systemctl list-timers 'gecko-*' --all --no-pager     # 13 timers with a NEXT time
 ```
 
 The dexscreener, geckoterminal and geckoterminal-ohlcv timers start
 `gecko-collector@<job>.service` instances; every other job timer starts
-`gecko-job@<job>.service`. Start the three collector timers before or together
-with `gecko-freshness.timer` (the one command above does both): freshness pages
-a collector that has never succeeded after its SLO (30 min for dexscreener).
+`gecko-job@<job>.service`. The timer command starts the collector timers and
+`gecko-freshness.timer` together, in no particular order; the explicit
+dexscreener start before it is what puts a collector ok run first. Freshness
+pages a collector that has never succeeded after its SLO (30 min for
+dexscreener).
 
 ## 7. Verification SQL
 

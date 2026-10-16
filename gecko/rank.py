@@ -234,15 +234,16 @@ async def rank_job(settings: GeckoSettings, ns) -> int:
             return 2
 
     async def body(store, session):
-        # live clock read after Store.open: a ledger exit committed during the
-        # open's busy-wait is then never newer than as_of (the rewind guard)
-        as_of = fixed or utcnow()
         if not ns.as_of:  # OR IGNORE: the first live run's stamp is never moved
+            stamp = utcnow()
             await store.conn.execute(
                 "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",
-                (ACTIVATION_KEY, as_of, as_of),
+                (ACTIVATION_KEY, stamp, stamp),
             )
             await store.conn.commit()
+        # the live clock is read last, after Store.open and the stamp's commit:
+        # the window to rank_once's rewind guard is zero writes (and waits) wide
+        as_of = fixed or utcnow()
         r = await rank_once(store, settings, as_of)
         return JobResult(rows_written=r.ranked)
 

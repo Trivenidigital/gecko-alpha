@@ -256,8 +256,8 @@ async def digest_text(
     store: Store, settings: GeckoSettings, now: str
 ) -> tuple[str, dict[str, str], bool]:
     """(message, kv state to store once sent, whether anything entered or
-    exited or the footer warns) since the last sent digest; the first lists
-    every open row."""
+    exited or the footer warns) since the last sent digest; the first (no kv
+    keys) lists every watchlist row as an entrant, exited rows also as exits."""
     now = canon_ts(now)
     q = store.conn.execute
     rows = await (
