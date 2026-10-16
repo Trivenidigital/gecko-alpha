@@ -156,8 +156,8 @@ Owner-provided, not copied:
 
 - `GECKO_COINGECKO_DEMO_API_KEY`: a free CoinGecko Demo key (the Pro key is
   deactivated). Until it exists, the two `coingecko-*` timers stay disabled.
-- `GECKO_TG_CHANNELS`: set only in section 9, after `tg-login` and the reader
-  unit start.
+- `GECKO_TG_CHANNELS`: set only in section 9, after `tg-login`, in the same
+  step that starts the reader unit.
 
 `GECKO_DB_PATH` in `.env.gecko` must be `/root/gecko-alpha/gecko.db` or absent.
 The units also set it, but systemd lets `EnvironmentFile=` values override
@@ -203,9 +203,21 @@ GECKO_DB_PATH=/root/gecko-alpha/gecko.db /root/.local/bin/uv run --frozen python
 systemctl start gecko-job@check.service; journalctl -u gecko-job@check.service -n 40 --no-pager
 ```
 
-The second form proves the unit resolves the same `db_path` as the shell. Every
-line must be `OK` (or an expected `WARN` for the missing CoinGecko key). Add
+The second form proves the unit resolves the same `db_path` as the shell. Add
 `--send` once to the shell form to post a test message to the health chat.
+
+On a fresh database these `WARN` lines are expected; every other line must be
+`OK`. Any `FAIL`, or any other `WARN`, is a stop.
+
+- `WARN db_path: ... created new empty DB`: the first `check` only. The unit
+  form, run second, reads `OK`.
+- One `WARN jobs_ran_once: <job> has no ok run; ...` per writer job:
+  dexscreener, geckoterminal, geckoterminal-ohlcv, benchmark, enrich, rank,
+  ledger, freshness, prune, research, digest, scorecard. Each clears after the
+  job's first ok run (section 4 and the timers).
+- `WARN telegram_reader: reader not activated: ...` until section 9.
+- `WARN coingecko: not set: GECKO_COINGECKO_DEMO_API_KEY, markets/hourly dark`
+  until section 10.
 
 **OnFailure falsifier:** `systemctl start gecko-job@no-such-job.service` exits
 2 (unknown job). The chat the codex handler posts to must receive the
@@ -345,27 +357,30 @@ it. This is a flag change: record its own approval.
 
 ## 9. Telegram reader activation (OWNER)
 
-Order matters. Setting `GECKO_TG_CHANNELS` before the reader has run makes
-`freshness` page `source_calls` within 30 min.
+Order matters. The reader exits 2 while `GECKO_TG_CHANNELS` is unset, and a
+channel list without a running reader makes `freshness` page `source_calls`
+within 30 min. So log in first, with the list still unset, then write the list
+and start the reader in one step.
 
 1. `/root/.gecko` exists with mode 0700 (`install.sh` created it).
-2. OWNER, interactively (phone code; a second device on the same account):
+2. OWNER, interactively (phone code; a second device on the same account).
+   `tg-login` does not need `GECKO_TG_CHANNELS`; leave it unset:
    ```bash
    cd /root/gecko-alpha
    GECKO_DB_PATH=/root/gecko-alpha/gecko.db /root/.local/bin/uv run --frozen python -m gecko tg-login
    stat -c '%a' /root/.gecko/gecko_tg.session      # 600
    ```
-3. Start the unit and confirm it polls:
+3. In one step: add the channel list from section 5 to `.env.gecko` with an
+   editor, in single quotes (`GECKO_TG_CHANNELS='["@foo","@bar"]'`), then
+   start the unit at once and confirm it polls:
    ```bash
+   grep -c '^GECKO_TG_CHANNELS=' .env.gecko         # 1
    systemctl enable --now gecko-telegram-reader.service
    journalctl -u gecko-telegram-reader.service -n 30 --no-pager
    ```
    Exit 2 (configuration or session lock) stops the unit instead of looping
    (`RestartPreventExitStatus=2`); read the journal, fix, start again.
-4. THEN add the channel list from section 5 to `.env.gecko`, in single quotes:
-   `GECKO_TG_CHANNELS='["@foo","@bar"]'`. Restart the reader so it reads the
-   list: `systemctl restart gecko-telegram-reader.service`. `freshness` needs
-   no restart; it reads the env file at each run.
+   `freshness` needs no restart; it reads the env file at each run.
 
 ## 10. CoinGecko (after the owner creates a Demo key)
 

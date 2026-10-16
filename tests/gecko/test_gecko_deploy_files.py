@@ -233,6 +233,35 @@ def test_install_remove_dry_run_disables_everything_and_keeps_data():
     ]
 
 
+def _runbook_section(n: str) -> str:
+    text = (ROOT / "docs" / "runbook_gecko_activation.md").read_text(encoding="utf-8")
+    return text.split(f"\n## {n}. ")[1].split("\n## ")[0]
+
+
+def test_runbook_reader_order_login_then_channels_and_start_together():
+    # the reader exits 2 without channels; channels without a reader page freshness
+    sec = _runbook_section("9")
+    login = sec.index("python -m gecko tg-login")
+    channels = sec.index("GECKO_TG_CHANNELS='")
+    start = sec.index("systemctl enable --now gecko-telegram-reader.service")
+    assert login < channels < start
+    assert "restart gecko-telegram-reader" not in sec  # no start-then-add-channels
+    example = (GECKO / "env.gecko.example").read_text(encoding="utf-8")
+    assert "same step as `systemctl enable --now" in example
+
+
+def test_runbook_check_lists_every_expected_fresh_db_warn():
+    from gecko.check import WRITER_JOBS
+
+    sec = _runbook_section("3")
+    listed = re.search(r"per writer job:\s*([a-z, \n-]+)\.", sec).group(1)
+    names = {j.strip() for j in listed.replace("\n", " ").split(",")}
+    _load_jobs()
+    assert set(WRITER_JOBS) <= names <= set(JOBS)
+    for warn in ("created new empty DB", "reader not activated", "coingecko: not set"):
+        assert warn in sec, warn
+
+
 @posix_only
 @pytest.mark.skipif(os.name == "posix" and os.geteuid() == 0, reason="runs as root")
 def test_install_refuses_to_run_as_non_root():
