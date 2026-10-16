@@ -24,6 +24,8 @@ RestartPreventExitStatus=2
 # restart); older systemd warns about the unknown key and ignores it.
 RestartMode=direct
 Nice=5
+# bound a runaway job: the kernel OOM-kills it inside this cgroup (OnFailure pages)
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target

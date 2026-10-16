@@ -744,6 +744,12 @@ def test_installed_deploy_gecko_tree_is_clean(tmp_path):
             ).unlink(),
             "DRIFT: gecko-job@coingecko-markets.service.d/timeout.conf (missing in prod)",
         ),
+        (
+            lambda prod: (
+                prod / "gecko-job@dexscreener.service.d" / "no-onfailure.conf"
+            ).unlink(),
+            "DRIFT: gecko-job@dexscreener.service.d/no-onfailure.conf (missing in prod)",
+        ),
     ],
 )
 def test_deploy_gecko_drift_still_alerts(tmp_path, mutate, expected):

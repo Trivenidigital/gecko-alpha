@@ -63,7 +63,13 @@ unit as missing in prod; running this step right after the fast-forward keeps
 that window to seconds.
 
 Scripts run from `/usr/local/bin`, so a later `git pull` changes nothing there:
-re-run `install.sh` after any change under `deploy/gecko/`.
+re-run `install.sh` after any change under `deploy/gecko/`. The
+`--with-coingecko` flag is the single source of truth for the two
+`coingecko-*` timers: a run without it disables and stops them, so once
+section 10 is done pass it on every re-run. `install.sh` prints their real
+`is-enabled` state, and ends with `systemctl try-restart
+gecko-telegram-reader.service`, which restarts the reader onto the new code
+only if it is already running.
 
 A timer cannot start an instance that is still running, so no job overlaps
 itself (the enrich budget no-overlap requirement). A SIGKILLed run still
@@ -91,6 +97,21 @@ Schedules (UTC, `deploy/gecko/timers/`):
 | digest | 07:00 |
 | scorecard | Monday 08:00 |
 | telegram-reader | long-running service (section 9) |
+
+Paging. Every gecko unit pages the codex failure handler on each failed run
+(`OnFailure=`), except `gecko-job@dexscreener`, `gecko-job@geckoterminal` and
+`gecko-job@geckoterminal-ohlcv`: their `no-onfailure.conf` drop-ins clear the
+list, so a high-frequency collector does not page per failed run. Their
+outages page only through `freshness` (per-source SLOs, deduplicated for 6 h).
+Check after the install:
+
+```bash
+systemctl show -p OnFailure gecko-job@dexscreener.service   # OnFailure=  (empty)
+systemctl show -p OnFailure gecko-job@rank.service          # the codex handler
+```
+
+Each job and the reader run under `MemoryMax=512M`; an out-of-memory kill
+fails the unit like any other failure.
 
 An enabled timer also starts at the next boot, so do not reboot between this
 step and section 6b.
@@ -355,6 +376,9 @@ on a command line), then:
 deploy/gecko/install.sh --with-coingecko
 systemctl start gecko-job@coingecko-markets.service   # up to 25 min
 ```
+
+From now on every `install.sh` re-run needs `--with-coingecko`; without it the
+two timers are disabled again (its output shows `is-enabled: disabled`).
 
 ## 11. Hermes `gecko-query` skill
 

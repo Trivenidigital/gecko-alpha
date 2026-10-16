@@ -112,6 +112,16 @@ def test_job_template_and_reader_contracts():
     assert reader["ExecStart"].endswith("python -m gecko telegram-reader")
     backup = _keys(GECKO / "gecko-db-backup.service")
     assert backup["ExecStart"] == "/usr/local/bin/gecko-db-backup.sh"
+    assert job["MemoryMax"] == reader["MemoryMax"] == "512M"
+
+
+def test_only_the_high_frequency_collectors_skip_the_per_run_page():
+    # freshness's per-source SLO pages their outages; every other job pages per failure
+    dropins = {p.parent.name: p for p in GECKO.glob("*.service.d/no-onfailure.conf")}
+    jobs = ("dexscreener", "geckoterminal", "geckoterminal-ohlcv")
+    assert set(dropins) == {f"gecko-job@{j}.service.d" for j in jobs}
+    for p in dropins.values():  # an empty assignment resets the OnFailure= list
+        assert [ln for ln in _lines(p) if ln[:1] != "#"] == ["[Unit]", "OnFailure="]
 
 
 def test_no_secret_value_anywhere_under_deploy():
@@ -168,13 +178,30 @@ def test_scripts_parse(script):
         (["--no-start"], "enable", False),
     ],
 )
-def test_install_dry_run_enables_the_right_timers(flags, verb, coingecko):
+def test_install_dry_run_enables_the_right_timers(tmp_path, flags, verb, coingecko):
+    # a systemctl stand-in answers is-enabled only (dry-run executes nothing else)
+    (tmp_path / "systemctl").write_text(
+        '#!/bin/sh\n[ "$1" = is-enabled ] && echo masked\n'
+    )
+    (tmp_path / "systemctl").chmod(0o755)
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
     r = subprocess.run(
         ["bash", str(GECKO / "install.sh"), "--dry-run", *flags],
         capture_output=True,
         text=True,
+        env=env,
     )
     assert r.returncode == 0, r.stderr
+    out = r.stdout
+    for c in GECKO.glob("*.service.d/*.conf"):  # every drop-in, incl. no-onfailure
+        rel = f"{c.parent.name}/{c.name}"
+        assert f"+ install -m 0644 {GECKO}/{rel} /etc/systemd/system/{rel}\n" in out
+    for t in ("gecko-coingecko-markets.timer", "gecko-coingecko-hourly.timer"):
+        # the flag is the single source of truth: absent means disabled now
+        assert (f"+ systemctl disable --now {t}\n" in out) is not coingecko
+        assert f"{t} is-enabled: masked\n" in out  # the real state, printed
+    restart = "+ systemctl try-restart gecko-telegram-reader.service\n"
+    assert restart in out and out.index(restart) > out.rindex("+ systemctl enable")
     calls = re.findall(r"^\+ systemctl (enable(?: --now)?) (\S+)$", r.stdout, re.M)
     assert {v for v, _ in calls} == {verb}
     enabled = {u for _, u in calls}
@@ -198,6 +225,8 @@ def test_install_remove_dry_run_disables_everything_and_keeps_data():
     assert "+ systemctl disable --now gecko-telegram-reader.service\n" in out
     assert "+ rm -f /etc/systemd/system/gecko-job@.service\n" in out
     assert "+ rm -f /usr/local/bin/gecko-db-backup.sh\n" in out
+    for c in GECKO.glob("*.service.d/*.conf"):
+        assert f"+ rm -f /etc/systemd/system/{c.parent.name}/{c.name}\n" in out
     rms = [ln for ln in out.splitlines() if ln.startswith("+ rm")]
     assert not [
         ln for ln in rms if "gecko.db" in ln or ".env" in ln or "/var/lib" in ln
