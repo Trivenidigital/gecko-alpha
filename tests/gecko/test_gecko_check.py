@@ -25,6 +25,7 @@ WRITERS = (
     "research",  # E4: the AI-layer writers own freshness keys too
     "digest",
     "scorecard",
+    "db-backup",  # ops b: WARN until the shell backup has written its runs row
 )
 GIB = 1024**3
 _Usage = namedtuple("_Usage", "total used free")
@@ -154,6 +155,12 @@ def test_check_send_posts_to_health_chat(monkeypatch, tmp_path, capsys):
         rc = _run(monkeypatch, s, ["check"])
         assert not m.requests
     assert rc == 0
+
+
+def test_writer_jobs_pinned():
+    from gecko.check import WRITER_JOBS
+
+    assert WRITER_JOBS == WRITERS
 
 
 def test_check_jobs_ran_once_warns_per_missing_job(monkeypatch, tmp_path, capsys):

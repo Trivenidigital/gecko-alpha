@@ -132,7 +132,7 @@ def test_ai_layer_bounds(tmp_path):
     db = str(tmp_path / "g.db")
     ok = dict(
         research_max_searches=20,
-        research_max_per_run=0,
+        research_max_per_run=1,
         research_daily_usd_cap=0.10,  # D2: the floor is one dossier's estimate
         digest_top_n=50,
         scorecard_min_n=1,
@@ -145,6 +145,7 @@ def test_ai_layer_bounds(tmp_path):
         research.EST_NEXT_USD == settings.EST_NEXT_USD == ok["research_daily_usd_cap"]
     )
     assert GeckoSettings(db_path=db, digest_top_n=1, _env_file=None)
+    assert GeckoSettings(db_path=db, ohlcv_run_budget_sec=780, _env_file=None)
     for n in (256, 8192):
         assert GeckoSettings(db_path=db, research_max_tokens=n, _env_file=None)
     zero_prices = dict(
@@ -156,7 +157,7 @@ def test_ai_layer_bounds(tmp_path):
     for bad in (
         {"research_max_searches": 21},
         {"research_max_searches": -1},
-        {"research_max_per_run": -1},
+        {"research_max_per_run": 0},  # M1: ok 0-row runs forever
         {"research_daily_usd_cap": 0.09},  # below EST_NEXT_USD: research never runs
         {"digest_top_n": 0},
         {"digest_top_n": 51},
@@ -167,6 +168,7 @@ def test_ai_layer_bounds(tmp_path):
         {"research_usd_per_search": -0.01},
         {"research_max_tokens": 255},
         {"research_max_tokens": 8193},
+        {"ohlcv_run_budget_sec": 781},  # ops c: one last fetch must fit in 900 s
         {"anthropic_base_url": "http://api.anthropic.com"},
         {"anthropic_base_url": "api.anthropic.com"},
     ):

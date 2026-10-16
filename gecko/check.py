@@ -29,6 +29,7 @@ WRITER_JOBS = (
     "research",
     "digest",
     "scorecard",
+    "db-backup",  # deploy/gecko/gecko-db-backup.sh, not a gecko job
 )
 
 Line = tuple[str, str, str]  # (OK|WARN|FAIL, check name, detail)

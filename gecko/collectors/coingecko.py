@@ -164,9 +164,10 @@ async def _fetch_platform(
 ) -> tuple[str, str] | None:
     """First platform on a configured chain; otherwise mark the coin unmapped."""
     body = await cg.get(f"/coins/{cid}", COIN_PARAMS)
-    platforms = (body if isinstance(body, dict) else {}).get("platforms") or {}
-    if not isinstance(platforms, dict) or not any(str(k).strip() for k in platforms):
-        return None  # no answer (empty, or the {"": ""} placeholder): no marker
+    if not isinstance(body, dict) or "platforms" not in body:
+        return None  # no answer: no marker, looked up again next sweep
+    # {} or the {"": ""} placeholder is an answer: marked, retried after the TTL
+    platforms = body["platforms"] if isinstance(body["platforms"], dict) else {}
     for platform, addr in platforms.items():
         chain = PLATFORM_MAP.get(platform)
         if chain not in settings.chains or not addr or not str(addr).strip():

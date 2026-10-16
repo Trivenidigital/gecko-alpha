@@ -23,6 +23,7 @@ from gecko.settings import GeckoSettings
 from gecko.store import Store, canon_ts, parse_utc, utcnow
 
 HORIZONS = (1, 7, 30, 90, 180)
+FRESHNESS_WARN_H = 26  # an older freshness ok run makes a silent digest send
 MAX_CHARS = 4000  # Telegram's limit is 4096; longer texts are split, never cut
 F4_RULE = "F4"
 # Pre-registered split: docs/prereg/2026-10-16-F4-entry-mcap-5m.md
@@ -228,19 +229,25 @@ async def _token_lines(store: Store, row: tuple, feats: dict) -> list[str]:
     return lines
 
 
-async def _health_extras(store: Store, settings: GeckoSettings, now: str) -> list[str]:
+async def _health_extras(
+    store: Store, settings: GeckoSettings, now: str
+) -> tuple[list[str], bool]:
     """Freshness's own last ok run (digest and freshness watch each other), the
-    reader's unresolved handles, and the enrich job's queue length."""
+    reader's unresolved handles, the enrich queue length; and whether it warns
+    (freshness never ran or is older than FRESHNESS_WARN_H, handles unresolved)."""
     q = store.conn.execute
     sql = "SELECT MAX(finished_at) FROM runs WHERE job='freshness' AND ok=1"
     (last,) = await (await q(sql)).fetchone()
-    hours = (parse_utc(now) - parse_utc(last)).total_seconds() // 3600 if last else 0
-    out = [f"freshness ok {hours:.0f}h ago" if last else "freshness never ran"]
+    age = (parse_utc(now) - parse_utc(last)).total_seconds() if last else 0
+    out = [f"freshness ok {age // 3600:.0f}h ago" if last else "freshness never ran"]
+    warn = not last or age > FRESHNESS_WARN_H * 3600
     sql = "SELECT error FROM runs WHERE job='telegram-reader' ORDER BY finished_at DESC"
     row = await (await q(sql + ", id DESC LIMIT 1")).fetchone()
     if row and (m := re.search(r"(\d+) handle\(s\) unresolved", row[0] or "")):
         out.append(f"reader: {m[1]} unresolved handle(s)")
-    return out + [f"enrich queue {len(await enrich_queue(store, settings, now))}"]
+        warn = warn or int(m[1]) > 0
+    n = len(await enrich_queue(store, settings, now))
+    return out + [f"enrich queue {n}"], warn
 
 
 def _past_mark(ts: str | None, tid: str, hwm: str, seen: set[str]) -> bool:
@@ -252,7 +259,8 @@ async def digest_text(
     store: Store, settings: GeckoSettings, now: str
 ) -> tuple[str, dict[str, str], bool]:
     """(message, kv state to store once sent, whether anything entered or
-    exited) since the last sent digest; the first lists every open row."""
+    exited or the footer warns) since the last sent digest; the first lists
+    every open row."""
     now = canon_ts(now)
     q = store.conn.execute
     rows = await (
@@ -297,13 +305,13 @@ async def digest_text(
         health = f"freshness check error {type(exc).__name__}"
     cur = await q("SELECT status, COUNT(*) FROM tokens GROUP BY status")
     counts = dict(await cur.fetchall())
+    extras, warn = await _health_extras(store, settings, now)
     lines.append(
         f"health: {health} | "
         f"candidates {counts.get('candidate', 0)} active {counts.get('active', 0)} "
-        f"watchlist {len(open_rows)} | "
-        + " | ".join(await _health_extras(store, settings, now))
+        f"watchlist {len(open_rows)} | " + " | ".join(extras)
     )
-    return "\n".join(lines), state, bool(new or gone)
+    return "\n".join(lines), state, bool(new or gone or warn)
 
 
 @register("digest")

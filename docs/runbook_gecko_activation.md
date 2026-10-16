@@ -221,8 +221,8 @@ On a fresh database these `WARN` lines are expected; every other line must be
   form, run second, reads `OK`.
 - One `WARN jobs_ran_once: <job> has no ok run; ...` per writer job:
   dexscreener, geckoterminal, geckoterminal-ohlcv, benchmark, enrich, rank,
-  ledger, freshness, prune, research, digest, scorecard. Each clears after the
-  job's first ok run (section 4 and the timers).
+  ledger, freshness, prune, research, digest, scorecard, db-backup. Each clears
+  after the job's first ok run (section 4 and the timers).
 - `WARN telegram_reader: reader not activated: ...` until section 9.
 - `WARN coingecko: not set: GECKO_COINGECKO_DEMO_API_KEY, markets/hourly dark`
   until section 10.

@@ -178,18 +178,29 @@ async def test_unmapped_marker_is_rechecked_after_ttl(
 
 
 @pytest.mark.parametrize(
-    "body", [{}, {"platforms": {}}, {"platforms": {"": ""}}, {"platforms": None}]
+    "body,markers",
+    [
+        ([], 0),  # not a dict: no answer, looked up again next sweep
+        ({}, 0),  # no platforms key: no answer
+        ({"platforms": {"": ""}}, 1),  # placeholder: an answer, retried after TTL
+        ({"platforms": {}}, 1),
+        ({"platforms": None}, 1),
+    ],
 )
-async def test_empty_platforms_answer_writes_no_marker(store, cg_settings, body):
-    # C1: no answer is not "unmapped": the coin is looked up again next sweep
+async def test_empty_platforms_answer_writes_no_marker(
+    store, cg_settings, body, markers
+):
+    # C1 / N2: only a body without a platforms map is "no answer"
     with aioresponses() as m:
         m.get(MARKETS, payload=[row("nochain", 2e6)])
         m.get(COIN, payload=body)
         m.get(MARKETS, payload=[])
         async with aiohttp.ClientSession() as s:
             await markets_sweep(store, cg_settings, s, NOW, sleep=RecordingSleep())
+    sql = "SELECT COUNT(*) FROM observations WHERE source='cg_unmapped'"
+    assert await (await store.conn.execute(sql)).fetchone() == (markers,)
     n = await (await store.conn.execute("SELECT COUNT(*) FROM observations")).fetchone()
-    assert n == (0,)
+    assert n == (markers,)
 
 
 async def test_markets_429_then_200(store, cg_settings):

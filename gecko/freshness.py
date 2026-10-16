@@ -67,7 +67,10 @@ WRITER_JOBS = {
     "source_calls:rows": ("telegram-reader",),
 }
 # Writers outside Hermes cron: no incident path, so freshness pages their failures.
-NON_CRON_WRITERS = frozenset({"telegram-reader"})
+# The collectors (gecko-collector@, no OnFailure) are always expected to run.
+NON_CRON_WRITERS = frozenset(
+    {"telegram-reader", "dexscreener", "geckoterminal", "geckoterminal-ohlcv"}
+)
 # Freshness keys whose writer job may legitimately write 0 rows (silent
 # channels, an empty watchlist, nothing due, nothing to prune); judged by the
 # writer's last ok run, not by any table's newest row.
@@ -112,6 +115,7 @@ async def _non_cron_first_failure(
     jobs = [j for j in WRITER_JOBS[table] if j in NON_CRON_WRITERS]
     if not jobs:
         return None
+    expected = expected or jobs != ["telegram-reader"]  # a collector is expected
     row = await (
         await store.conn.execute(
             f"SELECT MIN(finished_at) FROM runs WHERE ok=0 AND job IN "

@@ -278,7 +278,7 @@ def test_runbook_check_lists_every_expected_fresh_db_warn():
     listed = re.search(r"per writer job:\s*([a-z, \n-]+)\.", sec).group(1)
     names = {j.strip() for j in listed.replace("\n", " ").split(",")}
     _load_jobs()
-    assert set(WRITER_JOBS) <= names <= set(JOBS)
+    assert set(WRITER_JOBS) <= names <= set(JOBS) | {"db-backup"}  # a shell job
     for warn in ("created new empty DB", "reader not activated", "coingecko: not set"):
         assert warn in sec, warn
 

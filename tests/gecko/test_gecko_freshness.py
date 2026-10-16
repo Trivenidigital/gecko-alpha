@@ -610,6 +610,43 @@ def _plus_from(t0: str, minutes: int) -> str:
     return (parse_utc(t0) + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+@pytest.mark.parametrize(
+    "job,key",
+    [
+        ("dexscreener", "observations:dexscreener"),
+        ("geckoterminal", "observations:geckoterminal"),
+        ("geckoterminal-ohlcv", "observations:geckoterminal_ohlcv"),
+    ],
+)
+@pytest.mark.parametrize("failed_run", [True, False])
+async def test_collector_that_never_succeeded_pages(store, job, key, failed_run):
+    # N3: collectors run under gecko-collector@ (no OnFailure): failing since
+    # deploy, or never started at all, pages here even with no channels set
+    t0, slo = "2026-10-02T00:00:00Z", SLO_MINUTES[key]
+    await store.record_run(job if failed_run else "freshness", t0, t0, not failed_run)
+    for minutes, want in ((slo - 1, []), (slo + 1, [Breach(key, None, slo)])):
+        out = await check_freshness(store, _plus_from(t0, minutes))
+        assert [b for b in out if b.table == key] == want
+
+
+async def test_collector_after_first_ok_run_is_row_anchored(store):
+    key, t0 = "observations:dexscreener", "2026-10-02T00:00:00Z"
+    await store.record_run("dexscreener", t0, t0, False)
+    t1 = _plus_from(t0, 60)
+    await store.record_run("dexscreener", t1, t1, True)
+
+    async def hits(minutes: int) -> list[str]:
+        out = await check_freshness(store, _plus_from(t1, minutes))
+        return [b.table for b in out if b.table == key]
+
+    assert await hits(29) == []  # the empty table gets one SLO window from t1
+    assert await hits(31) == [key]
+    await store.upsert_token("solana:a", "solana", "A", "A", "A", t1, "dexscreener")
+    await store.add_observation("solana:a", "dexscreener", _plus_from(t1, 30), {})
+    assert await hits(59) == []  # anchored to the newest row, not the ok run
+    assert await hits(61) == [key]
+
+
 # A1: digest and scorecard are run-anchored like prune (the digest footer
 # watches freshness back).
 @pytest.mark.parametrize(

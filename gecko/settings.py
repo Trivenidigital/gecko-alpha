@@ -52,7 +52,7 @@ class GeckoSettings(BaseSettings):
     http_timeout_sec: float = 20
     ohlcv_max_per_run: int = 200
     # wall clock per run, under the 15 min timer: the rest waits for the next run
-    ohlcv_run_budget_sec: int = Field(600, ge=60, le=840)
+    ohlcv_run_budget_sec: int = Field(600, ge=60, le=780)
     gt_min_interval_sec: float = 2.1
     ds_min_interval_sec: float = 0.25  # spacing of every DexScreener request
     ds_refresh_max_per_run: int = 600  # known tokens re-read per run, oldest first
@@ -93,7 +93,7 @@ class GeckoSettings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
     research_model: str = "claude-sonnet-5-5"
-    research_max_per_run: int = Field(10, ge=0)
+    research_max_per_run: int = Field(10, ge=1)
     research_daily_usd_cap: float = Field(1.5, ge=EST_NEXT_USD)  # below: never runs
     research_max_searches: int = Field(5, ge=0, le=20)
     research_usd_per_mtok_in: float = Field(2.0, ge=0)

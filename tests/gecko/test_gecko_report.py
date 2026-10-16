@@ -2,6 +2,7 @@ import json
 import argparse
 
 import aiohttp
+import pytest
 from aioresponses import aioresponses
 from pydantic import SecretStr
 
@@ -347,6 +348,7 @@ async def test_digest_entrant_at_mark_not_yet_reported(store, settings, capsys):
     await _open(store, "x", 1, entered=T0)
     await _open(store, "y", 2, entered=T0)
     await _marks(store, T0, "", ids_in=["x"])
+    await _fresh(store)
     rc, (text,), _ = await _digest(store, settings)
     head, lines = _section(text, "ENTRANTS")
     assert rc == 0 and head == "ENTRANTS (1)" and lines[0].startswith("#2 Y ")
@@ -396,9 +398,20 @@ async def test_digest_does_not_miss_row_committed_with_earlier_timestamp(
     assert rc == 0 and head == "ENTRANTS (1)" and lines[0].startswith("#2 LATE ")
 
 
+async def _fresh(store, hours_ago: float = 0) -> None:
+    """An ok freshness run, so the digest footer carries no warning."""
+    from datetime import timedelta
+
+    from gecko.store import canon_ts, parse_utc, utcnow
+
+    at = canon_ts((parse_utc(utcnow()) - timedelta(hours=hours_ago)).isoformat())
+    await store.record_run("freshness", at, at, True)
+
+
 async def test_digest_silent_when_unchanged(store, settings, capsys):
     await _open(store, "a", 1)
     await _open(store, "b", 2)
+    await _fresh(store)
     rc, sent, _ = await _digest(store, settings)
     assert rc == 0 and len(sent) == 1
     assert json.loads(await store.kv_get("digest:top")) == ["a", "b"]
@@ -407,6 +420,40 @@ async def test_digest_silent_when_unchanged(store, settings, capsys):
     assert rc == 0 and sent == [] and row == (1, 0, None)
     cap = capsys.readouterr()  # the log is on stdout or stderr: test order decides
     assert "[SILENT]" in cap.out.splitlines() and "digest_silent" in cap.out + cap.err
+
+
+@pytest.mark.parametrize(
+    "case,footer",
+    [
+        ("never", "freshness never ran"),
+        ("stale", "freshness ok 27h ago"),
+        ("unresolved", "reader: 3 unresolved handle(s)"),
+        ("aging", None),  # 25 h: not yet stale
+        ("clean", None),  # 0 unresolved handles is no warning
+    ],
+)
+async def test_digest_footer_warning_sends_on_a_silent_day(
+    store, settings, case, footer
+):
+    # N1: an unchanged watchlist stays silent only when the footer is clean
+    from gecko.store import utcnow
+
+    await _open(store, "a", 1)
+    await _fresh(store)
+    await _digest(store, settings)
+    await store.conn.execute("DELETE FROM runs WHERE job='freshness'")
+    await store.conn.commit()
+    if case != "never":
+        await _fresh(store, {"stale": 27.5, "aging": 25.5}.get(case, 0))
+    n = {"unresolved": 3, "clean": 0}.get(case)
+    if n is not None:
+        err = f"0 channel(s) failed; {n} handle(s) unresolved"
+        await store.record_run("telegram-reader", utcnow(), utcnow(), True, error=err)
+    rc, sent, _ = await _digest(store, settings)
+    assert rc == 0 and len(sent) == (1 if footer else 0)
+    if footer:
+        assert _section(sent[0], "ENTRANTS")[0] == "ENTRANTS (0)"
+        assert f"| {footer} |" in sent[0].splitlines()[-1]
 
 
 async def test_digest_not_silent_when_top_order_changes(store, settings):
