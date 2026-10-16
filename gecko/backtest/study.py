@@ -17,6 +17,8 @@ from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import structlog
+
 from gecko.features import vol_ratio_from_candles
 from gecko.settings import GeckoSettings
 
@@ -32,6 +34,7 @@ STORED_QUERIES = [
 CHART_TOLERANCE_MS = 36 * 3600 * 1000
 STORED_BAND = (0.5, 2.0)
 RULES = ("R0", "F1", "F3", "F4")
+log = structlog.get_logger("gecko.backtest.study")
 DAY_SEC = 86400
 
 
@@ -113,15 +116,18 @@ def load_study(
 ) -> list[Coin]:
     """Live (charted, priced) study coins after the chart/stored exclusion.
 
-    ``stats``, when given, receives counts: universe, stored, excluded, rejected
-    (path-like ids), dead.
+    With a ``history_db``, a coin with no stored flag price is excluded too:
+    the chart/stored check cannot see a re-denominated chart without one.
+
+    ``stats``, when given, receives counts: universe, stored, excluded,
+    excluded_no_price, rejected (path-like ids), dead.
     """
     ev = _read_json(os.path.join(study_dir, "events.json"))
     btc = _read_json(os.path.join(study_dir, "btc.json"))["prices"]
     bt = [p[0] for p in btc]
     stored = _stored_prices(history_db)
     coins: list[Coin] = []
-    excluded = rejected = 0
+    excluded = excluded_no_price = rejected = 0
     for cid, e in ev.items():
         if os.path.basename(cid) != cid:
             rejected += 1  # a path-like id would read outside charts/ or v2/coins/
@@ -141,6 +147,9 @@ def load_study(
         p0 = _at(pr, pt, t0)
         if abs(p0[0] - t0) > CHART_TOLERANCE_MS or p0[1] <= 0:
             coins.append(Coin(cid, t0s, True))
+            continue
+        if history_db and cid not in stored:
+            excluded_no_price += 1  # unverifiable: may be a re-denominated chart
             continue
         if cid in stored and not (
             STORED_BAND[0] <= p0[1] / stored[cid][1] <= STORED_BAND[1]
@@ -172,11 +181,14 @@ def load_study(
                 c.live_vol_ratio = vol_ratio_from_candles(r["ohlcv"], t0_dt)
         coins.append(c)
     live = [c for c in coins if not c.dead]
+    if history_db:
+        log.info("study_excluded_no_price", n=excluded_no_price)
     if stats is not None:
         stats.update(
             universe=len(ev),
             stored=len(stored),
             excluded=excluded,
+            excluded_no_price=excluded_no_price,
             rejected=rejected,
             dead=len(coins) - len(live),
         )
