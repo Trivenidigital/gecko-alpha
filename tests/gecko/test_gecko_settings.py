@@ -70,3 +70,22 @@ def test_tg_poll_interval_floor(tmp_path):
     assert GeckoSettings(db_path=db, tg_poll_interval_sec=30, _env_file=None)
     with pytest.raises(ValidationError):
         GeckoSettings(db_path=db, tg_poll_interval_sec=29, _env_file=None)
+
+
+def test_channel_normalisation(tmp_path, monkeypatch):
+    # one canonical key per channel: "@foo" is what calls.event_id and the
+    # migrated history (source_id "@gem") are keyed on.
+    import pytest
+
+    db = str(tmp_path / "g.db")
+    s = GeckoSettings(
+        db_path=db,
+        tg_channels=[" @Foo ", "t.me/bar", "https://t.me/Baz", "http://t.me/qux", "x"],
+        _env_file=None,
+    )
+    assert s.tg_channels == ["@foo", "@bar", "@baz", "@qux", "@x"]
+    monkeypatch.setenv("GECKO_TG_CHANNELS", '["HTTPS://T.ME/Foo"]')
+    assert GeckoSettings(db_path=db, _env_file=None).tg_channels == ["@foo"]
+    for bad in (["@Foo", "t.me/foo"], ["@"], ["  "], ["https://t.me/"]):
+        with pytest.raises(ValueError):
+            GeckoSettings(db_path=db, tg_channels=bad, _env_file=None)

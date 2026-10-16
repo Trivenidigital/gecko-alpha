@@ -61,7 +61,7 @@ class GeckoSettings(BaseSettings):
     tg_session_path: str = (
         ""  # absolute, outside the repo, mode 0600; gecko's OWN session
     )
-    tg_channels: list[str] = []  # public @handles
+    tg_channels: list[str] = []  # public handles, canonical "@foo" (see validator)
     tg_poll_interval_sec: int = Field(120, ge=30)  # faster invites FloodWait
     # newest messages read per channel per poll; 0 would read nothing, ok forever
     tg_catchup_limit: int = Field(200, ge=1)
@@ -90,3 +90,21 @@ class GeckoSettings(BaseSettings):
         if bad:
             raise ValueError(f"unsupported chains: {bad}")
         return v
+
+    @field_validator("tg_channels")
+    @classmethod
+    def _channels_canonical(cls, v: list[str]) -> list[str]:
+        # "@foo": the key calls.event_id, source_id and the migrated history use;
+        # "@Foo", "t.me/foo" and "https://t.me/Foo" are the same channel.
+        out: list[str] = []
+        for raw in v:
+            h = raw.strip().lower()
+            for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+                h = h.removeprefix(prefix)
+            h = h.removeprefix("@").strip()
+            if not h:
+                raise ValueError(f"empty telegram channel: {raw!r}")
+            if f"@{h}" in out:
+                raise ValueError(f"duplicate telegram channel: {raw!r}")
+            out.append(f"@{h}")
+        return out
