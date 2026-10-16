@@ -90,6 +90,15 @@ def test_digest_refuses_as_of(monkeypatch, settings, capsys):
     assert main(["digest"]) == 0 and ran == ["digest"]
 
 
+def test_research_refuses_as_of(monkeypatch, settings, capsys):
+    _patch_settings(monkeypatch, settings)
+    ran = _noop_job(monkeypatch, "research")
+    assert main(["research", "--as-of", "2026-10-01T00:00:00Z"]) == 2
+    assert "research is live-only" in capsys.readouterr().err
+    assert ran == [] and not os.path.exists(settings.db_path)  # no run row
+    assert main(["research"]) == 0 and ran == ["research"]
+
+
 def test_coingecko_jobs_refuse_without_key(monkeypatch, settings, capsys):
     from pydantic import SecretStr
 

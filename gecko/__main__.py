@@ -82,10 +82,10 @@ def main(argv: list[str] | None = None) -> int:
     if ns.job not in JOBS:
         print(f"unknown job: {ns.job!r}; use --list", file=sys.stderr)
         return 2
-    if ns.job in ("ledger", "prune", "enrich", "digest") and ns.as_of:
+    if ns.job in ("ledger", "prune", "enrich", "digest", "research") and ns.as_of:
         # ledger fetches live prices; a future prune "now" deletes live rows;
         # enrich stamps today's GoPlus read at a past time (replay lookahead);
-        # digest sends and moves its kv high-water marks.
+        # digest sends and moves its kv high-water marks; research reads today's web.
         print(f"{ns.job} is live-only: --as-of is refused", file=sys.stderr)
         return 2
     settings = GeckoSettings()

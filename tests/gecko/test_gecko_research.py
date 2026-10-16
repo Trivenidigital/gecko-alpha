@@ -1,4 +1,6 @@
 import argparse
+import ast
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -134,19 +136,22 @@ async def test_research_pause_turn_resends_once_with_assistant_content(store, ke
     with aioresponses() as m:
         m.post(API, payload=paused)
         m.post(API, payload=reply(searches=1))
-        m.post(API, payload=paused)  # bb: paused twice -> abandoned, no row
+        m.post(API, payload=paused)  # bb: paused twice -> abandoned, a marker
         # still paused, though its text holds a valid dossier: abandoned all the same
         m.post(API, payload=reply(stop="pause_turn"))
         res, _ = await _run(store, keyed)
         bodies = _bodies(m)
-    assert (res.rows_written, res.credits_used) == (1, 4)
+    assert (res.rows_written, res.credits_used) == (2, 4)
     assert bodies[1]["messages"][1] == {
         "role": "assistant",
         "content": paused["content"],
     }
-    [(tid, _, _, note, cost)] = await _notes(store)
-    assert tid == "aa" and note == GOOD
+    [(tid, _, ver, note, cost), marker] = await _notes(store)
+    assert (tid, ver, note) == ("aa", 1, GOOD)
     assert cost == pytest.approx(2 * 0.03 + 3 * 0.01)  # both calls are charged
+    abandoned = {"status": "invalid", "reason": "paused_turn_abandoned"}
+    assert marker[:4] == ("bb", "claude-sonnet-5-5", 0, abandoned)
+    assert marker[4] == pytest.approx(2 * 0.03 + 5 * 0.01)
 
 
 async def test_research_skips_without_key_ok_run(store, settings, capsys):
@@ -200,15 +205,69 @@ async def test_research_respects_per_run_cap(store, keyed):
     assert [n[0] for n in await _notes(store)] == ["dd", "bb", "cc"]  # newest first
 
 
-async def test_research_invalid_json_writes_nothing(store, keyed):
+async def test_research_invalid_json_writes_marker_only(store, keyed):
+    # a paid reply with no dossier: a charged marker, never a note, never retried;
+    # a run with no dossier at all fails
     await _tok(store, "aa")
     await _tok(store, "bb", entered="2026-10-14T00:00:00Z")
+    await _tok(store, "cc", entered="2026-10-13T00:00:00Z")
+    deep = '{"a":' * 100_000 + "1" + "}" * 100_000  # RecursionError in json
     with aioresponses() as m:
         m.post(API, payload=reply(text="I could not find anything."))
         m.post(API, payload=reply(text='{"verdict": "watch", oops}'))
+        m.post(API, payload=reply(text=deep))
+        with pytest.raises(PartialFailure) as ei:
+            await _run(store, keyed)
+    assert (ei.value.credits_used, ei.value.rows_written) == (3, 3)
+    marker = {"status": "invalid", "reason": "invalid_json"}
+    assert [n[:4] for n in await _notes(store)] == [
+        (t, "claude-sonnet-5-5", 0, marker) for t in ("aa", "bb", "cc")
+    ]
+    assert all(n[4] == pytest.approx(0.06) for n in await _notes(store))
+    with aioresponses() as m:  # markers make the tokens non-targets
         res, _ = await _run(store, keyed)
-    assert (res.rows_written, res.credits_used) == (0, 2)
-    assert await _notes(store) == []
+    assert (res.rows_written, res.credits_used) == (0, 0)
+
+
+async def test_research_paid_failures_write_markers(store, keyed):
+    for i, tid in enumerate(("t1", "t2", "t3", "t4")):
+        await _tok(store, tid, entered=f"2026-10-1{5 - i}T00:00:00Z")
+    with aioresponses() as m:
+        m.post(API, payload=reply(text="...", stop="pause_turn", searches=2))
+        m.post(API, status=400)  # t1: the resend failed; the paused reply is charged
+        m.post(API, exception=asyncio.TimeoutError())  # t2: sent, likely billed
+        m.post(API, exception=aiohttp.ConnectionTimeoutError())  # t3: never sent
+        m.post(API, payload=reply())  # t4
+        res, _ = await _run(store, keyed)
+    assert (res.rows_written, res.credits_used) == (3, 5)
+    notes = await _notes(store)
+    assert [(n[0], n[2], n[3].get("reason")) for n in notes] == [
+        ("t1", 0, "resend_failed"),
+        ("t2", 0, "timeout"),
+        ("t4", 1, None),
+    ]
+    assert [n[4] for n in notes] == pytest.approx([0.05, 0.10, 0.06])
+    keyed.research_daily_usd_cap = 0.309  # markers count: 0.21 + 0.10 > 0.309
+    with aioresponses() as m:
+        res, _ = await _run(store, keyed)
+    assert (res.rows_written, res.credits_used) == (0, 0)
+    keyed.research_daily_usd_cap = 0.311  # only t3 (nothing written) is retried
+    with aioresponses() as m:
+        m.post(API, payload=reply(), repeat=True)
+        res, _ = await _run(store, keyed)
+        [body] = _bodies(m)
+    assert "0xt3t3t3t3" in body["messages"][0]["content"]
+    assert (res.rows_written, res.credits_used) == (1, 1)
+
+
+async def test_research_without_searches_omits_tools(store, keyed):
+    await _tok(store, "aa")
+    keyed.research_max_searches = 0
+    with aioresponses() as m:
+        m.post(API, payload=reply())
+        await _run(store, keyed)
+        [body] = _bodies(m)
+    assert "tools" not in body and "at most 0 times" in body["system"]
 
 
 async def test_research_truncates_and_drops_unknown_keys(store, keyed):
@@ -218,14 +277,17 @@ async def test_research_truncates_and_drops_unknown_keys(store, keyed):
         what_it_is="w\x00\x1b" + "x" * 500,
         team_or_deployer_history="t" * 401,
         narrative_fit="n‮" * 400,
-        red_flags=[f"flag{i}\n" + "r" * 200 for i in range(12)] + [7],
+        red_flags=["\x00\x01", "   ", 7]
+        + [f"flag{i}\n" + "r" * 200 for i in range(12)],
         confidence=1.7,
         sources=["ftp://x.org", "not a url", 5]
         + [f"https://s{i}.org/p" for i in range(10)],
         secret="dropped",
     )
     with aioresponses() as m:
-        m.post(API, payload=reply(long))
+        # a brace in prose before the JSON must not cost the paid reply
+        text = "Notes {draft}: see below.\n" + json.dumps(long) + "\n{end}"
+        m.post(API, payload=reply(text=text))
         res, _ = await _run(store, keyed)
     [(_, _, _, note, _)] = await _notes(store)
     assert set(note) == set(GOOD)
@@ -243,11 +305,18 @@ async def test_research_truncates_and_drops_unknown_keys(store, keyed):
 )
 async def test_research_rejects_bad_verdict(store, keyed, over):
     await _tok(store, "aa")
+    await _tok(store, "bb", entered="2026-10-14T00:00:00Z")
     with aioresponses() as m:
         m.post(API, payload=reply(dict(GOOD, **over)))
+        m.post(API, payload=reply())
         res, _ = await _run(store, keyed)
-    assert (res.rows_written, res.credits_used) == (0, 1)
-    assert await _notes(store) == []
+    assert (res.rows_written, res.credits_used) == (2, 2)
+    [aa, bb] = await _notes(store)
+    assert aa[0] == "aa" and aa[2:4] == (
+        0,
+        {"status": "invalid", "reason": "invalid_json"},
+    )
+    assert bb[0] == "bb" and bb[2:4] == (1, GOOD)
 
 
 async def test_research_retries_once_on_429(store, keyed):
@@ -304,9 +373,19 @@ async def test_research_prompt_contains_no_other_token(store, keyed):
 
 def test_research_module_touches_only_research_notes():
     src = (GECKO / "research.py").read_text(encoding="utf-8")
-    writes = re.findall(r"\b(?:INSERT|UPDATE|DELETE|executescript)\b.*", src)
+    pattern = r"\b(?:INSERT|UPDATE|DELETE|REPLACE|executescript)\b.*"
+    writes = re.findall(pattern, src, re.IGNORECASE)
     assert len(writes) == 1
     assert re.match(r"INSERT INTO research_notes\b", writes[0])
+    store_attrs, conn_attrs = set(), set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "store":
+                store_attrs.add(node.attr)
+            if isinstance(node.value, ast.Attribute) and node.value.attr == "conn":
+                conn_attrs.add(node.attr)
+    assert store_attrs == {"conn"}  # no Store helper at all, read or write
+    assert conn_attrs == {"execute", "commit"}
 
 
 def test_rank_ignores_research_notes():
