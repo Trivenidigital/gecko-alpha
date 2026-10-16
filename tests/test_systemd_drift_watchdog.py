@@ -38,7 +38,9 @@ def _make_uv_stub(tmp_path: Path) -> tuple[Path, Path]:
     marker = tmp_path / "alert_marker"
     quoted_marker = shlex.quote(str(marker))
     stub.write_text(
-        "#!/usr/bin/env bash\n" f'echo "uv called: $@" >> {quoted_marker}\n' "exit 0\n"
+        "#!/usr/bin/env bash\n"
+        f'echo "uv called: $@" >> {quoted_marker}\n'
+        "exit 0\n"
     )
     stub.chmod(0o755)
     return stub, marker
@@ -254,9 +256,9 @@ def test_telegram_http_failure_exits_7(tmp_path):
     curl_stub = stub_dir / "curl"
     curl_stub.write_text(
         "#!/usr/bin/env bash\n"
-        'for arg in "$@"; do\n'
-        '  if [[ "$arg" == -o ]]; then OUT_NEXT=1; continue; fi\n'
-        '  if [[ -n "${OUT_NEXT:-}" ]]; then echo \'simulated 503\' > "$arg"; OUT_NEXT=; fi\n'
+        "for arg in \"$@\"; do\n"
+        "  if [[ \"$arg\" == -o ]]; then OUT_NEXT=1; continue; fi\n"
+        "  if [[ -n \"${OUT_NEXT:-}\" ]]; then echo 'simulated 503' > \"$arg\"; OUT_NEXT=; fi\n"
         "done\n"
         "echo 503\n"
     )
@@ -290,7 +292,10 @@ def test_placeholder_token_exits_5(tmp_path):
     _write_unit(repo / "systemd", "gecko-foo.service", "[Unit]\nDescription=v1\n")
     _write_unit(prod, "gecko-foo.service", "[Unit]\nDescription=v2\n")
     env_file = tmp_path / ".env"
-    env_file.write_text("TELEGRAM_BOT_TOKEN=placeholder\n" "TELEGRAM_CHAT_ID=12345\n")
+    env_file.write_text(
+        "TELEGRAM_BOT_TOKEN=placeholder\n"
+        "TELEGRAM_CHAT_ID=12345\n"
+    )
 
     res = subprocess.run(
         ["bash", str(WATCHDOG_SCRIPT)],
@@ -376,9 +381,9 @@ def test_unchanged_drift_set_suppresses_re_alert(tmp_path):
     assert res2.returncode == 1  # still exit 1 (drift exists)
     # Marker exists from prior call; check size DID NOT GROW (no new stub call)
     second_payload_size = marker2.stat().st_size
-    assert (
-        second_payload_size == first_payload_size
-    ), "Second run must NOT invoke stub when drift hash matches"
+    assert second_payload_size == first_payload_size, (
+        "Second run must NOT invoke stub when drift hash matches"
+    )
 
 
 def test_changed_drift_set_re_alerts(tmp_path):
@@ -507,7 +512,9 @@ def test_self_reset_on_clean_after_drift(tmp_path):
     assert res3.returncode == 1
     assert ack_file.exists(), "ACK_FILE must be re-written on regression alert"
     third_size = marker3.stat().st_size
-    assert third_size > first_size, "Stub MUST be called on regression after self-reset"
+    assert third_size > first_size, (
+        "Stub MUST be called on regression after self-reset"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -597,13 +604,13 @@ def test_uv_bin_set_without_opt_in_refuses_prod_silent_suppression(tmp_path):
     assert "UV_BIN set" in res.stderr
     assert "refusing stub path" in res.stderr
     # R3 I1 load-bearing assertions: guard must exit BEFORE alert side-effects
-    assert (
-        not marker.exists()
-    ), "stub must NOT be invoked when guard fires (silent-absorption bug guard)"
+    assert not marker.exists(), (
+        "stub must NOT be invoked when guard fires (silent-absorption bug guard)"
+    )
     ack_file = ack_dir / "last_alerted_hash"
-    assert (
-        not ack_file.exists()
-    ), "ACK must NOT be written when guard fires (false-clean signal guard)"
+    assert not ack_file.exists(), (
+        "ACK must NOT be written when guard fires (false-clean signal guard)"
+    )
 
 
 def test_response_file_uses_mktemp_not_pid():
@@ -622,9 +629,9 @@ def test_curl_uses_max_time():
     flock indefinitely and block subsequent timer fires).
     """
     script_src = WATCHDOG_SCRIPT.read_text()
-    assert (
-        "--max-time 30" in script_src
-    ), "curl invocation must bound execution to prevent stale flock-held alerts"
+    assert "--max-time 30" in script_src, (
+        "curl invocation must bound execution to prevent stale flock-held alerts"
+    )
 
 
 def test_leading_whitespace_in_env_parsed_correctly(tmp_path):
@@ -649,9 +656,9 @@ def test_leading_whitespace_in_env_parsed_correctly(tmp_path):
     curl_stub = stub_dir / "curl"
     curl_stub.write_text(
         "#!/usr/bin/env bash\n"
-        'for arg in "$@"; do\n'
-        '  if [[ "$arg" == -o ]]; then OUT_NEXT=1; continue; fi\n'
-        '  if [[ -n "${OUT_NEXT:-}" ]]; then echo \'{"ok":true}\' > "$arg"; OUT_NEXT=; fi\n'
+        "for arg in \"$@\"; do\n"
+        "  if [[ \"$arg\" == -o ]]; then OUT_NEXT=1; continue; fi\n"
+        "  if [[ -n \"${OUT_NEXT:-}\" ]]; then echo '{\"ok\":true}' > \"$arg\"; OUT_NEXT=; fi\n"
         "done\n"
         "echo 200\n"
     )
