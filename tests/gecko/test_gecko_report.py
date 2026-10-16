@@ -286,7 +286,7 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     await store.watchlist_exit("gone", "2026-10-02T00:00:00Z", "rank")
     await _tok(store, "c", "C", status="candidate")
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 5, None)
+    assert rc == 0 and row == (1, 3, None)
     assert text.splitlines()[0].startswith("gecko digest 20")
     head, lines = _section(text, "ENTRANTS")
     assert head == "ENTRANTS (2)"
@@ -303,11 +303,9 @@ async def test_first_ever_digest_lists_whole_watchlist(store, settings):
     )
 
 
-async def _marks(store, entered, exited, ids_in=(), ids_out=()):
-    await store.kv_set("digest:hwm_entered", entered, OLD)
-    await store.kv_set("digest:hwm_exited", exited, OLD)
-    await store.kv_set("digest:ids_at_hwm_entered", json.dumps(list(ids_in)), OLD)
-    await store.kv_set("digest:ids_at_hwm_exited", json.dumps(list(ids_out)), OLD)
+async def _reported(store, ins=(), outs=()):
+    await store.kv_set("digest:reported_entrants", json.dumps(list(ins)), OLD)
+    await store.kv_set("digest:reported_exits", json.dumps(list(outs)), OLD)
 
 
 async def _kv(store):
@@ -315,14 +313,14 @@ async def _kv(store):
     return dict(rows)
 
 
-async def test_digest_diff_anchored_on_last_ok_run(store, settings):
+async def test_digest_diff_is_by_reported_identity(store, settings):
     await _open(store, "old", 1, entered="2026-10-01T00:00:00Z")
     await _open(store, "mid", 2, entered="2026-10-05T00:00:00Z")
     await _open(store, "out", 3, entered="2026-10-01T00:00:00Z")
     await store.watchlist_exit("out", "2026-10-06T00:00:00Z", "rank")
     await _open(store, "before", 4, entered="2026-10-01T00:00:00Z")
     await store.watchlist_exit("before", "2026-10-02T00:00:00Z", "rank")
-    await _marks(store, "2026-10-03T00:00:00Z", "2026-10-03T00:00:00Z")
+    await _reported(store, ["old", "out", "before"], ["before"])
     marks = await _kv(store)
     rc, _, _ = await _digest(store, settings, ok=False)
     assert rc == 1 and await _kv(store) == marks  # a failed send moves nothing
@@ -333,40 +331,59 @@ async def test_digest_diff_anchored_on_last_ok_run(store, settings):
     assert _section(text, "EXITS") == ("EXITS (1)", ["OUT rank"])
     assert await _kv(store) == {
         "digest:top": json.dumps(["old", "mid"]),
-        "digest:hwm_entered": "2026-10-05T00:00:00Z",
-        "digest:hwm_exited": "2026-10-06T00:00:00Z",
-        "digest:ids_at_hwm_entered": json.dumps(["mid"]),
-        "digest:ids_at_hwm_exited": json.dumps(["out"]),
+        "digest:reported_entrants": json.dumps(["before", "mid", "old", "out"]),
+        "digest:reported_exits": json.dumps(["before", "out"]),
     }
 
 
 T0 = "2026-10-05T00:00:00Z"  # one rank run's as_of, shared by all its rows
 
 
-async def test_digest_entrant_at_mark_not_yet_reported(store, settings, capsys):
+async def test_digest_entrant_reported_once(store, settings, capsys):
     # the last digest read mid-run: x (stamped T0) was committed, y not yet
     await _open(store, "x", 1, entered=T0)
     await _open(store, "y", 2, entered=T0)
-    await _marks(store, T0, "", ids_in=["x"])
+    await _reported(store, ["x"])
     await _fresh(store)
     rc, (text,), _ = await _digest(store, settings)
     head, lines = _section(text, "ENTRANTS")
     assert rc == 0 and head == "ENTRANTS (1)" and lines[0].startswith("#2 Y ")
-    assert json.loads(await store.kv_get("digest:ids_at_hwm_entered")) == ["x", "y"]
+    assert json.loads(await store.kv_get("digest:reported_entrants")) == ["x", "y"]
     capsys.readouterr()
-    rc, sent, _ = await _digest(store, settings)  # x and y at the mark: silent
+    rc, sent, _ = await _digest(store, settings)  # both reported: silent
     assert rc == 0 and sent == [] and "[SILENT]" in capsys.readouterr().out
 
 
-async def test_digest_exit_at_mark_not_yet_reported(store, settings):
+async def test_digest_exit_not_yet_reported(store, settings):
     for tid, rank in (("a", 1), ("x", 2), ("y", 3)):
         await _open(store, tid, rank)
     for tid in ("x", "y"):
         await store.watchlist_exit(tid, T0, "rank")
-    await _marks(store, OLD, T0, ids_in=["a", "x", "y"], ids_out=["x"])
+    await _reported(store, ["a", "x", "y"], ["x"])
     rc, (text,), _ = await _digest(store, settings)
     assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["Y rank"])
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
+
+
+async def test_digest_two_writer_race_reports_an_earlier_stamp_committed_later(
+    store, settings
+):
+    # rank stamps its as_of R; the ledger stamps W > R and commits first. A
+    # digest between the two commits must not hide the rank row behind W.
+    r, w = "2026-10-05T00:00:00Z", "2026-10-05T00:10:00Z"
+    for tid, rank in (("a", 1), ("b", 2)):
+        await _open(store, tid, rank)
+    await _digest(store, settings)
+    await store.watchlist_exit("a", w, "ledger_horizon")
+    await _open(store, "d", 4, entered=w)
+    rc, (text,), _ = await _digest(store, settings)
+    assert _section(text, "EXITS") == ("EXITS (1)", ["A ledger_horizon"])
+    await store.watchlist_exit("b", r, "rank")  # committed after that digest
+    await _open(store, "c", 3, entered=r)
+    rc, (text,), _ = await _digest(store, settings)
+    assert rc == 0 and _section(text, "EXITS") == ("EXITS (1)", ["B rank"])
+    head, lines = _section(text, "ENTRANTS")
+    assert head == "ENTRANTS (1)" and lines[0].startswith("#3 C ")
 
 
 async def test_digest_freshness_error_still_sends(store, settings, monkeypatch):
@@ -463,7 +480,7 @@ async def test_digest_not_silent_when_top_order_changes(store, settings):
     await store.conn.execute("UPDATE watchlist SET rank=3-rank")
     await store.conn.commit()
     rc, (text,), row = await _digest(store, settings)
-    assert rc == 0 and row == (1, 5, None)
+    assert rc == 0 and row == (1, 3, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (0)"
     assert [ln.split()[1] for ln in _section(text, "TOP ")[1]] == ["B", "A"]
     assert json.loads(await store.kv_get("digest:top")) == ["b", "a"]
@@ -480,7 +497,7 @@ async def test_digest_not_silent_on_entry_or_exit_outside_top(store, settings):
     later = iso_plus(utcnow(), 1)  # after the run's real-clock anchor
     await _open(store, "c", 3, entered=later)
     rc, (text,), row = await _digest(store, settings)  # top unchanged: ["a"]
-    assert rc == 0 and row == (1, 5, None)
+    assert rc == 0 and row == (1, 3, None)
     assert _section(text, "ENTRANTS")[0] == "ENTRANTS (1)"
     await store.watchlist_exit("b", iso_plus(later, 1), "rank")
     rc, (text,), _ = await _digest(store, settings)
@@ -528,7 +545,7 @@ async def test_digest_includes_research_verdict(store, settings):
 
 async def test_digest_sanitises_symbols(store, settings):
     evil = "AB\x00C\nD‮EVILLONGSYMBOLNAME123"
-    await _marks(store, OLD, OLD)
+    await _reported(store)
     await _open(store, "a", 1, sym=evil, entered="2026-10-02T00:00:00Z")
     await _open(store, "z", 2, sym=evil, entered="2026-10-02T00:00:00Z")
     await store.watchlist_exit("z", "2026-10-03T00:00:00Z", "rank")

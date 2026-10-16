@@ -222,7 +222,7 @@ async def rank_once(store: Store, settings: GeckoSettings, as_of: str) -> RankRe
 
 @register("rank")
 async def rank_job(settings: GeckoSettings, ns) -> int:
-    as_of = canon_ts(ns.as_of) if ns.as_of else utcnow()
+    fixed = canon_ts(ns.as_of) if ns.as_of else None
     if ns.as_of:
         store = await Store.open(settings.db_path)
         try:
@@ -234,6 +234,9 @@ async def rank_job(settings: GeckoSettings, ns) -> int:
             return 2
 
     async def body(store, session):
+        # live clock read after Store.open: a ledger exit committed during the
+        # open's busy-wait is then never newer than as_of (the rewind guard)
+        as_of = fixed or utcnow()
         if not ns.as_of:  # OR IGNORE: the first live run's stamp is never moved
             await store.conn.execute(
                 "INSERT OR IGNORE INTO kv(key,value,updated_at) VALUES(?,?,?)",

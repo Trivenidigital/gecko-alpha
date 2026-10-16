@@ -1,6 +1,7 @@
 # gecko collector runner: one oneshot instance per collector, started by the collector
 # timers; manual: `systemctl start gecko-collector@<job>` runs `python -m gecko <job>` once.
-# A timer cannot start an instance that is still active, so a job never overlaps itself.
+# One flock per job, shared by gecko-job@ and gecko-collector@: a second run of the
+# same job under either template exits 1 at once instead of overlapping.
 [Unit]
 Description=gecko collector %i (outages page via the freshness job, not per run)
 After=network-online.target
@@ -15,7 +16,7 @@ EnvironmentFile=/root/gecko-alpha/.env.gecko
 # Environment=, so .env.gecko must carry this same value or none (runbook preflight).
 Environment=GECKO_DB_PATH=/root/gecko-alpha/gecko.db
 Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/root/.local/bin/uv run --frozen python -m gecko %i
+ExecStart=/usr/bin/flock -n /run/lock/gecko-%i.lock /root/.local/bin/uv run --frozen python -m gecko %i
 Nice=5
 TimeoutStartSec=900
 # bound a runaway job: the kernel OOM-kills it inside this cgroup; that does NOT

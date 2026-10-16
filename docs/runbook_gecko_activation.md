@@ -76,14 +76,15 @@ A timer cannot start an instance that is still running, so no job overlaps
 itself (the enrich budget no-overlap requirement). A SIGKILLed run still
 records no credits; that gap stays open.
 
-There is no app-level job lock: systemd is the only thing preventing overlap.
-Never run a scheduled job as `uv run python -m gecko <job>` while its timer is
-live; start the unit its timer starts, which waits on (never overlaps) a
-running instance: `systemctl start gecko-collector@<job>.service` for
-dexscreener, geckoterminal and geckoterminal-ohlcv, `gecko-job@<job>.service`
-for every other job. The two templates are different units, so a
-`gecko-job@dexscreener` run CAN overlap a timer-started
-`gecko-collector@dexscreener` run.
+Both templates run the job under `/usr/bin/flock -n /run/lock/gecko-<job>.lock`,
+so the lock now enforces no overlap across them: a `gecko-job@dexscreener` run
+started while a timer-started `gecko-collector@dexscreener` run is live exits 1
+at once (that pages under gecko-job@; a collector run lost to the lock is
+freshness-covered). Never run a scheduled job as `uv run python -m gecko <job>`
+while its timer is live: that bypasses the lock. Start the unit its timer
+starts: `systemctl start gecko-collector@<job>.service` for dexscreener,
+geckoterminal and geckoterminal-ohlcv, `gecko-job@<job>.service` for every
+other job.
 
 Schedules (UTC, `deploy/gecko/timers/`):
 

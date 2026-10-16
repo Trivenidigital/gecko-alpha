@@ -104,7 +104,12 @@ def test_units_share_one_env_file_and_pin_the_db_path(name):
 def test_job_template_and_reader_contracts():
     job = _keys(GECKO / "gecko-job@.service")
     assert job["Type"] == "oneshot" and job["Nice"] == "5"
-    assert job["ExecStart"] == "/root/.local/bin/uv run --frozen python -m gecko %i"
+    # one lock per job across both templates (and a second run exits 1, not waits)
+    lock = "/usr/bin/flock -n /run/lock/gecko-%i.lock "
+    assert (
+        job["ExecStart"] == lock + "/root/.local/bin/uv run --frozen python -m gecko %i"
+    )
+    assert _keys(GECKO / "gecko-collector@.service")["ExecStart"] == job["ExecStart"]
     assert job["TimeoutStartSec"] == "900"
     dropin = GECKO / "gecko-job@coingecko-markets.service.d" / "timeout.conf"
     assert _keys(dropin)["TimeoutStartSec"] == "1500"

@@ -537,6 +537,33 @@ async def test_rank_job_exits_1_on_rewind(settings):
         await s.close()
 
 
+async def test_rank_job_reads_the_clock_after_store_open(settings, monkeypatch):
+    # concurrency: as_of taken before the open could predate a ledger exit
+    # committed while the open waited on the lock, tripping the rewind guard
+    from gecko.rank import ACTIVATION_KEY, rank_job
+    from gecko.store import Store
+
+    events, real_open = [], Store.open.__func__
+
+    async def spy_open(cls, path):
+        events.append("open")
+        return await real_open(cls, path)
+
+    def clock():
+        events.append("clock")
+        return A
+
+    monkeypatch.setattr(Store, "open", classmethod(spy_open))
+    monkeypatch.setattr("gecko.rank.utcnow", clock)
+    assert await rank_job(settings, argparse.Namespace(as_of=None)) == 0
+    assert events[:2] == ["open", "clock"] and events.count("clock") == 1
+    s = await real_open(Store, settings.db_path)
+    try:
+        assert await s.kv_get(ACTIVATION_KEY) == A
+    finally:
+        await s.close()
+
+
 async def test_activation_stamped_once_then_as_of_refused(
     settings, monkeypatch, capsys
 ):

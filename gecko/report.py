@@ -31,10 +31,12 @@ F4_MCAP_SPLIT_USD = 5_000_000
 F4_HI, F4_LO = "F4 mcap≥5M", "F4 mcap<5M"
 # kv state of the last SENT digest: its top-N ids, the newest entered_at /
 # exited_at it saw ("" = none yet) and the ids stamped exactly at each mark.
-# A row is new when past its mark, or at it and not in that id list: one rank
-# run stamps every row with the same as_of but commits them one by one.
-TOP, HWM_IN, HWM_OUT = "digest:top", "digest:hwm_entered", "digest:hwm_exited"
-IDS_IN, IDS_OUT = "digest:ids_at_hwm_entered", "digest:ids_at_hwm_exited"
+# Reported token_ids, not timestamps: a row stamped earlier but committed after
+# the last digest (rank and ledger write concurrently) is still new. v1 has no
+# re-entry (token_id is the watchlist key and an exit is final), so a reported
+# id never needs reporting again: the sets are correct by construction.
+TOP = "digest:top"
+SEEN_IN, SEEN_OUT = "digest:reported_entrants", "digest:reported_exits"
 
 log = structlog.get_logger("gecko.report")
 
@@ -250,11 +252,6 @@ async def _health_extras(
     return out + [f"enrich queue {n}"], warn
 
 
-def _past_mark(ts: str | None, tid: str, hwm: str, seen: set[str]) -> bool:
-    # newer than the mark, or equal to it and not reported at it
-    return bool(ts) and (ts > hwm or (ts == hwm and tid not in seen))
-
-
 async def digest_text(
     store: Store, settings: GeckoSettings, now: str
 ) -> tuple[str, dict[str, str], bool]:
@@ -273,17 +270,16 @@ async def digest_text(
     ).fetchall()
     open_rows = [r for r in rows if r[5] is None]
     top = open_rows[: settings.digest_top_n]
-    state = {TOP: json.dumps([r[0] for r in top])}
-    past = {}  # col -> rows newer than the mark, or at it and not yet reported
-    for key, ids_key, col in ((HWM_IN, IDS_IN, 4), (HWM_OUT, IDS_OUT, 5)):
-        hwm = await store.kv_get(key)
-        seen = set(json.loads(await store.kv_get(ids_key) or "[]"))
-        if hwm is not None:
-            past[col] = [r for r in rows if _past_mark(r[col], r[0], hwm, seen)]
-        state[key] = mark = max((r[col] for r in rows if r[col]), default="")
-        at_mark = sorted(r[0] for r in rows if mark and r[col] == mark)
-        state[ids_key] = json.dumps(at_mark)
-    new, gone = past.get(4, open_rows), past.get(5, [])
+    seen_in = set(json.loads(await store.kv_get(SEEN_IN) or "[]"))
+    out_raw = await store.kv_get(SEEN_OUT)  # None: the first digest lists no exits
+    seen_out = set(json.loads(out_raw or "[]"))
+    new = [r for r in open_rows if r[0] not in seen_in]
+    gone = [r for r in rows if r[5] and r[0] not in seen_out] if out_raw else []
+    state = {
+        TOP: json.dumps([r[0] for r in top]),
+        SEEN_IN: json.dumps(sorted(seen_in | {r[0] for r in new})),
+        SEEN_OUT: json.dumps(sorted(seen_out | {r[0] for r in rows if r[5]})),
+    }
     entry = {r[0]: json.loads(r[3]) for r in new}
     lines = [f"gecko digest {now[:10]}", f"ENTRANTS ({len(new)})"]
     for r in new:
