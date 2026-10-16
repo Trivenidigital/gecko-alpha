@@ -52,13 +52,13 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 
 ## Plan 3 deployment checklist items (from the ops-safety and concurrency vectors)
 - **FIRST: `GECKO_DB_PATH` is already used by legacy scripts (`scripts/gecko-backup-create.sh`, `scripts/chain-anchor-health-watchdog.sh`, `cron/README.md`) to mean the path to `scout.db`.** The same collision holds for **`GECKO_ENV_FILE`**, which legacy code reads as the path to the legacy `.env` (`scripts/alert-channel-watchdog.sh`, `scripts/acceleration-heartbeat-watchdog.sh`, `scripts/audit_stop_loss_false_negatives.sh`, `scout/config_alert.py`); gecko does not read it at all. Never export either globally; set `GECKO_DB_PATH` only in `/root/gecko-alpha/.env.gecko` or the Hermes per-job env. Ticket: rename the gecko env prefix (e.g. `GK_`) before cutover.
-- `.env.gecko` is resolved relative to the job's working directory: every Hermes job must run with `workdir=/root/gecko-alpha`.
+- `.env.gecko` is resolved relative to the job's working directory: every Hermes job must run with `workdir=/root/gecko-alpha`. — Plan 3 Task 11
 - `GECKO_*` variables live in `/root/gecko-alpha/.env.gecko` (or the Hermes job env); NEVER in the legacy `.env` (scout `extra="forbid"` crash-loop).
 - Set `GECKO_DB_PATH` absolute for every job; include `gecko.db` in the backup set; check srilu disk headroom before cutover (observations grow up to ~86k rows/day until pruning exists). — Plan 3 Task 11 (gecko.db backup)
 - During coexistence with the legacy pipeline (which polls GeckoTerminal every 60 s), set `GECKO_GT_MIN_INTERVAL_SEC=3.0` and schedule `geckoterminal-ohlcv` off the :00/:15/:30/:45 pool-job slots; stagger `coingecko-markets` away from `coingecko-hourly`. — Plan 3 Task 11 (stagger)
-- Hermes script timeout for `coingecko-markets` ≥ 20 min (normal run ≈ 11 min); credits are recorded only when a run ends.
-- Wire Hermes cron incidents to the health chat; a `coingecko-markets` budget stop exits 0 by design (warning log only).
-- Add a per-job `flock` (or Hermes `max_parallel_jobs`/no-overlap) so the same job never overlaps itself; rank-rank overlap can exceed the cap.
+- Hermes script timeout for `coingecko-markets` ≥ 20 min (normal run ≈ 11 min); credits are recorded only when a run ends. — Plan 3 Task 11
+- Wire Hermes cron incidents to the health chat; a `coingecko-markets` budget stop exits 0 by design (warning log only). — Plan 3 Task 11
+- Add a per-job `flock` (or Hermes `max_parallel_jobs`/no-overlap) so the same job never overlaps itself; rank-rank overlap can exceed the cap. — Plan 3 Task 11
 - Configure structlog JSON rendering for journald (spec §12) and add `gecko check` (config/Telegram/key self-test) before the soak. — Plan 3 Task 6 (`gecko check`)
 - The agent-side CoinGecko MCP must use a separate Demo key or share the `runs` ledger; MCP spend is invisible to the cap.
 
@@ -79,7 +79,7 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Reader marks come only from stored calls: a channel with no stored call restarts newest-N only, so more than `tg_catchup_limit` messages during downtime are skipped under an ok run — persist per-channel marks (`tg_marks`) or document — Plan 3.
 - GoPlus budget: `credits_used` counts tokens, not HTTP attempts (`get_json` retries up to 3× on 429/5xx, so the cap can undercount 4×); code 4029 (rate limit inside a 200 body) does not stop the run; two overlapping `enrich` runs share no cap reservation — calibrate in the soak before relying on `gp_daily_cap` — Plan 3.
 - Handle normalization: `@foo`, `foo` and `t.me/foo` give different `source_id`/`event_id` — marks reset, calls duplicate, caller identity splits; consistent today only if the operator pastes the `migrate-calls` channel list — Plan 3. — Plan 3 Task 4
-- Spec drift left after the 2026-10-15 fold: §11 `goplus` MCP args, line 22 Hermes row, decoys — docs, Plan 3. — Plan 3 Task 0
+- Spec drift left after the 2026-10-15 fold: §11 `goplus` MCP args, line 22 Hermes row, decoys — docs, Plan 3. — Plan 3 Task 0 (decoys: no referent found)
 - GoPlus parsing: a malformed holder `percent` reads 0 %, and an all-excluded top 10 reads 0.0 — concentration fails open on malformed bodies only; the malformed-`dex` test is weak — later.
 - `enrich --as-of` stamps live GoPlus data at the replayed time — docstring — later. — Plan 3 Task 2
 - DexScreener seeds: pair URLs posted as calls are offered as seeds (cap-bounded); `best_pair` trusts `chainId`; seed expansion of multi-chain addresses is untested — later.
@@ -90,14 +90,14 @@ Source: per-task and final-review findings triaged TICKET (not merge-blocking). 
 - Backtest: window-bound pins; `--from` > `--to` is silently empty (exit 1 ambiguity is on the checklist) — later.
 
 ### Plan 3 deployment checklist additions
-- Run `python -m gecko tg-login` once on the VPS as the gecko user with `GECKO_TG_SESSION_PATH=/root/.gecko/gecko_tg.session` (absolute, outside the repo); confirm mode 0600.
+- Run `python -m gecko tg-login` once on the VPS as the gecko user with `GECKO_TG_SESSION_PATH=/root/.gecko/gecko_tg.session` (absolute, outside the repo); confirm mode 0600. — Plan 3 Task 11
 - **Never reuse the legacy `TG_SOCIAL_SESSION_PATH` as `GECKO_TG_SESSION_PATH`** — gecko needs its own session (another device to Telegram); sharing the legacy file collides with the legacy listener.
 - The history copy (`/root/gecko-history/scout.db`) must be checkpointed / set to `journal_mode=DELETE` BEFORE `chmod 0444`: gecko opens it `immutable=1`, which ignores any `-wal` sidecar, so un-checkpointed rows are invisible.
-- `python -m gecko migrate-calls --history-db /root/gecko-history/scout.db` AFTER the read-only copy exists; paste its `GECKO_TG_CHANNELS=` line into `.env.gecko`. Run it after ingestion has filled `tokens` (or re-run it then) — calls only resolve to tokens that exist.
+- `python -m gecko migrate-calls --history-db /root/gecko-history/scout.db` AFTER the read-only copy exists; paste its `GECKO_TG_CHANNELS=` line into `.env.gecko`. Run it after ingestion has filled `tokens` (or re-run it then) — calls only resolve to tokens that exist. — Plan 3 Task 11
 - `gecko-telegram-reader.service`: `Restart=always`, `RestartSec=30`, `WorkingDirectory=/root/gecko-alpha`. — Plan 3 Task 11
-- Cron: `enrich` hourly (stagger off :00), `prune` daily (off-peak, after backup).
-- Set `GECKO_OBS_RETENTION_DAYS` from measured observation bytes/row and the disk headroom (floor 30).
-- Flip `require_security_known=True` only after `enrich` has covered every active token at least once.
+- Cron: `enrich` hourly (stagger off :00), `prune` daily (off-peak, after backup). — Plan 3 Task 11
+- Set `GECKO_OBS_RETENTION_DAYS` from measured observation bytes/row and the disk headroom (floor 30). — Plan 3 Task 11
+- Flip `require_security_known=True` only after `enrich` has covered every active token at least once. — Plan 3 Task 11
 - Re-run the F4 backtest anchor on the VPS study data; expect PASS with rc 0. Backtest exit 1 means FAIL **or** a crash — read the output, not just the code.
 - Verify every job has run once after deploy: a never-run writer is invisible to freshness. — Plan 3 Task 6
 - An X-lane writer must not share the `source_calls` freshness key with `telegram-reader` — give xkol its own key, or a live reader masks a dead X lane (and vice versa).
@@ -111,8 +111,8 @@ Format: area — finding — fix — owner plan. Items fixed in the PR are not l
 - `tg-login` — silently adopts an existing file at `GECKO_TG_SESSION_PATH`, so a COPY of the legacy session outside the repo runs as the legacy device — refuse when the file exists (force a fresh device) — Plan 3. — Plan 3 Task 4
 - Store — `prune` is the first DELETE path and only a schema clash stops it on the wrong DB (a leaked legacy `GECKO_DB_PATH` would create gecko tables inside scout.db before failing) — stamp and check `PRAGMA application_id` in `Store.open`, refuse a foreign DB before any DDL; raises the priority of the prefix rename — Plan 3, before cutover. — Plan 3 Task 1
 - Ledger — expiry is a silent automated closure (a warning log only) and expired rows leave the backlog count — put the `expired` count in the health page / digest — Plan 3. — Plan 3 Task 5
-- Retention — at the 30 d floor plus a ledger outage over 14 d, a late entry-price resolution finds the 48 h window already pruned — size `GECKO_OBS_RETENTION_DAYS` well above `30 + ledger_max_overdue_days` — Plan 3 (sizing).
-- Checklist — Telethon does not create the session directory and `session_problem` checks only the file mode — `install -d -m 700 /root/.gecko` before `tg-login` — Plan 3.
+- Retention — at the 30 d floor plus a ledger outage over 14 d, a late entry-price resolution finds the 48 h window already pruned — size `GECKO_OBS_RETENTION_DAYS` well above `30 + ledger_max_overdue_days` — Plan 3 (sizing). — Plan 3 Task 11
+- Checklist — Telethon does not create the session directory and `session_problem` checks only the file mode — `install -d -m 700 /root/.gecko` before `tg-login` — Plan 3. — Plan 3 Task 11
 - Checklist — with `GECKO_TG_CHANNELS` set and the unit not yet installed, freshness pages `source_calls` every 6 h (intended) — set `GECKO_TG_CHANNELS` only when the unit goes live — Plan 3. — Plan 3 Task 11 (runbook order)
 
 **Silent-failure (vec-silent)**
@@ -127,7 +127,7 @@ Format: area — finding — fix — owner plan. Items fixed in the PR are not l
 
 **Concurrency (vec-concurrency)**
 - Reader / `tg-login` — nothing stops a second Telethon client on the same session (`AUTH_KEY_DUPLICATED` can revoke it) — `fcntl.flock(LOCK_EX|LOCK_NB)` on `<session>.lock` in both jobs, exit 2 when held — Plan 3, before reader activation. — Plan 3 Task 4
-- Enrich — the budget is checked before the run and spent with no hold: two overlapping runs each spend the full remainder; SIGKILL or a Hermes timeout records no credits — a per-job `flock` or Hermes no-overlap (Hermes overlap behaviour unverified) — Plan 3.
+- Enrich — the budget is checked before the run and spent with no hold: two overlapping runs each spend the full remainder; SIGKILL or a Hermes timeout records no credits — a per-job `flock` or Hermes no-overlap (Hermes overlap behaviour unverified) — Plan 3. — Plan 3 Task 11 (no-overlap; SIGKILL credit loss stays open)
 - Runs — the failure-path `record_run` (run_job and the reader's `fail()`) can hit the same lock that caused the failure, losing the row and its credits — retry the failure row — later.
 - Reader unit — start the unit BEFORE adding channels to the freshness env (else one false page, deduped 6 h); consider `RestartPreventExitStatus=2` so a config error (rc 2) stops instead of looping — Plan 3 runbook. — Plan 3 Task 11 (runbook order)
 - Reader — any SQLite error crashes the process and recovery relies on `Restart=always` (no data loss: marks recompute from stored calls, inserts are idempotent) — accept, or catch per poll — later.
