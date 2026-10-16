@@ -178,3 +178,45 @@ def test_anthropic_api_key_is_secret(tmp_path, monkeypatch):
     assert s.anthropic_api_key.get_secret_value() == "sk-ant-topsecret"
     assert "topsecret" not in repr(s.anthropic_api_key)
     assert "topsecret" not in repr(s)
+
+
+SECRETS = ("tg_api_hash", "coingecko_demo_api_key", "telegram_bot_token")
+SECRETS += ("anthropic_api_key", "telegram_health_chat_id", "telegram_digest_chat_id")
+
+
+def test_empty_or_blank_optional_secret_reads_unset(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # no .env.gecko here
+    for blank in ("", "   "):
+        for f in SECRETS:
+            monkeypatch.setenv(f"GECKO_{f.upper()}", blank)
+        s = GeckoSettings(db_path=str(tmp_path / "g.db"))
+        assert [getattr(s, f) for f in SECRETS] == [None] * len(SECRETS), repr(blank)
+    (tmp_path / ".env.gecko").write_text(
+        "GECKO_TG_API_HASH=\nGECKO_ANTHROPIC_API_KEY= \n"
+    )
+    monkeypatch.delenv("GECKO_TG_API_HASH")
+    monkeypatch.delenv("GECKO_ANTHROPIC_API_KEY")
+    s = GeckoSettings(db_path=str(tmp_path / "g.db"))
+    assert s.tg_api_hash is None and s.anthropic_api_key is None
+
+
+def test_empty_coingecko_key_still_refused_keyless(tmp_path, monkeypatch, capsys):
+    from gecko.__main__ import main
+    from gecko.jobs import JOBS
+
+    ran = []
+
+    async def job(settings, ns):
+        ran.append(1)
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("GECKO_DB_PATH", str(tmp_path / "g.db"))
+    monkeypatch.setenv("GECKO_COINGECKO_DEMO_API_KEY", "")
+    main(["--list"])  # loads the real jobs before the stand-in replaces one
+    monkeypatch.setitem(JOBS, "coingecko-hourly", job)
+    assert main(["coingecko-hourly"]) == 1 and ran == []
+    assert capsys.readouterr().err == (
+        "job 'coingecko-hourly' needs GECKO_COINGECKO_DEMO_API_KEY; "
+        "refusing to run keyless\n"
+    )

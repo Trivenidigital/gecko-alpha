@@ -6,6 +6,14 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 SUPPORTED_CHAINS = ("solana", "base", "ethereum", "bsc")
+OPTIONAL_SECRETS = (  # credentials and chat ids: a blank value means unset
+    "tg_api_hash",
+    "coingecko_demo_api_key",
+    "telegram_bot_token",
+    "telegram_health_chat_id",
+    "anthropic_api_key",
+    "telegram_digest_chat_id",
+)
 
 
 class GeckoSettings(BaseSettings):
@@ -16,8 +24,12 @@ class GeckoSettings(BaseSettings):
     must not leak in here.
     """
 
+    # env_ignore_empty: `GECKO_X=` (env or .env.gecko) is unset, never an empty secret
     model_config = SettingsConfigDict(
-        env_prefix="GECKO_", env_file=".env.gecko", extra="ignore"
+        env_prefix="GECKO_",
+        env_file=".env.gecko",
+        extra="ignore",
+        env_ignore_empty=True,
     )
 
     db_path: str = "gecko.db"
@@ -100,6 +112,12 @@ class GeckoSettings(BaseSettings):
         if v < 30:
             raise ValueError("retention must be >= 30 days")
         return v
+
+    @field_validator(*OPTIONAL_SECRETS, mode="before")
+    @classmethod
+    def _blank_is_unset(cls, v):
+        # whitespace-only ONLY: "" is env_ignore_empty's (env and .env.gecko)
+        return None if isinstance(v, str) and v and not v.strip() else v
 
     @field_validator("chains")
     @classmethod
