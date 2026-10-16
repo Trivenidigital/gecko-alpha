@@ -40,7 +40,7 @@ multiple is `m = 1 + ret`; the multiple vs BTC is
 
 1. n >= 20 on each side.
 2. Mean ratio: (`>= $5M` mean multiple vs BTC) / (`< $5M` mean multiple vs
-   BTC) >= 1.5.
+   BTC) >= 1.5, computed on raw values, not the printed two decimals.
 3. Median multiple (`median` on the scorecard line) on the `>= $5M` side
    >= 1.0.
 
@@ -51,9 +51,13 @@ own hash.
 
 ## Integrity
 
+Amended 2026-10-16, before any forward data existed: criterion 2 now states
+that the ratio is computed on raw values. Wording only; no threshold, split or
+horizon changed.
+
 The footer line holds the SHA-256 of every byte above it, footer excluded.
 Reproduce with:
 
     sed '$d' docs/prereg/2026-10-16-F4-entry-mcap-5m.md | sha256sum
 
-sha256(body above): 506d0000f5c8b1656e1cbd568a3f128e452ee58aead720ab56f4a40c0c943a8e
+sha256(body above): 8804cdd7d5507e866a1ba94da45e35f9dff6b7c0af0dafe62fe3f2b2245ecf79
