@@ -18,6 +18,7 @@ def _load_jobs() -> None:
     # Importing registers jobs; later tasks add modules here.
     import gecko.backtest.runner  # noqa: F401
     import gecko.benchmark  # noqa: F401
+    import gecko.check  # noqa: F401
     import gecko.collectors.coingecko  # noqa: F401
     import gecko.collectors.dexscreener  # noqa: F401
     import gecko.collectors.geckoterminal  # noqa: F401
@@ -27,6 +28,23 @@ def _load_jobs() -> None:
     import gecko.prune  # noqa: F401
     import gecko.rank  # noqa: F401
     import gecko.telegram_reader  # noqa: F401
+
+
+def configure_logging(log_format: str) -> None:
+    """Render structlog events for journald: one JSON line each, or console."""
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if log_format == "json"
+        else structlog.dev.ConsoleRenderer()
+    )
+    structlog.configure(
+        processors=[
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            renderer,
+        ],
+        cache_logger_on_first_use=False,  # tests reconfigure per test
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -52,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--to", dest="date_to", default=None, help="backtest: last t0 (exclusive)"
     )
+    p.add_argument(
+        "--send", action="store_true", help="check: post a test message to health"
+    )
     ns = p.parse_args(argv)
     if ns.list:
         print("\n".join(sorted(JOBS)))
@@ -65,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{ns.job} is live-only: --as-of is refused", file=sys.stderr)
         return 2
     settings = GeckoSettings()
-    if not os.path.isabs(settings.db_path):
+    configure_logging(settings.log_format)
+    # check reports a relative path as a FAIL line instead of being refused here
+    if ns.job != "check" and not os.path.isabs(settings.db_path):
         # A relative path silently forks the database per working directory.
         print(
             f"GECKO_DB_PATH must be absolute (got {settings.db_path!r})",
