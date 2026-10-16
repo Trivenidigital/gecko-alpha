@@ -28,7 +28,12 @@ find gecko -name __pycache__ -type d -prune -exec rm -rf {} +
 /root/.local/bin/uv run --frozen python -m gecko --list   # every job listed
 grep -c '^GECKO_' .env                                 # must print 0: GECKO_* keys crash the legacy settings
 ls /etc/systemd/system/codex-systemd-failure-alert@.service   # the OnFailure= target exists
+systemctl --version | head -1                         # >= 254 for the reader's RestartMode=direct
 ```
+
+The reader unit's `RestartMode=direct` needs systemd 254 or newer. On older
+systemd the key is ignored with a warning, and each auto-restart still pages;
+the start limit bounds that to 5 pages per hour.
 
 ## 1. Stage 1: env file, directories, history copy
 
@@ -136,7 +141,9 @@ step and section 6b.
 ## 3. `python -m gecko check`
 
 NOTE: `check` is not read-only. It creates `gecko.db` at the absolute
-`GECKO_DB_PATH` and stamps its application id.
+`GECKO_DB_PATH` and stamps its application id if the file does not exist.
+Run it only after `.env.gecko` points at the intended path (the section 1a
+`GECKO_DB_PATH` check), or it creates a database in the wrong place.
 
 ```bash
 cd /root/gecko-alpha
@@ -173,12 +180,33 @@ done
 
 Expected on a fresh database: `rank` and `scorecard` have little or nothing to
 work with; `ledger` has nothing due; `freshness` may page for tables that have
-not had a cycle yet; `digest` posts to the digest chat. A partial multi-part
-Telegram send is re-sent whole on the next run, so duplicates are possible and
-loss is not.
+not had a cycle yet; `digest` posts to the digest chat.
+
+**Scorecard and digest sends.** A message over 4,000 characters is split into
+parts marked (i/n). A retry after a partial failure re-delivers the earlier
+parts too, so duplicates are expected and are not a bug; loss is not possible.
+
+**Digest run rows.** A sent digest records `rows_written=5`: two high-water
+marks, two ids-at-mark lists and `as_of`. A health footer reading
+`freshness check error <Type>` means the freshness detector itself failed.
+That is page-worthy: read the digest job's journal.
 
 `research` (daily 06:00) needs `GECKO_ANTHROPIC_API_KEY`; without it the job
 logs "research disabled" and writes nothing.
+
+**Research retries and cost.**
+
+- A token with a valid dossier is never researched again.
+- A token whose only rows are markers (`schema_version=0`: invalid JSON, an
+  abandoned pause, a timeout) is retried once every `MARKER_RETRY_DAYS` (7)
+  while it stays on the watchlist.
+- A malformed HTTP 200 body writes no marker and fails the run. The usual
+  cause is a wrong `GECKO_ANTHROPIC_BASE_URL`: fix the URL.
+- Pricing defaults were verified against the Anthropic docs on 2026-10-16:
+  claude-sonnet-5-5 at $2 / $10 per million input / output tokens, web search
+  at $10 per 1,000. One dossier can overshoot `research_daily_usd_cap` by
+  about one dossier's cost.
+- The research job's `rows_written` counts marker rows as well as dossiers.
 
 ## 5. `migrate-calls`
 
