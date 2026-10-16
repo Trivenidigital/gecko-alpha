@@ -548,3 +548,43 @@ async def test_not_authorized_writes_one_run_row(tmp_path, settings, monkeypatch
     monkeypatch.setattr(tr, "_client", lambda s: _DisconnectFails(authorized=False))
     assert await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None)) == 1
     assert await _job_runs(settings) == [(0, "not_authorized")]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real flock contention")
+def test_session_lock_contends_for_real(tmp_path):
+    import stat
+
+    import gecko.telegram_reader as tr
+
+    p = str(tmp_path / "gk.session")
+    first = tr.lock_session(p)
+    try:
+        with pytest.raises(tr.SessionLocked):
+            tr.lock_session(p)
+        assert stat.S_IMODE(os.stat(p + ".lock").st_mode) == 0o600
+    finally:
+        first.close()
+    tr.lock_session(p).close()  # released with the handle
+
+
+async def test_failed_run_record_is_retried_once(tmp_path, settings, monkeypatch):
+    # a fail() whose write raised recorded nothing: the outer except writes the row
+    import gecko.telegram_reader as tr
+    from gecko.store import Store
+
+    _job_settings(tmp_path, settings)
+    monkeypatch.setattr(tr, "_client", lambda s: EarlyFailClient(authorized=False))
+    real, calls = Store.record_run, []
+
+    async def flaky(self, *a, **kw):
+        calls.append(kw.get("error"))
+        if len(calls) == 1:
+            raise OSError("disk hiccup")
+        return await real(self, *a, **kw)
+
+    monkeypatch.setattr(Store, "record_run", flaky)
+    with pytest.raises(OSError):
+        await tr.telegram_reader_job(settings, SimpleNamespace(as_of=None))
+    monkeypatch.setattr(Store, "record_run", real)
+    assert calls == ["not_authorized", "OSError"]
+    assert await _job_runs(settings) == [(0, "OSError")]

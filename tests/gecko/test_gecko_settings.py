@@ -86,7 +86,23 @@ def test_channel_normalisation(tmp_path, monkeypatch):
     assert s.tg_channels == ["@foo", "@bar", "@baz", "@qux", "@x"]
     monkeypatch.setenv("GECKO_TG_CHANNELS", '["HTTPS://T.ME/Foo"]')
     assert GeckoSettings(db_path=db, _env_file=None).tg_channels == ["@foo"]
-    for bad in (["@Foo", "t.me/foo"], ["@"], ["  "], ["https://t.me/"]):
+    assert GeckoSettings(
+        db_path=db, tg_channels=["t.me/foo/", "a_1"], _env_file=None
+    ).tg_channels == ["@foo", "@a_1"]
+    for bad in (
+        ["@Foo", "t.me/foo"],
+        ["t.me/foo/", "@foo"],  # one trailing "/" is stripped, then deduped
+        ["@"],
+        ["  "],
+        ["https://t.me/"],
+        ["t.me/foo//"],
+        ["t.me/foo?x"],
+        ["https://t.me/s/foo"],
+        ["t.me/+invite"],
+        ["@@foo"],
+        ["telegram.me/foo"],
+        ["foo bar"],
+    ):
         with pytest.raises(ValueError):
             GeckoSettings(db_path=db, tg_channels=bad, _env_file=None)
 
@@ -124,6 +140,14 @@ def test_ai_layer_bounds(tmp_path):
     )
     assert GeckoSettings(db_path=db, _env_file=None, **ok)
     assert GeckoSettings(db_path=db, digest_top_n=1, _env_file=None)
+    for n in (256, 8192):
+        assert GeckoSettings(db_path=db, research_max_tokens=n, _env_file=None)
+    zero_prices = dict(
+        research_usd_per_mtok_in=0,
+        research_usd_per_mtok_out=0,
+        research_usd_per_search=0,
+    )
+    assert GeckoSettings(db_path=db, _env_file=None, **zero_prices)
     for bad in (
         {"research_max_searches": 21},
         {"research_max_searches": -1},
@@ -133,6 +157,13 @@ def test_ai_layer_bounds(tmp_path):
         {"digest_top_n": 51},
         {"scorecard_min_n": 0},
         {"log_format": "xml"},
+        {"research_usd_per_mtok_in": -0.01},
+        {"research_usd_per_mtok_out": -0.01},
+        {"research_usd_per_search": -0.01},
+        {"research_max_tokens": 255},
+        {"research_max_tokens": 8193},
+        {"anthropic_base_url": "http://api.anthropic.com"},
+        {"anthropic_base_url": "api.anthropic.com"},
     ):
         with pytest.raises(ValidationError):
             GeckoSettings(db_path=db, _env_file=None, **bad)

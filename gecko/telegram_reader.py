@@ -200,8 +200,8 @@ async def telegram_reader_job(settings: GeckoSettings, ns) -> int:
 
     async def fail(error: str) -> None:
         nonlocal recorded
-        recorded = True  # exactly one ok=0 row: the outer except must not add one
         await store.record_run("telegram-reader", started, utcnow(), False, error=error)
+        recorded = True  # one ok=0 row; a write that raised is retried by the except
 
     try:
         if problem := session_problem(settings, must_exist=True):

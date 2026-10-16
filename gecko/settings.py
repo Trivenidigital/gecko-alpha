@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -78,10 +80,10 @@ class GeckoSettings(BaseSettings):
     research_max_per_run: int = Field(10, ge=0)
     research_daily_usd_cap: float = Field(1.5, ge=0)
     research_max_searches: int = Field(5, ge=0, le=20)
-    research_usd_per_mtok_in: float = 2.0
-    research_usd_per_mtok_out: float = 10.0
-    research_usd_per_search: float = 0.01
-    research_max_tokens: int = 2000
+    research_usd_per_mtok_in: float = Field(2.0, ge=0)
+    research_usd_per_mtok_out: float = Field(10.0, ge=0)
+    research_usd_per_search: float = Field(0.01, ge=0)
+    research_max_tokens: int = Field(2000, ge=256, le=8192)
     telegram_digest_chat_id: str | None = None
     digest_top_n: int = Field(10, ge=1, le=50)
     scorecard_min_n: int = Field(20, ge=1)
@@ -114,6 +116,13 @@ class GeckoSettings(BaseSettings):
             raise ValueError(f"log_format must be 'json' or 'console', got {v!r}")
         return v
 
+    @field_validator("anthropic_base_url")
+    @classmethod
+    def _anthropic_https(cls, v: str) -> str:
+        if not v.startswith("https://"):  # the API key travels in a header
+            raise ValueError(f"anthropic_base_url must start with https://, got {v!r}")
+        return v
+
     @field_validator("tg_channels")
     @classmethod
     def _channels_canonical(cls, v: list[str]) -> list[str]:
@@ -124,9 +133,10 @@ class GeckoSettings(BaseSettings):
             h = raw.strip().lower()
             for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
                 h = h.removeprefix(prefix)
-            h = h.removeprefix("@").strip()
-            if not h:
-                raise ValueError(f"empty telegram channel: {raw!r}")
+            h = h.removeprefix("@").strip().removesuffix("/")
+            # a malformed handle never resolves and never pages: refuse it here
+            if not re.fullmatch(r"[a-z0-9_]+", h):
+                raise ValueError(f"not a public telegram channel handle: {raw!r}")
             if f"@{h}" in out:
                 raise ValueError(f"duplicate telegram channel: {raw!r}")
             out.append(f"@{h}")
