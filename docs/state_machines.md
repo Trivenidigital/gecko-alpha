@@ -61,7 +61,7 @@ One simulated position from open to close. A trade opens once and closes once; t
 
 - **State list:** not enforced (string literals at the write sites)
 - **Transitions:** guarded — writes check the prior state
-- **Checked by tests:** close statuses compared with the string literals in scout/trading; transitions not checked (only that each named function exists)
+- **Checked by tests:** state list compared with the TradeStatus Literal and with the close-status literals in scout/trading; transitions not checked (only that each named function exists)
 - **Other values in the column (not states):** `kraken_pilot_anchor`, `solana_lane_anchor`
 
 ```mermaid
@@ -133,8 +133,7 @@ Must never be true (checked by the auditor):
 Known hazards (read from the code at registration):
 
 - The column has no CHECK constraint; the close statuses are spelled at the call sites in scout/trading/evaluator.py and in status_map in scout/trading/paper.py.
-- execute_sell maps an unrecognised reason to closed_manual when no status_override is passed, and closed_manual is excluded from the combo statistics, so such a close silently leaves the feedback loop.
-- The TradeStatus Literal in scout/trading/models.py omits closed_high_peak_fade, closed_momentum_death and closed_time_death.
+- execute_sell maps an unrecognised reason to closed_manual when no status_override is passed, and closed_manual is excluded from the combo statistics. The close still happens; it logs paper_close_reason_unmapped at ERROR so it does not go unnoticed.
 - 'Closed' is re-derived with different predicates across modules (status != 'open', LIKE 'closed_%', LIKE 'closed%', VALID_TERMINAL_OUTCOME_SQL); they do not select the same rows.
 - The two anchor values are sentinel rows inserted by the Kraken pilot and the Solana lane so their live rows have a paper parent; they are not trades.
 
@@ -246,8 +245,8 @@ stateDiagram-v2
 | `open` | `rejected` | Kraken definitively refused the order | `scout/live/kraken_pilot.py::_submit_and_resolve` | none |
 | `open` | `rejected` | resolution proved Kraken never accepted the order | `scout/live/kraken_pilot.py::_resolve_ambiguity` | none |
 | `open` | `rejected` | Kraken order ended with nothing filled | `scout/live/kraken_pilot.py::_await_and_reconcile` | none |
-| `open` | `rejected` | operator cancel with nothing filled | `scout/live/kraken_pilot.py::cancel` | none |
-| `needs_manual_review` | `rejected` | operator cancel with nothing filled | `scout/live/kraken_pilot.py::cancel` | none |
+| `open` | `rejected` | operator cancel with nothing filled | `scout/live/kraken_pilot.py::cancel` | compare-and-swap in SQL |
+| `needs_manual_review` | `rejected` | operator cancel with nothing filled | `scout/live/kraken_pilot.py::cancel` | compare-and-swap in SQL |
 | `open` | `rejected` | Solana run proved never submitted, or failed on chain | `scout/live/solana_lane.py::retire_row` | none |
 | `needs_manual_review` | `rejected` | Solana run proved never submitted, or failed on chain | `scout/live/solana_lane.py::retire_row` | none |
 | `needs_manual_review` | `open` | reverse swap proved not submitted; the position is still held | `scout/live/solana_lane.py::_apply_reverse_verdict` | check in Python before the write |
@@ -259,8 +258,8 @@ Must never be true (checked by the auditor):
 
 Known hazards (read from the code at registration):
 
-- Most writes are UPDATE ... WHERE id = ? with no check of the prior status in the statement or the function; where a check exists it is usually in the caller. Only the three marked compare-and-swap filter on status = 'open' in the SQL itself.
-- KrakenPilot.cancel never checks the row's status before writing rejected. Cancelling a needs_manual_review row is the documented use; the same missing check lets it relabel a closed row.
+- Most writes are UPDATE ... WHERE id = ? with no check of the prior status in the statement or the function; where a check exists it is usually in the caller. Only the transitions marked compare-and-swap filter on the prior status in the SQL itself.
+- KrakenPilot.cancel always sends the venue cancel, whatever the row's status, because that reduces exposure. Its ledger write applies only while the row is open or needs_manual_review; a row that is already closed or rejected is left as it was and the evidence records cancel_ledger_unchanged.
 - Manual settlement of needs_manual_review rows is done with SQL outside the code, so those moves cannot appear in this table.
 - needs_manual_review means different things per venue: the Binance engine uses it so a row stops counting as open exposure, while the Kraken pilot and the Solana lane treat it as blocking the lane.
 - 'Closed' is re-derived three ways: LIKE 'closed_%' (scout/live/kill_switch.py), LIKE 'closed%' (scout/live/services/dormancy.py, approval_thresholds.py) and an explicit tuple (scout/live/mandate.py).
@@ -422,7 +421,7 @@ stateDiagram-v2
 Known hazards (read from the code at registration):
 
 - The guard reads the current state and then writes; the read is not part of the same SQL statement as the write.
-- On the forward path, when a submission that timed out waiting for confirmation is then adopted as landed by the resolver (the confirm-timeout branch of _await_and_reconcile), no landed or finalized state is recorded before reconciliation, so a passing reconciliation attempts submission_attempted -> reconciled and the guard raises. The reverse path records the catch-up state first.
+- When the confirmation poll times out and the resolver then adopts the transaction as landed, both paths first record the catch-up state (finalized or landed). An adoption that is not finalized is a reconciliation mismatch: the run stops at landed for review.
 - record_execution_state replaces the stored detail JSON whenever a detail is passed; callers that need to keep earlier keys must merge them first.
 
 ## EVM submission receipt
@@ -478,6 +477,7 @@ Whether live order placement is halted. Engaged by the daily loss cap, by the en
 stateDiagram-v2
     [*] --> inactive
     inactive --> engaged
+    expired_uncleared --> engaged
     engaged --> expired_uncleared
     engaged --> inactive
     expired_uncleared --> inactive
@@ -487,12 +487,13 @@ stateDiagram-v2
 |---|---|---|---|
 | `inactive` | Inactive | Live orders are allowed. | initial |
 | `engaged` | Engaged | Live orders are halted until killed_until. | needs attention |
-| `expired_uncleared` | Expired, not yet cleared | killed_until has passed, so orders are allowed again, but the pointer is still set. Until it is cleared a new kill cannot engage. The per-tick auto-clear normally removes this at once. | needs attention |
+| `expired_uncleared` | Expired, not yet cleared | killed_until has passed, so orders are allowed again, but the pointer is still set. The per-tick auto-clear normally removes this at once, and a new kill releases it itself. If it lingers, the auto-clear tick is not running. | needs attention |
 
 | From | To | When | Performed by | Guard |
 |---|---|---|---|---|
 | (new) | `inactive` | schema installed | `scout/db.py::_migrate_live_trading_schema` | creation |
 | `inactive` | `engaged` | daily loss cap tripped, automatic engine kill, or operator kill | `scout/live/kill_switch.py::trigger` | compare-and-swap in SQL |
+| `expired_uncleared` | `engaged` | a new kill arrives; the expired event is stamped cleared and the pointer re-claimed in one transaction | `scout/live/kill_switch.py::trigger` | re-read and written in one locked transaction |
 | `engaged` | `expired_uncleared` | killed_until passes (no write: is_active starts answering inactive) | `scout/live/kill_switch.py::is_active` | none |
 | `engaged` | `inactive` | operator clear, or automatic clear after expiry | `scout/live/kill_switch.py::clear` | none |
 | `expired_uncleared` | `inactive` | operator clear, or automatic clear after expiry | `scout/live/kill_switch.py::clear` | none |
@@ -507,8 +508,8 @@ How each state is recognised in the table:
 Known hazards (read from the code at registration):
 
 - trigger is a real compare-and-swap on the pointer; clear is an unconditional UPDATE that clears whichever event is active when it runs, not necessarily the one the caller looked at.
-- While the row is expired_uncleared the pointer is non-NULL, so trigger loses its compare-and-swap and a new breach cannot engage.
-- A pointer left on an already-cleared event matches no state: the switch reads as inactive, yet every later trigger loses its compare-and-swap. The auditor reports that row.
+- Before claiming, trigger releases a pointer whose event is expired, already cleared or missing, so a dead pointer does not block a new kill. A kill still in force wins the compare-and-swap as before.
+- A pointer left on an already-cleared event matches no state: the switch reads as inactive and nothing but the next trigger releases the pointer. The auditor reports that row.
 
 ## Signal lane (enabled / suspended)
 

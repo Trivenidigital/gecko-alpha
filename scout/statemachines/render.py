@@ -39,7 +39,8 @@ _GUARD = {
 #: step with that file; test_render_claims_match_the_tests enforces the keys.
 STATE_LIST_CHECKS = {
     "paper_trade": (
-        "close statuses compared with the string literals in scout/trading"
+        "state list compared with the TradeStatus Literal and with the "
+        "close-status literals in scout/trading"
     ),
     "signal_lane": (
         "state list compared with dashboard/lane_status.py and "

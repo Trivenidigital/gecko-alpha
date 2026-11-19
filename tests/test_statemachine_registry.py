@@ -352,7 +352,7 @@ def test_live_status_literals_in_code_are_all_registered():
 def test_trade_status_literal_is_covered_by_the_registry():
     from scout.trading.models import TradeStatus
 
-    assert set(get_args(TradeStatus)) <= set(sm.get("paper_trade").state_names)
+    assert set(get_args(TradeStatus)) == set(sm.get("paper_trade").state_names)
 
 
 def test_paper_anchor_sentinels_are_declared_as_foreign_values():

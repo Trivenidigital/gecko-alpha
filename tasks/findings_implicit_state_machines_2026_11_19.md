@@ -139,29 +139,31 @@ the state lives.
 
 ## 4. Defects noticed along the way
 
-None of these are fixed by this change, which alters no behavior. They are
+The registry change itself alters no behavior. Six of these were fixed
+afterwards on the same branch, each in its own commit with a failing test
+first; they are marked **FIXED** with the commit. The rest are
 recorded so they can be triaged separately.
 
 ### 4a. Confirmed by reading the code in this session
 
-1. **Solana forward swap adopted after a confirmation timeout cannot reach
+1. **FIXED (`e7cecd0f`).** **Solana forward swap adopted after a confirmation timeout cannot reach
    `reconciled`.** This is the confirm-timeout branch of
    `_await_and_reconcile`: `_handle_ambiguity` returns on adoption without
    recording a state (`scout/live/solana_lane.py:4071-4077`); the caller only
    patches the in-memory confirmation (`:4355-4361`); a passing reconciliation
    then writes `reconciled` from `submission_attempted`, which the lane's own
    table forbids, so the guard raises. The reverse path records the catch-up
-   state first and its comment explains why (`:6095-6108`). Read from the
-   code; not reproduced by a test.
-2. **`KrakenPilot.cancel` writes `rejected` without reading the row's
+   state first and its comment explains why (`:6095-6108`). Reproduced by
+   `test_confirm_timeout_then_finalized_adoption_reconciles` before the fix.
+2. **FIXED (`1424ba68`).** **`KrakenPilot.cancel` writes `rejected` without reading the row's
    status** (`scout/live/kraken_pilot.py:5024-5118`).
-3. **`record_contract_coin_map` overwrites `coin_id` unconditionally on
+3. **FIXED (`27c39f68`).** **`record_contract_coin_map` overwrites `coin_id` unconditionally on
    conflict** (`scout/db.py:1771-1774`) and the new-pools lane writes
    `coin_id=None` for every new pool (`scout/ingestion/gt_new_pools.py`), so a
    resolved mapping can be reset to NULL when the chain names match.
-4. **An unrecognised close reason silently becomes `closed_manual`**
+4. **FIXED (`524fbbf7`: now logged at ERROR; the close still happens).** **An unrecognised close reason silently becomes `closed_manual`**
    (`scout/trading/paper.py:748-759`), which the combo statistics exclude.
-5. **`TradeStatus` omits three live statuses** (`scout/trading/models.py:16-27`).
+5. **FIXED (`524fbbf7`).** **`TradeStatus` omits three live statuses** (`scout/trading/models.py:16-27`).
 6. **Ladder leg fills are not guarded on `status = 'open'`**
    (`scout/trading/paper.py:627-634`).
 7. **Kill-switch `clear` is an unconditional UPDATE** on whichever event is
@@ -198,7 +200,7 @@ recorded so they can be triaged separately.
 Raised by the independent reviews of the registry (each cites the code; none
 was reproduced by a test):
 
-19. **An expired kill that has not been cleared blocks the next kill.**
+19. **FIXED (`bbd3af58`).** **An expired kill that has not been cleared blocks the next kill.**
     `is_active()` stops reporting the kill once `killed_until` passes
     (`scout/live/kill_switch.py:197-209`), so orders are allowed again, but
     the pointer is still set and `trigger` is a compare-and-swap on the
