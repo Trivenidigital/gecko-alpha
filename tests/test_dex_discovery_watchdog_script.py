@@ -316,11 +316,22 @@ def test_future_corrupted_cooldown_cannot_suppress_breach(
     assert payload["status"] == "breach_paged"
     assert len(sent) == 1
     # Corrupted state was overwritten with a sane value by the send path.
+    #
+    # Window anchored to the CURRENT clock, not to module-import NOW. NOW is
+    # bound once when this module is imported, so on a slow run the gap between
+    # import and this assertion can exceed the tolerance and the test fails on
+    # elapsed time rather than on behaviour — observed on CI 2026-08-22, where a
+    # 25-minute run put 7.5 minutes between the two and the +/-5 minute window
+    # rejected a perfectly correct rewrite.
     rewritten = (state / "last_alert_poll_liveness").read_text()
+    now = datetime.now(timezone.utc)
     assert (
-        (NOW - timedelta(minutes=5)).isoformat()
+        (now - timedelta(minutes=5)).isoformat()
         < rewritten
-        < (NOW + timedelta(minutes=5)).isoformat()
+        < (now + timedelta(minutes=5)).isoformat()
+    ), (
+        "the send path should rewrite corrupted cooldown state to roughly now; "
+        f"got {rewritten} against a window centred on {now.isoformat()}"
     )
 
 

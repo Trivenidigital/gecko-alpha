@@ -7,10 +7,25 @@ import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import aiosqlite
 import structlog
+
+from scout.identity import LEGACY_SEMANTICS
+from scout.identity_recompute import CREDIT_BEARING, RECOMPUTE_SEMANTICS
+
+#: A surface must hold at least this many credit-bearing rows before its
+#: recovery rate is judged; below it, one row moves the rate enough to be
+#: noise.
+_COLLAPSE_MIN_POPULATION = 20
+#: Fraction of the high-water rate below which a surface is "collapsed".
+#: Deliberately generous -- this is a cliff detector, not a drift detector,
+#: and an alarm that fires on drift is one that gets muted.
+_COLLAPSE_FRACTION = 0.5
+#: Write timeout for the ratchet mark. Short on purpose -- see
+#: `_record_coverage_baseline`.
+_BASELINE_WRITE_TIMEOUT_MS = 2000
 
 _db_log = structlog.get_logger(__name__)
 
@@ -346,6 +361,39 @@ class Database:
             # GA-19: durable per-source consecutive-miss counters so the
             # ingest-starvation watchdog survives gecko-pipeline restarts.
             await self._migrate_ingest_watchdog_state_v1()
+            # 2026-08-21 monthly-budget repair: durable CoinGecko credit
+            # accounting. Module counters reset on restart, and a budget you can
+            # zero by bouncing the service is not a budget.
+            await self._migrate_cg_credit_ledger_v1()
+            # Retention option F: derived first-seen substrate, so
+            # consumers stop depending on unbounded signal_events history.
+            await self._migrate_signal_first_seen_v1()
+            # Ruling C: identity-semantics version marker on the comparison
+            # tables. Additive; stamps existing rows `legacy_prefix` WITHOUT
+            # recomputing their values.
+            await self._migrate_chain_identity_semantics_v1()
+            # Not gated by the migration marker: rows written by OLD code
+            # after the migration ran would otherwise keep NULL forever.
+            # Ungated by the migration marker: the migration early-returns
+            # forever once applied, and this is the IRREVERSIBLE half.
+            await self._migrate_chain_identity_recompute_v1()
+            await self._migrate_chain_identity_recompute_pk_v2()
+            # Ungated, like the archive step below and for the same reason: a
+            # migration early-returns forever once its marker exists, so
+            # putting this inside one meant every database that had already
+            # applied it never got the table. That is the gating mistake this
+            # tranche opened with, and I repeated it here.
+            await self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS recompute_coverage_baseline (
+                    source_table  TEXT PRIMARY KEY,
+                    best_rate     REAL NOT NULL,
+                    population    INTEGER NOT NULL,
+                    recorded_at   TEXT NOT NULL
+                )
+            """)
+            await self._conn.commit()
+            await self.archive_legacy_prefix_comparisons()
+            await self.stamp_unmarked_chain_semantics()
             # P0 edge-audit 2026-07-02: signal_outcome_ledger — every emission
             # (candidate alert / paper-trade dispatch / sampled gate-block)
             # self-labels with forward returns from in-DB price sources.
@@ -488,12 +536,23 @@ class Database:
             # gone, which is the gap this closes going forward.
             await self._migrate_alert_payloads_v1()
 
+            # INF-08: signal_events index migration. schema_version 20260821.
+            # Option D from retention rulings: drop idx_sig_events_type (466MB),
+            # add idx_sig_events_created_at. load_recent_events queries created_at;
+            # idx_sig_events_type serves NO WHERE clause anywhere. Measure NET
+            # occupied-page reduction. Run BEFORE retire_dead_tables as a schema
+            # index change (not destructive data-level pruning).
+            await self._migrate_signal_events_indexes_v1()
             # RH/Pons curve-launch evidence substrate. schema_version 20260913.
             # Bare-additive: two new tables + indexes, observe-only — never read
             # by scorer/gate/alert/paper paths. Curve launches are NOT pools, so
             # they do not reuse dex_pool_discoveries (pool-addressed UNIQUE key).
             # See tasks/design_rh_pons_discovery_delta_2026_09_13.md.
             await self._migrate_rh_pons_discovery_v1()
+            await self._migrate_curve_scan_checkpoints_v1()
+            await self._migrate_curve_reorg_markers_v1()
+            await self._migrate_curve_scan_checkpoint_head_v1()
+            await self._ensure_curve_event_block_index()
 
             # NAR-06 + INF-07 (opt-in-destructive): retire four dead tables. Gated
             # on RETIRE_DEAD_TABLES_ENABLED (plumbed from scout/main.py) because the
@@ -722,6 +781,407 @@ class Database:
             _log.error("SCHEMA_DRIFT_DETECTED", migration="rh_pons_discovery_v1")
             raise
 
+    async def _migrate_curve_scan_checkpoints_v1(self) -> None:
+        """Durable successful-range cursors, schema_version 20260914.
+
+        Stores successful scan coverage and bounded reorg headers. updated_at is
+        the freshness clock for the collector watchdog even across empty ranges.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        try:
+            await self._conn.execute("BEGIN EXCLUSIVE")
+            await self._conn.execute(
+                """CREATE TABLE IF NOT EXISTS curve_scan_checkpoints (
+                chain_id INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                factory TEXT NOT NULL,
+                next_block INTEGER NOT NULL CHECK(next_block >= 0),
+                block_hashes_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(chain_id, protocol, factory)
+            )"""
+            )
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260914,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_scan_checkpoints_v1",
+                ),
+            )
+            await self._conn.commit()
+        except BaseException:
+            await self._conn.rollback()
+            raise
+
+    async def _migrate_curve_reorg_markers_v1(self) -> None:
+        """Allow repeatable append-only reorg transitions (schema 20260915)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute(
+                "SELECT 1 FROM schema_version WHERE version=20260915"
+            )
+            if await cur.fetchone():
+                await conn.commit()
+                return
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='curve_launch_events'"
+            )
+            ddl = (await cur.fetchone())[0]
+            import re
+
+            rebuilt = re.sub(
+                r",\s*UNIQUE\s*\(chain_id,\s*block_hash,\s*transaction_hash,\s*log_index,\s*event_name\)",
+                "",
+                ddl,
+                flags=re.IGNORECASE,
+            )
+            if rebuilt == ddl:
+                raise RuntimeError(
+                    "curve_launch_events UNIQUE shape unexpectedly changed"
+                )
+            cur = await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='curve_launch_events' AND sql IS NOT NULL"
+            )
+            indexes = [r[0] for r in await cur.fetchall()]
+            await conn.execute(
+                "ALTER TABLE curve_launch_events RENAME TO curve_launch_events_reorg_old"
+            )
+            await conn.execute(rebuilt)
+            await conn.execute(
+                "INSERT INTO curve_launch_events SELECT * FROM curve_launch_events_reorg_old"
+            )
+            await conn.execute("DROP TABLE curve_launch_events_reorg_old")
+            for index in indexes:
+                await conn.execute(index)
+            await conn.execute(
+                """CREATE UNIQUE INDEX idx_curve_launch_ev_evidence_identity
+                ON curve_launch_events(chain_id, block_hash, transaction_hash, log_index, event_name)
+                WHERE event_name NOT IN ('reorg_removed','reorg_replaced','reorg_restored')"""
+            )
+            await conn.execute(
+                "INSERT INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260915,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_reorg_markers_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    @staticmethod
+    def _canonical_curve_hashes(
+        events: list[dict],
+    ) -> dict[tuple[str, int], str | None]:
+        """Fold append order; a later restoration supersedes earlier tombstones."""
+        canonical: dict[tuple[str, int], str | None] = {}
+        for ev in sorted(events, key=lambda event: event["id"]):
+            key = (ev["transaction_hash"], ev["log_index"])
+            name = ev["event_name"]
+            if name == "reorg_removed":
+                if canonical.get(key) == ev["block_hash"]:
+                    canonical[key] = None
+            elif name == "reorg_replaced":
+                old_hash = json.loads(ev["payload_json"] or "{}").get(
+                    "replaced_block_hash"
+                )
+                if canonical.get(key) == old_hash:
+                    canonical[key] = None
+            else:
+                canonical[key] = ev["block_hash"]
+        return canonical
+
+    async def _migrate_curve_scan_checkpoint_head_v1(self) -> None:
+        """Add nullable observed head for durable coverage-lag checks (20260916)."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            cur = await conn.execute("PRAGMA table_info(curve_scan_checkpoints)")
+            columns = {row[1] for row in await cur.fetchall()}
+            if "head_block" not in columns:
+                await conn.execute(
+                    "ALTER TABLE curve_scan_checkpoints ADD COLUMN head_block INTEGER"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at, description) VALUES (?, ?, ?)",
+                (
+                    20260916,
+                    datetime.now(timezone.utc).isoformat(),
+                    "curve_scan_checkpoint_head_v1",
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    async def _ensure_curve_event_block_index(self) -> None:
+        """Index overlap-range evidence reads so each scan pass stays bounded.
+
+        Pure access-path addition: idempotent, no data or schema_version change,
+        and older code simply ignores it on rollback.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_curve_launch_ev_block "
+            "ON curve_launch_events(chain_id, protocol, block_number)"
+        )
+        await self._conn.commit()
+
+    async def get_curve_scan_checkpoint(
+        self, chain_id: int, protocol: str, factory: str
+    ) -> dict | None:
+        """Return the last fully completed scan checkpoint for this deployment."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            "SELECT * FROM curve_scan_checkpoints WHERE chain_id=? AND protocol=? AND factory=?",
+            (chain_id, protocol, factory.lower()),
+        )
+        row = await cur.fetchone()
+        return dict(zip([c[0] for c in cur.description], row)) if row else None
+
+    async def save_curve_scan_checkpoint(
+        self,
+        chain_id: int,
+        protocol: str,
+        factory: str,
+        next_block: int,
+        block_hashes: dict,
+        head_block: int | None = None,
+    ) -> None:
+        """Commit completed coverage and the caller's bounded reorg header window."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            """INSERT INTO curve_scan_checkpoints
+            (chain_id, protocol, factory, next_block, block_hashes_json, updated_at, head_block)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chain_id, protocol, factory) DO UPDATE SET
+            next_block=excluded.next_block, block_hashes_json=excluded.block_hashes_json,
+            updated_at=excluded.updated_at, head_block=excluded.head_block""",
+            (
+                chain_id,
+                protocol,
+                factory.lower(),
+                next_block,
+                json.dumps(block_hashes),
+                datetime.now(timezone.utc).isoformat(),
+                head_block,
+            ),
+        )
+        await self._conn.commit()
+
+    async def record_curve_scan_attempt_head(
+        self, chain_id: int, protocol: str, factory: str, head_block: int
+    ) -> None:
+        """Raise the checkpoint's observed head from an unsuccessful attempt.
+
+        next_block, block hashes and updated_at (the success clock) are left
+        alone, so a collector that keeps failing shows growing head lag instead
+        of a frozen head. MAX() ignores a lagging provider head; no row, no-op.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        await self._conn.execute(
+            """UPDATE curve_scan_checkpoints
+            SET head_block = MAX(COALESCE(head_block, ?), ?)
+            WHERE chain_id=? AND protocol=? AND factory=?""",
+            (head_block, head_block, chain_id, protocol, factory.lower()),
+        )
+        await self._conn.commit()
+
+    async def list_curve_launch_curves(self, chain_id: int, protocol: str) -> list[str]:
+        """Canonical known curve contracts for deployment-scoped trade polling."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            """SELECT DISTINCT curve_address FROM curve_launch_discoveries
+            WHERE chain_id=? AND protocol=? AND lifecycle_status IN ('on_curve', 'graduating')
+            AND curve_address IS NOT NULL ORDER BY curve_address""",
+            (chain_id, protocol),
+        )
+        return [r[0] for r in await cur.fetchall()]
+
+    async def curve_launch_members(
+        self, chain_id: int, protocol: str, addresses: Iterable[str]
+    ) -> set[str]:
+        """Which of these emitters are pollable known curves.
+
+        Same lifecycle filter as list_curve_launch_curves, but bounded by the
+        emitters a topic-only log query actually returned instead of every
+        historical curve.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        wanted = sorted({a.lower() for a in addresses if isinstance(a, str)})
+        if not wanted:
+            return set()
+        cur = await self._conn.execute(
+            """SELECT DISTINCT curve_address FROM curve_launch_discoveries
+            WHERE chain_id=? AND protocol=? AND lifecycle_status IN ('on_curve', 'graduating')
+            AND curve_address IN (SELECT value FROM json_each(?))""",
+            (chain_id, protocol, json.dumps(wanted)),
+        )
+        return {r[0] for r in await cur.fetchall()}
+
+    async def curve_events_in_range(
+        self, chain_id: int, protocol: str, from_block: int, to_block: int
+    ) -> list[dict]:
+        """Historical evidence, excluding markers, for canonical-header comparison."""
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        cur = await self._conn.execute(
+            """SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=?
+            AND block_number BETWEEN ? AND ?
+            AND event_name NOT IN ('reorg_removed', 'reorg_replaced', 'reorg_restored')
+            ORDER BY block_number, log_index, id""",
+            (chain_id, protocol, from_block, to_block),
+        )
+        names = [c[0] for c in cur.description]
+        return [dict(zip(names, r)) for r in await cur.fetchall()]
+
+    async def reconcile_curve_launch_projection(
+        self,
+        chain_id: int,
+        protocol: str,
+        *,
+        identities: Iterable[tuple[str, int]] | None = None,
+    ) -> None:
+        """Rebuild mutable identities/lifecycles from surviving append-only evidence.
+
+        Observation clocks survive reorgs; identity and lifecycle do not. The
+        collector replays discovery insertion before calling this method, which
+        also repairs interrupted event/projection writes without deleting history.
+
+        ``identities=None`` rebuilds every row (diagnostics/migration checks).
+        Otherwise ``identities`` are the (transaction_hash, log_index) pairs a
+        pass processed. Their launch/graduation rows name the affected tokens,
+        including the old and new token when a replacement changed identity;
+        NULL-token reorg markers are reached through the identity itself. All
+        evidence for those tokens' launch/graduation identities is folded in
+        append order, exactly as the full rebuild would, and only those tokens
+        are published.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        tokens: list[str] | None = None
+        if identities is None:
+            cur = await self._conn.execute(
+                "SELECT * FROM curve_launch_events WHERE chain_id=? AND protocol=? ORDER BY block_number, log_index, id",
+                (chain_id, protocol),
+            )
+        else:
+            keys = sorted({(str(tx), int(index)) for tx, index in identities})
+            if not keys:
+                return
+            cur = await self._conn.execute(
+                """SELECT DISTINCT e.token_address
+                FROM json_each(?) j JOIN curve_launch_events e
+                ON e.chain_id=? AND e.transaction_hash=json_extract(j.value, '$[0]')
+                AND e.log_index=json_extract(j.value, '$[1]')
+                WHERE e.protocol=? AND e.token_address IS NOT NULL
+                AND e.event_name IN ('token_launched', 'pool_graduated')""",
+                (json.dumps(keys), chain_id, protocol),
+            )
+            tokens = sorted(r[0] for r in await cur.fetchall())
+            if not tokens:
+                return
+            cur = await self._conn.execute(
+                """WITH ids AS (
+                    SELECT DISTINCT transaction_hash, log_index FROM curve_launch_events
+                    WHERE chain_id=? AND protocol=?
+                    AND token_address IN (SELECT value FROM json_each(?))
+                    AND event_name IN ('token_launched', 'pool_graduated')
+                )
+                SELECT e.* FROM ids JOIN curve_launch_events e
+                ON e.chain_id=? AND e.transaction_hash=ids.transaction_hash
+                AND e.log_index=ids.log_index
+                WHERE e.protocol=?
+                ORDER BY e.block_number, e.log_index, e.id""",
+                (chain_id, protocol, json.dumps(tokens), chain_id, protocol),
+            )
+        names = [c[0] for c in cur.description]
+        events = [dict(zip(names, r)) for r in await cur.fetchall()]
+        canonical = self._canonical_curve_hashes(events)
+        projections: dict[str, dict] = {}
+        for ev in events:
+            if ev["event_name"] not in ("token_launched", "pool_graduated"):
+                continue
+            if (
+                canonical.get((ev["transaction_hash"], ev["log_index"]))
+                != ev["block_hash"]
+            ):
+                continue
+            if not ev["token_address"]:
+                continue
+            projection = projections.setdefault(ev["token_address"], {})
+            first_observed = projection.get("first_seen_at")
+            if first_observed is None or datetime.fromisoformat(
+                ev["observed_at"]
+            ) < datetime.fromisoformat(first_observed):
+                projection["first_seen_at"] = ev["observed_at"]
+            if ev["event_name"] == "pool_graduated":
+                projection["lifecycle_status"] = "on_v4"
+                projection.setdefault("event_time", ev["event_time"])
+            else:
+                projection.update(
+                    json.loads(ev["payload_json"] or "{}").get("fields", {})
+                )
+                projection["curve_address"] = ev["curve_address"]
+                projection["event_time"] = ev["event_time"]
+                projection.setdefault("lifecycle_status", "on_curve")
+        # One SQLite statement atomically publishes the complete projection.
+        # Other pipeline writers share this connection and may commit at any
+        # await; a multi-statement SAVEPOINT is therefore unsafe here.
+        await self._conn.execute(
+            """WITH projected AS (
+                SELECT key AS token, value AS facts FROM json_each(?)
+            )
+            UPDATE curve_launch_discoveries SET
+                curve_address=json_extract(p.facts, '$.curve_address'),
+                deployer_address=json_extract(p.facts, '$.deployer_address'),
+                pair_token_address=json_extract(p.facts, '$.pair_token_address'),
+                launch_config_id=json_extract(p.facts, '$.launch_config_id'),
+                graduation_threshold=json_extract(p.facts, '$.graduation_threshold'),
+                event_time=json_extract(p.facts, '$.event_time'),
+                lifecycle_status=COALESCE(json_extract(p.facts, '$.lifecycle_status'), 'unknown'),
+                execution_eligible=0,
+                first_seen_at=CASE
+                    WHEN julianday(json_extract(p.facts, '$.first_seen_at')) < julianday(first_seen_at)
+                    THEN json_extract(p.facts, '$.first_seen_at') ELSE first_seen_at END
+            FROM (
+                SELECT d.token_address AS token, projected.facts
+                FROM curve_launch_discoveries d LEFT JOIN projected
+                ON projected.token=d.token_address
+                WHERE d.chain_id=? AND d.protocol=?
+                AND (? IS NULL OR d.token_address IN (SELECT value FROM json_each(?)))
+            ) p
+            WHERE curve_launch_discoveries.chain_id=?
+            AND curve_launch_discoveries.protocol=?
+            AND curve_launch_discoveries.token_address=p.token""",
+            (
+                json.dumps(projections),
+                chain_id,
+                protocol,
+                None if tokens is None else 1,
+                json.dumps(tokens or []),
+                chain_id,
+                protocol,
+            ),
+        )
+        await self._conn.commit()
+
     async def record_curve_launch_discovery(
         self,
         *,
@@ -837,6 +1297,27 @@ class Database:
         UNIQUE key + INSERT OR IGNORE). Append-only: no UPDATE path exists."""
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
+        prior_hash = await self.canonical_curve_event_block_hash(
+            chain_id, transaction_hash, log_index
+        )
+        markers = {"reorg_removed", "reorg_replaced", "reorg_restored"}
+        if event_name == "reorg_removed" and prior_hash != block_hash:
+            # Preserve an unsolicited removal even when its original log was
+            # never observed; repeated polling of that removal is idempotent.
+            existing = await self._conn.execute(
+                """SELECT 1 FROM curve_launch_events WHERE chain_id=? AND protocol=?
+                AND transaction_hash=? AND log_index=? AND block_hash=?
+                AND event_name='reorg_removed' LIMIT 1""",
+                (chain_id, protocol, transaction_hash, log_index, block_hash),
+            )
+            if await existing.fetchone():
+                return False
+        if event_name == "reorg_replaced":
+            target = json.loads(payload_json or "{}").get("replaced_block_hash")
+            if prior_hash != target:
+                return False
+        if event_name == "reorg_restored" and prior_hash == block_hash:
+            return False
         cur = await self._conn.execute(
             """INSERT OR IGNORE INTO curve_launch_events
                (chain_id, protocol, event_name, token_address, curve_address,
@@ -862,8 +1343,40 @@ class Database:
                 payload_json,
             ),
         )
+        inserted = cur.rowcount > 0
+        if not inserted and event_name not in markers and prior_hash != block_hash:
+            # Same canonical block can return after a fork. Preserve original
+            # evidence and observation clock; append its new canonical status.
+            await self._conn.execute(
+                """INSERT INTO curve_launch_events
+                (chain_id, protocol, event_name, token_address, curve_address,
+                 transaction_hash, log_index, block_number, block_hash,
+                 event_time, observed_at, provider_available_at, source, provenance, payload_json)
+                VALUES (?, ?, 'reorg_restored', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    chain_id,
+                    protocol,
+                    token_address,
+                    curve_address,
+                    transaction_hash,
+                    log_index,
+                    block_number,
+                    block_hash,
+                    event_time,
+                    observed_at,
+                    provider_available_at,
+                    source,
+                    provenance,
+                    json.dumps(
+                        {
+                            "restored_block_hash": block_hash,
+                            "prior_block_hash": prior_hash,
+                        }
+                    ),
+                ),
+            )
         await self._conn.commit()
-        return cur.rowcount > 0
+        return inserted
 
     async def get_curve_launch(self, chain_id: int, token_address: str) -> dict | None:
         """One discovery row as a dict, or None."""
@@ -917,14 +1430,12 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database not initialized. Call initialize() first.")
         cur = await self._conn.execute(
-            "SELECT block_hash FROM curve_launch_events "
-            "WHERE chain_id = ? AND transaction_hash = ? AND log_index = ? "
-            "AND event_name NOT IN ('reorg_removed', 'reorg_replaced') "
-            "ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM curve_launch_events WHERE chain_id=? AND transaction_hash=? AND log_index=? ORDER BY id",
             (chain_id, transaction_hash, log_index),
         )
-        row = await cur.fetchone()
-        return row[0] if row else None
+        names = [c[0] for c in cur.description]
+        events = [dict(zip(names, row)) for row in await cur.fetchall()]
+        return self._canonical_curve_hashes(events).get((transaction_hash, log_index))
 
     async def max_curve_event_block(self, chain_id: int) -> int | None:
         """Highest observed block number — the reconnect/backfill cursor."""
@@ -2611,8 +3122,8 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_sig_events_token
                 ON signal_events(token_id, pipeline, created_at);
-            CREATE INDEX IF NOT EXISTS idx_sig_events_type
-                ON signal_events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_sig_events_created_at
+                ON signal_events(created_at);
 
             CREATE TABLE IF NOT EXISTS chain_patterns (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6993,6 +7504,94 @@ class Database:
                 _log.exception("schema_migration_rollback_failed", err=str(rb_err))
             raise
 
+    async def _migrate_signal_events_indexes_v1(self) -> None:
+        """Drop idx_sig_events_type, add idx_sig_events_created_at.
+
+        Option D from retention rulings 2026-08-16: idx_sig_events_type (466 MB)
+        serves NO WHERE clause anywhere; load_recent_events does a full-scan +
+        temp-sort every cycle because it filters on created_at. Swapping them
+        gives both size and latency wins.
+
+        Migration runs EXCLUSIVE to gate the index operations. Both indexes exist
+        by schema definition, but the DROP happens only once; subsequent runs
+        check paper_migrations and skip.
+
+        The new index helps:
+        - load_recent_events: WHERE created_at >= ? ORDER BY created_at ASC
+        - tracker MIN queries: WHERE ... AND datetime(created_at) < ...
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "signal_events_indexes_v1"
+        schema_version = 20260822
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+
+            # Check if already applied
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name = ?", (migration_name,)
+            )
+            if await cur.fetchone() is not None:
+                await conn.execute("COMMIT")
+                _log.info(
+                    "signal_events_indexes_v1_migration_skip_already_applied",
+                )
+                return
+
+            # Drop the old index (serves no WHERE clause)
+            await conn.execute("DROP INDEX IF EXISTS idx_sig_events_type")
+
+            # Create the new index (helps with created_at filters)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sig_events_created_at "
+                "ON signal_events(created_at)"
+            )
+
+            # Record the migration
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "signal_events_indexes_v1_migration_complete",
+                dropped="idx_sig_events_type",
+                created="idx_sig_events_created_at",
+            )
+        except BaseException as e:
+            _log.exception(
+                "signal_events_indexes_v1_migration_failed",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
     async def _migrate_entry_snapshot_liquidity_provenance_v1(self) -> None:
         """Add liquidity provenance columns to paper_trade_entry_snapshots:
         ``liquidity_source_at_entry`` + ``liquidity_confidence_at_entry``.
@@ -7724,6 +8323,1506 @@ class Database:
         except BaseException as e:
             _log.exception(
                 "source_call_price_snapshot_runs_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    # Measured 2026-08-23 via dbstat: signal_outcome_ledger 171,900,928 B table
+    # + 59,994,112 B indexes over 511,386 rows = 453.42 B/row all-in, rounded UP
+    # to 454. The direction is deliberate: an overestimate makes the reopen
+    # threshold fire slightly EARLY, and late is the direction that lets a
+    # deferral quietly stop being safe. Used as a
+    # cheap proxy because dbstat itself scans the whole 7 GB database and takes
+    # minutes -- far too heavy for an hourly probe whose only job is to notice a
+    # threshold crossing.
+    #
+    # RE-MEASURE TRIGGER: the drift risk is `gate_verdicts`, a variable-length
+    # JSON blob -- adding gates raises the true per-row cost with nothing here
+    # noticing. (The label columns matter less: measured 257.7 B/row all-pending
+    # vs 342.5 B/row all-complete, and at a 7-day finalize the table sits ~94%
+    # complete.) Re-measure via dbstat if the gate set changes materially. The
+    # pinning test asserts the constant against a 2026-08-23 measurement; it
+    # cannot detect that the measurement went stale.
+    _LEDGER_BYTES_PER_ROW = 454
+    _LEDGER_REOPEN_RECLAIMABLE_BYTES = 100 * 1024 * 1024
+    _LEDGER_REOPEN_PROJECTED_DAYS = 30
+    _LEDGER_SIZE_CEILING_BYTES = 1024 * 1024 * 1024
+
+    async def signal_outcome_ledger_growth_probe(
+        self, *, horizon_days: int = 10
+    ) -> dict:
+        """Lightweight growth watch for the DEFERRED ruling-E pruning work.
+
+        E was deferred on economics, not on correctness: as ruled
+        (cohort-closure only, no age-based pruning) it reclaims ~309 rows of a
+        511,386-row table, and the whole table is ~232 MB of a 7 GB database.
+        Building the cohort registry, closure classifier, durable receipts and
+        byte-identical proof harness for ~140 KB is not a defensible trade.
+
+        Deferral is only safe if something watches for the economics changing,
+        which is what this is. It reports the four measures the ruling names and
+        sets `reopen` when either threshold is crossed. Reopening the
+        INVESTIGATION needs no approval; any destructive pruning still follows
+        the cohort-closure ruling.
+
+        `horizon_days` is the label deadline (r7d horizon + permitted lateness):
+        past it, a labelled row can no longer change, which is what makes it
+        mechanically closed rather than merely old.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute("SELECT COUNT(*) FROM signal_outcome_ledger")
+        rows = (await cur.fetchone())[0]
+
+        # No datetime() on the COLUMN side: it is non-sargable and forces a full
+        # scan (measured 203 ms vs 0.19 ms on a 511k-row clone).
+        #
+        # This is a LEXICOGRAPHIC compare standing in for a chronological one,
+        # which is only valid while every stored value is canonical
+        # isoformat-T/UTC. An earlier version of this comment justified that on
+        # "record_emission always stores datetime.now(timezone.utc).isoformat()"
+        # -- which was FALSE: `record_emission_with_status` takes an
+        # `emitted_at` parameter for backfills and stored it unvalidated, so a
+        # space-separated or negative-offset value would sort below 'T' and be
+        # silently dropped from the window (growth undercounts -> under-alarm).
+        #
+        # The invariant is now ENFORCED at the writer by
+        # `scout.outcome_ledger._normalise_emitted_at`, not asserted here. If
+        # that normalisation is ever removed, this must go back to datetime().
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM signal_outcome_ledger "
+            "WHERE emitted_at >= strftime('%Y-%m-%dT%H:%M:%S','now','-1 day')"
+        )
+        growth_rows_per_day = (await cur.fetchone())[0]
+
+        # Safely prunable == fully-dormant (surface, kind) cohorts, per the
+        # cohort-closure ruling. NOT age-based: a cohort still emitting is not
+        # closed no matter how old its oldest row is.
+        cur = await self._conn.execute(f"""SELECT COALESCE(SUM(n), 0) FROM (
+                    SELECT COUNT(*) AS n
+                      FROM signal_outcome_ledger
+                     GROUP BY surface, kind
+                    HAVING datetime(MAX(emitted_at))
+                             < datetime('now', '-{int(horizon_days)} days')
+                       AND SUM(label_status IN ('pending','partial')) = 0)""")
+        reclaimable_rows = (await cur.fetchone())[0]
+
+        bytes_total = rows * self._LEDGER_BYTES_PER_ROW
+        reclaimable_bytes = reclaimable_rows * self._LEDGER_BYTES_PER_ROW
+        growth_bytes_per_day = growth_rows_per_day * self._LEDGER_BYTES_PER_ROW
+
+        headroom = self._LEDGER_SIZE_CEILING_BYTES - bytes_total
+        if growth_bytes_per_day > 0:
+            days_to_ceiling = max(0.0, headroom / growth_bytes_per_day)
+        else:
+            days_to_ceiling = float("inf")
+
+        reopen_reasons = []
+        if reclaimable_bytes >= self._LEDGER_REOPEN_RECLAIMABLE_BYTES:
+            reopen_reasons.append("reclaimable_bytes")
+        # ALREADY over the ceiling. This is a separate condition from the
+        # projection on purpose: the projection is gated on
+        # `growth_bytes_per_day > 0`, so without this clause a table that has
+        # crossed 1 GB and then stopped growing -- the kill switch flipped off,
+        # or any >24h outage -- reports `reopen: False` and the hourly line
+        # reads green. The watch would go quiet at exactly the moment the thing
+        # it watches for had already happened.
+        if bytes_total >= self._LEDGER_SIZE_CEILING_BYTES:
+            reopen_reasons.append("over_ceiling")
+        if days_to_ceiling <= self._LEDGER_REOPEN_PROJECTED_DAYS:
+            reopen_reasons.append("projected_size")
+
+        return {
+            "status": "E_DEFERRED_BY_ECONOMICS",
+            "rows": rows,
+            # `_est` because these are rows x a measured proxy, not dbstat. An
+            # operator grepping journald for `bytes_total=` would otherwise read
+            # them as measured.
+            "bytes_total_est": bytes_total,
+            "bytes_per_row_proxy": self._LEDGER_BYTES_PER_ROW,
+            "growth_rows_per_day": growth_rows_per_day,
+            "growth_bytes_per_day_est": growth_bytes_per_day,
+            "reclaimable_rows": reclaimable_rows,
+            # Drops the ruling's "non-protected" qualifier: no protection
+            # mechanism exists yet, so this counts closed cohorts regardless.
+            # Safe direction -- it OVERSTATES what is reclaimable, so the alarm
+            # fires early -- but the name promises more than it delivers.
+            "reclaimable_bytes_est": reclaimable_bytes,
+            "days_to_1gb": (
+                None if days_to_ceiling == float("inf") else round(days_to_ceiling, 1)
+            ),
+            "reopen": bool(reopen_reasons),
+            "reopen_reasons": reopen_reasons,
+        }
+
+    async def reconcile_signal_first_seen(self) -> dict[str, int]:
+        """Re-derive the substrate from surviving events. Idempotent, self-healing.
+
+        The substrate's per-write path is NOT atomic against the shared
+        connection, and no savepoint can make it so. `scout/chains/tracker.py`
+        opens an explicit `BEGIN` on `db._conn` and calls `conn.rollback()` on
+        any failure in its pass -- and that failure fires several times a day
+        in production. A concurrent `emit_event` whose fold is pending when
+        that FOREIGN rollback lands loses the fold, then commits its own event
+        insert: a committed event with no substrate row, reading as "never
+        detected by chains" at every consumer.
+
+        Ordering the fold before the insert does not help; neither does
+        insert-first. The two writes are simply not atomic against a foreign
+        rollback, so the durable answer is repair rather than prevention.
+
+        This is that repair, and it is safe precisely because the fold can only
+        ever LOWER the minimum: re-running it can restore a lost row or correct
+        a late one, and can never push a first_seen later than the truth. It
+        also repairs a truncated/restored table, which the one-shot migration
+        cannot -- that early-returns forever once its marker exists.
+
+        Returns counts for observability; `repaired` > 0 is a real signal that
+        the write path dropped something, not routine noise.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT token_id FROM signal_events "
+            "WHERE token_id IS NOT NULL AND token_id != '' "
+            "EXCEPT SELECT token_id FROM signal_first_seen)"
+        )
+        missing = (await cur.fetchone())[0]
+        cur = await self._conn.execute("""SELECT COUNT(*) FROM signal_first_seen s
+                 JOIN (SELECT token_id, MIN(created_at) m FROM signal_events
+                        WHERE token_id IS NOT NULL AND token_id != ''
+                        GROUP BY token_id) e ON e.token_id = s.token_id
+                WHERE s.first_seen_at > e.m""")
+        late = (await cur.fetchone())[0]
+
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+               SELECT token_id, MIN(created_at), ?
+                 FROM signal_events
+                WHERE token_id IS NOT NULL AND token_id != ''
+                GROUP BY token_id
+               ON CONFLICT(token_id) DO UPDATE SET
+                 first_seen_at = MIN(
+                   signal_first_seen.first_seen_at, excluded.first_seen_at),
+                 updated_at = excluded.updated_at""",
+            (now,),
+        )
+        # An '' row poisons every consumer via LIKE '%'; nothing prunes this
+        # table, so sweep it here rather than hoping it never lands.
+        cur = await self._conn.execute(
+            "DELETE FROM signal_first_seen WHERE token_id IS NULL OR token_id = ''"
+        )
+        poisoned = cur.rowcount or 0
+        await self._conn.commit()
+        return {
+            "repaired": missing + late,
+            "missing": missing,
+            "late": late,
+            "poisoned_removed": poisoned,
+        }
+
+    async def record_signal_first_seen(self, token_id: str, created_at: str) -> None:
+        """Fold one observation into the derived first-seen substrate.
+
+        MIN semantics, NOT insert-once. `emit_event` stamps `created_at` in
+        Python, so two concurrent callers can interleave and produce an event
+        whose timestamp is EARLIER than one already written; replay and
+        backfill paths write historical rows deliberately. An insert-once cache
+        would keep whichever row happened to land first and be permanently
+        wrong about the minimum, with nothing to signal it.
+
+        Idempotent and order-independent: applying the same observations in any
+        order, any number of times, converges on the same value.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        if not token_id or not created_at:
+            # RAISE, do not return. `signal_events.token_id` is TEXT NOT NULL
+            # but '' satisfies that, so a silent no-op here commits an event
+            # with no substrate row -- the exact divergence this table exists
+            # to prevent, and invisible because the write "succeeded".
+            #
+            # An empty token_id in the substrate is separately destructive:
+            # consumers match with `LOWER(?) LIKE LOWER(token_id || '%')`,
+            # which for '' degenerates to LIKE '%' and matches EVERY coin. MIN
+            # then makes that row win everywhere, and nothing prunes this table
+            # so it would never age out.
+            raise ValueError(
+                f"record_signal_first_seen requires a non-empty token_id and "
+                f"created_at, got token_id={token_id!r} created_at={created_at!r}"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        await self._conn.execute(
+            """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(token_id) DO UPDATE SET
+                 first_seen_at = MIN(
+                   signal_first_seen.first_seen_at, excluded.first_seen_at),
+                 updated_at = excluded.updated_at""",
+            (token_id, created_at, now),
+        )
+
+    async def _migrate_chain_identity_recompute_pk_v2(self) -> None:
+        """Put `semantics_version` in the overlay's PRIMARY KEY.
+
+        The v1 table stored the version as a plain column and keyed on
+        (source_table, source_row_id). With `INSERT OR REPLACE` that made the
+        "versioned derived store" able to hold exactly ONE version: replaying
+        under a bumped `RECOMPUTE_SEMANTICS` overwrote the v1 verdict in place
+        and the earlier evidence was simply gone.
+
+        That is the shape ruling C forbids -- "only as a distinct derived
+        dataset with explicit semantic version, not an UPDATE that destroys the
+        previous evidence" -- deferred one level. The archive/overlay split was
+        built so the archive would never be rewritten, and it is not; the
+        overlay then reproduced the same defect against itself.
+
+        Latent when found (one version exists, so nothing had been destroyed),
+        and it goes live the first time anyone bumps the constant -- which is
+        the normal way this table is meant to evolve. Cheapest to fix now, for
+        exactly that reason.
+
+        Rebuild rather than ALTER: SQLite cannot add a column to a PRIMARY KEY
+        in place.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_pk_v2"
+        schema_version = 20260826
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                return
+
+        cur = await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='chain_identity_recompute_v1'"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return
+        # Already the v2 shape (a fresh install creates it directly). Detected
+        # from the stored DDL rather than from a marker, so a database that
+        # applied the earlier build is upgraded and a fresh one is left alone.
+        ddl = " ".join((row[0] or "").split())
+        if "semantics_version)" in ddl:
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.commit()
+            return
+
+        try:
+            # BEGIN EXCLUSIVE so the rebuild is actually atomic. DDL runs in
+            # AUTOCOMMIT under this connection mode -- the same property behind
+            # the archive-commit finding -- so without it the scratch CREATE is
+            # already durable and `rollback()` cannot undo it. Any failure
+            # (exception, OOM, SIGTERM, a deploy restart while it copies
+            # production's 2,891 rows) then left an orphan
+            # `..._pk2` table, and EVERY subsequent boot raised
+            # "table already exists" out of `initialize()`, which no caller
+            # catches, until someone dropped it by hand.
+            #
+            # That is the concurrent-startup crash this tranche opened with,
+            # reintroduced in its newest migration -- and only on the path that
+            # runs against databases carrying real data, since a fresh install
+            # takes the early return above.
+            await conn.execute("BEGIN EXCLUSIVE")
+            # And drop first, so a database already wedged by an earlier failed
+            # attempt recovers on the next boot instead of needing hands.
+            await conn.execute("DROP TABLE IF EXISTS chain_identity_recompute_v1_pk2")
+            await conn.execute("""
+                CREATE TABLE chain_identity_recompute_v1_pk2 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
+                )
+            """)
+            await conn.execute(
+                "INSERT INTO chain_identity_recompute_v1_pk2 "
+                "SELECT * FROM chain_identity_recompute_v1"
+            )
+            await conn.execute("DROP TABLE chain_identity_recompute_v1")
+            await conn.execute(
+                "ALTER TABLE chain_identity_recompute_v1_pk2 "
+                "RENAME TO chain_identity_recompute_v1"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, datetime('now'))",
+                (migration_name,),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, datetime('now'), ?)",
+                (
+                    schema_version,
+                    "chain_identity_recompute PK includes semantics_version",
+                ),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_pk_v2_migration_complete")
+        except Exception:
+            await conn.rollback()
+            _log.exception("chain_identity_recompute_pk_v2_migration_rollback")
+            raise
+
+    async def _migrate_chain_identity_recompute_v1(self) -> None:
+        """Versioned derived store for recomputed legacy provenance (ruling C).
+
+        SEPARATE from the archived legacy rows on purpose. The ruling allows
+        historical recomputation "only as a distinct derived dataset with
+        explicit semantic version -- not an UPDATE that destroys the previous
+        evidence", so this table carries the recomputed answer beside the
+        archive rather than rewriting it.
+
+        Keyed on (source_table, source_row_id, semantics_version) against the
+        IMMUTABLE archive, so a rerun of the SAME version REPLACEs in place and
+        cannot double-count, while a DIFFERENT version lands beside the old
+        verdict instead of destroying it. See
+        `_migrate_chain_identity_recompute_pk_v2` for why the version had to be
+        in the key rather than merely stored on the row.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_recompute_v1"
+        schema_version = 20260825
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_recompute_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chain_identity_recompute_v1 (
+                    source_table        TEXT NOT NULL,
+                    source_row_id       INTEGER NOT NULL,
+                    coin_id             TEXT NOT NULL,
+                    symbol              TEXT,
+                    historical_anchor   TEXT NOT NULL,
+                    legacy_detected     INTEGER NOT NULL,
+                    legacy_lead         REAL,
+                    canonical_detected  INTEGER NOT NULL,
+                    canonical_lead      REAL,
+                    identity_tier       TEXT NOT NULL,
+                    evidence_status     TEXT NOT NULL,
+                    semantics_version   TEXT NOT NULL,
+                    computed_at         TEXT NOT NULL,
+                    -- semantics_version IS PART OF THE KEY. Without it the
+                    -- "versioned derived store" could hold exactly one
+                    -- version: `INSERT OR REPLACE` keyed on
+                    -- (source_table, source_row_id) meant a v2 replay
+                    -- OVERWROTE the v1 verdict in place, destroying the
+                    -- evidence it was supposed to sit beside. That is the
+                    -- shape ruling C forbids -- "not an UPDATE that destroys
+                    -- the previous evidence" -- deferred one level, from the
+                    -- archive to the overlay. The archive is genuinely
+                    -- immutable; the derived store was not versioned in the
+                    -- only sense that matters.
+                    --
+                    -- Re-running the SAME version still replaces, so the
+                    -- backfill stays idempotent.
+                    PRIMARY KEY (source_table, source_row_id, semantics_version)
+                )
+                """)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_status "
+                "ON chain_identity_recompute_v1(evidence_status)"
+            )
+            # The READ path's key. The trackers correlate on
+            # (source_table, coin_id, historical_anchor) and the implicit
+            # primary-key index is on (source_table, source_row_id), so
+            # without this every dashboard row scanned all overlay rows for
+            # its surface and built a temp b-tree for the ORDER BY -- twice,
+            # once per scalar subquery. Measured by review as
+            # "SEARCH cir USING INDEX ... (source_table=?)
+            #  + USE TEMP B-TREE FOR ORDER BY".
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cir_reader "
+                "ON chain_identity_recompute_v1"
+                "(source_table, coin_id, historical_anchor)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing = await cur.fetchone()
+            if existing is not None and existing["description"] != migration_name:
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_recompute_v1: "
+                    f"version={schema_version} description={existing['description']}"
+                )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at, description) "
+                "VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info("chain_identity_recompute_v1_migration_complete")
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_recompute_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def archive_legacy_prefix_comparisons(self) -> dict[str, int]:
+        """Snapshot the pre-cutover comparison rows. NOT gated by any marker.
+
+        The semantics marker alone does not preserve this evidence, because the
+        trackers do not UPDATE these rows -- all three
+        `DELETE FROM <table> WHERE coin_id = ?` and re-INSERT on every
+        recompute. After the semantics change that recompute writes canonical
+        values over a legacy row and the original is gone.
+
+        This lives OUTSIDE `_migrate_chain_identity_semantics_v1` on purpose,
+        and that is the second half of a lesson I only half-learned. The
+        migration early-returns forever once its `paper_migrations` marker
+        exists -- so retrofitting the archive INSIDE it meant any database that
+        had already run the earlier build skipped the archive silently, under a
+        log line reading `..._skip_already_applied`. I had already fixed exactly
+        that gating for the stamping step and left it in place for archiving,
+        which is the IRREVERSIBLE half.
+
+        Self-guarding via `sqlite_master`, so running it every startup is free
+        once the archives exist.
+
+        SCOPE, stated honestly: this is the PRE-CUTOVER SNAPSHOT, not a promise
+        that every `legacy_prefix` row ever written has an archived twin. Rows
+        created later by rolled-back old code are stamped legacy by
+        `stamp_unmarked_chain_semantics` but arrive after this snapshot was
+        taken. `CREATE TABLE ... AS SELECT *` also copies values only -- no
+        primary key, constraints or indexes -- which is right for a forensic
+        snapshot but means `id` is not a key here.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)",
+                (table, archive),
+            )
+            names = {r[0] for r in await cur.fetchall()}
+            if table not in names or archive in names:
+                continue
+            # IF NOT EXISTS is load-bearing, not decoration. The
+            # `sqlite_master` check above and this CREATE are separated by an
+            # await, and on the FIRST boot after deploy several processes call
+            # initialize() on this database at once -- pipeline, dashboard and
+            # a handful of cron entry points. Both can observe "archive absent"
+            # and both proceed; without this the loser raises
+            # "table ... already exists" straight out of initialize(), which no
+            # caller catches. Concurrent startup migrations have taken this box
+            # down before.
+            await self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {archive} AS SELECT * FROM {table}"
+            )
+            cur = await self._conn.execute(f"SELECT COUNT(*) FROM {archive}")
+            out[archive] = (await cur.fetchone())[0]
+        # UNCONDITIONAL. The `if out:` guard was safe only by accident of the
+        # connection mode: under legacy `isolation_level=''` a bare SELECT
+        # opens no transaction, so the nothing-to-do path left nothing
+        # dangling. Under `autocommit=False` (PEP 249 strict, available since
+        # 3.12; this repo runs 3.14) the same guard SELECT DOES open one.
+        #
+        # The failure that produces is quieter than the sibling's "cannot
+        # start a transaction within a transaction": a dangling READ
+        # transaction on the shared connection pins the WAL snapshot, so the
+        # hourly `wal_checkpoint(TRUNCATE)` returns BUSY and reclaims zero
+        # pages -- measured -- and it surfaces as unexplained WAL growth
+        # nowhere near this function, on a box already at 90% disk.
+        await self._conn.commit()
+        return out
+
+    #: Surfaces whose pre-cutover chains credit depends on the recompute
+    #: overlay, paired with the anchor column the overlay is correlated on.
+    _RECOMPUTE_SURFACES = (
+        ("gainers_comparisons", "appeared_on_gainers_at"),
+        ("losers_comparisons", "appeared_on_losers_at"),
+        ("trending_comparisons", "appeared_on_trending_at"),
+    )
+
+    async def _classify_coverage_mark(
+        self, source_table: str, row, pop: int, rate: float
+    ) -> tuple[str, float | None, dict | None]:
+        """Decide what to do with a stored high-water mark. Three outcomes.
+
+        Exists so the caller cannot forget an arm. The clear is best-effort, so
+        "this mark should go" and "this mark is gone" are DIFFERENT states, and
+        collapsing them is what produced three separate defects at this seam.
+
+          ``rearm``                   -- no usable mark; record today's rate.
+          ``incomparable_unresolved`` -- it should go, but the DELETE failed and
+                                         it is still there. Judge nothing.
+          ``raise_mark``              -- comparable, and today IMPROVES it; the
+                                         ratchet rises.
+          ``compare``                 -- comparable, today does not improve it;
+                                         run the collapse check.
+
+        FOUR arms, not three, and the missing one cost a blocking round. The
+        boolean chain this replaced branched on TWO axes -- is the mark
+        comparable, and does today's rate improve it -- while the first version
+        of this taxonomy named only the first. The improvement axis then had no
+        arm to be unhandled in, so it vanished silently and every arm was still
+        "handled": the mark froze at the FIRST observation and could never rise.
+
+        In production that is worse than a mis-calibration. The probe is hourly
+        and the backfill is a manual post-deploy step, so the first observation
+        lands before any credit exists -- a mark of 0.0, which makes
+        ``rate < best * FRACTION`` unsatisfiable for every rate. Collapse
+        detection would have been off on every surface, permanently, from the
+        first pass after deploy.
+
+        The lesson generalises past this function: making an unhandled arm
+        unrepresentable only works for the axis the taxonomy names. When a
+        refactor replaces a boolean chain with a taxonomy, the check is not
+        whether every arm is handled -- it is whether every BEHAVIOUR of the
+        old code maps onto an arm.
+
+        The incomparability test is a TRANSITION: the recorded population is
+        below twice the judging floor AND today's is more than double it. The
+        first half is the comparability claim -- a handful of rows is not
+        comparable to a thousand -- and the second is what stops it being a
+        standing state that re-arms every pass.
+        """
+        if row is None:
+            return "rearm", None, None
+
+        best, recorded_pop = row[0], row[1]
+        incomparable = (
+            recorded_pop < _COLLAPSE_MIN_POPULATION * 2 and pop > recorded_pop * 2
+        )
+        if not incomparable:
+            # The second axis, explicit. `rate > best` is the ratchet rising,
+            # which is the whole mechanism -- calibrating on the BEST
+            # observation, so ordinary attrition rides underneath it.
+            if rate > best:
+                return "raise_mark", best, None
+            return "compare", best, None
+
+        if not await self._clear_coverage_baseline(source_table):
+            return "incomparable_unresolved", best, None
+
+        # The discard facts go BACK to the caller rather than being logged
+        # here, because the field an operator actually needs -- the rate being
+        # ARMED in this one's place -- is not knowable yet. The clear precedes
+        # the write, and if that write is starved by its 2s give-up the table
+        # ends up with NO mark at all. Logging the observed rate here would
+        # name a mark that does not exist, which is the trap `mark_written`
+        # exists to avoid one function over.
+        return (
+            "rearm",
+            None,
+            {
+                "discarded_rate": round(best, 4),
+                "discarded_population": recorded_pop,
+                "current_population": pop,
+            },
+        )
+
+    async def _clear_coverage_baseline(self, source_table: str) -> bool:
+        """Drop a mark deemed incomparable, on its own connection.
+
+        The only sanctioned way a high-water mark falls. Best-effort for the
+        same reason the write is: a failure here leaves the old mark in place
+        for one more pass, which is the safe direction.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "DELETE FROM recompute_coverage_baseline WHERE source_table = ?",
+                    (source_table,),
+                )
+                await conn.commit()
+                return True
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_clear_failed", source_table=source_table
+            )
+            return False
+
+    async def _record_coverage_baseline(
+        self, source_table: str, rate: float, population: int
+    ) -> float | None:
+        """Write the ratchet mark on its OWN connection, never the shared one.
+
+        This was the probe's first write, and putting it on `self._conn` made
+        the probe a laundering hazard: `commit()` on a shared connection
+        commits EVERYTHING pending, including a sibling's half-finished unit.
+        `scout/chains/tracker.py` opens a bare `BEGIN` on this connection and
+        calls `rollback()` on failure -- by its own comment, several times a
+        day in production -- so an hourly probe committing in between makes the
+        sibling's rollback a no-op and its partial row durable.
+
+        `self._txn_lock` does NOT fix this. It serialises the writers that take
+        it, and chains/tracker does not take it: it BEGINs directly. A lock
+        only the polite callers hold cannot stop the impolite one, so the write
+        has to leave the connection entirely.
+
+        Best-effort by design. A failure here loses one observation of a mark
+        the next hourly pass re-records, and it must never take the probe --
+        or the maintenance pass around it -- down with it.
+        """
+        import aiosqlite
+
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            try:
+                # SHORT timeout, deliberately unlike the pipeline's 90s. Moving
+                # this write off the shared connection means it now CONTENDS
+                # for the write lock instead of riding along on it -- and a
+                # sibling holding an open transaction would otherwise stall the
+                # hourly maintenance pass for a minute and a half to record a
+                # number the next pass will record anyway. Give up fast; the
+                # ratchet is best-effort and only ever moves upward.
+                await conn.execute(
+                    f"PRAGMA busy_timeout = {_BASELINE_WRITE_TIMEOUT_MS}"
+                )
+                await conn.execute(
+                    "INSERT INTO recompute_coverage_baseline "
+                    "(source_table, best_rate, population, recorded_at) "
+                    "VALUES (?, ?, ?, datetime('now')) "
+                    # MAX at the WRITE, so "never lowered" is enforced where
+                    # the docstring says it lives rather than by a caller
+                    # guard. It was enforced only by the read
+                    # (`best is None or rate > best`), so ANY path that made
+                    # the read return None -- the population guard did -- let
+                    # an unconditional upsert rewrite a durable high mark with
+                    # today's rate. Same collapsed recovery, one pass apart:
+                    # the first fires, the second is silent and STAYS silent,
+                    # because the baseline it would fire against has been
+                    # overwritten with the collapsed value.
+                    #
+                    # A deliberate re-arm is a DELETE (see the guard), not a
+                    # side effect of an upsert. That keeps the downgrade a
+                    # decision someone made.
+                    "ON CONFLICT(source_table) DO UPDATE SET "
+                    "best_rate=MAX(recompute_coverage_baseline.best_rate, "
+                    "              excluded.best_rate), "
+                    "population=excluded.population, "
+                    "recorded_at=excluded.recorded_at",
+                    (source_table, rate, population),
+                )
+                await conn.commit()
+                # Read BACK, rather than returning True and letting the caller
+                # assume the stored value equals `rate`. With MAX at the write
+                # that assumption is false whenever the clear failed: the
+                # upsert keeps the OLD value while the caller reports today's,
+                # so the payload claims a mark that was never stored -- the
+                # exact defect `mark_written` was added to close, reintroduced
+                # by the fix for a different one. The checker reads the table,
+                # so probe and checker would disagree about the same surface.
+                cur = await conn.execute(
+                    "SELECT best_rate FROM recompute_coverage_baseline "
+                    "WHERE source_table = ?",
+                    (source_table,),
+                )
+                stored = await cur.fetchone()
+                return stored[0] if stored else None
+            finally:
+                await conn.close()
+        except Exception:
+            import structlog
+
+            structlog.get_logger().warning(
+                "recompute_coverage_baseline_write_failed",
+                source_table=source_table,
+                rate=rate,
+            )
+            return None
+
+    async def chain_identity_recompute_coverage_probe(
+        self, *, gate_minutes: float = 1440.0
+    ) -> dict[str, object]:
+        """Report whether the legacy-provenance overlay is actually WORKING.
+
+        `chain_identity_recompute_v1` has no runtime writer -- it is filled by
+        an offline ops step. So a deploy that ships the code and skips the
+        backfill leaves the overlay empty, and an empty overlay is not a
+        neutral state: every credit-bearing `legacy_prefix` row fails the trust
+        check and loses its chains credit. That is the naive cutover this
+        overlay exists to prevent (tier_high 341 -> 187), arriving quietly,
+        under green logs, looking exactly like a real decline in detection.
+
+        The escalation is `credit_recovered == 0` against a non-empty
+        population, NOT `overlay_rows == 0`. Row presence is the wrong
+        question, and asking it was this probe's original defect: an overlay
+        can be fully populated and still recover nothing, because only
+        `verified_canonical` earns credit. That is not a corner case -- it is
+        the likeliest real outcome, since the reconstruction depends on
+        preserved `/root` snapshots that are being deleted over time. Rerun the
+        backfill once they are gone and roughly four rows in five land
+        `indeterminate_history`: overlay full, credit zero, tier_high collapsed.
+        Counting rows would have printed a green line through all of it.
+
+        Coverage is correlated the way the READERS correlate it -- on
+        `(source_table, coin_id, historical_anchor)`. Not on `source_row_id`:
+        the trackers DELETE and re-insert by coin_id on every recompute, so ids
+        do not survive, and the archives are `CREATE TABLE ... AS SELECT`
+        copies with no primary key, where `id` is not a key at all. A probe
+        keyed on the row id measures a wire nothing reads.
+
+        `gate_minutes` is re-checked against each row's `canonical_lead`
+        rather than trusting `evidence_status` alone. That status is a FROZEN
+        decision about the gate as it stood at backfill time; the reader
+        re-tests the lead against `CONVICTION_EARLY_LEAD_MINUTES` at scoring
+        time. Counting statuses alone measures TRUST, not credit, and the two
+        coincide only while the gate has not moved. Raise the setting and
+        every reader silently refuses rows the probe still reports as
+        recovered -- measured: readers grant 0 of 10 while the probe reports
+        10. Pass the setting the readers use.
+
+        Partial coverage is the expected steady state -- history genuinely runs
+        out for older anchors -- and must never page, or the alarm gets muted
+        before the day it matters.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+
+        cur = await self._conn.execute(
+            "SELECT COUNT(*) FROM chain_identity_recompute_v1"
+        )
+        overlay_rows = (await cur.fetchone())[0]
+
+        credit_bearing = 0
+        uncovered = 0
+        credit_recovered = 0
+        per_surface: dict[str, dict[str, int]] = {}
+
+        for table, anchor in self._RECOMPUTE_SURFACES:
+            # COALESCE, matching what the readers do: `cross_surface` trusts
+            # ONLY 'canonical_v1', so a NULL semantics row -- written by
+            # rolled-back old code -- is untrusted there. Filtering on
+            # `= 'legacy_prefix'` made those rows invisible here while they
+            # silently lost credit in the reader.
+            untrusted = (
+                "COALESCE(c.chains_identity_semantics, 'legacy_prefix') "
+                "!= 'canonical_v1'"
+            )
+            # CURRENT version only. The version is in the primary key now, so
+            # the overlay holds every generation at once -- and an unfiltered
+            # read would let a superseded, more generous verdict keep counting
+            # as recovered after a version bump tightened the semantics.
+            matched = (
+                "SELECT 1 FROM chain_identity_recompute_v1 AS r "
+                "  WHERE r.source_table = ? AND r.coin_id = c.coin_id "
+                "  AND r.semantics_version = ? "
+                f"  AND r.historical_anchor = c.{anchor}"
+            )
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1"
+            )
+            pop = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND NOT EXISTS ({matched})",
+                (table, RECOMPUTE_SEMANTICS),
+            )
+            unc = (await cur.fetchone())[0]
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} AS c "
+                f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                f"AND EXISTS ({matched} AND r.evidence_status IN "
+                f"({','.join('?' * len(CREDIT_BEARING))}) "
+                "  AND r.canonical_lead IS NOT NULL AND r.canonical_lead >= ?)",
+                (table, RECOMPUTE_SEMANTICS, *sorted(CREDIT_BEARING), gate_minutes),
+            )
+            rec = (await cur.fetchone())[0]
+
+            # Rows with no archived twin. `archive_legacy_prefix_comparisons`
+            # self-guards on sqlite_master and never re-runs once the archives
+            # exist, while `stamp_unmarked_chain_semantics` runs every startup
+            # -- so a row written by rolled-back old code AFTER the archives
+            # were taken enters this population permanently and can never be
+            # covered, because the backfill only reads archives. Meanwhile the
+            # archived rows drain out as the trackers re-insert them
+            # `canonical_v1`. In the limit the population is entirely
+            # unarchivable: credit_bearing > 0, credit_recovered == 0, an
+            # hourly page forever, and `--apply` cannot clear it.
+            #
+            # Counted separately so the alert says "0 recovered of 7, 7
+            # unarchivable" rather than presenting an unfixable page as though
+            # re-running the backfill would help. That distinction is the
+            # difference between an alarm an operator acts on and one they mute.
+            archive = f"{table}_legacy_prefix_v1"
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (archive,),
+            )
+            # Archive ABSENT means no row has an archived twin -- every one
+            # of them is unarchivable, not zero of them. The checker learned
+            # this and the probe did not, so on the same database the
+            # runbook's own decision rule ("credit_recovered 0 and
+            # unarchivable == population means design limit, not incident")
+            # returned INCIDENT from journald and DESIGN LIMIT from Telegram.
+            unarchivable = pop
+            if await cur.fetchone():
+                cur = await self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} AS c "
+                    f"WHERE {untrusted} AND c.detected_by_chains = 1 "
+                    f"AND NOT EXISTS (SELECT 1 FROM {archive} AS a "
+                    f"  WHERE a.coin_id = c.coin_id "
+                    f"  AND a.{anchor} = c.{anchor})"
+                )
+                unarchivable = (await cur.fetchone())[0]
+
+            credit_bearing += pop
+            uncovered += unc
+            credit_recovered += rec
+            per_surface[table] = {
+                "credit_bearing": pop,
+                "uncovered": unc,
+                "credit_recovered": rec,
+                "unarchivable": unarchivable,
+            }
+
+        # COLLAPSE detection, on top of the zero case.
+        #
+        # `dark` fires only at EXACTLY zero recovery, and that misses the
+        # degradation this probe's own docstring predicts: delete the /root
+        # snapshots, re-run the backfill, and roughly four rows in five land
+        # indeterminate. Four in five is 20% -- not zero -- so a fall from the
+        # measured 53% baseline to 5% is silent on every layer while 95% of
+        # readers go blind.
+        #
+        # History running out is GRADUAL; a snapshot-less or failed backfill is
+        # a CLIFF. Only the second should page, so this compares against a
+        # high-water RATE per surface rather than a fixed threshold: the mark
+        # self-calibrates on the first healthy observation and never lowers
+        # itself, so ordinary attrition rides underneath it and a collapse
+        # crosses it. Reset by deleting the surface's row.
+        collapsed: list[str] = []
+        for table, v in per_surface.items():
+            pop, rec = v["credit_bearing"], v["credit_recovered"]
+            # Computed BEFORE the floor check: the branch below reports it,
+            # and referencing it there used the PREVIOUS surface's value.
+            rate = (rec / pop) if pop else None
+            if pop < _COLLAPSE_MIN_POPULATION:
+                # Say so, rather than omitting the keys. Production's trending
+                # surface drains as coins re-appear and are rewritten
+                # canonical_v1; when it crosses the floor it would simply stop
+                # reporting a rate, and an operator seeing two surfaces with
+                # rates and one without cannot tell "too small to judge" from
+                # "something went wrong".
+                v["rate"] = round(rate, 4) if rate is not None else None
+                v["best_rate"] = None
+                v["rate_judged"] = False
+                continue
+            v["rate_judged"] = True
+            cur = await self._conn.execute(
+                "SELECT best_rate, population FROM recompute_coverage_baseline "
+                "WHERE source_table = ?",
+                (table,),
+            )
+            row = await cur.fetchone()
+
+            # THREE outcomes, named, and every one handled. This was a chain of
+            # `if`s over a `best` variable that the clear mutated -- and the
+            # clear is BEST-EFFORT, two outcomes, with the surrounding code
+            # written for one. Three separate defects came out of that single
+            # shape: the payload claiming a mark the write never stored; the
+            # probe forgetting a mark the starved clear left behind; and then
+            # the starved case judging AGAINST the very mark the guard had just
+            # declared incomparable -- inverting the guard's purpose and turning
+            # a lock race into an operator page.
+            #
+            # Each fix corrected the arm it was looking at and left the other,
+            # which is why the count kept rising by one. Naming the decision
+            # makes the unhandled arm unrepresentable instead of merely
+            # currently-handled.
+            decision, best, discarded = await self._classify_coverage_mark(
+                table, row, pop, rate
+            )
+            v["rate"] = round(rate, 4)
+
+            if decision == "incomparable_unresolved":
+                # Incomparable AND still present: the DELETE lost a lock race.
+                # Do NOT judge against it -- that is precisely the false page
+                # the guard exists to prevent, and the read-only checker
+                # already handles this case by skipping. Say the pass was
+                # skipped rather than leaving it silently unjudged.
+                v["best_rate"] = round(row[0], 4)
+                v["mark_written"] = False
+                v["comparison_skipped"] = "incomparable_mark_not_cleared"
+                continue
+
+            if decision in ("rearm", "raise_mark"):
+                stored = await self._record_coverage_baseline(table, rate, pop)
+                v["mark_written"] = stored is not None
+                v["best_rate"] = (
+                    round(stored, 4)
+                    if stored is not None
+                    else (round(best, 4) if best is not None else None)
+                )
+                if discarded is not None:
+                    # ANNOUNCE the disarm, AFTER the write, carrying what
+                    # actually replaced the discarded mark. This line used to
+                    # name every field except the one the ratchet is about --
+                    # an operator could see what was thrown away but not what
+                    # took its place, and had to join to another log line to
+                    # judge whether the discard was reasonable. `armed_rate`
+                    # is None when the write was starved, which is the honest
+                    # answer: the table has no mark at all.
+                    import structlog
+
+                    structlog.get_logger().warning(
+                        "recompute_coverage_baseline_cleared",
+                        source_table=table,
+                        armed_rate=round(stored, 4) if stored is not None else None,
+                        **discarded,
+                    )
+            elif decision == "compare":
+                v["mark_written"] = False
+                v["best_rate"] = round(best, 4)
+                if rate < best * _COLLAPSE_FRACTION:
+                    collapsed.append(table)
+            else:
+                # "Unrepresentable" was overclaimed: a bare `else` put any
+                # future decision into the JUDGING arm, where it would crash on
+                # `round(None, 4)` -- and that crash is swallowed by the
+                # maintenance pass, so the coverage probe would silently stop
+                # running. That is the deploy-without-activate class this
+                # component exists to prevent. Fail loudly at the edit instead.
+                raise AssertionError(f"unhandled coverage-mark decision: {decision!r}")
+
+        # PER SURFACE, not global. The comment here used to claim a global
+        # predicate covered "populated for one surface only"; it did not, and
+        # per-surface commits made that reachable. A replay that fails partway
+        # leaves earlier surfaces durable, so gainers alone satisfies a global
+        # `credit_recovered == 0` while losers and trending sit fully stripped
+        # -- measured: recovered 5 of 15, two surfaces at zero, alarm silent.
+        # The reporting was already per-surface while the predicate was not,
+        # so the watchdog printed `losers=0/5 trending=0/5` in its own alert
+        # text and exited 0.
+        #
+        # A surface with a population that recovered NOTHING is the alarm,
+        # whatever the other surfaces did. Partial coverage within a surface
+        # still must not page -- history genuinely runs out.
+        dark = sorted(
+            t
+            for t, v in per_surface.items()
+            if v["credit_bearing"] > 0 and v["credit_recovered"] == 0
+        )
+        unarchivable_total = sum(v["unarchivable"] for v in per_surface.values())
+        not_recovering = bool(dark) or bool(collapsed)
+        return {
+            "overlay_rows": overlay_rows,
+            "credit_bearing_legacy_rows": credit_bearing,
+            "credit_recovered": credit_recovered,
+            "uncovered": uncovered,
+            "not_recovering": not_recovering,
+            "dark_surfaces": dark,
+            "collapsed_surfaces": sorted(collapsed),
+            "unarchivable": unarchivable_total,
+            "per_surface": per_surface,
+        }
+
+    async def stamp_unmarked_chain_semantics(self) -> dict[str, int]:
+        """Give any unmarked comparison row its `legacy_prefix` stamp.
+
+        The migration is one-shot: once its `paper_migrations` marker exists it
+        early-returns forever. So rows written by OLD code -- during a rollback,
+        say -- land with the columns NULL and the migration will never reach
+        them. NULL then becomes a third, undocumented semantics state that no
+        consumer knows how to read.
+
+        Those rows were produced by prefix semantics, so `legacy_prefix` is the
+        correct stamp. Idempotent and safe to run every startup: the
+        `IS NULL` predicate cannot touch a row already marked `canonical_v1`.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        out: dict[str, int] = {}
+        for table in (
+            "gainers_comparisons",
+            "losers_comparisons",
+            "trending_comparisons",
+        ):
+            cur = await self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            )
+            if not await cur.fetchone():
+                continue
+            cur = await self._conn.execute(f"PRAGMA table_info({table})")
+            if "chains_identity_semantics" not in {r[1] for r in await cur.fetchall()}:
+                continue
+            cur = await self._conn.execute(
+                f"UPDATE {table} SET chains_identity_semantics = ? "
+                f"WHERE chains_identity_semantics IS NULL",
+                (LEGACY_SEMANTICS,),
+            )
+            if cur.rowcount:
+                out[table] = cur.rowcount
+        # Commit UNCONDITIONALLY. An UPDATE that matches zero rows still opens
+        # an implicit transaction, so a `if out:` guard here leaves one dangling
+        # on the shared connection and the NEXT migration's BEGIN EXCLUSIVE dies
+        # with "cannot start a transaction within a transaction". Same shape as
+        # the `if rows:` prune-logging guard: the guard looks like an
+        # optimisation and is actually a correctness bug.
+        await self._conn.commit()
+        return out
+
+    async def _migrate_chain_identity_semantics_v1(self) -> None:
+        """Version marker for chain-detection identity semantics (ruling C).
+
+        Prefix similarity is not identity, so it stops determining
+        ``detected_by_chains`` / ``chains_lead_minutes``. But historical
+        lead-time evidence must NOT be rewritten in place -- an UPDATE would
+        destroy the very numbers a later analysis needs to judge the change. So
+        each comparison row records WHICH semantics produced it:
+
+          * existing rows -> ``legacy_prefix``, a marker ONLY; their values are
+            left exactly as they were.
+          * rows written from now on -> ``canonical_v1``, plus the identity tier
+            that resolved them.
+
+        Recomputing history under the new semantics is allowed later, but only
+        as a distinct derived dataset carrying its own version -- never as an
+        in-place overwrite of this one.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "chain_identity_semantics_v1"
+        schema_version = 20260824
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("chain_identity_semantics_v1_migration_skip_already_applied")
+                return
+
+        tables = ("gainers_comparisons", "losers_comparisons", "trending_comparisons")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for chain_identity_semantics_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            stamped = {}
+            for table in tables:
+                cur = await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                if not await cur.fetchone():
+                    continue
+                cur = await conn.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in await cur.fetchall()}
+                for col in ("chains_identity_semantics", "chains_identity_tier"):
+                    if col in cols:
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="skip_exists",
+                        )
+                    else:
+                        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                        _log.info(
+                            "schema_migration_column_action",
+                            migration=migration_name,
+                            table=table,
+                            col=col,
+                            action="added",
+                        )
+                # Marker ONLY. Deliberately does not touch detected_by_chains,
+                # chains_lead_minutes or any other evidence column.
+                cur = await conn.execute(
+                    f"UPDATE {table} SET chains_identity_semantics = ? "
+                    f"WHERE chains_identity_semantics IS NULL",
+                    (LEGACY_SEMANTICS,),
+                )
+                stamped[table] = cur.rowcount or 0
+
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "chain_identity_semantics_v1_migration_complete",
+                stamped_legacy=stamped,
+            )
+        except BaseException as e:
+            _log.exception(
+                "chain_identity_semantics_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_signal_first_seen_v1(self) -> None:
+        """Derived first-seen substrate for signal_events (retention option F).
+
+        Several consumers derive "when did we first see this token" with
+        ``MIN(created_at)`` over the whole of ``signal_events``. That makes
+        RETENTION the implicit historical boundary: shorten it and the derived
+        minimum silently moves forward, changing lead-time attribution with no
+        error anywhere. The ruling's requirement is to build the derived state
+        FIRST, migrate the consumers, prove parity, and only then reopen
+        retention separately -- which this migration does not touch.
+
+        MONOTONIC BY CONSTRUCTION. The writer takes ``MIN(existing, incoming)``,
+        not insert-once. An insert-once cache would be wrong the first time an
+        event arrives carrying an earlier timestamp than one already recorded --
+        a replay, an out-of-order insert, or a backfill -- and the repository
+        cannot prove those impossible: ``emit_event`` stamps ``created_at`` in
+        Python, so two callers can interleave, and the ledger/backfill paths
+        write historical rows by design.
+
+        Backfill is a single grouped scan of the existing table, so the
+        substrate starts equal to what the consumers compute today. That
+        equality is what the differential tests assert.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "signal_first_seen_v1"
+        schema_version = 20260823
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("signal_first_seen_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for signal_first_seen_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_first_seen (
+                    token_id TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """)
+            # Backfill from whatever history still exists. Runs BEFORE any
+            # retention change, which is the whole point of ordering F ahead of
+            # a shortening: once rows are gone the true minimum is
+            # unrecoverable.
+            await conn.execute(
+                """INSERT INTO signal_first_seen (token_id, first_seen_at, updated_at)
+                   SELECT token_id, MIN(created_at), ?
+                     FROM signal_events
+                    WHERE token_id IS NOT NULL AND token_id != ''
+                    GROUP BY token_id
+                   ON CONFLICT(token_id) DO UPDATE SET
+                     first_seen_at = MIN(
+                       signal_first_seen.first_seen_at, excluded.first_seen_at),
+                     updated_at = excluded.updated_at""",
+                (now_iso,),
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signal_first_seen_at "
+                "ON signal_first_seen(first_seen_at)"
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            cur = await conn.execute("SELECT COUNT(*) FROM signal_first_seen")
+            n = (await cur.fetchone())[0]
+            _log.info(
+                "signal_first_seen_v1_migration_complete",
+                table="signal_first_seen",
+                backfilled_tokens=n,
+            )
+        except BaseException as e:
+            _log.exception(
+                "signal_first_seen_v1_migration_rollback",
+                migration=migration_name,
+                err=str(e),
+                err_type=type(e).__name__,
+            )
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception as rb_err:
+                _log.exception("schema_migration_rollback_failed", err=str(rb_err))
+            raise
+
+    async def _migrate_cg_credit_ledger_v1(self) -> None:
+        """Monthly-credit accounting for the CoinGecko provider budget.
+
+        2026-08-21: the Basic plan's 100,000 monthly credits hit 100.0% with 11
+        days to the reset. Nothing counted them — the system modeled
+        calls/MINUTE (the rate limiter) while the hard constraint was
+        calls/MONTH. Those are independent limits at the provider.
+
+        Durable because module counters reset on restart, and a budget you can
+        zero by bouncing the service is not a budget.
+
+        Two measures per (month, bucket), because ATTEMPTS ARE NOT CREDITS:
+          * ``attempts`` — every request issued. Rate/backoff observability.
+          * ``credits``  — successful billable calls only. CoinGecko deducts a
+            monthly credit on HTTP 200; 4xx/5xx do NOT deduct one, though they
+            still count against the per-minute rate limit.
+
+        ``month`` is the provider's billing period key (``YYYY-MM``, UTC) —
+        credits replenish on the 1st. ``bucket`` partitions the allowance so
+        discovery cannot consume the reserve that keeps held positions
+        re-priceable.
+
+        Additive + idempotent, mirroring _migrate_ingest_watchdog_state_v1.
+        """
+        import structlog
+
+        _log = structlog.get_logger()
+        if self._conn is None:
+            raise RuntimeError("Database not initialized.")
+        conn = self._conn
+        migration_name = "cg_credit_ledger_v1"
+        schema_version = 20260821
+
+        cur = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='paper_migrations'"
+        )
+        if await cur.fetchone():
+            cur = await conn.execute(
+                "SELECT 1 FROM paper_migrations WHERE name=?", (migration_name,)
+            )
+            if await cur.fetchone():
+                _log.info("cg_credit_ledger_v1_migration_skip_already_applied")
+                return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await conn.execute("BEGIN EXCLUSIVE")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS paper_migrations ("
+                "name TEXT PRIMARY KEY, cutover_ts TEXT NOT NULL)"
+            )
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL, "
+                "description TEXT NOT NULL)"
+            )
+            cur = await conn.execute(
+                "SELECT description FROM schema_version WHERE version=?",
+                (schema_version,),
+            )
+            existing_version = await cur.fetchone()
+            if (
+                existing_version is not None
+                and existing_version["description"] != migration_name
+            ):
+                raise RuntimeError(
+                    "schema_version collision for cg_credit_ledger_v1: "
+                    f"version={schema_version} "
+                    f"description={existing_version['description']}"
+                )
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS cg_credit_ledger (
+                    month TEXT NOT NULL,
+                    bucket TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    credits INTEGER NOT NULL DEFAULT 0,
+                    -- When CoinGecko itself last returned HTTP 200. This is the
+                    -- PROVIDER liveness heartbeat the open-boundary gate reads.
+                    -- Deliberately not derived from price_cache: that table is
+                    -- also written by DexScreener (outcome_ledger's dex
+                    -- enrollment poller), so its freshness says nothing about
+                    -- CoinGecko. Durable so a restart does not present a dead
+                    -- provider as merely unobserved.
+                    last_success_at TEXT,
+                    -- Reconciled provider truth. Persisted because
+                    -- effective_used() depends on it: without this a restart
+                    -- came back with zero drift and treated unattributed spend
+                    -- as capacity that still existed.
+                    provider_credits_used INTEGER,
+                    provider_checked_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (month, bucket)
+                )
+                """)
+            await conn.execute(
+                "INSERT OR IGNORE INTO paper_migrations (name, cutover_ts) "
+                "VALUES (?, ?)",
+                (migration_name, now_iso),
+            )
+            await conn.execute(
+                "INSERT OR IGNORE INTO schema_version "
+                "(version, applied_at, description) VALUES (?, ?, ?)",
+                (schema_version, now_iso, migration_name),
+            )
+            await conn.commit()
+            _log.info(
+                "cg_credit_ledger_v1_migration_complete", table="cg_credit_ledger"
+            )
+        except BaseException as e:
+            _log.exception(
+                "cg_credit_ledger_v1_migration_rollback",
                 migration=migration_name,
                 err=str(e),
                 err_type=type(e).__name__,
@@ -10354,8 +12453,12 @@ class Database:
                 ),
             )
             count += 1
-        if count:
-            await self._conn.commit()
+        # Unconditional, for the reason given in
+        # archive_legacy_prefix_comparisons: a guarded commit is safe only
+        # while a bare SELECT opens no transaction, which is a property of the
+        # connection mode rather than of this loop. These two were the only
+        # guarded commits in this file.
+        await self._conn.commit()
         return count
 
     async def get_cached_prices(self, coin_ids: list[str]) -> dict[str, dict]:
@@ -10599,17 +12702,49 @@ class Database:
         await self._conn.commit()
         return cur.rowcount or 0
 
-    async def prune_volume_snapshots(self, *, keep_days: int) -> int:
-        """Delete ``volume_snapshots`` rows older than ``keep_days``. Returns rowcount."""
+    async def prune_volume_snapshots(
+        self, *, keep_days: int, batch_size: int = 50_000
+    ) -> int:
+        """Delete ``volume_snapshots`` rows older than ``keep_days``.
+
+        Batched, and the batching is not premature. Ruling B drops retention
+        21 -> 14, which makes the FIRST prune after cutover delete 3,283,124
+        rows -- 39% of the table -- where the steady state is ~17K/hour. A
+        single DELETE of that size holds the write lock while it rewrites the
+        table plus both indexes; the read-only index scan alone measures 3.9s
+        on prod, so the write can plausibly exceed the 90s ``busy_timeout`` and
+        cascade ``database is locked`` into the pipeline sharing this
+        connection -- the same failure shape as the Solana watchdog incident.
+
+        Batching trades atomicity for bounded lock-hold time, which is the
+        right trade for a retention prune: a partially-completed prune is
+        indistinguishable from one that ran an hour earlier, and the next pass
+        finishes it.
+
+        Returns the total rows deleted across batches.
+        """
         if self._conn is None:
             raise RuntimeError("Database not initialized")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
-        cur = await self._conn.execute(
-            "DELETE FROM volume_snapshots WHERE scanned_at <= ?",
-            (cutoff,),
-        )
-        await self._conn.commit()
-        return cur.rowcount or 0
+        total = 0
+        # Bound the loop independently of the exit condition: a driver that
+        # reports rowcount as -1 would otherwise spin forever.
+        for _ in range(10_000):
+            cur = await self._conn.execute(
+                "DELETE FROM volume_snapshots WHERE rowid IN ("
+                "  SELECT rowid FROM volume_snapshots WHERE scanned_at <= ? LIMIT ?)",
+                (cutoff, batch_size),
+            )
+            await self._conn.commit()
+            deleted = cur.rowcount or 0
+            if deleted <= 0:
+                break
+            total += deleted
+            if deleted < batch_size:
+                break
+        return total
 
     async def prune_trade_decision_events(self, *, keep_days: int) -> int:
         """Delete ``trade_decision_events`` rows older than ``keep_days`` (INF-02).
@@ -11047,6 +13182,31 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
         cur = await self._conn.execute(
             "DELETE FROM chain_matches WHERE completed_at <= ?",
+            (cutoff,),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
+
+    async def prune_signal_events(self, *, keep_days: int) -> int:
+        """Delete ``signal_events`` rows older than ``keep_days``. Returns rowcount.
+
+        Owned by the hourly maintenance pass, NOT by the chains engine. The
+        prune used to live in ``scout/chains/tracker.py::_prune_stale``, which
+        ``check_chains`` reaches only after its early return on an empty
+        ``load_active_patterns()`` result — so at zero active patterns the
+        largest table in the database (2.04 GB / 6.9M rows / ~550K rows a day)
+        stopped pruning silently. Retention housekeeping must not sit beneath a
+        "there is useful chain work to do" condition.
+
+        ``<`` not ``<=`` (the siblings above use ``<=``): this carries over the
+        exact boundary of the relocated implementation, so the relocation
+        changes WHEN the prune runs and never how much it keeps.
+        """
+        if self._conn is None:
+            raise RuntimeError("Database not initialized")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        cur = await self._conn.execute(
+            "DELETE FROM signal_events WHERE created_at < ?",
             (cutoff,),
         )
         await self._conn.commit()

@@ -690,3 +690,412 @@ async def test_reclassification_does_not_re_page_already_alerted_combos(
         assert "STALLED" in sender.messages[0]
     finally:
         await db.close()
+
+
+# --- the EMIT path -------------------------------------------------------
+#
+# Everything above tests `_classify_retest` in isolation, which is why the
+# defect below survived: the classifier returned "parole_stalled" correctly
+# in prod, and the per-combo log line still said "waiting". The if/elif chain
+# in `_refresh_combo_locked` had branches for complete / terminal_incomplete /
+# contaminated / accounting_inconsistent and an `else` — and no arm for the
+# state this module exists to introduce, so it fell through to the generic
+# "be patient" log. Same shape as the classifier being pinned while the thing
+# that CONSUMES it is not.
+#
+# Measured on prod 2026-09-03: five combos classified `parole_stalled` when
+# the real function was run against the real DB, while every nightly run had
+# logged `parole_retest_waiting` for them and the string "parole_stalled"
+# appeared ZERO times in the entire retained journal.
+
+
+def _silence_senders(monkeypatch):
+    """Silence every combo_refresh sender. Local to this module -- the
+    identically-named helper in test_alert_events_insertion_sites.py is not
+    importable from here."""
+    for name in (
+        "_send_permanent_suppression_alert",
+        "_send_suppression_reversal_alert",
+        "_send_retest_incomplete_alert",
+    ):
+        monkeypatch.setattr(combo_refresh, name, _StubSender())
+
+
+async def _stalled_states(db, settings, combo_key):
+    """Run one refresh and return the retest events it logged."""
+    from structlog.testing import capture_logs
+
+    with capture_logs() as logs:
+        await combo_refresh.refresh_combo(db, combo_key, settings)
+    return [e for e in logs if str(e.get("event", "")).startswith("parole_retest")]
+
+
+async def test_stalled_combo_is_not_logged_as_waiting(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The whole point of the state: a stalled retest must not be reported
+    with the word that means 'be patient'.
+
+    Asserted as an ABSENCE plus a matching presence, not absence alone -- an
+    absence-only assertion would also pass if the refresh silently did
+    nothing at all.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "slow_burn")
+
+        events = await _stalled_states(db, s, "slow_burn")
+        names = [e["event"] for e in events]
+
+        assert "parole_retest_waiting" not in names, (
+            "a stalled combo was reported as 'waiting' -- the exact "
+            f"mislabel this state exists to remove: {names}"
+        )
+        assert "parole_retest_stalled" in names, (
+            f"no stall-specific event was emitted: {names}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_stalled_log_carries_the_diagnostic_fields(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The page tells the operator to check signal_params.enabled; the LOG has
+    to carry enough to confirm the diagnosis without re-deriving it. Asserts
+    real values, not mere presence."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "volume_spike", days_open=6.0, remaining=5)
+
+        events = await _stalled_states(db, s, "volume_spike")
+        stalled = [e for e in events if e["event"] == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"expected exactly one stall log: {events}"
+        e = stalled[0]
+        assert e["combo_key"] == "volume_spike"
+        assert e["cohort_total"] == 0
+        assert e["remaining"] == 5
+        assert e["required"] == 5
+        assert e["slots_spent"] == 0
+        # The remedy pointer is the one field that tells the operator what to
+        # DO. Mutation showed `slots_spent`, `required` and the entire
+        # `detail=` string could all be stripped with the suite still green.
+        assert "signal_params.enabled" in e["detail"]
+        assert "SIGNAL_DISPATCH_QUARANTINE" in e["detail"]
+        # WARNING, not info: an empty cohort under a window open for more than
+        # the grace period is a stuck system.
+        assert e["log_level"] == "warning"
+    finally:
+        await db.close()
+
+
+async def test_budget_exhausted_stall_reports_spent_not_cohort(
+    tmp_path, settings_factory, monkeypatch
+):
+    """A stall with the budget BURNED — slots reserved at the gate then
+    leaked, never admitting anything.
+
+    Every other fixture here uses remaining=5, which equals
+    FEEDBACK_PAROLE_RETEST_TRADES, so `spent` is 0 and `remaining` == `required`
+    in all of them. That makes three distinct fields indistinguishable and lets
+    two real mutants live: `cohort_total=acct["spent"]` and
+    `remaining=retest`. Under the first, a combo with an EMPTY cohort would be
+    logged `cohort_total=5` -- the exact misstatement this state exists to
+    remove, in the exact prod scenario (chain_completed, 2026-08-13, spent=5
+    cohort_total=0) the classifier was re-partitioned onto the cohort to catch.
+
+    This is also the only emit-path coverage of the budget-exhausted stall.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "chain_completed", days_open=9.0, remaining=0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "chain_completed", s)
+        stalled = [e for e in logs if e.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"expected a stall log: {logs}"
+        e = stalled[0]
+        # The discriminating trio: an empty cohort, a fully spent budget, and
+        # nothing remaining. All three differ here.
+        assert e["cohort_total"] == 0
+        assert e["slots_spent"] == 5
+        assert e["remaining"] == 0
+        assert e["required"] == 5
+    finally:
+        await db.close()
+
+
+async def test_fresh_window_is_not_yet_warned_about(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The 1-day grace, mirrored from the pager.
+
+    `_classify_retest`'s window_open is a bare `parole_at <= now`, but
+    `_process_retest_terminal_incomplete` applies a 1-day grace and says why:
+    a window that opened minutes ago has legitimately not been used yet.
+    Without mirroring it, the LOG asserts "the retest cannot start" for a
+    generation the PAGE correctly judges too fresh -- and since parole_at is
+    suppressed_at+14d at an arbitrary time of day against a nightly refresh,
+    roughly half of all fresh generations would draw a spurious WARNING.
+
+    Still logged, at INFO: the classification is real, it is just not yet
+    evidence of a stuck system.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Window opened 2 hours ago -- inside the grace.
+        await _seed_livelocked(db, "slow_burn", days_open=2.0 / 24.0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+        stalled = [e for e in logs if e.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"a fresh stall must still be traced: {logs}"
+        assert stalled[0]["log_level"] == "info", (
+            "a window open for 2 hours must not be WARNED about -- that is the "
+            f"false-alarm class the pager's grace exists to avoid: {stalled[0]}"
+        )
+        assert stalled[0]["days_open"] < 1.0
+    finally:
+        await db.close()
+
+
+async def test_aged_stall_carries_its_elapsed_time(
+    tmp_path, settings_factory, monkeypatch
+):
+    """Elapsed time is what makes five stalled combos rankable from one grep.
+    Without it a one-night stall and a six-week one read identically."""
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "narrative_prediction", days_open=42.0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "narrative_prediction", s)
+        e = [x for x in logs if x.get("event") == "parole_retest_stalled"][0]
+        assert e["log_level"] == "warning"
+        assert 41.5 <= e["days_open"] <= 42.5, e
+        assert e["parole_at"] is not None
+    finally:
+        await db.close()
+
+
+async def test_waiting_is_still_used_when_the_cohort_is_genuinely_progressing(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The fix must not turn every non-terminal state into 'stalled'.
+
+    A combo with an OPEN trade has a non-empty cohort, so it is genuinely
+    waiting -- and must still say so. Without this, replacing the `else` arm
+    wholesale would pass the two tests above.
+    """
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "chain_completed", remaining=3)
+        # One admitted, still-open trade inside the parole window.
+        cur = await db._conn.execute(
+            "SELECT parole_at FROM combo_performance WHERE combo_key='chain_completed'"
+        )
+        (parole_at,) = await cur.fetchone()
+        await db._conn.execute(
+            "INSERT INTO paper_trades "
+            "(token_id, symbol, name, chain, signal_type, signal_data, "
+            " entry_price, amount_usd, quantity, tp_price, sl_price, status, "
+            " opened_at, created_at, signal_combo) "
+            "VALUES ('t1','T','T','solana','chain_completed','{}',1.0,100.0,100.0,"
+            "1.2,0.9,'open',?,?,'chain_completed')",
+            (parole_at, parole_at),
+        )
+        await db._conn.commit()
+
+        events = await _stalled_states(db, s, "chain_completed")
+        names = [e["event"] for e in events]
+        assert "parole_retest_waiting" in names, (
+            f"a progressing cohort must still read as waiting: {names}"
+        )
+        assert "parole_retest_stalled" not in names, names
+    finally:
+        await db.close()
+
+
+async def test_an_unclassified_state_announces_itself(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The SHAPE guard, not the instance.
+
+    This PR exists because a new classifier state fell silently into the
+    `else` and was reported as "waiting" -- a confident lie. Adding the
+    missing arm fixes that instance; it does not stop the NEXT state added to
+    `_classify_retest` from inheriting the same mislabel. This pins the guard
+    that turns that recurrence from a silent lie into a loud one.
+
+    Driven by forcing the classifier to return a state the emit chain has no
+    arm for, because by construction every state it can currently return now
+    HAS an arm -- so there is no natural input that reaches the guard.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        await _seed_livelocked(db, "slow_burn")
+        monkeypatch.setattr(
+            combo_refresh, "_classify_retest", lambda *a, **k: "some_future_state"
+        )
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+
+        unknown = [e for e in logs if e.get("event") == "parole_retest_unclassified"]
+        assert len(unknown) == 1, f"an unhandled state must announce itself: {logs}"
+        assert unknown[0]["retest_state"] == "some_future_state"
+        assert unknown[0]["log_level"] == "error"
+        # Still reported as waiting afterwards -- the guard adds a signal, it
+        # does not change the fallback behaviour.
+        assert any(e.get("event") == "parole_retest_waiting" for e in logs)
+    finally:
+        await db.close()
+
+
+async def test_fresh_burned_budget_stall_warns_without_grace(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The pager's grace is a DISJUNCTION; the log must mirror it.
+
+    `_process_retest_terminal_incomplete`'s WHERE admits on
+        (COALESCE(parole_trades_remaining, 1) <= 0 OR parole_at <= cutoff)
+    so the 1-day cutoff binds only the SECOND disjunct: a burned-budget stall
+    pages with NO grace. An earlier revision graced everything, so a fresh
+    burned-budget stall paged the operator at ERROR while logging INFO --
+    a log contradicting a page, which is this module's own defect class.
+
+    Reachable by the prod case that motivated the state: chain_completed on
+    2026-08-13 was spent=5 with cohort_total=0, and five slots can be
+    reserved-then-leaked within hours of a window opening.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Window open FIVE HOURS -- far inside the calendar grace -- but the
+        # budget is gone. The pager fires on this; so must the log.
+        await _seed_livelocked(db, "chain_completed", days_open=5.0 / 24.0, remaining=0)
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "chain_completed", s)
+        e = [x for x in logs if x.get("event") == "parole_retest_stalled"][0]
+        assert e["days_open"] < 1.0, "fixture must be inside the calendar grace"
+        assert e["remaining"] == 0
+        assert e["log_level"] == "warning", (
+            "a burned-budget stall pages with no grace, so the log must not "
+            f"call it uninteresting: {e}"
+        )
+    finally:
+        await db.close()
+
+
+async def test_grace_boundary_is_one_day(tmp_path, settings_factory, monkeypatch):
+    """Pins the threshold to ~1 day, not merely to some value in a wide band.
+
+    Without both sides, any threshold in (0.083, 6.0] passed -- the existing
+    fixtures only bracket it at 2 hours and 6 days.
+    """
+    from structlog.testing import capture_logs
+
+    async def _level_at(days_open, combo):
+        db = Database(tmp_path / f"{combo}.db")
+        await db.initialize()
+        try:
+            s = settings_factory()
+            _silence_senders(monkeypatch)
+            # remaining=5 so the budget disjunct cannot mask the calendar one.
+            await _seed_livelocked(db, combo, days_open=days_open, remaining=5)
+            with capture_logs() as logs:
+                await combo_refresh.refresh_combo(db, combo, s)
+            return [
+                x for x in logs if x.get("event") == "parole_retest_stalled"
+            ][0]["log_level"]
+        finally:
+            await db.close()
+
+    assert await _level_at(0.98, "slow_burn") == "info"
+    assert await _level_at(1.02, "volume_spike") == "warning"
+
+
+async def test_null_budget_stall_is_not_treated_as_burned(
+    tmp_path, settings_factory, monkeypatch
+):
+    """The NULL edge of the budget disjunct.
+
+    The pager's predicate is `COALESCE(parole_trades_remaining, 1) <= 0`, so
+    a NULL budget coalesces to 1 and is NOT burned -- the pager declines. The
+    Python mirror must agree, which is why it reads
+    `remaining is not None and remaining <= 0` rather than the obvious
+    simplification `(remaining or 0) <= 0`.
+
+    Both simplifications a future reader would reach for --
+    `(remaining or 0) <= 0` and `remaining is None or remaining <= 0` --
+    invert that edge and survived the suite before this test: they WARN on a
+    NULL budget while the pager stays silent, which is the log-contradicts-
+    page shape this PR exists to remove, one value further over.
+
+    NULL is a real anticipated state here, not a theoretical one: the pager
+    renders it specially ("unknown" rather than the number),
+    `_retest_accounting` special-cases it for `spent`, and `_classify_retest`
+    guards on it.
+    """
+    from structlog.testing import capture_logs
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    try:
+        s = settings_factory()
+        _silence_senders(monkeypatch)
+        # Inside the calendar grace, so only the budget disjunct can decide.
+        await _seed_livelocked(db, "slow_burn", days_open=2.0 / 24.0)
+        await db._conn.execute(
+            "UPDATE combo_performance SET parole_trades_remaining = NULL "
+            "WHERE combo_key = 'slow_burn' AND window = '30d'"
+        )
+        await db._conn.commit()
+
+        with capture_logs() as logs:
+            await combo_refresh.refresh_combo(db, "slow_burn", s)
+        stalled = [x for x in logs if x.get("event") == "parole_retest_stalled"]
+        assert len(stalled) == 1, f"a NULL-budget stall must still classify: {logs}"
+        e = stalled[0]
+        assert e["remaining"] is None, "fixture must actually exercise the NULL edge"
+        assert e["days_open"] < 1.0, "fixture must be inside the calendar grace"
+        assert e["log_level"] == "info", (
+            "NULL coalesces to 1 in the pager's predicate, so it is NOT burned "
+            f"and the pager declines -- the log must not WARN: {e}"
+        )
+    finally:
+        await db.close()

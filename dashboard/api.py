@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -12,22 +13,29 @@ import structlog
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi import Path as FPath
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from dashboard import db
+from dashboard.stop_shortfall_summary import get_stop_shortfall_summary
+from dashboard.suppression_health import HealthReader
+from starlette.responses import JSONResponse
 from dashboard.models import (
     AlertResponse,
     CandidateResponse,
+    PostmortemHistoryResponse,
     FunnelResponse,
     LiveCandidateCockpit,
     SignalTrustScorecardsResponse,
     SignalHitRate,
     StatusResponse,
+    StopShortfallSummaryResponse,
     TodaysFocusResponse,
     TradeInboxResponse,
     WinRateResponse,
 )
 from dashboard.signal_trust_registry import load_signal_trust_registry_payload
+from dashboard.telegram_outcomes import get_telegram_outcomes
 
 _log = structlog.get_logger()
 
@@ -210,7 +218,30 @@ def create_app(db_path: str | None = None) -> FastAPI:
     if db_path is not None:
         _db_path = db_path
 
-    app = FastAPI(title="Gecko-Alpha Dashboard")
+    # Freeze this read-only route target; legacy routes still use the module global.
+    postmortem_db_path = _db_path
+    lane_status_db_path = str(Path(_db_path).resolve())
+
+    suppression_reader = HealthReader(_db_path)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await suppression_reader.drain()
+
+    app = FastAPI(title="Gecko-Alpha Dashboard", lifespan=lifespan)
+
+    @app.get("/api/suppression_cohort/health")
+    async def suppression_health_endpoint():
+        result = await suppression_reader.get()
+        return JSONResponse(
+            result,
+            status_code=200 if result["meta"]["ok"] else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+
     repo_root = Path(__file__).resolve().parent.parent
 
     def _iso_utc(dt: datetime) -> str:
@@ -264,6 +295,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/alerts/recent", response_model=list[AlertResponse])
     async def get_alerts():
         return await db.get_recent_alerts(_db_path, limit=20)
+
+    # Capture per app; legacy routes still consult the module-level default.
+    telegram_outcomes_db_path = _db_path
+
+    @app.get("/api/tg_alerts/outcomes")
+    async def telegram_outcomes(days: int = Query(1, ge=1, le=30)) -> JSONResponse:
+        payload = await get_telegram_outcomes(telegram_outcomes_db_path, days)
+        available = payload["meta"]["ok"]
+        headers = {"Cache-Control": "no-store"}
+        if not available:
+            headers["Retry-After"] = "60"
+        return JSONResponse(
+            payload, status_code=200 if available else 503, headers=headers
+        )
 
     @app.get("/api/tg_alerts/recent")
     async def get_recent_tg_dispatch_alerts(limit: int = Query(50, ge=1, le=200)):
@@ -385,6 +430,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/win-rate", response_model=WinRateResponse)
     async def get_win_rate():
         return await db.get_win_rate(_db_path)
+
+    @app.get("/api/signal_lane_status")
+    async def get_signal_lane_status():
+        from dashboard.lane_status import (
+            LaneStatusUnavailable,
+            get_lane_status,
+            metadata,
+        )
+
+        try:
+            payload = await get_lane_status(lane_status_db_path)
+            status_code = 200
+        except LaneStatusUnavailable as exc:
+            payload = {"meta": metadata(False, None, str(exc)), "lanes": []}
+            status_code = 503
+        return JSONResponse(
+            payload, status_code=status_code, headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/api/signal_trust_registry", response_model=None)
     async def get_signal_trust_registry():
@@ -799,6 +862,71 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/trading/positions")
     async def get_trading_positions_endpoint():
         return await db.get_trading_positions(_db_path)
+
+    summary_db_path = db_path or _db_path
+
+    @app.get(
+        "/api/trading/stop-shortfall-summary",
+        response_model=StopShortfallSummaryResponse,
+    )
+    async def stop_shortfall_summary_endpoint():
+        payload = StopShortfallSummaryResponse.model_validate(
+            await get_stop_shortfall_summary(summary_db_path)
+        ).model_dump()
+        headers = {"Cache-Control": "no-store"}
+        if not payload["meta"]["ok"]:
+            headers["Retry-After"] = "60"
+        return JSONResponse(
+            payload, status_code=200 if payload["meta"]["ok"] else 503, headers=headers
+        )
+
+    @app.get("/api/postmortems/moved-already", response_model=PostmortemHistoryResponse)
+    async def get_postmortem_history_endpoint(
+        limit: int = Query(25, ge=1, le=100),
+        before_id: int | None = Query(None, ge=1, le=9223372036854775807),
+    ) -> JSONResponse:
+        """Descriptive stored history, not missed-token coverage or causality."""
+        from fastapi.responses import JSONResponse
+
+        headers = {"Cache-Control": "no-store"}
+        try:
+            payload = await db.get_postmortem_history(
+                postmortem_db_path, limit, before_id
+            )
+            content = PostmortemHistoryResponse.model_validate(payload).model_dump(
+                mode="json"
+            )
+            return JSONResponse(content=content, headers=headers)
+        except Exception as exc:
+            reason = "query_failed"
+            if isinstance(exc, FileNotFoundError):
+                reason = "database_unavailable"
+            elif isinstance(exc, aiosqlite.OperationalError) and (
+                "no such table:" in str(exc) or "no such column:" in str(exc)
+            ):
+                reason = "schema_unavailable"
+            _log.warning(
+                "postmortem_history_unavailable",
+                reason=reason,
+                exception_type=type(exc).__name__,
+                exc_info=reason == "query_failed",
+            )
+            return JSONResponse(
+                status_code=503,
+                headers={**headers, "Retry-After": "60"},
+                content={
+                    "meta": {
+                        "ok": False,
+                        "read_only": True,
+                        "historical_only": True,
+                        "generated_at": _now_iso_utc(),
+                        "data_missing_reason": reason,
+                    },
+                    "rows": [],
+                    "has_more": False,
+                    "next_before_id": None,
+                },
+            )
 
     @app.get("/api/trading/history")
     async def get_trading_history_endpoint(
@@ -1763,6 +1891,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
         #
         # Same definition as gecko-backup-rotate.sh and gecko-backup-offhost.sh
         # — "completed backup" must mean one thing across every reader.
+        #
+        # 2026-08-16: that claim had gone false. The `.partial` exclusion above
+        # covers the 2026-08-08 family; it does NOT cover the SQLite sidecars a
+        # reader mints beside a COMPLETED backup — those names contain no
+        # `.partial` at all. Rotation was fixed on 2026-08-15 and the off-host
+        # shipper in this change, leaving THIS reader as the last one still
+        # counting a 0-byte `-wal` as the newest backup and reporting its age
+        # and size as the backup's. A comment asserting a shared definition is
+        # worth nothing unless every reader is checked against it.
         backup_dir = Path(os.environ.get("GECKO_BACKUP_DIR", "/root/gecko-alpha"))
         try:
             files = sorted(
@@ -1770,7 +1907,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     p
                     for pattern in ("scout.db.bak.*", "scout.db.bak-*")
                     for p in backup_dir.glob(pattern)
-                    if p.is_file() and ".partial" not in p.name
+                    if p.is_file()
+                    and ".partial" not in p.name
+                    and not p.name.endswith(("-wal", "-shm", "-journal"))
                 ),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
@@ -1792,7 +1931,48 @@ def create_app(db_path: str | None = None) -> FastAPI:
         # "operator hasn't enabled this" (False) from "enabled but
         # stale" (True + fresh=False). Treating unconfigured as fresh
         # would mask a regression where the env was unset by accident.
-        if os.environ.get("GECKO_OFFHOST_BACKUP_DEST", "").strip():
+        #
+        # BOTH transports count. `GECKO_OFFHOST_BACKUP_DEST` is the rsync
+        # destination; the s3/B2 transport is configured by
+        # `GECKO_OFFHOST_S3_BUCKET` instead and leaves DEST unset. Keying this
+        # on DEST alone would report `offhost_configured: False` — "the
+        # operator hasn't enabled this" — on a box where the lane is fully
+        # configured and shipping nightly, which is precisely the reading this
+        # field exists to distinguish from "enabled but stale".
+        #
+        # ...but reading the env is not sufficient, because THIS IS A DIFFERENT
+        # PROCESS. The shipper's configuration lives in a 0600 env file loaded
+        # only by the unit that runs the shipper; gecko-dashboard.service has no
+        # EnvironmentFile and nothing here loads a dotenv. So on a correctly
+        # configured box both variables are absent from this process and the
+        # field would still read False.
+        #
+        # The fix is NOT to put that env file on the dashboard's unit: that
+        # would hand a network-facing process the B2 application key in order to
+        # correct a display field, trading a wrong dashboard for a credential
+        # exposure. Instead the shipper publishes one non-secret bit — a marker
+        # file holding the destination LABEL — which this process can read
+        # without holding any credential. It is re-read per request, so it
+        # tracks reality without a dashboard restart, and the shipper removes it
+        # when the lane is un-configured.
+        #
+        # The env checks are kept as well: they cost nothing, and they cover a
+        # deployment that does export the destination into this process.
+        offhost_marker = Path(
+            os.environ.get(
+                "GECKO_OFFHOST_CONFIGURED_MARKER",
+                "/var/lib/gecko-alpha/backup-rotation/offhost-configured",
+            )
+        )
+        try:
+            marker_present = offhost_marker.is_file()
+        except OSError:
+            marker_present = False
+        if (
+            os.environ.get("GECKO_OFFHOST_BACKUP_DEST", "").strip()
+            or os.environ.get("GECKO_OFFHOST_S3_BUCKET", "").strip()
+            or marker_present
+        ):
             backup_status["offhost_configured"] = True
             offhost_hb = Path(
                 os.environ.get(
@@ -1849,9 +2029,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
                         default=str,
                     )
 
-                    await ws.send_text(payload)
                 except Exception:
-                    pass  # DB may not exist yet -- keep connection alive
+                    pass  # Retry transient DB/payload preparation failures.
+                else:
+                    await ws.send_text(payload)
 
                 await asyncio.sleep(5)
         except WebSocketDisconnect:

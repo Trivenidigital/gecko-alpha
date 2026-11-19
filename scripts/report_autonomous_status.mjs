@@ -309,8 +309,9 @@ lines.push(`- \`${backlogPath}\`: ${backlogExists ? "present" : "MISSING"}`);
 lines.push(`- \`${todoPath}\`: ${todoExists ? "present" : "MISSING"}`);
 lines.push("");
 
-lines.push("## Backlog anchors (best-effort)");
+lines.push("## Backlog anchors (historical; best-effort)");
 lines.push("");
+lines.push("- These are extracted item headers, not the current work queue. Follow backlog.md reconciliation instructions and verify its named forward tracker before scoping superseded items.");
 if (!backlogExists) {
   lines.push("- backlog.md missing; cannot extract statuses.");
 } else {
@@ -337,12 +338,13 @@ lines.push("### Runner candidates");
 lines.push("");
 if (loopRunnerHits.runnerCandidates.length === 0) {
   lines.push("- No in-tree runner candidates found for `gecko-overnight-autonomous-closeout`.");
-  lines.push("- First-run behavior: manual/runbook-driven until a concrete scheduler or launcher artifact is designed, reviewed, and operator-approved.");
 } else {
   for (const hit of loopRunnerHits.runnerCandidates) {
     lines.push(`- \`${hit.file}\` (matched: ${hit.needle}; ${hit.kind})`);
   }
 }
+lines.push("- External scheduling and run history: NOT INSPECTED by this local report.");
+lines.push("- Candidate files or their absence do not establish activation, execution, or first-run status; verify the scheduler and run artifacts separately.");
 lines.push("");
 lines.push("### Reference-only mentions");
 lines.push("");

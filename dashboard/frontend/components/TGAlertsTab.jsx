@@ -21,6 +21,7 @@ import TGOverviewPanel from './TGOverviewPanel.jsx'
 import TGSignalsPanel from './TGSignalsPanel.jsx'
 import TGChannelsPanel from './TGChannelsPanel.jsx'
 import TGDispatchFeedbackPanel from './TGDispatchFeedbackPanel.jsx'
+import TelegramOutcomePanel from './TelegramOutcomePanel.jsx'
 
 // Sub-tab map. Overview and Signals lead because they are the two questions an
 // operator opens this tab with; the ledgers follow.
@@ -196,6 +197,8 @@ export default function TGAlertsTab() {
         ))}
 
       {subTab === 'dispatch' && (
+        <>
+        <TelegramOutcomePanel />
         <TGDispatchFeedbackPanel
           alerts={(dispatchData && dispatchData.alerts) || []}
           onMark={markDispatch}
@@ -203,6 +206,7 @@ export default function TGAlertsTab() {
           loading={!dispatchData}
           error={markError || (dispatchData ? null : error)}
         />
+        </>
       )}
 
       {subTab === 'dlq' && <TGDLQPanel />}

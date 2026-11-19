@@ -30,24 +30,81 @@ _BOUND = "datetime(gainers_comparisons.appeared_on_gainers_at,'+5 minutes')"
 
 # (flag_col, lead_col, table, alias, match-expr, ts-col)
 SURFACES = [
-    ("detected_by_narrative", "narrative_lead_minutes", "predictions", "p",
-     "(p.coin_id=gainers_comparisons.coin_id OR LOWER(p.symbol)=LOWER(gainers_comparisons.symbol))",
-     "p.predicted_at"),
-    ("detected_by_pipeline", "pipeline_lead_minutes", "candidates", "c",
-     "(c.contract_address=gainers_comparisons.coin_id OR LOWER(c.ticker)=LOWER(gainers_comparisons.symbol))",
-     "c.first_seen_at"),
-    ("detected_by_chains", "chains_lead_minutes", "signal_events", "e",
-     "(e.token_id=gainers_comparisons.coin_id)", "e.created_at"),
-    ("detected_by_spikes", "spikes_lead_minutes", "volume_spikes", "v",
-     "(v.coin_id=gainers_comparisons.coin_id)", "v.detected_at"),
-    ("detected_by_acceleration", "acceleration_lead_minutes", "gainer_acceleration", "a",
-     "(a.coin_id=gainers_comparisons.coin_id)", "a.detected_at"),
-    ("detected_by_momentum", "momentum_lead_minutes", "momentum_7d", "m",
-     "(m.coin_id=gainers_comparisons.coin_id)", "m.detected_at"),
-    ("detected_by_slow_burn", "slow_burn_lead_minutes", "slow_burn_candidates", "s",
-     "(s.coin_id=gainers_comparisons.coin_id)", "s.detected_at"),
-    ("detected_by_velocity", "velocity_lead_minutes", "velocity_alerts", "vl",
-     "(vl.coin_id=gainers_comparisons.coin_id)", "vl.detected_at"),
+    (
+        "detected_by_narrative",
+        "narrative_lead_minutes",
+        "predictions",
+        "p",
+        "(p.coin_id=gainers_comparisons.coin_id OR LOWER(p.symbol)=LOWER(gainers_comparisons.symbol))",
+        "p.predicted_at",
+    ),
+    (
+        "detected_by_pipeline",
+        "pipeline_lead_minutes",
+        "candidates",
+        "c",
+        "(c.contract_address=gainers_comparisons.coin_id OR LOWER(c.ticker)=LOWER(gainers_comparisons.symbol))",
+        "c.first_seen_at",
+    ),
+    # CHAINS SURFACE DELIBERATELY REMOVED (ruling C).
+    #
+    # This row used to UPDATE detected_by_chains / chains_lead_minutes -- the
+    # columns the trackers now derive by canonical IDENTITY and stamp with a
+    # semantics version. It cannot be made correct here:
+    #
+    #   * its match rule was `e.token_id = coin_id`, canonical-id ONLY, with no
+    #     contract tier and no alias tier -- narrower than the tier its stamp
+    #     would claim;
+    #   * it wrote no semantics stamp at all, so one `--apply` produced two
+    #     classes of lying rows: `legacy_prefix` rows whose values had silently
+    #     been recomputed, and `canonical_v1` rows recomputed under the narrower
+    #     rule;
+    #   * it overwrote `chains_lead_minutes` UNCONDITIONALLY, despite this
+    #     module's docstring claiming the fix only ever ADDS credit. That is
+    #     true of the flag and false of the lead.
+    #
+    # The tracker is the single owner of these two columns. Do not re-add a
+    # chains row here; extend the tracker instead.
+    (
+        "detected_by_spikes",
+        "spikes_lead_minutes",
+        "volume_spikes",
+        "v",
+        "(v.coin_id=gainers_comparisons.coin_id)",
+        "v.detected_at",
+    ),
+    (
+        "detected_by_acceleration",
+        "acceleration_lead_minutes",
+        "gainer_acceleration",
+        "a",
+        "(a.coin_id=gainers_comparisons.coin_id)",
+        "a.detected_at",
+    ),
+    (
+        "detected_by_momentum",
+        "momentum_lead_minutes",
+        "momentum_7d",
+        "m",
+        "(m.coin_id=gainers_comparisons.coin_id)",
+        "m.detected_at",
+    ),
+    (
+        "detected_by_slow_burn",
+        "slow_burn_lead_minutes",
+        "slow_burn_candidates",
+        "s",
+        "(s.coin_id=gainers_comparisons.coin_id)",
+        "s.detected_at",
+    ),
+    (
+        "detected_by_velocity",
+        "velocity_lead_minutes",
+        "velocity_alerts",
+        "vl",
+        "(vl.coin_id=gainers_comparisons.coin_id)",
+        "vl.detected_at",
+    ),
 ]
 
 _FLAGS = [s[0] for s in SURFACES]
@@ -74,9 +131,7 @@ def _update_sql(flag, lead, table, alias, match, ts):
 
 
 def _table_exists(cur, table):
-    cur.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-    )
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
     return cur.fetchone() is not None
 
 
@@ -91,7 +146,9 @@ def _stats(cur):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default="scout.db")
-    ap.add_argument("--apply", action="store_true", help="write changes (default: dry-run)")
+    ap.add_argument(
+        "--apply", action="store_true", help="write changes (default: dry-run)"
+    )
     args = ap.parse_args()
 
     con = sqlite3.connect(args.db)
@@ -108,12 +165,16 @@ def main():
     would_recover = cur.fetchone()[0]
 
     print(f"db={args.db} apply={args.apply}")
-    print(f"  before: total={total} caught={caught_before} gaps={gaps_before} "
-          f"hit_rate={round(caught_before/total*100,1) if total else 0}%")
+    print(
+        f"  before: total={total} caught={caught_before} gaps={gaps_before} "
+        f"hit_rate={round(caught_before/total*100,1) if total else 0}%"
+    )
     print(f"  would recover (is_gap 1->0): {would_recover}")
-    print(f"  projected: caught={caught_before + would_recover} "
-          f"gaps={gaps_before - would_recover} "
-          f"hit_rate={round((caught_before+would_recover)/total*100,1) if total else 0}%")
+    print(
+        f"  projected: caught={caught_before + would_recover} "
+        f"gaps={gaps_before - would_recover} "
+        f"hit_rate={round((caught_before+would_recover)/total*100,1) if total else 0}%"
+    )
     if absent:
         print(f"  (absent surface tables, skipped: {absent})")
 
@@ -122,7 +183,9 @@ def main():
         con.close()
         return
 
-    bak = "gainers_comparisons_bak_" + _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    bak = "gainers_comparisons_bak_" + _dt.datetime.now(_dt.timezone.utc).strftime(
+        "%Y%m%d%H%M%S"
+    )
     try:
         cur.execute("BEGIN")
         cur.execute(f"CREATE TABLE {bak} AS SELECT * FROM gainers_comparisons")
@@ -140,8 +203,10 @@ def main():
 
     total, caught_after, gaps_after = _stats(cur)
     print(f"  APPLIED. backup table: {bak}")
-    print(f"  after: total={total} caught={caught_after} gaps={gaps_after} "
-          f"hit_rate={round(caught_after/total*100,1) if total else 0}%")
+    print(
+        f"  after: total={total} caught={caught_after} gaps={gaps_after} "
+        f"hit_rate={round(caught_after/total*100,1) if total else 0}%"
+    )
     con.close()
 
 

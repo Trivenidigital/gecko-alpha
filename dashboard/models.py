@@ -2,7 +2,34 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat
+
+
+class StopShortfallSummaryMeta(BaseModel):
+    ok: bool
+    generated_at: str
+    read_only: Literal[True]
+    basis: Literal["historical_paper_experimental"]
+    scope: Literal["all_stored_closed_sl"]
+    independent_of_table_filters: Literal[True]
+    cutover_ts: str | None
+    data_missing_reason: str | None
+
+
+class StopShortfallSummaryData(BaseModel):
+    state: Literal["available", "empty", "no_eligible_rows", "unavailable"]
+    total_stop_rows: int | None
+    eligible_rows: int | None
+    modeled_rows: int | None
+    unavailable_rows: int | None
+    exclusions_by_reason: dict[str, int] | None
+    mean_shortfall_pp: FiniteFloat | None
+    median_shortfall_pp: FiniteFloat | None
+
+
+class StopShortfallSummaryResponse(BaseModel):
+    meta: StopShortfallSummaryMeta
+    data: StopShortfallSummaryData
 
 
 class CandidateResponse(BaseModel):
@@ -450,3 +477,31 @@ class TodaysFocusMeta(BaseModel):
 class TodaysFocusResponse(BaseModel):
     meta: TodaysFocusMeta
     rows: list[TodaysFocusRow] = Field(default_factory=list)
+
+
+class PostmortemHistoryRow(BaseModel):
+    id: str
+    token_id: str | None
+    detected_at: str | None
+    run_pct: float | None
+    most_frequent_recorded_block_reason: str | None
+    field_unavailable_reasons: dict[str, str] = Field(default_factory=dict)
+
+
+class PostmortemHistoryMeta(BaseModel):
+    ok: bool = True
+    read_only: bool = True
+    historical_only: bool = True
+    generated_at: str
+    total_records: int
+    latest_detected_at: str | None
+    latest_detected_at_unavailable_reason: str | None = None
+    sort_policy: str = "id_desc"
+    limit: int
+
+
+class PostmortemHistoryResponse(BaseModel):
+    meta: PostmortemHistoryMeta
+    rows: list[PostmortemHistoryRow]
+    has_more: bool
+    next_before_id: str | None

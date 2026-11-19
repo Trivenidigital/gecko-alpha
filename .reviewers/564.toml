@@ -1,0 +1,40 @@
+# PR #564 — per-PR clearance record (ticket 21).
+#
+# Each SHA is the revision that vector actually DERIVED at. They are not all
+# the same, deliberately: the concurrency vector declined to name a SHA it had
+# not measured, even though the gate's own recompute shows its clearance holds
+# there. Naming the measured revision is the honest record; a clearance that
+# holds at a later head is a property the gate computes, not a claim a reviewer
+# should be asked to make.
+#
+# Every entry below is an ancestor of this revision, and no path in `watch`
+# differs between that entry and this revision — checked with the gate, not
+# asserted.
+
+pr = 564
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    "scout",
+    "scripts",
+    "tests",
+    ".github",
+    ".claude",
+    "dashboard",
+    "cron",
+    "ops",
+    "systemd",
+    "pyproject.toml",
+    "uv.lock",
+    "Dockerfile",
+    "docker-compose.yml",
+    "start.sh",
+]
+
+[clearances]
+concurrency    = "d3cad66eecb71e9a5dc618c4330a17326cc96929"
+logic          = "670d5bf6c136dff3ba1ce5fd9a50496b5f0918a4"
+ops-safety     = "670d5bf6c136dff3ba1ce5fd9a50496b5f0918a4"
+silent-failure = "670d5bf6c136dff3ba1ce5fd9a50496b5f0918a4"

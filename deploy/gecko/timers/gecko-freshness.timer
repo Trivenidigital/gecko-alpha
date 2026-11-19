@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-freshness schedule
+
+[Timer]
+Unit=gecko-job@freshness.service
+OnCalendar=*-*-* *:05/30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

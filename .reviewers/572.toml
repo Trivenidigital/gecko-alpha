@@ -1,0 +1,25 @@
+# Independent durable reviewer: concurrency and silent-failure.
+# Latency worker reviewing collector: logic.
+# Collector worker reviewing complementary operations paths: ops-safety.
+# Ownership overlap for head-lag code is covered by the durable reviewer.
+# Primary Codex also executed real-RPC probes and 176 regression tests.
+# These are agent review records, not independent human approval or
+# authorization to activate trading. See readiness report for scopes.
+# Claude session 3c9deda4-5c60-4ecb-9007-96c7ebfbce0b separately cleared
+# header batching/completion head/deadline at c23ad743. The only subsequent
+# watched delta scopes the deadline assertion to RH heartbeat writes.
+pr = 572
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    ".claude", ".github", "Dockerfile", "cron", "dashboard",
+    "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts",
+    "start.sh", "systemd", "tests", "uv.lock",
+]
+
+[clearances]
+concurrency = "2b397d184f31268ca6045e7511c355fb5542144d"
+logic = "2b397d184f31268ca6045e7511c355fb5542144d"
+ops-safety = "2b397d184f31268ca6045e7511c355fb5542144d"
+silent-failure = "2b397d184f31268ca6045e7511c355fb5542144d"
+

@@ -1,0 +1,11 @@
+pr = 590
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
+# Independent terminal reviews at 9fa1f4ce: cleanup_structure (logic/concurrency), cleanup_ops (ops-safety/silent-failure).
+# Three reporting/lint residuals folded and independently re-reviewed; Linux/full CI remains separate.
+[clearances]
+concurrency = "9fa1f4ce0a670842be1a1efe3f90cdf22b328a41"
+logic = "9fa1f4ce0a670842be1a1efe3f90cdf22b328a41"
+ops-safety = "9fa1f4ce0a670842be1a1efe3f90cdf22b328a41"
+silent-failure = "9fa1f4ce0a670842be1a1efe3f90cdf22b328a41"

@@ -19,6 +19,25 @@ from scout.narrative.observer import (
     store_snapshot,
 )
 
+
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    These CoinGecko callers now REQUIRE Settings: `governed_cg_call` fails
+    closed without it, because "counted but not refused" was a silent hole that
+    let a caller keep spending while appearing governed.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 # ------------------------------------------------------------------
 # parse_category_response
 # ------------------------------------------------------------------
@@ -161,7 +180,9 @@ async def test_fetch_categories_success():
     with aioresponses() as m:
         m.get(f"{DEMO_BASE}/coins/categories", payload=payload)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_categories(session, api_key="test-key")
+            result = await fetch_categories(
+                session, api_key="test-key", settings=_budget_settings()
+            )
     assert result == payload
 
 
@@ -171,7 +192,9 @@ async def test_fetch_categories_429_retries():
         m.get(f"{DEMO_BASE}/coins/categories", status=429)
         m.get(f"{DEMO_BASE}/coins/categories", payload=payload)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_categories(session, api_key="", max_retries=3)
+            result = await fetch_categories(
+                session, api_key="", max_retries=3, settings=_budget_settings()
+            )
     assert result == payload
 
 

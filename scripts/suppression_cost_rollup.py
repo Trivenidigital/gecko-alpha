@@ -10,12 +10,8 @@ hourly labeler (scout/outcome_ledger.py :func:`label_pending`) resolves forward
 returns from IN-DB prices. This script answers the operator's weekly one-liner:
 "what did suppression cost me?"
 
-DEPLOY STATE (important): #421 is MERGED but NOT yet deployed to prod, so prod
-today has ZERO dispatcher ``reason='suppressed'`` ledger rows — SAMPLING APPEARS
-DEAD is the EXPECTED state until #421 ships. Do NOT schedule this on cron before
-#421 deploys. (The 42 ``gated_out_sample`` rows currently on prod are the
-engine's 1-in-N ``reason='signal_disabled'`` lane, which this script's cohort
-filter deliberately excludes.)
+Deployment and label readiness must be checked from current runtime evidence.
+Repository history cannot establish that an empty sampling lane is expected.
 
 Read-only (SELECTs only; never writes any table). Two blocks:
 
@@ -23,10 +19,11 @@ Read-only (SELECTs only; never writes any table). Two blocks:
    number is trusted:
      * window sampling: dispatcher-suppression ``gated_out_sample`` rows emitted
        in the last ``--window-days`` vs total ``reason='suppressed'`` blocks in
-       ``trade_decision_events`` for the same window, with the sampling fraction
-       and rows/day. Zero sampled rows while blocks exist -> SAMPLING APPEARS
-       DEAD (expected pre-#421-deploy; a real outage once deployed). DEGRADED
-       trips on a low sampling fraction OR a low rows/day floor — the fraction
+       ``trade_decision_events`` for the same window, grouped by signal. Some
+       dispatchers only write ledger rows, so aggregate counts are NOT verified
+       sampling coverage. Ledger-only/excess lanes warn POPULATION MISMATCH.
+       Zero samples for any event-bearing signal -> SAMPLING APPEARS DEAD.
+       DEGRADED trips on a low per-signal count ratio OR aggregate rows/day — the ratio
        arm catches a fail-soft drop at post-deploy record-all volumes (~6,860
        rows/day) that a rows/day floor alone would miss.
      * maturation (lookback-scoped, NOT window-scoped, because r7d cannot
@@ -43,8 +40,8 @@ Read-only (SELECTs only; never writes any table). Two blocks:
    label_pending / _price_at_or_after), so the basis is a buy-at-emission /
    mark-at-7d gross return with NO exit modeling (no TP/SL, no slippage):
    per-token counterfactual PnL = ``r7d * notional``. Below the floor the line
-   reads INSUFFICIENT_DATA and NEVER a dollar number — the ledger is ~1 week old
-   (born 2026-07-03) so the first meaningful weekly read is expected ~2026-07-31.
+   reads INSUFFICIENT_DATA and NEVER a dollar number. Readiness is data-bound,
+   not an assumed calendar date. Output is experimental and not for pruning.
 
 Config: CLI flags with env-var defaults (mirrors scripts/
 source_call_coverage_watchdog.py). Optional Telegram send is off by default
@@ -55,7 +52,7 @@ touches the network (and runs on Windows dev boxes).
 
 Exit codes:
   0 — ok
-  5 — SAMPLING APPEARS DEAD (expected until #421 deploys; a real outage after)
+  5 — SAMPLING APPEARS DEAD for at least one event-bearing signal
   1 — DB missing, runtime error, or (with --send) dispatch failure
 """
 
@@ -66,6 +63,7 @@ import asyncio
 import json
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -75,11 +73,6 @@ import aiosqlite
 import structlog
 
 _log = structlog.get_logger()
-
-# The ledger was born 2026-07-03; MIN_SAMPLE matured (r7d) suppression rows are
-# not expected before this date. Surfaced in the INSUFFICIENT_DATA line so the
-# operator reads the gate as "too early", not "broken".
-_FIRST_MEANINGFUL_READ = "2026-07-31"
 
 
 def _env_int(name: str, default: int) -> int:
@@ -137,15 +130,18 @@ async def analyze(
     window_start = (now - timedelta(days=window_days)).isoformat()
     lookback_start = (now - timedelta(days=lookback_days)).isoformat()
 
-    async with aiosqlite.connect(db_path) as conn:
+    async with aiosqlite.connect(
+        Path(db_path).resolve().as_uri() + "?mode=ro", uri=True
+    ) as conn:
         conn.row_factory = aiosqlite.Row
 
         cur = await conn.execute(
-            "SELECT COUNT(*) FROM trade_decision_events "
-            "WHERE reason = 'suppressed' AND created_at >= ?",
+            "SELECT signal_type, COUNT(*) FROM trade_decision_events "
+            "WHERE reason = 'suppressed' AND created_at >= ? GROUP BY signal_type",
             (window_start,),
         )
-        blocks_in_window = int((await cur.fetchone())[0])
+        blocks_by_signal = {r[0]: int(r[1]) for r in await cur.fetchall()}
+        blocks_in_window = sum(blocks_by_signal.values())
 
         cur = await conn.execute(
             "SELECT token_id, surface, gate_verdicts, emitted_at, "
@@ -175,7 +171,10 @@ async def analyze(
         ):
             supp.append(r)
 
-    sampled_in_window = sum(1 for r in supp if r["emitted_at"] >= window_start)
+    samples_by_signal = Counter(
+        r["surface"] for r in supp if r["emitted_at"] >= window_start
+    )
+    sampled_in_window = sum(samples_by_signal.values())
     distinct_in_window = len(
         {r["token_id"] for r in supp if r["emitted_at"] >= window_start}
     )
@@ -201,17 +200,40 @@ async def analyze(
     n_distinct_matured = len(matured_tokens)
 
     rows_per_day = sampled_in_window / window_days if window_days > 0 else 0.0
-    sampling_fraction = (
-        sampled_in_window / blocks_in_window if blocks_in_window > 0 else None
-    )
-    sampling_dead = blocks_in_window > 0 and sampled_in_window == 0
-    # DEGRADED trips on EITHER a low sampling fraction (catches a fail-soft drop
-    # at post-deploy record-all volumes where rows/day stays high) OR a low
-    # rows/day floor (catches the low-absolute-volume case) — S3-b.
+    population_counts = []
+    population_mismatch_signals = []
+    missing_sample_signals = []
     degraded_reasons: list = []
+    for signal in sorted(samples_by_signal.keys() | blocks_by_signal.keys()):
+        samples = samples_by_signal.get(signal, 0)
+        blocks = blocks_by_signal.get(signal, 0)
+        ratio = samples / blocks if blocks else None
+        population_counts.append(
+            dict(
+                signal_type=signal,
+                sampled_rows=samples,
+                decision_rows=blocks,
+                count_ratio=ratio,
+            )
+        )
+        if samples > blocks:
+            population_mismatch_signals.append(signal)
+            degraded_reasons.append(f"population_mismatch:{signal}")
+        if blocks and not samples:
+            missing_sample_signals.append(signal)
+        elif blocks and ratio < min_sampling_fraction:
+            degraded_reasons.append(f"fraction<{min_sampling_fraction:g}:{signal}")
+    # Retain the legacy field, but never present incompatible populations as
+    # a sampling fraction. Even compatible counts do not prove event matching.
+    sampling_fraction = (
+        sampled_in_window / blocks_in_window
+        if blocks_in_window and not population_mismatch_signals
+        else None
+    )
+    sampling_dead = bool(missing_sample_signals)
+    # Absolute throughput remains aggregate; splitting lanes must not create
+    # new low-volume alarms. Fraction checks above are per signal to avoid masking.
     if blocks_in_window > 0 and sampled_in_window > 0:
-        if sampling_fraction is not None and sampling_fraction < min_sampling_fraction:
-            degraded_reasons.append(f"fraction<{min_sampling_fraction:g}")
         if rows_per_day < min_rows_per_day:
             degraded_reasons.append(f"rows/day<{min_rows_per_day:g}")
 
@@ -220,6 +242,9 @@ async def analyze(
         "distinct_tokens_in_window": distinct_in_window,
         "suppressed_blocks_in_window": blocks_in_window,
         "sampling_fraction": sampling_fraction,
+        "population_counts": population_counts,
+        "population_mismatch_signals": population_mismatch_signals,
+        "missing_sample_signals": missing_sample_signals,
         "rows_per_day": rows_per_day,
         "sampling_dead": sampling_dead,
         "sampling_degraded": bool(degraded_reasons),
@@ -280,19 +305,19 @@ def format_summary(result: dict) -> str:
     h = result["health"]
     c = result["cost"]
     w = result["window_days"]
-    lines = [f"[suppression-cost-rollup] window={w}d as-of {result['now']}"]
+    lines = [
+        f"[suppression-cost-rollup] EXPERIMENTAL/not-for-pruning window={w}d as-of {result['now']}"
+    ]
 
     if h["sampling_dead"]:
         lines.append(
-            f"HEALTH: SAMPLING APPEARS DEAD - 0 dispatcher-suppression rows vs "
-            f"{h['suppressed_blocks_in_window']} suppressed blocks in {w}d "
-            f"(EXPECTED until #421 deploys - merged, not deployed; "
-            f"do not schedule cron before deploy)"
+            f"HEALTH: SAMPLING APPEARS DEAD for {','.join(h['missing_sample_signals'])}; "
+            f"verify runtime deployment/ingest; {h['sampled_in_window']} total sampled / "
+            f"{h['suppressed_blocks_in_window']} decision events in {w}d"
         )
-    elif h["suppressed_blocks_in_window"] == 0:
+    elif h["suppressed_blocks_in_window"] == 0 and h["sampled_in_window"] == 0:
         lines.append(
-            f"HEALTH: no suppressed blocks in {w}d window; "
-            f"{h['sampled_in_window']} sampled ({h['rows_per_day']:.1f}/day)"
+            f"HEALTH: NO OBSERVED ACTIVITY in {w}d; sampling health unverified"
         )
     else:
         deg = (
@@ -300,12 +325,25 @@ def format_summary(result: dict) -> str:
             if h["sampling_degraded"]
             else ""
         )
+        ratio_text = (
+            f"{h['sampling_fraction']:.3f}"
+            if h["sampling_fraction"] is not None
+            else "UNKNOWN"
+        )
         lines.append(
             f"HEALTH: {h['sampled_in_window']} sampled / "
             f"{h['suppressed_blocks_in_window']} suppressed blocks in {w}d "
-            f"(fraction {h['sampling_fraction']:.3f}, "
+            f"(count ratio {ratio_text}, "
             f"{h['rows_per_day']:.1f}/day{deg})"
         )
+    if h["population_mismatch_signals"]:
+        lines[-1] += (
+            " | POPULATION MISMATCH: "
+            + ",".join(h["population_mismatch_signals"])
+            + "; aggregate count ratio UNKNOWN; not verified coverage"
+        )
+    else:
+        lines[-1] += "; count diagnostics do not prove event-level coverage"
 
     lines.append(
         f"MATURATION ({result['lookback_days']}d lookback): "
@@ -319,8 +357,7 @@ def format_summary(result: dict) -> str:
     if c["gated"]:
         lines.append(
             f"COST: INSUFFICIENT_DATA (n={c['n_distinct_tokens']} matured, "
-            f"need >={c['min_sample']}; first meaningful read expected "
-            f"~{_FIRST_MEANINGFUL_READ})"
+            f"need >={c['min_sample']}; verify runtime label progress)"
         )
     else:
         lines.append(

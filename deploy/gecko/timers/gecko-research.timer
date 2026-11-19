@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-research schedule
+
+[Timer]
+Unit=gecko-job@research.service
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

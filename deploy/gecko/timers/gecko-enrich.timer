@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-enrich schedule
+
+[Timer]
+Unit=gecko-job@enrich.service
+OnCalendar=*-*-* *:17:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

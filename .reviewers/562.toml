@@ -1,0 +1,35 @@
+# PR #562 — docs only (CLAUDE.md).
+#
+# `[clearances]` is EMPTY and that is correct: `CLAUDE.md` is not on the watch
+# floor (`.claude/` the DIRECTORY is; `CLAUDE.md` the file is not), so no
+# watched path moves and no reviewer SHA is demanded. The record must still
+# exist — absence is RED by design, because treating a missing file as
+# "nothing to check" would let deleting it turn the gate green while
+# disabling it.
+#
+# Floors are declared in full even though nothing is cleared against them.
+# They are floors, not a description of this PR.
+
+pr = 562
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]

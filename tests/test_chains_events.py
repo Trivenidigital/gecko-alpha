@@ -8,7 +8,6 @@ import pytest
 from scout.chains.events import (
     emit_event,
     load_recent_events,
-    prune_old_events,
     safe_emit,
 )
 from scout.db import Database
@@ -72,7 +71,16 @@ async def test_load_recent_events_filters_by_window(db):
     assert "0xold" not in ids
 
 
-async def test_prune_old_events(db):
+async def test_signal_events_retention_deletes_only_stale_rows(db):
+    """Retention behaviour of the SURVIVING owner.
+
+    This was ``test_prune_old_events`` against
+    ``scout.chains.events.prune_old_events``, which has been removed so that
+    exactly one implementation owns ``signal_events`` retention. The assertions
+    are carried over unchanged — same 30d-old row, same 14d keep, same
+    delete-exactly-one outcome — so this file still proves the boundary did not
+    move when ownership did.
+    """
     old_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     await db._conn.execute(
         """INSERT INTO signal_events
@@ -83,7 +91,7 @@ async def test_prune_old_events(db):
     await db._conn.commit()
     await emit_event(db, "0xnew", "memecoin", "candidate_scored", {}, "scorer")
 
-    deleted = await prune_old_events(db, retention_days=14)
+    deleted = await db.prune_signal_events(keep_days=14)
     assert deleted == 1
 
     async with db._conn.execute("SELECT COUNT(*) FROM signal_events") as cur:

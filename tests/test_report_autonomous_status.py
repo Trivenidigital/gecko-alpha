@@ -73,7 +73,12 @@ def test_reporter_is_reference_only_when_no_launcher_exists(tmp_path: Path):
         "No in-tree runner candidates found for `gecko-overnight-autonomous-closeout`"
         in result.stdout
     )
-    assert "First-run behavior: manual/runbook-driven" in result.stdout
+    assert "External scheduling and run history: NOT INSPECTED" in result.stdout
+    assert "do not establish activation, execution, or first-run status" in result.stdout
+    assert "First-run behavior: manual/runbook-driven" not in result.stdout
+    assert "Backlog anchors (historical; best-effort)" in result.stdout
+    assert "not the current work queue" in result.stdout
+    assert "verify its named forward tracker" in result.stdout
     assert "Reference-only mentions" in result.stdout
     assert "`scripts/report_autonomous_status.mjs`" in result.stdout
     assert "reporter-self-reference" in result.stdout
@@ -106,6 +111,9 @@ def test_cron_and_systemd_closeout_launchers_are_runner_candidates(tmp_path: Pat
     assert "`systemd/gecko-overnight-autonomous-closeout.timer`" in result.stdout
     assert "`systemd/gecko-overnight-autonomous-closeout.service`" in result.stdout
     assert "No in-tree runner candidates found" not in result.stdout
+    assert "External scheduling and run history: NOT INSPECTED" in result.stdout
+    assert "do not establish activation, execution, or first-run status" in result.stdout
+    assert "First-run behavior: manual/runbook-driven" not in result.stdout
 
 
 def test_cron_documentation_mentions_are_reference_only(tmp_path: Path):

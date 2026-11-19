@@ -437,3 +437,34 @@ surviving mutant turns out genuinely unreachable, keep the guard and fix the
 *comment*: an `amount < required_amount` check here was unreachable under integer
 floor division but **had** been reachable under the earlier `Decimal`
 formulation, so the comment asserting reachability had silently become false.
+
+## 2026-09-13 — Allocate work across the operator's subscriptions
+
+The operator explicitly asked to conserve ChatGPT credits while using both
+subscriptions. Default to one Claude Max implementation task at a time through
+the verified safe-mode CLI; keep Codex on compact coordination, independent
+review of material risks, and native verification. Do not launch redundant
+Codex coding/review swarms for work already assigned to Claude. Use bounded
+handoffs and test summaries, reuse unchanged-code verification, and check usage
+at milestones rather than consuming reset credits or promising unlimited work.
+Required independent review remains mandatory; choose complementary review
+scopes and use the other subscription where appropriate.
+
+## 2026-09-14 — Claude Code performs the routine workload
+
+The operator explicitly set the allocation target: Claude Code should perform
+about 95% of implementation, testing, review follow-through, CI monitoring and
+routine investigation. Preserve GPT credits for high-value scope control,
+risk decisions, synthesis and final verification. Do not duplicate Claude's
+work in Codex unless evidence is missing, a material conflict appears, or an
+independent judgment is required by the review barrier.
+
+## 2026-09-14 — Distinguish endpoint defaults from configured provider accounts
+
+The operator clarified that the working collector uses a hardcoded public RPC
+in a separate macOS detector. Checking a Windows/VPS dotenv and finding no
+provider key does not mean the project has no endpoint. State the installation
+and configuration source inspected; inspect defaults too. Treat operator-supplied
+paths on another machine as reported evidence until accessible. Ask for current
+workload/configuration, not a paid account by assumption. A throttled test proves
+failure at its tested workload, not inability to perform all read-only collection.

@@ -686,3 +686,89 @@ def test_leading_whitespace_in_env_parsed_correctly(tmp_path):
         f"stdout={res.stdout!r} stderr={res.stderr!r}"
     )
     assert "ALERTED" in res.stdout
+
+
+# ----------------------------------------------------------------------
+# deploy/gecko (lean gecko package) is a repo source in both directions
+# ----------------------------------------------------------------------
+
+
+def _install_real_deploy_gecko(repo: Path, prod: Path) -> None:
+    """Copy the real deploy/gecko tree into the fake repo, and install it into
+    the fake prod dir the way deploy/gecko/install.sh does (flat units/timers,
+    drop-in dirs kept)."""
+    src = REPO_ROOT / "deploy" / "gecko"
+    for f in src.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src)
+        (repo / "deploy" / "gecko" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / "deploy" / "gecko" / rel).write_bytes(f.read_bytes())
+        if f.suffix in (".service", ".timer"):
+            _write_unit(prod, f.name, f.read_bytes().decode())
+        elif f.suffix == ".conf":
+            (prod / f.parent.name).mkdir(exist_ok=True)
+            _write_unit(prod / f.parent.name, f.name, f.read_bytes().decode())
+
+
+def test_installed_deploy_gecko_tree_is_clean(tmp_path):
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _install_real_deploy_gecko(repo, prod)
+    assert (prod / "gecko-dexscreener.timer").exists()  # the fixture installed it
+    res, marker = _run_watchdog(tmp_path, repo, prod)
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "mutate, expected",
+    [
+        (
+            lambda prod: _write_unit(prod, "gecko-zzz.timer", "[Timer]\n"),
+            "UNTRACKED PROD UNIT: gecko-zzz.timer",
+        ),
+        (
+            lambda prod: (prod / "gecko-rank.timer").unlink(),
+            "DRIFT: gecko-rank.timer (missing in prod)",
+        ),
+        (
+            lambda prod: _write_unit(
+                prod / "gecko-job@coingecko-markets.service.d", "timeout.conf", "x\n"
+            ),
+            "DRIFT: gecko-job@coingecko-markets.service.d/timeout.conf",
+        ),
+        (
+            lambda prod: (
+                prod / "gecko-job@coingecko-markets.service.d" / "timeout.conf"
+            ).unlink(),
+            "DRIFT: gecko-job@coingecko-markets.service.d/timeout.conf (missing in prod)",
+        ),
+        (
+            lambda prod: (prod / "gecko-collector@.service").unlink(),
+            "DRIFT: gecko-collector@.service (missing in prod)",
+        ),
+    ],
+)
+def test_deploy_gecko_drift_still_alerts(tmp_path, mutate, expected):
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _install_real_deploy_gecko(repo, prod)
+    mutate(prod)
+    res, marker = _run_watchdog(tmp_path, repo, prod)
+    assert res.returncode == 1, (res.stdout, res.stderr)
+    assert expected in marker.read_text()
+
+
+def test_repo_tracked_drop_in_of_a_tracked_unit_is_not_reported(tmp_path):
+    repo = _make_fake_repo(tmp_path)
+    prod = _make_fake_prod_systemd(tmp_path)
+    _install_real_deploy_gecko(repo, prod)
+    for root in (repo / "deploy" / "gecko", prod):
+        (root / "gecko-db-backup.service.d").mkdir()
+        _write_unit(root / "gecko-db-backup.service.d", "x.conf", "[Service]\n")
+    res, marker = _run_watchdog(tmp_path, repo, prod)
+    assert res.returncode == 0, (res.stdout, res.stderr)
+    _write_unit(prod / "gecko-db-backup.service.d", "y.conf", "[Service]\n")
+    res, marker = _run_watchdog(tmp_path, repo, prod)
+    assert "DROP-IN PRESENT: gecko-db-backup.service.d/" in marker.read_text()

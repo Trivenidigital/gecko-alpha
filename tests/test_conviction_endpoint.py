@@ -8,6 +8,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from dashboard.api import create_app
+from scout.identity import CANONICAL_SEMANTICS
 from scout.conviction import SURFACE_LEAD_COLUMNS
 from scout.db import Database
 
@@ -68,6 +69,12 @@ async def _insert_gc(
         vals.append(1 if surface in early else 0)
         cols.append(lead_col)
         vals.append(lead if surface in early else None)
+    # Ruling C: a chains lead only counts toward conviction when it was derived
+    # by canonical identity. These fixtures use `chains` as a generic surface,
+    # so they declare canonical; the legacy-exclusion behaviour is covered in
+    # tests/test_cross_surface_conviction.py.
+    cols.append("chains_identity_semantics")
+    vals.append(CANONICAL_SEMANTICS)
     placeholders = ",".join("?" for _ in vals)
     await conn.execute(
         f"INSERT INTO gainers_comparisons ({','.join(cols)}) VALUES ({placeholders})",

@@ -18,7 +18,30 @@
 # *** ACTIVATION PREREQUISITE: deploy PR #429 (daily-digest yesterday-fix) and
 # confirm >=1 fresh paper_daily_summary row exists BEFORE activating, else the
 # first digest pages are for a known-broken-being-fixed writer. ***
+#
+# The same line also carries check 6, the off-host backup shipper's heartbeat
+# freshness. It stays OFF until the B2 lane is actually configured: add
+# OFFHOST_BACKUP_WATCH_ENABLED=true to this line in the SAME change that
+# configures the bucket, never before — off-host shipping is opt-in, so
+# enabling the watch on a box with no destination pages every window for a
+# lane that was never meant to run. See docs/runbook_offhost_backup_b2.md.
+#
+# *** ORDERING: the shipper must be TRIGGERED AND OBSERVED before that flag is
+# flipped. It is not scheduled here — see the note below the next line. A
+# watchdog over a job nothing runs is a false-alarm generator, and a watchdog
+# the operator learns to ignore is worse than none.
 50 * * * * ALERT_CHANNEL_WATCHDOG_ENABLED=true /root/gecko-alpha/scripts/alert-channel-watchdog.sh >> /var/log/gecko-alpha-alert-channel-watchdog.log 2>&1
+# The off-host backup shipper is deliberately NOT scheduled here. It runs as
+# systemd/gecko-backup-offhost.service, triggered by gecko-backup.service via
+# OnSuccess= — event-coupled to the backup it ships rather than clock-coupled
+# to a guess about how long that backup takes.
+#
+# A cron line 30 minutes after the backup timer was the first attempt and was
+# wrong: gecko-backup.timer has AccuracySec=1h and Persistent=true, and the
+# backup can legitimately run for many minutes, so on any deferred day the
+# shipper would re-verify YESTERDAY's backup and write a fresh heartbeat —
+# a lane that reads healthy while being permanently one day stale.
+# See docs/runbook_offhost_backup_b2.md.
 # Liquidity enrichment (b2 Phase 1a-ii). Writer is a NO-OP unless
 # LIQUIDITY_ENRICHMENT_ENABLED=true in .env (killswitch). See
 # tasks/runbook_enable_liquidity_enrichment_2026_06_23.md for the enable

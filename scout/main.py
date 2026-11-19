@@ -37,6 +37,11 @@ from scout.ingestion.coingecko import fetch_trending as cg_fetch_trending
 from scout.ingestion.coingecko import fetch_by_volume as cg_fetch_by_volume
 from scout.ingestion.coingecko import fetch_midcap_gainers as cg_fetch_midcap_gainers
 from scout.ingestion.coingecko import fetch_deep_volume as cg_fetch_deep_volume
+from scout.coingecko_budget import (
+    BUCKET_CRITICAL,
+    BUCKET_DISCOVERY,
+    budget as cg_budget,
+)
 from scout.ingestion import coingecko as _cg_module
 from scout.ingestion import dexscreener as _dex_module
 from scout.ingestion import geckoterminal as _gt_module
@@ -120,6 +125,13 @@ logger = structlog.get_logger()
 # completes — without a stored reference, the task can be GC'd mid-flight
 # and never reach the callback.
 _counter_followup_tasks: set[asyncio.Task] = set()
+# CG discovery cadence counter (monthly-budget repair 2026-08-21). Increments on
+# every pipeline cycle that reaches the CG lanes; the discovery fan-out runs only
+# when it divides COINGECKO_DISCOVERY_INTERVAL_CYCLES. Deliberately a COUNTER,
+# not a wall-clock deadline: it makes the cadence deterministic in tests and
+# matches the existing idiom in fetch_midcap_gainers / fetch_held_position_prices.
+# Resets to 0 on restart, which only ever costs one extra discovery round.
+_cg_discovery_cycle_counter: int = 0
 # ALR-02 detection-time alert lane fire-and-forget tasks. Same GC-protection
 # rationale as the sets above — hold a strong ref so a spawned task can't be
 # collected before its done-callback runs.
@@ -730,7 +742,82 @@ async def _fetch_coingecko_lanes(
         logger.warning(
             "coingecko_lanes_stopped_for_backoff", after="held_position_prices"
         )
+        _cg_module.reset_discovery_raw()
         return [], [], [], [], [], held_position_raw
+
+    # --- CG DISCOVERY cadence gate (monthly-budget repair 2026-08-21) ---
+    # held_position ran ABOVE this gate on purpose: it is the critical surface
+    # and keeps its own cadence + no_open_trades no-op. Only the paid DISCOVERY
+    # lanes are throttled here. The free leading sources (DexScreener /
+    # GeckoTerminal) are not touched by this function at all.
+    #
+    # reset_discovery_raw() is REQUIRED, not tidiness: the fetchers clear their
+    # own globals on entry, so skipping them leaves the PREVIOUS payload live,
+    # and main.py would then republish it as this cycle's data — restamping
+    # price_cache as fresh and re-inserting duplicate volume_history_cg rows
+    # under a new recorded_at. See reset_discovery_raw's docstring.
+    # DARK-UNTIL-RESET gate. Default-off, checked before everything else.
+    # The operator ruling is "no CoinGecko discovery before the September 1
+    # credit reset". Without this flag that is only a promise about deployment
+    # timing: a deploy before the reset starts with an EMPTY local ledger, so
+    # every envelope looks available and discovery resumes on the 5th cycle. The
+    # provider would answer 429 because its real quota is gone — but attempting
+    # and being refused is not "dark", it just moves the failure to a place the
+    # local ledger cannot see. Flipping this to true is the activation step.
+    if not settings.COINGECKO_DISCOVERY_ENABLED:
+        _cg_module.reset_discovery_raw()
+        logger.debug(
+            "coingecko_discovery_disabled",
+            hint=(
+                "COINGECKO_DISCOVERY_ENABLED is false — CG discovery stays dark "
+                "regardless of local ledger state; set it in the same change "
+                "that activates the lane after the monthly credit reset"
+            ),
+        )
+        return [], [], [], [], [], held_position_raw
+
+    # Monthly-credit envelope. Checked BEFORE the cadence gate so an exhausted
+    # discovery budget stops discovery on every cycle, not only on the 5th.
+    # Only DISCOVERY stops — held_position ran above and draws on the reserved
+    # critical envelope, so an exhausted discovery budget can never leave an
+    # open position unpriceable.
+    if cg_budget.discovery_exhausted(settings):
+        _cg_module.reset_discovery_raw()
+        logger.warning(
+            "coingecko_discovery_budget_exhausted",
+            month=cg_budget.month,
+            discovery_credits=cg_budget.credits(BUCKET_DISCOVERY),
+            discovery_cap=settings.COINGECKO_MONTHLY_DISCOVERY_CREDITS,
+            critical_credits=cg_budget.credits(BUCKET_CRITICAL),
+            hint=(
+                "discovery halted for the remainder of the billing month; "
+                "the critical reserve remains spendable so held positions "
+                "stay re-priceable"
+            ),
+        )
+        return [], [], [], [], [], held_position_raw
+
+    global _cg_discovery_cycle_counter
+    _cg_discovery_cycle_counter += 1
+    discovery_interval = max(1, int(settings.COINGECKO_DISCOVERY_INTERVAL_CYCLES))
+    if _cg_discovery_cycle_counter % discovery_interval != 0:
+        _cg_module.reset_discovery_raw()
+        logger.debug(
+            "coingecko_discovery_skipped_off_cadence",
+            cycle=_cg_discovery_cycle_counter,
+            interval=discovery_interval,
+        )
+        return [], [], [], [], [], held_position_raw
+
+    # Start every discovery round from a clean slate. Each fetch_* clears its
+    # OWN global on entry, so this is redundant for a lane that runs — and
+    # essential for one that does not. The backoff early-returns below abort the
+    # sequence part-way; without this, the lanes that never ran would still be
+    # holding the PREVIOUS round's payload, and main.py (which reads the globals,
+    # not this function's return value) would republish it as current. That is a
+    # pre-existing defect, not one the cadence gate introduced — it fires on
+    # every backoff-truncated cycle, and CG has been backing off constantly.
+    _cg_module.reset_discovery_raw()
 
     cg_movers = await _call("top_movers", cg_fetch_top_movers, session, settings)
     if coingecko_limiter.is_backing_off():
@@ -892,6 +979,16 @@ async def run_cycle(
             settings,
             dry_run=dry_run,
         )
+
+    # Bounded credit-durability flush. The hourly maintenance pass is too
+    # coarse to be the only persistence: a crash or deploy between flushes would
+    # discard up to an hour of spend and the process would restart believing it
+    # has capacity it already burned. Flushes by CREDITS rather than clock,
+    # because the exposure scales with spend, not with time.
+    try:
+        await cg_budget.maybe_persist(db, settings)
+    except Exception:
+        logger.exception("cg_budget_flush_failed")
 
     # Cache raw CoinGecko prices for dashboard (zero extra API calls)
     all_raw = list(_cg_module.last_raw_markets)
@@ -1108,15 +1205,9 @@ async def run_cycle(
         except Exception:
             logger.exception("dex_discovery_error")
 
-    # RH/Pons curve-launch collector (observe-only, inert by default): records
-    # evidence only; emits no candidates, no alert, no paper trade. Flag off =
-    # no call; even when on, poll_once refuses without a configured RPC URL
-    # AND an onchain-verified deployment registry entry.
-    if settings.RH_PONS_COLLECTOR_ENABLED:
-        try:
-            await rh_pons.poll_once(session, db, settings)
-        except Exception:
-            logger.exception("rh_pons_collector_error")
+    # RH/Pons capture no longer runs inside the cycle: a 60 s+ cycle cannot keep
+    # up with ~10 blocks/s. It is a dedicated worker spawned in main() behind
+    # RH_PONS_COLLECTOR_ENABLED (plan_rh_pons_sustained_capture_20260913).
 
     # Stage 2: Aggregate
     all_candidates = aggregate(
@@ -1567,6 +1658,68 @@ async def _run_narrative_resolution_watchdog(db, settings, logger) -> list[str]:
     return n_alarms
 
 
+async def _send_cg_budget_pace_alert(
+    session,
+    settings,
+    *,
+    projected: float,
+    allowance: int,
+    ratio: float,
+    snapshot: dict,
+) -> None:
+    """§12b operator page: this month's CoinGecko pace overshoots the allowance.
+
+    Fires on PROJECTION, not on an absolute mark. The 2026-08-21 exhaustion was
+    visible in the logs for three days as a rising 429 rate and nobody was told,
+    because nothing was watching the monthly axis at all. A pace alarm is the
+    piece that turns "we ran out" into "we are going to run out".
+
+    Never raises: a failed alert must not break the maintenance pass.
+    """
+    if session is None:
+        logger.warning("cg_budget_pace_alert_skipped_no_session", ratio=round(ratio, 2))
+        return
+
+    # Deferred import: scout.alerter pulls aiohttp at module level (Windows
+    # OpenSSL Applink) — same pattern as auto_suspend / evaluator.
+    from scout import alerter
+
+    body = "\n".join(
+        [
+            "WARNING: CoinGecko monthly credit pace exceeds the plan allowance",
+            f"month: {snapshot.get('month')}",
+            f"credits used so far: {snapshot.get('total_credits')}",
+            f"projected month-end: {round(projected)}",
+            f"allowance: {allowance}",
+            f"projected overshoot: {ratio:.2f}x",
+            (
+                f"discovery: {snapshot.get('discovery_credits')} credits "
+                f"({snapshot.get('discovery_attempts')} attempts)"
+            ),
+            f"critical: {snapshot.get('critical_credits')} credits",
+            "Discovery halts at its own envelope; the critical reserve is preserved.",
+        ]
+    )
+    try:
+        logger.info(
+            "cg_budget_pace_alert_dispatched", ratio=round(ratio, 2), **snapshot
+        )
+        await alerter.send_telegram_message(
+            body,
+            session,
+            settings,
+            # parse_mode=None: bucket names and keys contain `_`, which Telegram
+            # MarkdownV1 silently mangles into italics (§12b Class-3 rendering).
+            parse_mode=None,
+            source="cg_budget_pace",
+        )
+        logger.info("cg_budget_pace_alert_delivered", ratio=round(ratio, 2))
+    except Exception:
+        # Logged, never fatal. The default alerter is silent on success, so the
+        # dispatched/delivered pair above is what makes "no logs" unambiguous.
+        logger.exception("cg_budget_pace_alert_failed", ratio=round(ratio, 2))
+
+
 async def _run_hourly_maintenance(db, session, settings, logger) -> None:
     """Hourly maintenance: outcome check + table prunes.
 
@@ -1616,38 +1769,92 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             pruned_cp = await db.prune_cryptopanic_posts(
                 keep_days=settings.CRYPTOPANIC_RETENTION_DAYS
             )
-            if pruned_cp:
-                logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
+            logger.info("cryptopanic_pruned", rows_deleted=pruned_cp)
         except Exception:
             logger.exception("cryptopanic_prune_failed")
 
     # BL-NEW-SCORE-HISTORY-PRUNING + BL-NEW-VOLUME-SNAPSHOTS-PRUNING:
-    # parameterized + decoupled from narrative daily loop. Follow cryptopanic
-    # pattern (V4#4 fold): info-when-rows>0, silent-when-zero — structlog at
-    # main.py has no filter_by_level so debug would still emit.
+    # parameterized + decoupled from narrative daily loop.
+    #
+    # These log UNCONDITIONALLY, including rows_deleted=0. The former
+    # info-when-rows>0 / silent-when-zero pattern made "the prune ran and
+    # deleted nothing" and "the prune never ran" write byte-identical journals,
+    # so a silent stop was undetectable at the only rate that could reveal it.
+    # #547 removed that guard from the loop-driven prunes below; these
+    # hand-written siblings in the same function kept it, so the blind spot
+    # survived where #547 was believed to have closed it. Ruling B's retention
+    # evidence depends on reading the prune's effect from the journal, which
+    # requires the zero case to be visible.
     try:
         pruned_sh = await db.prune_score_history(
             keep_days=settings.SCORE_HISTORY_RETENTION_DAYS
         )
-        if pruned_sh:
-            logger.info(
-                "score_history_pruned",
-                rows_deleted=pruned_sh,
-                keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
-            )
+        logger.info(
+            "score_history_pruned",
+            rows_deleted=pruned_sh,
+            keep_days=settings.SCORE_HISTORY_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("score_history_prune_failed")
+
+    # Ruling E is DEFERRED_BY_ECONOMICS, and a deferral is only safe while
+    # something watches for the economics changing. Logged unconditionally so
+    # "watched and nothing crossed" stays distinguishable from "stopped
+    # watching"; `reopen` escalates to a warning. Reopening the investigation
+    # needs no approval -- destructive pruning still follows the ruling.
+    try:
+        e_probe = await db.signal_outcome_ledger_growth_probe()
+        logger.info("signal_outcome_ledger_growth", **e_probe)
+        if e_probe["reopen"]:
+            logger.warning("signal_outcome_ledger_REOPEN_E", **e_probe)
+    except Exception:
+        logger.exception("signal_outcome_ledger_growth_probe_failed")
+
+    # Deploy-without-activate watch for the legacy-provenance overlay. The
+    # overlay is written by an OFFLINE ops step, so shipping the code without
+    # running it leaves every pre-cutover chains detection untrusted and
+    # collapses tier_high silently -- the exact outcome the overlay exists to
+    # prevent. Logged unconditionally so "populated and healthy" stays
+    # distinguishable from "never checked"; only `not_recovering` escalates --
+    # RECOVERED CREDIT, not row count, because a fully-populated overlay that
+    # resolved nothing produces the identical collapse. Partial coverage is the
+    # expected steady state (history runs out) and must never page.
+    try:
+        cov = await db.chain_identity_recompute_coverage_probe(
+            gate_minutes=float(getattr(settings, "CONVICTION_EARLY_LEAD_MINUTES", 1440))
+        )
+        logger.info("chain_identity_recompute_coverage", **cov)
+        if cov["not_recovering"]:
+            logger.error("chain_identity_recompute_NOT_RECOVERING", **cov)
+    except Exception:
+        logger.exception("chain_identity_recompute_coverage_probe_failed")
+
+    # Repair the derived first-seen substrate. See
+    # Database.reconcile_signal_first_seen: the per-write fold is not atomic
+    # against a foreign rollback on the shared connection, so the substrate is
+    # kept correct by repair rather than by prevention. The fold only lowers
+    # the minimum, so this can never make first_seen later than the truth.
+    #
+    # repaired > 0 is a REAL SIGNAL, not routine noise -- it means the write
+    # path dropped something. Logged unconditionally (including the zero) so
+    # "ran and repaired nothing" stays distinguishable from "never ran".
+    try:
+        recon = await db.reconcile_signal_first_seen()
+        logger.info("signal_first_seen_reconciled", **recon)
+        if recon["repaired"] or recon["poisoned_removed"]:
+            logger.warning("signal_first_seen_drift_detected", **recon)
+    except Exception:
+        logger.exception("signal_first_seen_reconcile_failed")
 
     try:
         pruned_vs = await db.prune_volume_snapshots(
             keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS
         )
-        if pruned_vs:
-            logger.info(
-                "volume_snapshots_pruned",
-                rows_deleted=pruned_vs,
-                keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "volume_snapshots_pruned",
+            rows_deleted=pruned_vs,
+            keep_days=settings.VOLUME_SNAPSHOTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("volume_snapshots_prune_failed")
 
@@ -1658,12 +1865,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         pruned_tde = await db.prune_trade_decision_events(
             keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS
         )
-        if pruned_tde:
-            logger.info(
-                "trade_decision_events_pruned",
-                rows_deleted=pruned_tde,
-                keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "trade_decision_events_pruned",
+            rows_deleted=pruned_tde,
+            keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("trade_decision_events_prune_failed")
 
@@ -1675,12 +1881,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
         pruned_vh = await db.prune_volume_history_cg(
             keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS
         )
-        if pruned_vh:
-            logger.info(
-                "volume_history_cg_pruned",
-                rows_deleted=pruned_vh,
-                keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,
-            )
+        logger.info(
+            "volume_history_cg_pruned",
+            rows_deleted=pruned_vh,
+            keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("volume_history_cg_prune_failed")
 
@@ -1695,12 +1900,11 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
             cohort_closed_at=settings.DETECTION_RECEIPTS_COHORT_CLOSED_AT or None,
         )
-        if pruned_ddr:
-            logger.info(
-                "detection_decision_receipts_pruned",
-                rows_deleted=pruned_ddr,
-                keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
-            )
+        logger.info(
+            "detection_decision_receipts_pruned",
+            rows_deleted=pruned_ddr,
+            keep_days=settings.DETECTION_DECISION_RECEIPTS_RETENTION_DAYS,
+        )
     except Exception:
         logger.exception("detection_decision_receipts_prune_failed")
 
@@ -1721,19 +1925,79 @@ async def _run_hourly_maintenance(db, session, settings, logger) -> None:
             "prune_conviction_watchlist_snapshots",
             "CONVICTION_WATCHLIST_SNAPSHOT_RETENTION_DAYS",
         ),
+        # signal_events is the LARGEST table in prod (2.04 GB / 6.9M rows /
+        # ~550K rows a day at 14d retention). Its prune used to live in the
+        # chains engine's _prune_stale, downstream of check_chains' early
+        # return on zero active patterns — so it would have stopped silently
+        # the moment the pattern set emptied, with nothing watching. Same
+        # decoupling rationale as INF-06 above; retention is unchanged.
+        ("prune_signal_events", "CHAIN_EVENT_RETENTION_DAYS"),
     ]:
         event_base = prune_name.removeprefix("prune_")
         try:
             keep_days = getattr(settings, retention_attr)
             rows = await getattr(db, prune_name)(keep_days=keep_days)
-            if rows:
-                logger.info(
-                    f"{event_base}_pruned",
-                    rows_deleted=rows,
-                    keep_days=keep_days,
-                )
+            # §12a prune-freshness: emit UNCONDITIONALLY, including
+            # rows_deleted=0. The previous `if rows:` made "the prune ran and
+            # had nothing to delete" and "the prune stopped running" produce
+            # byte-identical journals — the exact ambiguity that let the
+            # relocated signal_events prune be gated on active chain patterns
+            # for as long as it was without anything noticing. Absence of this
+            # event for >1h is now unambiguously "the hourly pass did not run".
+            # Same idiom as scout/conviction/prospective.py, which writes a run
+            # heartbeat even on an empty build so its watchdog can tell "ran,
+            # found 0" from "never ran".
+            logger.info(
+                f"{event_base}_pruned",
+                rows_deleted=rows,
+                keep_days=keep_days,
+            )
         except Exception:
             logger.exception(f"{event_base}_prune_failed")
+
+    # --- CoinGecko monthly-credit governor: reconcile + persist + PACE ---
+    # Emitted unconditionally, like the prunes above: a budget report that only
+    # appears when something is wrong is indistinguishable from a governor that
+    # stopped running, which is the failure mode this repair exists to close.
+    try:
+        # Provider is the ACCEPTANCE truth. Reconcile BEFORE reading the
+        # snapshot so pacing, enforcement and the report all see the corrected
+        # figure — a /key call that only produced a log line would leave the
+        # local ledger authoritative, which is precisely the wrong direction.
+        if session is not None and settings.COINGECKO_BUDGET_RECONCILE_ENABLED:
+            try:
+                await _cg_module.reconcile_monthly_credits(session, settings)
+            except Exception:
+                logger.exception("cg_budget_reconcile_failed")
+
+        await cg_budget.persist(db)
+        snapshot = cg_budget.snapshot()
+        projected = cg_budget.projected_month_end_credits()
+        allowance = int(settings.COINGECKO_MONTHLY_CREDIT_ALLOWANCE or 0)
+        logger.info(
+            "cg_budget_status",
+            projected_month_end=(round(projected) if projected else None),
+            allowance=allowance,
+            **snapshot,
+        )
+        # PACE, not an absolute mark, and on the CROSSING rather than the
+        # condition: this pass runs hourly, so paging whenever the projection is
+        # over threshold would produce ~24 pages/day for one unchanged fact.
+        if (
+            projected is not None
+            and allowance > 0
+            and cg_budget.should_page_on_pace(settings)
+        ):
+            await _send_cg_budget_pace_alert(
+                session,
+                settings,
+                projected=projected,
+                allowance=allowance,
+                ratio=projected / allowance,
+                snapshot=snapshot,
+            )
+    except Exception:
+        logger.exception("cg_budget_maintenance_failed")
 
     # BL-NEW-SQLITE-WAL-PROFILE cycle 4 + BL-NEW-SQLITE-DURABLE-MAINTENANCE
     # (P0 Part B): probe the WAL/freelist state ONCE (after all 12 prunes so
@@ -2561,6 +2825,15 @@ async def main(argv: list[str] | None = None) -> int:
     except Exception:
         logger.exception("ingest_watchdog_state_hydrate_failed")
 
+    # Same rationale as GA-19 above, one axis over: the CoinGecko monthly-credit
+    # counters live in memory (they are read on every CG call), so without this
+    # a restart would zero the month's spend and the envelopes would silently
+    # reset on every deploy. A budget a service bounce clears is not a budget.
+    try:
+        await cg_budget.hydrate(db)
+    except Exception:
+        logger.exception("cg_budget_hydrate_failed")
+
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15)
@@ -2808,6 +3081,19 @@ async def main(argv: list[str] | None = None) -> int:
 
                 tasks.append(
                     asyncio.create_task(tg_shadow_loop(db=db, settings=settings))
+                )
+
+            # RH/Pons curve-launch capture (observe-only, inert by default):
+            # evidence only — no candidates, alerts or paper trades. The loop
+            # never returns while enabled, bounds each pass by
+            # RH_PONS_POLL_TIMEOUT_SEC, backs off on refusals/failures, and is
+            # cancelled with the other workers at shutdown.
+            if settings.RH_PONS_COLLECTOR_ENABLED:
+                tasks.append(
+                    asyncio.create_task(
+                        rh_pons.run_rh_pons_loop(session, db, settings),
+                        name="rh-pons-collector",
+                    )
                 )
 
             # BL-055 live-subsystem loops (spec §10) — only spawned when a

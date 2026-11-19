@@ -4,6 +4,25 @@ import re
 from datetime import datetime, timedelta, timezone
 
 
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    fetch_and_store_trending now REQUIRES settings (keyword-only, no default):
+    a `settings=None` default failed CLOSED but SILENTLY, returning zero
+    snapshots instead of raising — which is how an unenforced call looks exactly
+    like a quiet upstream.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 def _sqlite_ts(dt: datetime) -> str:
     """Format datetime as SQLite-compatible string (space separator, no tz)."""
     return dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -70,7 +89,9 @@ async def test_fetch_and_store_trending_success(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload=TRENDING_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     assert len(snapshots) == 5
     assert snapshots[0].coin_id == "coin-0"
@@ -89,7 +110,9 @@ async def test_fetch_and_store_trending_empty_response(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, status=500)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     assert snapshots == []
 
@@ -100,7 +123,9 @@ async def test_fetch_and_store_trending_malformed(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload={"coins": [{"item": {}}]})
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db)
+            snapshots = await fetch_and_store_trending(
+                session, db, settings=_budget_settings()
+            )
 
     # Entry without id is skipped
     assert len(snapshots) == 0
@@ -112,7 +137,9 @@ async def test_fetch_and_store_trending_with_api_key(db):
     with aioresponses() as mocked:
         mocked.get(CG_TRENDING_URL, payload=TRENDING_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            snapshots = await fetch_and_store_trending(session, db, api_key="test-key")
+            snapshots = await fetch_and_store_trending(
+                session, db, api_key="test-key", settings=_budget_settings()
+            )
 
     assert len(snapshots) == 5
 
@@ -243,6 +270,11 @@ async def test_compare_detects_chain_signal(db):
         ),
     )
 
+    # "CC" is a SHORT symbol, so this exercises the branch that now reads the
+    # derived substrate. emit_event writes both rows as one unit; a raw INSERT
+    # alone builds a state production does not produce.
+    await db.record_signal_first_seen("coin-c", _sqlite_ts(earlier))
+
     # Insert trending snapshot
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
@@ -304,6 +336,12 @@ async def test_compare_credits_same_day_isoformat_chain_signal(db):
             earlier.isoformat(),
         ),
     )
+    # `emit_event` writes the event AND folds signal_first_seen in one
+    # transaction, and the tracker now derives first-seen from that substrate.
+    # A raw INSERT alone builds a state production cannot reach (the savepoint
+    # in emit_event makes an event without its substrate row unreachable), so
+    # the fixture would be testing an impossible shape rather than this branch.
+    await db.record_signal_first_seen("coin-isoc", earlier.isoformat())
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
         ("coin-isoc", "CISO", "Coin IsoC", now.isoformat()),
@@ -342,6 +380,8 @@ async def test_compare_multiple_detections(db):
             _sqlite_ts(earlier_chain),
         ),
     )
+    # "CD" is a SHORT symbol -- see the note in test_compare_detects_chain_signal.
+    await db.record_signal_first_seen("coin-d", _sqlite_ts(earlier_chain))
     await db._conn.execute(
         "INSERT INTO trending_snapshots (coin_id, symbol, name, snapshot_at) VALUES (?, ?, ?, ?)",
         ("coin-d", "CD", "Coin D", _sqlite_ts(now)),
@@ -566,6 +606,10 @@ async def test_compare_signal_events_like_matching(db):
            VALUES (?, ?, ?, ?, ?, ?)""",
         ("bless", "memecoin", "candidate_scored", "{}", "scorer", _sqlite_ts(earlier)),
     )
+    # Mirror emit_event's atomic unit -- see the note in the isoformat test.
+    # The LIKE matching under test is unchanged: signal_first_seen.token_id
+    # holds the same values signal_events.token_id does.
+    await db.record_signal_first_seen("bless", _sqlite_ts(earlier))
 
     # Trending snapshot uses CoinGecko slug (long form)
     await db._conn.execute(

@@ -1,0 +1,580 @@
+{
+  "observed_at_utc": "2026-09-13T18:53:59.742779+00:00",
+  "scope": "Public read-only verification; retrospective samples, no collector activation",
+  "calls": [
+    {
+      "url": "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+      "status": 200,
+      "response_sha256": "b2285b178a8e70c10da3a11c87e783d989019b58f1e03dfbc462fcb9e68d6c84",
+      "contract": {
+        "name": "PonsV2LaunchFactory",
+        "is_verified": true,
+        "verified_at": "2026-08-04T17:40:45.239016Z",
+        "file_path": "contracts/src/v2/PonsV2LaunchFactory.sol",
+        "compiler_version": "v0.8.35+commit.47b9dedd",
+        "proxy_type": null
+      },
+      "event_abi": [
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "GraduationTokensPermanentlyLocked",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "quoteAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "LaunchGraduationRescued",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "quoteOut",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "tokenOut",
+              "type": "uint256"
+            }
+          ],
+          "name": "LaunchSwept",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "positionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "pairTokenAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "PoolGraduated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "curve",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "deployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pairToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "launchConfigId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "graduationThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokenLaunched",
+          "type": "event"
+        }
+      ],
+      "bytecode_sha256": "226a042e6d68a69a6038d4fda211925b03eb5299399434b87a7877f79f6e3848",
+      "bytecode_bytes": 24177,
+      "curve_event_source": [
+        "event CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax);",
+        "event CurveSell(address indexed seller, address indexed recipient, uint256 tokensIn, uint256 quoteOut, uint256 fee, uint256 tax);"
+      ]
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api/v2/smart-contracts/0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+      "error": "Response status code does not indicate success: 500 (Internal Server Error)."
+    },
+    {
+      "status": 200,
+      "url": "https://robinhoodchain.blockscout.com/api/v2/addresses/0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+      "response_sha256": "0785c59117130c280ff7c04baf363caae5e3bf165efce17f42a0758bec00f441",
+      "response": {
+        "block_number_balance_updated_at": 62181975,
+        "coin_balance": "15669373867714746",
+        "creation_status": "success",
+        "creation_transaction_hash": "0x3817f297aa7c2ef78789bffac57491ceedc218fef962d47ed36c272699deddeb",
+        "creator_address_hash": "0xFdDE5a1E3cDF791Da71E49F817D70C7ceD72CC36",
+        "ens_domain_name": null,
+        "exchange_rate": "2508.12",
+        "has_beacon_chain_withdrawals": false,
+        "has_logs": true,
+        "has_token_transfers": true,
+        "has_tokens": true,
+        "has_validated_blocks": false,
+        "hash": "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
+        "implementations": [],
+        "is_contract": true,
+        "is_scam": false,
+        "is_verified": true,
+        "metadata": null,
+        "name": "PonsV2LaunchFactory",
+        "private_tags": [],
+        "proxy_type": null,
+        "public_tags": [],
+        "reputation": "ok",
+        "token": null,
+        "watchlist_address_id": null,
+        "watchlist_names": []
+      }
+    },
+    {
+      "error": "Response status code does not indicate success: 500 (Internal Server Error).",
+      "url": "https://robinhoodchain.blockscout.com/api/v2/addresses/0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb"
+    },
+    {
+      "error": "Response status code does not indicate success: 500 (Internal Server Error).",
+      "url": "https://robinhoodchain.blockscout.com/api/v2/addresses/0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e/logs"
+    },
+    {
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": "0x3b4d3d0"
+      },
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "jsonrpc": "2.0",
+        "method": "eth_blockNumber",
+        "id": 1,
+        "params": []
+      }
+    },
+    {
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "code_bytes": 24177,
+        "code_sha256": "226a042e6d68a69a6038d4fda211925b03eb5299399434b87a7877f79f6e3848"
+      },
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "id": 2,
+        "params": [
+          "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "latest"
+        ]
+      }
+    },
+    {
+      "response": {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "code_bytes": 24353,
+        "code_sha256": "834a3a3f3c5a7ca4db3be3ca96f34c99cab44e01822aef04ea9d7104a2159507"
+      },
+      "url": "https://rpc.mainnet.chain.robinhood.com",
+      "request": {
+        "jsonrpc": "2.0",
+        "method": "eth_getCode",
+        "id": 3,
+        "params": [
+          "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+          "latest"
+        ]
+      }
+    },
+    {
+      "request": {
+        "params": [
+          "0x3817f297aa7c2ef78789bffac57491ceedc218fef962d47ed36c272699deddeb"
+        ],
+        "method": "eth_getTransactionReceipt",
+        "jsonrpc": "2.0",
+        "id": 11
+      },
+      "error": "Response status code does not indicate success: 403 (Forbidden).",
+      "url": "https://rpc.mainnet.chain.robinhood.com"
+    },
+    {
+      "request": {
+        "params": [
+          {
+            "fromBlock": "0x3b4acc1",
+            "toBlock": "0x3b4d3d0",
+            "address": [
+              "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+              "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb"
+            ]
+          }
+        ],
+        "method": "eth_getLogs",
+        "jsonrpc": "2.0",
+        "id": 12
+      },
+      "error": "Response status code does not indicate success: 403 (Forbidden).",
+      "url": "https://rpc.mainnet.chain.robinhood.com"
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api/v2/transactions/0x3817f297aa7c2ef78789bffac57491ceedc218fef962d47ed36c272699deddeb",
+      "status": 200,
+      "response_sha256": "009f5e9e6e49438783eb7811bb21b67b7623264e562f11f0587971bcc05f426c",
+      "response": {
+        "hash": "0x3817f297aa7c2ef78789bffac57491ceedc218fef962d47ed36c272699deddeb",
+        "block_number": 26841846,
+        "timestamp": "2026-08-03T14:41:19.000000Z",
+        "created_contract": {
+          "ens_domain_name": null,
+          "hash": "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
+          "implementations": [],
+          "is_contract": true,
+          "is_scam": false,
+          "is_verified": true,
+          "metadata": null,
+          "name": "PonsV2LaunchFactory",
+          "private_tags": [],
+          "proxy_type": null,
+          "public_tags": [],
+          "reputation": "ok",
+          "watchlist_names": []
+        },
+        "status": "ok"
+      }
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62106833&toBlock=62116832&address=0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+      "status": 200,
+      "response_sha256": "db58653ca22114dee52fb53c2c3220c9ecfa55f008066da2f52e2902a6b8b801",
+      "log_count": 412,
+      "topic0_counts": {
+        "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607": 319,
+        "0xcdb72f157fd3666758a6ce201387ffb52038c7562e4fff352828da1096c4b6b4": 4,
+        "0x308c390ed1ab5873392818e036cabdf408bc8ad042fbaead3108954ff75ba980": 81,
+        "0xa0a18f5bf205becee8b268d7cf69addab8548ae8ef361791464cf0e0e17c1361": 4,
+        "0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259": 4
+      },
+      "response_status": "1",
+      "examples": [
+        {
+          "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "blockNumber": "0x3b3ad02",
+          "data": "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003a4965bf58a40000",
+          "gasPrice": "0x506b670",
+          "gasUsed": "0x369554",
+          "logIndex": "0x4",
+          "timeStamp": "0x6aa6d26e",
+          "topics": [
+            "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607",
+            "0x000000000000000000000000dfe69b66b2b83eb90ddf2d0fdce7f5cff316a031",
+            "0x000000000000000000000000fe29e4deec8002bccfdd87cc70ff38343e99977a",
+            "0x000000000000000000000000fcb594b8507994b0b8dac02e527b3640df48f20f"
+          ],
+          "transactionHash": "0xe4a948149dc1b9633e5782ee5876a5655948da835af11698e407154868de32a3",
+          "transactionIndex": "0x1"
+        },
+        {
+          "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "blockNumber": "0x3b3afbd",
+          "data": "0x0000000000000000000000000000000000000000000000000000000000285771000000000000000000000000000000000000000000a8cff781a2309085924a1d00000000000000000000000000000000000000000000000000000001e2339ad2",
+          "gasPrice": "0x529c700",
+          "gasUsed": "0xd35cd",
+          "logIndex": "0x6e",
+          "timeStamp": "0x6aa6d2b2",
+          "topics": [
+            "0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259",
+            "0x000000000000000000000000a1f412c58561913c5e45326b9a83884623918cec",
+            null,
+            null
+          ],
+          "transactionHash": "0x36a3c7fcbbd6a19bfd1e9947457c360b0f331e54e0fefad5493b7153b3c33a8a",
+          "transactionIndex": "0x5"
+        }
+      ],
+      "first_event_time_utc": "2026-09-13T16:42:22+00:00",
+      "last_event_time_utc": "2026-09-13T16:59:10+00:00",
+      "event_span_seconds": 1008,
+      "approx_launches_per_hour_event_span": 1139.29
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62172353&toBlock=62182352&address=0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+      "status": 200,
+      "response_sha256": "6c6bd783dbc2160398e05bdca16ef6377baaff95280f265757ccb230cd414ec6",
+      "log_count": 428,
+      "topic0_counts": {
+        "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607": 327,
+        "0x308c390ed1ab5873392818e036cabdf408bc8ad042fbaead3108954ff75ba980": 65,
+        "0xcdb72f157fd3666758a6ce201387ffb52038c7562e4fff352828da1096c4b6b4": 12,
+        "0xa0a18f5bf205becee8b268d7cf69addab8548ae8ef361791464cf0e0e17c1361": 12,
+        "0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259": 12
+      },
+      "response_status": "1",
+      "examples": [
+        {
+          "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "blockNumber": "0x3b4acdc",
+          "data": "0x0000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d168000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001e2339a80",
+          "gasPrice": "0x51d0560",
+          "gasUsed": "0x382603",
+          "logIndex": "0x4",
+          "timeStamp": "0x6aa6ec6b",
+          "topics": [
+            "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607",
+            "0x00000000000000000000000077205eb82c32c1106b7b4ab192c823cff082e48f",
+            "0x00000000000000000000000010e7734f9c44da75b3382cbe90f001eeaa9f3d4e",
+            "0x000000000000000000000000a0ef0b58e4843cd140072fb67f050ddd5e1a709b"
+          ],
+          "transactionHash": "0x3541c33a4a57ae5a62297d90b9844d23106be0474c2b569fde7ec354e337edad",
+          "transactionIndex": "0x1"
+        },
+        {
+          "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "blockNumber": "0x3b4b1ec",
+          "data": "0x0000000000000000000000000000000000000000000000000000000000286d0a000000000000000000000000000000000000000000a8cff7796e783680f5f0a40000000000000000000000000000000000000000000000003a4965bf58a40056",
+          "gasPrice": "0x51525c0",
+          "gasUsed": "0xc4d5a",
+          "logIndex": "0x19",
+          "timeStamp": "0x6aa6ecf0",
+          "topics": [
+            "0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494e6f258c259",
+            "0x000000000000000000000000a89c296c92518e8cee489d8e7365f229247ee200",
+            null,
+            null
+          ],
+          "transactionHash": "0xe103d655ace461961dd27526aa62c33a50cc4a5ae7c1248a05f53a5619aa395b",
+          "transactionIndex": "0x7"
+        }
+      ],
+      "first_event_time_utc": "2026-09-13T18:33:15+00:00",
+      "last_event_time_utc": "2026-09-13T18:50:11+00:00",
+      "event_span_seconds": 1016,
+      "approx_launches_per_hour_event_span": 1158.66
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62172353&toBlock=62182352&address=0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+      "status": 200,
+      "response_sha256": "1531ed0377c1e4056d99e9eccb0f7f2e65e72763593de740e3c1103cae3d691d",
+      "log_count": 0,
+      "topic0_counts": {},
+      "response_status": "0",
+      "examples": []
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=contract&action=getsourcecode&address=0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+      "status": 200,
+      "response_sha256": "a493f1df0be76e99f20b9e80757a8d614837262ed8271743f79fb234f53b6ad6",
+      "contract_name": "PonsLaunchFactory",
+      "event_abi": [
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "deployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "dexFactory",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pairToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "dexId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "launchConfigId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "positionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "restrictionsEndBlock",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "initialBuyAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokenLaunched",
+          "type": "event"
+        }
+      ],
+      "source_excerpt": "Deploys fixed-supply tokens directly into one-sided Uniswap V3"
+    },
+    {
+      "error": "The provided JSON includes a property whose name is an empty string, this is only supported using the -AsHashTable switch.",
+      "url": "https://robinhoodchain.blockscout.com/api?module=contract&action=getsourcecode&address=0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb"
+    },
+    {
+      "status": 200,
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62172353&toBlock=62182352&address=0x10e7734f9c44da75b3382cbe90f001eeaa9f3d4e",
+      "response_sha256": "64f253f4da0513b3f4ff906f355bad0f9b1a8379dc389d6bceb991556bec2eeb",
+      "log_count": 2,
+      "topic0_counts": {
+        "0x908408e307fc569b417f6cbec5d5a06f44a0a505ac0479b47d421a4b2fd6a1e6": 1,
+        "0xe4b7e48fbd47c2f602bacadee76ad33b16542ddb4997cfc0de04c311adcfa8c7": 1
+      },
+      "response_status": "1",
+      "examples": [
+        {
+          "address": "0x10e7734f9c44da75b3382cbe90f001eeaa9f3d4e",
+          "blockNumber": "0x3b4acdc",
+          "data": "0x",
+          "gasPrice": "0x51d0560",
+          "gasUsed": "0x382603",
+          "logIndex": "0x2",
+          "timeStamp": "0x6aa6ec6b",
+          "topics": [
+            "0xe4b7e48fbd47c2f602bacadee76ad33b16542ddb4997cfc0de04c311adcfa8c7",
+            "0x000000000000000000000000a0ef0b58e4843cd140072fb67f050ddd5e1a709b",
+            null,
+            null
+          ],
+          "transactionHash": "0x3541c33a4a57ae5a62297d90b9844d23106be0474c2b569fde7ec354e337edad",
+          "transactionIndex": "0x1"
+        },
+        {
+          "address": "0x10e7734f9c44da75b3382cbe90f001eeaa9f3d4e",
+          "blockNumber": "0x3b4acdc",
+          "data": "0x00000000000000000000000077205eb82c32c1106b7b4ab192c823cff082e48f",
+          "gasPrice": "0x51d0560",
+          "gasUsed": "0x382603",
+          "logIndex": "0x1",
+          "timeStamp": "0x6aa6ec6b",
+          "topics": [
+            "0x908408e307fc569b417f6cbec5d5a06f44a0a505ac0479b47d421a4b2fd6a1e6",
+            null,
+            null,
+            null
+          ],
+          "transactionHash": "0x3541c33a4a57ae5a62297d90b9844d23106be0474c2b569fde7ec354e337edad",
+          "transactionIndex": "0x1"
+        }
+      ],
+      "first_event_time_utc": "2026-09-13T18:33:15+00:00",
+      "last_event_time_utc": "2026-09-13T18:33:15+00:00",
+      "event_span_seconds": 0,
+      "approx_launches_per_hour_event_span": null
+    },
+    {
+      "url": "https://robinhoodchain.blockscout.com/api?module=logs&action=getLogs&fromBlock=62172353&toBlock=62182352&address=0x9ba24b3a293f78c39da9a41ef04b69e6ef70f6e1",
+      "error": "The request was canceled due to the configured HttpClient.Timeout of 20 seconds elapsing."
+    }
+  ]
+}

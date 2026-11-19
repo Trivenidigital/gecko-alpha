@@ -1,0 +1,165 @@
+{
+  "scope": "isolated_public_rpc_sustained_capacity",
+  "production_mutated": false,
+  "endpoint": "https://rpc.mainnet.chain.robinhood.com",
+  "quota": "unknown_not_probed",
+  "stop_reason": "target_reached_or_limit",
+  "config": {
+    "backlog_blocks": 3000,
+    "min_span": 100,
+    "max_span": 2000,
+    "header_batch_size": 50,
+    "idle_sleep_s": 2.0,
+    "pass_timeout_s": 30,
+    "catchup_lag_blocks": 100
+  },
+  "catchup": null,
+  "summary": {
+    "passes": 7,
+    "statuses": {
+      "completed": 4,
+      "failed": 3
+    },
+    "checkpoint_regressions": 0,
+    "rate_limited_passes": 3,
+    "rpc_calls": 901,
+    "initial_backlog_blocks": 3000
+  },
+  "real_time_event_delay": {
+    "samples": 0,
+    "note": "no catch-up; no real-time samples"
+  },
+  "db": {
+    "events": 420,
+    "launches": 26,
+    "execution_eligible": 0
+  },
+  "acceptance": {
+    "drain_ratio_ge_1_2": null,
+    "steady_state": "not_evaluated_insufficient_passes",
+    "event_delay": "not_evaluated_no_real_time_samples",
+    "zero_checkpoint_regressions": true
+  },
+  "passes": [
+    {
+      "status": "completed",
+      "reason": "",
+      "from_block": 62282330,
+      "to_block": 62282429,
+      "new_blocks": 100,
+      "start_head": 62285329,
+      "completion_head": 62285389,
+      "recorded_events": 0,
+      "header_heights": 13,
+      "trade_logs": 100,
+      "excluded_foreign_logs": 100,
+      "rpc_calls": 19,
+      "rate_limited": false,
+      "duration_s": 8.716,
+      "completed_monotonic": 15632931.587240849
+    },
+    {
+      "status": "completed",
+      "reason": "",
+      "from_block": 62282418,
+      "to_block": 62282629,
+      "new_blocks": 200,
+      "start_head": 62285409,
+      "completion_head": 62285473,
+      "recorded_events": 70,
+      "header_heights": 65,
+      "trade_logs": 338,
+      "excluded_foreign_logs": 280,
+      "rpc_calls": 71,
+      "rate_limited": false,
+      "duration_s": 8.958,
+      "completed_monotonic": 15632940.544767192
+    },
+    {
+      "status": "completed",
+      "reason": "",
+      "from_block": 62282618,
+      "to_block": 62283029,
+      "new_blocks": 400,
+      "start_head": 62285499,
+      "completion_head": 62285567,
+      "recorded_events": 173,
+      "header_heights": 99,
+      "trade_logs": 666,
+      "excluded_foreign_logs": 501,
+      "rpc_calls": 105,
+      "rate_limited": false,
+      "duration_s": 9.498,
+      "completed_monotonic": 15632950.04275438
+    },
+    {
+      "status": "failed",
+      "reason": "headers_unavailable",
+      "from_block": 62283018,
+      "to_block": 62283829,
+      "new_blocks": 0,
+      "start_head": 62285592,
+      "completion_head": null,
+      "recorded_events": 0,
+      "header_heights": 442,
+      "trade_logs": 1880,
+      "excluded_foreign_logs": 426,
+      "rpc_calls": 204,
+      "rate_limited": true,
+      "duration_s": 8.035,
+      "completed_monotonic": null
+    },
+    {
+      "status": "failed",
+      "reason": "headers_unavailable",
+      "from_block": 62283018,
+      "to_block": 62283429,
+      "new_blocks": 0,
+      "start_head": 62285691,
+      "completion_head": null,
+      "recorded_events": 0,
+      "header_heights": 205,
+      "trade_logs": 853,
+      "excluded_foreign_logs": 292,
+      "rpc_calls": 204,
+      "rate_limited": true,
+      "duration_s": 7.457,
+      "completed_monotonic": null
+    },
+    {
+      "status": "completed",
+      "reason": "",
+      "from_block": 62283018,
+      "to_block": 62283229,
+      "new_blocks": 200,
+      "start_head": 62285800,
+      "completion_head": 62285864,
+      "recorded_events": 177,
+      "header_heights": 88,
+      "trade_logs": 383,
+      "excluded_foreign_logs": 205,
+      "rpc_calls": 94,
+      "rate_limited": false,
+      "duration_s": 8.692,
+      "completed_monotonic": 15632980.233175883
+    },
+    {
+      "status": "failed",
+      "reason": "headers_unavailable",
+      "from_block": 62283218,
+      "to_block": 62283629,
+      "new_blocks": 0,
+      "start_head": 62285889,
+      "completion_head": null,
+      "recorded_events": 0,
+      "header_heights": 261,
+      "trade_logs": 1091,
+      "excluded_foreign_logs": 179,
+      "rpc_calls": 204,
+      "rate_limited": true,
+      "duration_s": 8.316,
+      "completed_monotonic": null
+    }
+  ]
+}
+

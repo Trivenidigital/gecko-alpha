@@ -127,7 +127,6 @@ async def test_run_hourly_maintenance_prunes_volume_history_cg_when_spike_disabl
 
 
 async def test_run_hourly_maintenance_logs_info_when_rows_pruned(tmp_path):
-    """V4#4 fold: info-when-rows>0 pattern matches cryptopanic at main.py:1747."""
     settings = _make_settings(tmp_path)
     db = _make_db_mock(score_pruned=42, volume_pruned=7)
     session = MagicMock()
@@ -140,8 +139,19 @@ async def test_run_hourly_maintenance_logs_info_when_rows_pruned(tmp_path):
     assert "volume_snapshots_pruned" in info_events
 
 
-async def test_run_hourly_maintenance_silent_when_zero_rows(tmp_path):
-    """V4#4 fold: silent when rows_deleted == 0 (no info OR debug emit)."""
+async def test_run_hourly_maintenance_STILL_LOGS_when_zero_rows(tmp_path):
+    """Inverted deliberately. This test used to assert SILENCE at zero rows.
+
+    That was the V4#4 "info-when-rows>0, silent-when-zero" pattern, and it is
+    the same blind spot #547 removed from the loop-driven prunes: with it,
+    "the prune ran and deleted nothing" and "the prune never ran" write
+    byte-identical journals, so a silent stop is undetectable at the only rate
+    that could reveal it. #547 fixed the loop; these hand-written siblings kept
+    the guard, and this test was what pinned it in place.
+
+    Ruling B's retention evidence is read from the journal, so the zero case
+    must be visible.
+    """
     settings = _make_settings(tmp_path)
     db = _make_db_mock(score_pruned=0, volume_pruned=0)
     session = MagicMock()
@@ -149,13 +159,46 @@ async def test_run_hourly_maintenance_silent_when_zero_rows(tmp_path):
 
     await _run_hourly_maintenance(db, session, settings, logger)
 
-    info_events = [call.args[0] for call in logger.info.call_args_list if call.args]
-    assert "score_history_pruned" not in info_events
-    assert "volume_snapshots_pruned" not in info_events
-    # No debug call either (no level filter at startup)
-    debug_events = [call.args[0] for call in logger.debug.call_args_list if call.args]
-    assert "score_history_pruned" not in debug_events
-    assert "volume_snapshots_pruned" not in debug_events
+    calls = {
+        call.args[0]: call.kwargs
+        for call in logger.info.call_args_list
+        if call.args
+    }
+    for event in ("score_history_pruned", "volume_snapshots_pruned"):
+        assert event in calls, (
+            f"{event} was not emitted at zero rows -- 'ran and deleted nothing' "
+            "is indistinguishable from 'never ran'"
+        )
+        assert calls[event].get("rows_deleted") == 0, (
+            f"{event} must report the zero explicitly, not omit the count"
+        )
+
+
+async def test_every_hand_written_prune_reports_its_zero(tmp_path):
+    """The guard was shared by all six siblings, so the fix must be too.
+
+    #547's own lesson: the blind spot was shared across every prune that copied
+    the pattern, so verifying one of them proves nothing about the rest.
+    """
+    settings = _make_settings(tmp_path)
+    db = _make_db_mock(score_pruned=0, volume_pruned=0)
+    session = MagicMock()
+    logger = MagicMock()
+
+    await _run_hourly_maintenance(db, session, settings, logger)
+
+    emitted = {
+        call.args[0]
+        for call in logger.info.call_args_list
+        if call.args and str(call.args[0]).endswith("_pruned")
+    }
+    for event in (
+        "score_history_pruned",
+        "volume_snapshots_pruned",
+        "trade_decision_events_pruned",
+        "volume_history_cg_pruned",
+    ):
+        assert event in emitted, f"{event} still silent at zero rows"
 
 
 @pytest.mark.parametrize(

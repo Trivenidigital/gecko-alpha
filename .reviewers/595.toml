@@ -1,0 +1,8 @@
+pr = 595
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
+# Docs-only PR: no watched delta. Two independent factual-provenance and
+# runtime/silent-failure reviews approved the pre-PR working-tree revision;
+# PR reviews and exact-head CI remain separate merge gates.
+[clearances]

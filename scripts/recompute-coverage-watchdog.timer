@@ -1,0 +1,22 @@
+# §12a timer for the legacy-provenance overlay watchdog.
+#
+# Ships in the repo because the alternative is the failure this whole PR
+# exists to close, one level up: a watchdog that nothing schedules is itself
+# deploy-without-activate, and it has no liveness signal of its own.
+#
+#   install -m 0644 scripts/recompute-coverage-watchdog.{timer,service} \
+#       /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now recompute-coverage-watchdog.timer
+#   systemctl list-timers recompute-coverage-watchdog.timer   # verify it is armed
+
+[Unit]
+Description=Check the legacy chains-provenance overlay is recovering credit
+
+[Timer]
+OnCalendar=*-*-* *:37:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

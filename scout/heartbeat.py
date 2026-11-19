@@ -33,6 +33,13 @@ _heartbeat_stats: dict = {
 
 _ingest_watchdog_state: dict[str, dict] = {}
 
+# These rows use updated_at as the last completed successful poll, including
+# empty polls. Only their collectors may write them; generic per-cycle miss
+# persistence would make a stopped collector look alive after a restart.
+# rh_pons_attempt is the RH collector's per-attempt failure streak, written
+# only by the collector and read only by its watchdog.
+_POLL_ONLY_SOURCES = frozenset({"rh_pons", "rh_pons_attempt", "dex_discovery"})
+
 
 @dataclass(frozen=True)
 class IngestSourceSample:
@@ -106,6 +113,13 @@ async def hydrate_ingest_watchdog_state(db, settings) -> None:
     """
     threshold = _starvation_threshold(settings)
     persisted = await db.load_ingest_watchdog_state()
+    persisted = {
+        source: misses
+        for source, misses in persisted.items()
+        if source not in _POLL_ONLY_SOURCES
+    }
+    for source in _POLL_ONLY_SOURCES:
+        _ingest_watchdog_state.pop(source, None)
     for source, misses in persisted.items():
         _ingest_watchdog_state[source] = {
             "consecutive_empty": misses,
@@ -130,6 +144,8 @@ async def persist_ingest_watchdog_state(db) -> None:
     the same way — the row is UPSERTed to 0, never deleted.
     """
     for source, state in _ingest_watchdog_state.items():
+        if source in _POLL_ONLY_SOURCES:
+            continue
         await db.upsert_ingest_watchdog_state(source, state["consecutive_empty"])
 
 
@@ -148,7 +164,7 @@ def observe_ingest_sources(
     events: list[IngestWatchdogEvent] = []
 
     for sample in samples:
-        if not sample.expected:
+        if not sample.expected or sample.source in _POLL_ONLY_SOURCES:
             continue
 
         state = _ingest_watchdog_state.setdefault(

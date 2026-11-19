@@ -1,0 +1,12 @@
+pr = 574
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Docs-only follow-up: no watched production delta and no clearance SHA required.
+# Independent document reviews are recorded in the PR description/session.
+[clearances]

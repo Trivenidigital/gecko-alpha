@@ -7,10 +7,61 @@ on:
     branches: [master]
 
 jobs:
+  receipt-inventory-timeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prove synthetic receipt wrapper cleanup on Linux
+        run: python -m unittest discover -s tests -p test_receipt_inventory_timeout.py -v
+
+  frontend-dist-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.0'
+      - name: Install locked frontend dependencies
+        working-directory: dashboard/frontend
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify committed frontend rebuild parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          node --version
+          npm --version
+          sha256sum dashboard/frontend/package-lock.json
+          build_dir=$(mktemp -d "$RUNNER_TEMP/gecko-dist-parity.XXXXXX")
+          npm --prefix dashboard/frontend run build -- --outDir "$build_dir"
+          python scripts/check_dist_rebuild_parity.py --repo-root . --build-dir "$build_dir"
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the reviewer-clearance gate resolves SHAs that
+          # a shallow clone does not contain, and a missing commit there
+          # is indistinguishable from a revoked clearance.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -36,8 +87,24 @@ jobs:
           ANTHROPIC_API_KEY: test
 
       - name: Run tests
-        timeout-minutes: 25
-        run: uv run pytest --tb=short -q --timeout=180 --timeout-method=thread
+        # 40, not 25. The suite legitimately runs ~15-16 min on a healthy
+        # ubuntu-latest runner (13.5 / 14.3 / 15.0 / 15.3 / 15.4 / 15.5 min
+        # across the last seven green master runs) but GitHub shared runners
+        # vary by well over 60%: run 32588230863 hit the 25-minute wall with
+        # ZERO test failures, and 32519309039 timed out at 62% complete.
+        #
+        # A timeout is not a test result. Blocking a merge on runner weather
+        # trains people to re-run until it passes, which is how a real failure
+        # eventually gets re-run away too. Real failures still fail; only the
+        # infrastructure ceiling moves.
+        #
+        # --durations makes the next slowdown diagnosable from the log instead
+        # of requiring a bisect: if this budget is ever approached again, the
+        # answer should be visible rather than inferred.
+        timeout-minutes: 40
+        run: >-
+          uv run pytest --tb=short -q --timeout=180 --timeout-method=thread
+          --durations=15
         env:
           TELEGRAM_BOT_TOKEN: test
           TELEGRAM_CHAT_ID: test
@@ -56,3 +123,57 @@ jobs:
           TELEGRAM_BOT_TOKEN: test
           TELEGRAM_CHAT_ID: test
           ANTHROPIC_API_KEY: test
+
+  gecko:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v4
+      - run: uv python install 3.12
+      - run: uv sync --all-extras
+      # the functional backup-script test skips without the CLI: fail loudly instead
+      - run: sqlite3 --version
+      - run: uv run pytest tests/gecko -q --timeout=120
+      - run: uv run python scripts/gecko_loc_guard.py
+      - run: uv run python -m black --check gecko tests/gecko scripts/gecko_loc_guard.py
+
+  reviewer-clearances:
+    # Its OWN job, deliberately. As a step inside `test` a stale declaration
+    # failed the job in 13 seconds and produced zero test signal -- a
+    # clearance problem masquerading as a broken build.
+    #
+    # pull_request only: this repo squash-merges, so recorded SHAs stop being
+    # ancestors of master the moment a PR lands. The revision under review is
+    # the PR head.
+    #
+    # NOTE: with no branch protection configured on master this job cannot
+    # block a merge. It reports. See the script docstring and the runbook.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the check resolves clearance SHAs that a shallow
+          # clone does not contain, and a missing commit there is
+          # indistinguishable from a revoked clearance.
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Clearance lapse check (ruling D)
+        run: |
+          # LOAD-BEARING, do not add `|| true`. The script no longer fetches
+          # (it had no base ref to fetch for, so the call was decorative); the
+          # base ref is now an argument to `git merge-base`, so a stale or
+          # absent origin/master yields a wrong or unresolvable merge-base.
+          # This must fail the job, not be swallowed.
+          git fetch --quiet origin "${{ github.base_ref }}"
+          python scripts/check_reviewer_clearances.py             "${{ github.event.pull_request.head.sha }}"             "origin/${{ github.base_ref }}"             --pr "${{ github.event.pull_request.number }}"

@@ -13,6 +13,7 @@ while no backup exists. Round 18 adds file-evidence fields:
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -225,3 +226,80 @@ def test_health_still_counts_manual_and_legacy_backup_names(
         data = client.get("/health").json()
 
     assert data["backup_file_count"] == 3, data
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_health_ignores_sidecars_beside_a_completed_backup(
+    monkeypatch, tmp_path, _scout_db_stub, suffix
+):
+    """*** THE /health HALF OF THE 2026-08-15 INCIDENT. ***
+
+    A backup carries the live DB's WAL-mode header, so merely OPENING one makes
+    SQLite mint `-wal` and `-shm` beside it — read-only opens included. Those
+    names contain no `.partial`, so the exclusion added for the 2026-08-08
+    family never covered them.
+
+    This reader sorts by mtime and reports the newest file's age and size as THE
+    BACKUP's. A 0-byte `-wal` minted by an integrity check is always newer than
+    the backup it describes, so /health would report a fresh 0-byte backup while
+    the real newest one aged out — and the operator's dashboard would look
+    healthiest at exactly the moment it was least true.
+
+    Rotation was fixed on 2026-08-15 and the off-host shipper alongside this
+    test; this reader was the last one still counting them.
+    """
+    monkeypatch.setenv("GECKO_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("GECKO_BACKUP_HEARTBEAT_FILE", str(tmp_path / "missing1"))
+    monkeypatch.setenv(
+        "GECKO_BACKUP_CREATE_HEARTBEAT_FILE", str(tmp_path / "missing2")
+    )
+
+    real = tmp_path / "scout.db.bak.20260815T030000Z"
+    real.write_bytes(b"x" * 4096)
+    old = time.time() - 7200
+    os.utime(real, (old, old))
+
+    sidecar = tmp_path / ("scout.db.bak.20260815T030000Z" + suffix)
+    sidecar.write_bytes(b"")
+    fresh = time.time() - 30
+    os.utime(sidecar, (fresh, fresh))
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["backup_file_count"] == 1, (
+        f"a {suffix} sidecar was counted as a backup file"
+    )
+    assert data["latest_backup_size_bytes"] == 4096, (
+        f"/health reported the {suffix} sidecar's size as the backup's"
+    )
+    assert data["latest_backup_age_sec"] >= 7200, (
+        f"/health reported the {suffix} sidecar's age as the backup's, so a "
+        "week-old backup would render as minutes fresh"
+    )
+
+
+def test_health_still_counts_a_tag_containing_a_sidecar_word(
+    monkeypatch, tmp_path, _scout_db_stub
+):
+    """The exclusions anchor to the END of the name, so the supported ad-hoc-tag
+    workflow is not narrowed — same deliberate choice as rotation and the
+    shipper."""
+    monkeypatch.setenv("GECKO_BACKUP_DIR", str(tmp_path))
+    monkeypatch.setenv("GECKO_BACKUP_HEARTBEAT_FILE", str(tmp_path / "missing1"))
+    monkeypatch.setenv(
+        "GECKO_BACKUP_CREATE_HEARTBEAT_FILE", str(tmp_path / "missing2")
+    )
+
+    tagged = tmp_path / "scout.db.bak.before-wal-migration"
+    tagged.write_bytes(b"y" * 2048)
+
+    app = create_app(str(_scout_db_stub))
+    with TestClient(app) as client:
+        r = client.get("/health")
+    data = r.json()
+
+    assert data["backup_file_count"] == 1
+    assert data["latest_backup_size_bytes"] == 2048

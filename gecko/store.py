@@ -1,0 +1,563 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import aiosqlite
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tokens (
+  token_id TEXT PRIMARY KEY, chain TEXT NOT NULL, address TEXT NOT NULL,
+  symbol TEXT NOT NULL, name TEXT NOT NULL, cg_id TEXT, first_seen_at TEXT NOT NULL,
+  first_source TEXT NOT NULL, pool_created_at TEXT, deployer TEXT,
+  status TEXT NOT NULL DEFAULT 'candidate'
+    CHECK (status IN ('candidate','active','disqualified','dead')),
+  disqualify_reason TEXT, updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_tokens_address ON tokens(address);
+CREATE TABLE IF NOT EXISTS observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT NOT NULL, source TEXT NOT NULL,
+  observed_at TEXT NOT NULL, features_json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_obs_token_time ON observations(token_id, observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_time ON observations(observed_at);
+CREATE INDEX IF NOT EXISTS idx_obs_source_time ON observations(source, observed_at);
+CREATE TABLE IF NOT EXISTS source_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT, source_type TEXT NOT NULL
+    CHECK (source_type IN ('telegram','x')), source_id TEXT NOT NULL,
+  event_id TEXT NOT NULL UNIQUE, posted_at TEXT NOT NULL, text_hash TEXT NOT NULL,
+  cashtags_json TEXT NOT NULL DEFAULT '[]', addresses_json TEXT NOT NULL DEFAULT '[]',
+  resolved_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_calls_token ON source_calls(token_id, posted_at);
+CREATE INDEX IF NOT EXISTS idx_calls_source_time ON source_calls(source_id, posted_at);
+CREATE TABLE IF NOT EXISTS watchlist (
+  token_id TEXT PRIMARY KEY, entered_at TEXT NOT NULL, rule_id TEXT NOT NULL,
+  rank INTEGER NOT NULL, score REAL NOT NULL, features_at_entry_json TEXT NOT NULL,
+  last_ranked_at TEXT NOT NULL, exited_at TEXT, exit_reason TEXT, entry_price REAL);
+CREATE TABLE IF NOT EXISTS forward_returns (
+  token_id TEXT NOT NULL, horizon_days INTEGER NOT NULL, due_at TEXT NOT NULL,
+  entry_price REAL, price REAL, btc_entry REAL, btc_price REAL, ret REAL, ret_vs_btc REAL,
+  attempts INTEGER NOT NULL DEFAULT 0, measured_at TEXT, last_attempt_at TEXT,
+  PRIMARY KEY (token_id, horizon_days));
+CREATE TABLE IF NOT EXISTS research_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, token_id TEXT NOT NULL, created_at TEXT NOT NULL,
+  model TEXT NOT NULL, schema_version INTEGER NOT NULL, note_json TEXT NOT NULL,
+  cost_usd REAL NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL, started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL, ok INTEGER NOT NULL, rows_written INTEGER NOT NULL DEFAULT 0,
+  credits_used INTEGER NOT NULL DEFAULT 0, error TEXT);
+CREATE INDEX IF NOT EXISTS idx_runs_job_time ON runs(job, finished_at);
+CREATE TABLE IF NOT EXISTS kv (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+"""
+
+# Every table and index name the schema creates: a file holding anything else
+# (bar SQLite's own ``sqlite_*`` objects) is not a gecko database.
+SCHEMA_NAMES = frozenset(
+    re.findall(r"CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)", SCHEMA)
+)
+
+# Sources whose observations carry a market price (and maybe liquidity).
+MARKET_SOURCES = ("dexscreener", "geckoterminal", "coingecko")
+DEX_SOURCES = ("dexscreener", "geckoterminal")  # market sources with liquidity
+
+# Columns added after the first schema; Store.open adds them when missing.
+LATE_COLUMNS = (
+    ("watchlist", "entry_price", "REAL"),
+    ("forward_returns", "last_attempt_at", "TEXT"),
+    ("forward_returns", "closed_reason", "TEXT"),
+)
+
+TIME_COLUMN = {
+    "tokens": "updated_at",
+    "observations": "observed_at",
+    "source_calls": "posted_at",
+    "watchlist": "last_ranked_at",
+    "forward_returns": "measured_at",
+    "research_notes": "created_at",
+    "runs": "finished_at",
+}
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_utc(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def canon_ts(ts: str | None) -> str | None:
+    """Canonical UTC ``%Y-%m-%dT%H:%M:%SZ`` form of any ISO-8601 string.
+
+    Accepts a trailing ``Z``, ``+00:00`` or any other offset, and fractional
+    seconds (truncated). A naive timestamp is taken as UTC. ``None`` passes
+    through. Every stored timestamp and every comparison parameter goes
+    through this so that lexical SQL comparisons are chronological.
+    """
+    if ts is None:
+        return None
+    return parse_utc(ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso_plus(ts: str, days: int) -> str:
+    return (parse_utc(ts) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class ForeignDatabase(Exception):
+    """``Store.open`` was pointed at a SQLite file that is not a gecko database."""
+
+    def __init__(self, path: str, application_id: int):
+        super().__init__(
+            f"{path} is not a gecko database (application_id={application_id})"
+        )
+        self.path = path
+        self.application_id = application_id
+
+
+class ReturnAlreadyMeasured(ValueError):
+    """``set_return`` found no unmeasured row: missing, or already finalized."""
+
+
+@dataclass
+class Observation:
+    token_id: str
+    source: str
+    observed_at: str
+    features: dict
+
+
+@dataclass
+class WatchRow:
+    token_id: str
+    entered_at: str
+    rule_id: str
+    rank: int
+    score: float
+    features_at_entry: dict
+
+
+@dataclass
+class ReturnRow:
+    token_id: str
+    horizon_days: int
+    due_at: str
+    attempts: int
+    last_attempt_at: str | None = None
+
+
+class Store:
+    APPLICATION_ID = 0x47454B4F  # ASCII "GEKO", stamped in the file header
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self.conn = conn
+
+    @classmethod
+    async def _check_identity(cls, conn: aiosqlite.Connection, path: str) -> int:
+        """The file's ``application_id``; raise ``ForeignDatabase`` unless the
+        file is fresh or gecko's own.
+
+        Runs before any DDL or journal-mode change, so a refused file is
+        left exactly as it was found.
+        """
+        (pages,) = await (await conn.execute("PRAGMA page_count")).fetchone()
+        (app_id,) = await (await conn.execute("PRAGMA application_id")).fetchone()
+        if pages == 0 or app_id == cls.APPLICATION_ID:
+            return app_id
+        if app_id != 0:
+            raise ForeignDatabase(path, app_id)
+        rows = await (
+            await conn.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            )
+        ).fetchall()
+        if any(r[0] not in SCHEMA_NAMES for r in rows):
+            raise ForeignDatabase(path, app_id)
+        return app_id
+
+    @classmethod
+    async def open(cls, path: str) -> "Store":
+        conn = await aiosqlite.connect(path)
+        try:
+            # busy_timeout first: switching to WAL itself needs the lock.
+            await conn.execute("PRAGMA busy_timeout=30000")
+            if await cls._check_identity(conn, path) != cls.APPLICATION_ID:
+                await conn.execute(f"PRAGMA application_id={cls.APPLICATION_ID}")
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            await conn.executescript(SCHEMA)
+            for table, col, decl in LATE_COLUMNS:
+                info = await (
+                    await conn.execute(f"PRAGMA table_info({table})")
+                ).fetchall()
+                if col in {r[1] for r in info}:
+                    continue
+                try:  # databases created before the column existed
+                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise  # a concurrent opener added it first: fine; else real
+            await conn.commit()
+        except BaseException:
+            await conn.close()
+            raise
+        return cls(conn)
+
+    async def close(self) -> None:
+        await self.conn.close()
+
+    async def upsert_token(
+        self,
+        token_id,
+        chain,
+        address,
+        symbol,
+        name,
+        first_seen_at,
+        first_source,
+        cg_id=None,
+        pool_created_at=None,
+    ) -> None:
+        await self.conn.execute(
+            "INSERT INTO tokens(token_id,chain,address,symbol,name,cg_id,first_seen_at,"
+            "first_source,pool_created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(token_id) DO UPDATE SET "
+            "cg_id=COALESCE(tokens.cg_id, excluded.cg_id), "
+            # Earliest pool wins; canonical strings, so MIN is chronological.
+            "pool_created_at=MIN(COALESCE(tokens.pool_created_at, excluded.pool_created_at),"
+            " COALESCE(excluded.pool_created_at, tokens.pool_created_at)), "
+            "updated_at=excluded.updated_at",
+            (
+                token_id,
+                chain,
+                address,
+                symbol,
+                name,
+                cg_id,
+                canon_ts(first_seen_at),
+                first_source,
+                canon_ts(pool_created_at),
+                utcnow(),
+            ),
+        )
+        await self.conn.commit()
+
+    async def revive_candidate(self, token_id, now) -> bool:
+        """An aged-out candidate seen in band again restarts as a fresh candidate."""
+        cur = await self.conn.execute(
+            "UPDATE tokens SET status='candidate', disqualify_reason=NULL, "
+            "first_seen_at=?, updated_at=? WHERE token_id=? AND status='disqualified' "
+            "AND disqualify_reason='stale_candidate'",
+            (canon_ts(now), utcnow(), token_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def set_token_status(self, token_id, status, reason=None) -> None:
+        await self.conn.execute(
+            "UPDATE tokens SET status=?, disqualify_reason=?, updated_at=? WHERE token_id=?",
+            (status, reason, utcnow(), token_id),
+        )
+        await self.conn.commit()
+
+    async def demote_if_active(self, token_id, reason) -> bool:
+        """Back to candidate only while still active: a verdict another job
+        committed since the caller's read is never overwritten."""
+        cur = await self.conn.execute(
+            "UPDATE tokens SET status='candidate', disqualify_reason=?, updated_at=? "
+            "WHERE token_id=? AND status='active'",
+            (reason, utcnow(), token_id),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def set_deployer(self, token_id, deployer) -> None:
+        """Record a token's deployer; the first value recorded is kept."""
+        await self.conn.execute(
+            "UPDATE tokens SET deployer=COALESCE(deployer, ?), updated_at=? WHERE token_id=?",
+            (deployer, utcnow(), token_id),
+        )
+        await self.conn.commit()
+
+    async def add_observation(
+        self, token_id, source, observed_at, features: dict
+    ) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO observations(token_id,source,observed_at,features_json) VALUES(?,?,?,?)",
+            (
+                token_id,
+                source,
+                canon_ts(observed_at),
+                json.dumps(features, sort_keys=True),
+            ),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def observations(
+        self, token_id, *, as_of: str, source: str | None = None, limit: int = 500
+    ) -> list[Observation]:
+        sql = (
+            "SELECT token_id,source,observed_at,features_json FROM observations "
+            "WHERE token_id=? AND observed_at<=?"
+        )
+        args: list = [token_id, canon_ts(as_of)]
+        if source is not None:
+            sql += " AND source=?"
+            args.append(source)
+        sql += " ORDER BY observed_at DESC, id DESC LIMIT ?"  # ties: later write first
+        args.append(limit)
+        rows = await (await self.conn.execute(sql, args)).fetchall()
+        return [Observation(r[0], r[1], r[2], json.loads(r[3])) for r in rows]
+
+    async def record_run(
+        self,
+        job,
+        started_at,
+        finished_at,
+        ok,
+        rows_written=0,
+        credits_used=0,
+        error=None,
+    ) -> int:
+        cur = await self.conn.execute(
+            "INSERT INTO runs(job,started_at,finished_at,ok,rows_written,credits_used,error) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                job,
+                canon_ts(started_at),
+                canon_ts(finished_at),
+                1 if ok else 0,
+                rows_written,
+                credits_used,
+                error,
+            ),
+        )
+        await self.conn.commit()
+        return cur.lastrowid
+
+    async def last_write(self, table: str) -> str | None:
+        col = TIME_COLUMN[table]
+        row = await (
+            await self.conn.execute(f"SELECT MAX({col}) FROM {table}")
+        ).fetchone()
+        return row[0]
+
+    async def kv_get(self, key: str) -> str | None:
+        row = await (
+            await self.conn.execute("SELECT value FROM kv WHERE key=?", (key,))
+        ).fetchone()
+        return row[0] if row else None
+
+    async def kv_set(self, key: str, value: str, now: str) -> None:
+        await self.conn.execute(
+            "INSERT INTO kv(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) "
+            "DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, canon_ts(now)),
+        )
+        await self.conn.commit()
+
+    async def watchlist_upsert(
+        self, token_id, entered_at, rule_id, rank, score, features_at_entry: dict
+    ) -> None:
+        entered_at = canon_ts(entered_at)
+        await self.conn.execute(
+            "INSERT INTO watchlist(token_id,entered_at,rule_id,rank,score,"
+            "features_at_entry_json,last_ranked_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(token_id) DO UPDATE SET rank=excluded.rank, score=excluded.score, "
+            "last_ranked_at=excluded.last_ranked_at",
+            (
+                token_id,
+                entered_at,
+                rule_id,
+                rank,
+                score,
+                json.dumps(features_at_entry, sort_keys=True),
+                entered_at,
+            ),
+        )
+        await self.conn.commit()
+
+    async def set_entry_price(self, token_id, price: float) -> None:
+        """Freeze a watchlist entry's price; a stored one is never replaced."""
+        await self.conn.execute(
+            "UPDATE watchlist SET entry_price=? WHERE token_id=? AND entry_price IS NULL",
+            (price, token_id),
+        )
+        await self.conn.commit()
+
+    async def watchlist_exit(self, token_id, exited_at, reason) -> None:
+        await self.conn.execute(
+            "UPDATE watchlist SET exited_at=?, exit_reason=? WHERE token_id=? AND exited_at IS NULL",
+            (canon_ts(exited_at), reason, token_id),
+        )
+        await self.conn.commit()
+
+    async def active_watchlist(self) -> list[WatchRow]:
+        rows = await (
+            await self.conn.execute(
+                "SELECT token_id,entered_at,rule_id,rank,score,features_at_entry_json "
+                "FROM watchlist WHERE exited_at IS NULL ORDER BY rank"
+            )
+        ).fetchall()
+        return [WatchRow(r[0], r[1], r[2], r[3], r[4], json.loads(r[5])) for r in rows]
+
+    async def repair_schedules(self, horizons=(1, 7, 30, 90, 180)) -> int:
+        """Schedule any missing horizon of every watchlist entry, exited ones
+        included, at its stored ``entered_at``. Returns rows inserted.
+
+        Table-driven, so a crash between a watchlist write and its scheduling
+        is repaired whatever has happened to the entry since.
+        """
+        rows = await (
+            await self.conn.execute("SELECT token_id, entered_at FROM watchlist")
+        ).fetchall()
+        before = self.conn.total_changes
+        await self.conn.executemany(
+            "INSERT OR IGNORE INTO forward_returns(token_id,horizon_days,due_at) "
+            "VALUES(?,?,?)",
+            [(tid, h, iso_plus(at, h)) for tid, at in rows for h in horizons],
+        )
+        await self.conn.commit()
+        return self.conn.total_changes - before
+
+    async def due_returns(self, now: str) -> list[ReturnRow]:
+        rows = await (
+            await self.conn.execute(
+                "SELECT token_id,horizon_days,due_at,attempts,last_attempt_at FROM forward_returns "
+                "WHERE measured_at IS NULL AND due_at<=? ORDER BY due_at, horizon_days",
+                (canon_ts(now),),
+            )
+        ).fetchall()
+        return [ReturnRow(*r) for r in rows]
+
+    async def set_return(
+        self,
+        token_id,
+        horizon_days,
+        entry_price,
+        price,
+        btc_entry,
+        btc_price,
+        measured_at,
+    ) -> None:
+        """Finalize one forward-return row. Write-once.
+
+        Raises ``ValueError`` when ``price``, ``btc_entry`` or ``btc_price`` is
+        missing (a ``btc_entry`` of 0 counts as missing): the measurement is
+        retryable later, so the row must stay unmeasured. A missing or zero
+        ``entry_price`` is allowed and finalizes the row with ``ret`` and
+        ``ret_vs_btc`` NULL, because an entry price that never existed cannot
+        appear later. Raises ``ReturnAlreadyMeasured`` (a ``ValueError``) if
+        the row does not exist or was already measured.
+        """
+        if price is None or btc_entry is None or btc_price is None:
+            raise ValueError(
+                f"set_return {token_id} h={horizon_days}: "
+                "price/btc_entry/btc_price required"
+            )
+        if btc_entry == 0:
+            raise ValueError(f"set_return {token_id} h={horizon_days}: btc_entry is 0")
+        if entry_price:
+            ret = price / entry_price - 1.0
+            ret_vs_btc = ret - (btc_price / btc_entry - 1.0)
+        else:
+            ret = None
+            ret_vs_btc = None
+        cur = await self.conn.execute(
+            "UPDATE forward_returns SET entry_price=?,price=?,btc_entry=?,btc_price=?,ret=?,"
+            "ret_vs_btc=?,measured_at=? WHERE token_id=? AND horizon_days=? "
+            "AND measured_at IS NULL",
+            (
+                entry_price,
+                price,
+                btc_entry,
+                btc_price,
+                ret,
+                ret_vs_btc,
+                canon_ts(measured_at),
+                token_id,
+                horizon_days,
+            ),
+        )
+        if cur.rowcount == 0:
+            # No open write transaction may outlive the refusal on a shared conn.
+            await self.conn.rollback()
+            raise ReturnAlreadyMeasured(
+                f"set_return {token_id} h={horizon_days}: row missing or already measured"
+            )
+        await self.conn.commit()
+
+    async def close_unmeasured(
+        self, token_id, horizon_days, measured_at, reason: str
+    ) -> bool:
+        """Finalize an open row with no return (ret NULL), recording why in
+        ``closed_reason``. Write-once."""
+        cur = await self.conn.execute(
+            "UPDATE forward_returns SET measured_at=?, closed_reason=? "
+            "WHERE token_id=? AND horizon_days=? AND measured_at IS NULL",
+            (canon_ts(measured_at), reason, token_id, horizon_days),
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def expired_count(self, since: str) -> int:
+        """Rows closed as ``expired`` at or after ``since``."""
+        row = await (
+            await self.conn.execute(
+                "SELECT COUNT(*) FROM forward_returns "
+                "WHERE closed_reason='expired' AND measured_at>=?",
+                (canon_ts(since),),
+            )
+        ).fetchone()
+        return row[0]
+
+    async def overdue_count(self, now: str, hours: float) -> int:
+        """Open rows whose ``due_at`` is more than ``hours`` before ``now``."""
+        cutoff = canon_ts((parse_utc(now) - timedelta(hours=hours)).isoformat())
+        row = await (
+            await self.conn.execute(
+                "SELECT COUNT(*) FROM forward_returns "
+                "WHERE measured_at IS NULL AND due_at<?",
+                (cutoff,),
+            )
+        ).fetchone()
+        return row[0]
+
+    async def bump_return_attempt(
+        self,
+        token_id,
+        horizon_days,
+        *,
+        attempted_at: str | None = None,
+        min_gap_hours: float = 20,
+    ) -> int | None:
+        """Spend one attempt, unless one was spent within ``min_gap_hours``.
+
+        The gap is enforced in the UPDATE itself, so two overlapping runs that
+        both passed an in-memory check still spend only one. Returns the new
+        attempt count, or None when gated.
+        """
+        at = canon_ts(attempted_at) or utcnow()
+        floor = canon_ts((parse_utc(at) - timedelta(hours=min_gap_hours)).isoformat())
+        cur = await self.conn.execute(
+            "UPDATE forward_returns SET attempts=attempts+1, last_attempt_at=? "
+            "WHERE token_id=? AND horizon_days=? "
+            "AND (last_attempt_at IS NULL OR last_attempt_at<=?)",
+            (at, token_id, horizon_days, floor),
+        )
+        await self.conn.commit()
+        if cur.rowcount == 0:
+            return None
+        row = await (
+            await self.conn.execute(
+                "SELECT attempts FROM forward_returns WHERE token_id=? AND horizon_days=?",
+                (token_id, horizon_days),
+            )
+        ).fetchone()
+        return row[0]

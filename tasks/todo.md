@@ -1,4 +1,276 @@
+## Active Work: 2026-10-02 09:24 UTC — Overnight autonomous closeout no-build verification
+
+**Plan (evidence-only):**
+
+- [x] Refresh the source baseline to `origin/master` before this plan edit and
+  verify the prior reconciliation PR's merge and exact reviewed head.
+- [x] Run a bounded, read-only production check of reported revision, service
+  state, timer invocation, and worker main-process evidence.
+- [x] Obtain two orthogonal reviews of the proposed no-build disposition and
+  fold the merge-versus-reviewed-head, pre-edit-cleanliness, and runtime-SHA
+  provenance corrections.
+- [x] Write a durable closeout report that distinguishes complete PR #594,
+  worker pre-start failure, operator-only gates, and parked work; focused
+  status-reporter tests and syntax checks pass.
+- [ ] Commit and publish the docs-only closeout after final PR review. No deploy,
+  database/config/account mutation, vendor call, policy change, or trading
+  action is in scope.
+
+**Current evidence:** PR #594 merged into `origin/master` at `f5b2154a`; its
+reviewed head `9390a6ec` has all four checks green. At 2026-10-02T09:24:43Z,
+production reported revision `7775189` as unit-status evidence only, not a
+source-content attestation; pipeline/dashboard/Hermes gateway and the worker
+timer are active.
+`codex-autonomous-dev-srilu.timer` invoked
+`codex-autonomous-dev-srilu.service` at 07:33:34Z, whose
+`ExecStartPre` auth guard exited 21 before `ExecStart` began. This is an
+operator account gate, not an autonomous-run completion or a safe trigger for
+a new product child.
+
+---
+
+## Completed Work: 2026-10-02 05:20 UTC — Overnight autonomous closeout reconciliation
+
+**Scope:** evidence-only reconciliation of the current closeout queue. No
+receipt collection, production deployment, DB/config/account mutation, vendor
+call, signal-policy change, or trading action.
+
+**Hermes-first analysis:** drift-check first found the existing Hermes/Codex
+operating model, six requested reusable session templates (plus a closeout
+report template), local status reporter, and
+read-only cockpit/trust surfaces. Existing orchestration remains the intended
+Hermes role; no additional Hermes dependency or custom orchestration primitive
+is justified for this reconciliation.
+
+- [x] Refresh `origin/master` (`5281f047`), create an isolated branch, read
+  automation memory, instructions, lessons, backlog snapshot, and current queue.
+- [x] Verify runtime state read-only at 2026-10-02T05:19:57Z: pipeline,
+  dashboard, Hermes gateway, and timer active; its recorded trigger is
+  2026-10-02T01:24:20Z and worker service is failed with no main-process start
+  timestamp. This is scheduler/unit state, not completion evidence. The raw
+  production `git status --porcelain` count is 11; do not infer entry type or
+  use that checkout as source/revision proof.
+- [x] Get two independent plan reviews covering stale-state evidence and
+  operational scope; fold required corrections before changing records.
+- [x] Reclassify the stale PR592 CI/merge and four-Linux-synthetic-mutation-proof
+  portions after separate merge and exact-head check-run evidence; retain the
+  separate no-production-collection gate. Record remaining worker/account and
+  future named non-production target gates without inventing a new child scope.
+- [x] Two independent final reviews, durable SHA/vector/fold record, focused
+  documentation verification, exact-head CI and clearance completed; PR #594
+  merged at `f5b2154a` on 2026-10-02T08:26:18Z.
+
+**Review record:** `tasks/review_overnight_closeout_reconciliation_2026_10_02.md`
+is the durable review/fold record. It distinguishes pre-amend findings from
+final approvals and records each reviewed SHA and attack vector.
+
+## Active Work: 2026-09-16 18:37 UTC — Receipt reducer/META design
+
+- [x] Verify PR591 exact-head retry and retained independent approvals; merge363b9614.
+- [x] Configured Claude drafts separate design; preserve32842337.
+- [x] Two parallel design reviews completed; both request correctness and filesystem-test folds.
+- [x] Configured author folds; both reviewers approve fa032eea design and bounded schema amendment.
+- [x] Implementation and local adversarial validation; both PR reviewers APPROVE08063e64 after folds.
+- [x] PR592 merged (`5281f047`, 2026-09-16); its exact-head `test` check for
+  `65d93065` succeeded at 19:43:55Z (run `35140345937`). Its four synthetic
+  Linux mutation proofs completed in that exact-head CI; this does not
+  authorize production receipt collection.
+- Review: tasks/review_receipt_reducer_meta_design_2026_09_16.md.
+- Production collection remains outside this local/synthetic slice.
+
+## Active Work: 2026-09-16 16:35 UTC — Receipt reducer/META, local and synthetic only
+
+- [x] Refresh master f5bc54ba (PR590 merged, Linux cleanup tests green); read AGENTS/CLAUDE/lessons/queue, receipt inventory plan/design/findings, cleanup design revision 7, handoff assessment.
+- [x] Drift check: no reducer/META/journal script exists; 13 allowlisted events still present; two extra `ledger_record_failed` sites in scout/trading/engine.py noted; supervisor caps read from source.
+- [x] Plan written: tasks/plan_receipt_reducer_meta_2026_09_16.md (files, tests, gates, rollback, integration prerequisites, eight open decisions).
+- [x] Two independent parallel plan reviews; all folds approved at ddb185b6.
+- [ ] Separate design; two independent parallel design reviews; settle the eight decisions.
+- [ ] Implement reducer, META and three test modules; Windows local gate; Linux full-suite CI on exact head.
+- [ ] New PR; two PR reviews; mutation checklist; four-vector clearances in a new .reviewers file.
+- Passing every gate does NOT authorize collection. No production command, host write, transport, deploy, SSH, DB, config, account, policy or vendor action in this slice.
+## Active Work: 2026-09-16 — Receipt cleanup implementation, findings folded
+
+- [x] Refresh origin/master b5daecfc and current PR590; retain approved plan and combined revision7 design.
+- [x] Configured Claude author drafted supervisor, fault runner and expanded 29-case harness; preserved candidate 9db77514 on draft PR590.
+- [x] Two independent implementation reviews completed on 9db77514: both REQUEST CHANGES; four code findings and one deadline design residual recorded.
+- [x] Linux CI on 9db77514: 29-case job passed; full suite 1 failure (round8 subprocess lint rejects Popen without a timeout kwarg Popen cannot take), 8151 passed, 14 skipped.
+- [x] Post-reset author run: all five findings folded (anchored raw-path cleanup, closed_reader close-before-release, bounded worker output, single report attempt, absolute deadlines in enumeration and per-child loops); lint corrected at the blocking point with unit tests; design consolidated to revision7 with section 11 clarifications; cross-platform contract tests added. Windows: 42 passed, 29 skipped; diff check clean. Subsequently pushed to PR590.
+- [x] Review of c72e6e55: structural/concurrency APPROVE; ops REQUEST CHANGES on two reproduced residuals (clipped diagnostic prefixing the WORKER line; lint missing `with Popen` exit and annotated bindings). Both folded with exact discriminating tests; Windows: 48 passed, 29 skipped.
+- [x] Structural re-review of e99e121d: one P2 (line_open derived from the intended buffer, not relay completion) folded with a simulated partial-relay regression; ownership review intact.
+- [x] Push reviewed implementation and clearance evidence to existing draft PR590.
+- [ ] Final-head Linux 29-case job and full suite green in GitHub CI (no local Linux available).
+- [x] Both independent reviewers terminal APPROVE on9fa1f4ce; all findings folded; four-vector clearances recorded.
+- [ ] Reducer/META and fresh runtime preflight remain later gates; no production collection or deployment.
+
+Windows skips are not cleanup proof. Independent code-review clearances are recorded; final-head CI remains separate. See tasks/review_receipt_cleanup_replacement_2026_09_16.md for this run's evidence.
+## Active Work: 2026-09-16 08:30 UTC — Receipt cleanup replacement design
+
+- [x] Refresh current master, canonical memory, backlog and current draft PR590.
+- [x] Configured author returned revision4; two parallel design reviews completed.
+- [x] Fold scan completeness, recovery budgets, event records and deterministic faults; revision7 received two design approvals at0e632d9c.
+- [ ] Build only after design approval; retain Linux falsifiers, two PR reviews and final-head green CI.
+- Existing approved plan retained. No production re-attestation or implementation clearance.
+- Review: tasks/review_receipt_cleanup_replacement_2026_09_16.md.
+## Historical: 2026-09-16 — Receipt cleanup replacement (superseded by revision7 above)
+
+- [x] Refresh origin/master; current backlog, lessons, PR590 and failure evidence checked.
+- [x] Claude authored replacement plan; two parallel reviews returned required folds.
+- [x] Fold identity/oracle, shared budget, output/status and falsifier findings.
+- [x] Both plan_logic and plan_ops approve amended plan e2790e8d; no residual plan blockers.
+- [x] Separate design and three paired review rounds; folds retained. Design6eb94b4f NOT APPROVED.
+- [ ] Build, focused Linux falsifiers, update draft PR590, two PR reviews/folds.
+- [ ] Final-head CI and clearance gate; no production collection or deployment.
+
+Historical review state: tasks/review_receipt_cleanup_replacement_2026_09_16.md. Parent fallback/publication findings below were superseded by the revision7 approvals above; implementation and Linux verification remain outstanding. Initial plan031a943f was not approved. The amended plan specifies proof
+obligations; it does not establish a safe cleanup algorithm. Prior raw wrapper
+remains unsafe. Plan: tasks/plan_receipt_cleanup_replacement_2026_09_16.md.
+## Active Work: 2026-09-16 — Receipt timeout CI validation
+
+- [x] Fresh master, drift/Hermes checks and identity-only production preflight.
+- [x] Plan and design: two parallel reviews at each gate.
+- [x] Synthetic Linux cleanup harness, draft PR590, two initial PR reviews and two final findings reviews at95bc8efd.
+- [ ] Cleanup gate FAILED in Linux CI: TERM-resistant producer/descendant remained; do not collect production receipts with this wrapper.
+- Plan: tasks/plan_receipt_timeout_ci_2026_09_16.md.
+- Scope: test-only prerequisite; no receipt collection or deployment.
+
+## Active Work: 2026-09-14 — Bounded suppression receipt inventory
+
+- [x] Refresh master, canonical memory/backlog/source drift and initial production identity.
+- [x] Plan 8836b14a: independent evidence and ops reviews approved.
+- [x] Design and two reviews; required cleanup/parsing folds approved d8625be4.
+- [ ] Runtime inventory blocked: healthy non-production Linux cleanup-test runner required; reducer not built or executed.
+- [x] Findings PR589 and two PR reviews approved 90dd5f7d; source/diff verification complete.
+- [ ] Final-head CI/merge gate; no deployment. Review: tasks/review_suppression_receipt_inventory_2026_09_14.md.
+- Plan: tasks/plan_suppression_receipt_inventory_2026_09_14.md.
+## Active Work: 2026-09-14 — Suppression trust evidence contract
+
+- [x] Refresh master, drift/Hermes checks and schema/source-only production preflight.
+- [x] Plan and two reviews; design and two reviews; folds verified.
+- [x] Published docs contract as PR #588; both final PR reviews approved 5fb149b1 after folds.
+- [ ] Final-head CI/merge gate; no deployment. Review: tasks/review_suppression_trust_evidence_contract_2026_09_14.md.
+- Plan: tasks/plan_suppression_trust_evidence_contract_2026_09_14.md.
+
+## Active Work: 2026-09-14 — DASH-11 provenance readiness
+
+- [x] Current-master drift and initial production read-only check.
+- [x] Plan/design: two parallel reviewers each; folds applied.
+- [x] Pinned audit, findings PR #579 and two-vector PR review; factual folds applied.
+- [ ] CI/merge gate for #579; no deployment. Health-only UI merged in #585; current_closeout_queue_2026_09_14.md separately records the verified 77751890 deployment. This historical audit does not re-attest runtime or establish provenance and monetary interpretations.
+- Plan: tasks/plan_dash11_provenance_2026_09_14.md.
+
+## Overnight closeout recovery — 2026-09-14
+
+- [x] Recover failed owner, refresh clean master and verify first retained work-loop artifact.
+- [x] Merge PR585 after exact CI and two independent recovery reviews.
+- [x] Review successor plan/design and two-file UI amendment before assembly.
+- [x] Merge PR586 release tools after two PR reviews and8080 tests/118 contracts.
+- [x] Verify exact source, Linux build/render/regressions, copy initializer/content, and pinned rollout helper.
+- [x] Deploy77751890 dashboard only at13:14:10Z; full smokes/invariants passed, pipeline unchanged, rollback unused.
+- [x] Complete bounded producer/retention/price-provenance audit and reconcile the tracked closeout queue.
+- [x] Prepare final findings/queue and retained deployment evidence for independent review; PR records track review, CI and merge status.
+
+Review evidence: tasks/closeout_recovery_2026_09_14.md. Worker OAuth remains
+operator-gated; no trading, policy, paid-vendor or account changes were made.
+
+## DASH-11 suppression cohort health — 2026-09-14
+
+- [x] Fresh-master isolated worktree and drift/Hermes checks; plan_suppression_cohort_health_2026_09_14.md written.
+- [x] Root structural and ops provenance plan approvals; pinned read-only runtime snapshot2026-09-14T02:46:47Z completed.
+- [x] Design and both resource amendments received two independent approvals before each build slice.
+- [x] Final14d scope approved; exact three private-copy trials2.047/0.444/0.388s pass predeclared4s gate and full parity.85focused tests and React/browser fixture QA pass.
+- [x] PR585 original and renewed integration661020e8 received two independent approvals; four-vector clearances recorded.100combined tests and84-module/3-file build parity pass.
+
+- [x] PR585 exact f64bf7c2 CI passed (8055 tests,14 skipped,118 contracts); two recovery reviews passed and merged829d12b1 at2026-09-14T12:32:18Z. Successor deployment remains separately verified.
+
+## DASH-12 full frontend rebuild parity — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift and Hermes-first checks; plan only written.
+- [x] Existing asset-existence baseline: 3 tests passed; no fresh build or CI edits.
+- [x] Two independent plan reviewers approved ab2a4aac with no required folds.
+- [x] Separate design written; no comparator/workflow/build changes yet.
+- [x] Design23b0dd7e approved by two independent reviewers, no folds; build authorized.
+- [x] Comparator/workflow implementation608f73d8; Linux two-build parity and real stale-source falsifier pass;21 focused Linux tests pass.
+- [x] PR582: ops CI/reproducibility and postmortem structural/comparator reviewers independently approved fe034d3c, no folds; clearances recorded.
+- [x] PR582 final CI passed (8003 tests,12 skipped,118 contracts); merged2b084e27 at2026-09-14T02:53:28Z. CI-only change; no runtime deployment required.
+- Plan: tasks/plan_dist_rebuild_parity_2026_09_14.md.
+
+## Telegram recorded-outcome visibility — 2026-09-13
+
+- [x] Drift/runtime verified on fresh d5b26ff base; plan written.
+- [x] Two plan reviews, design and two design reviews.
+- [x] Read-only build and102focused tests; PR578 and two independent PR approvals at21886e79.
+- [x] PR578 merged as f55271fc at 2026-09-14T01:03:20Z after 7964 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
+
+## Active Work: 2026-09-13 22:15 - Historical entry-stop display
+
+- [x] Current-base drift and production read-only schema/state preflight.
+- [x] Plan/design two-agent reviews, build, tests and PR575 two-vector reviews.
+- [x] Exact-head CI: 7808 passed/12 skipped, 118 contracts; PR575 merged as d5b26ff791ff64dac65d77d2a10a841df1c34007 at 2026-09-13T23:05:55Z. Not deployed; selective release validation remains separate from capture/migration rollout.
+- Plan: tasks/plan_stop_shortfall_surface_2026_09_13.md.
+
+## Findings closeout: 2026-09-13 — autonomous product readiness
+
+**Status:** HISTORICAL FINDINGS — the 19:21 UTC DASH-11 denominator mismatch was corrected by PR #571; PR #573 records deployment evidence. Next engineering gate: residual DASH-11 read-only dashboard/API integration, with fresh runtime verification of producer coverage, retention and price provenance. Do not rebuild the analyzer correction. Report: tasks/findings_autonomous_product_readiness_2026_09_13.md. Plan: tasks/plan_autonomous_product_readiness_2026_09_13.md.
+- [x] Refresh current master; inspect backlog drift and read-only runtime.
+- [x] Plan/design: two parallel reviews each approved, evidence-precision folds applied.
+- [x] Findings PR #570 opened: source + runtime evidence, next product gate, two PR reviews approved with citation/checklist folds. CI/final-head confirmation tracked in session report.
 # Backlog — gecko-alpha
+
+## RH/Pons implementation follow-through — 2026-09-13
+
+- [x] Integrate original increment on clean production/master base.
+- [x] Repair checkpoints, curve-emitter coverage, canonical recovery and clocks.
+- [x] Correct chain-qualified latency evidence and successful-scan monitoring.
+- [x] Verify public V2 deployment and replay real launch/buy/sell logs.
+- [x] Establish direct Claude CLI collaboration and cross-review.
+- [x] Run isolated live RPC capture and injected failure check.
+- [x] Complete throughput followup and final review; Linux CI passed at 4da32b77.
+- [x] Publish reviewed PR #572 and acceptance evidence.
+
+Results and remaining activation boundaries:
+`tasks/report_rh_pons_readiness_20260913.md`. This supersedes the review-only
+status below; it does not authorize or claim live trading.
+
+## Codex / Claude coordination review — 2026-09-13
+
+- [x] Read operator handoff; fetch exact reviewed tip b8843487.
+- [x] Isolate review on feat/claude-review-20260913; preserve main checkout changes.
+- [x] Discover authenticated Claude Code CLI and request a read-only second review.
+- [x] Reproduce focused test results and investigate uncovered collection/evidence defects.
+- [x] Reconcile Claude feedback and independent durable-evidence review.
+- [x] Record findings, verification limits, and reusable direct-coordination procedure.
+
+Scope: review and coordination only. No deployment, live activation, or funding.
+No new product primitives are proposed by this review; Hermes ecosystem analysis
+does not apply to inspecting existing code and using the installed CLI.
+
+Review result: 24 focused tests pass; five concrete findings recorded in
+`tasks/review_claude_rh_pons_2026_09_13.md`. Direct CLI request and same-session
+follow-up both succeeded. Product fixes and live readiness remain outstanding.
+
+## Completed Work: 2026-09-13 - Autonomous closeout evidence boundaries
+
+- [x] Fresh origin/master drift audit in isolated branch; templates, role map,
+  cockpit and Signal Trust V1 already exist.
+- [x] Read-only production service/revision and endpoint checks; external Codex
+  configuration found; no matching closeout job in inspected Hermes job store.
+- [x] Two parallel plan reviews, then two parallel design reviews approved;
+  folds recorded in `tasks/design_overnight_closeout_2026_09_13.md`.
+- [x] Reporter regression reproduced before bounded wording/doc correction.
+- [x] Recovered successor tracker; runtime findings advanced DASH-09/11.
+- [x] Suppression report population mismatch corrected after two parallel plan
+  and two parallel design reviews; 21 focused tests pass, cost identical in
+  shared production read-only snapshot. No deployment or sends.
+- [x] Focused verification and PR #571; both independent PR reviewers approved
+  candidate `218a295e` across all four clearance vectors, no remaining folds.
+- [x] Exact-head CI: 7,625 passed/12 skipped; PR #571 merged as d2f0d61e.
+- [x] Production scripts/docs refresh and no-send smokes passed at 19:55Z;
+  final report and automation memory recorded. Remaining UI work stays open.
+
+Scope and review evidence: `tasks/plan_overnight_closeout_2026_09_13.md` and
+`tasks/closeout_report_overnight_2026_09_13.md`. No policy, runtime configuration,
+DB, vendor, or execution mutation. Successor tracker recovered from the main
+checkout as untracked dated evidence; historical parents are not rebuilt.
 
 ## Completed Work: 2026-06-22 - Overnight autonomous closeout reporter refresh
 
@@ -2331,3 +2603,163 @@ dormant), BL-NEW-SOURCE-CALL-PRICE-COVERAGE-SAMPLE-CG-PRO (MED, operator vendor 
 BL-NEW-CG-DEMO-API-KEY (MED, operator action, runbook ready), BL-NEW-DEPLOY-FILEMODE-CRLF-HYGIENE
 (LOW-MED), plus the low-priority tail enumerated in backlog.md. See backlog.md for full
 evidence and the SUPERSEDED→new-ID mapping.
+
+## Closeout follow-through: 2026-09-13 21:14 UTC
+
+Docs-only scope; detailed findings and verification in
+`tasks/closeout_followthrough_2026_09_13_2114.md`.
+
+- [x] Refresh clean isolated branch to origin/master 6dd4327b; read prior run
+  memory, current reconciliation, local AGENTS.md and lessons.
+- [x] Verify earlier automation turns completed; identify current PR572/capture
+  owner before any shared PR or production action.
+- [x] Trace alert destinations through send helpers and correct three registry
+  rows; document overlap preflight without claiming an implemented lock.
+- [x] Focused registry coverage: 2 passed; diff whitespace check passed.
+- [ ] Two independent PR reviews, folds, exact-head CI and conditional merge.
+
+Review: no code/runtime changes; centralized routing, stop history and postmortem
+UI stay open. Avoid rebuilding shipped templates/cockpit/Signal Trust parents.
+
+## Historical postmortem viewer: 2026-09-13
+
+- [x] Isolated branch feat/postmortem-history-20260913; drift and Hermes checks.
+- [x] Two plan reviews and folds; two design reviews and folds (final e7b5cc28).
+- [x] Bounded read-only historical list API and Performance tab; 142 focused/API/navigation/stop tests and frontend build passed. Independent synthetic component visual QA passed.
+- [x] PR577 and two independent final reviews approved exact 2cb1d4f9; per-app DB isolation regression fixed and reviewed.
+- [x] PR577 merged as 7cbd82dd at 2026-09-14T00:42:14Z after 7945 tests/12 skipped and 118 contracts. Not deployed; selective release validation remains separate.
+
+Review: list-only scope; no capture/writer/schema/dispatch change or deployment.
+See tasks/plan_postmortem_history_2026_09_13.md.
+
+## 2026-09-13 — Sustained RH/Pons capture integration
+
+- [x] Coordinate implementation and independent reviews through Claude Max; preserve the original checkout.
+- [x] Implement dedicated capture, bounded DB queries, strict header batches and paced requests.
+- [x] Fix shared-connection interference; test cancellation and replay.
+- [x] Fix attempt freshness, probe verdicts, watchdog arguments and reason-aware cooldown.
+- [x] Native affected tests verified; nine Linux-specific watchdog failures reproduced on unchanged Windows baseline.
+- [x] Mutation round 3: 28 caught, one documented equivalent, no unresolved result; two cooldown mutations caught; files restored.
+- [ ] Final independent clearances and exact-head Linux CI.
+- [ ] Production capacity assessment on a suitable provider; public smoke failed and further load is paused.
+
+Review evidence and residuals: `tasks/report_rh_pons_sustained_capture_20260913.md`
+and `investigation/rh_capture_provider_evidence_20260913.md`. Collector and
+watchdog remain off; captured discoveries remain execution-ineligible.
+
+## 2026-09-14 — Authenticated RH capacity-probe readiness
+
+**New primitives introduced:** NONE; extend the existing investigation CLI only.
+
+### Hermes-first analysis
+
+| Domain | Hermes skill found? | Decision |
+|---|---|---|
+| Explicit secret input to existing probe | No verified matching skill; hub catalog did not load | Extend existing argparse boundary and redaction; no new service |
+| Provider range/batch preflight and failure stop | No verified matching skill | Reuse existing settings, stop_reason_for and evaluation code |
+
+Ecosystem check: https://github.com/Anil-matcha/awesome-hermes-agent inspected;
+no Alchemy-specific drop-in found. Hub at https://hermes-agent.nousresearch.com/docs/skills/
+returned its loading shell, not a usable catalog; that is not proof no skill exists.
+A dependency is unwarranted for these small CLI corrections.
+
+- [x] Verify runtime configuration and provider documentation; no endpoint configured.
+- [x] Drift review: existing redaction/preflight preserved; CLI lacks a secure URL input.
+- [x] Claude: tests first, explicit named environment URL input, conflict/missing-value refusal.
+- [x] Claude: configured provider range/batch caps checked before any traffic, including reorg overlap.
+- [x] Claude: stop after consecutive failed passes; truthful failure verdict; proxy behavior matches production.
+- [x] Document secure invocation and account/range/cost prerequisites; retain unrelated settings isolation.
+- [ ] Native focused verification, independent review and exact-head CI before integration.
+  Native RED 27F/30P, GREEN 74 passed, 12/12 guard mutants killed (Codex);
+  all four independent review vectors cleared; 01081e09 CI green (3/3); master #583–#586
+  integrated at 7520bd82 and #587 at e22e0db7; all four vectors renewed CLEAR at each; exact-head CI pending. Record: `tasks/findings_rh_provider_readiness_20260914.md`.
+- [x] Operator confirmed public RPC, chain 4663, no provider account; separate macOS collector path recorded.
+- [ ] Assess existing public-collector lag/failure evidence; capacity remains unverified.
+
+Scope: probe, corresponding tests, runbook and this task record. No collector,
+schema, production configuration or trading changes. Authorization: operator
+“go on” on 2026-09-14, continuing the announced provider-readiness work.
+
+## DASH-09 all-history summary plan: 2026-09-14
+
+- [x] New clean worktree from e6a55d7a; drift and Hermes checks; reuse classifier.
+- [x] Plan-only scope and fresh historical cohort evidence documented in tasks/plan_stop_shortfall_summary_2026_09_14.md.
+- [x] Two independent plan reviews approved4085bf88; fresh schema/hash/cohort runtime prerequisites verified.
+- [x] Design-only artifact tasks/design_stop_shortfall_summary_2026_09_14.md prepared with SQL and Python deadlines.
+
+- [x] Both independent design reviewers approved e4f8ecbc without folds before build; root authorized implementation.
+
+Review: no implementation/deploy. All-history PAPER/EXPERIMENTAL descriptive summary only; no eligibility loosening or page mean.
+
+- [x] All-history summary API/panel built;190focused tests, Vite76module build and synthetic browser QA passed.
+- [ ] Two independent PRreviews/folds and exact-head CI before root considers merge/deploy.
+
+Summary evidence: tasks/report_stop_shortfall_summary_2026_09_14.md. No production changes.
+## DASH-08 current recorded lane status — 2026-09-14
+
+- [x] Fresh-master isolated worktree; drift/data-path and Hermes checks.
+- [x] Bounded read-only runtime schema/status/flag observations; plan only written.
+- [x] Plan a0703322 approved by root structural and ops provenance reviewers.
+- [x] Separate design drafted with raw storage, per-app target and freshness contracts.
+- [x] Design d0130893 approved by root reader/provenance and postmortem lifecycle/freshness reviewers.
+- [x] Annotation-only implementation52ba7dd7; Linux164 tests, exact fresh-build parity, and built-page mixed-lane visual/failure checks passed.
+- [x] WS master552db707 integrated at555f1676;76 relevant API/lifecycle tests passed; lane/frontend bytes unchanged.
+- [x] PR584 independently approved at25733ca5: ops reader/provenance74tests and postmortem controller/render/mapping29tests; no findings, clearances recorded.
+- [ ] Exact final-head CI before root merge; no deployment by this task.
+- Plan: tasks/plan_lane_status_annotations_2026_09_14.md.
+
+## WebSocket disconnect cleanup: 2026-09-14
+
+- [x] Fresh isolated master worktree; drift/Hermes/source/runtime evidence documented in plan_ws_disconnect_cleanup_2026_09_14.md.
+- [x] Two plan reviews before design; two design reviews before implementation.
+- [x] Real-handler disconnect/cleanup/transient-DB regressions, bounded natural shutdown proof and focused verification.
+- [x] Two independent PR583 approvals at6a644a45; four-vector clearances recorded truthfully.
+- [ ] Exact final-head CI before root integration; no production actions in this task.
+
+Review: PR583 built and independently approved; CI pending. Frozen selective release07afc0ad unchanged.
+
+- [x] WS plan3e86326c approved independently by ops and logic without folds; design-only lifecycle/shutdown artifact prepared.
+- [x] Two independent WS design approvals preceded implementation.
+
+- [x] WS design7cc39a0a approved by ops and logic; minimal send-boundary fix built after actual-handler red tests.
+- [x] Natural Uvicorn old-code shutdown falsifier failed; corrected lifecycle5pass and combined API/cold-start51pass; formatting/diff checks pass.
+- [x] WS PR: operations51tests and independent structural49tests approved6a644a45 without findings.
+- [ ] Exact CI before root merge/integration.
+
+WS report: tasks/report_ws_disconnect_cleanup_2026_09_14.md. No production/helper/frozen-release changes.
+
+## Selective dashboard release plan: 2026-09-14
+
+> Superseded (2026-10-15, PR #599 reconciliation): these three sections are the release branch's 09-14 snapshots. The release itself was deployed as 77751890 at 13:14:10Z — see tasks/closeout_recovery_2026_09_14.md; unchecked boxes below are historical, not open work.
+
+- [x] New production-baseline worktree d2f0d61e; plan-only drift/Hermes/safety analysis.
+- [x] Both plan reviewers approved bc4c5837 without folds; design-only artifact prepared with copy/lock/runtime bounds.
+- [x] Both design reviewers approved 38150404 without folds; local disposable harnesses prepared with boundary tests.
+- [x] All four features merged; selective old-core source assembled locally, focused tests and combined build parity recorded in release report.
+- [ ] Exact old-core release verification and two candidate reviews before conditional dashboard-only deploy.
+
+Review: tasks/plan_dashboard_selective_release_2026_09_14.md. No production changes; source release remains unassembled. Merged-feature CI and exact selective-candidate local Linux validation remain distinct evidence.
+
+## Release retry after aborted stop (2026-09-14)
+- [x] Isolate from frozen07af and record retry plan.
+- [ ] Two plan reviews, design/two reviews, merged WS fix, assembly and exact verification.
+- [ ] Final candidate/helper reviews, fresh preflight, conditional dashboard-only rollout and recovery checks.
+- [x] Retry plan/design each received two approvals, sibling-baseline fold recorded.
+- [x] PR583 merged with reviews/green CI; exact two-file application delta applied to frozen07af;59local tests passed.
+- [ ] Exact new manifest/Linux/copy proofs, final candidate/helper reviews and conditional rollout remain.
+
+## Successor read-only health/lanes release (2026-09-14)
+- [x] Isolate from frozen5c; inspect current source, existing validators, prior Hermes evidence and available disk.
+- [x] Write plan separating immutable d2 core reference from actual deployed/rollback release.
+- [ ] Two plan reviews; separate design and two design reviews before assembly.
+- [ ] PR585 merged/CI green; exact seven-PR manifest, candidate source/Linux/copy/content evidence.
+- [ ] Two final candidate/helper reviews; root-owned fresh runtime preflight and conditional rollout.
+
+Review: tasks/plan_dashboard_health_successor_release_2026_09_14.md. PLAN ONLY; no application assembly, helper changes, DB copies or deployment.
+- [x] Successor plan5e249634 approved by root and postmortem; concrete design audits core/runtime baseline separation, copy reuse and helper dependencies.
+- [ ] Two exact design approvals before implementation or archive/copy changes.
+- [x] Root/ops approved design f1a9250c and exact two-UI exception amendment ed680902 before implementation.
+- [x] Successor manifest red/green:25 local harness tests passed; original1358 proof preserved,1356 unchanged, two exact merged UI replacements, full runtime/candidate metadata mappings.
+- [ ] Assemble exact829d12b1 selected blobs, local regression/build proofs, then Linux/copy validation and two final reviews.
+- [x] Exact829d source assembled at4e677167;315 local regression tests plus25 manifest tests passed;84-module private frontend build matches all3 served merged blobs.
+- [ ] Root-owned exact archive/Linux/copy proofs and two final reviews remain; Windows aiosqlite warning recorded for comparison.

@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-db-backup schedule
+
+[Timer]
+Unit=gecko-db-backup.service
+OnCalendar=*-*-* 03:24:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

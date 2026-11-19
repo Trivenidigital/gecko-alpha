@@ -11,7 +11,6 @@ import structlog
 
 from scout.chains.events import (
     load_recent_events,
-    prune_old_events,
     safe_emit,
 )
 from scout.chains.mcap_fetcher import (
@@ -983,13 +982,17 @@ async def _update_chain_outcomes_inner(
 
 
 async def _prune_stale(db: Database, settings: Settings) -> None:
-    """Prune old signal_events and stale/completed active_chains."""
-    deleted_events = await prune_old_events(
-        db, retention_days=settings.CHAIN_EVENT_RETENTION_DAYS
-    )
-    if deleted_events:
-        logger.debug("chain_events_pruned", count=deleted_events)
+    """Prune stale/completed active_chains.
 
+    signal_events is deliberately NOT pruned here. This helper is only
+    reachable after check_chains has passed its early return on an empty
+    load_active_patterns() result, so anything pruned here stops silently at
+    zero active patterns. active_chains rows can only exist while patterns do,
+    so gating their cleanup on chain work is sound; signal_events keeps
+    accumulating regardless, which is why its prune now belongs to the hourly
+    maintenance pass (Database.prune_signal_events, called from
+    scout/main.py::_run_hourly_maintenance).
+    """
     cutoff = (
         datetime.now(timezone.utc)
         - timedelta(days=settings.CHAIN_ACTIVE_RETENTION_DAYS)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Alert-channel + digest + narrative + tg-channel freshness watchdog (CLAUDE.md §12a).
 
-Monitors FIVE pipeline surfaces in ONE script (operator amendment):
+Monitors SIX pipeline surfaces in ONE script (operator amendment):
 
   1. ``tg_alert_log`` — the latest ``outcome='sent'`` row must be newer than
      ``ALERT_SENT_SLO_HOURS`` (default 48). The Telegram alert channel went
@@ -38,6 +38,15 @@ Monitors FIVE pipeline surfaces in ONE script (operator amendment):
      class it exists to close — the writer works at ship time, a later refactor
      disconnects it, and the gap surfaces months later via an unrelated audit.
      A missing OR empty table is a breach.
+  6. ``offhost-last-ok`` — the off-host backup shipper's heartbeat FILE (not a
+     table; the shipper does not touch the DB) must be within
+     ``OFFHOST_BACKUP_SLO_HOURS`` (default 48). Written only after a copy is
+     proven good off-box — under the s3/B2 transport, only after the uploaded
+     object's size and content hash are read back and matched — so freshness
+     here means "a VERIFIED off-site copy existed at that instant". Gated on
+     ``OFFHOST_BACKUP_WATCH_ENABLED`` because off-host shipping is opt-in and a
+     default-on check would page on every box that has not configured a
+     destination. Once enabled, a missing or unreadable heartbeat IS a breach.
 
 On ANY breach the watchdog sends ONE plain-text Telegram message covering
 every breached check that is not inside its send cooldown (``parse_mode=None``
@@ -454,6 +463,78 @@ async def _check_alert_events_rate(
     }
 
 
+def _check_offhost_backup_freshness(
+    heartbeat_file: str, slo_hours: int, now: datetime, *, watch_enabled: bool
+) -> dict:
+    """Off-host backup freshness, read from the shipper's heartbeat FILE.
+
+    The only check here that is not a DB table, because the thing being watched
+    does not touch the DB: ``scripts/gecko-backup-offhost.sh`` writes a unix
+    timestamp to ``offhost-last-ok`` after — and only after — the copy is
+    proven good off-box (under the s3 transport, after the uploaded object's
+    size and content hash are read back and matched). So a fresh heartbeat here
+    means "a VERIFIED off-host copy of a real backup existed at that instant",
+    which is the only claim worth monitoring: the local backup stack already
+    has its own watchdog, and it is worthless in the failure mode this lane
+    exists for (the VPS provider's failure domain taking the box with it).
+
+    ``watch_enabled`` is the deploy-without-activate gate. Off-host shipping is
+    opt-in and the destination is unset by default, so paging for a missing
+    heartbeat before the operator has configured a bucket would be a guaranteed
+    false page on every box — the fastest way to train an operator to ignore
+    this watchdog. Once the operator turns the watch on, silence stops being
+    ambiguous and a missing or unreadable heartbeat IS a breach, exactly like
+    the DB-table checks: "the shipper has never run" and "the shipper broke"
+    are both things to be woken for."""
+    table = "offhost_backup"
+    base = {
+        "table": table,
+        "slo_hours": slo_hours,
+        "heartbeat_file": heartbeat_file,
+    }
+    if not watch_enabled:
+        return {
+            **base,
+            "status": "ok",
+            "reason": "watch_disabled",
+            "last_seen": None,
+            "age_hours": None,
+        }
+
+    path = Path(heartbeat_file).expanduser()
+    if not path.exists():
+        return {
+            **base,
+            "status": "breach",
+            "reason": "heartbeat_absent",
+            "last_seen": None,
+            "age_hours": None,
+        }
+    try:
+        epoch = int(path.read_text().strip())
+    except (ValueError, OSError):
+        # A truncated / empty / non-numeric heartbeat cannot prove anything.
+        # Fail toward the page: an unreadable heartbeat is a broken shipper.
+        return {
+            **base,
+            "status": "breach",
+            "reason": "heartbeat_unreadable",
+            "last_seen": None,
+            "age_hours": None,
+        }
+
+    last_seen = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    age_hours = (now - last_seen).total_seconds() / 3600.0
+    breached = age_hours > slo_hours
+    return {
+        **base,
+        "status": "breach" if breached else "ok",
+        "reason": "stale" if breached else "fresh",
+        "last_seen": last_seen.isoformat(),
+        "age_hours": round(age_hours, 2),
+    }
+
+
 async def _check_tg_channel_staleness(
     conn: aiosqlite.Connection, stale_days: int, now: datetime
 ) -> dict:
@@ -516,6 +597,9 @@ async def _evaluate(
     tg_channel_stale_days: int,
     dispatch_activity_threshold: int,
     alert_events_slo_hours: int,
+    offhost_backup_slo_hours: int,
+    offhost_heartbeat_file: str,
+    offhost_watch_enabled: bool,
     now: datetime,
 ) -> dict:
     async with aiosqlite.connect(db_path) as conn:
@@ -527,12 +611,20 @@ async def _evaluate(
         narrative = await _check_narrative_inbound_rate(conn, narrative_slo_hours, now)
         tg_channel = await _check_tg_channel_staleness(conn, tg_channel_stale_days, now)
         alert_events = await _check_alert_events_rate(conn, alert_events_slo_hours, now)
+    # Filesystem-only; no DB connection needed (see the check's docstring).
+    offhost = _check_offhost_backup_freshness(
+        offhost_heartbeat_file,
+        offhost_backup_slo_hours,
+        now,
+        watch_enabled=offhost_watch_enabled,
+    )
     return {
         "alert_sent_rate": alert,
         "digest_write_rate": digest,
         "narrative_inbound_rate": narrative,
         "tg_channel_staleness": tg_channel,
         "alert_events_rate": alert_events,
+        "offhost_backup_freshness": offhost,
     }
 
 
@@ -664,6 +756,29 @@ def _compose_message(checks: dict, include: list[str]) -> str:
                 "no longer being recorded"
             )
 
+    o = checks["offhost_backup_freshness"]
+    if "offhost_backup_freshness" in include and o["status"] == "breach":
+        if o["reason"] == "heartbeat_absent":
+            lines.append(
+                "- offhost_backup: NO heartbeat at "
+                f"{o['heartbeat_file']} — the off-host shipper has never "
+                f"completed a verified upload (SLO {o['slo_hours']}h). Every "
+                "backup that exists is on the same box as the DB."
+            )
+        elif o["reason"] == "heartbeat_unreadable":
+            lines.append(
+                f"- offhost_backup: the heartbeat at {o['heartbeat_file']} is "
+                "empty or non-numeric — the off-host shipper is broken and the "
+                "age of the last off-site copy cannot be established"
+            )
+        else:
+            lines.append(
+                f"- offhost_backup: last VERIFIED off-host upload at "
+                f"{o['last_seen']} ({o['age_hours']}h ago) exceeds SLO "
+                f"{o['slo_hours']}h — nothing has left the box since, so a "
+                "provider-level loss would take the DB and every backup with it"
+            )
+
     lines.append("Check the pipeline/digest cron and the Telegram delivery path.")
     return "\n".join(lines)
 
@@ -775,6 +890,17 @@ def main(argv: list[str] | None = None) -> int:
     # raise it to tolerate the dedup tail). See the qualifier in
     # _check_alert_sent_rate.
     parser.add_argument("--dispatch-activity-threshold", type=int, default=0)
+    # Off-host backup shipper freshness. 48h, not 27h: the shipper rides the
+    # daily backup schedule, and one missed night on a lane whose purpose is
+    # disaster recovery is not worth a page while two in a row is.
+    parser.add_argument("--offhost-backup-slo-hours", type=int, default=48)
+    parser.add_argument(
+        "--offhost-heartbeat-file",
+        default="/var/lib/gecko-alpha/backup-rotation/offhost-last-ok",
+    )
+    # Deploy-without-activate: off-host shipping is opt-in, so the watch stays
+    # off until the operator has actually configured a destination.
+    parser.add_argument("--offhost-backup-watch-enabled", default="false")
     parser.add_argument("--cooldown-hours", type=int, default=24)
     parser.add_argument(
         "--state-dir", default="/var/lib/gecko-alpha/alert-channel-watchdog"
@@ -810,6 +936,9 @@ def main(argv: list[str] | None = None) -> int:
                 tg_channel_stale_days=args.tg_channel_stale_days,
                 dispatch_activity_threshold=args.dispatch_activity_threshold,
                 alert_events_slo_hours=args.alert_events_slo_hours,
+                offhost_backup_slo_hours=args.offhost_backup_slo_hours,
+                offhost_heartbeat_file=args.offhost_heartbeat_file,
+                offhost_watch_enabled=_is_enabled(args.offhost_backup_watch_enabled),
                 now=now,
             )
         )
@@ -855,6 +984,9 @@ def main(argv: list[str] | None = None) -> int:
             ),
             alert_events_last_seen=checks["alert_events_rate"]["last_seen"],
             alert_events_age_hours=checks["alert_events_rate"]["age_hours"],
+            offhost_backup_last_seen=checks["offhost_backup_freshness"]["last_seen"],
+            offhost_backup_age_hours=checks["offhost_backup_freshness"]["age_hours"],
+            offhost_backup_reason=checks["offhost_backup_freshness"]["reason"],
         )
         out = {"ok": True, "breaches": 0, "checks": checks}
         if quiet_msg is not None:

@@ -1,0 +1,36 @@
+# PR #566 — docs only.
+#
+# `[clearances]` is EMPTY, and that is correct rather than an omission. This PR
+# touches `backlog.md` and `.reviewers/README.md`; neither is on the watch
+# floor, so no watched path moves and the gate demands no reviewer SHA. The
+# record must still EXIST — absence is RED by design, because treating a
+# missing file as "nothing to check" would let deleting it turn the gate green
+# while disabling it.
+#
+# The floors below are declared in full even though nothing is cleared against
+# them: they are floors, not a description of this PR, and narrowing them here
+# would be a real narrowing rather than a shorthand.
+
+pr = 566
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]

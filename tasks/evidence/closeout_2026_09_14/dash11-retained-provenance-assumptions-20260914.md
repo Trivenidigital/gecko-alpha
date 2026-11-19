@@ -1,0 +1,5 @@
+# DASH11 retained-evidence audit assumptions
+
+Before live queries: retained ledger/decision timestamps prove recorded events only, not complete producer capture. Compare suppression rows only in the same half-open seven-day UTC interval; ledger must also have source_layer=dispatcher and kind=gated_out_sample. Fourteen-day label status and actual r7d availability are separate measures. A complete label may lack r7d. Price provenance requires the actual stored observation/selection path; a source-code preference order is not proof of what historically supplied a return. Retention spans do not prove active settings or pruning success. No settings/environment/service/account inspection is included.
+
+Limits: one read-only SQLite snapshot,45s total/10s each query/1000 aggregate rows across the entire output/512MiB address space/64KiB SQLite values. No application imports, costs/rankings, token rows, DB or config writes, service actions, API requests or messages. SSH uses stdin and redirects to a new local evidence file; file is read separately.

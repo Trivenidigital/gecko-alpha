@@ -25,6 +25,24 @@ MARKETS_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/coins/markets"
 # ------------------------------------------------------------------
 
 
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    These callers now REQUIRE Settings: governed_cg_call fails closed without
+    it, because "counted but not refused" let a caller keep spending while
+    appearing governed.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 def test_classify_hit():
     assert classify_checkpoint(20.0, hit=15.0, miss=-10.0) == "HIT"
 
@@ -93,7 +111,9 @@ async def test_fetch_prices_batch_success():
                     {"id": "ethereum", "current_price": 3000.0},
                 ],
             )
-            result = await fetch_prices_batch(session, ["bitcoin", "ethereum"])
+            result = await fetch_prices_batch(
+                session, ["bitcoin", "ethereum"], settings=_budget_settings()
+            )
             assert result == {"bitcoin": 50000.0, "ethereum": 3000.0}
 
 
@@ -105,14 +125,16 @@ async def test_fetch_prices_batch_429():
                 MARKETS_PATTERN,
                 status=429,
             )
-            result = await fetch_prices_batch(session, ["bitcoin"])
+            result = await fetch_prices_batch(
+                session, ["bitcoin"], settings=_budget_settings()
+            )
             assert result == {}
 
 
 async def test_fetch_prices_batch_empty():
     """Empty coin_ids list returns empty dict without HTTP call."""
     async with aiohttp.ClientSession() as session:
-        result = await fetch_prices_batch(session, [])
+        result = await fetch_prices_batch(session, [], settings=_budget_settings())
         assert result == {}
 
 
@@ -171,7 +193,7 @@ async def test_evaluate_pending_48h_hit(db: Database, strategy: Strategy):
                 MARKETS_PATTERN,
                 payload=[{"id": "bitcoin", "current_price": 120.0}],
             )
-            await evaluate_pending(session, db, strategy)
+            await evaluate_pending(session, db, strategy, settings=_budget_settings())
 
     conn = db._conn
     assert conn is not None
@@ -198,7 +220,7 @@ async def test_evaluate_pending_miss(db: Database, strategy: Strategy):
                 MARKETS_PATTERN,
                 payload=[{"id": "bitcoin", "current_price": 80.0}],
             )
-            await evaluate_pending(session, db, strategy)
+            await evaluate_pending(session, db, strategy, settings=_budget_settings())
 
     conn = db._conn
     assert conn is not None
@@ -223,7 +245,7 @@ async def test_evaluate_pending_price_unavailable_retries(
                 MARKETS_PATTERN,
                 payload=[],
             )
-            await evaluate_pending(session, db, strategy)
+            await evaluate_pending(session, db, strategy, settings=_budget_settings())
 
     conn = db._conn
     assert conn is not None
@@ -249,7 +271,7 @@ async def test_evaluate_pending_peak_tracking(db: Database, strategy: Strategy):
                 MARKETS_PATTERN,
                 payload=[{"id": "bitcoin", "current_price": 150.0}],
             )
-            await evaluate_pending(session, db, strategy)
+            await evaluate_pending(session, db, strategy, settings=_budget_settings())
 
     conn = db._conn
     assert conn is not None
@@ -276,7 +298,7 @@ async def test_evaluate_pending_only_6h_elapsed(db: Database, strategy: Strategy
                 MARKETS_PATTERN,
                 payload=[{"id": "bitcoin", "current_price": 120.0}],
             )
-            await evaluate_pending(session, db, strategy)
+            await evaluate_pending(session, db, strategy, settings=_budget_settings())
 
     conn = db._conn
     assert conn is not None

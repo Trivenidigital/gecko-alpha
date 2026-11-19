@@ -14,6 +14,25 @@ from scout.counter.detail import (
     fetch_coin_detail,
 )
 
+
+def _budget_settings():
+    """Minimal Settings for the CoinGecko budget governor.
+
+    These CoinGecko callers now REQUIRE Settings: `governed_cg_call` fails
+    closed without it, because "counted but not refused" was a silent hole that
+    let a caller keep spending while appearing governed.
+    """
+    from scout.config import Settings
+
+    return Settings(
+        _env_file=None,
+        TELEGRAM_BOT_TOKEN="t",
+        TELEGRAM_CHAT_ID="c",
+        ANTHROPIC_API_KEY="k",
+        COINGECKO_DISCOVERY_ENABLED=True,
+    )
+
+
 SAMPLE_DETAIL = {
     "id": "bitcoin",
     "sentiment_votes_up_percentage": 72.5,
@@ -72,7 +91,9 @@ async def test_fetch_coin_detail_success():
     with aioresponses() as m:
         m.get(URL_PATTERN, payload=SAMPLE_DETAIL)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_coin_detail(session, "bitcoin")
+            result = await fetch_coin_detail(
+                session, "bitcoin", settings=_budget_settings()
+            )
 
     assert result is not None
     assert result["id"] == "bitcoin"
@@ -87,7 +108,9 @@ async def test_fetch_coin_detail_cache_hit():
     with aioresponses() as m:
         # No mock registered — any HTTP call would raise
         async with aiohttp.ClientSession() as session:
-            result = await fetch_coin_detail(session, "bitcoin")
+            result = await fetch_coin_detail(
+                session, "bitcoin", settings=_budget_settings()
+            )
 
     assert result is SAMPLE_DETAIL
 
@@ -100,7 +123,9 @@ async def test_fetch_coin_detail_cache_expired():
     with aioresponses() as m:
         m.get(URL_PATTERN, payload=SAMPLE_DETAIL)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_coin_detail(session, "bitcoin")
+            result = await fetch_coin_detail(
+                session, "bitcoin", settings=_budget_settings()
+            )
 
     assert result is not None
     assert result["id"] == "bitcoin"
@@ -113,7 +138,9 @@ async def test_fetch_coin_detail_404_returns_none():
     with aioresponses() as m:
         m.get(URL_PATTERN, status=404)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_coin_detail(session, "bitcoin")
+            result = await fetch_coin_detail(
+                session, "bitcoin", settings=_budget_settings()
+            )
 
     assert result is None
 
@@ -122,6 +149,8 @@ async def test_fetch_coin_detail_429_returns_none():
     with aioresponses() as m:
         m.get(URL_PATTERN, status=429)
         async with aiohttp.ClientSession() as session:
-            result = await fetch_coin_detail(session, "bitcoin")
+            result = await fetch_coin_detail(
+                session, "bitcoin", settings=_budget_settings()
+            )
 
     assert result is None

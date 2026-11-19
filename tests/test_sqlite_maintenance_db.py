@@ -5,8 +5,26 @@ import aiosqlite
 from scout.db import Database
 
 
-async def _wal_db(tmp_path):
-    db = Database(str(tmp_path / "t.db"))
+async def _wal_db(tmp_path, *, busy_timeout_ms: int | None = None):
+    """Open a WAL database for maintenance tests.
+
+    `busy_timeout_ms` exists because `Database` defaults to 90_000 — a
+    deliberate production value so a long migration does not lose a lock race.
+    A test that deliberately CREATES contention then inherits that 90-second
+    wait: `test_checkpoint_busy_with_concurrent_reader` measured 90.3s on CI and
+    99.3s locally, roughly 8% of the entire suite for one assertion, and it was
+    the single slowest test by a factor of eight.
+
+    Shortening it does not weaken the test. The assertion is that a pinned WAL
+    reports `busy == 1`; how long SQLite is willing to wait first is not the
+    property under test, and a shorter wait actually makes the test STRICTER —
+    it proves busy is reported promptly rather than only after exhausting a
+    90-second timeout.
+    """
+    if busy_timeout_ms is None:
+        db = Database(str(tmp_path / "t.db"))
+    else:
+        db = Database(str(tmp_path / "t.db"), busy_timeout_ms=busy_timeout_ms)
     await db.initialize()
     return db
 
@@ -25,8 +43,13 @@ async def test_checkpoint_wal_truncate_returns_tuple(tmp_path):
 
 async def test_checkpoint_busy_with_concurrent_reader(tmp_path):
     """Fold 6: a second connection holding an open read transaction pins the
-    WAL so checkpoint(TRUNCATE) cannot truncate → busy == 1."""
-    db = await _wal_db(tmp_path)
+    WAL so checkpoint(TRUNCATE) cannot truncate → busy == 1.
+
+    Uses a short busy_timeout: this test deliberately creates lock contention,
+    so with the production 90-second default it spent the whole timeout waiting
+    before reporting the very thing it asserts.
+    """
+    db = await _wal_db(tmp_path, busy_timeout_ms=250)
     await db._conn.execute("CREATE TABLE t(x)")
     await db._conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(300)])
     await db._conn.commit()

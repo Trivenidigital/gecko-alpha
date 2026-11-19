@@ -34,6 +34,22 @@ SIMPLE_PRICE_PATTERN = re.compile(r"https://api\.coingecko\.com/api/v3/simple/pr
 
 
 @pytest.fixture(autouse=True)
+def _cg_enrollment_poll_every_cycle(monkeypatch):
+    """Pin the CG enrollment poll to every cycle for these tests.
+
+    These cover the poll's SHAPE (batching, heartbeat, labelling), not its
+    cadence. Production throttles the CG branch to every 15th main cycle —
+    unthrottled it is 1,440 calls/day = ~43.2k/month, larger than the entire
+    30k reserve it used to be charged to. Cadence is covered by
+    tests/test_cg_budget_round3_discriminators.py.
+    """
+    import scout.outcome_ledger as _ledger
+
+    monkeypatch.setattr(_ledger, "_ENROLLMENT_CG_POLL_INTERVAL_CYCLES", 1)
+    monkeypatch.setattr(_ledger, "_enrollment_cg_cycle_counter", 0)
+
+
+@pytest.fixture(autouse=True)
 async def _clear_rate_limit():
     await coingecko_limiter.reset()
     yield

@@ -1,0 +1,2279 @@
+{
+  "source_sha": "5c43526c46a33b06e7ed18509c8a0ea43c7772d3",
+  "files": {
+    "scout/trading/signals.py": {
+      "sha256": "4ef0488e5c5a161ebe39361eee5da2f4b6b0f17b29926fca2b75af8b54eb3504",
+      "excerpts": [
+        {
+          "line": 25,
+          "text": ""
+        },
+        {
+          "line": 26,
+          "text": ""
+        },
+        {
+          "line": 27,
+          "text": "async def _record_suppressed_ledger_emission("
+        },
+        {
+          "line": 28,
+          "text": "    db: Database,"
+        },
+        {
+          "line": 29,
+          "text": "    settings,"
+        },
+        {
+          "line": 30,
+          "text": "    *,"
+        },
+        {
+          "line": 31,
+          "text": "    signal_type: str,"
+        },
+        {
+          "line": 32,
+          "text": "    token_id: str | None,"
+        },
+        {
+          "line": 33,
+          "text": "    combo_key: str,"
+        },
+        {
+          "line": 34,
+          "text": "    suppression_reason: str,"
+        },
+        {
+          "line": 35,
+          "text": "    price: float | None = None,"
+        },
+        {
+          "line": 36,
+          "text": "    signal_data: dict | None = None,"
+        },
+        {
+          "line": 53,
+          "text": "    lets the whole lane be disabled without disturbing the rest of the ledger."
+        },
+        {
+          "line": 54,
+          "text": ""
+        },
+        {
+          "line": 55,
+          "text": "    ``gate_verdicts`` carries ``reason='suppressed'`` + ``source_layer="
+        },
+        {
+          "line": 56,
+          "text": "    'dispatcher'`` so analysis can cleanly separate this population from"
+        },
+        {
+          "line": 57,
+          "text": "    engine-level blocks (which keep their own ``reason``), plus the ``combo_key``"
+        },
+        {
+          "line": 58,
+          "text": "    and the underlying ``should_open`` verdict for per-combo attribution."
+        },
+        {
+          "line": 59,
+          "text": ""
+        },
+        {
+          "line": 60,
+          "text": "    Observability, not control flow: NEVER raises. ``record_emission`` is"
+        },
+        {
+          "line": 61,
+          "text": "    already fail-soft; the try/except is belt-and-braces so a ledger bug can"
+        },
+        {
+          "line": 62,
+          "text": "    NEVER break the suppression / dispatch path. Respects"
+        },
+        {
+          "line": 63,
+          "text": "    ``LEDGER_SAMPLE_SUPPRESSED`` (this lane) AND ``LEDGER_ENABLED`` (global kill"
+        },
+        {
+          "line": 64,
+          "text": "    switch, enforced inside ``record_emission``)."
+        },
+        {
+          "line": 65,
+          "text": "    \"\"\""
+        },
+        {
+          "line": 66,
+          "text": "    if not getattr(settings, \"LEDGER_SAMPLE_SUPPRESSED\", True):"
+        },
+        {
+          "line": 67,
+          "text": "        return"
+        },
+        {
+          "line": 68,
+          "text": "    try:"
+        },
+        {
+          "line": 69,
+          "text": "        liq, liq_src = liquidity_from_signal_data(signal_data)"
+        },
+        {
+          "line": 70,
+          "text": "        await _ledger_record_emission("
+        },
+        {
+          "line": 71,
+          "text": "            db,"
+        },
+        {
+          "line": 72,
+          "text": "            settings,"
+        },
+        {
+          "line": 73,
+          "text": "            kind=\"gated_out_sample\","
+        },
+        {
+          "line": 74,
+          "text": "            token_id=token_id,"
+        },
+        {
+          "line": 75,
+          "text": "            surface=signal_type,"
+        },
+        {
+          "line": 79,
+          "text": "            gate_verdicts={"
+        },
+        {
+          "line": 80,
+          "text": "                \"reason\": \"suppressed\","
+        },
+        {
+          "line": 81,
+          "text": "                \"source_layer\": \"dispatcher\","
+        },
+        {
+          "line": 82,
+          "text": "                \"combo_key\": combo_key,"
+        },
+        {
+          "line": 83,
+          "text": "                \"suppression_reason\": suppression_reason,"
+        },
+        {
+          "line": 84,
+          "text": "            },"
+        },
+        {
+          "line": 85,
+          "text": "        )"
+        },
+        {
+          "line": 86,
+          "text": "    except Exception as exc:"
+        },
+        {
+          "line": 87,
+          "text": "        logger.warning("
+        },
+        {
+          "line": 88,
+          "text": "            \"ledger_record_failed\","
+        },
+        {
+          "line": 89,
+          "text": "            site=\"dispatcher_suppressed\","
+        },
+        {
+          "line": 90,
+          "text": "            token_id=token_id,"
+        },
+        {
+          "line": 575,
+          "text": "        logger.warning("
+        },
+        {
+          "line": 576,
+          "text": "            \"pilot_entry_cap_no_baseline\","
+        },
+        {
+          "line": 577,
+          "text": "            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 578,
+          "text": "            cap=cap,"
+        },
+        {
+          "line": 579,
+          "text": "            detail=\"cap configured but drawdown_baseline_at is unset; \""
+        },
+        {
+          "line": 580,
+          "text": "            \"refusing admission (fail closed)\","
+        },
+        {
+          "line": 581,
+          "text": "        )"
+        },
+        {
+          "line": 582,
+          "text": "        return False"
+        },
+        {
+          "line": 583,
+          "text": ""
+        },
+        {
+          "line": 584,
+          "text": "    cur = await db._conn.execute("
+        },
+        {
+          "line": 585,
+          "text": "        \"SELECT COUNT(*) FROM paper_trades \""
+        },
+        {
+          "line": 586,
+          "text": "        \"WHERE signal_type = 'losers_contrarian' AND opened_at >= ?\","
+        },
+        {
+          "line": 596,
+          "text": "        logger.error("
+        },
+        {
+          "line": 597,
+          "text": "            \"pilot_entry_cap_exceeded\","
+        },
+        {
+          "line": 598,
+          "text": "            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 599,
+          "text": "            entries=entries,"
+        },
+        {
+          "line": 600,
+          "text": "            cap=cap,"
+        },
+        {
+          "line": 601,
+          "text": "            overshoot=entries - cap,"
+        },
+        {
+          "line": 602,
+          "text": "            cohort_anchor=baseline,"
+        },
+        {
+          "line": 603,
+          "text": "            detail=\"cohort exceeds the pre-registered cap \u2014 concurrent \""
+        },
+        {
+          "line": 604,
+          "text": "            \"admission writers suspected; treat as a pilot stop condition\","
+        },
+        {
+          "line": 605,
+          "text": "        )"
+        },
+        {
+          "line": 606,
+          "text": "        return False"
+        },
+        {
+          "line": 607,
+          "text": "    if entries >= cap:"
+        },
+        {
+          "line": 608,
+          "text": "        logger.info("
+        },
+        {
+          "line": 609,
+          "text": "            \"pilot_entry_cap_reached\","
+        },
+        {
+          "line": 610,
+          "text": "            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 611,
+          "text": "            entries=entries,"
+        },
+        {
+          "line": 612,
+          "text": "            cap=cap,"
+        },
+        {
+          "line": 613,
+          "text": "            cohort_anchor=baseline,"
+        },
+        {
+          "line": 614,
+          "text": "        )"
+        },
+        {
+          "line": 615,
+          "text": "        return False"
+        },
+        {
+          "line": 616,
+          "text": "    return True"
+        },
+        {
+          "line": 617,
+          "text": ""
+        },
+        {
+          "line": 618,
+          "text": ""
+        },
+        {
+          "line": 619,
+          "text": "async def trade_losers("
+        },
+        {
+          "line": 664,
+          "text": "                    coin_id=l[\"coin_id\"],"
+        },
+        {
+          "line": 665,
+          "text": "                    symbol=l[\"symbol\"],"
+        },
+        {
+          "line": 666,
+          "text": "                    signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 667,
+          "text": "                )"
+        },
+        {
+          "line": 668,
+          "text": "                await _emit_dispatch_decision("
+        },
+        {
+          "line": 669,
+          "text": "                    db,"
+        },
+        {
+          "line": 670,
+          "text": "                    row=l,"
+        },
+        {
+          "line": 671,
+          "text": "                    signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 672,
+          "text": "                    decision=\"blocked\","
+        },
+        {
+          "line": 673,
+          "text": "                    reason=\"junk_candidate\","
+        },
+        {
+          "line": 674,
+          "text": "                )"
+        },
+        {
+          "line": 675,
+          "text": "                continue"
+        },
+        {
+          "line": 676,
+          "text": "            if (l[\"market_cap\"] or 0) < min_mcap:"
+        },
+        {
+          "line": 677,
+          "text": "                await _emit_dispatch_decision("
+        },
+        {
+          "line": 678,
+          "text": "                    db,"
+        },
+        {
+          "line": 679,
+          "text": "                    row=l,"
+        },
+        {
+          "line": 680,
+          "text": "                    signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 681,
+          "text": "                    decision=\"blocked\","
+        },
+        {
+          "line": 682,
+          "text": "                    reason=("
+        },
+        {
+          "line": 683,
+          "text": "                        \"missing_market_cap\""
+        },
+        {
+          "line": 684,
+          "text": "                        if l[\"market_cap\"] is None"
+        },
+        {
+          "line": 685,
+          "text": "                        else \"below_min_market_cap\""
+        },
+        {
+          "line": 686,
+          "text": "                    ),"
+        },
+        {
+          "line": 687,
+          "text": "                    min_mcap=min_mcap,"
+        },
+        {
+          "line": 688,
+          "text": "                )"
+        },
+        {
+          "line": 689,
+          "text": "                continue"
+        },
+        {
+          "line": 692,
+          "text": "                    db,"
+        },
+        {
+          "line": 693,
+          "text": "                    row=l,"
+        },
+        {
+          "line": 694,
+          "text": "                    signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 695,
+          "text": "                    decision=\"blocked\","
+        },
+        {
+          "line": 696,
+          "text": "                    reason=\"above_max_market_cap\","
+        },
+        {
+          "line": 697,
+          "text": "                    max_mcap=max_mcap,"
+        },
+        {
+          "line": 698,
+          "text": "                )"
+        },
+        {
+          "line": 699,
+          "text": "                continue"
+        },
+        {
+          "line": 700,
+          "text": "            try:"
+        },
+        {
+          "line": 701,
+          "text": "                combo_key = build_combo_key("
+        },
+        {
+          "line": 702,
+          "text": "                    signal_type=\"losers_contrarian\", signals=None"
+        },
+        {
+          "line": 703,
+          "text": "                )"
+        },
+        {
+          "line": 704,
+          "text": "                async with parole_reservation(db, combo_key, settings=settings) as res:"
+        },
+        {
+          "line": 705,
+          "text": "                    if not res.allow:"
+        },
+        {
+          "line": 706,
+          "text": "                        logger.info("
+        },
+        {
+          "line": 707,
+          "text": "                            \"signal_suppressed\","
+        },
+        {
+          "line": 708,
+          "text": "                            combo_key=combo_key,"
+        },
+        {
+          "line": 709,
+          "text": "                            reason=res.reason,"
+        },
+        {
+          "line": 710,
+          "text": "                            coin_id=l[\"coin_id\"],"
+        },
+        {
+          "line": 711,
+          "text": "                            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 712,
+          "text": "                        )"
+        },
+        {
+          "line": 713,
+          "text": "                        await _emit_dispatch_decision("
+        },
+        {
+          "line": 714,
+          "text": "                            db,"
+        },
+        {
+          "line": 715,
+          "text": "                            row=l,"
+        },
+        {
+          "line": 716,
+          "text": "                            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 717,
+          "text": "                            decision=\"blocked\","
+        },
+        {
+          "line": 718,
+          "text": "                            reason=\"suppressed\","
+        },
+        {
+          "line": 719,
+          "text": "                            signal_combo=combo_key,"
+        },
+        {
+          "line": 720,
+          "text": "                            suppression_reason=res.reason,"
+        },
+        {
+          "line": 721,
+          "text": "                        )"
+        },
+        {
+          "line": 722,
+          "text": "                        await _record_suppressed_ledger_emission("
+        },
+        {
+          "line": 723,
+          "text": "                            db,"
+        },
+        {
+          "line": 724,
+          "text": "                            settings,"
+        },
+        {
+          "line": 725,
+          "text": "                            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 726,
+          "text": "                            token_id=l[\"coin_id\"],"
+        },
+        {
+          "line": 727,
+          "text": "                            combo_key=combo_key,"
+        },
+        {
+          "line": 728,
+          "text": "                            suppression_reason=res.reason,"
+        },
+        {
+          "line": 729,
+          "text": "                            price=l[\"price_at_snapshot\"],"
+        },
+        {
+          "line": 730,
+          "text": "                            signal_data={"
+        },
+        {
+          "line": 731,
+          "text": "                                \"price_change_24h\": l[\"price_change_24h\"],"
+        },
+        {
+          "line": 732,
+          "text": "                                \"mcap\": l[\"market_cap\"],"
+        },
+        {
+          "line": 733,
+          "text": "                            },"
+        },
+        {
+          "line": 734,
+          "text": "                        )"
+        },
+        {
+          "line": 763,
+          "text": "                            db,"
+        },
+        {
+          "line": 764,
+          "text": "                            row=l,"
+        },
+        {
+          "line": 765,
+          "text": "                            signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 766,
+          "text": "                            decision=\"blocked\","
+        },
+        {
+          "line": 767,
+          "text": "                            reason=\"pilot_entry_cap_reached\","
+        },
+        {
+          "line": 768,
+          "text": "                            signal_combo=combo_key,"
+        },
+        {
+          "line": 769,
+          "text": "                        )"
+        },
+        {
+          "line": 770,
+          "text": "                        continue"
+        },
+        {
+          "line": 771,
+          "text": ""
+        },
+        {
+          "line": 772,
+          "text": "                    trade_id = await engine.open_trade("
+        },
+        {
+          "line": 773,
+          "text": "                        token_id=l[\"coin_id\"],"
+        },
+        {
+          "line": 774,
+          "text": "                        symbol=l[\"symbol\"],"
+        },
+        {
+          "line": 775,
+          "text": "                        name=l[\"name\"],"
+        },
+        {
+          "line": 776,
+          "text": "                        chain=\"coingecko\","
+        },
+        {
+          "line": 777,
+          "text": "                        signal_type=\"losers_contrarian\","
+        },
+        {
+          "line": 778,
+          "text": "                        signal_data={"
+        },
+        {
+          "line": 779,
+          "text": "                            \"price_change_24h\": l[\"price_change_24h\"],"
+        },
+        {
+          "line": 780,
+          "text": "                            \"mcap\": l[\"market_cap\"],"
+        },
+        {
+          "line": 781,
+          "text": "                        },"
+        },
+        {
+          "line": 782,
+          "text": "                        entry_price=loser_price,"
+        },
+        {
+          "line": 783,
+          "text": "                        signal_combo=combo_key,"
+        },
+        {
+          "line": 784,
+          "text": "                    )"
+        },
+        {
+          "line": 785,
+          "text": "                    if trade_id is not None:"
+        },
+        {
+          "line": 786,
+          "text": "                        res.confirm()"
+        },
+        {
+          "line": 836,
+          "text": "                coin_id=token.contract_address,"
+        },
+        {
+          "line": 837,
+          "text": "                symbol=token.ticker,"
+        },
+        {
+          "line": 838,
+          "text": "                signal_type=\"first_signal\","
+        },
+        {
+          "line": 839,
+          "text": "            )"
+        },
+        {
+          "line": 840,
+          "text": "            continue"
+        },
+        {
+          "line": 841,
+          "text": "        if (token.market_cap_usd or 0) < min_mcap:"
+        },
+        {
+          "line": 842,
+          "text": "            continue"
+        },
+        {
+          "line": 843,
+          "text": "        if max_mcap is not None and (token.market_cap_usd or 0) > max_mcap:"
+        },
+        {
+          "line": 844,
+          "text": "            skipped_large += 1"
+        },
+        {
+          "line": 845,
+          "text": "            continue"
+        },
+        {
+          "line": 846,
+          "text": "        # Focus on CoinGecko-listed tokens, skip DEX memecoins"
+        },
+        {
+          "line": 847,
+          "text": "        if token.chain not in (\"coingecko\",):"
+        },
+        {
+          "line": 849,
+          "text": "        try:"
+        },
+        {
+          "line": 850,
+          "text": "            sigs = signals_fired"
+        },
+        {
+          "line": 851,
+          "text": "            combo_key = build_combo_key(signal_type=\"first_signal\", signals=sigs)"
+        },
+        {
+          "line": 852,
+          "text": "            async with parole_reservation(db, combo_key, settings=settings) as res:"
+        },
+        {
+          "line": 853,
+          "text": "                if not res.allow:"
+        },
+        {
+          "line": 854,
+          "text": "                    logger.info("
+        },
+        {
+          "line": 855,
+          "text": "                        \"signal_suppressed\","
+        },
+        {
+          "line": 856,
+          "text": "                        combo_key=combo_key,"
+        },
+        {
+          "line": 857,
+          "text": "                        reason=res.reason,"
+        },
+        {
+          "line": 858,
+          "text": "                        coin_id=token.contract_address,"
+        },
+        {
+          "line": 859,
+          "text": "                        signal_type=\"first_signal\","
+        },
+        {
+          "line": 860,
+          "text": "                    )"
+        },
+        {
+          "line": 861,
+          "text": "                    await _record_suppressed_ledger_emission("
+        },
+        {
+          "line": 862,
+          "text": "                        db,"
+        },
+        {
+          "line": 863,
+          "text": "                        settings,"
+        },
+        {
+          "line": 864,
+          "text": "                        signal_type=\"first_signal\","
+        },
+        {
+          "line": 865,
+          "text": "                        token_id=token.contract_address,"
+        },
+        {
+          "line": 866,
+          "text": "                        combo_key=combo_key,"
+        },
+        {
+          "line": 867,
+          "text": "                        suppression_reason=res.reason,"
+        },
+        {
+          "line": 868,
+          "text": "                        price=None,"
+        },
+        {
+          "line": 869,
+          "text": "                        signal_data={"
+        },
+        {
+          "line": 870,
+          "text": "                            \"quant_score\": quant_score,"
+        },
+        {
+          "line": 871,
+          "text": "                            \"signals\": signals_fired,"
+        },
+        {
+          "line": 872,
+          "text": "                        },"
+        },
+        {
+          "line": 873,
+          "text": "                    )"
+        },
+        {
+          "line": 885,
+          "text": "                    name=token.token_name,"
+        },
+        {
+          "line": 886,
+          "text": "                    chain=token.chain,"
+        },
+        {
+          "line": 887,
+          "text": "                    signal_type=\"first_signal\","
+        },
+        {
+          "line": 888,
+          "text": "                    signal_data={"
+        },
+        {
+          "line": 889,
+          "text": "                        \"quant_score\": quant_score,"
+        },
+        {
+          "line": 890,
+          "text": "                        \"signals\": signals_fired,"
+        },
+        {
+          "line": 891,
+          "text": "                    },"
+        },
+        {
+          "line": 892,
+          "text": "                    entry_price=price,"
+        },
+        {
+          "line": 893,
+          "text": "                    signal_combo=combo_key,"
+        },
+        {
+          "line": 894,
+          "text": "                )"
+        },
+        {
+          "line": 895,
+          "text": "                if trade_id is not None:"
+        },
+        {
+          "line": 896,
+          "text": "                    res.confirm()"
+        },
+        {
+          "line": 1402,
+          "text": "                    \"signal_skipped_junk\","
+        },
+        {
+          "line": 1403,
+          "text": "                    coin_id=token_id,"
+        },
+        {
+          "line": 1404,
+          "text": "                    signal_type=\"chain_completed\","
+        },
+        {
+          "line": 1405,
+          "text": "                )"
+        },
+        {
+          "line": 1406,
+          "text": "                continue"
+        },
+        {
+          "line": 1407,
+          "text": "            try:"
+        },
+        {
+          "line": 1408,
+          "text": "                combo_key = build_combo_key(signal_type=\"chain_completed\", signals=None)"
+        },
+        {
+          "line": 1409,
+          "text": "                async with parole_reservation(db, combo_key, settings=settings) as res:"
+        },
+        {
+          "line": 1410,
+          "text": "                    if not res.allow:"
+        },
+        {
+          "line": 1411,
+          "text": "                        logger.info("
+        },
+        {
+          "line": 1412,
+          "text": "                            \"signal_suppressed\","
+        },
+        {
+          "line": 1413,
+          "text": "                            combo_key=combo_key,"
+        },
+        {
+          "line": 1414,
+          "text": "                            reason=res.reason,"
+        },
+        {
+          "line": 1415,
+          "text": "                            coin_id=c[\"token_id\"],"
+        },
+        {
+          "line": 1416,
+          "text": "                            signal_type=\"chain_completed\","
+        },
+        {
+          "line": 1417,
+          "text": "                        )"
+        },
+        {
+          "line": 1418,
+          "text": "                        await _record_suppressed_ledger_emission("
+        },
+        {
+          "line": 1419,
+          "text": "                            db,"
+        },
+        {
+          "line": 1420,
+          "text": "                            settings,"
+        },
+        {
+          "line": 1421,
+          "text": "                            signal_type=\"chain_completed\","
+        },
+        {
+          "line": 1422,
+          "text": "                            token_id=c[\"token_id\"],"
+        },
+        {
+          "line": 1423,
+          "text": "                            combo_key=combo_key,"
+        },
+        {
+          "line": 1424,
+          "text": "                            suppression_reason=res.reason,"
+        },
+        {
+          "line": 1425,
+          "text": "                            price=None,"
+        },
+        {
+          "line": 1426,
+          "text": "                            signal_data={"
+        },
+        {
+          "line": 1427,
+          "text": "                                \"pattern\": c[\"pattern_name\"],"
+        },
+        {
+          "line": 1428,
+          "text": "                                \"boost\": c[\"conviction_boost\"],"
+        },
+        {
+          "line": 1429,
+          "text": "                            },"
+        },
+        {
+          "line": 1430,
+          "text": "                        )"
+        },
+        {
+          "line": 1478,
+          "text": "                        name=ct_name,"
+        },
+        {
+          "line": 1479,
+          "text": "                        chain=\"coingecko\","
+        },
+        {
+          "line": 1480,
+          "text": "                        signal_type=\"chain_completed\","
+        },
+        {
+          "line": 1481,
+          "text": "                        signal_data={"
+        },
+        {
+          "line": 1482,
+          "text": "                            \"pattern\": c[\"pattern_name\"],"
+        },
+        {
+          "line": 1483,
+          "text": "                            \"boost\": c[\"conviction_boost\"],"
+        },
+        {
+          "line": 1484,
+          "text": "                        },"
+        },
+        {
+          "line": 1485,
+          "text": "                        entry_price=chain_price,"
+        },
+        {
+          "line": 1486,
+          "text": "                        signal_combo=combo_key,"
+        },
+        {
+          "line": 1487,
+          "text": "                        expected_empty_metadata=ct_orphan,"
+        },
+        {
+          "line": 1488,
+          "text": "                    )"
+        },
+        {
+          "line": 1489,
+          "text": "                    if trade_id is not None:"
+        }
+      ]
+    },
+    "scout/outcome_ledger.py": {
+      "sha256": "0ae31d08de51677f3023a993263e494a2a989a62a49e551fb3f144bdc95aa566",
+      "excerpts": [
+        {
+          "line": 513,
+          "text": "        if price is None:"
+        },
+        {
+          "line": 514,
+          "text": "            anchor_age: float | None = None"
+        },
+        {
+          "line": 515,
+          "text": "        elif anchor_cache_age_seconds is not None:"
+        },
+        {
+          "line": 516,
+          "text": "            anchor_age = float(anchor_cache_age_seconds)"
+        },
+        {
+          "line": 517,
+          "text": "        else:"
+        },
+        {
+          "line": 518,
+          "text": "            anchor_age = 0.0"
+        },
+        {
+          "line": 519,
+          "text": "        # c2: enrollment outcome is stamped ON the ledger row so unrecorded"
+        },
+        {
+          "line": 520,
+          "text": "        # skips can never silently censor the missed-winner lane. Under the"
+        },
+        {
+          "line": 521,
+          "text": "        # evict-oldest-to-make-room semantics the new enrollment always"
+        },
+        {
+          "line": 522,
+          "text": "        # lands, so the stamp is binary here ('skipped_cap' stays reserved"
+        },
+        {
+          "line": 523,
+          "text": "        # in the CHECK for a future no-eviction policy)."
+        },
+        {
+          "line": 524,
+          "text": "        #"
+        },
+        {
+          "line": 525,
+          "text": "        # Coverage-gated enrollment (2026-07-03, condition (b) on #423->#421):"
+        },
+        {
+          "line": 526,
+          "text": "        # enroll ONLY tokens with NO LIVE in-DB price coverage. Coverage is"
+        },
+        {
+          "line": 527,
+          "text": "        # LIVENESS, not shape/existence: a token is covered iff a FRESH price"
+        },
+        {
+          "line": 637,
+          "text": ""
+        },
+        {
+          "line": 638,
+          "text": ""
+        },
+        {
+          "line": 639,
+          "text": "async def _price_at_or_after("
+        },
+        {
+          "line": 640,
+          "text": "    db: Database,"
+        },
+        {
+          "line": 641,
+          "text": "    token_id: str,"
+        },
+        {
+          "line": 642,
+          "text": "    deadline: datetime,"
+        },
+        {
+          "line": 643,
+          "text": "    max_cache_lateness: timedelta,"
+        },
+        {
+          "line": 644,
+          "text": ") -> float | None:"
+        },
+        {
+          "line": 645,
+          "text": "    \"\"\"First in-DB price observed at/after *deadline* for *token_id*."
+        },
+        {
+          "line": 646,
+          "text": ""
+        },
+        {
+          "line": 647,
+          "text": "    Preference order (in-DB only \u2014 no external calls):"
+        },
+        {
+          "line": 648,
+          "text": "    1. volume_history_cg \u2014 true historical observations; the first row at or"
+        },
+        {
+          "line": 649,
+          "text": "       after the deadline is the horizon price, however late the labeler runs."
+        },
+        {
+          "line": 650,
+          "text": "    2. price_cache \u2014 holds only the CURRENT observation, so it is accepted"
+        },
+        {
+          "line": 651,
+          "text": "       only when observed within *max_cache_lateness* after the deadline"
+        },
+        {
+          "line": 652,
+          "text": "       (otherwise it would inject a far-future price into an old horizon)."
+        },
+        {
+          "line": 653,
+          "text": "    \"\"\""
+        },
+        {
+          "line": 654,
+          "text": "    conn = db._conn"
+        },
+        {
+          "line": 655,
+          "text": "    cur = await conn.execute("
+        },
+        {
+          "line": 656,
+          "text": "        \"SELECT price, recorded_at FROM volume_history_cg \""
+        },
+        {
+          "line": 657,
+          "text": "        \"WHERE coin_id = ? AND recorded_at >= ? \""
+        },
+        {
+          "line": 658,
+          "text": "        \"AND price IS NOT NULL AND price > 0 \""
+        },
+        {
+          "line": 659,
+          "text": "        \"ORDER BY recorded_at ASC LIMIT 1\","
+        },
+        {
+          "line": 660,
+          "text": "        (token_id, deadline.isoformat()),"
+        },
+        {
+          "line": 661,
+          "text": "    )"
+        },
+        {
+          "line": 662,
+          "text": "    row = await cur.fetchone()"
+        },
+        {
+          "line": 663,
+          "text": "    if row:"
+        },
+        {
+          "line": 664,
+          "text": "        return float(row[0])"
+        },
+        {
+          "line": 665,
+          "text": ""
+        },
+        {
+          "line": 666,
+          "text": "    cur = await conn.execute("
+        },
+        {
+          "line": 667,
+          "text": "        \"SELECT current_price, updated_at FROM price_cache \""
+        },
+        {
+          "line": 668,
+          "text": "        \"WHERE coin_id = ? AND updated_at >= ? \""
+        },
+        {
+          "line": 669,
+          "text": "        \"AND current_price IS NOT NULL AND current_price > 0\","
+        },
+        {
+          "line": 670,
+          "text": "        (token_id, deadline.isoformat()),"
+        },
+        {
+          "line": 671,
+          "text": "    )"
+        },
+        {
+          "line": 672,
+          "text": "    row = await cur.fetchone()"
+        },
+        {
+          "line": 673,
+          "text": "    if row:"
+        },
+        {
+          "line": 674,
+          "text": "        observed = _parse_ts(row[1])"
+        },
+        {
+          "line": 675,
+          "text": "        if observed is not None and observed - deadline <= max_cache_lateness:"
+        },
+        {
+          "line": 676,
+          "text": "            return float(row[0])"
+        },
+        {
+          "line": 677,
+          "text": "    return None"
+        },
+        {
+          "line": 678,
+          "text": ""
+        },
+        {
+          "line": 679,
+          "text": ""
+        },
+        {
+          "line": 680,
+          "text": "async def _peak_price_in_window("
+        },
+        {
+          "line": 681,
+          "text": "    db: Database, token_id: str, start: datetime, end: datetime"
+        },
+        {
+          "line": 682,
+          "text": ") -> float | None:"
+        },
+        {
+          "line": 683,
+          "text": "    \"\"\"MAX(volume_history_cg.price) in [start, end] \u2014 raw price, not a return,"
+        },
+        {
+          "line": 684,
+          "text": "    so it labels even when price_at_emission is NULL.\"\"\""
+        },
+        {
+          "line": 685,
+          "text": "    conn = db._conn"
+        },
+        {
+          "line": 691,
+          "text": "    )"
+        },
+        {
+          "line": 692,
+          "text": "    row = await cur.fetchone()"
+        },
+        {
+          "line": 693,
+          "text": "    return float(row[0]) if row and row[0] is not None else None"
+        },
+        {
+          "line": 694,
+          "text": ""
+        },
+        {
+          "line": 695,
+          "text": ""
+        },
+        {
+          "line": 696,
+          "text": "async def label_pending(db: Database, settings: Any) -> dict[str, Any]:"
+        },
+        {
+          "line": 697,
+          "text": "    \"\"\"Per-cycle labeler: resolve forward returns for pending/partial rows."
+        },
+        {
+          "line": 698,
+          "text": ""
+        },
+        {
+          "line": 699,
+          "text": "    Called from the hourly maintenance pass. For each of the oldest"
+        },
+        {
+          "line": 700,
+          "text": "    ``LEDGER_LABEL_BATCH_MAX`` pending/partial rows, every horizon whose"
+        },
+        {
+          "line": 701,
+          "text": "    deadline (emitted_at + horizon) has passed is labeled with"
+        },
+        {
+          "line": 702,
+          "text": "    ``price_at_horizon / price_at_emission - 1`` using the first in-DB price"
+        },
+        {
+          "line": 762,
+          "text": "                    await conn.execute("
+        },
+        {
+          "line": 763,
+          "text": "                        \"UPDATE signal_outcome_ledger \""
+        },
+        {
+          "line": 764,
+          "text": "                        \"SET label_status = 'unlabelable', labeled_at = ? \""
+        },
+        {
+          "line": 765,
+          "text": "                        \"WHERE id = ?\","
+        },
+        {
+          "line": 766,
+          "text": "                        (now.isoformat(), row[\"id\"]),"
+        },
+        {
+          "line": 767,
+          "text": "                    )"
+        },
+        {
+          "line": 768,
+          "text": "                    stats[\"n_unlabelable\"] += 1"
+        },
+        {
+          "line": 769,
+          "text": "                    continue"
+        },
+        {
+          "line": 770,
+          "text": ""
+        },
+        {
+          "line": 771,
+          "text": "                base = row[\"price_at_emission\"]"
+        },
+        {
+          "line": 772,
+          "text": "                base = float(base) if base is not None and base > 0 else None"
+        },
+        {
+          "line": 773,
+          "text": "                updates: dict[str, float] = {}"
+        },
+        {
+          "line": 801,
+          "text": "                )"
+        },
+        {
+          "line": 802,
+          "text": ""
+        },
+        {
+          "line": 803,
+          "text": "                set_parts = [f\"{col} = ?\" for col in updates]"
+        },
+        {
+          "line": 804,
+          "text": "                params: list[Any] = list(updates.values())"
+        },
+        {
+          "line": 805,
+          "text": "                if final:"
+        },
+        {
+          "line": 806,
+          "text": "                    status = \"complete\" if any_label else \"unlabelable\""
+        },
+        {
+          "line": 807,
+          "text": "                    set_parts += [\"label_status = ?\", \"labeled_at = ?\"]"
+        },
+        {
+          "line": 808,
+          "text": "                    params += [status, now.isoformat()]"
+        },
+        {
+          "line": 809,
+          "text": "                    stats["
+        },
+        {
+          "line": 810,
+          "text": "                        \"n_complete\" if status == \"complete\" else \"n_unlabelable\""
+        },
+        {
+          "line": 811,
+          "text": "                    ] += 1"
+        },
+        {
+          "line": 812,
+          "text": "                elif any_label and row[\"label_status\"] == \"pending\":"
+        },
+        {
+          "line": 813,
+          "text": "                    set_parts.append(\"label_status = 'partial'\")"
+        },
+        {
+          "line": 814,
+          "text": ""
+        },
+        {
+          "line": 815,
+          "text": "                if set_parts:"
+        }
+      ]
+    },
+    "scout/config.py": {
+      "sha256": "a4a89c4b895cd7ccf9c9061c3dc31feaf15019c2aae0ec3cddd4d867d5b441f1",
+      "excerpts": [
+        {
+          "line": 90,
+          "text": "    # Max pending/partial rows examined per hourly labeling pass \u2014 bounds the"
+        },
+        {
+          "line": 91,
+          "text": "    # per-pass read/write load on the hot-loop DB connection."
+        },
+        {
+          "line": 92,
+          "text": "    LEDGER_LABEL_BATCH_MAX: int = Field(default=500, ge=1, le=100_000)"
+        },
+        {
+          "line": 93,
+          "text": "    # price_cache fallback freshness: a cache row may stand in for a horizon"
+        },
+        {
+          "line": 94,
+          "text": "    # price only if observed within this many minutes AFTER the horizon"
+        },
+        {
+          "line": 95,
+          "text": "    # deadline (volume_history_cg rows are preferred and un-bounded \u2014 they are"
+        },
+        {
+          "line": 96,
+          "text": "    # true historical observations). 120 min covers the hourly pass + margin;"
+        },
+        {
+          "line": 97,
+          "text": "    # le = 7 days (the longest horizon)."
+        },
+        {
+          "line": 98,
+          "text": "    LEDGER_PRICE_CACHE_MAX_LATENESS_MINUTES: int = Field(default=120, ge=1, le=10_080)"
+        },
+        {
+          "line": 99,
+          "text": "    # Enrollment-at-emission: emissions whose token has no LIVE in-DB price"
+        },
+        {
+          "line": 100,
+          "text": "    # coverage (all gated_out_samples + priceless alerts) enroll the token"
+        },
+        {
+          "line": 101,
+          "text": "    # into a forward-polling set so the labeler can price it. TTL matches"
+        },
+        {
+          "line": 102,
+          "text": "    # the 7d labeling window; cap bounds the per-cycle polling cost"
+        },
+        {
+          "line": 103,
+          "text": "    # (oldest-expire-first eviction)."
+        },
+        {
+          "line": 104,
+          "text": "    LEDGER_ENROLLMENT_TTL_DAYS: int = Field(default=7, ge=1, le=90)"
+        },
+        {
+          "line": 105,
+          "text": "    LEDGER_ENROLLMENT_MAX_ACTIVE: int = Field(default=200, ge=1, le=10_000)"
+        },
+        {
+          "line": 106,
+          "text": "    # Coverage = LIVENESS, not shape (2026-07-03 operator condition (b) on the"
+        },
+        {
+          "line": 107,
+          "text": "    # #423->#421 pair). A gated_out / priceless emission is treated as"
+        },
+        {
+          "line": 825,
+          "text": "    # check_trade_decision_events uses 15min; evaluator's per-trade dedup is"
+        },
+        {
+          "line": 826,
+          "text": "    # bounded by PAPER_MAX_DURATION_HOURS=48h). 45d default clears them all."
+        },
+        {
+          "line": 827,
+          "text": "    TRADE_DECISION_EVENTS_RETENTION_DAYS: int = Field(default=45, ge=7)"
+        },
+        {
+          "line": 828,
+          "text": "    # volume_history_cg retention. ONE owner: Database.prune_volume_history_cg,"
+        },
+        {
+          "line": 829,
+          "text": "    # driven from main._run_hourly_maintenance. The spike detector's duplicate"
+        },
+        {
+          "line": 830,
+          "text": "    # hardcoded `-7 days` prune has been removed (scout/spikes/detector.py)."
+        },
+        {
+          "line": 831,
+          "text": "    #"
+        },
+        {
+          "line": 832,
+          "text": "    # The previous comment here claimed 7d \"matches the longest reader horizon"
+        },
+        {
+          "line": 833,
+          "text": "    # (ledger r7d labeling + spike 7d average) \u2014 harmless duplication\". That was"
+        },
+        {
+          "line": 834,
+          "text": "    # FALSE, because it omitted LABEL-PROCESSING LATENESS."
+        },
+        {
+          "line": 835,
+          "text": "    #"
+        },
+        {
+          "line": 836,
+          "text": "    # The ledger labeler computes peak7d as MAX(price) over the CLOSED window"
+        },
+        {
+          "line": 852,
+          "text": "    # whole day. Do NOT lower either value without re-running that measurement."
+        },
+        {
+          "line": 853,
+          "text": "    LEDGER_LABEL_MAX_LATENESS_DAYS: int = Field(default=3, ge=1)"
+        },
+        {
+          "line": 854,
+          "text": "    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=10, ge=8)"
+        },
+        {
+          "line": 855,
+          "text": ""
+        },
+        {
+          "line": 856,
+          "text": "    # DASH-05 moved-already / too-late postmortem recorder. FORWARD-recording"
+        },
+        {
+          "line": 857,
+          "text": "    # only: gainers_snapshots has a 7-day retention so pre-run T-minus evidence"
+        },
+        {
+          "line": 858,
+          "text": "    # for past monsters (ANSEM +3,354% at TOO_LATE/score 0) is already gone \u2014"
+        },
+        {
+          "line": 859,
+          "text": "    # backfill is impossible. Flag-gated OFF: when False the recorder never runs"
+        },
+        {
+          "line": 860,
+          "text": "    # and the pipeline is byte-identical (no scorer/gate/trade/alert change). The"
+        },
+        {
+          "line": 861,
+          "text": "    # detection predicate MIRRORS the dashboard's _trade_window_state \"late\" state"
+        },
+        {
+          "line": 862,
+          "text": "    # (dashboard/db.py): an OPEN paper trade whose pct-from-entry exceeds"
+        },
+        {
+          "line": 863,
+          "text": "    # MOVED_ALREADY_RUN_PCT_THRESHOLD. Dedup is per token via a UNIQUE(token_id)"
+        }
+      ]
+    },
+    "scout/main.py": {
+      "sha256": "da988cf7613f899ddfbe61424d402b67ff519ba456708ab446a10921e4f741e5",
+      "excerpts": [
+        {
+          "line": 1737,
+          "text": "    # part of the table's \u00a712a freshness surface."
+        },
+        {
+          "line": 1738,
+          "text": "    try:"
+        },
+        {
+          "line": 1739,
+          "text": "        await label_pending(db, settings)"
+        },
+        {
+          "line": 1740,
+          "text": "    except Exception:"
+        },
+        {
+          "line": 1741,
+          "text": "        logger.exception(\"ledger_label_pass_failed\")"
+        },
+        {
+          "line": 1742,
+          "text": ""
+        },
+        {
+          "line": 1743,
+          "text": "    # Prune old candidates if DB > 500MB"
+        },
+        {
+          "line": 1744,
+          "text": "    try:"
+        },
+        {
+          "line": 1745,
+          "text": "        db_size = settings.DB_PATH.stat().st_size if settings.DB_PATH.exists() else 0"
+        },
+        {
+          "line": 1746,
+          "text": "        if db_size > 500_000_000:"
+        },
+        {
+          "line": 1747,
+          "text": "            pruned = await db.prune_old_candidates(keep_days=7)"
+        },
+        {
+          "line": 1748,
+          "text": "            logger.info("
+        },
+        {
+          "line": 1858,
+          "text": "    # covers every consumer lookback (see TRADE_DECISION_EVENTS_RETENTION_DAYS)."
+        },
+        {
+          "line": 1859,
+          "text": "    try:"
+        },
+        {
+          "line": 1860,
+          "text": "        pruned_tde = await db.prune_trade_decision_events("
+        },
+        {
+          "line": 1861,
+          "text": "            keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS"
+        },
+        {
+          "line": 1862,
+          "text": "        )"
+        },
+        {
+          "line": 1863,
+          "text": "        logger.info("
+        },
+        {
+          "line": 1864,
+          "text": "            \"trade_decision_events_pruned\","
+        },
+        {
+          "line": 1865,
+          "text": "            rows_deleted=pruned_tde,"
+        },
+        {
+          "line": 1866,
+          "text": "            keep_days=settings.TRADE_DECISION_EVENTS_RETENTION_DAYS,"
+        },
+        {
+          "line": 1867,
+          "text": "        )"
+        },
+        {
+          "line": 1868,
+          "text": "    except Exception:"
+        },
+        {
+          "line": 1869,
+          "text": "        logger.exception(\"trade_decision_events_prune_failed\")"
+        },
+        {
+          "line": 1874,
+          "text": "    # the 7d cutoff duplicates the detector's own \u2014 harmless when the flag is on."
+        },
+        {
+          "line": 1875,
+          "text": "    try:"
+        },
+        {
+          "line": 1876,
+          "text": "        pruned_vh = await db.prune_volume_history_cg("
+        },
+        {
+          "line": 1877,
+          "text": "            keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS"
+        },
+        {
+          "line": 1878,
+          "text": "        )"
+        },
+        {
+          "line": 1879,
+          "text": "        logger.info("
+        },
+        {
+          "line": 1880,
+          "text": "            \"volume_history_cg_pruned\","
+        },
+        {
+          "line": 1881,
+          "text": "            rows_deleted=pruned_vh,"
+        },
+        {
+          "line": 1882,
+          "text": "            keep_days=settings.VOLUME_HISTORY_CG_RETENTION_DAYS,"
+        },
+        {
+          "line": 1883,
+          "text": "        )"
+        },
+        {
+          "line": 1884,
+          "text": "    except Exception:"
+        },
+        {
+          "line": 1885,
+          "text": "        logger.exception(\"volume_history_cg_prune_failed\")"
+        }
+      ]
+    },
+    "scout/db.py": {
+      "sha256": "2644180e1dd9383771ea40cfa51cee324b23db22ea6105910ddd4605baf1031a",
+      "excerpts": [
+        {
+          "line": 2478,
+          "text": "                ON trending_comparisons(coin_id);"
+        },
+        {
+          "line": 2479,
+          "text": ""
+        },
+        {
+          "line": 2480,
+          "text": "            CREATE TABLE IF NOT EXISTS price_cache ("
+        },
+        {
+          "line": 2481,
+          "text": "                coin_id          TEXT PRIMARY KEY,"
+        },
+        {
+          "line": 2482,
+          "text": "                current_price    REAL,"
+        },
+        {
+          "line": 2483,
+          "text": "                price_change_24h REAL,"
+        },
+        {
+          "line": 2484,
+          "text": "                price_change_7d  REAL,"
+        },
+        {
+          "line": 2485,
+          "text": "                market_cap       REAL,"
+        },
+        {
+          "line": 2486,
+          "text": "                updated_at       TEXT NOT NULL"
+        },
+        {
+          "line": 2487,
+          "text": "            );"
+        },
+        {
+          "line": 2488,
+          "text": ""
+        },
+        {
+          "line": 2489,
+          "text": "            CREATE TABLE IF NOT EXISTS volume_history_cg ("
+        },
+        {
+          "line": 2490,
+          "text": "                id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        },
+        {
+          "line": 2491,
+          "text": "                coin_id TEXT NOT NULL,"
+        },
+        {
+          "line": 2492,
+          "text": "                symbol TEXT NOT NULL,"
+        },
+        {
+          "line": 2493,
+          "text": "                name TEXT NOT NULL,"
+        },
+        {
+          "line": 2494,
+          "text": "                volume_24h REAL NOT NULL,"
+        },
+        {
+          "line": 2495,
+          "text": "                market_cap REAL,"
+        },
+        {
+          "line": 2496,
+          "text": "                price REAL,"
+        },
+        {
+          "line": 2497,
+          "text": "                recorded_at TEXT NOT NULL,"
+        },
+        {
+          "line": 2498,
+          "text": "                created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+        },
+        {
+          "line": 11656,
+          "text": "                continue"
+        },
+        {
+          "line": 11657,
+          "text": "            await self._conn.execute("
+        },
+        {
+          "line": 11658,
+          "text": "                \"\"\"INSERT INTO price_cache"
+        },
+        {
+          "line": 11659,
+          "text": "                   (coin_id, current_price, price_change_24h, price_change_7d,"
+        },
+        {
+          "line": 11660,
+          "text": "                    market_cap, updated_at)"
+        },
+        {
+          "line": 11661,
+          "text": "                   VALUES (?, ?, ?, ?, ?, ?)"
+        },
+        {
+          "line": 11662,
+          "text": "                   ON CONFLICT(coin_id) DO UPDATE SET"
+        },
+        {
+          "line": 11663,
+          "text": "                     current_price = excluded.current_price,"
+        },
+        {
+          "line": 11664,
+          "text": "                     price_change_24h = excluded.price_change_24h,"
+        },
+        {
+          "line": 11665,
+          "text": "                     price_change_7d = COALESCE("
+        },
+        {
+          "line": 11666,
+          "text": "                       excluded.price_change_7d, price_cache.price_change_7d),"
+        },
+        {
+          "line": 11667,
+          "text": "                     market_cap = excluded.market_cap,"
+        },
+        {
+          "line": 11970,
+          "text": "        return total"
+        },
+        {
+          "line": 11971,
+          "text": ""
+        },
+        {
+          "line": 11972,
+          "text": "    async def prune_trade_decision_events(self, *, keep_days: int) -> int:"
+        },
+        {
+          "line": 11973,
+          "text": "        \"\"\"Delete ``trade_decision_events`` rows older than ``keep_days`` (INF-02)."
+        },
+        {
+          "line": 11974,
+          "text": ""
+        },
+        {
+          "line": 11975,
+          "text": "        ``created_at`` is written via ``datetime.now(timezone.utc).isoformat()``"
+        },
+        {
+          "line": 11976,
+          "text": "        (scout/trading/decision_events.py), so the isoformat cutoff compares"
+        },
+        {
+          "line": 11977,
+          "text": "        order-correctly. Returns rowcount."
+        },
+        {
+          "line": 11978,
+          "text": "        \"\"\""
+        },
+        {
+          "line": 11979,
+          "text": "        if self._conn is None:"
+        },
+        {
+          "line": 11980,
+          "text": "            raise RuntimeError(\"Database not initialized\")"
+        },
+        {
+          "line": 11981,
+          "text": "        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()"
+        },
+        {
+          "line": 11987,
+          "text": "        return cur.rowcount or 0"
+        },
+        {
+          "line": 11988,
+          "text": ""
+        },
+        {
+          "line": 11989,
+          "text": "    async def prune_volume_history_cg(self, *, keep_days: int) -> int:"
+        },
+        {
+          "line": 11990,
+          "text": "        \"\"\"Delete ``volume_history_cg`` rows older than ``keep_days`` (INF-06)."
+        },
+        {
+          "line": 11991,
+          "text": ""
+        },
+        {
+          "line": 11992,
+          "text": "        Independent of VOLUME_SPIKE_ENABLED (which gates the detector's own 7d"
+        },
+        {
+          "line": 11993,
+          "text": "        prune). ``recorded_at`` is written via ``.isoformat()``"
+        },
+        {
+          "line": 11994,
+          "text": "        (scout/spikes/detector.py), so the isoformat cutoff compares"
+        },
+        {
+          "line": 11995,
+          "text": "        order-correctly. Returns rowcount."
+        },
+        {
+          "line": 11996,
+          "text": "        \"\"\""
+        },
+        {
+          "line": 11997,
+          "text": "        if self._conn is None:"
+        },
+        {
+          "line": 11998,
+          "text": "            raise RuntimeError(\"Database not initialized\")"
+        }
+      ]
+    },
+    "scout/spikes/detector.py": {
+      "sha256": "6339c6b878afa7bcc833cabb7df3b5d7f8fca8c439bd0634104cd1f47c871789",
+      "excerpts": [
+        {
+          "line": 16,
+          "text": ""
+        },
+        {
+          "line": 17,
+          "text": ""
+        },
+        {
+          "line": 18,
+          "text": "async def record_volume(db: \"Database\", raw_coins: list[dict]) -> int:"
+        },
+        {
+          "line": 19,
+          "text": "    \"\"\"Store volume snapshot from CoinGecko /coins/markets response."
+        },
+        {
+          "line": 20,
+          "text": ""
+        },
+        {
+          "line": 21,
+          "text": "    Returns the number of rows inserted. Does NOT prune \u2014 volume_history_cg"
+        },
+        {
+          "line": 22,
+          "text": "    retention is owned solely by Database.prune_volume_history_cg (see below)."
+        },
+        {
+          "line": 23,
+          "text": "    \"\"\""
+        },
+        {
+          "line": 24,
+          "text": "    if db._conn is None:"
+        },
+        {
+          "line": 25,
+          "text": "        raise RuntimeError(\"Database not initialized.\")"
+        },
+        {
+          "line": 26,
+          "text": ""
+        },
+        {
+          "line": 27,
+          "text": "    now = datetime.now(timezone.utc).isoformat()"
+        },
+        {
+          "line": 35,
+          "text": "            continue"
+        },
+        {
+          "line": 36,
+          "text": "        await db._conn.execute("
+        },
+        {
+          "line": 37,
+          "text": "            \"\"\"INSERT INTO volume_history_cg"
+        },
+        {
+          "line": 38,
+          "text": "               (coin_id, symbol, name, volume_24h, market_cap, price, recorded_at)"
+        },
+        {
+          "line": 39,
+          "text": "               VALUES (?, ?, ?, ?, ?, ?, ?)\"\"\","
+        },
+        {
+          "line": 40,
+          "text": "            ("
+        },
+        {
+          "line": 41,
+          "text": "                coin_id,"
+        },
+        {
+          "line": 42,
+          "text": "                (coin.get(\"symbol\") or \"???\").upper(),"
+        },
+        {
+          "line": 43,
+          "text": "                coin.get(\"name\") or \"Unknown\","
+        },
+        {
+          "line": 44,
+          "text": "                float(volume),"
+        },
+        {
+          "line": 45,
+          "text": "                coin.get(\"market_cap\"),"
+        },
+        {
+          "line": 46,
+          "text": "                coin.get(\"current_price\"),"
+        },
+        {
+          "line": 47,
+          "text": "                now,"
+        },
+        {
+          "line": 48,
+          "text": "            ),"
+        },
+        {
+          "line": 49,
+          "text": "        )"
+        },
+        {
+          "line": 50,
+          "text": "        count += 1"
+        },
+        {
+          "line": 51,
+          "text": ""
+        },
+        {
+          "line": 52,
+          "text": "    if count:"
+        },
+        {
+          "line": 53,
+          "text": "        await db._conn.commit()"
+        },
+        {
+          "line": 54,
+          "text": ""
+        },
+        {
+          "line": 55,
+          "text": "    # volume_history_cg retention is NOT pruned here. It is owned by exactly one"
+        },
+        {
+          "line": 251,
+          "text": "            \"price_change_24h\": coin.get(\"price_change_percentage_24h\") or 0,"
+        },
+        {
+          "line": 252,
+          "text": "            \"market_cap\": mcap,"
+        },
+        {
+          "line": 253,
+          "text": "            \"current_price\": coin.get(\"current_price\"),"
+        },
+        {
+          "line": 254,
+          "text": "            \"volume_24h\": coin.get(\"total_volume\") or 0,"
+        },
+        {
+          "line": 255,
+          "text": "        }"
+        },
+        {
+          "line": 256,
+          "text": ""
+        },
+        {
+          "line": 257,
+          "text": "        # Persist to momentum_7d table"
+        },
+        {
+          "line": 258,
+          "text": "        await db._conn.execute("
+        },
+        {
+          "line": 259,
+          "text": "            \"\"\"INSERT INTO momentum_7d"
+        },
+        {
+          "line": 260,
+          "text": "               (coin_id, symbol, name, price_change_7d, price_change_24h,"
+        },
+        {
+          "line": 261,
+          "text": "                market_cap, current_price, volume_24h, detected_at)"
+        },
+        {
+          "line": 262,
+          "text": "               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\"\"\","
+        },
+        {
+          "line": 515,
+          "text": "                or 0,"
+        },
+        {
+          "line": 516,
+          "text": "                \"market_cap\": mcap,"
+        },
+        {
+          "line": 517,
+          "text": "                \"current_price\": _safe_float(coin.get(\"current_price\")),"
+        },
+        {
+          "line": 518,
+          "text": "                \"volume_24h\": volume,"
+        },
+        {
+          "line": 519,
+          "text": "                \"also_in_momentum_7d\": also_in_momentum,"
+        },
+        {
+          "line": 520,
+          "text": "            }"
+        },
+        {
+          "line": 521,
+          "text": ""
+        },
+        {
+          "line": 522,
+          "text": "            await db._conn.execute("
+        },
+        {
+          "line": 523,
+          "text": "                \"\"\"INSERT INTO slow_burn_candidates"
+        },
+        {
+          "line": 524,
+          "text": "                   (coin_id, symbol, name, price_change_7d, price_change_1h,"
+        },
+        {
+          "line": 525,
+          "text": "                    price_change_24h, market_cap, current_price, volume_24h,"
+        },
+        {
+          "line": 526,
+          "text": "                    also_in_momentum_7d, detected_at)"
+        }
+      ]
+    }
+  }
+}

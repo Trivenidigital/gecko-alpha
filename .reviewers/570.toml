@@ -1,0 +1,8 @@
+# PR570 is evidence-only documentation. No watched production/test delta.
+# Empty clearance table is deliberate: no four-vector code review is claimed.
+# Two independent documentation reviews are recorded in the session report.
+pr = 570
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [".claude", ".github", "Dockerfile", "cron", "dashboard", "docker-compose.yml", "ops", "pyproject.toml", "scout", "scripts", "start.sh", "systemd", "tests", "uv.lock"]
+[clearances]

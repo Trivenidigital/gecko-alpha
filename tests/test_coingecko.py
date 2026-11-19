@@ -7,6 +7,7 @@ import aiohttp
 from aioresponses import aioresponses
 
 from scout.ingestion import coingecko as cg_module
+from scout.coingecko_budget import BUCKET_DISCOVERY
 from scout.ingestion.coingecko import (
     fetch_top_movers,
     fetch_trending,
@@ -204,7 +205,7 @@ async def test_fetch_trending_hydration_failure_keeps_rank_without_fake_mcap(
 
 @pytest.mark.asyncio
 async def test_429_enters_global_cooldown_without_retry_amplification(
-    patch_module_sleep,
+    patch_module_sleep, settings_factory
 ):
     """A 429 should not be retried inside the same cycle.
 
@@ -218,7 +219,12 @@ async def test_429_enters_global_cooldown_without_retry_amplification(
         mocked.get(MARKETS_PATTERN, status=429)
         mocked.get(MARKETS_PATTERN, payload=COINS_MARKETS_RESPONSE)
         async with aiohttp.ClientSession() as session:
-            data = await _get_with_backoff(session, f"{CG_BASE}/coins/markets")
+            data = await _get_with_backoff(
+                session,
+                f"{CG_BASE}/coins/markets",
+                bucket=BUCKET_DISCOVERY,
+                settings=settings_factory(),
+            )
 
     assert data is None
     assert len(mocked.requests) == 1
@@ -688,44 +694,72 @@ async def test_fetch_trending_outage_returns_empty(settings_factory):
 
 DEEP_VOLUME_PAYLOAD = [
     {  # in $500K-$10M band, vol>=100K, vol/mcap>=0.03, 24h>=3% -> ACCEPTED
-        "id": "good-band", "symbol": "gb", "name": "GoodBand",
-        "market_cap": 5_000_000, "total_volume": 1_000_000, "current_price": 0.5,
+        "id": "good-band",
+        "symbol": "gb",
+        "name": "GoodBand",
+        "market_cap": 5_000_000,
+        "total_volume": 1_000_000,
+        "current_price": 0.5,
         "price_change_percentage_1h_in_currency": 6.0,
         "price_change_percentage_24h": 5.0,
     },
     {  # mcap > $10M target ceiling -> rejected
-        "id": "too-big", "symbol": "tb", "name": "TooBig",
-        "market_cap": 50_000_000, "total_volume": 5_000_000, "current_price": 2.0,
+        "id": "too-big",
+        "symbol": "tb",
+        "name": "TooBig",
+        "market_cap": 50_000_000,
+        "total_volume": 5_000_000,
+        "current_price": 2.0,
         "price_change_percentage_1h_in_currency": 4.0,
         "price_change_percentage_24h": 6.0,
     },
     {  # mcap < $500K -> rejected
-        "id": "too-small", "symbol": "ts", "name": "TooSmall",
-        "market_cap": 200_000, "total_volume": 300_000, "current_price": 0.1,
+        "id": "too-small",
+        "symbol": "ts",
+        "name": "TooSmall",
+        "market_cap": 200_000,
+        "total_volume": 300_000,
+        "current_price": 0.1,
         "price_change_percentage_1h_in_currency": 10.0,
         "price_change_percentage_24h": 8.0,
     },
     {  # volume < $100K -> rejected
-        "id": "low-vol", "symbol": "lv", "name": "LowVol",
-        "market_cap": 5_000_000, "total_volume": 50_000, "current_price": 0.5,
+        "id": "low-vol",
+        "symbol": "lv",
+        "name": "LowVol",
+        "market_cap": 5_000_000,
+        "total_volume": 50_000,
+        "current_price": 0.5,
         "price_change_percentage_1h_in_currency": 4.0,
         "price_change_percentage_24h": 5.0,
     },
     {  # vol/mcap = 0.024 < 0.03 -> rejected
-        "id": "low-ratio", "symbol": "lr", "name": "LowRatio",
-        "market_cap": 5_000_000, "total_volume": 120_000, "current_price": 0.5,
+        "id": "low-ratio",
+        "symbol": "lr",
+        "name": "LowRatio",
+        "market_cap": 5_000_000,
+        "total_volume": 120_000,
+        "current_price": 0.5,
         "price_change_percentage_1h_in_currency": 4.0,
         "price_change_percentage_24h": 5.0,
     },
     {  # 24h change < 3% -> rejected
-        "id": "low-change", "symbol": "lc", "name": "LowChange",
-        "market_cap": 5_000_000, "total_volume": 1_000_000, "current_price": 0.5,
+        "id": "low-change",
+        "symbol": "lc",
+        "name": "LowChange",
+        "market_cap": 5_000_000,
+        "total_volume": 1_000_000,
+        "current_price": 0.5,
         "price_change_percentage_1h_in_currency": 1.0,
         "price_change_percentage_24h": 1.0,
     },
     {  # null mcap -> skipped + counted (null_mcap_skipped)
-        "id": "no-mcap", "symbol": "nm", "name": "NoMcap",
-        "market_cap": None, "total_volume": 1_000_000, "current_price": 0.5,
+        "id": "no-mcap",
+        "symbol": "nm",
+        "name": "NoMcap",
+        "market_cap": None,
+        "total_volume": 1_000_000,
+        "current_price": 0.5,
         "price_change_percentage_1h_in_currency": 5.0,
         "price_change_percentage_24h": 5.0,
     },

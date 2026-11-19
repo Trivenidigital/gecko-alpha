@@ -1,0 +1,35 @@
+# PR #599 — chore: reconcile prod release branch (77751890) into master.
+#
+# Docs-only merge commit (tasks/ only; no watched path differs from master).
+# Four independent vector reviewers cleared the merge commit below; the commit
+# adding this file changes only tasks/todo.md (superseded note) and this record.
+# Must land as a MERGE COMMIT so 77751890 becomes an ancestor of master.
+
+pr = 599
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "docker-compose.yml",
+    "gecko",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "5886df8508f6b9b395c3f3a556133b7c16a4b9f8"
+logic          = "5886df8508f6b9b395c3f3a556133b7c16a4b9f8"
+ops-safety     = "5886df8508f6b9b395c3f3a556133b7c16a4b9f8"
+silent-failure = "5886df8508f6b9b395c3f3a556133b7c16a4b9f8"

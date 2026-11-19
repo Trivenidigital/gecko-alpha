@@ -134,6 +134,12 @@ class TestHygieneRetentionBounds:
         assert s.TRADE_DECISION_EVENTS_RETENTION_DAYS == 7
 
     def test_volume_history_cg_retention_default(self, _min_env):
-        # INF-06: matches the spike detector's own 7d cutoff (harmless dup).
+        # Was 7, "matching the spike detector's own 7d cutoff (harmless dup)".
+        # That duplicate prune is removed and the claim was false: it omitted
+        # ledger label-processing lateness, so a 7d floor truncated the
+        # peak7d window [emitted, emitted+7d] from the left. Now
+        # LEDGER_R7D_HORIZON_DAYS (7) + LEDGER_LABEL_MAX_LATENESS_DAYS (3).
+        # See tests/test_volume_history_cg_retention_lateness.py.
         s = Settings()
-        assert s.VOLUME_HISTORY_CG_RETENTION_DAYS == 7
+        assert s.VOLUME_HISTORY_CG_RETENTION_DAYS == 10
+        assert s.LEDGER_LABEL_MAX_LATENESS_DAYS == 3

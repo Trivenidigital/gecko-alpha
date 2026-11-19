@@ -1,0 +1,45 @@
+# PR #600 — feat(gecko): Plan 3 — activation files, AI research/digest/scorecard, pre-soak tickets.
+#
+# Every mandatory vector was reviewed by an independent reviewer agent against
+# the LAST CODE COMMIT on the branch (c8c542f3); the commit adding this file is
+# record only, so no watched path moves.
+#
+# Review history (SDD ledger, session 2026-10-16): 13 per-task reviews (Tasks
+# 0–12) with scoped re-reviews and fix rounds (T0 ×3, T2 ×1, T3 ×1, T4/T7 ×1,
+# T5 ×1, T9 ×2, T10 ×2, T11 ×2 + minors, T12 ×1); then four vector reviews at
+# ae6993e1 (concurrency, logic, ops-safety, silent-failure) — outcomes recorded
+# in the ledger: findings at ae6993e1 → fix wave 1 (d8a3a284) → micro-wave 2
+# (985b2563, all four CLEAR) → final minors (c8c542f3, four scoped re-confirms).
+# Each clearance below was written AFTER that reviewer's verdict named the SHA.
+# `deploy` is added to `watch` because this PR introduces it.
+# Unfixed tickets are filed in docs/superpowers/plans/2026-10-09-gecko-core-package-followups.md.
+
+pr = 600
+record_version = 1
+
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+
+watch = [
+    ".claude",
+    ".github",
+    "Dockerfile",
+    "cron",
+    "dashboard",
+    "deploy",
+    "docker-compose.yml",
+    "gecko",
+    "ops",
+    "pyproject.toml",
+    "scout",
+    "scripts",
+    "start.sh",
+    "systemd",
+    "tests",
+    "uv.lock",
+]
+
+[clearances]
+concurrency    = "c8c542f309306e77aac63bf69bb9e3320be1a45a"
+logic          = "c8c542f309306e77aac63bf69bb9e3320be1a45a"
+ops-safety     = "c8c542f309306e77aac63bf69bb9e3320be1a45a"
+silent-failure = "c8c542f309306e77aac63bf69bb9e3320be1a45a"

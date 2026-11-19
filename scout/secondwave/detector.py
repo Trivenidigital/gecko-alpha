@@ -11,6 +11,7 @@ import structlog
 from scout import cg_api
 from scout.config import Settings
 from scout.db import Database
+from scout.coingecko_budget import BUCKET_DISCOVERY, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 from scout.secondwave.alerts import format_secondwave_alert
 
@@ -158,12 +159,30 @@ async def fetch_current_prices(
     try:
         # Honor the shared CoinGecko rate limit (25/min token bucket) so the
         # second-wave detector never bypasses the global budget.
+        # Governed: secondwave re-scans previously-alerted tokens — a
+        # DISCOVERY-class surface, so it stops with discovery rather than
+        # eating the reserve that keeps open positions re-priceable.
+        # The refusal check comes BEFORE the limiter so a disabled/exhausted
+        # discovery budget issues nothing and does not even consume a token.
+        _call = governed_cg_call(BUCKET_DISCOVERY, settings)
+        if not _call.allowed:
+            return {}
         await coingecko_limiter.acquire()
+        # Attempt recorded IMMEDIATELY before the request, after the limiter:
+        # counting at construction would invent an attempt for a cancellation
+        # while waiting here.
+        _call.issued()
+        # finish(None) is guaranteed below so a CONNECTION/TIMEOUT failure —
+        # which never reaches a response and so never reaches finish(status) —
+        # still records one attempt with zero credits. Counting only the
+        # request paths that produced a response makes a lane that is failing
+        # at the transport layer invisible in the attempt rate.
         async with session.get(
             f"{cg_api.base_url(settings.COINGECKO_API_TIER)}/coins/markets",
             params=params,
             headers=headers,
         ) as resp:
+            _call.finish(resp.status)
             if resp.status == 429:
                 await coingecko_limiter.report_429()
                 logger.warning(

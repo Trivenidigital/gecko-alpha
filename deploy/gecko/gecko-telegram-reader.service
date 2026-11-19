@@ -1,0 +1,31 @@
+# gecko Telegram channel reader (long-running). Installed but NOT enabled by
+# install.sh: the owner runs `python -m gecko tg-login` first (runbook).
+# Exit 2 = configuration or session-lock problem: do not restart-loop on it.
+[Unit]
+Description=gecko telegram reader
+After=network-online.target
+Wants=network-online.target
+OnFailure=codex-systemd-failure-alert@%n.service
+# RestartSec=30 never trips the default 5-in-10s limit: bound a crash loop at 5/h
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gecko-alpha
+EnvironmentFile=/root/gecko-alpha/.env.gecko
+Environment=GECKO_DB_PATH=/root/gecko-alpha/gecko.db
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/.local/bin/uv run --frozen python -m gecko telegram-reader
+Restart=always
+RestartSec=30
+RestartPreventExitStatus=2
+# systemd >= 254: an auto-restart does not pass through failed (no OnFailure page per
+# restart); older systemd warns about the unknown key and ignores it.
+RestartMode=direct
+Nice=5
+# bound a runaway job: the kernel OOM-kills it inside this cgroup (OnFailure pages)
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

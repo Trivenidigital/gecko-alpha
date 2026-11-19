@@ -1,0 +1,16 @@
+pr = 580
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# logic_review and ops_review independently approved the integrated candidate.
+# Both original review findings were reproduced, fixed, and re-reviewed.
+[clearances]
+concurrency = "ddf5d6cb3ba956d45d30109a4ce46d9769406f4f"
+logic = "ddf5d6cb3ba956d45d30109a4ce46d9769406f4f"
+ops-safety = "ddf5d6cb3ba956d45d30109a4ce46d9769406f4f"
+silent-failure = "ddf5d6cb3ba956d45d30109a4ce46d9769406f4f"

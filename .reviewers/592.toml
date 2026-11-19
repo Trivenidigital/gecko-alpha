@@ -1,0 +1,11 @@
+pr = 592
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh"]
+# Independent terminal reviews at08063e64: design_logic (logic/concurrency), design_ops (ops-safety/silent-failure).
+# Overflow and Linux mutation evidence folds independently approved; exact-head Linux CI remains separate.
+[clearances]
+concurrency = "08063e64d1cb4696654709fec29fcbe9627bd718"
+logic = "08063e64d1cb4696654709fec29fcbe9627bd718"
+ops-safety = "08063e64d1cb4696654709fec29fcbe9627bd718"
+silent-failure = "08063e64d1cb4696654709fec29fcbe9627bd718"

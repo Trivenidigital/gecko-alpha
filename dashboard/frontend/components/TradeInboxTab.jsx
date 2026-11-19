@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import TokenLink from './TokenLink'
 import ProvenanceExpander from './ProvenanceExpander'
+import LaneStatusAnnotations, { LaneStatusNotice, useLaneStatus } from './LaneStatusAnnotations'
 import { buildTradeDecisionBoard, canonicalScore } from './tradeDecisionBoard.js'
 import { formatDecisionReason } from './actionability.js'
 
@@ -134,7 +135,7 @@ function renderCounterRisk(row) {
   )
 }
 
-function renderDecisionRow(row, variant = '') {
+function renderDecisionRow(row, variant = '', laneStatus) {
   if (!row) return null
   const riskClass = `trade-decision-risk ${row.risk_tier || 'unknown'}`
   return (
@@ -147,6 +148,7 @@ function renderDecisionRow(row, variant = '') {
         {row.name ? <span>{row.name}</span> : null}
         <span className={riskClass}>{row.risk_tier || 'unknown'} risk</span>
       </div>
+      <LaneStatusAnnotations surfaces={row.surfaces} status={laneStatus} />
       <div className="trade-decision-label">{row.decision_label}</div>
       <div className="trade-decision-metrics">
         <span>{fmtPct(row.pct_from_entry)} from entry</span>
@@ -173,6 +175,7 @@ export default function TradeInboxTab() {
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(false)
   const [paused, setPaused] = useState(false)
+  const laneStatus = useLaneStatus(paused)
   const [limit, setLimit] = useState(10)
   const [seen, setSeen] = useState(loadSeen)
   const [dismissed, setDismissed] = useState({})
@@ -243,6 +246,7 @@ export default function TradeInboxTab() {
 
   return (
     <div>
+      <LaneStatusNotice />
       <div className="panel" style={{ marginBottom: 16 }}>
         <div className="panel-header" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--color-text-primary)' }}>Trade Inbox</span>
@@ -305,7 +309,7 @@ export default function TradeInboxTab() {
             <section className="trade-decision-lane">
               <div className="trade-decision-lane-title">Review first</div>
               {decisionBoard.primary ? (
-                renderDecisionRow(decisionBoard.primary, 'primary')
+                renderDecisionRow(decisionBoard.primary, 'primary', laneStatus)
               ) : (
                 <div className="trade-decision-empty">No clean review-now rows</div>
               )}
@@ -313,7 +317,7 @@ export default function TradeInboxTab() {
             <section className="trade-decision-lane">
               <div className="trade-decision-lane-title">Best watch</div>
               {decisionBoard.watchlist.length ? (
-                decisionBoard.watchlist.map(row => renderDecisionRow(row, `watch ${row.risk_tier || ''}`))
+                decisionBoard.watchlist.map(row => renderDecisionRow(row, `watch ${row.risk_tier || ''}`, laneStatus))
               ) : (
                 <div className="trade-decision-empty">No open-window watch rows</div>
               )}
@@ -321,7 +325,7 @@ export default function TradeInboxTab() {
             <section className="trade-decision-lane">
               <div className="trade-decision-lane-title">Too late</div>
               {decisionBoard.late.length ? (
-                decisionBoard.late.map(row => renderDecisionRow(row, 'late'))
+                decisionBoard.late.map(row => renderDecisionRow(row, 'late', laneStatus))
               ) : (
                 <div className="trade-decision-empty">No late runners in page</div>
               )}
@@ -387,6 +391,7 @@ export default function TradeInboxTab() {
                             <TokenLink tokenId={row.token_id} symbol={row.symbol || row.name} chain={row.chain} />
                             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>{rowStatus(row, wasSeen)}</div>
                             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>Source: {row.source_corpus || 'paper'}</div>
+                            <LaneStatusAnnotations surfaces={row.surfaces} status={laneStatus} />
                           </td>
                           <td style={{ fontWeight: 700 }}>{row.action_label}</td>
                           <td>{row.window_state}</td>

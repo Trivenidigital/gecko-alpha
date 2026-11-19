@@ -34,6 +34,7 @@ async def resolve_coin_platforms(
             coin_id=coin_id,
             api_key=getattr(settings, "COINGECKO_API_KEY", "") or "",
             api_tier=getattr(settings, "COINGECKO_API_TIER", "demo"),
+            settings=settings,
         )
     except Exception:
         logger.warning("dex_resolver_fetch_failed", coin_id=coin_id)

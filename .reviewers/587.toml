@@ -1,0 +1,12 @@
+# Independent review of 04a0d531: merge_structure logic/concurrency;
+# content_probe operations/silent-failure. Retained audit evidence only.
+pr = 587
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = ["scout", "scripts", "tests", ".github", "dashboard", "cron", "ops", "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "start.sh", "tasks/evidence/closeout_2026_09_14/dash11-retained-provenance-audit-20260914.py"]
+
+[clearances]
+concurrency = "04a0d531df290a462097265912f6838897966871"
+logic = "04a0d531df290a462097265912f6838897966871"
+ops-safety = "04a0d531df290a462097265912f6838897966871"
+silent-failure = "04a0d531df290a462097265912f6838897966871"

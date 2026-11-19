@@ -21,6 +21,7 @@ import structlog
 
 from scout import cg_api
 from scout.config import Settings
+from scout.coingecko_budget import BUCKET_OPERATIONAL, governed_cg_call
 from scout.ratelimit import coingecko_limiter
 from scout.safety import is_safe_strict
 from scout.social.telegram.models import (
@@ -85,8 +86,20 @@ async def _get_json(
     """
     try:
         is_coingecko = url.startswith(_cg_base(settings))
+        # Governed ONLY on the CoinGecko branch: this resolver also serves
+        # non-CG hosts, and recording those would inflate the CoinGecko ledger
+        # with spend CoinGecko never billed.
+        _call = None
         if is_coingecko:
+            _call = governed_cg_call(BUCKET_OPERATIONAL, settings)
+            if not _call.allowed:
+                # TRANSIENT, not AUTH_ERROR: the budget refusal is ours, not
+                # CoinGecko's, and it clears when the envelope resets.
+                return (_Outcome.TRANSIENT, None)
             await coingecko_limiter.acquire()
+            # AFTER the limiter: a cancellation while queued must not invent an
+            # attempt the provider never saw.
+            _call.issued()
             auth = cg_api.auth_query(
                 settings.COINGECKO_API_KEY, settings.COINGECKO_API_TIER
             )
@@ -95,6 +108,8 @@ async def _get_json(
         async with session.get(
             url, params=params, timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
+            if _call is not None:
+                _call.finish(resp.status)
             if resp.status == 200:
                 return (_Outcome.OK, await resp.json())
             if resp.status == 404:

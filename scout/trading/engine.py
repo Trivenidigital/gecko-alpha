@@ -22,7 +22,8 @@ from scout.outcome_ledger import (
     liquidity_from_signal_data,
     record_emission as _ledger_record_emission,
 )
-from scout.price_sources import resolve_price_source
+from scout.coingecko_budget import BUCKET_CRITICAL, budget as cg_budget
+from scout.price_sources import PRICE_SOURCE_CG_LANE, resolve_price_source
 from scout.trading.trust_sizing import resolve_paper_trust_size
 
 log = structlog.get_logger()
@@ -503,6 +504,83 @@ class TradingEngine:
         # PaperTrader.execute_buy's PaperTradeOpen boundary model refuses
         # price_source=None (belt and suspenders; the flag only controls
         # this gate's blocked-event telemetry path).
+
+        # --- step 0d: pricing LIVENESS (monthly-budget repair 2026-08-21) ---
+        # 0c above is a REGISTRY check — it admits a token iff it is CG-id-shaped
+        # ("the CG lanes serve it") or a price_cache row exists. That proves a
+        # source exists IN PRINCIPLE, never that one can price this token TODAY.
+        #
+        # Liveness is asked of the PROVIDER, not of price_cache. The first
+        # version of this gate read MAX(price_cache.updated_at) and assumed every
+        # writer was CoinGecko. That was false: outcome_ledger's
+        # _poll_dex_enrollments prices dex: tokens from DEXSCREENER and writes
+        # them through Database.cache_prices. So a fresh DexScreener row would
+        # have made a dead CoinGecko look alive and admitted a CG-only position
+        # nothing could re-price — and a stale price_cache would have blocked a
+        # perfectly healthy Dex-backed token for an unrelated provider's silence.
+        #
+        # cg_budget.last_success_at is set only by a CoinGecko HTTP 200, so it
+        # answers the question actually being asked.
+        #
+        # Applied only to CG-SERVED positions: `price_source` was resolved at 0c,
+        # so a dex: token is judged on its own source, not CoinGecko's health.
+        #
+        # Sits ABOVE the entry_price branch deliberately: the per-token
+        # `trade_skipped_stale_price` check below lives in the `else` arm, so it
+        # is BYPASSED whenever a caller supplies entry_price — which every
+        # production signal in scout/trading/signals.py does. A caller-supplied
+        # price says what the token was worth at SIGHTING; it says nothing about
+        # whether we can re-price it to EXIT.
+        if price_source == PRICE_SOURCE_CG_LANE and not cg_budget.cg_pricing_live(
+            self.settings
+        ):
+            log.warning(
+                "trade_skipped_pricing_not_live",
+                token_id=token_id,
+                signal_type=signal_type,
+                price_source=price_source,
+                last_cg_success_at=(
+                    cg_budget.last_success_at.isoformat()
+                    if cg_budget.last_success_at
+                    else None
+                ),
+                max_age_sec=self.settings.PAPER_OPEN_CG_PRICING_MAX_AGE_SEC,
+                hint=(
+                    "CoinGecko has not served a successful response recently, so "
+                    "exit monitoring could not re-price this position; opening "
+                    "would create an unmonitored trade that force-closes at a "
+                    "fabricated 0% PnL"
+                ),
+            )
+            await _emit_decision("blocked", "pricing_not_live")
+            return None
+
+        # The critical reserve being spent does not stop RE-PRICING (that would
+        # recreate the fabricated close), but it must stop taking on NEW
+        # re-pricing demand.
+        #
+        # Only for positions whose exit pricing CONSUMES that reserve. The
+        # registry also admits `price_cache_row` — a token served by some other
+        # writer — and blocking those on an exhausted CoinGecko reserve would be
+        # a false rejection: their exit pricing costs no CoinGecko credits, so
+        # opening them adds no demand to the lane that is exhausted.
+        if (
+            price_source == PRICE_SOURCE_CG_LANE
+            and cg_budget.critical_reserve_exceeded(self.settings)
+        ):
+            log.warning(
+                "trade_skipped_critical_reserve_exhausted",
+                token_id=token_id,
+                signal_type=signal_type,
+                critical_credits=cg_budget.credits(BUCKET_CRITICAL),
+                hint=(
+                    "the CoinGecko re-pricing reserve for this billing month is "
+                    "spent; opening more positions adds re-pricing demand that "
+                    "cannot be funded"
+                ),
+            )
+            await _emit_decision("blocked", "critical_reserve_exhausted")
+            return None
 
         # 1. Resolve current price -- prefer caller-supplied entry_price
         if entry_price is not None and entry_price > 0:

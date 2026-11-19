@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import StatBar from './components/StatBar.jsx'
 import PipelineFunnel from './components/PipelineFunnel.jsx'
 import DispatchFunnelPanel from './components/DispatchFunnelPanel.jsx'
+import SuppressionCohortHealthPanel from './components/SuppressionCohortHealthPanel.jsx'
 import CandidatesTable from './components/CandidatesTable.jsx'
 import SignalHitRate from './components/SignalHitRate.jsx'
 import AlertFeed from './components/AlertFeed.jsx'
@@ -20,6 +21,7 @@ import ConvictionTab from './components/ConvictionTab.jsx'
 import ProspectiveWatchlistTab from './components/ProspectiveWatchlistTab.jsx'
 import TodayFocusPanel from './components/TodayFocusPanel.jsx'
 import WhatChangedPanel from './components/WhatChangedPanel.jsx'
+import PostmortemHistoryTab from './components/PostmortemHistoryTab.jsx'
 
 const DEFAULT_STATUS = {
   pipeline_status: 'connecting',
@@ -85,6 +87,7 @@ const NAV_GROUPS = [
     tabs: [
       { id: 'trading', label: 'Trading' },
       { id: 'signal_trust', label: 'Signal Trust' },
+      { id: 'postmortem_history', label: 'Historical Postmortems' },
       { id: 'briefing', label: 'Briefing' },
     ],
   },
@@ -268,6 +271,7 @@ export default function App() {
       {activeTab === 'prospective' && <ProspectiveWatchlistTab />}
 
       {activeTab === 'signal_trust' && <SignalTrustTab />}
+      {activeTab === 'postmortem_history' && <PostmortemHistoryTab />}
 
       {activeTab === 'pipeline' && (
         <>
@@ -275,6 +279,7 @@ export default function App() {
           <PipelineFunnel funnel={funnel} />
 
           <DispatchFunnelPanel />
+          <SuppressionCohortHealthPanel />
 
           <div className="main-grid">
             <CandidatesTable candidates={candidates} />

@@ -1,0 +1,17 @@
+pr = 582
+record_version = 1
+required = ["concurrency", "logic", "ops-safety", "silent-failure"]
+watch = [
+    "scout", "scripts", "tests", ".github", "dashboard", "cron", "ops",
+    "systemd", ".claude", "pyproject.toml", "uv.lock", "Dockerfile",
+    "docker-compose.yml", "start.sh",
+]
+
+# Root relayed two terminal independent approvals, no folds:
+# postmortem_integration: structural/comparator; ops_review: CI/reproducibility.
+# Each verified 20 passing Windows tests and one OS symlink-permission skip.
+[clearances]
+concurrency = "fe034d3cb46841ebaaa2be9d5deb5fcfca777970"
+logic = "fe034d3cb46841ebaaa2be9d5deb5fcfca777970"
+ops-safety = "fe034d3cb46841ebaaa2be9d5deb5fcfca777970"
+silent-failure = "fe034d3cb46841ebaaa2be9d5deb5fcfca777970"

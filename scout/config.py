@@ -16,6 +16,19 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 # this only fixes the DEFAULT.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# The ledger's longest forward-return horizon, in days. MIRRORS the
+# schema-bound constants in scout/outcome_ledger.py — the ``r7d`` entry of
+# ``_HORIZONS`` and ``_FINALIZE_AFTER``, which are deliberately NOT Settings
+# fields (each maps to a fixed ledger column, so changing one needs a schema
+# migration).
+#
+# It is duplicated here rather than imported because scout.outcome_ledger
+# imports scout.db, which imports this module — importing back would be
+# circular. The duplication is pinned by a test that asserts the two agree, so
+# a future change to _FINALIZE_AFTER cannot silently desynchronise the
+# retention floor derived from it below.
+LEDGER_R7D_HORIZON_DAYS = 7
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -189,7 +202,170 @@ class Settings(BaseSettings):
     # held-position refresh can add 1 when enabled, and midcap scan averages
     # +1/min under its default 3-cycle cadence. Raise only with rate-budget
     # review against the 25/min limiter.
-    COINGECKO_VOLUME_SCAN_PAGES: int = 3
+    # 2026-08-21 monthly-budget repair: 3 -> 2. See
+    # tasks/plan_cg_monthly_budget_governor.md. The comment ABOVE reasons
+    # entirely about "the 25/min limiter" — a RATE constraint. The account also
+    # has a MONTHLY CREDIT ceiling (Basic = 100k/mo) which that model ignored
+    # entirely, and which is what actually ran out on 2026-08-21 at 100.0%.
+    # Restore to 3 only after a full measured billing month AND evidence of
+    # discovery-quality loss from 2 pages — not by spending headroom by default.
+    COINGECKO_VOLUME_SCAN_PAGES: int = 2
+
+    # CG DISCOVERY cadence, decoupled from the 60s main cycle. The free leading
+    # sources (DexScreener / GeckoTerminal) stay at 60s; only the paid CG
+    # discovery lanes are throttled, because CG is the LAGGING source.
+    #
+    # held-position pricing is deliberately NOT gated by this — it keeps its own
+    # HELD_POSITION_PRICE_REFRESH_INTERVAL_CYCLES cadence and its
+    # no_open_trades no-op, because it is the operationally critical surface
+    # (the live trailing-stop evaluator reads the price_cache rows it writes).
+    # 8, NOT the 5 of the original C profile. That figure was derived from the
+    # main discovery bundle ALONE (7 calls x 288 rounds/day = ~62k/month, said
+    # to fit the 65k envelope). It omitted every OTHER discovery-class CoinGecko
+    # consumer, all of which are enabled in prod today:
+    #
+    #   narrative observer /coins/categories        1,488/mo
+    #   narrative trending tracker                  1,488/mo
+    #   narrative predictor /coins/markets          2,976/mo
+    #   narrative evaluator (batch + fallback)      2,976/mo
+    #   counter detail /coins/{id}                  1,488/mo
+    #   secondwave /coins/markets                   1,488/mo
+    #                                              ----------
+    #                                              11,904/mo
+    #
+    # Under the CORRECTED model (bounded narrative fan-out + the evaluator,
+    # which the first model omitted entirely) the discovery structural maximum
+    # at every-8th is 55,924/month against the 65,000 envelope — 14.0% margin.
+    # every-5th remains demonstrably impossible; 7 was retired in favour of 8
+    # because the margin has to survive estimation error in bounds on loops.
+    #
+    # Hard caps protect against an estimation mistake; they are not a substitute
+    # for a planned workload that fits. Operator ratification is wanted for this
+    # deviation — set COINGECKO_DISCOVERY_INTERVAL_CYCLES=5 in .env to restore
+    # the original profile, accepting that discovery will then hit its envelope
+    # partway through the month and stop.
+    COINGECKO_DISCOVERY_INTERVAL_CYCLES: int = Field(default=8, ge=1, le=1440)
+
+    # Open-boundary pricing LIVENESS bound (monthly-budget repair 2026-08-21).
+    # The engine's step-0c gate is a REGISTRY check ("a CG lane serves this
+    # token_id shape"); this is the LIVENESS check ("CoinGecko ITSELF answered
+    # recently").
+    #
+    # Deliberately NOT price_cache freshness. price_cache is also written by
+    # DexScreener (outcome_ledger's dex enrollment poller), so its freshness
+    # says nothing about CoinGecko: a fresh Dex row would present a dead
+    # provider as alive. The signal is cg_budget.last_success_at, set only by a
+    # CoinGecko HTTP 200. With CG dark — exhausted monthly credits, a
+    # suspended account, a spent discovery envelope — a position can open and
+    # then be unmonitored (no trailing stop, no SL) until max_duration
+    # force-closes it at entry_price with a fabricated pnl_pct=0.
+    #
+    # Sized against the discovery cadence: at 8 cycles x 60s a discovery round
+    # runs every ~8 min, so 1800s is >3x headroom and will not trip on ordinary
+    # jitter or a couple of skipped rounds. Note this bounds PROVIDER silence,
+    # not price_cache staleness. Set to 0 to disable the gate entirely (NOT recommended — that
+    # restores the unmonitored-position class).
+    PAPER_OPEN_CG_PRICING_MAX_AGE_SEC: int = Field(default=1800, ge=0, le=86_400)
+
+    # -------- CoinGecko MONTHLY-CREDIT budget (2026-08-21 repair) --------
+    # The provider enforces calls/minute and calls/MONTH as INDEPENDENT limits.
+    # coingecko_limiter owns the first; these own the second. Modeling only the
+    # first is what exhausted the Basic plan's 100,000 credits at 100.0% on
+    # 2026-08-21 with 11 days to the reset.
+    #
+    # Partitioned rather than one shared pool, because a single number lets
+    # discovery spend the allowance that keeps held positions re-priceable —
+    # and an unpriceable open position is the GA-01 failure class.
+    #
+    #   discovery  65,000  <- corrected full model projects 55,428 (14.7% margin)
+    #   critical   30,000  <- reserved for held-position re-pricing
+    #   operational 5,000  <- reconciliation / margin for model error
+    #   ------------------
+    #   total     100,000
+    #
+    # v1 deliberately does NOT let unused critical reserve spill back into
+    # discovery. That optimization needs a measured billing month behind it.
+    COINGECKO_MONTHLY_CREDIT_ALLOWANCE: int = Field(default=100_000, ge=0)
+    COINGECKO_MONTHLY_DISCOVERY_CREDITS: int = Field(default=65_000, ge=0)
+    COINGECKO_MONTHLY_CRITICAL_CREDITS: int = Field(default=30_000, ge=0)
+    COINGECKO_MONTHLY_OPERATIONAL_CREDITS: int = Field(default=5_000, ge=0)
+    # Pace alarm: page when PROJECTED month-end consumption exceeds the
+    # allowance by this fraction. Projection beats absolute 50/75/90% marks —
+    # 60% spent on day 3 is an emergency, 60% on day 27 is fine.
+    COINGECKO_BUDGET_PACE_ALERT_RATIO: float = Field(default=1.10, ge=1.0, le=10.0)
+    # Durability window for the credit ledger, in CREDITS rather than minutes.
+    # Persisting only in the hourly pass would lose up to an hour of spend to a
+    # crash/deploy, and the process would come back believing it has capacity it
+    # already burned. Bounded by spend rather than clock because the exposure
+    # scales with spend.
+    #
+    # 25 credits is roughly 3.5 discovery rounds at the 7-call bundle — so
+    # the worst-case loss is a few rounds, not the ~60 rounds an hourly-only
+    # flush could discard. (An earlier comment claimed "well under one discovery
+    # round", which was simply wrong: 25 > 7.)
+    COINGECKO_BUDGET_FLUSH_EVERY_CREDITS: int = Field(default=25, ge=0, le=10_000)
+    # /key reconciliation. Provider is the ACCEPTANCE truth; positive drift is
+    # real capacity gone that no local counter explains, so it reduces
+    # non-critical capacity rather than only being logged.
+    COINGECKO_BUDGET_RECONCILE_ENABLED: bool = True
+    # Discovery activation. Default FALSE so a deploy before the September 1
+    # credit reset cannot resume CoinGecko discovery merely because the local
+    # ledger starts empty. "Dark until the reset" is then a property of the
+    # tree, not of an operator remembering not to deploy.
+    COINGECKO_DISCOVERY_ENABLED: bool = False
+
+    # -------- Executable caps on the VARIABLE CoinGecko consumers --------
+    # Round-4 finding: the budget model had fixed per-pass estimates for
+    # consumers whose call count is a LOOP BOUND, not a constant. The narrative
+    # pass fans out as:
+    #
+    #   1 /coins/categories
+    # + 1 /search/trending
+    # + max_heating_per_cycle                           -> fetch_laggards
+    # + max_heating * max_picks_per_category            -> scored-token detail
+    # + max_heating * max_picks_per_category            -> control-token detail
+    #
+    # And the multipliers are LEARNER-TUNABLE, so the default (5,5 -> 57/pass)
+    # is not the bound. scout/narrative/strategy_bounds.py permits
+    # max_heating_per_cycle up to 10 and max_picks_per_category up to 10, i.e.
+    # 1 + 1 + 10 + 100 + 100 = 212 calls/pass ~= 315,000/month from ONE
+    # consumer, against a 100,000 plan. Even at the defaults it is 84,816/month
+    # — more than the entire 65,000 discovery envelope. No main-bundle cadence
+    # can absorb that, so the fan-out itself has to be bounded.
+    #
+    # This cap covers the whole per-pass fan-out (laggards AND both detail
+    # loops), so the monthly model is 2 + this number per pass regardless of
+    # how the learner tunes the strategy knobs.
+    #
+    # Today's production measurement (2026-08-19: narrative.observe_empty x44,
+    # zero heating/laggard/detail events) shows the pass aborting right after an
+    # empty /coins/categories — so the observed cost is ~1 call/pass. That is an
+    # artifact of a failing upstream, NOT a bound, and it would vanish the moment
+    # categories starts returning data. Modelling on it would repeat exactly the
+    # mistake that produced the 62k headline.
+    #
+    # These caps degrade the pass (fewer tokens enriched) rather than failing it.
+    NARRATIVE_MAX_CG_CALLS_PER_PASS: int = Field(default=8, ge=0, le=200)
+    # /simple/price fallback chunks in evaluate_pending. The loop is already
+    # bounded at 3 chunks (min(len(missing),60) step 20); this makes the bound a
+    # SETTING so the budget model can cite it instead of re-deriving it.
+    NARRATIVE_MAX_CG_EVAL_CALLS_PER_PASS: int = Field(default=4, ge=0, le=100)
+
+    # Telegram resolver monthly CoinGecko ceiling. The resolver is EVENT-DRIVEN
+    # (TG_SOCIAL_ENABLED=true in prod), so it has no natural cadence: a contract
+    # can cost one lookup, a cashtag path costs search + markets, and misses can
+    # be retried. The budget table previously carried "620/month" for it as an
+    # ESTIMATE while calling the table a bound — the exact error this repair
+    # exists to stop.
+    #
+    # Capping it inside OPERATIONAL is not enough on its own: TG volume could
+    # consume the whole 5,000 bucket and starve /key reconciliation and the
+    # outcome-ledger poller, which are FIXED duties sharing it. So the resolver
+    # gets its own sub-ceiling and those two keep a guaranteed floor.
+    COINGECKO_TG_RESOLVER_MONTHLY_CREDITS: int = Field(default=1_000, ge=0)
+    # Reserved for /key reconciliation (~744/mo) + the ledger enrollment poll
+    # (~2,976/mo). Nothing discretionary may push OPERATIONAL below this.
+    COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS: int = Field(default=3_800, ge=0)
     # BL-NEW-COINGECKO-MIDCAP-GAINER-SCAN: rank-band scan for CoinGecko
     # gainers that are not top-volume and not trending. Cadence and output cap
     # keep this quality-first under the free-tier limiter.
@@ -396,9 +572,52 @@ class Settings(BaseSettings):
     # No default endpoint on purpose: the public RH RPC is documented as
     # rate-limited/non-production, and endpoint choice is an operator call.
     RH_PONS_RPC_URL: str = ""
-    RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=3, ge=1, le=60)
+    # poll_once compatibility only: the dedicated loop ignores it. Reduce loop
+    # RPC load with RH_PONS_RPC_CALLS_PER_SEC / RH_PONS_IDLE_SLEEP_SEC instead.
+    RH_PONS_POLL_EVERY_N_CYCLES: int = Field(default=1, ge=1, le=60)
+    # Whole-poll budget: observe-only RPC/backfill must not stall live lanes.
+    RH_PONS_POLL_TIMEOUT_SEC: float = Field(default=30, ge=1, le=300)
     # eth_getLogs span per pass; bounds backfill after downtime.
     RH_PONS_BACKFILL_BLOCK_SPAN: int = Field(default=2000, ge=1, le=100_000)
+    RH_PONS_REORG_OVERLAP_BLOCKS: int = Field(default=12, ge=1, le=256)
+    RH_PONS_CURVE_ADDRESS_BATCH_SIZE: int = Field(default=100, ge=1, le=1000)
+    # No checkpoint: recent capture defaults to one span; archival start is explicit.
+    RH_PONS_INITIAL_LOOKBACK_BLOCKS: int | None = Field(default=None, ge=1, le=100_000)
+    RH_PONS_START_BLOCK: int | None = Field(default=None, ge=0)
+    # Dedicated collector loop (plan_rh_pons_sustained_capture_20260913). The
+    # adaptive window moves between MIN and RH_PONS_BACKFILL_BLOCK_SPAN (MIN is
+    # capped at that maximum); the loop sleeps only once a pass reaches the head
+    # it started from, or on failure.
+    RH_PONS_MIN_SCAN_SPAN_BLOCKS: int = Field(default=100, ge=1, le=100_000)
+    RH_PONS_IDLE_SLEEP_SEC: float = Field(default=2.0, ge=0.1, le=300)
+    RH_PONS_FAILURE_BACKOFF_MAX_SEC: float = Field(default=60.0, ge=1, le=3600)
+    # JSON-RPC calls per batched header POST (at most two POSTs in flight).
+    RH_PONS_HEADER_BATCH_SIZE: int = Field(default=50, ge=1, le=100)
+    # Trade logs by event topic with indexed emitter membership. False keeps the
+    # address-batched query, whose RPC count grows with every known curve.
+    RH_PONS_TOPIC_ONLY_TRADE_QUERY: bool = True
+    # Loop-only pacing over LOGICAL JSON-RPC calls (a batch of N costs N).
+    # Provider quota is unknown: these are provisional, not measured limits. A
+    # 429 empties the bucket and halves the rate (not below MIN); completed
+    # passes restore it. A 2026-09-13 public-RPC smoke accepted ~100-call header
+    # bursts and throttled a second 100-call burst seconds later.
+    RH_PONS_RPC_CALLS_PER_SEC: float = Field(default=8.0, ge=0.5, le=1000)
+    RH_PONS_RPC_MIN_CALLS_PER_SEC: float = Field(default=1.0, ge=0.1, le=1000)
+    RH_PONS_RPC_BURST_CALLS: int = Field(default=100, ge=1, le=10_000)
+    # Header reads per loop pass (also capped by what the pacer can supply in
+    # half the remaining pass deadline). A pass that would exceed it covers the
+    # largest block prefix that fits instead of failing on a throttled burst.
+    RH_PONS_MAX_HEADERS_PER_PASS: int = Field(default=80, ge=1, le=10_000)
+    # Watchdog knobs read by scripts/rh-pons-watchdog.sh from .env; declared here
+    # so those .env lines cannot break Settings(extra="forbid"). Only the
+    # watchdog consumes them. Staleness is in MINUTES: the collector passes every
+    # few seconds, so an hours-scale SLO would hide a stalled lane.
+    RH_PONS_POLL_STALENESS_ALERT_MINUTES: int = Field(default=10, ge=1, le=10_080)
+    RH_PONS_MAX_CONSECUTIVE_FAILED_PASSES: int = Field(default=10, ge=1, le=10_000)
+    RH_PONS_MAX_HEAD_LAG_BLOCKS: int = Field(default=2000, ge=0, le=10_000_000)
+    RH_PONS_WATCHDOG_CLOCK_SKEW_SECONDS: int = Field(default=300, ge=0, le=3600)
+    RH_PONS_WATCHDOG_COOLDOWN_HOURS: float = Field(default=24.0, gt=0, le=168)
+    RH_PONS_WATCHDOG_STATE_DIR: str = "/var/lib/gecko-alpha/rh-pons-watchdog"
 
     # Database
     DB_PATH: Path = Path("scout.db")
@@ -613,7 +832,32 @@ class Settings(BaseSettings):
     # >= SECONDWAVE_COOLDOWN_MAX_DAYS to avoid truncating secondwave's
     # evidence window. Validator below enforces.
     SCORE_HISTORY_RETENTION_DAYS: int = 21
-    VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 21
+    # Ruling B (2026-08-16), executed 2026-08-22 after a verified backup.
+    #
+    # 21 -> 14 is a DESTRUCTIVE change: once the shorter cutoff has deleted
+    # rows, restoring the value does not restore them.
+    #
+    # It is authorized because BOTH readers of volume_snapshots are bounded at
+    # <= 14 days, which is what distinguishes B from ruling A:
+    #   * get_vol_7d_avg      -- scanned_at >= now-7d  (hard 7-day window)
+    #   * get_volume_history  -- scanned_at >= now-`days`, and the only
+    #                            production caller (secondwave/detector.py)
+    #                            passes days=SECONDWAVE_COOLDOWN_MAX_DAYS=14.
+    # A was falsified because ITS binding reader, get_recent_scores(limit=3),
+    # has no date window at all -- so retention silently supplied the boundary
+    # and 22.8% of tokens changed. Here, hiding >14d rows cannot change either
+    # reader's output by construction; the prod replay agreed exactly (1668
+    # vol_7d-eligible contracts before and after, delta 0).
+    #
+    # Both boundaries are TRAILING from `now` -- the prune deletes
+    # scanned_at <= now-14d and the readers ask for scanned_at >= now-Nd -- so
+    # they abut without a gap and no lateness margin is required. This is the
+    # structural difference from #548's volume_history_cg, whose window was
+    # RETROSPECTIVE ([emitted, emitted+7d]) and therefore truncated from the
+    # left at zero margin. If a future reader anchors its window to an event
+    # time instead of `now`, that equivalence breaks and this floor must be
+    # re-derived as horizon + measured lateness margin.
+    VOLUME_SNAPSHOTS_RETENTION_DAYS: int = 14
 
     # -------- Narrative-owned table retention (BL-NEW-NARRATIVE-PRUNE-SCOPE-EXPANSION) --------
     # Hourly prune via main._run_hourly_maintenance. V8 plan-review fold:
@@ -636,12 +880,33 @@ class Settings(BaseSettings):
     # check_trade_decision_events uses 15min; evaluator's per-trade dedup is
     # bounded by PAPER_MAX_DURATION_HOURS=48h). 45d default clears them all.
     TRADE_DECISION_EVENTS_RETENTION_DAYS: int = Field(default=45, ge=7)
-    # INF-06: volume_history_cg's other prune lives in the spike detector
-    # (scout/spikes/detector.py) and runs ONLY when VOLUME_SPIKE_ENABLED is on.
-    # This decouples retention from the flag. 7d matches the detector cutoff
-    # AND the longest reader horizon (ledger r7d labeling + spike 7d average) —
-    # harmless duplication when the flag is on.
-    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=7, ge=7)
+    # volume_history_cg retention. ONE owner: Database.prune_volume_history_cg,
+    # driven from main._run_hourly_maintenance. The spike detector's duplicate
+    # hardcoded `-7 days` prune has been removed (scout/spikes/detector.py).
+    #
+    # The previous comment here claimed 7d "matches the longest reader horizon
+    # (ledger r7d labeling + spike 7d average) — harmless duplication". That was
+    # FALSE, because it omitted LABEL-PROCESSING LATENESS.
+    #
+    # The ledger labeler computes peak7d as MAX(price) over the CLOSED window
+    # [emitted, emitted + 7d] (scout/outcome_ledger.py::_peak_price_in_window).
+    # The row it needs at the LEFT edge is exactly 7.0 days old at the earliest
+    # instant the ledger row becomes finalizable (now >= emitted + 7d). A 7d
+    # prune therefore leaves ZERO margin: any lateness at all truncates the
+    # window from the left and yields a wrong-but-plausible peak7d rather than
+    # a NULL — a silently biased label, not a missing one.
+    #
+    # Measured on prod 2026-08-18, n=273,296 completed ledger rows, lateness
+    # past the r7d deadline (labeled_at - emitted_at - 7d):
+    #     p50 0.153d | p90 2.529d | p99 2.857d | max 2.910d
+    # i.e. essentially EVERY labeled row was already losing left-edge data, and
+    # p90 rows were computing "peak7d" over roughly 4.5 days.
+    #
+    # Retention is therefore horizon + an explicit permitted lateness margin,
+    # never a bare number. The margin is measured (max 2.910d), rounded up to a
+    # whole day. Do NOT lower either value without re-running that measurement.
+    LEDGER_LABEL_MAX_LATENESS_DAYS: int = Field(default=3, ge=1)
+    VOLUME_HISTORY_CG_RETENTION_DAYS: int = Field(default=10, ge=8)
 
     # DASH-05 moved-already / too-late postmortem recorder. FORWARD-recording
     # only: gainers_snapshots has a 7-day retention so pre-run T-minus evidence
@@ -1214,6 +1479,35 @@ class Settings(BaseSettings):
     PAPER_TG_SOCIAL_CASHTAG_DISAMBIGUITY_RATIO: float = 2.0
     PAPER_TG_SOCIAL_CASHTAG_MAX_PER_CHANNEL_PER_DAY: int = 5
     TG_SOCIAL_CATCHUP_LIMIT: int = 200
+    # Catchup replays historical messages through the SAME path as live ones
+    # (handle_new_message), and nothing else filters on message age — so a
+    # catchup pass would alert/trade on months-old calls as if they just
+    # fired. A channel whose watermark is 0 would replay its ENTIRE history.
+    # This bounds that: a replayed message older than the threshold is still
+    # persisted, but is not resolved, alerted, or traded.
+    #
+    # Applies to CATCHUP REPLAY ONLY (handle_new_message(is_replay=True)),
+    # never to live messages. The age is derived from our clock against
+    # Telegram's, so a fast local clock inflates it; gating live traffic on
+    # that would let clock skew silently suppress the entire signal lane
+    # while every health surface still reported green. See the guard in
+    # listener.py.
+    #
+    # 1440 = 24h. Sized to the hazard, not to signal freshness: the replay
+    # this exists to stop is months old, while a restart/outage gap is hours,
+    # and messages recovered from such a gap are still worth acting on. A
+    # tighter bound would discard same-day recovery to block nothing extra.
+    #
+    # 24h specifically, to match the dashboard's funnel window
+    # (`get_tg_social_funnel_24h` selects on `posted_at >= now-24h`). At any
+    # tighter value there is a band of ages that are BOTH dropped by this
+    # guard AND inside that window, which surfaces as a parsed-vs-signals gap
+    # with no reason code attached. Aligning the two bounds removes the band
+    # rather than instrumenting it.
+    #
+    # 0 disables the check entirely — the pre-guard behaviour, and the
+    # documented escape hatch.
+    TG_SOCIAL_MAX_MESSAGE_AGE_MIN: int = Field(default=1440, ge=0)
     TG_SOCIAL_FLOOD_WAIT_MAX_SEC: int = 600
     TG_SOCIAL_CHANNEL_RELOAD_INTERVAL_SEC: int = 300
     TG_SOCIAL_RESOLUTION_RETRY_DELAY_SEC: int = 60
@@ -2339,6 +2633,123 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_cg_operational_floor_and_tg_ceiling(self) -> "Settings":
+        """The TG ceiling must be ENFORCEABLE by the floor, not a parallel number.
+
+        Discretionary OPERATIONAL traffic is stopped at
+        ``operational_cap - fixed_floor``. If the declared TG ceiling exceeded
+        that, the table would claim a bound the code does not enforce -- exactly
+        the "620/month estimate presented as a bound" defect. If the floor were
+        smaller than the fixed duties it protects, it would protect nothing.
+        """
+        cap = self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        floor = self.COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS
+        if cap <= 0:
+            return self
+        if floor > cap:
+            raise ValueError(
+                f"COINGECKO_OPERATIONAL_FIXED_FLOOR_CREDITS={floor} exceeds "
+                f"COINGECKO_MONTHLY_OPERATIONAL_CREDITS={cap}"
+            )
+        discretionary = cap - floor
+        if self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS > discretionary:
+            raise ValueError(
+                f"COINGECKO_TG_RESOLVER_MONTHLY_CREDITS="
+                f"{self.COINGECKO_TG_RESOLVER_MONTHLY_CREDITS} exceeds the "
+                f"{discretionary} of discretionary operational capacity that the "
+                f"reserved floor actually leaves. A ceiling the code cannot "
+                f"enforce is an estimate wearing a bound's clothes."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cg_monthly_envelopes_fit_the_allowance(self) -> "Settings":
+        """Envelope sum must not exceed the plan's monthly credit allowance.
+
+        Pinned as a validator because over-subscription is SILENT: each envelope
+        looks reasonable alone, discovery stops at its own cap, and the plan
+        still runs dry — which is exactly the shape of the 2026-08-21 incident,
+        one axis un-modelled while every visible number looked fine.
+        """
+        allowance = self.COINGECKO_MONTHLY_CREDIT_ALLOWANCE
+        if allowance <= 0:
+            return self
+        total = (
+            self.COINGECKO_MONTHLY_DISCOVERY_CREDITS
+            + self.COINGECKO_MONTHLY_CRITICAL_CREDITS
+            + self.COINGECKO_MONTHLY_OPERATIONAL_CREDITS
+        )
+        if total > allowance:
+            raise ValueError(
+                f"CoinGecko monthly envelopes sum to {total} which exceeds "
+                f"COINGECKO_MONTHLY_CREDIT_ALLOWANCE={allowance}. Over-subscribing "
+                f"the allowance means discovery can stop at its own cap while the "
+                f"plan still runs dry."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_volume_history_cg_covers_label_lateness(self) -> "Settings":
+        """volume_history_cg must outlive the r7d window PLUS labeling lateness.
+
+        The ledger labeler computes peak7d as MAX(price) over the closed window
+        [emitted, emitted + 7d] (outcome_ledger._peak_price_in_window), so the
+        left-edge row is exactly LEDGER_R7D_HORIZON_DAYS old at the earliest
+        finalizable instant. Retention equal to the horizon leaves zero margin,
+        and lateness then truncates the window from the left — yielding a
+        wrong-but-plausible peak7d instead of a NULL.
+
+        This is pinned as a validator rather than left to the field default
+        because the failure is SILENT: a retention of 7 produces labels, just
+        biased ones. Nothing downstream would raise.
+        """
+        required = LEDGER_R7D_HORIZON_DAYS + self.LEDGER_LABEL_MAX_LATENESS_DAYS
+        if self.VOLUME_HISTORY_CG_RETENTION_DAYS < required:
+            raise ValueError(
+                f"VOLUME_HISTORY_CG_RETENTION_DAYS="
+                f"{self.VOLUME_HISTORY_CG_RETENTION_DAYS} must be >= {required} "
+                f"(= {LEDGER_R7D_HORIZON_DAYS}d r7d/peak7d horizon + "
+                f"{self.LEDGER_LABEL_MAX_LATENESS_DAYS}d "
+                f"LEDGER_LABEL_MAX_LATENESS_DAYS). Below this the ledger's "
+                f"peak7d window is truncated from the left and labels are "
+                f"silently biased low rather than left NULL."
+            )
+        return self
+
+    # Ruling B pinned this at 14 as a HARD floor -- "never below 14 without a
+    # new consumer study." The secondwave validator below is necessary but NOT
+    # sufficient for that: it compares against SECONDWAVE_COOLDOWN_MAX_DAYS,
+    # so lowering that knob would silently drag the permitted retention floor
+    # down with it and re-open the deletion the ruling bounded. Pin the
+    # absolute floor separately from the relative one.
+    VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS: int = 14
+
+    @model_validator(mode="after")
+    def _validate_chain_retention_covers_prospective_lookback(self) -> "Settings":
+        """Ruling F residual: the ONE consumer left reading signal_events.
+
+        `scout/conviction/prospective.py` derives its chains surface with
+        `MIN(created_at) ... WHERE created_at >= now - LOOKBACK_DAYS`. It is
+        window-bounded, so it is exempt from the first-seen migration -- but
+        only while retention actually covers that window. Today the two knobs
+        merely COINCIDE at 14; nothing enforced it, so the first cut of
+        CHAIN_EVENT_RETENTION_DAYS below the lookback would silently truncate
+        it, with no error, which is exactly the harm ruling F exists to remove.
+
+        Making the coincidence an invariant is what lets that consumer stay
+        un-migrated honestly.
+        """
+        if self.CHAIN_EVENT_RETENTION_DAYS < self.CONVICTION_PROSPECTIVE_LOOKBACK_DAYS:
+            raise ValueError(
+                f"CHAIN_EVENT_RETENTION_DAYS={self.CHAIN_EVENT_RETENTION_DAYS} "
+                f"must be >= CONVICTION_PROSPECTIVE_LOOKBACK_DAYS="
+                f"{self.CONVICTION_PROSPECTIVE_LOOKBACK_DAYS}. The prospective "
+                f"watchlist derives first-seen from signal_events over that "
+                f"lookback; lower retention truncates it silently."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_retention_covers_secondwave_window(self) -> "Settings":
         """V2#3 fold: prevent silent mis-config where prune retention <
         secondwave's evidence-window upper bound. The secondwave detector
@@ -2359,6 +2770,28 @@ class Settings(BaseSettings):
                     f"SECONDWAVE_COOLDOWN_MAX_DAYS={self.SECONDWAVE_COOLDOWN_MAX_DAYS}. "
                     f"Lower retention silently truncates secondwave's evidence window."
                 )
+        return self
+
+    # Ordered AFTER the relative check on purpose: when both are violated the
+    # secondwave message names the actual consumer and is the more actionable
+    # one, so this floor only speaks in the case the relative check CANNOT
+    # catch -- someone lowering SECONDWAVE_COOLDOWN_MAX_DAYS, which would
+    # otherwise drag the permitted retention floor down with it.
+    @model_validator(mode="after")
+    def _validate_volume_snapshots_retention_floor(self) -> "Settings":
+        if (
+            self.VOLUME_SNAPSHOTS_RETENTION_DAYS
+            < self.VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS
+        ):
+            raise ValueError(
+                f"VOLUME_SNAPSHOTS_RETENTION_DAYS="
+                f"{self.VOLUME_SNAPSHOTS_RETENTION_DAYS} is below the ruling-B "
+                f"hard floor of {self.VOLUME_SNAPSHOTS_RETENTION_FLOOR_DAYS} "
+                f"days. Going lower requires a new consumer study: the readers "
+                f"are bounded at 7d and SECONDWAVE_COOLDOWN_MAX_DAYS, and "
+                f"deleted snapshots cannot be restored by raising the value "
+                f"back."
+            )
         return self
 
     @model_validator(mode="after")

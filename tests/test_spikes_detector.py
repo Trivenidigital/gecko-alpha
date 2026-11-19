@@ -172,8 +172,18 @@ async def test_get_spike_stats(db):
     assert stats["avg_spike_ratio"] == 5.0
 
 
-async def test_record_volume_prunes_old_data(db):
-    # Insert a record older than 7 days
+async def test_record_volume_does_not_prune(db):
+    """Inverted from test_record_volume_prunes_old_data, deliberately.
+
+    record_volume used to carry its own hardcoded
+    `DELETE ... < datetime('now','-7 days')`. That second owner is removed:
+    it only ran when VOLUME_SPIKE_ENABLED was on (so retention silently
+    depended on a feature flag), and its 7d cutoff truncated the ledger's
+    peak7d window [emitted, emitted+7d] from the left as soon as labeling ran
+    even slightly late. Retention is now owned solely by
+    Database.prune_volume_history_cg at horizon + measured lateness margin.
+    See tests/test_volume_history_cg_retention_lateness.py.
+    """
     await db._conn.execute(
         """INSERT INTO volume_history_cg
            (coin_id, symbol, name, volume_24h, market_cap, price, recorded_at)
@@ -182,14 +192,13 @@ async def test_record_volume_prunes_old_data(db):
     )
     await db._conn.commit()
 
-    # Record new volume (triggers prune)
     await record_volume(db, [_make_raw_coin("new-coin", 200_000)])
 
     cursor = await db._conn.execute(
         "SELECT COUNT(*) FROM volume_history_cg WHERE coin_id = 'old-coin'"
     )
     row = await cursor.fetchone()
-    assert row[0] == 0
+    assert row[0] == 1, "record_volume pruned — the duplicate owner is back"
 
 
 # -- 7-Day Momentum Scanner Tests --

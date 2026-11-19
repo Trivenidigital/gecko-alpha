@@ -40,6 +40,10 @@ class TrendingComparison(BaseModel):
     detected_by_chains: bool = False
     chains_detected_at: datetime | None = None
     chains_lead_minutes: float | None = None
+    # Ruling C: which identity semantics produced the chain columns on this
+    # row, and which tier resolved it. Historical rows carry `legacy_prefix`.
+    chains_identity_semantics: str | None = None
+    chains_identity_tier: str | None = None
 
     # LunarCrush social-velocity detection (4th tier)
     detected_by_social: bool = False

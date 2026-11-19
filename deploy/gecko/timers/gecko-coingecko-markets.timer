@@ -1,0 +1,11 @@
+[Unit]
+Description=gecko-coingecko-markets schedule
+
+[Timer]
+Unit=gecko-job@coingecko-markets.service
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
