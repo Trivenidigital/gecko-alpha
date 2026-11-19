@@ -612,3 +612,64 @@ async def test_a_failed_trigger_insert_releases_nothing(tmp_path):
     )
     assert (await cur.fetchone())[0] is None
     await db.close()
+
+
+async def test_clear_reports_nothing_cleared_when_another_process_swapped_the_kill(
+    tmp_path,
+):
+    """Another process (the kill CLI has its own connection) can engage a new
+    kill between _clear's read of the pointer and its write. The write then
+    matches nothing — and _clear must say so, not announce "cleared, live
+    trading re-enabled" while the new kill is in force."""
+    import sqlite3
+
+    dbp = tmp_path / "t.db"
+    db = Database(dbp)
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    now = datetime.now(timezone.utc)
+    old_id = await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+
+    real_execute = db._conn.execute
+    swapped: dict = {}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if "SELECT active_kill_event_id FROM live_control" in sql and not swapped:
+            other = sqlite3.connect(dbp)
+            c = other.execute(
+                "INSERT INTO kill_events (triggered_by, reason, triggered_at, "
+                "killed_until) VALUES ('manual', 'other process', ?, ?)",
+                (now.isoformat(), (now + timedelta(hours=4)).isoformat()),
+            )
+            swapped["id"] = c.lastrowid
+            other.execute(
+                "UPDATE live_control SET active_kill_event_id = ? WHERE id = 1",
+                (c.lastrowid,),
+            )
+            other.commit()
+            other.close()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        cleared = await ks.auto_clear_if_expired()
+    finally:
+        db._conn.execute = real_execute
+
+    assert cleared is False
+    assert alerts == []
+    cur = await db._conn.execute(
+        "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+    )
+    assert (await cur.fetchone())[0] == swapped["id"]
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events WHERE id = ?", (old_id,)
+    )
+    assert (await cur.fetchone())[0] is None
+    await db.close()

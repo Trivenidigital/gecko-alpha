@@ -154,3 +154,25 @@ def test_apply_does_not_clear_a_kill_engaged_after_the_expired_one_was_found(
     new_id, applied, pointer = asyncio.run(_race())
     assert applied is False
     assert pointer == new_id
+
+
+def test_superseded_and_not_expired_results_name_their_reason(tmp_path, monkeypatch):
+    """The result's `reason` says why nothing was done. The kill's own reason
+    text must not overwrite it."""
+    mod = _load_script()
+    dbp = tmp_path / "expired.db"
+    asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _not_applied(conn, kill_event_id, now):
+        return False
+
+    monkeypatch.setattr(mod, "_apply_clear", _not_applied)
+    result = asyncio.run(mod._run(str(dbp), apply=True))
+    assert result["action"] == "none"
+    assert result["reason"] == "kill_superseded"
+
+    fresh = tmp_path / "fresh.db"
+    asyncio.run(_setup_kill(fresh, hours_delta=2))
+    result = asyncio.run(mod._run(str(fresh), apply=True))
+    assert result["action"] == "none"
+    assert result["reason"] == "kill_not_expired"

@@ -402,11 +402,22 @@ class KillSwitch:
                     cleared_by=cleared_by,
                 )
                 return None
-            await self._db._conn.execute(
+            cur = await self._db._conn.execute(
                 "UPDATE live_control SET active_kill_event_id = NULL "
                 "WHERE id = 1 AND active_kill_event_id = ?",
                 (active_id,),
             )
+            if cur.rowcount != 1:
+                # The pointer changed between the read above and this write:
+                # another process (the kill CLI holds its own connection)
+                # engaged a different kill. Nothing of ours is pending, so
+                # there is nothing to undo — and nothing was cleared.
+                log.warning(
+                    "live_kill_clear_skipped_pointer_moved",
+                    read_kill_event_id=active_id,
+                    cleared_by=cleared_by,
+                )
+                return None
             await self._db._conn.execute(
                 "UPDATE kill_events SET cleared_at = ?, cleared_by = ? "
                 "WHERE id = ? AND cleared_at IS NULL",

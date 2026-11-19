@@ -125,19 +125,21 @@ async def _run(db_path: str, *, apply: bool) -> dict:
             return {"ok": True, "action": "none", "reason": "no_active_kill"}
         if not found["expired"]:
             return {
+                **found,
+                "kill_reason": found["reason"],
                 "ok": True,
                 "action": "none",
                 "reason": "kill_not_expired",
-                **found,
             }
         if not apply:
             return {"ok": True, "action": "dry_run", "would_clear": True, **found}
         if not await _apply_clear(conn, found["kill_event_id"], now):
             return {
+                **found,
+                "kill_reason": found["reason"],
                 "ok": True,
                 "action": "none",
                 "reason": "kill_superseded",
-                **found,
             }
         return {"ok": True, "action": "cleared", **found}
 

@@ -126,7 +126,7 @@ python -m scout.live.kraken_pilot cancel --decision-id <uuid>  # pull it
 | 1 | A gate refused, or you did not authorize | Read the reason. No order exists. |
 | 2 | Lane blocked (prior row, unknown resting order, lock held) | Resolve what it names, then retry. |
 | 3 | Unresolved submission, or an unexpected failure | **State is unknown.** Check the Kraken UI before anything else. NEVER resend. |
-| 4 | Traded, but the balance move could not be explained | Check the account before the next run. |
+| 4 | Traded, but the balance move could not be explained. From `cancel`: the ledger and Kraken disagree about a fill (the ledger row is left unchanged) | Check the account before the next run. |
 
 ## If it goes wrong
 
