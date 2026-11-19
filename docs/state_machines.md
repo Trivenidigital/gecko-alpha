@@ -259,7 +259,7 @@ Must never be true (checked by the auditor):
 Known hazards (read from the code at registration):
 
 - Most writes are UPDATE ... WHERE id = ? with no check of the prior status in the statement or the function; where a check exists it is usually in the caller. Only the transitions marked compare-and-swap filter on the prior status in the SQL itself.
-- KrakenPilot.cancel always sends the venue cancel, whatever the row's status, because that reduces exposure. Its ledger write applies only while the row is open or needs_manual_review; a row that is already closed or rejected is left as it was and the evidence records cancel_ledger_unchanged.
+- KrakenPilot.cancel always sends the venue cancel, whatever the row's status, because that reduces exposure. Its ledger write applies only while the row is open or needs_manual_review (and, for a reported fill, only while no exit is recorded); otherwise the row is left as it was and the evidence records cancel_ledger_unchanged. A fill reported on a rejected row exits for review.
 - Manual settlement of needs_manual_review rows is done with SQL outside the code, so those moves cannot appear in this table.
 - needs_manual_review means different things per venue: the Binance engine uses it so a row stops counting as open exposure, while the Kraken pilot and the Solana lane treat it as blocking the lane.
 - 'Closed' is re-derived three ways: LIKE 'closed_%' (scout/live/kill_switch.py), LIKE 'closed%' (scout/live/services/dormancy.py, approval_thresholds.py) and an explicit tuple (scout/live/mandate.py).
@@ -495,9 +495,10 @@ stateDiagram-v2
 | `inactive` | `engaged` | daily loss cap tripped, automatic engine kill, or operator kill | `scout/live/kill_switch.py::trigger` | compare-and-swap in SQL |
 | `expired_uncleared` | `engaged` | a new kill arrives; the expired event is stamped cleared and the pointer re-claimed in one transaction | `scout/live/kill_switch.py::trigger` | re-read and written in one locked transaction |
 | `engaged` | `expired_uncleared` | killed_until passes (no write: is_active starts answering inactive) | `scout/live/kill_switch.py::is_active` | none |
-| `engaged` | `inactive` | operator clear, or automatic clear after expiry | `scout/live/kill_switch.py::clear` | none |
-| `expired_uncleared` | `inactive` | operator clear, or automatic clear after expiry | `scout/live/kill_switch.py::clear` | none |
-| `expired_uncleared` | `inactive` | the clear-expired-kills script (its caller checks the expiry first) | `scripts/clear_expired_kills.py::_apply_clear` | none |
+| `engaged` | `inactive` | operator clear | `scout/live/kill_switch.py::clear` | none |
+| `expired_uncleared` | `inactive` | operator clear | `scout/live/kill_switch.py::clear` | none |
+| `expired_uncleared` | `inactive` | automatic clear on the next tick or at boot | `scout/live/kill_switch.py::auto_clear_if_expired` | compare-and-swap in SQL |
+| `expired_uncleared` | `inactive` | the clear-expired-kills script (its caller checks the expiry first) | `scripts/clear_expired_kills.py::_apply_clear` | compare-and-swap in SQL |
 
 How each state is recognised in the table:
 
@@ -507,9 +508,9 @@ How each state is recognised in the table:
 
 Known hazards (read from the code at registration):
 
-- trigger is a real compare-and-swap on the pointer; clear is an unconditional UPDATE that clears whichever event is active when it runs, not necessarily the one the caller looked at.
+- trigger is a real compare-and-swap on the pointer. The operator's clear releases whichever kill is active when it runs. The automatic clears (auto_clear_if_expired and the clear-expired-kills script) apply only while the pointer still names the event they judged expired.
 - Before claiming, trigger releases a pointer whose event is expired, already cleared or missing, so a dead pointer does not block a new kill. A kill still in force wins the compare-and-swap as before.
-- A pointer left on an already-cleared event matches no state: the switch reads as inactive and nothing but the next trigger releases the pointer. The auditor reports that row.
+- A pointer left on an already-cleared event matches no state: the switch reads as inactive. No automatic clear releases it; the next trigger does, and so does an operator clear. The auditor reports that row.
 
 ## Signal lane (enabled / suspended)
 

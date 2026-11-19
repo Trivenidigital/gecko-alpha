@@ -155,7 +155,7 @@ recorded so they can be triaged separately.
    table forbids, so the guard raises. The reverse path records the catch-up
    state first and its comment explains why (`:6095-6108`). Reproduced by
    `test_confirm_timeout_then_finalized_adoption_reconciles` before the fix.
-2. **FIXED (`1424ba68`).** **`KrakenPilot.cancel` writes `rejected` without reading the row's
+2. **FIXED (`1424ba68`, `b8d6ed86`).** **`KrakenPilot.cancel` writes `rejected` without reading the row's
    status** (`scout/live/kraken_pilot.py:5024-5118`).
 3. **FIXED (`27c39f68`).** **`record_contract_coin_map` overwrites `coin_id` unconditionally on
    conflict** (`scout/db.py:1771-1774`) and the new-pools lane writes
@@ -200,7 +200,7 @@ recorded so they can be triaged separately.
 Raised by the independent reviews of the registry (each cites the code; none
 was reproduced by a test):
 
-19. **FIXED (`bbd3af58`).** **An expired kill that has not been cleared blocks the next kill.**
+19. **FIXED (`bbd3af58`, `cbb215bf`).** **An expired kill that has not been cleared blocks the next kill.**
     `is_active()` stops reporting the kill once `killed_until` passes
     (`scout/live/kill_switch.py:197-209`), so orders are allowed again, but
     the pointer is still set and `trigger` is a compare-and-swap on the
@@ -233,6 +233,21 @@ was reproduced by a test):
     shared connection commit without that lock (for example
     `scout/social/telegram/listener.py:1100`), and a commit on a shared
     SQLite connection commits everything pending on it.
+
+Raised by the independent review of the fixes (not fixed):
+
+26. **A forward Solana run that stops at `landed` has no command to move it
+    on.** A finalize timeout, or an adoption that is not yet finalized, ends
+    the run at `landed` with a review verdict. Recovery then blocks the lane,
+    and the forward `resolve` command targets `landed` from `landed`, which
+    the transition table refuses (`scout/live/solana_lane.py:2431-2443`,
+    `:4823-4825`). The reverse resolve can target `finalized`
+    (`:6907-6911`); the forward one cannot, so the run needs a hand edit.
+    True before the fixes as well.
+27. **A kill released by a new trigger skips the "latched over an hour"
+    alert** that `auto_clear_if_expired` would have sent for it
+    (`scout/live/kill_switch.py`). The release is logged as
+    `live_kill_dead_pointer_released` and the new kill's own alert follows.
 
 ### 4b. Reported by the survey, not independently confirmed here
 

@@ -7617,7 +7617,9 @@ async def _run_watchdog_readonly(db_path: Path, settings: Settings) -> int:
             timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
         )
         try:
-            summary = await check_stuck_executions(_ReadOnlyDB(conn), session, settings)
+            summary = await check_stuck_executions(
+                _ReadOnlyDB(conn), session, settings
+            )
         finally:
             await session.close()
     finally:

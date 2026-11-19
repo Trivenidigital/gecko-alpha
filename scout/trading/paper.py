@@ -767,7 +767,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
                 "paper_close_reason_unmapped",
                 trade_id=trade_id,
                 reason=reason,
-                status_written=status,
+                fallback_status=status,
                 known_reasons=sorted(status_map),
             )
 
