@@ -753,11 +753,23 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
             "peak_fade": "closed_peak_fade",
             "manual": "closed_manual",
         }
-        status = (
-            status_override
-            if status_override is not None
-            else status_map.get(reason, "closed_manual")
-        )
+        if status_override is not None:
+            status = status_override
+        elif reason in status_map:
+            status = status_map[reason]
+        else:
+            # Still close — refusing would strand the position open — but say
+            # so. closed_manual is excluded from the combo win-rate
+            # statistics, so a mistyped or newly added reason that lands here
+            # drops its trades out of the feedback loop.
+            status = "closed_manual"
+            log.error(
+                "paper_close_reason_unmapped",
+                trade_id=trade_id,
+                reason=reason,
+                status_written=status,
+                known_reasons=sorted(status_map),
+            )
 
         cursor_upd = await conn.execute(
             """UPDATE paper_trades

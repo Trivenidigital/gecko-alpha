@@ -556,3 +556,115 @@ async def test_live_handoff_task_cancelled_does_not_log_or_raise():
         _log_live_handoff_task_exception(task)
 
     assert not [e for e in logs if e["event"] == "live_handoff_task_failed"]
+
+
+# --- a close reason the status map does not know -----------------------------
+# execute_sell falls back to closed_manual for a reason it cannot map, and
+# closed_manual is excluded from the combo win-rate statistics. That used to
+# happen without a word, so a mistyped or newly added reason would quietly
+# drop its trades out of the feedback loop.
+
+
+async def _open_btc(db, trader) -> int:
+    return await trader.execute_buy(
+        db=db,
+        token_id="bitcoin",
+        symbol="BTC",
+        name="Bitcoin",
+        chain="coingecko",
+        signal_type="volume_spike",
+        signal_data={},
+        current_price=50000.0,
+        amount_usd=1000.0,
+        tp_pct=20.0,
+        sl_pct=10.0,
+        slippage_bps=0,
+        signal_combo="volume_spike",
+    )
+
+
+async def _status(db, trade_id) -> str:
+    cur = await db._conn.execute(
+        "SELECT status FROM paper_trades WHERE id = ?", (trade_id,)
+    )
+    return (await cur.fetchone())[0]
+
+
+async def test_unmapped_close_reason_is_logged_as_an_error(db, trader):
+    import structlog
+
+    trade_id = await _open_btc(db, trader)
+    with structlog.testing.capture_logs() as logs:
+        closed = await trader.execute_sell(
+            db=db,
+            trade_id=trade_id,
+            current_price=55000.0,
+            reason="trailng_stop",  # typo: not in the status map
+            slippage_bps=0,
+        )
+
+    # The position is still closed — refusing would strand it open.
+    assert closed is True
+    assert await _status(db, trade_id) == "closed_manual"
+    unmapped = [e for e in logs if e.get("event") == "paper_close_reason_unmapped"]
+    assert len(unmapped) == 1
+    assert unmapped[0]["log_level"] == "error"
+    assert unmapped[0]["reason"] == "trailng_stop"
+    assert unmapped[0]["trade_id"] == trade_id
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("take_profit", "closed_tp"),
+        ("stop_loss", "closed_sl"),
+        ("expired", "closed_expired"),
+        ("trailing_stop", "closed_trailing_stop"),
+        ("peak_fade", "closed_peak_fade"),
+        ("manual", "closed_manual"),
+    ],
+)
+async def test_mapped_close_reasons_do_not_log_unmapped(db, trader, reason, expected):
+    import structlog
+
+    trade_id = await _open_btc(db, trader)
+    with structlog.testing.capture_logs() as logs:
+        await trader.execute_sell(
+            db=db,
+            trade_id=trade_id,
+            current_price=55000.0,
+            reason=reason,
+            slippage_bps=0,
+        )
+    assert await _status(db, trade_id) == expected
+    assert "paper_close_reason_unmapped" not in [e.get("event") for e in logs]
+
+
+async def test_explicit_status_override_does_not_log_unmapped(db, trader):
+    import structlog
+
+    trade_id = await _open_btc(db, trader)
+    with structlog.testing.capture_logs() as logs:
+        await trader.execute_sell(
+            db=db,
+            trade_id=trade_id,
+            current_price=55000.0,
+            reason="time_death",
+            slippage_bps=0,
+            status_override="closed_time_death",
+        )
+    assert await _status(db, trade_id) == "closed_time_death"
+    assert "paper_close_reason_unmapped" not in [e.get("event") for e in logs]
+
+
+def test_trade_status_literal_lists_every_close_status_the_evaluator_writes():
+    from typing import get_args
+
+    from scout.trading.models import TradeStatus
+
+    for status in (
+        "closed_high_peak_fade",
+        "closed_momentum_death",
+        "closed_time_death",
+    ):
+        assert status in get_args(TradeStatus)
