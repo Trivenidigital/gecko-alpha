@@ -73,6 +73,50 @@ see `docs/gecko-alpha-alignment.md`.
 validate that the listed primitives are TRUTHFUL or COMPLETE. Human PR
 review verifies accuracy.
 
+### State machines
+
+The main lifecycles (trade status, exit ladder, lane suspension, combo parole,
+kill switch, alert outcome, execution run, outcome labelling, ...) are each
+declared once in `scout/statemachines/registry.py`: the states and what each
+means, the moves that happen, and the function that performs each move. Before
+touching code that reads or writes a status, start there instead of grepping
+for string literals:
+
+```bash
+python -m scout.statemachines list                  # the registered machines
+python -m scout.statemachines show live_trade       # states, transitions, known hazards
+python -m scout.statemachines next live_trade open  # where can it go from here?
+python scripts/audit_state_machines.py --db scout.db  # read-only: rows in undeclared states
+```
+
+- **It is a map, not a proof.** Tests hold the *state lists* to the code
+  wherever the code has one spelling to compare with (CHECK constraint, Enum,
+  Literal, the close-status literals in `scout/trading`, the dashboard's
+  copies) and hold the *transitions* only for `solana_execution`. The other
+  transitions, the meanings, the guard kinds and the hazard notes are reviewed
+  prose — each machine's "Checked by tests" line says which applies. Read the
+  function an entry points at before relying on a detail.
+- **Changing a status value, a transition or what a state means? Update the
+  registry entry in the same change**, then run
+  `python -m scout.statemachines render --write`. A test will catch a new or
+  removed status value in the places listed above and a renamed writer
+  function; it will not catch a changed transition or a stale meaning, so
+  that part is on you.
+- The registry is **descriptive**. No pipeline, alerting, execution or
+  dashboard module imports it (a test pins that). Calling
+  `statemachines.assert_legal` at an existing write site is a behavior change
+  and goes through normal review; outside `solana_execution` the declared
+  transitions are not a verified complete list.
+- Do not define an outcome population by membership in a status list — see
+  the note above `VALID_TERMINAL_OUTCOME_SQL` in `scout/trading/paper.py`.
+- **Not everything is registered.** About 47 further lifecycles were surveyed
+  and left undeclared — some database-backed (venue health, operator
+  overrides, chain instances, contract-to-coin mapping, `alert_events`
+  sequences), others in memory or in files (exit latches, scheduler
+  sentinels, watchdog state files). They are catalogued in
+  `tasks/findings_implicit_state_machines_2026_11_19.md`; absence from the
+  registry does not mean a status has no lifecycle.
+
 ## REVIEW BARRIER (standing order, 2026-08-24) — mandatory before merge
 
 **Once independent reviewers have been dispatched for a candidate SHA, that SHA
