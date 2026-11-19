@@ -251,11 +251,13 @@ class KillSwitch:
                 "WHERE id = ? AND cleared_at IS NULL",
                 (now.isoformat(), pointer),
             )
-        await self._db._conn.execute(
+        cur = await self._db._conn.execute(
             "UPDATE live_control SET active_kill_event_id = NULL "
             "WHERE id = 1 AND active_kill_event_id = ?",
             (pointer,),
         )
+        if cur.rowcount != 1:
+            return None
         log.warning(
             "live_kill_dead_pointer_released",
             released_kill_event_id=pointer,
@@ -295,8 +297,6 @@ class KillSwitch:
         now = datetime.now(timezone.utc)
         killed_until = now + duration
         async with self._db._txn_lock:
-            await self._release_dead_pointer_locked(now)
-
             # Insert the row first — speculative. If we lose the race we
             # DELETE it below.
             await self._db._conn.execute(
@@ -307,6 +307,11 @@ class KillSwitch:
             )
             cur = await self._db._conn.execute("SELECT last_insert_rowid()")
             new_id = (await cur.fetchone())[0]
+
+            # Only after the INSERT has succeeded: if it raises (a CHECK on
+            # triggered_by, say) nothing has been released, so no uncommitted
+            # release is left to ride out on someone else's commit.
+            await self._release_dead_pointer_locked(now)
 
             # Conditional claim — only succeeds if no other trigger has won.
             cur = await self._db._conn.execute(
@@ -361,6 +366,21 @@ class KillSwitch:
         UPDATE ``live_control`` → NULL and stamp ``cleared_at`` + ``cleared_by``
         on the previously-active ``kill_events`` row. Both writes go through
         the txn lock so a concurrent ``trigger()`` cannot interleave.
+
+        This is the operator's lever: it clears whichever kill is active when
+        it runs. An event that already carries a clear stamp keeps it.
+        """
+        await self._clear(cleared_by=cleared_by, only_event_id=None)
+
+    async def _clear(self, *, cleared_by: str, only_event_id: int | None) -> int | None:
+        """Clear the active kill and return its event id, or ``None`` if
+        nothing was cleared.
+
+        ``only_event_id`` makes the clear conditional: it applies only while
+        the pointer still names that event. A caller that decided to clear
+        from an earlier, unlocked read (:meth:`auto_clear_if_expired`) passes
+        the event it judged, so it cannot clear a different kill that
+        :meth:`trigger` engaged in between.
         """
         assert self._db._conn is not None
         assert self._db._txn_lock is not None
@@ -373,12 +393,23 @@ class KillSwitch:
             active_id = row[0] if row is not None else None
             if active_id is None:
                 # Nothing to clear — commit nothing, return silently.
-                return
+                return None
+            if only_event_id is not None and active_id != only_event_id:
+                log.info(
+                    "live_kill_clear_skipped_superseded",
+                    judged_kill_event_id=only_event_id,
+                    active_kill_event_id=active_id,
+                    cleared_by=cleared_by,
+                )
+                return None
             await self._db._conn.execute(
-                "UPDATE live_control SET active_kill_event_id = NULL " "WHERE id = 1"
+                "UPDATE live_control SET active_kill_event_id = NULL "
+                "WHERE id = 1 AND active_kill_event_id = ?",
+                (active_id,),
             )
             await self._db._conn.execute(
-                "UPDATE kill_events SET cleared_at = ?, cleared_by = ? " "WHERE id = ?",
+                "UPDATE kill_events SET cleared_at = ?, cleared_by = ? "
+                "WHERE id = ? AND cleared_at IS NULL",
                 (now.isoformat(), cleared_by, active_id),
             )
             await self._db._conn.commit()
@@ -396,6 +427,7 @@ class KillSwitch:
             kill_event_id=active_id,
             cleared_by=cleared_by,
         )
+        return active_id
 
     async def auto_clear_if_expired(self) -> bool:
         """If the active kill has expired, clear it with ``cleared_by='auto_expired'``.
@@ -418,7 +450,14 @@ class KillSwitch:
         if state.killed_until >= now:
             return False
         latched = now - state.killed_until
-        await self.clear(cleared_by="auto_expired")
+        # Conditional on the event judged above: the read was unlocked, and a
+        # trigger() in between may have replaced that expired kill with a
+        # fresh one, which must not be cleared here.
+        cleared_id = await self._clear(
+            cleared_by="auto_expired", only_event_id=state.kill_event_id
+        )
+        if cleared_id is None:
+            return False
         if latched > _LATCHED_ALERT_THRESHOLD:
             latched_hours = latched.total_seconds() / 3600.0
             log.warning(

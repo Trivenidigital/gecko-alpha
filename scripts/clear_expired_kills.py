@@ -88,22 +88,33 @@ async def _find_active_kill(conn: aiosqlite.Connection, now: datetime) -> dict |
 
 async def _apply_clear(
     conn: aiosqlite.Connection, kill_event_id: int, now: datetime
-) -> None:
-    """Clear the kill, mirroring ``KillSwitch.clear`` (cleared_by='auto_expired').
+) -> bool:
+    """Clear the kill, mirroring the in-process auto-clear
+    (cleared_by='auto_expired'). Returns whether it was cleared.
 
     ``auto_expired`` is one of the two values allowed by the ``kill_events``
     ``cleared_by`` CHECK constraint (the other is ``manual``); it matches the
     semantics of the in-process auto-clear this script substitutes for.
+
+    The clear applies only while the pointer still names ``kill_event_id``,
+    the event the caller found expired. The pipeline is a separate process:
+    if it engaged a fresh kill in between, that kill is left in force.
     """
-    await conn.execute(
-        "UPDATE live_control SET active_kill_event_id = NULL WHERE id = 1"
+    cur = await conn.execute(
+        "UPDATE live_control SET active_kill_event_id = NULL "
+        "WHERE id = 1 AND active_kill_event_id = ?",
+        (kill_event_id,),
     )
+    if cur.rowcount != 1:
+        await conn.rollback()
+        return False
     await conn.execute(
         "UPDATE kill_events SET cleared_at = ?, cleared_by = 'auto_expired' "
-        "WHERE id = ?",
+        "WHERE id = ? AND cleared_at IS NULL",
         (now.isoformat(), kill_event_id),
     )
     await conn.commit()
+    return True
 
 
 async def _run(db_path: str, *, apply: bool) -> dict:
@@ -121,7 +132,13 @@ async def _run(db_path: str, *, apply: bool) -> dict:
             }
         if not apply:
             return {"ok": True, "action": "dry_run", "would_clear": True, **found}
-        await _apply_clear(conn, found["kill_event_id"], now)
+        if not await _apply_clear(conn, found["kill_event_id"], now):
+            return {
+                "ok": True,
+                "action": "none",
+                "reason": "kill_superseded",
+                **found,
+            }
         return {"ok": True, "action": "cleared", **found}
 
 

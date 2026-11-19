@@ -492,3 +492,123 @@ async def test_daily_loss_breach_engages_over_an_expired_uncleared_kill(tmp_path
     assert await maybe_trigger_from_daily_loss(db, ks, _S()) is True
     assert await ks.is_active() is not None
     await db.close()
+
+
+# --- an auto-clear must only clear the kill it judged expired ----------------
+#
+# auto_clear_if_expired reads "event E has expired" without the lock and then
+# clears. Now that trigger() can replace an expired E with a fresh N, a tick
+# that read E just before must not go on to clear N.
+
+
+async def test_auto_clear_does_not_clear_a_kill_that_replaced_the_expired_one(
+    tmp_path,
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    now = datetime.now(timezone.utc)
+    old_id = await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+    stale = await ks._active_kill_state()  # what the tick read: E, expired
+    assert stale.kill_event_id == old_id
+
+    new_id, won = await ks.trigger(
+        triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+    )
+    assert won is True
+
+    # The tick resumes with its stale read.
+    async def _stale_read():
+        return stale
+
+    ks._active_kill_state = _stale_read
+    cleared = await ks.auto_clear_if_expired()
+    del ks._active_kill_state
+
+    assert cleared is False
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events WHERE id = ?", (new_id,)
+    )
+    assert (await cur.fetchone())[0] is None
+    assert not any("CLEARED" in a.upper() for a in alerts)
+    await db.close()
+
+
+async def test_trigger_racing_an_auto_clear_tick_always_leaves_the_kill_engaged(
+    tmp_path,
+):
+    for attempt in range(5):
+        db = Database(tmp_path / f"t{attempt}.db")
+        await db.initialize()
+        ks = KillSwitch(db)
+        now = datetime.now(timezone.utc)
+        await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+
+        (new_id, won), _cleared = await asyncio.gather(
+            ks.trigger(triggered_by="manual", reason="r", duration=timedelta(hours=4)),
+            ks.auto_clear_if_expired(),
+        )
+
+        assert won is True
+        state = await ks.is_active()
+        assert state is not None and state.kill_event_id == new_id
+        await db.close()
+
+
+async def test_operator_clear_does_not_restamp_an_already_cleared_event(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    cleared = now - timedelta(hours=2)
+    old_id = await _point_control_at(
+        db, killed_until=now + timedelta(hours=6), cleared_at=cleared
+    )
+
+    await ks.clear(cleared_by="manual")
+
+    cur = await db._conn.execute(
+        "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+    )
+    assert (await cur.fetchone())[0] is None  # the dangling pointer is released
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events WHERE id = ?", (old_id,)
+    )
+    assert (await cur.fetchone())[0] == cleared.isoformat()  # stamp untouched
+    await db.close()
+
+
+async def test_a_failed_trigger_insert_releases_nothing(tmp_path):
+    """An invalid triggered_by fails the INSERT's CHECK. The dead pointer must
+    not have been released by then, or the release would ride out on some
+    unrelated later commit with no kill and no log line that matches."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    old_id = await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await ks.trigger(
+            triggered_by="not_a_valid_source", reason="x", duration=timedelta(hours=1)
+        )
+    await db._conn.commit()  # an unrelated writer commits
+
+    cur = await db._conn.execute(
+        "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+    )
+    assert (await cur.fetchone())[0] == old_id
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events WHERE id = ?", (old_id,)
+    )
+    assert (await cur.fetchone())[0] is None
+    await db.close()

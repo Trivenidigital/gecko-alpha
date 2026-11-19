@@ -116,3 +116,41 @@ def test_no_active_kill_is_clean(tmp_path):
 def test_missing_db_returns_error(tmp_path):
     mod = _load_script()
     assert mod.main(["--db", str(tmp_path / "nope.db")]) == 1
+
+
+def test_apply_does_not_clear_a_kill_engaged_after_the_expired_one_was_found(
+    tmp_path,
+):
+    """The pipeline is another process. If it engages a fresh kill between
+    this script finding the expired one and clearing it, the fresh kill must
+    stay in force."""
+    import aiosqlite
+    from datetime import datetime, timezone
+
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    old_id = asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _race():
+        db = Database(dbp)
+        await db.initialize()
+        try:
+            new_id, won = await KillSwitch(db).trigger(
+                triggered_by="daily_loss_cap",
+                reason="fresh breach",
+                duration=timedelta(hours=4),
+            )
+            assert won is True
+        finally:
+            await db.close()
+        async with aiosqlite.connect(dbp) as conn:
+            applied = await mod._apply_clear(conn, old_id, datetime.now(timezone.utc))
+            cur = await conn.execute(
+                "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+            )
+            pointer = (await cur.fetchone())[0]
+        return new_id, applied, pointer
+
+    new_id, applied, pointer = asyncio.run(_race())
+    assert applied is False
+    assert pointer == new_id
