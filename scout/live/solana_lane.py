@@ -4359,6 +4359,21 @@ class LaneRunner:
             confirmation["outcome"] = "landed_after_resolution"
             confirmation["slot"] = resolution.slot
             confirmation["confirmation_status"] = resolution.confirmation_status
+            # The state machine has to catch up with what the resolver found
+            # before reconciliation can advance it: the run is still at
+            # `submission_attempted`, from which `reconciled` is not reachable
+            # — and must not be, or a run could reconcile without ever
+            # recording that its transaction landed. Same catch-up, for the
+            # same reason, as the reverse path's.
+            await self._state(
+                decision_id,
+                (
+                    STATE_FINALIZED
+                    if resolution.confirmation_status == "finalized"
+                    else STATE_LANDED
+                ),
+                mode=mode,
+            )
 
         transaction = None
         try:
@@ -4551,6 +4566,18 @@ class LaneRunner:
             mismatches.append(
                 "the transaction confirmed but was not finalized inside the "
                 "window — it is landed but not yet rooted"
+            )
+        elif confirmation["outcome"] == "landed_after_resolution" and not _is_finalized(
+            confirmation
+        ):
+            # The same fact as finalize_timeout, reached through the
+            # resolver: a fork can still take this back. A `pass` here would
+            # also try to advance `landed` straight to `reconciled`, which
+            # the transition table forbids.
+            mismatches.append(
+                "the resolver found the transaction landed but not finalized "
+                f"(status {confirmation.get('confirmation_status')!r}) — it "
+                "is landed but not yet rooted"
             )
 
         # ---- the position, and what it cost to open ----
@@ -7590,9 +7617,7 @@ async def _run_watchdog_readonly(db_path: Path, settings: Settings) -> int:
             timeout=aiohttp.ClientTimeout(total=float(settings.SOLANA_HTTP_TIMEOUT_SEC))
         )
         try:
-            summary = await check_stuck_executions(
-                _ReadOnlyDB(conn), session, settings
-            )
+            summary = await check_stuck_executions(_ReadOnlyDB(conn), session, settings)
         finally:
             await session.close()
     finally:

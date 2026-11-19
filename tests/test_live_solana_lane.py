@@ -4692,3 +4692,99 @@ def test_solana_lane_defaults_are_safe():
 def test_runner_config_rejects_an_envelope_that_could_never_trade(overrides, fragment):
     with pytest.raises(ValueError, match=re.escape(fragment)):
         Settings(_env_file=None, **_REQUIRED, **overrides)
+
+
+# ======================================================================
+# Confirmation timeout, then the resolver finds the transaction landed
+# ======================================================================
+# Distinct from the ambiguous-SUBMISSION tests above: here the submit call
+# succeeded and it is the confirmation poll that never saw the signature. The
+# resolver then adopts the landing. The run is still at `submission_attempted`
+# at that point, and `reconciled` is not reachable from there — so before the
+# catch-up state was recorded, a reconciliation that passed ended in
+# IllegalStateTransition instead of a result.
+async def _run_confirm_timeout_then_adopted(tmp_path, monkeypatch, *, resolver_status):
+    tx = build_swap_tx().tx_b64
+    _authorize(monkeypatch, _phrase(tx))
+    runner, db, session = await _make_runner(tmp_path)
+
+    async def _never_seen(_signature: str) -> dict:
+        return {
+            "outcome": "confirm_timeout",
+            "polls": 3,
+            "poll_errors": [],
+            "known": False,
+            "slot": None,
+            "confirmation_status": None,
+            "err": None,
+            "confirm_timeout_sec": 0.05,
+            "finalize_timeout_sec": 0.05,
+        }
+
+    monkeypatch.setattr(runner, "_await_confirmation", _never_seen)
+    with aioresponses() as m:
+        _mock_quote_and_build(m, tx)
+        _mock_pre_approval_rpc(m)
+        _mock_post_approval_rpc(m)
+        m.post(_SUBMIT_RE, payload=_rpc(_expected_signature(tx)))
+        # the resolver finds the signature, and records balances as evidence
+        m.post(_RPC_URL, payload=_sig_status(status=resolver_status))
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(0))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        # getTransaction, then the post-trade balances reconciliation reads
+        m.post(
+            _RPC_URL,
+            payload=_rpc({"slot": 283_000_455, "meta": {"fee": _TX_FEES, "err": None}}),
+        )
+        m.post(_RPC_URL, payload=_rpc({"context": {"slot": 1}, "value": _SOL_AFTER}))
+        m.post(_RPC_URL, payload=_token_accounts(_OUT_RAW))
+        code = await runner.place(sol=_SOL)
+        submissions = _submissions(m)
+    steps = _steps(tmp_path)
+    execution = await solana_lane.load_execution(
+        db, _step(steps, "run_started")["decision_id"]
+    )
+    return code, db, session, steps, execution, submissions
+
+
+async def test_confirm_timeout_then_finalized_adoption_reconciles(
+    tmp_path, monkeypatch
+):
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path, monkeypatch, resolver_status="finalized"
+        )
+    )
+    assert _step(steps, "confirmation_timeout") is not None
+    assert _step(steps, "ambiguity_adopted") is not None
+    assert len(submissions) == 1  # adopted, never resubmitted
+    assert _step(steps, "reconciliation")["verdict"] == "pass"
+    assert code == EXIT_OK
+    assert execution["state"] == solana_lane.STATE_RECONCILED
+    assert (await _live_rows(db))[0][0] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_confirm_timeout_then_unrooted_adoption_is_review_not_reconciled(
+    tmp_path, monkeypatch
+):
+    """Adopted but only 'confirmed': a fork can still take it back. That is
+    the same fact as finalize_timeout and gets the same answer — the state
+    records the landing and stops there."""
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path, monkeypatch, resolver_status="confirmed"
+        )
+    )
+    assert _step(steps, "ambiguity_adopted") is not None
+    assert len(submissions) == 1
+    reconciliation = _step(steps, "reconciliation")
+    assert reconciliation["verdict"] == "review"
+    assert any("not finalized" in m for m in reconciliation["mismatches"])
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
+    assert (await _live_rows(db))[0][0] == "open"
+    await session.close()
+    await db.close()
