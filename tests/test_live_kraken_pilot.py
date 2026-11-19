@@ -2219,3 +2219,127 @@ class TestEntryFreshStateRecheck:
         assert snapshot["price"] and snapshot["volume"]
         assert snapshot["available_balance"]
         assert step["approved_digest"]
+
+
+# ======================================================================
+# Cancel — the ledger write is guarded on the row's status
+# ======================================================================
+# The venue cancel is deliberately never refused (it reduces exposure). The
+# ledger write is a different matter: 'rejected' means "the entry produced no
+# position", so it may only be written over a row that still stands for an
+# order that may be live. Before this guard, cancelling the decision id of a
+# closed trade relabelled the closed row 'rejected' and re-stamped closed_at.
+_CLOSED_AT = "2026-10-01T00:00:00+00:00"
+
+
+def _mock_cancel_venue(m, *, vol_exec: str, cost: str) -> None:
+    m.post(_CANCEL_URL, payload={"error": [], "result": {"count": 0}})
+    m.post(_OPEN_ORDERS_URL, payload={"error": [], "result": {"open": {}}}, repeat=True)
+    m.post(
+        _CLOSED_ORDERS_URL,
+        payload={
+            "error": [],
+            "result": {
+                "closed": {
+                    _TXID: _filled_order_row(
+                        status="canceled", vol_exec=vol_exec, cost=cost
+                    )
+                }
+            },
+        },
+        repeat=True,
+    )
+    m.post(_QUERY_ORDERS_URL, payload={"error": [], "result": {}}, repeat=True)
+    m.post(_BALANCE_EX_URL, payload=_balance_payload(), repeat=True)
+
+
+async def _seed_settled_row(db: Database, *, status: str) -> int:
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status=status,
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET closed_at = ?, entry_fill_qty = '0.10000000', "
+        "entry_fill_price = '100.00' WHERE id = ?",
+        (_CLOSED_AT, live_id),
+    )
+    await db._conn.commit()
+    return live_id
+
+
+async def _ledger(db: Database, live_id: int) -> tuple:
+    cur = await db._conn.execute(
+        "SELECT status, closed_at, entry_fill_qty, entry_fill_price "
+        "FROM live_trades WHERE id = ?",
+        (live_id,),
+    )
+    return tuple(await cur.fetchone())
+
+
+@pytest.mark.parametrize("status", ["closed_via_reconciliation", "rejected"])
+async def test_cancel_does_not_relabel_a_settled_row(tmp_path, status):
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_settled_row(db, status=status)
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+        # The safety lever is intact: the venue cancel was still sent.
+        assert len(_posts_to(m, _CANCEL_URL)) == 1
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    unchanged = _step(steps, "cancel_ledger_unchanged")
+    assert unchanged is not None
+    assert unchanged["ledger_status"] == status
+    assert _step(steps, "cancel_zero_fill") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_does_not_overwrite_fills_on_a_settled_row(tmp_path):
+    """The partial-fill branch rewrites entry_fill_* — on a closed row that
+    would replace the recorded entry with the cancel-time lookup."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_settled_row(db, status="closed_via_reconciliation")
+    before = await _ledger(db, live_id)
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.05000000", cost="5.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    assert await _ledger(db, live_id) == before
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "cancel_ledger_unchanged") is not None
+    assert _step(steps, "cancel_partial_fill") is None
+    await adapter.close()
+    await db.close()
+
+
+async def test_cancel_still_settles_a_row_under_manual_review(tmp_path):
+    """Cancelling a needs_manual_review row is the documented way out of it."""
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="needs_manual_review",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        assert await runner.cancel(decision_id=_DECISION) == EXIT_OK
+
+    status, closed_at, _qty, _price = await _ledger(db, live_id)
+    assert status == "rejected"
+    assert closed_at is not None
+    steps = _evidence_steps(tmp_path)
+    assert _step(steps, "cancel_zero_fill") is not None
+    assert _step(steps, "cancel_ledger_unchanged") is None
+    await adapter.close()
+    await db.close()
