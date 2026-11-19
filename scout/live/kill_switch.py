@@ -208,6 +208,61 @@ class KillSwitch:
             return None
         return state
 
+    async def _release_dead_pointer_locked(self, now: datetime) -> int | None:
+        """Null ``live_control.active_kill_event_id`` when it does not stand
+        for a kill in force. Caller holds the txn lock and commits.
+
+        Dead means: the referenced event row is missing, is already cleared,
+        or is uncleared with ``killed_until`` strictly before ``now`` — the
+        same expiry rule :meth:`is_active` applies. An expired event is
+        stamped ``cleared_by='auto_expired'`` so it is not left dangling; an
+        already-cleared event keeps its stamp. A ``killed_until`` that cannot
+        be read is NOT treated as dead: the pointer is left alone.
+
+        Returns the released event id, or ``None`` if nothing was released.
+        No operator alert of its own: the caller is engaging a new kill and
+        that alert follows.
+        """
+        assert self._db._conn is not None
+        cur = await self._db._conn.execute(
+            "SELECT lc.active_kill_event_id, ke.id, ke.cleared_at, ke.killed_until "
+            "FROM live_control AS lc "
+            "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
+            "WHERE lc.id = 1"
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        pointer, event_id, cleared_at, killed_until_raw = row
+        if event_id is None:
+            why = "event_missing"
+        elif cleared_at is not None:
+            why = "event_already_cleared"
+        else:
+            try:
+                expired = datetime.fromisoformat(killed_until_raw) < now
+            except (TypeError, ValueError):
+                return None
+            if not expired:
+                return None
+            why = "event_expired"
+            await self._db._conn.execute(
+                "UPDATE kill_events SET cleared_at = ?, cleared_by = 'auto_expired' "
+                "WHERE id = ? AND cleared_at IS NULL",
+                (now.isoformat(), pointer),
+            )
+        await self._db._conn.execute(
+            "UPDATE live_control SET active_kill_event_id = NULL "
+            "WHERE id = 1 AND active_kill_event_id = ?",
+            (pointer,),
+        )
+        log.warning(
+            "live_kill_dead_pointer_released",
+            released_kill_event_id=pointer,
+            why=why,
+        )
+        return pointer
+
     async def trigger(
         self,
         *,
@@ -220,6 +275,12 @@ class KillSwitch:
         Concurrent triggers collapse: only the one that flips
         ``live_control.active_kill_event_id`` from NULL wins. The loser's
         speculative ``kill_events`` row is removed.
+
+        A pointer that no longer stands for a kill in force — its event is
+        expired, already cleared, or gone — is released first, inside the same
+        transaction (:meth:`_release_dead_pointer_locked`). Otherwise the
+        claim below would lose to a kill that :meth:`is_active` already
+        reports as inactive, and a fresh breach could not halt trading.
 
         Returns ``(kill_event_id, i_am_winner)`` — the first element is the
         **active** event id (winner's id for both callers, so callers that
@@ -234,6 +295,8 @@ class KillSwitch:
         now = datetime.now(timezone.utc)
         killed_until = now + duration
         async with self._db._txn_lock:
+            await self._release_dead_pointer_locked(now)
+
             # Insert the row first — speculative. If we lose the race we
             # DELETE it below.
             await self._db._conn.execute(

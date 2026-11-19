@@ -336,3 +336,159 @@ async def test_recent_expiry_auto_clear_no_frozen_alert(tmp_path):
     assert await ks.auto_clear_if_expired() is True
     assert not any("soak was frozen" in m for m in sent)
     await db.close()
+
+
+# --- a dead pointer must not block the next kill -----------------------------
+#
+# live_control.active_kill_event_id is released only by clear(). Between a
+# kill's expiry and the next auto-clear tick is_active() already answers
+# "inactive" (orders flow), yet trigger()'s compare-and-swap still saw a
+# non-NULL pointer and lost — so a fresh loss-cap breach could not halt
+# trading. A pointer left on an already-cleared event was worse: nothing ever
+# released it.
+
+
+async def _point_control_at(db, *, killed_until, cleared_at=None):
+    cur = await db._conn.execute(
+        "INSERT INTO kill_events (triggered_by, reason, triggered_at, "
+        "killed_until, cleared_at, cleared_by) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "manual",
+            "old",
+            "2026-01-01T00:00:00+00:00",
+            killed_until.isoformat(),
+            cleared_at.isoformat() if cleared_at else None,
+            "manual" if cleared_at else None,
+        ),
+    )
+    old_id = cur.lastrowid
+    await db._conn.execute(
+        "UPDATE live_control SET active_kill_event_id = ? WHERE id = 1", (old_id,)
+    )
+    await db._conn.commit()
+    return old_id
+
+
+async def test_trigger_engages_over_an_expired_uncleared_kill(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    old_id = await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+    assert await ks.is_active() is None  # orders are already flowing again
+
+    new_id, won = await ks.trigger(
+        triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+    )
+
+    assert won is True
+    assert new_id != old_id
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    # The expired event is closed out, not left dangling.
+    cur = await db._conn.execute(
+        "SELECT cleared_at, cleared_by FROM kill_events WHERE id = ?", (old_id,)
+    )
+    cleared_at, cleared_by = await cur.fetchone()
+    assert cleared_at is not None
+    assert cleared_by == "auto_expired"
+    await db.close()
+
+
+async def test_trigger_engages_over_a_pointer_to_a_cleared_event(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    cleared = now - timedelta(hours=2)
+    old_id = await _point_control_at(
+        db, killed_until=now + timedelta(hours=6), cleared_at=cleared
+    )
+    assert await ks.is_active() is None
+
+    new_id, won = await ks.trigger(
+        triggered_by="manual", reason="again", duration=timedelta(hours=1)
+    )
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    # The already-cleared event keeps its original clear stamp.
+    cur = await db._conn.execute(
+        "SELECT cleared_at, cleared_by FROM kill_events WHERE id = ?", (old_id,)
+    )
+    assert tuple(await cur.fetchone()) == (cleared.isoformat(), "manual")
+    await db.close()
+
+
+async def test_trigger_still_loses_to_a_live_kill(tmp_path):
+    """The release must not weaken the compare-and-swap for a kill that is
+    genuinely in force."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    first_id, won = await ks.trigger(
+        triggered_by="manual", reason="first", duration=timedelta(hours=1)
+    )
+    assert won is True
+
+    second_id, won_again = await ks.trigger(
+        triggered_by="daily_loss_cap", reason="second", duration=timedelta(hours=4)
+    )
+
+    assert won_again is False
+    assert second_id == first_id
+    cur = await db._conn.execute("SELECT COUNT(*) FROM kill_events")
+    assert (await cur.fetchone())[0] == 1
+    cur = await db._conn.execute(
+        "SELECT cleared_at FROM kill_events WHERE id = ?", (first_id,)
+    )
+    assert (await cur.fetchone())[0] is None
+    await db.close()
+
+
+async def test_daily_loss_breach_engages_over_an_expired_uncleared_kill(tmp_path):
+    """End to end through the loss-cap path that the stale pointer used to
+    defeat silently (it returned False as if a kill were already in force)."""
+    from scout.live.kill_switch import maybe_trigger_from_daily_loss
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+    await db._conn.execute(
+        "INSERT INTO paper_trades (token_id, symbol, name, chain, signal_type, "
+        "signal_data, entry_price, amount_usd, quantity, tp_pct, sl_pct, tp_price, "
+        "sl_price, status, opened_at) VALUES ('t', 'T', 'T', 'eth', 'x', '{}', "
+        "1, 1, 1, 1, 1, 1, 1, 'open', ?)",
+        (now.isoformat(),),
+    )
+    cur = await db._conn.execute("SELECT last_insert_rowid()")
+    paper_id = (await cur.fetchone())[0]
+    cur = await db._conn.execute("PRAGMA table_info(shadow_trades)")
+    cols = {r[1]: r for r in await cur.fetchall()}
+    values = {
+        "paper_trade_id": paper_id,
+        "status": "closed_sl",
+        "closed_at": now.isoformat(),
+        "realized_pnl_usd": "-100000",
+    }
+    for name, (_cid, _n, ctype, notnull, default, pk) in cols.items():
+        if name in values or default is not None or pk or not notnull:
+            continue
+        values[name] = 0 if "INT" in (ctype or "").upper() else "x"
+    await db._conn.execute(
+        f"INSERT INTO shadow_trades ({', '.join(values)}) "
+        f"VALUES ({', '.join('?' for _ in values)})",
+        tuple(values.values()),
+    )
+    await db._conn.commit()
+
+    class _S:
+        LIVE_DAILY_LOSS_CAP_USD = 50
+        LIVE_TRADING_ENABLED = False
+
+    assert await maybe_trigger_from_daily_loss(db, ks, _S()) is True
+    assert await ks.is_active() is not None
+    await db.close()
