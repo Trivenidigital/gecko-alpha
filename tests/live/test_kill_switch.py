@@ -664,6 +664,10 @@ async def test_clear_reports_nothing_cleared_when_another_process_swapped_the_ki
 
     assert cleared is False
     assert alerts == []
+    # The write that matched nothing must not leave a write transaction open
+    # on the shared connection: it would hold the database lock against every
+    # other process until some unrelated commit came along.
+    assert db._conn.in_transaction is False
     cur = await db._conn.execute(
         "SELECT active_kill_event_id FROM live_control WHERE id = 1"
     )
@@ -672,4 +676,17 @@ async def test_clear_reports_nothing_cleared_when_another_process_swapped_the_ki
         "SELECT cleared_at FROM kill_events WHERE id = ?", (old_id,)
     )
     assert (await cur.fetchone())[0] is None
+    await db.close()
+
+
+async def test_clear_returns_the_cleared_event_id_or_none(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    assert await ks.clear(cleared_by="manual") is None  # nothing active
+    kid, _ = await ks.trigger(
+        triggered_by="manual", reason="x", duration=timedelta(hours=1)
+    )
+    assert await ks.clear(cleared_by="manual") == kid
+    assert await ks.is_active() is None
     await db.close()

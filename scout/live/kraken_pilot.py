@@ -291,7 +291,16 @@ _BLOCKING_STATUSES = ("open", "needs_manual_review")
 # exit is recorded by exit_order_id, or by exit_fill_price alone when the
 # exit's txid was not known (_record_partial_exit accepts txid=None).
 _NO_EXIT_RECORDED = "exit_order_id IS NULL AND exit_fill_price IS NULL"
-_NO_ENTRY_FILL_RECORDED = "(entry_fill_qty IS NULL OR CAST(entry_fill_qty AS REAL) = 0)"
+# "No entry fill" means no price, and a quantity that is absent, blank or a
+# plain zero ("0", "0.00000000" — _fmt writes fixed-point). Anything else,
+# including a value that cannot be read as a number, counts as a recorded
+# fill: CAST would turn 'abc' into 0 and wave it through.
+_NO_ENTRY_FILL_RECORDED = (
+    "entry_fill_price IS NULL AND ("
+    "entry_fill_qty IS NULL OR TRIM(entry_fill_qty) = '' OR ("
+    "TRIM(entry_fill_qty) NOT GLOB '*[^0-9.]*' "
+    "AND TRIM(entry_fill_qty) NOT GLOB '*[1-9]*'))"
+)
 
 # Kraken's published default taker fee, used only when AssetPairs carries no
 # fee schedule for the pair. Always labelled ESTIMATE in the approval block.

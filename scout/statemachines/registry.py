@@ -548,13 +548,14 @@ LIVE_TRADE = Machine(
         "status in the statement or the function; where a check exists it "
         "is usually in the caller. Only the transitions marked "
         "compare-and-swap filter on the prior status in the SQL itself.",
-        "KrakenPilot.cancel always sends the venue cancel, whatever the "
+        "PilotRunner.cancel (Kraken) always sends the venue cancel, whatever the "
         "row's status, because that reduces exposure. Its ledger write "
         "applies only while the row is open or needs_manual_review, no "
         "exit is recorded and, for the write of rejected, the ledger "
         "records no entry fill; otherwise the row is left as it was and the "
-        "evidence records cancel_ledger_unchanged. When the ledger and the "
-        "venue disagree about a fill, cancel exits for review.",
+        "evidence records cancel_ledger_unchanged. It exits for review in "
+        "two cases: a fill reported on a rejected row, and a row whose "
+        "ledger records a fill while the venue shows none.",
         "Manual settlement of needs_manual_review rows is done with SQL "
         "outside the code, so those moves cannot appear in this table.",
         "needs_manual_review means different things per venue: the Binance "
@@ -962,7 +963,9 @@ KILL_SWITCH = Machine(
     ),
     caveats=(
         "trigger is a real compare-and-swap on the pointer. The operator's "
-        "clear releases whichever kill is active when it runs. The automatic "
+        "clear releases the kill it read as active; if another process moved "
+        "the pointer in between it clears nothing and returns None (the CLI "
+        "then says NOT cleared). The automatic "
         "clears (auto_clear_if_expired and the clear-expired-kills script) "
         "apply only while the pointer still names the event they judged "
         "expired.",

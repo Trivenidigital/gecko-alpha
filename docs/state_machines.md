@@ -259,7 +259,7 @@ Must never be true (checked by the auditor):
 Known hazards (read from the code at registration):
 
 - Most writes are UPDATE ... WHERE id = ? with no check of the prior status in the statement or the function; where a check exists it is usually in the caller. Only the transitions marked compare-and-swap filter on the prior status in the SQL itself.
-- KrakenPilot.cancel always sends the venue cancel, whatever the row's status, because that reduces exposure. Its ledger write applies only while the row is open or needs_manual_review, no exit is recorded and, for the write of rejected, the ledger records no entry fill; otherwise the row is left as it was and the evidence records cancel_ledger_unchanged. When the ledger and the venue disagree about a fill, cancel exits for review.
+- PilotRunner.cancel (Kraken) always sends the venue cancel, whatever the row's status, because that reduces exposure. Its ledger write applies only while the row is open or needs_manual_review, no exit is recorded and, for the write of rejected, the ledger records no entry fill; otherwise the row is left as it was and the evidence records cancel_ledger_unchanged. It exits for review in two cases: a fill reported on a rejected row, and a row whose ledger records a fill while the venue shows none.
 - Manual settlement of needs_manual_review rows is done with SQL outside the code, so those moves cannot appear in this table.
 - needs_manual_review means different things per venue: the Binance engine uses it so a row stops counting as open exposure, while the Kraken pilot and the Solana lane treat it as blocking the lane.
 - 'Closed' is re-derived three ways: LIKE 'closed_%' (scout/live/kill_switch.py), LIKE 'closed%' (scout/live/services/dormancy.py, approval_thresholds.py) and an explicit tuple (scout/live/mandate.py).
@@ -508,7 +508,7 @@ How each state is recognised in the table:
 
 Known hazards (read from the code at registration):
 
-- trigger is a real compare-and-swap on the pointer. The operator's clear releases whichever kill is active when it runs. The automatic clears (auto_clear_if_expired and the clear-expired-kills script) apply only while the pointer still names the event they judged expired.
+- trigger is a real compare-and-swap on the pointer. The operator's clear releases the kill it read as active; if another process moved the pointer in between it clears nothing and returns None (the CLI then says NOT cleared). The automatic clears (auto_clear_if_expired and the clear-expired-kills script) apply only while the pointer still names the event they judged expired.
 - Before claiming, trigger releases a pointer whose event is expired, already cleared or missing, so a dead pointer does not block a new kill. A kill still in force wins the compare-and-swap as before.
 - A pointer left on an already-cleared event matches no state: the switch reads as inactive. No automatic clear releases it; the next trigger does, and so does an operator clear. The auditor reports that row.
 

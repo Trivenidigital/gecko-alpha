@@ -116,7 +116,7 @@ touch money or safety controls:
    `reconciled`** — the lane's own guard raises
    (`scout/live/solana_lane.py:4335-4357`, `:4421-4427`). Read from the code
    by me and by two reviewers; not reproduced by a test.
-2. **`KrakenPilot.cancel` writes `rejected` without checking the row's
+2. **`PilotRunner.cancel` (Kraken pilot) writes `rejected` without checking the row's
    status**, so it can relabel a closed row
    (`scout/live/kraken_pilot.py:5024-5118`).
 3. **An expired kill that has not been cleared blocks the next kill from

@@ -2521,3 +2521,44 @@ async def test_cancel_after_an_exit_says_the_position_still_blocks(tmp_path, cap
     assert "still blocks" in capsys.readouterr().out
     await adapter.close()
     await db.close()
+
+
+@pytest.mark.parametrize(
+    "qty,price,expect_rejected",
+    [
+        (None, None, True),  # the ordinary resting order
+        ("0.00000000", None, True),  # a recorded zero is not a fill
+        ("", None, True),
+        ("abc", None, False),  # unreadable: do not assume "no fill"
+        (None, "100.00", False),  # a price without a quantity is still a fill
+        ("0.10000000", "100.00", False),
+    ],
+)
+async def test_zero_fill_cancel_rejects_only_a_row_with_no_recorded_fill(
+    tmp_path, qty, price, expect_rejected
+):
+    runner, db, adapter = await _make_runner(tmp_path)
+    live_id = await _seed_kraken_row(
+        db,
+        size_usd="15.00",
+        status="open",
+        client_order_id=_DECISION,
+        entry_order_id=_TXID,
+    )
+    await db._conn.execute(
+        "UPDATE live_trades SET entry_fill_qty = ?, entry_fill_price = ? WHERE id = ?",
+        (qty, price, live_id),
+    )
+    await db._conn.commit()
+
+    with aioresponses() as m:
+        _mock_cancel_venue(m, vol_exec="0.00000000", cost="0.00000")
+        code = await runner.cancel(decision_id=_DECISION)
+
+    status = (await _ledger(db, live_id))[0]
+    if expect_rejected:
+        assert (code, status) == (EXIT_OK, "rejected")
+    else:
+        assert (code, status) == (EXIT_REVIEW, "open")
+    await adapter.close()
+    await db.close()

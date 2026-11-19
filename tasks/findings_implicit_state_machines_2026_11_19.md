@@ -155,7 +155,7 @@ recorded so they can be triaged separately.
    table forbids, so the guard raises. The reverse path records the catch-up
    state first and its comment explains why (`:6095-6108`). Reproduced by
    `test_confirm_timeout_then_finalized_adoption_reconciles` before the fix.
-2. **FIXED (`1424ba68`, `b8d6ed86`).** **`KrakenPilot.cancel` writes `rejected` without reading the row's
+2. **FIXED (`1424ba68`, `b8d6ed86`).** **`PilotRunner.cancel` (Kraken pilot) writes `rejected` without reading the row's
    status** (`scout/live/kraken_pilot.py:5024-5118`).
 3. **FIXED (`27c39f68`).** **`record_contract_coin_map` overwrites `coin_id` unconditionally on
    conflict** (`scout/db.py:1771-1774`) and the new-pools lane writes
@@ -248,6 +248,14 @@ Raised by the independent review of the fixes (not fixed):
     alert** that `auto_clear_if_expired` would have sent for it
     (`scout/live/kill_switch.py`). The release is logged as
     `live_kill_dead_pointer_released` and the new kill's own alert follows.
+
+28. **A Kraken partial exit recorded with neither an order id nor a price
+    leaves no exit marker.** `_record_partial_exit` reduces the held quantity
+    and writes `exit_order_id=txid`, where `txid` (and the exit price) may be
+    None (`scout/live/kraken_pilot.py`, around `_record_partial_exit`). Cancel
+    then sees no exit on the row and may write the entry order's fill back
+    over the reduced quantity. Low probability; needs a marker written by the
+    exit path itself.
 
 ### 4b. Reported by the survey, not independently confirmed here
 

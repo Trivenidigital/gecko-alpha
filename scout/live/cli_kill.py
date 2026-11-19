@@ -90,9 +90,21 @@ async def main() -> int:
             print(f"kill_event_id={kid} won={won}")
             return 0
         if args.off:
-            await ks.clear(cleared_by="manual")
-            print("cleared")
-            return 0
+            cleared_id = await ks.clear(cleared_by="manual")
+            if cleared_id is not None:
+                print(f"cleared kill_event_id={cleared_id}")
+                return 0
+            still = await ks.is_active()
+            if still is None:
+                print("nothing to clear — the kill switch is already inactive")
+                return 0
+            # Nothing was cleared, yet a kill is in force: another process
+            # engaged one while this command ran. Do not report success.
+            print(
+                f"NOT cleared — kill_event_id={still.kill_event_id} is in force "
+                f"until {still.killed_until.isoformat()}; run --off again"
+            )
+            return 1
         if args.status:
             state = await ks.is_active()
             if state is None:

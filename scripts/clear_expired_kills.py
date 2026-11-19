@@ -79,6 +79,9 @@ async def _find_active_kill(conn: aiosqlite.Connection, now: datetime) -> dict |
         "kill_event_id": row[0],
         "killed_until": row[1],
         "reason": row[2],
+        # The kill's own reason text, under a key no result reuses. In the
+        # "nothing done" results `reason` is replaced by why nothing was done.
+        "kill_reason": row[2],
         "triggered_by": row[3],
         "triggered_at": row[4],
         "expired": expired,
@@ -126,7 +129,6 @@ async def _run(db_path: str, *, apply: bool) -> dict:
         if not found["expired"]:
             return {
                 **found,
-                "kill_reason": found["reason"],
                 "ok": True,
                 "action": "none",
                 "reason": "kill_not_expired",
@@ -136,7 +138,6 @@ async def _run(db_path: str, *, apply: bool) -> dict:
         if not await _apply_clear(conn, found["kill_event_id"], now):
             return {
                 **found,
-                "kill_reason": found["reason"],
                 "ok": True,
                 "action": "none",
                 "reason": "kill_superseded",

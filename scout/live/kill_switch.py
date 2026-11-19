@@ -360,17 +360,21 @@ class KillSwitch:
         )
         return new_id, True
 
-    async def clear(self, *, cleared_by: str) -> None:
-        """Clear the active kill, if any.
+    async def clear(self, *, cleared_by: str) -> int | None:
+        """Clear the active kill, if any. Returns the cleared event id, or
+        ``None`` when nothing was cleared.
 
         UPDATE ``live_control`` → NULL and stamp ``cleared_at`` + ``cleared_by``
         on the previously-active ``kill_events`` row. Both writes go through
         the txn lock so a concurrent ``trigger()`` cannot interleave.
 
         This is the operator's lever: it clears whichever kill is active when
-        it runs. An event that already carries a clear stamp keeps it.
+        it reads the pointer. An event that already carries a clear stamp
+        keeps it. ``None`` means either nothing was active, or the pointer
+        moved between the read and the write (another process engaged a kill);
+        callers that report to an operator should check :meth:`is_active`.
         """
-        await self._clear(cleared_by=cleared_by, only_event_id=None)
+        return await self._clear(cleared_by=cleared_by, only_event_id=None)
 
     async def _clear(self, *, cleared_by: str, only_event_id: int | None) -> int | None:
         """Clear the active kill and return its event id, or ``None`` if
@@ -412,6 +416,12 @@ class KillSwitch:
                 # another process (the kill CLI holds its own connection)
                 # engaged a different kill. Nothing of ours is pending, so
                 # there is nothing to undo — and nothing was cleared.
+                # The UPDATE matched no row but still opened a write
+                # transaction, which holds the database lock against every
+                # other process. End it. COMMIT, not ROLLBACK: nothing of ours
+                # is pending, and a rollback on this shared connection would
+                # discard other writers' uncommitted work.
+                await self._db._conn.commit()
                 log.warning(
                     "live_kill_clear_skipped_pointer_moved",
                     read_kill_event_id=active_id,

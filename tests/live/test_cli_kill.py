@@ -92,3 +92,40 @@ async def test_status_when_inactive_and_active(tmp_path, monkeypatch, capsys):
     assert "active" in out_active
     assert "status-check" in out_active
     assert out_active != out_inactive
+
+
+async def test_off_with_nothing_active_says_so(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    await db.close()
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setattr(sys, "argv", ["cli_kill", "--off"])
+    assert await cli_main() == 0
+    assert "nothing to clear" in capsys.readouterr().out
+
+
+async def test_off_does_not_claim_cleared_while_a_kill_is_still_in_force(
+    tmp_path, monkeypatch, capsys
+):
+    """clear() can find the pointer moved under it (another process engaged a
+    kill between its read and its write). The operator must not be told
+    'cleared' while trading is still halted."""
+    db_path = tmp_path / "t.db"
+    db = Database(db_path)
+    await db.initialize()
+    await KillSwitch(db).trigger(
+        triggered_by="manual", reason="still on", duration=timedelta(hours=1)
+    )
+    await db.close()
+
+    async def _clear_that_lost(self, *, cleared_by):
+        return None
+
+    monkeypatch.setattr(KillSwitch, "clear", _clear_that_lost)
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setattr(sys, "argv", ["cli_kill", "--off"])
+    assert await cli_main() == 1
+    out = capsys.readouterr().out
+    assert "NOT cleared" in out
+    assert "cleared\n" != out[-8:]

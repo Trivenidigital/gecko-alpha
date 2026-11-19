@@ -176,3 +176,14 @@ def test_superseded_and_not_expired_results_name_their_reason(tmp_path, monkeypa
     result = asyncio.run(mod._run(str(fresh), apply=True))
     assert result["action"] == "none"
     assert result["reason"] == "kill_not_expired"
+
+
+def test_every_result_carries_the_kills_own_reason_under_one_key(tmp_path):
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    asyncio.run(_setup_kill(dbp, hours_delta=-2))
+    dry = asyncio.run(mod._run(str(dbp), apply=False))
+    assert dry["kill_reason"] == "x"
+    done = asyncio.run(mod._run(str(dbp), apply=True))
+    assert done["action"] == "cleared"
+    assert done["kill_reason"] == "x"
