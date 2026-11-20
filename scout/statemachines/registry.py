@@ -137,7 +137,8 @@ _PAPER_CLOSES: tuple[tuple[str, str, str, str], ...] = (
         "closed_manual",
         "Closed — manual",
         "Closed by the operator. Also what a close with an unrecognised "
-        "reason silently becomes. Excluded from combo win-rate statistics.",
+        "reason becomes (logged at ERROR as paper_close_reason_unmapped). "
+        "Excluded from combo win-rate statistics.",
         "operator close, or a close reason missing from status_map",
     ),
 )
@@ -972,7 +973,12 @@ KILL_SWITCH = Machine(
         "Before claiming, trigger releases a pointer whose event is "
         "expired, already cleared or missing, so a dead pointer does not "
         "block a new kill. A kill still in force wins the compare-and-swap "
-        "as before.",
+        "as before. A killed_until that cannot be parsed is left in force "
+        "and logged at ERROR (live_kill_dead_pointer_unreadable).",
+        "Writers that do not take the transaction lock can roll back the "
+        "shared connection mid-trigger. trigger reads its claim back before "
+        "reporting a win and retries an attempt that was undone, up to three "
+        "times; after that it logs live_kill_trigger_unconfirmed.",
         "A pointer left on an already-cleared event matches no state: the "
         "switch reads as inactive. No automatic clear releases it; the next "
         "trigger does, and so does an operator clear. The auditor reports "

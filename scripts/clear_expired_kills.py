@@ -136,11 +136,20 @@ async def _run(db_path: str, *, apply: bool) -> dict:
         if not apply:
             return {"ok": True, "action": "dry_run", "would_clear": True, **found}
         if not await _apply_clear(conn, found["kill_event_id"], now):
+            # Say what is in force instead: NULL (someone else cleared it) or
+            # a fresh kill the pipeline engaged in between.
+            cur = await conn.execute(
+                "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+            )
+            pointer_now = await cur.fetchone()
             return {
                 **found,
                 "ok": True,
                 "action": "none",
                 "reason": "kill_superseded",
+                "active_kill_event_id_now": (
+                    pointer_now[0] if pointer_now is not None else None
+                ),
             }
         return {"ok": True, "action": "cleared", **found}
 

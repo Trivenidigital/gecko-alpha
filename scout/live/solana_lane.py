@@ -4365,15 +4365,31 @@ class LaneRunner:
             # — and must not be, or a run could reconcile without ever
             # recording that its transaction landed. Same catch-up, for the
             # same reason, as the reverse path's.
-            await self._state(
-                decision_id,
-                (
-                    STATE_FINALIZED
-                    if resolution.confirmation_status == "finalized"
-                    else STATE_LANDED
-                ),
-                mode=mode,
+            #
+            # `resolve` runs without the lane lock, so an operator may already
+            # have recorded the landing between adoption and here. Write the
+            # catch-up only if the lane's own table allows it from the state
+            # the row is in NOW; otherwise the row already says at least as
+            # much, and writing would raise IllegalStateTransition.
+            catch_up = (
+                STATE_FINALIZED
+                if resolution.confirmation_status == "finalized"
+                else STATE_LANDED
             )
+            current = await load_execution(self._db, decision_id)
+            current_state = None if current is None else current.get("state")
+            if current_state is None or catch_up in LEGAL_TRANSITIONS.get(
+                current_state, ()
+            ):
+                await self._state(decision_id, catch_up, mode=mode)
+            else:
+                evidence.record(
+                    "catch_up_state_skipped",
+                    wanted=catch_up,
+                    current_state=current_state,
+                    note="the execution row was already advanced (most likely "
+                    "by a concurrent `resolve`); not rewriting it",
+                )
 
         transaction = None
         try:

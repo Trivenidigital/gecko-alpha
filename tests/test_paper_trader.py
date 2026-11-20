@@ -668,3 +668,28 @@ def test_trade_status_literal_lists_every_close_status_the_evaluator_writes():
         "closed_time_death",
     ):
         assert status in get_args(TradeStatus)
+
+
+async def test_unmapped_reason_on_an_already_closed_trade_logs_nothing_unmapped(
+    db, trader
+):
+    """A losing close race writes nothing, so it must not be counted as a
+    trade that left the win-rate loop."""
+    import structlog
+
+    trade_id = await _open_btc(db, trader)
+    await trader.execute_sell(
+        db=db, trade_id=trade_id, current_price=55000.0, reason="manual", slippage_bps=0
+    )
+    with structlog.testing.capture_logs() as logs:
+        closed = await trader.execute_sell(
+            db=db,
+            trade_id=trade_id,
+            current_price=55000.0,
+            reason="trailng_stop",
+            slippage_bps=0,
+        )
+    assert closed is False
+    events = [e.get("event") for e in logs]
+    assert "trade_already_closed" in events
+    assert "paper_close_reason_unmapped" not in events

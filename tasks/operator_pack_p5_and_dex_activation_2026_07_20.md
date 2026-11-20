@@ -1,5 +1,9 @@
 # Operator decision pack — P5 inert flags + DEX activation (2026-07-20)
 
+> **HISTORICAL (marked 2026-11-20).** A snapshot from July 2026, carried on
+> this branch from an earlier session. The commands below describe production
+> as it was then; do not paste them without checking current state first.
+
 Current-state update of the ops pack's Priority 5 briefs (frozen at 07-18)
 plus the paste-ready DEX-first activation sequence. Every action below is a
 prod-state change: operator-executed, per-item decision, recorded approval

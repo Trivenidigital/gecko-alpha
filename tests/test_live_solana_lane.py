@@ -4703,7 +4703,9 @@ def test_runner_config_rejects_an_envelope_that_could_never_trade(overrides, fra
 # at that point, and `reconciled` is not reachable from there — so before the
 # catch-up state was recorded, a reconciliation that passed ended in
 # IllegalStateTransition instead of a result.
-async def _run_confirm_timeout_then_adopted(tmp_path, monkeypatch, *, resolver_status):
+async def _run_confirm_timeout_then_adopted(
+    tmp_path, monkeypatch, *, resolver_status, after_adoption=None
+):
     tx = build_swap_tx().tx_b64
     _authorize(monkeypatch, _phrase(tx))
     runner, db, session = await _make_runner(tmp_path)
@@ -4722,6 +4724,15 @@ async def _run_confirm_timeout_then_adopted(tmp_path, monkeypatch, *, resolver_s
         }
 
     monkeypatch.setattr(runner, "_await_confirmation", _never_seen)
+    if after_adoption is not None:
+        real_handle = runner._handle_ambiguity
+
+        async def _handle_then_interfere(**kwargs):
+            result = await real_handle(**kwargs)
+            await after_adoption(db, kwargs["decision_id"])
+            return result
+
+        monkeypatch.setattr(runner, "_handle_ambiguity", _handle_then_interfere)
     with aioresponses() as m:
         _mock_quote_and_build(m, tx)
         _mock_pre_approval_rpc(m)
@@ -4786,5 +4797,32 @@ async def test_confirm_timeout_then_unrooted_adoption_is_review_not_reconciled(
     assert code == EXIT_REVIEW
     assert execution["state"] == solana_lane.STATE_LANDED
     assert (await _live_rows(db))[0][0] == "open"
+    await session.close()
+    await db.close()
+
+
+async def test_adoption_does_not_crash_when_resolve_already_recorded_the_landing(
+    tmp_path, monkeypatch
+):
+    """`resolve` deliberately runs without the lane lock. If an operator's
+    resolve records `landed` while this run is between adoption and its own
+    catch-up write, the catch-up must not attempt `landed -> landed`."""
+
+    async def _operator_resolve(db, decision_id):
+        await solana_lane.record_execution_state(
+            db, decision_id, solana_lane.STATE_LANDED, mode="SUPERVISED_LIVE"
+        )
+
+    code, db, session, steps, execution, submissions = (
+        await _run_confirm_timeout_then_adopted(
+            tmp_path,
+            monkeypatch,
+            resolver_status="confirmed",
+            after_adoption=_operator_resolve,
+        )
+    )
+    assert _step(steps, "unexpected_error") is None
+    assert code == EXIT_REVIEW
+    assert execution["state"] == solana_lane.STATE_LANDED
     await session.close()
     await db.close()

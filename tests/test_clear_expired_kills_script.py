@@ -187,3 +187,28 @@ def test_every_result_carries_the_kills_own_reason_under_one_key(tmp_path):
     done = asyncio.run(mod._run(str(dbp), apply=True))
     assert done["action"] == "cleared"
     assert done["kill_reason"] == "x"
+
+
+def test_superseded_result_says_what_is_in_force_now(tmp_path):
+    mod = _load_script()
+    dbp = tmp_path / "t.db"
+    old_id = asyncio.run(_setup_kill(dbp, hours_delta=-2))
+
+    async def _supersede_then_apply(conn, kill_event_id, now):
+        db = Database(dbp)
+        await db.initialize()
+        try:
+            new_id, _ = await KillSwitch(db).trigger(
+                triggered_by="manual", reason="fresh", duration=timedelta(hours=4)
+            )
+        finally:
+            await db.close()
+        _supersede_then_apply.new_id = new_id
+        return await real_apply(conn, kill_event_id, now)
+
+    real_apply = mod._apply_clear
+    mod._apply_clear = _supersede_then_apply
+    result = asyncio.run(mod._run(str(dbp), apply=True))
+    assert result["reason"] == "kill_superseded"
+    assert result["kill_event_id"] == old_id
+    assert result["active_kill_event_id_now"] == _supersede_then_apply.new_id

@@ -690,3 +690,163 @@ async def test_clear_returns_the_cleared_event_id_or_none(tmp_path):
     assert await ks.clear(cleared_by="manual") == kid
     assert await ks.is_active() is None
     await db.close()
+
+
+# --- vector-review findings (PR #602) ----------------------------------------
+# Some writers on the shared connection commit or roll back without
+# db._txn_lock. trigger() awaits several statements while holding the lock;
+# a foreign ROLLBACK landing between them undoes trigger's own pending writes.
+
+
+def _rollback_once_after(db, needle: str):
+    """Make the shared connection roll back once, right after the first
+    statement containing ``needle`` — as an unlocked writer elsewhere would."""
+    real_execute = db._conn.execute
+    fired: dict = {}
+
+    async def _execute(sql, *args, **kwargs):
+        cur = await real_execute(sql, *args, **kwargs)
+        if needle in sql and not fired:
+            fired["at"] = sql
+            await db._conn.rollback()
+        return cur
+
+    db._conn.execute = _execute
+    return fired, real_execute
+
+
+async def test_trigger_still_engages_when_a_foreign_rollback_undoes_the_release(
+    tmp_path,
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    await _point_control_at(db, killed_until=now - timedelta(minutes=5))
+
+    fired, real_execute = _rollback_once_after(
+        db, "UPDATE live_control SET active_kill_event_id = NULL"
+    )
+    try:
+        new_id, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert fired, "the interference was not injected"
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    assert db._conn.in_transaction is False
+    await db.close()
+
+
+async def test_trigger_still_engages_when_a_foreign_rollback_undoes_the_insert(
+    tmp_path,
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+
+    fired, real_execute = _rollback_once_after(db, "INSERT INTO kill_events")
+    try:
+        new_id, won = await ks.trigger(
+            triggered_by="manual", reason="op", duration=timedelta(hours=1)
+        )
+    finally:
+        db._conn.execute = real_execute
+
+    assert fired
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    assert db._conn.in_transaction is False
+    # No orphan speculative rows: exactly the one live event.
+    cur = await db._conn.execute("SELECT COUNT(*) FROM kill_events")
+    assert (await cur.fetchone())[0] == 1
+    await db.close()
+
+
+async def test_trigger_judges_expiry_after_waiting_for_the_lock(tmp_path):
+    """A trigger that queued behind the lock while the old kill expired must
+    judge the old kill by the time it gets the lock, not the time it asked."""
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    now = datetime.now(timezone.utc)
+    await _point_control_at(db, killed_until=now + timedelta(milliseconds=300))
+
+    await db._txn_lock.acquire()
+    try:
+        pending = asyncio.ensure_future(
+            ks.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                duration=timedelta(hours=4),
+            )
+        )
+        await asyncio.sleep(0.6)  # the old kill expires while trigger waits
+    finally:
+        db._txn_lock.release()
+    new_id, won = await pending
+
+    assert won is True
+    state = await ks.is_active()
+    assert state is not None and state.kill_event_id == new_id
+    await db.close()
+
+
+async def test_an_unreadable_killed_until_is_logged_when_it_blocks_a_trigger(
+    tmp_path,
+):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    ks = KillSwitch(db)
+    old_id = await _point_control_at(
+        db, killed_until=datetime.now(timezone.utc) + timedelta(hours=1)
+    )
+    await db._conn.execute(
+        "UPDATE kill_events SET killed_until = 'not-a-time' WHERE id = ?", (old_id,)
+    )
+    await db._conn.commit()
+
+    with structlog.testing.capture_logs() as logs:
+        winner, won = await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+
+    assert won is False and winner == old_id  # left alone: cannot judge it
+    unreadable = [
+        e for e in logs if e.get("event") == "live_kill_dead_pointer_unreadable"
+    ]
+    assert len(unreadable) == 1
+    assert unreadable[0]["log_level"] == "error"
+    assert unreadable[0]["kill_event_id"] == old_id
+    await db.close()
+
+
+async def test_releasing_a_long_latched_kill_sends_the_latched_alert(tmp_path):
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+    old_id = await _point_control_at(
+        db, killed_until=datetime.now(timezone.utc) - timedelta(hours=3)
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await ks.trigger(
+            triggered_by="daily_loss_cap", reason="breach", duration=timedelta(hours=4)
+        )
+
+    released = [e for e in logs if e.get("event") == "live_kill_dead_pointer_released"]
+    assert released and released[0]["triggered_by"] == "manual"
+    assert released[0]["latched_hours"] >= 2.9
+    assert any(f"#{old_id}" in a and "latched" in a for a in alerts)
+    assert any("TRIGGERED" in a for a in alerts)
+    await db.close()

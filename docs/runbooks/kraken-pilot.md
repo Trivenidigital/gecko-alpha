@@ -95,6 +95,12 @@ python -m scout.live.kraken_pilot cancel --decision-id <uuid>  # pull it if so
 rm <db>.pilot.lock                                             # only then
 ```
 
+Delete the lock only after `cancel` exits 0 **and** `status` shows nothing
+resting. Exit 4 from `cancel` means the ledger and Kraken disagree about a
+fill: the ledger row was left as it was, and the account must be checked
+first. Exit 0 can still leave a row that blocks the next `place` (a position
+exists, or an exit is already recorded); `cancel` says so when it does.
+
 ## The run
 
 ```bash

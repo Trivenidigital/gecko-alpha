@@ -20,6 +20,7 @@ NULL and the other does not.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,9 @@ log = structlog.get_logger(__name__)
 # next 60s tick expires only seconds-to-minutes past killed_until (below this),
 # so steady-state auto-clears do not trip the latched alert.
 _LATCHED_ALERT_THRESHOLD = timedelta(hours=1)
+# trigger() retries an attempt that another writer's unlocked ROLLBACK
+# interfered with, at most this many times in total.
+_TRIGGER_ATTEMPTS = 3
 
 
 def compute_kill_duration(trigger_time: datetime) -> timedelta:
@@ -208,7 +212,9 @@ class KillSwitch:
             return None
         return state
 
-    async def _release_dead_pointer_locked(self, now: datetime) -> int | None:
+    async def _release_dead_pointer_locked(
+        self, now: datetime
+    ) -> tuple[int, str, timedelta | None] | None:
         """Null ``live_control.active_kill_event_id`` when it does not stand
         for a kill in force. Caller holds the txn lock and commits.
 
@@ -217,15 +223,18 @@ class KillSwitch:
         same expiry rule :meth:`is_active` applies. An expired event is
         stamped ``cleared_by='auto_expired'`` so it is not left dangling; an
         already-cleared event keeps its stamp. A ``killed_until`` that cannot
-        be read is NOT treated as dead: the pointer is left alone.
+        be read is NOT treated as dead: the pointer is left alone, and that
+        is logged at ERROR because it can stop a fresh kill from engaging.
 
-        Returns the released event id, or ``None`` if nothing was released.
-        No operator alert of its own: the caller is engaging a new kill and
-        that alert follows.
+        Returns ``(released_event_id, why, latched_for)`` or ``None`` if
+        nothing was released. ``latched_for`` is how long an expired kill had
+        sat past its expiry. The caller sends the operator alerts after it
+        leaves the lock.
         """
         assert self._db._conn is not None
         cur = await self._db._conn.execute(
-            "SELECT lc.active_kill_event_id, ke.id, ke.cleared_at, ke.killed_until "
+            "SELECT lc.active_kill_event_id, ke.id, ke.cleared_at, "
+            "ke.killed_until, ke.triggered_by "
             "FROM live_control AS lc "
             "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
             "WHERE lc.id = 1"
@@ -233,19 +242,30 @@ class KillSwitch:
         row = await cur.fetchone()
         if row is None or row[0] is None:
             return None
-        pointer, event_id, cleared_at, killed_until_raw = row
+        pointer, event_id, cleared_at, killed_until_raw, event_triggered_by = row
+        latched_for: timedelta | None = None
         if event_id is None:
             why = "event_missing"
         elif cleared_at is not None:
             why = "event_already_cleared"
         else:
             try:
-                expired = datetime.fromisoformat(killed_until_raw) < now
+                killed_until = datetime.fromisoformat(killed_until_raw)
+                expired = killed_until < now
             except (TypeError, ValueError):
+                log.error(
+                    "live_kill_dead_pointer_unreadable",
+                    kill_event_id=pointer,
+                    killed_until=killed_until_raw,
+                    note="cannot tell whether this kill has expired, so it is "
+                    "left in force; a new kill cannot engage until it is "
+                    "cleared by hand",
+                )
                 return None
             if not expired:
                 return None
             why = "event_expired"
+            latched_for = now - killed_until
             await self._db._conn.execute(
                 "UPDATE kill_events SET cleared_at = ?, cleared_by = 'auto_expired' "
                 "WHERE id = ? AND cleared_at IS NULL",
@@ -262,8 +282,36 @@ class KillSwitch:
             "live_kill_dead_pointer_released",
             released_kill_event_id=pointer,
             why=why,
+            triggered_by=event_triggered_by,
+            killed_until=killed_until_raw,
+            latched_hours=(
+                None
+                if latched_for is None
+                else round(latched_for.total_seconds() / 3600.0, 2)
+            ),
         )
-        return pointer
+        return pointer, why, latched_for
+
+    async def _pointer_is_dead_locked(self, now: datetime) -> bool:
+        """Whether the current pointer stands for no kill in force (same rule
+        as :meth:`_release_dead_pointer_locked`, read-only)."""
+        assert self._db._conn is not None
+        cur = await self._db._conn.execute(
+            "SELECT lc.active_kill_event_id, ke.id, ke.cleared_at, ke.killed_until "
+            "FROM live_control AS lc "
+            "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
+            "WHERE lc.id = 1"
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return True
+        _pointer, event_id, cleared_at, killed_until_raw = row
+        if event_id is None or cleared_at is not None:
+            return True
+        try:
+            return datetime.fromisoformat(killed_until_raw) < now
+        except (TypeError, ValueError):
+            return False
 
     async def trigger(
         self,
@@ -284,6 +332,13 @@ class KillSwitch:
         claim below would lose to a kill that :meth:`is_active` already
         reports as inactive, and a fresh breach could not halt trading.
 
+        Some writers on the shared connection commit or roll back WITHOUT
+        ``db._txn_lock``, so a foreign ROLLBACK can land between this method's
+        statements and undo its pending writes. Each attempt therefore checks
+        its own result — a win is reported only once the pointer is read back
+        naming the new event — and an attempt that was interfered with is
+        retried, up to ``_TRIGGER_ATTEMPTS`` times.
+
         Returns ``(kill_event_id, i_am_winner)`` — the first element is the
         **active** event id (winner's id for both callers, so callers that
         only care about "which event is active" can ignore the second
@@ -294,71 +349,184 @@ class KillSwitch:
         """
         assert self._db._conn is not None
         assert self._db._txn_lock is not None
-        now = datetime.now(timezone.utc)
-        killed_until = now + duration
-        async with self._db._txn_lock:
+        for attempt in range(1, _TRIGGER_ATTEMPTS + 1):
+            last = attempt == _TRIGGER_ATTEMPTS
+            async with self._db._txn_lock:
+                # Judged under the lock: a trigger that queued behind another
+                # holder must see the clock as it is when it gets in.
+                now = datetime.now(timezone.utc)
+                killed_until = now + duration
+                outcome = await self._trigger_attempt_locked(
+                    triggered_by=triggered_by,
+                    reason=reason,
+                    now=now,
+                    killed_until=killed_until,
+                    attempt=attempt,
+                    last=last,
+                )
+            if outcome is None:
+                continue  # interfered with; logged inside
+            new_id, won, released = outcome
+            if not won:
+                return new_id, False
+            # §12b: notify the operator OUTSIDE the txn lock — the HTTP send
+            # must not hold the single DB writer. Winner-only.
+            if (
+                released is not None
+                and released[2] is not None
+                and released[2] > _LATCHED_ALERT_THRESHOLD
+            ):
+                await self._emit_alert(
+                    event_type="latched_auto_clear",
+                    kill_event_id=released[0],
+                    latched_hours=released[2].total_seconds() / 3600.0,
+                )
+            await self._emit_alert(
+                event_type="triggered",
+                kill_event_id=new_id,
+                triggered_by=triggered_by,
+                reason=reason,
+                killed_until=killed_until,
+            )
+            return new_id, True
+        # Every attempt was interfered with. Report what is in force now,
+        # and say loudly that this call did not engage a kill.
+        state = await self._active_kill_state()
+        current = state.kill_event_id if state is not None else None
+        log.error(
+            "live_kill_trigger_unconfirmed",
+            triggered_by=triggered_by,
+            reason=reason,
+            attempts=_TRIGGER_ATTEMPTS,
+            active_kill_event_id=current,
+        )
+        return current, False
+
+    async def _trigger_attempt_locked(
+        self,
+        *,
+        triggered_by: str,
+        reason: str,
+        now: datetime,
+        killed_until: datetime,
+        attempt: int,
+        last: bool,
+    ) -> tuple[int, bool, tuple[int, str, timedelta | None] | None] | None:
+        """One insert-release-claim pass. Caller holds the txn lock.
+
+        Returns ``(event_id, won, released)``, or ``None`` when a foreign
+        rollback interfered and the attempt should be retried. Never leaves a
+        write transaction open: every exit commits (never rolls back — a
+        ROLLBACK on the shared connection would discard other writers' work).
+        """
+        conn = self._db._conn
+        assert conn is not None
+        new_id: int | None = None
+        try:
             # Insert the row first — speculative. If we lose the race we
             # DELETE it below.
-            await self._db._conn.execute(
+            await conn.execute(
                 "INSERT INTO kill_events "
                 "(triggered_by, reason, triggered_at, killed_until) "
                 "VALUES (?, ?, ?, ?)",
                 (triggered_by, reason, now.isoformat(), killed_until.isoformat()),
             )
-            cur = await self._db._conn.execute("SELECT last_insert_rowid()")
+            cur = await conn.execute("SELECT last_insert_rowid()")
             new_id = (await cur.fetchone())[0]
 
             # Only after the INSERT has succeeded: if it raises (a CHECK on
-            # triggered_by, say) nothing has been released, so no uncommitted
-            # release is left to ride out on someone else's commit.
-            await self._release_dead_pointer_locked(now)
+            # triggered_by, say) nothing has been released.
+            released = await self._release_dead_pointer_locked(now)
 
             # Conditional claim — only succeeds if no other trigger has won.
-            cur = await self._db._conn.execute(
+            cur = await conn.execute(
                 "UPDATE live_control SET active_kill_event_id = ? "
                 "WHERE id = 1 AND active_kill_event_id IS NULL",
                 (new_id,),
             )
             claimed = cur.rowcount == 1
 
-            if not claimed:
-                # Lost the race — a concurrent trigger already claimed. Mark our
-                # speculative row as superseded and return the winner's id. No
-                # alert here: the winner emits it (avoids duplicate notifications).
-                await self._db._conn.execute(
-                    "DELETE FROM kill_events WHERE id = ?", (new_id,)
+            if claimed:
+                # Read back before claiming a win: a foreign rollback between
+                # the INSERT and here would leave the pointer naming a row
+                # that no longer exists, or no pointer at all.
+                cur = await conn.execute(
+                    "SELECT lc.active_kill_event_id, ke.id "
+                    "FROM live_control AS lc "
+                    "LEFT JOIN kill_events AS ke ON ke.id = lc.active_kill_event_id "
+                    "WHERE lc.id = 1"
                 )
-                cur = await self._db._conn.execute(
-                    "SELECT active_kill_event_id FROM live_control WHERE id = 1"
+                check = await cur.fetchone()
+                if check is not None and check[0] == new_id and check[1] == new_id:
+                    await conn.commit()
+                    log.warning(
+                        "live_kill_event_triggered",
+                        kill_event_id=new_id,
+                        triggered_by=triggered_by,
+                        reason=reason,
+                        killed_until=killed_until.isoformat(),
+                    )
+                    return new_id, True, released
+                await conn.execute(
+                    "UPDATE live_control SET active_kill_event_id = NULL "
+                    "WHERE id = 1 AND active_kill_event_id = ?",
+                    (new_id,),
                 )
-                winner_id = (await cur.fetchone())[0]
-                await self._db._conn.commit()
-                log.info(
-                    "live_kill_event_trigger_lost_race",
-                    losing_speculative_id=new_id,
-                    winner_id=winner_id,
-                )
-                return winner_id, False
+                await conn.execute("DELETE FROM kill_events WHERE id = ?", (new_id,))
+                await conn.commit()
+                return self._interfered(attempt, last, "claim_not_confirmed")
 
-            await self._db._conn.commit()
-            log.warning(
-                "live_kill_event_triggered",
-                kill_event_id=new_id,
-                triggered_by=triggered_by,
-                reason=reason,
-                killed_until=killed_until.isoformat(),
+            # Lost the claim. Either a real kill is in force (a concurrent
+            # trigger won), or a foreign rollback undid our release and the
+            # pointer is dead again — in which case try once more.
+            await conn.execute("DELETE FROM kill_events WHERE id = ?", (new_id,))
+            if await self._pointer_is_dead_locked(now):
+                await conn.commit()
+                return self._interfered(attempt, last, "release_undone")
+            cur = await conn.execute(
+                "SELECT active_kill_event_id FROM live_control WHERE id = 1"
             )
+            winner_id = (await cur.fetchone())[0]
+            await conn.commit()
+            log.info(
+                "live_kill_event_trigger_lost_race",
+                losing_speculative_id=new_id,
+                winner_id=winner_id,
+            )
+            return winner_id, False, None
+        except sqlite3.Error as exc:
+            # e.g. the claim names a row a foreign rollback removed (FOREIGN
+            # KEY). End our transaction without leaving an orphan row behind.
+            if new_id is not None:
+                try:
+                    await conn.execute(
+                        "DELETE FROM kill_events WHERE id = ? AND id NOT IN ("
+                        "SELECT active_kill_event_id FROM live_control "
+                        "WHERE active_kill_event_id IS NOT NULL)",
+                        (new_id,),
+                    )
+                except sqlite3.Error:
+                    pass
+            await conn.commit()
+            if last:
+                raise
+            log.warning(
+                "live_kill_trigger_retry",
+                attempt=attempt,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return None
 
-        # §12b: notify the operator OUTSIDE the txn lock — the HTTP send must not
-        # hold the single DB writer. Winner-only (the loser returned above).
-        await self._emit_alert(
-            event_type="triggered",
-            kill_event_id=new_id,
-            triggered_by=triggered_by,
-            reason=reason,
-            killed_until=killed_until,
+    @staticmethod
+    def _interfered(attempt: int, last: bool, why: str) -> None:
+        log.warning(
+            "live_kill_trigger_retry",
+            attempt=attempt,
+            why=why,
+            final=last,
         )
-        return new_id, True
+        return None
 
     async def clear(self, *, cleared_by: str) -> int | None:
         """Clear the active kill, if any. Returns the cleared event id, or
@@ -388,8 +556,8 @@ class KillSwitch:
         """
         assert self._db._conn is not None
         assert self._db._txn_lock is not None
-        now = datetime.now(timezone.utc)
         async with self._db._txn_lock:
+            now = datetime.now(timezone.utc)
             cur = await self._db._conn.execute(
                 "SELECT active_kill_event_id FROM live_control WHERE id = 1"
             )
