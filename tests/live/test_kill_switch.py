@@ -1941,3 +1941,137 @@ async def test_a_reused_id_in_a_later_attempt_announces_that_attempts_expiry(
     triggered = [a for a in alerts if "TRIGGERED" in a]
     assert triggered and stored in triggered[0]
     await db.close()
+
+
+# --- vector review findings at 46ff9af1 --------------------------------------
+
+
+def _frozen_clock(monkeypatch):
+    """Every datetime.now() in kill_switch returns one instant, so the only
+    thing keeping attempt timestamps apart is _unique_utc_now."""
+    from scout.live import kill_switch as ks_module
+
+    fixed = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(ks_module, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(ks_module, "_last_attempt_at", None)
+
+
+async def _colliding_expiry_race(tmp_path, *, fail_owned_read: bool):
+    """A's insert is undone; B reuses the id and wins. The durations are
+    chosen so that, by attempt time, A's and B's killed_until are equal —
+    as two callers computing "until midnight" from their own clocks can."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks_a = KillSwitch(db, alert_hook=_hook)
+    ks_b = KillSwitch(db, alert_hook=_hook)
+    real_execute = db._conn.execute
+    state = {"rolled": False}
+
+    async def _execute(sql, *args, **kwargs):
+        if fail_owned_read and "ke.id, ke.triggered_at" in sql:
+            raise sqlite3.OperationalError("disk I/O error")
+        cur = await real_execute(sql, *args, **kwargs)
+        if "INSERT INTO kill_events" in sql and not state["rolled"]:
+            state["rolled"] = True
+            await db._conn.rollback()
+        return cur
+
+    db._conn.execute = _execute
+    try:
+        results = await asyncio.gather(
+            ks_a.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                duration=timedelta(hours=4),
+            ),
+            ks_b.trigger(
+                triggered_by="daily_loss_cap",
+                reason="breach",
+                # B's first attempt is stamped 1us after A's: same expiry.
+                duration=timedelta(hours=4) - timedelta(microseconds=1),
+            ),
+            return_exceptions=True,
+        )
+    finally:
+        db._conn.execute = real_execute
+    wins = [r for r in results if isinstance(r, tuple) and r[1]]
+    await db.close()
+    return results, wins, alerts
+
+
+async def test_equal_expiries_from_different_callers_never_give_two_winners(
+    tmp_path, monkeypatch
+):
+    _frozen_clock(monkeypatch)
+    results, wins, alerts = await _colliding_expiry_race(tmp_path, fail_owned_read=True)
+    assert len(wins) <= 1, results
+    assert sum("TRIGGERED" in a for a in alerts) == len(wins)
+
+
+async def test_a_successful_not_ours_read_is_not_overridden(tmp_path, monkeypatch):
+    """When the committed-state ownership read works and says "not ours",
+    the weaker is_active-based check must not run and override it — even if
+    expiries happen to collide (uniqueness disabled here to isolate this)."""
+    from scout.live import kill_switch as ks_module
+
+    _frozen_clock(monkeypatch)
+    monkeypatch.setattr(ks_module, "_unique_kill_until", lambda value: value)
+    results, wins, alerts = await _colliding_expiry_race(
+        tmp_path, fail_owned_read=False
+    )
+    assert len(wins) <= 1, results
+    assert sum("TRIGGERED" in a for a in alerts) == len(wins)
+
+
+def test_kill_expiries_issued_in_one_process_are_unique():
+    from scout.live.kill_switch import _unique_kill_until
+
+    base = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    issued = [_unique_kill_until(base) for _ in range(50)]
+    assert len(set(issued)) == 50
+
+
+async def test_a_naive_killed_until_in_the_final_step_still_alerts(tmp_path):
+    """The attempts all end in retry (the judging read keeps failing) and the
+    final is_active() raises TypeError, as a hand-edited killed_until with no
+    timezone makes it do. That must be handled like any unreadable state."""
+    import sqlite3
+
+    db = Database(tmp_path / "t.db")
+    await db.initialize()
+    alerts: list[str] = []
+
+    async def _hook(text):
+        alerts.append(text)
+
+    ks = KillSwitch(db, alert_hook=_hook)
+
+    async def _naive_compare():
+        raise TypeError("can't compare offset-naive and offset-aware datetimes")
+
+    ks.is_active = _naive_compare
+    real_execute = _fail_sql(db, "ke.id, ke.triggered_at")
+    try:
+        with structlog.testing.capture_logs() as logs:
+            with pytest.raises(sqlite3.OperationalError):
+                await ks.trigger(
+                    triggered_by="manual", reason="op", duration=timedelta(hours=1)
+                )
+    finally:
+        db._conn.execute = real_execute
+    assert any(e.get("event") == "live_kill_trigger_state_unreadable" for e in logs)
+    assert any("NOT ENGAGED" in a for a in alerts)
+    await db.close()

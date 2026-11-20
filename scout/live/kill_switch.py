@@ -66,6 +66,23 @@ def _unique_utc_now() -> datetime:
     return now
 
 
+_issued_kill_until: set[datetime] = set()
+
+
+def _unique_kill_until(value: datetime) -> datetime:
+    """``value``, moved on by a microsecond at a time until no earlier
+    attempt in this process was issued the same expiry.
+
+    Callers pass "until midnight" durations computed from their own clocks,
+    so two calls' killed_until can coincide exactly even though their
+    attempt timestamps differ. The ownership check in the final step relies
+    on killed_until telling this call's row from another's."""
+    while value in _issued_kill_until:
+        value += timedelta(microseconds=1)
+    _issued_kill_until.add(value)
+    return value
+
+
 def compute_kill_duration(trigger_time: datetime) -> timedelta:
     """Returns ``max(4h, time until next UTC midnight)``.
 
@@ -402,7 +419,7 @@ class KillSwitch:
                 # holder must see the clock as it is when it gets in. Unique
                 # per attempt: it is half of how this call knows its own row.
                 now = _unique_utc_now()
-                killed_until = now + duration
+                killed_until = _unique_kill_until(now + duration)
                 verdict, event_id, attempt_released, error = (
                     await self._trigger_attempt_locked(
                         triggered_by=triggered_by,
@@ -464,6 +481,10 @@ class KillSwitch:
         # goes through, judge from committed state like any attempt.
         conn = self._db._conn
         pending: list[int] = []
+        # Set only when the committed-state ownership read itself failed. A
+        # read that worked and answered "not ours" is final: the weaker
+        # is_active()-based check below must not override it.
+        owned_read_failed = False
         async with self._db._txn_lock:
             settle_closed = True
             if conn.in_transaction:
@@ -475,6 +496,7 @@ class KillSwitch:
                     settled = await self._owned_pointer_locked(our_ids)
                 except sqlite3.Error as exc:
                     settled, last_error = None, last_error or exc
+                    owned_read_failed = True
                 if settled is not None:
                     if released is not None:
                         await self._ensure_released_event_stamped_locked(
@@ -491,7 +513,7 @@ class KillSwitch:
         if settled is None and not unconfirmable:
             try:
                 state = await self.is_active()
-            except ValueError as exc:  # an unreadable killed_until
+            except (TypeError, ValueError) as exc:  # unreadable / naive killed_until
                 log.error(
                     "live_kill_trigger_state_unreadable",
                     error=str(exc),
@@ -506,8 +528,10 @@ class KillSwitch:
                     error_type=type(exc).__name__,
                 )
                 state, last_error = None, last_error or exc
-            if state is not None and self._is_ours(
-                state, our_ids, our_until, triggered_by, reason
+            if (
+                owned_read_failed
+                and state is not None
+                and self._is_ours(state, our_ids, our_until, triggered_by, reason)
             ):
                 # The judging read failed, but the kill in force is this
                 # call's own: it engaged, so report it as engaged.
